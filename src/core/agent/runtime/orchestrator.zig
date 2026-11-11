@@ -270,6 +270,27 @@ fn append_steering_guidance(
     }
 }
 
+/// Adds the notes that join the turn at a step boundary: the notes the last
+/// step's gate queued, and a changed runtime context. The saved turn restores a
+/// boundary's notes before its steering (D93), so they join before the steering
+/// the last step ended with, such as a continuation prompt, the nudge, or a
+/// message from a Stop hook, not after it (`boundaryNotesStart`). The turn's
+/// messages a compaction already took out of the request stay where they are.
+fn insertBoundaryNotes(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    compacted_suffix_len: usize,
+    notes: []const ChatMessage,
+) Allocator.Error!void {
+    if (notes.len == 0) return;
+    const start = runtime_execution_memory.boundaryNotesStart(within_turn_suffix.items);
+    const at = @max(start, @min(compacted_suffix_len, within_turn_suffix.items.len));
+    if (at < within_turn_suffix.items.len) {
+        debug_trace.logf("context", "boundary notes join before steering notes={d} index={d} messages={d}", .{ notes.len, at, within_turn_suffix.items.len });
+    }
+    try within_turn_suffix.insertSlice(arena, at, notes);
+}
+
 fn append_pending_steering_after_assistant(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -7602,9 +7623,10 @@ fn processQueuedPromptLoop(
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         // The notes the last step's gate queued follow that step's results and
-        // come before any steering at this boundary (D93).
+        // come before any steering at this boundary (D93), including the
+        // steering the last step ended with.
         if (pending_context_notes.items.len > 0) {
-            try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
+            try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, pending_context_notes.items);
             pending_context_notes.clearRetainingCapacity();
         }
         current_step_index = step + 1;
@@ -7646,7 +7668,8 @@ fn processQueuedPromptLoop(
             debug_trace.logf("context", "runtime context captured step={d} messages={d}", .{ current_step_index, runtime_context.messages().len });
         }
         if (runtime_update) |note| {
-            try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
+            const update = [_]ChatMessage{.{ .role = .system, .content = note, .context_note = true }};
+            try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, &update);
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
         const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);

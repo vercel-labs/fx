@@ -483,9 +483,33 @@ pub fn project_image_references(
     return try out.toOwnedSlice();
 }
 
+/// Whether `message` is the user's own message that starts a turn, as a saved
+/// turn restores it, and not steering, feedback, or a message fx sent.
+fn isTurnUserMessage(message: types.ChatMessage) bool {
+    return message.role == .user and message.context_origin == .user_turn and
+        !message.restored_steering and !message.permission_feedback and !message.recovery_prompt;
+}
+
+/// `content` followed by the reference list of `catalog`, as every projected
+/// message carries it. Returned storage belongs to `alloc`.
+fn withImageReferences(
+    alloc: Allocator,
+    content: []const u8,
+    catalog: []const types.ImageAttachment,
+) ![]u8 {
+    const references = try project_image_references(alloc, catalog);
+    defer alloc.free(references);
+    if (content.len == 0) return alloc.dupe(u8, references);
+    return alloc.print("{s}\n\n{s}", .{ content, references });
+}
+
 /// Projects an eligible text-only request without carrying filesystem-backed
 /// image parts. Every authorized stable ID is attached to the current root user
-/// message as a compact reference list. Returned storage belongs to `alloc`.
+/// message as a compact reference list. Each earlier turn's user message lists
+/// the images the conversation held at its own turn, which are the ones with an
+/// ID up to the newest image of that turn or before it, so it reads in every
+/// later request as it did in the request of its own turn, and the provider's
+/// prompt cache still covers it. Returned storage belongs to `alloc`.
 pub noinline fn project_text_only_messages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
@@ -503,13 +527,18 @@ pub noinline fn project_text_only_messages(
     {
         return error.MissingUserMessage;
     }
-    const references = try project_image_references(alloc, catalog);
-    defer alloc.free(references);
-    const content = projected[current_user_message_index].content orelse "";
-    projected[current_user_message_index].content = if (content.len == 0)
-        try alloc.dupe(u8, references)
-    else
-        try alloc.print("{s}\n\n{s}", .{ content, references });
+    // The catalog is sorted by ID, so the images known at a turn are its start.
+    var newest_known: usize = 0;
+    for (messages[0..current_user_message_index], 0..) |message, index| {
+        for (message.images) |image| newest_known = @max(newest_known, image.id);
+        if (newest_known == 0 or !isTurnUserMessage(message)) continue;
+        var known: usize = 0;
+        while (known < catalog.len and catalog[known].id <= newest_known) known += 1;
+        if (known == 0) continue;
+        projected[index].content = try withImageReferences(alloc, message.content orelse "", catalog[0..known]);
+    }
+    const current = &projected[current_user_message_index];
+    current.content = try withImageReferences(alloc, current.content orelse "", catalog);
     return projected;
 }
 
@@ -1551,6 +1580,53 @@ test "text-only projection preserves typed permission feedback byte-exact" {
     ));
     try std.testing.expectEqualStrings(feedback, messages[3].content.?);
     try std.testing.expectEqualStrings("Make the requested changes.", messages[0].content.?);
+}
+
+test "text-only projection lists each earlier turn's images on its own message, as that turn's request did" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const catalog = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/tmp/one.png"), .media_type = @constCast("image/png") },
+        .{ .id = 2, .path = @constCast("/tmp/two.png"), .media_type = @constCast("image/png") },
+        .{ .id = 3, .path = @constCast("/tmp/three.png"), .media_type = @constCast("image/png") },
+    };
+    const history = [_]types.ChatMessage{
+        .{ .role = .user, .content = "zero", .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a0" },
+        .{ .role = .user, .content = "first", .images = catalog[0..1], .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "second", .images = catalog[1..3], .context_origin = .user_turn },
+        .{ .role = .user, .content = "typed update", .restored_steering = true, .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a2" },
+    };
+    const current = types.ChatMessage{ .role = .user, .content = "third" };
+    const messages = history ++ [_]types.ChatMessage{current};
+
+    const projected = try project_text_only_messages(arena, &messages, 7, &catalog);
+    // Before any image, a turn lists none; later turns list every image the
+    // conversation held at their turn, and steering is the user's own words.
+    try std.testing.expectEqualStrings("zero", projected[0].content.?);
+    try std.testing.expectEqualStrings("first\n\n<available_images>\n[Image #1]\n</available_images>", projected[2].content.?);
+    try std.testing.expectEqualStrings(
+        "second\n\n<available_images>\n[Image #1]\n[Image #2]\n[Image #3]\n</available_images>",
+        projected[4].content.?,
+    );
+    try std.testing.expectEqualStrings("typed update", projected[5].content.?);
+    try std.testing.expectEqualStrings(
+        "third\n\n<available_images>\n[Image #1]\n[Image #2]\n[Image #3]\n</available_images>",
+        projected[7].content.?,
+    );
+    for (projected) |chat_message| try std.testing.expectEqual(@as(usize, 0), chat_message.images.len);
+    try std.testing.expectEqualStrings("first", messages[2].content.?);
+
+    // The request each earlier turn sent, built when that turn was the current
+    // one over the images it knew, carries the message as a later request does.
+    const then_first = try project_text_only_messages(arena, messages[0..3], 2, catalog[0..1]);
+    try std.testing.expectEqualStrings(then_first[2].content.?, projected[2].content.?);
+    const then_second = try project_text_only_messages(arena, messages[0..5], 4, &catalog);
+    try std.testing.expectEqualStrings(then_second[4].content.?, projected[4].content.?);
+    try std.testing.expectEqualStrings(then_second[2].content.?, projected[2].content.?);
 }
 
 test "native message projection retains only the current turn structured rejection" {

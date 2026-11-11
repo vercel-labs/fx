@@ -9023,6 +9023,46 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP's second prompt after an image prompt starts with the last request of the first",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-second-prompt-");
+      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
+      // The default fake model has no image input, so the first request lists
+      // the image on the user's message and the model reads it through Vision.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("vision_1", "vision", { image_ids: [1], focus: "describe" }),
+        finalText(JSON.stringify({ images: [{ image_id: 1, status: "ok", summary: "small fixture", visible_text: [], details: [] }] })),
+        finalText("ACP_FIRST_IMAGE_ANSWER"),
+        finalText("ACP_SECOND_ANSWER"),
+      ]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const first = await runPromptBlocks(client, [
+          { type: "text", text: "Describe the image." },
+          { type: "image", data: imageData, mimeType: "image/png" },
+        ], TIMEOUT);
+        expect(first.promptResult.error).toBeUndefined();
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[0]!.body).toContain("available_images");
+
+        const second = await runPrompt(client, "And once more.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+        expectPromptExtends(gateway.requests[2]!.body, gateway.requests[3]!.body);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "ACP delivers complete explicit skill and required reference content",
     async () => {
       const root = createIsolatedRoot("fx-acp-explicit-skill-");

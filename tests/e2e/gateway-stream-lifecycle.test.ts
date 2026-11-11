@@ -10679,6 +10679,159 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 60_000);
 
+  // A branch switched by another process changes the runtime context while the
+  // turn runs. The change joins the turn at the next step's boundary as a note,
+  // next to the nudge fx sends after an empty reply. The saved turn restores a
+  // boundary's notes before its steering (D93), so the request that carries
+  // both must send them in that order, or the next request, a resume and a
+  // crash recovery rebuild a different request.
+  const CONTEXT_UPDATE_BRANCH = "feature/saved-order";
+  const initGitWorkspace = (workspace: string) => {
+    const init = Bun.spawnSync(["git", "init", "-q", "-b", "main"], { cwd: workspace });
+    if (init.exitCode !== 0) throw new Error(init.stderr.toString());
+  };
+  const switchBranch = (workspace: string) =>
+    writeFileSync(join(workspace, ".git", "HEAD"), `ref: refs/heads/${CONTEXT_UPDATE_BRANCH}\n`);
+  const CLAUDE_MODEL = "anthropic/claude-sonnet-4.5";
+  const branchChangeGateway = (replies: Array<() => Response | Promise<Response>>) => {
+    let index = 0;
+    return startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      {
+        models: [
+          { id: MODEL, type: "language", tags: ["tool-use"] },
+          { id: CLAUDE_MODEL, type: "language", tags: ["tool-use"] },
+        ],
+      },
+    );
+  };
+  const carriesNoteAndNudge = (body: string) => {
+    expect(body).toContain(`git_branch: ${CONTEXT_UPDATE_BRANCH}`);
+    expect(body).toContain(EMPTY_REPLY_NUDGE);
+  };
+
+  for (const model of [MODEL, CLAUDE_MODEL]) {
+    test(`${model}: a runtime context change after an empty reply joins before the nudge, and a resumed session's next request starts with that request`, async () => {
+      const root = createFixtureRoot("empty-other-context-change");
+      initGitWorkspace(root.workspace);
+      const gateway = branchChangeGateway([
+        () => {
+          switchBranch(root.workspace);
+          return emptyOtherReply()();
+        },
+        () => fakeGatewayFinalText("continued after the nudge"),
+        () => fakeGatewayFinalText("second turn answered"),
+      ]);
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: model };
+        const first = await runFx(["ask", "--json", "--auto", "Answer briefly."], {
+          cwd: root.workspace, env, timeoutMs: 30_000,
+        });
+        expect(first.code).toBe(0);
+        expect(gateway.requests).toHaveLength(2);
+        carriesNoteAndNudge(gateway.requests[1]!.body);
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--resume", parseAskJson(first.stdout).session_id, "And once more."],
+          { cwd: root.workspace, env, timeoutMs: 30_000 },
+        );
+        expect(resumed.code).toBe(0);
+        expect(parseAskJson(resumed.stdout).final_output).toContain("second turn answered");
+        expect(gateway.requests).toHaveLength(3);
+        expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+  }
+
+  test("a request that carries the nudge and the runtime context note fails once and is sent again in the same order, and the next request extends the one that went through", async () => {
+    const root = createFixtureRoot("empty-other-context-change-retry");
+    initGitWorkspace(root.workspace);
+    const gateway = branchChangeGateway([
+      () => {
+        switchBranch(root.workspace);
+        return emptyOtherReply()();
+      },
+      () => new Response("bad gateway", { status: 502 }),
+      () => fakeGatewayFinalText("continued after the nudge"),
+      () => fakeGatewayFinalText("second turn answered"),
+    ]);
+    try {
+      const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
+      const first = await runFx(["ask", "--json", "--auto", "Answer briefly."], {
+        cwd: root.workspace, env, timeoutMs: 60_000,
+      });
+      expect(first.code).toBe(0);
+      expect(gateway.requests).toHaveLength(3);
+      carriesNoteAndNudge(gateway.requests[2]!.body);
+      expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", parseAskJson(first.stdout).session_id, "And once more."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(gateway.requests).toHaveLength(4);
+      expectPromptExtends(gateway.requests[2]!.body, gateway.requests[3]!.body);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("a turn killed while the request with the nudge and the runtime context note waits resumes with that request's messages first", async () => {
+    const root = createFixtureRoot("empty-other-context-change-crash");
+    initGitWorkspace(root.workspace);
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    let releaseHeld: (() => void) | undefined;
+    const gateway = branchChangeGateway([
+      () => {
+        switchBranch(root.workspace);
+        return emptyOtherReply()();
+      },
+      async () => {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return fakeGatewayFinalText("too late");
+      },
+      () => fakeGatewayFinalText("recovered after the crash"),
+    ]);
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "Answer briefly."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      proc.kill("SIGKILL");
+      await proc.exited;
+      expect(gateway.requests).toHaveLength(2);
+      carriesNoteAndNudge(gateway.requests[1]!.body);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", onlySessionId(root.home), "Continue after the crash."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(gateway.requests).toHaveLength(3);
+      expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
   test("a second empty reply in a row that stops for another reason says so instead of Done.", async () => {
     const { result, bodies } = await askWithReplies("empty-other-twice", [
       emptyOtherReply(),
