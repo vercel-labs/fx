@@ -3436,8 +3436,8 @@ function savedModel(fixture: Fixture, id: string): string {
   return (prefs.at(-1) as any).value.model;
 }
 
-/// Every session's log, to show a read wrote nothing.
-function logBytes(fixture: Fixture, ids: string[]) {
+/// The logs of the sessions `ids`, to show a read wrote nothing.
+function logBytesOf(fixture: Fixture, ids: string[]) {
   return ids.map((id) => readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")));
 }
 
@@ -3482,7 +3482,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     // The parent's turn ends with the receipt while its subagent works.
     await waitForLog(fixture, delegating!, "turn_committed");
     const childId = childLines(fixture.home, delegating!)[0].child;
-    const before = logBytes(fixture, [working!, delegating!, childId]);
+    const before = logBytesOf(fixture, [working!, delegating!, childId]);
 
     // This workspace has one live session; the other workspace's is left out.
     const here = await liveSessions(fixture, gateway);
@@ -3521,7 +3521,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     ].join("\n"));
 
     // Listing took no lock that stayed and wrote nothing.
-    expect(logBytes(fixture, [working!, delegating!, childId])).toEqual(before);
+    expect(logBytesOf(fixture, [working!, delegating!, childId])).toEqual(before);
 
     // A killed process frees its lock, so its session drops off on the next run.
     holders[1]!.child.kill("SIGKILL");
@@ -3557,7 +3557,7 @@ test("fx session --tail prints the last turns of a held session under their own 
     expect((await ask(fixture, gateway, ["--resume", id, "Tail turn three."])).code).toBe(0);
     holder = spawnAsk(fixture, gateway, ["--resume", id, "Tail turn held."]);
     await until(() => held, "the held turn");
-    const before = logBytes(fixture, [id]);
+    const before = logBytesOf(fixture, [id]);
 
     const text = await command(fixture, gateway, ["session", id, "--tail", "2"]);
     expect(text.code).toBe(0);
@@ -3592,7 +3592,7 @@ test("fx session --tail prints the last turns of a held session under their own 
     expect(whole.history).toHaveLength(3);
     expect(whole.first_turn).toBeUndefined();
 
-    expect(logBytes(fixture, [id])).toEqual(before);
+    expect(logBytesOf(fixture, [id])).toEqual(before);
   } finally {
     holder?.child.kill("SIGKILL");
     gateway.stop();
@@ -3642,7 +3642,7 @@ test("fx session <id>/<agent> reads a subagent by the name its parent gave it", 
     round = 2;
     expect((await ask(fixture, gateway, ["--resume", id, "Second agent review."])).code).toBe(0);
     const childId = childLines(fixture.home, id)[0].child;
-    const before = logBytes(fixture, [id, childId]);
+    const before = logBytesOf(fixture, [id, childId]);
 
     const whole = await command(fixture, gateway, ["session", `${id}/reviewer`, "--json"]);
     expect(whole.code).toBe(0);
@@ -3697,7 +3697,7 @@ test("fx session <id>/<agent> reads a subagent by the name its parent gave it", 
     expect(direct.code).toBe(1);
     expect(JSON.parse(direct.stdout).code).toBe("SessionNotFound");
 
-    expect(logBytes(fixture, [id, childId])).toEqual(before);
+    expect(logBytesOf(fixture, [id, childId])).toEqual(before);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -3808,7 +3808,7 @@ test("fx sessions --live lists a live session whose log is damaged, skips a fold
 }, TIMEOUT * 3);
 
 /// The newest user text of a Gateway request.
-function latestUserText(body: string): string {
+function latestUserPlainText(body: string): string {
   const user = (JSON.parse(body).prompt ?? []).filter((message: any) => message.role === "user").at(-1);
   if (!user) return "";
   if (typeof user.content === "string") return user.content;
@@ -3821,7 +3821,7 @@ test("fx sessions --live leaves out a subagent its parent closed for good", asyn
   const gateway = startDynamicFakeGateway(async (body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("Come back.") ? "GONER_BACK" : "CLOSED_CHILD_ANSWER");
     if (isReportTurn(body)) return fakeGatewayFinalText("CLOSED_REPORT_READ");
-    const latest = latestUserText(body);
+    const latest = latestUserPlainText(body);
     if (latest.includes("Start the goner again.")) {
       if (!body.includes("again-goner")) return fakeGatewayToolCall("again-goner", "subagent", { request: { action: "message", agent: "goner", message: "Come back." } });
       return fakeGatewayFinalText("GONER_STARTED_AGAIN");
