@@ -745,10 +745,11 @@ pub fn postGatewayCompletion(
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const result = client.fetch(.{
+        const result = fetchWithClient(&client, .{
             .location = .{ .url = request_url },
             .method = .POST,
             .payload = payload,
+            .redirect_behavior = .unhandled,
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
