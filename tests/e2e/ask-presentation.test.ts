@@ -514,11 +514,10 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("Inspect fixture.txt and render the response.");
-      expect(pane.match(/1 tool call · 1 read/g)).toHaveLength(2);
-      expect(pane).toContain("Reading fixture.txt");
+      // Each group's only call is its header, and the failed read is marked.
+      expect(pane).toContain("● Reading fixture.txt");
       expect(pane).toContain("Between groups.");
-      expect(pane).toContain("Reading missing.txt");
-      expect(pane).toContain("failed");
+      expect(pane).toContain("● Failed: Reading missing.txt: Path not found: missing.txt");
       expect(pane).toContain("Ask presentation");
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
@@ -979,7 +978,7 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Run the notice filtering fixture.");
       expect(scrollback).toContain("Notice filtering complete.");
-      expect(scrollback).toContain("1 tool call · 1 command");
+      expect(scrollback).toContain("● Running printf notice-test > ask-notice.txt");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);

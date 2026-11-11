@@ -603,6 +603,774 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
     return out.toOwnedSlice();
 }
 
+// Story presentation. A group header names the main event of the group and
+// how it ended. Calls that repeat one task share a row that shows their latest
+// state. A failed call gets one reason line, and the turn summary leads with a
+// recap of what the turn changed and ran.
+
+/// Keeps printable text on one line: drops escape sequences and control
+/// bytes, folds whitespace runs to one space, caps the length, and writes
+/// what remains terminal-safe, so a C1 control or an invalid UTF-8 byte shows
+/// as its visible escape.
+fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    var index: usize = 0;
+    var pending_space = false;
+    while (index < text.len and out.written().len < max_bytes) {
+        const byte = text[index];
+        if (byte == 0x1b) {
+            index += 1;
+            if (index < text.len and text[index] == '[') {
+                index += 1;
+                while (index < text.len and (text[index] < 0x40 or text[index] > 0x7e)) : (index += 1) {}
+            }
+            index += 1;
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f or byte == ' ') {
+            pending_space = out.written().len > 0;
+            index += 1;
+            continue;
+        }
+        if (pending_space) try out.writer.writeByte(' ');
+        pending_space = false;
+        try out.writer.writeByte(byte);
+        index += 1;
+    }
+    const written = out.written();
+    // Never end inside a UTF-8 sequence.
+    var end = written.len;
+    while (end > 0 and (written[end - 1] & 0xC0) == 0x80) end -= 1;
+    if (end > 0 and written[end - 1] >= 0xC0) {
+        const lead = written[end - 1];
+        const need: usize = if (lead >= 0xF0) 4 else if (lead >= 0xE0) 3 else 2;
+        if (written.len - (end - 1) < need) return scratch.print("{f}", .{text_utils.terminalSafe(written[0 .. end - 1])});
+    }
+    return scratch.print("{f}", .{text_utils.terminalSafe(written)});
+}
+
+fn storyArgs(scratch: std.mem.Allocator, record: *const ToolDetailRecord) ?std.json.ObjectMap {
+    const json = record.arguments_json orelse return null;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{}) catch return null;
+    return if (value == .object) value.object else null;
+}
+
+fn storyArgString(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?[]const u8 {
+    const args = storyArgs(scratch, record) orelse return null;
+    const value = args.get(key) orelse return null;
+    return if (value == .string and value.string.len > 0) value.string else null;
+}
+
+const DiffTotals = struct { added: usize = 0, removed: usize = 0 };
+
+fn diffTotalsOfPhrase(phrase: []const u8) DiffTotals {
+    var totals: DiffTotals = .{};
+    const last = trailingStatToken(phrase) orelse return totals;
+    const last_value = std.fmt.parseInt(usize, phrase[last.start + 1 ..], 10) catch 0;
+    if (last.added) totals.added = last_value else totals.removed = last_value;
+    if (pairedAddedStat(phrase, last)) |first| {
+        const before_slash = std.mem.trimEnd(u8, phrase[0 .. last.start - 2], " ");
+        totals.added = std.fmt.parseInt(usize, before_slash[first.start + 1 ..], 10) catch 0;
+    }
+    return totals;
+}
+
+fn storyCommandFailed(record: *const ToolDetailRecord) bool {
+    if (record.outcome) |outcome| if (outcome == .failed) return true;
+    return commandProcessFailed(record);
+}
+
+const StoryTally = struct {
+    changed_paths: std.ArrayList([]const u8) = .empty,
+    change_calls: usize = 0,
+    write_calls: usize = 0,
+    /// Edits and writes that have not finished.
+    changes_running: usize = 0,
+    diff: DiffTotals = .{},
+    read_paths: std.ArrayList([]const u8) = .empty,
+    /// read_file calls whose saved arguments name no path, as in old records.
+    unnamed_reads: usize = 0,
+    searches: usize = 0,
+    web_searches: usize = 0,
+    web_reads: usize = 0,
+    commands: usize = 0,
+    /// Sessions that later calls sent input to or stopped. Those calls are
+    /// not new commands, so they count here instead.
+    followed_sessions: std.ArrayList([]const u8) = .empty,
+    unnamed_session_calls: usize = 0,
+    commands_failed: usize = 0,
+    /// Whether the latest command failed, so the result mark and the recap
+    /// report where the work ended rather than every retry on the way.
+    last_command_failed: ?bool = null,
+    /// Commands that have not finished, which hold back the ✓.
+    commands_running: usize = 0,
+    /// Calls other than commands that failed, such as an edit that did not
+    /// apply.
+    other_failures: usize = 0,
+    /// Calls held until fx reads the project instructions they reach.
+    deferred: usize = 0,
+    /// Rows whose latest command failed, other than the group's last
+    /// command, whose result the mark already shows. A command that passed on
+    /// a retry shares one row with its failures and does not count.
+    earlier_command_failures: usize = 0,
+    subagent_calls: usize = 0,
+    subagent_names: std.ArrayList([]const u8) = .empty,
+    /// Reports and messages from subagents, which show as subagent calls
+    /// with empty arguments (src/core/subagent/reports.zig, Row.call).
+    subagent_updates: usize = 0,
+    subagent_waits: usize = 0,
+    mcp_calls: usize = 0,
+    opens: usize = 0,
+
+    fn addDistinct(list: *std.ArrayList([]const u8), scratch: std.mem.Allocator, value: []const u8) !void {
+        for (list.items) |existing| if (std.mem.eql(u8, existing, value)) return;
+        try list.append(scratch, value);
+    }
+
+    fn observe(
+        self: *StoryTally,
+        scratch: std.mem.Allocator,
+        entry: TranscriptEntry,
+        detail: ?*const ToolDetailRecord,
+    ) !void {
+        const record = detail orelse return;
+        if (record.fallback_disposition != null) return;
+        // A denied, cancelled, or deferred call did not run, so the story
+        // does not count it as work.
+        if (record.outcome) |outcome| switch (outcome) {
+            .denied, .cancelled => return,
+            .deferred => {
+                self.deferred += 1;
+                return;
+            },
+            else => {},
+        };
+        const name = record.tool_name;
+        const kind = record.activity_kind orelse return;
+        // Another call that failed did not do its work, so the header counts
+        // it only as a failure.
+        if (kind != .command) if (record.outcome) |outcome| if (outcome == .failed) {
+            self.other_failures += 1;
+            return;
+        };
+        switch (kind) {
+            .edit, .write => {
+                self.change_calls += 1;
+                if (record.outcome == null) self.changes_running += 1;
+                if (kind == .write) self.write_calls += 1;
+                if (storyArgString(scratch, record, "path")) |path| try addDistinct(&self.changed_paths, scratch, path);
+                const phrase = switch (entry) {
+                    .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
+                    else => null,
+                } orelse "";
+                const totals = diffTotalsOfPhrase(phrase);
+                self.diff.added += totals.added;
+                self.diff.removed += totals.removed;
+            },
+            .command => {
+                const follow_up = isSessionFollowUp(scratch, record);
+                if (!follow_up) {
+                    self.commands += 1;
+                } else if (storyArgString(scratch, record, "session_id")) |id| {
+                    try addDistinct(&self.followed_sessions, scratch, id);
+                } else {
+                    self.unnamed_session_calls += 1;
+                }
+                if (record.outcome == null and record.command_process_presentation == null) {
+                    if (!follow_up) self.commands_running += 1;
+                    return;
+                }
+                const failed = storyCommandFailed(record);
+                if (failed) self.commands_failed += 1;
+                self.last_command_failed = failed;
+            },
+            .read, .list => {
+                if (std.mem.eql(u8, name, "read_file")) {
+                    if (storyArgString(scratch, record, "path")) |path| try addDistinct(&self.read_paths, scratch, path) else self.unnamed_reads += 1;
+                } else if (std.mem.eql(u8, name, "web_search") or isProviderSearchName(name)) {
+                    self.web_searches += 1;
+                } else if (std.mem.eql(u8, name, "web_fetch")) {
+                    self.web_reads += 1;
+                } else {
+                    self.searches += 1;
+                }
+            },
+            .subagent => {
+                self.subagent_calls += 1;
+                // Old records keep no arguments, so they say nothing more.
+                if (storyArgs(scratch, record) == null) return;
+                if (storyArgString(scratch, record, "agent")) |agent| {
+                    try addDistinct(&self.subagent_names, scratch, agent);
+                } else if (storyArgString(scratch, record, "action")) |action| {
+                    if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) self.subagent_waits += 1;
+                } else {
+                    self.subagent_updates += 1;
+                }
+            },
+            .mcp => self.mcp_calls += 1,
+            .open => self.opens += 1,
+            .ask => {},
+        }
+    }
+
+    fn sessionsFollowed(self: StoryTally) usize {
+        return self.followed_sessions.items.len + self.unnamed_session_calls;
+    }
+
+    fn reads(self: StoryTally) usize {
+        return self.read_paths.items.len + self.unnamed_reads;
+    }
+
+    fn changedFiles(self: StoryTally) usize {
+        return if (self.changed_paths.items.len > 0) self.changed_paths.items.len else self.change_calls;
+    }
+};
+
+/// A shell call that sends input to a running session or stops it, rather
+/// than running a command.
+fn isSessionFollowUp(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    const action = storyArgString(scratch, record, "action") orelse return false;
+    return std.mem.eql(u8, action, "interact") or std.mem.eql(u8, action, "stop");
+}
+
+fn isProviderSearchName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
+}
+
+fn pluralWord(count: usize, singular: []const u8, plural_form: []const u8) []const u8 {
+    return if (count == 1) singular else plural_form;
+}
+
+/// Writes " +N -M" with the same accents the rows' diff counts use, then
+/// returns to the header's own style.
+fn writeDiffTotals(writer: *std.Io.Writer, diff: DiffTotals, style: SummaryStyle) !void {
+    if (diff.added > 0) try writeDiffCount(writer, '+', diff.added, ui_render.diff_added_marker_style, style);
+    if (diff.removed > 0) try writeDiffCount(writer, '-', diff.removed, ui_render.diff_removed_marker_style, style);
+}
+
+fn writeDiffCount(writer: *std.Io.Writer, sign: u8, count: usize, accent: []const u8, style: SummaryStyle) !void {
+    if (accent.len == 0) return writer.print(" {c}{d}", .{ sign, count });
+    try writer.print(" {s}{c}{d}\x1b[0m{s}", .{ accent, sign, count, style.text_style });
+}
+
+/// Where the group's commands ended: ✗ when the latest finished command
+/// failed, and ✓ when it passed and every command finished, so a command that
+/// passed on a retry still ends its group with ✓. Other calls that failed show
+/// as " · N failed" instead, so the mark never blames a command for them.
+fn writeResultMark(writer: *std.Io.Writer, tally: StoryTally) !void {
+    const latest_failed = tally.last_command_failed orelse return;
+    if (latest_failed) {
+        try writer.writeAll(" ✗");
+    } else if (tally.commands_running == 0) {
+        try writer.writeAll(" ✓");
+    }
+}
+
+/// A story header, and where its subject ends: the diff counts, the result
+/// mark, and the call states after it stay when the header is clipped.
+const StoryHeader = struct {
+    text: []u8,
+    tail_start: usize,
+};
+
+/// "● Ran 3 shell commands ✗": the main event of the group and its result. The main
+/// event is the strongest change the group made: edits, then subagents, then
+/// commands, then the web, then reads and searches. Returns null when the
+/// group has nothing the story can name, so the caller keeps the count
+/// summary. Caller owns the returned text.
+fn formatStoryHeader(
+    alloc: std.mem.Allocator,
+    tally: StoryTally,
+    summary: Summary,
+    style: SummaryStyle,
+) !?StoryHeader {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("● ");
+    var tail_start: ?usize = null;
+
+    const changed = tally.changedFiles();
+    const reads = tally.reads();
+    if (changed > 0) {
+        const writes_only = tally.write_calls == tally.change_calls;
+        const verb = if (tally.changes_running > 0)
+            (if (writes_only) "Writing" else "Editing")
+        else if (writes_only) "Wrote" else "Edited";
+        if (tally.changed_paths.items.len == 1)
+            try w.print("{s} {f}", .{ verb, text_utils.terminalSafe(tally.changed_paths.items[0]) })
+        else
+            try w.print("{s} {d} {s}", .{ verb, changed, pluralWord(changed, "file", "files") });
+        tail_start = out.written().len;
+        try writeDiffTotals(w, tally.diff, style);
+    } else if (tally.subagent_calls > 0) {
+        const agents = tally.subagent_names.items.len;
+        if (agents > 0)
+            try w.print("Started {d} {s}", .{ agents, pluralWord(agents, "subagent", "subagents") })
+        else if (tally.subagent_updates > 0)
+            try w.print("Got {d} subagent {s}", .{ tally.subagent_updates, pluralWord(tally.subagent_updates, "update", "updates") })
+        else if (tally.subagent_waits == tally.subagent_calls)
+            try w.writeAll("Waited for subagents")
+        else
+            try w.print("Made {d} subagent {s}", .{ tally.subagent_calls, pluralWord(tally.subagent_calls, "call", "calls") });
+    } else if (tally.commands > 0) {
+        const verb = if (tally.commands_running == tally.commands) "Running" else "Ran";
+        try w.print("{s} {d} shell {s}", .{ verb, tally.commands, pluralWord(tally.commands, "command", "commands") });
+    } else if (tally.sessionsFollowed() > 0) {
+        const sessions = tally.sessionsFollowed();
+        try w.print("Checked {d} shell {s}", .{ sessions, pluralWord(sessions, "session", "sessions") });
+    } else if (tally.mcp_calls > 0) {
+        try w.print("Made {d} {s}", .{ tally.mcp_calls, pluralWord(tally.mcp_calls, "MCP call", "MCP calls") });
+    } else if (tally.web_reads > 0) {
+        try w.print("Read {d} web {s}", .{ tally.web_reads, pluralWord(tally.web_reads, "page", "pages") });
+    } else if (tally.web_searches > 0) {
+        try w.writeAll("Searched the web");
+    } else if (reads > 0) {
+        try w.print("Read {d} {s}", .{ reads, pluralWord(reads, "file", "files") });
+    } else if (tally.searches > 0) {
+        try w.print("Searched for {d} {s}", .{ tally.searches, pluralWord(tally.searches, "pattern", "patterns") });
+    } else if (tally.opens > 0) {
+        try w.print("Opened {d} {s}", .{ tally.opens, pluralWord(tally.opens, "file", "files") });
+    } else if (tally.other_failures > 0) {
+        try w.print("{d} {s} failed", .{ tally.other_failures, pluralWord(tally.other_failures, "call", "calls") });
+    } else if (tally.deferred > 0) {
+        try w.writeAll(std.mem.trimEnd(u8, types.context_deferred_tool_status_label, ":"));
+    } else {
+        out.deinit();
+        return null;
+    }
+    if (tail_start == null) tail_start = out.written().len;
+    try writeResultMark(w, tally);
+    if (!std.mem.endsWith(u8, out.written()[0..tail_start.?], " failed"))
+        try appendSegment(w, tally.other_failures + tally.earlier_command_failures, "failed");
+    try appendSegment(w, summary.completion_unreported, "unreported");
+    try appendSegment(w, summary.not_executed, "not executed");
+    try appendSegment(w, summary.timed_out, "timed out");
+    try appendSegment(w, summary.denied, "denied");
+    try appendSegment(w, summary.cancelled, "cancelled");
+    return .{ .text = try out.toOwnedSlice(), .tail_start = tail_start.? };
+}
+
+/// Clips a story header to `cols` from the end of its subject, so its diff
+/// counts, result mark, and call states stay. When they would take more than
+/// half the row, the header clips from the right like any other summary.
+fn clipStoryHeader(alloc: std.mem.Allocator, header: StoryHeader, cols: u16) ![]u8 {
+    return clipKeepingTail(alloc, header.text[0..header.tail_start], header.text[header.tail_start..], cols, "");
+}
+
+/// Clips `body` so `tail` still fits after it in `cols`, the way a row keeps
+/// its diff counts: a merge note such as " ×3 · passed on the 3rd run" or a
+/// result mark stays when a long command clips. When the tail would take more
+/// than half the row, the whole line clips from the right like any other.
+/// A clip inside a highlight ends in a reset, so `restyle`, the row's own
+/// style, comes back before the tail. Caller owns the returned slice.
+fn clipKeepingTail(alloc: std.mem.Allocator, body: []const u8, tail: []const u8, cols: u16, restyle: []const u8) ![]u8 {
+    const whole = try std.mem.concat(alloc, u8, &.{ body, tail });
+    if (display_width.visibleWidthIgnoringAnsi(whole) <= cols) return whole;
+    defer alloc.free(whole);
+    const tail_width = display_width.visibleWidthIgnoringAnsi(tail);
+    if (tail_width * 2 > cols) return try clipSummary(alloc, whole, cols);
+    const clipped = try clipSummary(alloc, body, cols - @as(u16, @intCast(tail_width)));
+    defer alloc.free(clipped);
+    const reset = std.mem.endsWith(u8, clipped, "\x1b[0m") and !std.mem.endsWith(u8, body, "\x1b[0m");
+    return try std.mem.concat(alloc, u8, &.{ clipped, if (reset) restyle else "", tail });
+}
+
+/// How a call joins the row of an earlier call that does the same task.
+const StoryRowKind = enum {
+    /// Its own row.
+    single,
+    /// The same command again, one call after the other.
+    command,
+    /// The same shell session: its run, input, and stop.
+    session,
+    /// The same file, read in parts one after the other.
+    read,
+    /// The same subagent: its messages, status, and close.
+    subagent,
+    /// A subagent wait or status that names no agent.
+    subagent_wait,
+};
+
+const StoryIdentity = struct {
+    kind: StoryRowKind = .single,
+    key: []const u8 = "",
+};
+
+const StoryRow = struct {
+    entry: TranscriptEntry,
+    entry_id: u32,
+    detail: ?*const ToolDetailRecord,
+    identity: StoryIdentity,
+    count: usize = 1,
+    /// How many of the calls that share the row failed.
+    failures: usize = 0,
+};
+
+fn storyRowCallFailed(detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    return record.activity_kind == .command and storyCallFailed(detail);
+}
+
+fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !StoryIdentity {
+    const record = detail orelse return .{};
+    // A deferred call waits for project instructions and has not run, so it
+    // keeps its own row instead of counting as a run of the same command.
+    if (record.outcome == .deferred) return .{};
+    const kind = record.activity_kind orelse return .{};
+    switch (kind) {
+        .command => {
+            if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
+            if (record.result) |result| {
+                if (std.json.parseFromSliceLeaky(std.json.Value, scratch, result, .{})) |parsed| {
+                    if (parsed == .object) if (parsed.object.get("session_id")) |id| if (id == .string and id.string.len > 0)
+                        return .{ .kind = .session, .key = id.string };
+                } else |_| {}
+            }
+            const command = storyArgString(scratch, record, "command") orelse record.command_display orelse "";
+            if (command.len > 0) return .{ .kind = .command, .key = command };
+            return .{};
+        },
+        .read => {
+            if (!std.mem.eql(u8, record.tool_name, "read_file")) return .{};
+            const path = storyArgString(scratch, record, "path") orelse return .{};
+            return .{ .kind = .read, .key = path };
+        },
+        .subagent => {
+            if (storyArgString(scratch, record, "agent")) |agent| return .{ .kind = .subagent, .key = agent };
+            // A report row carries no call; only a bare wait or status
+            // joins other subagent rows.
+            const action = storyArgString(scratch, record, "action") orelse return .{};
+            if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) return .{ .kind = .subagent_wait };
+            return .{};
+        },
+        else => return .{},
+    }
+}
+
+/// The rows of a group after calls for the same task share one row. Rows
+/// keep the position of their first call and show their latest call.
+fn collectStoryRows(
+    scratch: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    status_indices: []const usize,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    focused_entry_id: ?u32,
+) !std.ArrayList(StoryRow) {
+    var rows: std.ArrayList(StoryRow) = .empty;
+    for (status_indices) |status_index| {
+        const entry = entries[status_index];
+        const entry_id = toolStatusEntryId(entry) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
+        const identity = try storyIdentity(scratch, detail);
+
+        const target: ?*StoryRow = switch (identity.kind) {
+            .single => null,
+            .session, .subagent => blk: {
+                for (rows.items) |*row| {
+                    if (row.identity.kind == identity.kind and std.mem.eql(u8, row.identity.key, identity.key)) break :blk row;
+                }
+                break :blk null;
+            },
+            .subagent_wait => blk: {
+                // An agent's own row already shows its state, so a bare
+                // wait adds nothing once an agent row exists.
+                var wait_row: ?*StoryRow = null;
+                for (rows.items) |*row| {
+                    if (row.identity.kind == .subagent) break :blk row;
+                    if (row.identity.kind == .subagent_wait) wait_row = row;
+                }
+                break :blk wait_row;
+            },
+            .command, .read => blk: {
+                if (rows.items.len == 0) break :blk null;
+                const last = &rows.items[rows.items.len - 1];
+                if (last.identity.kind == identity.kind and std.mem.eql(u8, last.identity.key, identity.key)) break :blk last;
+                break :blk null;
+            },
+        };
+        if (target) |row| {
+            if (identity.kind == .subagent_wait and row.identity.kind == .subagent) continue;
+            row.count += 1;
+            if (storyRowCallFailed(detail)) row.failures += 1;
+            row.entry = entry;
+            row.entry_id = entry_id;
+            row.detail = detail;
+            continue;
+        }
+        try rows.append(scratch, .{
+            .entry = entry,
+            .entry_id = entry_id,
+            .detail = detail,
+            .identity = identity,
+            .failures = if (storyRowCallFailed(detail)) 1 else 0,
+        });
+    }
+    return rows;
+}
+
+const StoryRowText = struct {
+    /// The phrase and the merge note together.
+    display: []const u8,
+    /// The phrase alone, which clips first when the row is too wide.
+    body: []const u8,
+    /// How many calls share the row, such as " ×3" or " · 2 calls".
+    suffix: []const u8,
+    split_failure: ?SplitFailure,
+};
+
+/// One row's phrase: the recorded status of its latest call, then how many
+/// calls share the row. A command that passed after failing says so, so the
+/// earlier failures stay in the story.
+fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) !StoryRowText {
+    const merged_read = row.identity.kind == .read and row.count > 1;
+    const status_phrase = if (merged_read)
+        try scratch.print("Read {f}", .{text_utils.terminalSafe(row.identity.key)})
+    else
+        switch (row.entry) {
+            .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
+            else => null,
+        } orelse if (row.detail) |record| record.tool_name else "tool activity";
+    const split_failure = splitFailedPhrase(status_phrase, row.detail);
+    const raw_phrase = if (split_failure) |split| split.row else status_phrase;
+    const phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
+    const display = try highlightCommandPhrase(scratch, phrase, row.detail, style.text_style) orelse phrase;
+    const passed_after_failing = row.failures > 0 and row.detail != null and
+        row.detail.?.outcome != null and !storyCallFailed(row.detail);
+    const suffix: []const u8 = if (row.count < 2) "" else switch (row.identity.kind) {
+        .command => if (passed_after_failing)
+            try scratch.print(" ×{d} · passed on the {d}{s} run", .{ row.count, row.count, ordinalSuffix(row.count) })
+        else
+            try scratch.print(" ×{d}", .{row.count}),
+        .session => try scratch.print(" · {d} calls", .{row.count}),
+        .read => try scratch.print(" · {d} parts", .{row.count}),
+        .single, .subagent, .subagent_wait => "",
+    };
+    return .{
+        .display = if (suffix.len == 0) display else try scratch.print("{s}{s}", .{ display, suffix }),
+        .body = display,
+        .suffix = suffix,
+        .split_failure = split_failure,
+    };
+}
+
+/// A phrase that still says the call is running, such as the status line
+/// `fx ask` prints when a command starts and never rewrites.
+fn phraseShowsProgress(phrase: []const u8) bool {
+    return std.mem.startsWith(u8, phrase, "Running ");
+}
+
+/// Whether a row's own status already says it failed, as an old record with
+/// no exit code can ("Exited 1 make"), so it never gets a ✓.
+fn phraseNamesFailure(phrase: []const u8) bool {
+    const labels = [_][]const u8{ "Exited ", "Failed", "Timed out", "Killed", "Denied", "Cancelled" };
+    for (labels) |label| if (std.mem.startsWith(u8, phrase, label)) return true;
+    return false;
+}
+
+fn ordinalSuffix(number: usize) []const u8 {
+    if (number % 100 >= 11 and number % 100 <= 13) return "th";
+    return switch (number % 10) {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        else => "th",
+    };
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// The line of command output that says what went wrong: the first line that
+/// mentions an error or a failure, else the last line.
+/// Command output kept in its escaped form, where text_utils.encodeTerminalSafe
+/// writes every control byte, line feeds included, as "\xNN", gets its escaped
+/// line feeds back as line breaks, so the reason line can pick one line of it.
+/// Text with real line breaks is returned as is.
+fn storyOutputLines(scratch: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.findScalar(u8, text, '\n') != null) return text;
+    if (std.mem.find(u8, text, "\\x0a") == null) return text;
+    return std.mem.replaceOwned(u8, scratch, text, "\\x0a", "\n");
+}
+
+fn verdictLine(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (containsIgnoreCase(trimmed, "error") or containsIgnoreCase(trimmed, "fail")) return trimmed;
+    }
+    return lastNonEmptyLine(text);
+}
+
+fn lastNonEmptyLine(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
+fn firstNonEmptyLine(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
+fn storyCallFailed(detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    if (record.fallback_disposition != null) return false;
+    const failed = if (record.outcome) |outcome| outcome == .failed else false;
+    return failed or commandProcessFailed(record);
+}
+
+/// A failed non-command row reads "Failed <target>: <error>". Splits it so the
+/// row keeps "Failed <target>" and the error moves to the reason line.
+const SplitFailure = struct { row: []const u8, reason: []const u8 };
+
+fn splitFailedPhrase(phrase: []const u8, detail: ?*const ToolDetailRecord) ?SplitFailure {
+    const record = detail orelse return null;
+    if (record.activity_kind == .command or !storyCallFailed(detail)) return null;
+    const colon = std.mem.find(u8, phrase, ": ") orelse return null;
+    // "Failed: <action>: <error>", as `fx ask` writes it, names no target
+    // before its first colon, so the row keeps the whole phrase.
+    if (std.mem.eql(u8, std.mem.trim(u8, phrase[0..colon], " "), "Failed")) return null;
+    const reason = std.mem.trim(u8, phrase[colon + 2 ..], " ");
+    if (reason.len == 0) return null;
+    return .{ .row = phrase[0..colon], .reason = reason };
+}
+
+/// One plain line that says why a call failed, such as
+/// "exit 1 · 1 failed: backoff adds 500ms". Null for calls that did not fail
+/// and for failures whose output has no line to show.
+fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !?[]const u8 {
+    const record = detail orelse return null;
+    if (!storyCallFailed(detail)) return null;
+
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    const w = &out.writer;
+    if (record.command_process_presentation) |presentation| switch (presentation) {
+        .exit_code => |code| try w.print("exit {d}", .{code}),
+        .signal => |signal| try w.print("signal {d}", .{signal}),
+        .timed_out => try w.writeAll("timed out"),
+        .output_capture_failed => try w.writeAll("output not captured"),
+    };
+    const is_command = record.activity_kind == .command;
+    const line: ?[]const u8 = if (record.result) |result| blk: {
+        // Command details keep the plain output, where the line that names
+        // the error says the most; other tools lead with their error.
+        const plain_line = if (is_command) verdictLine(try storyOutputLines(scratch, result)) else firstNonEmptyLine(result);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch, result, .{}) catch break :blk plain_line;
+        if (parsed != .object) break :blk plain_line;
+        if (parsed.object.get("output_delta")) |value| if (value == .string) break :blk verdictLine(value.string);
+        if (parsed.object.get("error")) |value| if (value == .string) break :blk firstNonEmptyLine(value.string);
+        if (parsed.object.get("message")) |value| if (value == .string) break :blk firstNonEmptyLine(value.string);
+        break :blk null;
+    } else null;
+    // Without a line of output the reason would only repeat the row's own
+    // status, such as "Exited 2" or "Timed out", so there is no reason line.
+    const text = line orelse return null;
+    const safe = try storySafeLine(scratch, text, 160);
+    if (safe.len == 0) return null;
+    if (out.written().len > 0) try w.writeAll(" · ");
+    try w.writeAll(safe);
+    return out.written();
+}
+
+/// The recap a turn summary leads with: "1 file changed +2 -1 · ran 4
+/// commands ✓ · ", where the mark is the outcome of the last command. Empty
+/// when the turn changed and ran nothing.
+fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    const w = &out.writer;
+    const changed = tally.changedFiles();
+    if (changed > 0) {
+        try w.print("{d} {s} changed", .{ changed, pluralWord(changed, "file", "files") });
+        if (tally.diff.added > 0) try w.print(" +{d}", .{tally.diff.added});
+        if (tally.diff.removed > 0) try w.print(" -{d}", .{tally.diff.removed});
+        try w.writeAll(" · ");
+    }
+    if (tally.last_command_failed) |last_failed| {
+        try w.print("ran {d} {s} {s} · ", .{
+            tally.commands,
+            pluralWord(tally.commands, "command", "commands"),
+            if (last_failed) "✗" else "✓",
+        });
+    }
+    // A turn that handed its work to subagents did more than explore.
+    if (changed == 0 and tally.commands == 0 and tally.subagent_calls == 0 and tally.read_paths.items.len > 0) {
+        const reads = tally.read_paths.items.len;
+        try w.print("explored {d} {s} · ", .{ reads, pluralWord(reads, "file", "files") });
+    }
+    const recap = out.written();
+    if (recap.len > 0) recap[0] = std.ascii.toUpper(recap[0]);
+    return recap;
+}
+
+/// Inserts the turn recap before the first visible character of a turn
+/// summary row, after its indent and any leading style. Null when the turn
+/// has nothing to recap or the longer row would not fit `cols`, since the
+/// painter shows a turn summary as it is and never wraps it. Caller owns it.
+fn recapTurnSummary(
+    alloc: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    summary_index: usize,
+    cols: u16,
+) !?[]u8 {
+    const summary_bytes = switch (entries[summary_index]) {
+        .raw_bytes => |raw| raw.bytes,
+        else => return null,
+    };
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+
+    var turn_start = summary_index;
+    while (turn_start > 0) {
+        const entry = entries[turn_start - 1];
+        const boundary = switch (entry) {
+            .user_turn => true,
+            .raw_bytes => |raw| raw.class == .turn_summary or raw.class == .turn_cancellation,
+            else => false,
+        };
+        if (boundary) break;
+        turn_start -= 1;
+    }
+    var tally: StoryTally = .{};
+    for (entries[turn_start..summary_index]) |entry| {
+        const entry_id = toolStatusEntryId(entry) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        if (statusNamesAsk(entry, detail)) continue;
+        try tally.observe(scratch, entry, detail);
+    }
+    const recap = try formatTurnRecap(scratch, tally);
+    if (recap.len == 0) return null;
+
+    var insert_at: usize = 0;
+    while (insert_at < summary_bytes.len) {
+        if (skipSgrSequence(summary_bytes, &insert_at)) continue;
+        if (summary_bytes[insert_at] != ' ') break;
+        insert_at += 1;
+    }
+    const recapped = try scratch.print("{s}{s}{s}", .{ summary_bytes[0..insert_at], recap, summary_bytes[insert_at..] });
+    if (display_width.visibleWidthIgnoringAnsi(std.mem.trimEnd(u8, recapped, "\n")) > cols) return null;
+    return try alloc.dupe(u8, recapped);
+}
+
 const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
 
 fn formatGroupBlock(
@@ -618,66 +1386,97 @@ fn formatGroupBlock(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !GroupBlock {
-    const header = try formatGroupHeader(alloc, summary, cols, style);
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+
+    var tally: StoryTally = .{};
+    var focused_in_group = false;
+    for (status_indices) |status_index| {
+        const entry = entries[status_index];
+        const entry_id = toolStatusEntryId(entry) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        if (statusNamesAsk(entry, detail)) continue;
+        if (focused_entry_id == entry_id) focused_in_group = true;
+        try tally.observe(scratch, entry, detail);
+    }
+    const rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, focused_entry_id);
+    var last_command_row: ?usize = null;
+    for (rows.items, 0..) |row, index| {
+        if (row.detail) |record| if (record.activity_kind == .command) {
+            last_command_row = index;
+        };
+    }
+    for (rows.items, 0..) |row, index| {
+        if (index != last_command_row and storyRowCallFailed(row.detail)) tally.earlier_command_failures += 1;
+    }
+
+    // A group left with one row needs no summary above it: the row is the
+    // header, so nothing is said twice.
+    const single_row: ?StoryRow = if (!focused_in_group and rows.items.len == 1) rows.items[0] else null;
+    const single_text: ?StoryRowText = if (single_row) |row| try storyRowText(scratch, row, style) else null;
+
+    const header = if (single_row) |row| blk: {
+        const text = single_text.?;
+        const succeeded_command = if (row.detail) |record|
+            record.activity_kind == .command and record.outcome == .completed and
+                !storyCallFailed(row.detail) and !phraseNamesFailure(text.display) and
+                !phraseShowsProgress(text.display)
+        else
+            false;
+        // A failure the phrase does not name, such as a status line `fx ask`
+        // never rewrites, still shows on the header.
+        const unnamed_failure = storyCallFailed(row.detail) and !phraseNamesFailure(text.display);
+        const mark = if (succeeded_command) " ✓" else if (unnamed_failure) " ✗" else "";
+        const shows_diff_stats = entryShowsDiffStats(row.detail);
+        // The merge note and the mark stay when the phrase is clipped, like
+        // the diff counts.
+        const clipped = if (shows_diff_stats) clip: {
+            const line = try scratch.print("● {s}", .{text.display});
+            const mark_width: u16 = @intCast(display_width.visibleWidthIgnoringAnsi(mark));
+            const phrase_cols = if (cols > mark_width * 2) cols - mark_width else cols;
+            const clipped_phrase = try clipKeepingDiffStats(scratch, line, phrase_cols);
+            break :clip if (phrase_cols == cols) clipped_phrase else try scratch.print("{s}{s}", .{ clipped_phrase, mark });
+        } else try clipKeepingTail(
+            scratch,
+            try scratch.print("● {s}", .{text.body}),
+            try scratch.print("{s}{s}", .{ text.suffix, mark }),
+            cols,
+            style.text_style,
+        );
+        const accented = if (shows_diff_stats) try accentTrailingDiffStats(scratch, clipped, style.text_style) else clipped;
+        break :blk try applySummaryStyle(alloc, accented, style);
+    } else if (try formatStoryHeader(scratch, tally, summary, style)) |story| blk: {
+        const clipped = try clipStoryHeader(scratch, story, cols);
+        break :blk try applySummaryStyle(alloc, clipped, style);
+    } else try formatGroupHeader(alloc, summary, cols, style);
     defer alloc.free(header);
     var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
     errdefer lines.deinit(alloc);
-    try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
+    const header_entry_id = if (single_row) |row| row.entry_id else entries[status_indices[0]].id();
+    try lines.append(alloc, .{ .entry = .{ .entry_id = header_entry_id, .entry_class = .tool_status, .projection_part = .group_header } });
     if (collapse_tool_calls) {
         const bytes = try alloc.dupe(u8, header);
         errdefer alloc.free(bytes);
         return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
     }
 
-    var focused_in_group = false;
-    var static_count: usize = 0;
-    for (status_indices) |status_index| {
-        const entry = entries[status_index];
-        const entry_id = toolStatusEntryId(entry) orelse continue;
-        const detail = detailForEntry(details, detail_indices, entry_id, null);
-        if (statusNamesAsk(entry, detail)) continue;
-        if (focused_entry_id == entry_id) {
-            focused_in_group = true;
-        } else {
-            static_count += 1;
-        }
-    }
-
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer mem_utils.deinit_arena(scratch_state);
-    const scratch = scratch_state.allocator();
-
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.writeAll(header);
 
-    var static_index: usize = 0;
-    for (status_indices) |status_index| {
-        const entry = entries[status_index];
-        const entry_id = toolStatusEntryId(entry) orelse continue;
-        const detail = detailForEntry(details, detail_indices, entry_id, null);
-        if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
-
-        const raw_phrase = switch (entry) {
-            .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
-            else => null,
-        } orelse if (detail) |record| record.tool_name else "tool activity";
-        const phrase = try reprojectTruncatedCommandPhrase(
-            scratch,
-            raw_phrase,
-            detail,
-        ) orelse raw_phrase;
-        const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
-        static_index += 1;
-        const last_static_row = !focused_in_group and static_index == static_count;
+    if (single_row) |row| {
+        try writeRowDetails(alloc, scratch, &out.writer, &lines, row, single_text.?, "  ", cols, style);
+    } else for (rows.items, 0..) |row, row_index| {
+        const text = try storyRowText(scratch, row, style);
+        const last_static_row = !focused_in_group and row_index + 1 == rows.items.len;
         const connector = if (last_static_row) "└" else "├";
-        const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
-        const shows_diff_stats = entryShowsDiffStats(detail);
+        const shows_diff_stats = entryShowsDiffStats(row.detail);
         const clipped = if (shows_diff_stats)
-            try clipKeepingDiffStats(scratch, child, cols)
+            try clipKeepingDiffStats(scratch, try scratch.print("{s} {s}", .{ connector, text.display }), cols)
         else
-            try clipSummary(scratch, child, cols);
-        try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+            try clipKeepingTail(scratch, try scratch.print("{s} {s}", .{ connector, text.body }), text.suffix, cols, style.text_style);
+        try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
         const accented = if (shows_diff_stats)
             try accentTrailingDiffStats(scratch, clipped, style.text_style)
         else
@@ -686,18 +1485,7 @@ fn formatGroupBlock(
         if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
         try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
-        if (subagentStatusContinuation(entry, detail)) |continuation| {
-            const continuation_row = try scratch.print(
-                "{s}{s}",
-                .{ if (last_static_row) "  " else "│ ", continuation },
-            );
-            const clipped_continuation = try clipSummary(scratch, continuation_row, cols);
-            try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
-            try out.writer.writeByte('\n');
-            if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
-            try out.writer.writeAll(clipped_continuation);
-            if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
-        }
+        try writeRowDetails(alloc, scratch, &out.writer, &lines, row, text, if (last_static_row) "  " else "│ ", cols, style);
     }
 
     for (status_indices) |status_index| {
@@ -719,6 +1507,43 @@ fn formatGroupBlock(
     const bytes = try out.toOwnedSlice();
     errdefer alloc.free(bytes);
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+}
+
+/// The lines under a row: a subagent's model line and the reason its latest
+/// call failed, each behind `indent`.
+fn writeRowDetails(
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    lines: *std.ArrayList(transcript_blocks.LineProvenance),
+    row: StoryRow,
+    text: StoryRowText,
+    indent: []const u8,
+    cols: u16,
+    style: SummaryStyle,
+) !void {
+    if (subagentStatusContinuation(row.entry, row.detail)) |continuation| {
+        const continuation_row = try scratch.print("{s}{s}", .{ indent, continuation });
+        const clipped_continuation = try clipSummary(scratch, continuation_row, cols);
+        try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+        try writer.writeByte('\n');
+        if (style.text_style.len > 0) try writer.writeAll(style.text_style);
+        try writer.writeAll(clipped_continuation);
+        if (style.text_style.len > 0) try writer.writeAll(style.reset_style);
+    }
+    const failure_reason = if (text.split_failure) |split|
+        try storySafeLine(scratch, split.reason, 160)
+    else
+        try storyFailureReason(scratch, row.detail);
+    if (failure_reason) |reason| {
+        const failure_row = try scratch.print("{s}✗ {s}", .{ indent, reason });
+        const clipped_failure = try clipSummary(scratch, failure_row, cols);
+        try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+        try writer.writeByte('\n');
+        try writer.writeAll(ui_render.red_style);
+        try writer.writeAll(clipped_failure);
+        try writer.writeAll(ui_render.reset_style);
+    }
 }
 
 /// The minimum tail length accepted as an identity match in
@@ -1413,6 +2238,18 @@ fn buildWithStyleAndStats(
         try projection.setOwnedGroup(alloc, first_index, bytes);
     }
 
+    for (entries, 0..) |entry, entry_index| {
+        try build_checkpoint.tick(checkpoint);
+        const raw = switch (entry) {
+            .raw_bytes => |value| value,
+            else => continue,
+        };
+        if (raw.class != .turn_summary or projection.entry_actions.items[entry_index] != .keep) continue;
+        if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        const recapped = try recapTurnSummary(alloc, entries, details, &detail_indices, entry_index, cols) orelse continue;
+        try projection.setOwnedOverride(alloc, entry_index, .turn_summary, recapped);
+    }
+
     return projection;
 }
 
@@ -1430,8 +2267,7 @@ test "collapsed tool groups render only the summary header" {
     var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
     defer projection.deinit(alloc);
     const block = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.find(u8, block, "2 tool calls") != null);
-    try std.testing.expect(std.mem.find(u8, block, "Read file") == null);
+    try std.testing.expectEqualStrings("● Read 1 file", block);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
 }
 
@@ -1464,7 +2300,7 @@ test "tool relationship grouping retries cleanly after cancellation" {
     try std.testing.expect(retry.entry_actions.items[entries.len - 1] == .keep);
 }
 
-test "minimal tool group summary uses semantic category order and outcomes" {
+test "group header names the main event and marks a failed call" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Read runtime.zig\n", .class = .tool_status } },
@@ -1482,7 +2318,7 @@ test "minimal tool group summary uses semantic category order and outcomes" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 1 read · 1 edit · 1 command · 1 failed\n" ++
+        "● Ran 1 shell command ✓ · 1 failed\n" ++
             "├ Read runtime.zig\n" ++
             "├ Edited main.zig\n" ++
             "└ Ran \x1b[38;5;252mzig\x1b[39m build",
@@ -1512,7 +2348,7 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 4 subagent calls\n" ++
+        "● Made 4 subagent calls\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
@@ -1555,7 +2391,7 @@ test "small minimal tool groups surface canonical action targets" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 2 read · 1 edit\n" ++
+        "● Editing 1 file\n" ++
             "├ Read runtime.zig\n" ++
             "├ Searched snapshot\n" ++
             "└ Editing store.zig",
@@ -1623,7 +2459,7 @@ test "collapsed tool group keeps diff count accents" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 1 read · 1 write · 1 edit\n" ++
+        "● Edited 2 files [G]+155\x1b[0m [R]-3\x1b[0m\n" ++
             "├ Read runtime.zig\n" ++
             "├ Wrote note.txt [G]+143\x1b[0m\n" ++
             "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
@@ -1659,7 +2495,7 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     // The phrase ends in the ellipsis and the counts follow it, so each row
     // fills the width exactly instead of losing its counts to the clip.
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 2 edit · 1 write\n" ++
+        "● Edited 3 files [G]+155\x1b[0m [R]-30\x1b[0m\n" ++
             "├ Wrote docs/release-notes/very-lo… [G]+143\x1b[0m\n" ++
             "├ Edited src/ui/transcript/tool_gro… [R]-27\x1b[0m\n" ++
             "└ Edited src/ui/transcript/too… [G]+12\x1b[0m / [R]-3\x1b[0m",
@@ -1670,6 +2506,85 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     while (rows.next()) |row| {
         try std.testing.expectEqual(@as(usize, cols), try widthWithoutTestMarkersForTest(alloc, row));
     }
+}
+
+test "a long edit path keeps the header's diff counts" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const path = "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture.ts";
+    const status = "● Edited " ++ path ++ " +1 / -1\n";
+    const arguments = "{\"path\":\"" ++ path ++ "\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = status, .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = status, .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed, .arguments_json = @constCast(arguments) },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed, .arguments_json = @constCast(arguments) },
+    };
+    const cols: u16 = 60;
+
+    var projection = try build(alloc, &entries, &details, cols);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    const header = bytes[0 .. std.mem.findScalar(u8, bytes, '\n') orelse bytes.len];
+
+    // The path ends in the ellipsis and the counts follow it. The header is
+    // clipped with the counts' styles in place, so the "[G]" and "[R]"
+    // stand-ins count as visible text here, where real styles have no width.
+    try std.testing.expect(std.mem.find(u8, header, "…") != null);
+    try std.testing.expect(std.mem.endsWith(u8, header, " [G]+2\x1b[0m [R]-2\x1b[0m"));
+    try std.testing.expectEqual(@as(usize, cols), display_width.visibleWidthIgnoringAnsi(header));
+}
+
+test "a failed call whose row does not say so gets a failure mark" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading missing.txt\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .failed },
+    };
+    var projection = try build(alloc, &entries, &details, 80);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings("● Reading missing.txt ✗", projection.entry_actions.items[0].override.bytes);
+}
+
+test "a failure that names no target keeps its whole phrase" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Failed: Reading missing.txt: Path not found: missing.txt\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .failed },
+    };
+    var projection = try build(alloc, &entries, &details, 100);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● Failed: Reading missing.txt: Path not found: missing.txt",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "a command whose row still says Running gets no mark" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running printf notice-test > ask-notice.txt\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .completed },
+    };
+    var projection = try build(alloc, &entries, &details, 80);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Running "));
+    try std.testing.expect(std.mem.find(u8, bytes, "✓") == null);
 }
 
 /// Visible width of a row once the "[G]" and "[R]" stand-ins for the diff
@@ -1694,14 +2609,15 @@ test "clipped diff counts fall back to a plain clip below half the row" {
     const both = "● Edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n";
     const wide = "● Edited\x1b[0m \x1b[38;5;245m文档文档文档文档文档文档.md\x1b[0m \x1b[38;2;229;72;77m-7\x1b[0m\n";
     const cases = [_]struct { bytes: []const u8, cols: u16, row: []const u8 }{
-        // " +12 / -3" takes 9 of 18 cells: the counts still fit in half the row.
-        .{ .bytes = both, .cols = 18, .row = "└ Edited… [G]+12\x1b[0m / [R]-3\x1b[0m" },
+        // A one-call group is its own header line. " +12 / -3" takes 9 of 18
+        // cells: the counts still fit in half the row.
+        .{ .bytes = both, .cols = 18, .row = "● Edited… [G]+12\x1b[0m / [R]-3\x1b[0m" },
         // One cell narrower, the counts would take more than half the row,
         // so the row clips from the right like any other row.
-        .{ .bytes = both, .cols = 17, .row = "└ Edited main.zi…" },
-        .{ .bytes = both, .cols = 12, .row = "└ Edited ma…" },
+        .{ .bytes = both, .cols = 17, .row = "● Edited main.zi…" },
+        .{ .bytes = both, .cols = 12, .row = "● Edited ma…" },
         // A two-cell glyph that would cross the cut is dropped whole.
-        .{ .bytes = wide, .cols = 20, .row = "└ Edited 文档文… [R]-7\x1b[0m" },
+        .{ .bytes = wide, .cols = 20, .row = "● Edited 文档文… [R]-7\x1b[0m" },
     };
     for (cases) |case| {
         const entries = [_]TranscriptEntry{
@@ -1712,9 +2628,8 @@ test "clipped diff counts fall back to a plain clip below half the row" {
         };
         var projection = try build(alloc, &entries, &details, case.cols);
         defer projection.deinit(alloc);
-        const bytes = projection.entry_actions.items[0].override.bytes;
-        const newline = std.mem.findScalar(u8, bytes, '\n').?;
-        const row = bytes[newline + 1 ..];
+        const row = projection.entry_actions.items[0].override.bytes;
+        try std.testing.expect(std.mem.findScalar(u8, row, '\n') == null);
         try std.testing.expectEqualStrings(case.row, row);
         try std.testing.expect(try widthWithoutTestMarkersForTest(alloc, row) <= case.cols);
     }
@@ -1745,7 +2660,7 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 1 write · 1 command\n" ++
+        "● Wrote 1 file [G]+2\x1b[0m ✓\n" ++
             "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
             "├ Wrote note.txt [G]+2\x1b[0m\n" ++
             "└ Wrote detached.txt +7",
@@ -1805,7 +2720,7 @@ test "minimal tool groups keep instruction refresh neutral and denials visible" 
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command · 1 denied\n" ++
+        "● Reading project instructions before continuing · 1 denied\n" ++
             "├ Denied by auto agent \x1b[38;5;252mzig\x1b[39m build\n" ++
             "└ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
@@ -1844,7 +2759,7 @@ test "focused tool remains counted but is omitted from stable child rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command\n├ Read runtime.zig",
+        "● Running 1 shell command\n├ Read runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -1867,7 +2782,7 @@ test "minimal command details expose running completed and failed process states
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 3 commands · 1 failed\n" ++
+        "● Ran 3 shell commands ✗\n" ++
             "├ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
             "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "└ Ran \x1b[38;5;252mzig\x1b[39m build test",
@@ -1904,7 +2819,8 @@ test "completed command rows shell-highlight quoted strings without coloring the
 
     // The header, connector, and action label stay uncolored; the command
     // verb and quoted string pick up the syntax palette and close again.
-    try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
+    try std.testing.expect(std.mem.startsWith(u8, row, "● Ran \x1b[38;5;252mprintf\x1b[39m "));
+    try std.testing.expect(std.mem.endsWith(u8, row, " ✓"));
     try std.testing.expect(std.mem.find(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
 
@@ -1940,14 +2856,15 @@ test "minimal completed command rows reproject stored arguments at the current w
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    // The row carries styling (the command verb token), so the clip closes it.
-    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m"));
+    // The row carries styling (the command verb token), so the clip closes
+    // it, and the pass mark stays after the clip.
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m ✓"));
     try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
 
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
+        "● Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8) ++ " ✓",
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1961,7 +2878,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     };
     var legacy = try build(alloc, &entries, &legacy_details, 240);
     defer legacy.deinit(alloc);
-    try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
+    try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "... ✓"));
 
     const relative_command = "cd ./packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
     const relative_arguments_json = try alloc.print(
@@ -1992,7 +2909,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
+        "● Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path  ✓",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -2017,7 +2934,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
+        "● Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8) ++ " ✓",
         compatibility.entry_actions.items[0].override.bytes,
     );
 }
@@ -2080,7 +2997,7 @@ test "completed session and tty command rows reproject stored commands at the cu
     var wide = try build(alloc, &entries, &details, 400);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
+        "● Ran 2 shell commands ✓\n" ++
             "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
             "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
         wide.entry_actions.items[0].override.bytes,
@@ -2327,7 +3244,7 @@ test "command reprojection rejects a record carrying a different command" {
     defer projection.deinit(alloc);
     // The frozen tail is no prefix of the stored command, so the row is left
     // untouched rather than rewritten with unrelated content.
-    try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "..."));
+    try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "... ✓"));
     try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "zig build") == null);
 }
 
@@ -2380,9 +3297,10 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         // row keeps its own label rather than the stored prediction.
         try std.testing.expect(std.mem.find(u8, row, "...") == null);
         try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
-        const expected_prefix = try alloc.print("\n└ {s} ", .{case.label});
+        // A one-call group is its own header line.
+        const expected_prefix = try alloc.print("● {s} ", .{case.label});
         defer alloc.free(expected_prefix);
-        try std.testing.expect(std.mem.find(u8, row, expected_prefix) != null);
+        try std.testing.expect(std.mem.startsWith(u8, row, expected_prefix));
     }
 }
 
@@ -2412,8 +3330,7 @@ test "minimal command timeout uses its typed cause in the row and group" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command · 1 timed out\n" ++
-            "└ Timed out \x1b[38;5;252msleep\x1b[39m 5",
+        "● Timed out \x1b[38;5;252msleep\x1b[39m 5",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2460,10 +3377,9 @@ test "tool-heavy groups render every canonical action" {
     defer projection.deinit(alloc);
     const summary = projection.entry_actions.items[0].override.bytes;
 
-    try std.testing.expect(std.mem.find(u8, summary, "20 tool calls") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "10 read") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "8 commands") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "1 failed") != null);
+    // The header names the main event, the edits, in the tense of the one
+    // still running, and the last command's failure.
+    try std.testing.expect(std.mem.startsWith(u8, summary, "● Editing 2 files ✗\n"));
     try std.testing.expect(std.mem.find(u8, summary, "Ran \x1b[38;5;252mrg\x1b[39m snapshot") != null);
     try std.testing.expect(std.mem.find(u8, summary, "Editing runtime.zig") != null);
     try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, summary, "\n"));
@@ -2478,11 +3394,12 @@ test "tool-heavy groups render every canonical action" {
     defer completed_projection.deinit(alloc);
     const completed_summary = completed_projection.entry_actions.items[0].override.bytes;
 
+    try std.testing.expect(std.mem.startsWith(u8, completed_summary, "● Edited 2 files ✗\n"));
     try std.testing.expect(std.mem.find(u8, completed_summary, "Edited runtime.zig") != null);
     try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, completed_summary, "\n"));
 }
 
-test "minimal tool group keeps cancellation in the header and child row" {
+test "a cancelled call is its group's header above the cancellation block" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
@@ -2495,14 +3412,13 @@ test "minimal tool group keeps cancellation in the header and child row" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command · 1 cancelled\n" ++
-            "└ Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
+        "● Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
             "▪ Cancelled sleep 30 · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
 }
 
-test "minimal tool group clips cancellation to one child row" {
+test "a cancelled call clips its header to one row" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
@@ -2526,7 +3442,7 @@ test "minimal tool group clips cancellation to one child row" {
         group_line_count += 1;
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 24);
     }
-    try std.testing.expectEqual(@as(usize, 2), group_line_count);
+    try std.testing.expectEqual(@as(usize, 1), group_line_count);
 
     var feedback_lines = std.mem.splitScalar(u8, bytes[gap + 2 ..], '\n');
     while (feedback_lines.next()) |line| {
@@ -2658,7 +3574,7 @@ test "one presentation group keeps sibling tools in creation order across assist
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
+        "● Running 2 shell commands\n" ++
             "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
             "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
@@ -2694,11 +3610,11 @@ test "different presentation groups remain separate within one turn" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ Read first",
+        "● Read first",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ Read second",
+        "● Read second",
         projection.entry_actions.items[1].override.bytes,
     );
 }
@@ -2731,12 +3647,12 @@ test "legacy lifecycle records without group identity respect transcript boundar
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ Read first",
+        "● Read first",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Running \x1b[38;5;252msecond\x1b[39m",
+        "● Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[2].override.bytes,
     );
 }
@@ -2772,7 +3688,7 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     };
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
+        "● Running 2 shell commands\n" ++
             "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
             "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
@@ -2811,7 +3727,7 @@ test "entries hidden by compact presentation do not split tool groups" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 edit\n" ++
+        "● Edited 1 file\n" ++
             "├ read_file\n" ++
             "└ edit_file",
         projection.entry_actions.items[0].override.bytes,
@@ -2859,8 +3775,7 @@ test "visible tool status after a display clear keeps its compact group" {
     try std.testing.expect(projection.entry_actions.items[0] == .keep);
     try std.testing.expect(projection.entry_actions.items[1] == .override);
     const block = projection.entry_actions.items[1].override.bytes;
-    try std.testing.expect(std.mem.find(u8, block, "1 tool call") != null);
-    try std.testing.expect(std.mem.find(u8, block, "run_command") == null);
+    try std.testing.expectEqualStrings("● read_file", block);
 }
 
 test "visible assistant messages split groups while silent entries do not" {
@@ -2901,7 +3816,7 @@ test "visible assistant messages split groups while silent entries do not" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 5 tool calls · 3 read · 2 list\n" ++
+        "● Read 3 files\n" ++
             "├ read_file\n├ read_file\n├ read_file\n├ glob_files\n└ glob_files",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -2912,7 +3827,7 @@ test "visible assistant messages split groups while silent entries do not" {
     try std.testing.expect(projection.entry_actions.items[6] == .override);
     try std.testing.expect(projection.entry_actions.items[7] == .keep);
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 3 read · 1 command\n" ++
+        "● Ran 1 shell command ✓\n" ++
             "├ read_file\n├ read_file\n├ read_file\n└ run_command",
         projection.entry_actions.items[8].override.bytes,
     );
@@ -2970,7 +3885,7 @@ test "ask activity remains outside tool groups" {
     try std.testing.expect(projection.entry_actions.items[0] == .keep);
     try std.testing.expect(projection.entry_actions.items[1] == .override);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ read_file",
+        "● read_file",
         projection.entry_actions.items[1].override.bytes,
     );
 }
@@ -2996,11 +3911,11 @@ test "ask activity remains outside tool groups without complete detail metadata"
     try std.testing.expect(projection.entry_actions.items[2] == .override);
     try std.testing.expect(projection.entry_actions.items[3] == .keep);
     try std.testing.expectEqualStrings(
-        "● 1 tool call\n└ Reading /tmp/ask_user_question",
+        "● Reading /tmp/ask_user_question",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ read_file",
+        "● read_file",
         projection.entry_actions.items[2].override.bytes,
     );
 }
@@ -3028,7 +3943,7 @@ test "narrow block clips every row without wrapping" {
     }
 }
 
-test "mixed group keeps the count header before every action" {
+test "mixed group keeps its header before every action" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Read one.zig", .class = .tool_status } },
@@ -3051,7 +3966,7 @@ test "mixed group keeps the count header before every action" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 6 tool calls · 5 read · 1 command\n" ++
+        "● Ran 1 shell command ✓\n" ++
             "├ Read one.zig\n" ++
             "├ Read two.zig\n" ++
             "├ Read three.zig\n" ++
@@ -3085,7 +4000,8 @@ test "styled minimal summary preserves the clipped width" {
         line_count += 1;
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
     }
-    try std.testing.expectEqual(@as(usize, 2), line_count);
+    // A one-call group is a single header line.
+    try std.testing.expectEqual(@as(usize, 1), line_count);
 }
 
 test "Ctrl+O shows a tool call as its own line with no group header or tree marks" {
@@ -3290,4 +4206,514 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
     try std.testing.expect(std.mem.find(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
+}
+
+test "a deferred call keeps its own row and does not count as a run" {
+    const alloc = std.testing.allocator;
+    const arguments = "{\"command\":\"cat AGENTS.md\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "↻ Reading project instructions before continuing: cat AGENTS.md\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran cat AGENTS.md\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast(arguments), .command_display = @constCast("cat AGENTS.md"), .outcome = .deferred },
+        .{ .entry_id = 2, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast(arguments), .command_display = @constCast("cat AGENTS.md"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } },
+    };
+    var projection = try build(alloc, &entries, &details, 100);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran 1 shell command ✓\n"));
+    try std.testing.expect(std.mem.find(u8, bytes, "\n├ Reading project instructions before continuing: ") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\n└ Ran ") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "×") == null);
+}
+
+fn storyCommandDetail(
+    entry_id: u32,
+    arguments_json: []const u8,
+    exit_code: i64,
+    result: ?[]const u8,
+) ToolDetailRecord {
+    return .{
+        .entry_id = entry_id,
+        .tool_name = @constCast("shell"),
+        .activity_kind = .command,
+        .arguments_json = @constCast(arguments_json),
+        .result = if (result) |text| @constCast(text) else null,
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = exit_code },
+    };
+}
+
+test "repeated runs of one command share a row that keeps the earlier failures" {
+    const alloc = std.testing.allocator;
+    const args = "{\"action\":\"run\",\"command\":\"sh test.sh\"}";
+    const passing = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh test.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 1 sh test.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh test.sh\n", .class = .tool_status } },
+    };
+    const passing_details = [_]ToolDetailRecord{
+        storyCommandDetail(1, args, 1, "Error: Test timed out."),
+        storyCommandDetail(2, args, 1, "Error: Test timed out."),
+        storyCommandDetail(3, args, 0, "Tests 24 passed (24)"),
+    };
+    var passed = try build(alloc, &passing, &passing_details, 120);
+    defer passed.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● Ran \x1b[38;5;252msh\x1b[39m test.sh ×3 · passed on the 3rd run ✓",
+        passed.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expect(passed.entry_actions.items[1] == .hide);
+    try std.testing.expect(passed.entry_actions.items[2] == .hide);
+
+    const failing_details = [_]ToolDetailRecord{
+        storyCommandDetail(1, args, 1, "Error: Test timed out."),
+        storyCommandDetail(2, args, 1, "Error: Test timed out."),
+        storyCommandDetail(3, args, 1, "running 4 tests\n FAIL  quits on click\nError: Test timed out."),
+    };
+    var failed = try build(alloc, &passing, &failing_details, 120);
+    defer failed.deinit(alloc);
+    const failed_bytes = failed.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, failed_bytes, "● Ran \x1b[38;5;252msh\x1b[39m test.sh ×3 ✗\n"));
+    // The reason comes from the latest run: its first line that names a failure.
+    try std.testing.expect(std.mem.find(u8, failed_bytes, "  ✗ exit 1 · FAIL quits on click") != null);
+}
+
+test "input to a running session and its stop are not new commands" {
+    const alloc = std.testing.allocator;
+    const run = "{\"action\":\"run\",\"command\":\"npm run dev\",\"tty\":true}";
+    const interact = "{\"action\":\"interact\",\"session_id\":\"shell-7\",\"chars\":\"q\"}";
+    const stop = "{\"action\":\"stop\",\"session_id\":\"shell-7\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Observed npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Stopped npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "  2s", .class = .turn_summary } },
+    };
+    const details = [_]ToolDetailRecord{
+        storyCommandDetail(1, run, 0, null),
+        storyCommandDetail(2, interact, 0, null),
+        storyCommandDetail(3, stop, 0, null),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran 1 shell command ✓\n"));
+    try std.testing.expect(std.mem.find(u8, bytes, " · 2 calls") != null);
+    try std.testing.expectEqualStrings("  Ran 1 command ✓ · 2s", projection.entry_actions.items[3].override.bytes);
+
+    // A group that only checks on the session names the session.
+    var follow_ups = try build(alloc, entries[1..3], details[1..3], 120);
+    defer follow_ups.deinit(alloc);
+    const follow_bytes = follow_ups.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● Stopped "));
+    try std.testing.expect(std.mem.endsWith(u8, follow_bytes, " · 2 calls ✓") or std.mem.endsWith(u8, follow_bytes, " · 2 calls"));
+}
+
+test "a command that failed before the last one still counts in the header" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sh fast.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 1 sh failed.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh last.sh\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"sh fast.sh\"}", 0, null),
+        storyCommandDetail(2, "{\"command\":\"sh failed.sh\"}", 1, null),
+        storyCommandDetail(3, "{\"command\":\"sh last.sh\"}", 0, null),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran 3 shell commands ✓ · 1 failed\n"));
+
+    // When the last command is the one that failed, the mark says so alone.
+    const last_failed = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"sh fast.sh\"}", 0, null),
+        storyCommandDetail(2, "{\"command\":\"sh failed.sh\"}", 0, null),
+        storyCommandDetail(3, "{\"command\":\"sh last.sh\"}", 1, null),
+    };
+    var last = try build(alloc, &entries, &last_failed, 120);
+    defer last.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, last.entry_actions.items[0].override.bytes, "● Ran 3 shell commands ✗\n"));
+}
+
+test "a long command keeps its merge note when its row is clipped" {
+    const alloc = std.testing.allocator;
+    const command = "cd desktop && npm ci --no-audit --no-fund --loglevel=error && npm run build -- --mode production";
+    const args = "{\"command\":\"" ++ command ++ "\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read src/main.ts\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        storyCommandDetail(1, args, 1, null),
+        storyCommandDetail(2, args, 0, null),
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .arguments_json = @constCast("{\"path\":\"src/main.ts\"}") },
+    };
+    const cols: u16 = 72;
+    var projection = try build(alloc, &entries, &details, cols);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next();
+    const merged = lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, merged, "├ Ran "));
+    // The clipped command closes its highlight before the note.
+    try std.testing.expect(std.mem.endsWith(u8, merged, "…\x1b[0m ×2 · passed on the 2nd run"));
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(merged) <= cols);
+}
+
+test "a command between two runs of another keeps all three rows" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran sh lint.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"sh build.sh\"}", 0, null),
+        storyCommandDetail(2, "{\"command\":\"sh lint.sh\"}", 0, null),
+        storyCommandDetail(3, "{\"command\":\"sh build.sh\"}", 0, null),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● Ran 3 shell commands ✓\n" ++
+            "├ Ran \x1b[38;5;252msh\x1b[39m build.sh\n" ++
+            "├ Ran \x1b[38;5;252msh\x1b[39m lint.sh\n" ++
+            "└ Ran \x1b[38;5;252msh\x1b[39m build.sh",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "one file read in parts shares a row" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
+    };
+    var details: [3]ToolDetailRecord = undefined;
+    const args = [_][]const u8{
+        "{\"path\":\"src/main.zig\",\"start_line\":1,\"line_count\":40}",
+        "{\"path\":\"src/main.zig\",\"start_line\":41,\"line_count\":40}",
+        "{\"path\":\"src/main.zig\",\"start_line\":81,\"line_count\":40}",
+    };
+    for (&details, args, 0..) |*detail, arguments_json, index| detail.* = .{
+        .entry_id = @intCast(index + 1),
+        .tool_name = @constCast("read_file"),
+        .activity_kind = .read,
+        .arguments_json = @constCast(arguments_json),
+        .outcome = .completed,
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings("● Read src/main.zig · 3 parts", projection.entry_actions.items[0].override.bytes);
+}
+
+test "subagent waits and status calls fold into the agents' rows" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● sent to tester · run the tests\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● waited for reviewer, tester\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● checked reviewer, tester\n", .class = .tool_status } },
+    };
+    const args = [_][]const u8{
+        "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}",
+        "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"run the tests\"}",
+        "{\"action\":\"wait\"}",
+        "{\"action\":\"status\"}",
+    };
+    var details: [4]ToolDetailRecord = undefined;
+    for (&details, args, 0..) |*detail, arguments_json, index| detail.* = .{
+        .entry_id = @intCast(index + 1),
+        .tool_name = @constCast("subagent"),
+        .activity_kind = .subagent,
+        .arguments_json = @constCast(arguments_json),
+        .outcome = .completed,
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● Started 2 subagents\n" ++
+            "├ sent to reviewer · review the change\n" ++
+            "└ sent to tester · run the tests",
+        projection.entry_actions.items[0].override.bytes,
+    );
+
+    // Waits with no agent row yet share one row of their own.
+    var waits = try build(alloc, entries[2..], details[2..], 120);
+    defer waits.deinit(alloc);
+    try std.testing.expectEqualStrings("● checked reviewer, tester", waits.entry_actions.items[0].override.bytes);
+}
+
+test "saved arguments that are not usable leave rows unmerged" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read one.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read one.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran make\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran make\n", .class = .tool_status } },
+    };
+    const args = [_][]const u8{ "{\"path\":", "{\"path\":7}", "[]", "{\"command\":\"\"}" };
+    const tools = [_][]const u8{ "read_file", "read_file", "shell", "shell" };
+    const kinds = [_]types.ToolActivityKind{ .read, .read, .command, .command };
+    var details: [4]ToolDetailRecord = undefined;
+    for (&details, args, tools, kinds, 0..) |*detail, arguments_json, tool, kind, index| detail.* = .{
+        .entry_id = @intCast(index + 1),
+        .tool_name = @constCast(tool),
+        .activity_kind = kind,
+        .arguments_json = @constCast(arguments_json),
+        .outcome = .completed,
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran 2 shell commands ✓\n"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\n"));
+}
+
+test "a failure reason is one line of plain text within the width" {
+    const alloc = std.testing.allocator;
+    const cols: u16 = 64;
+    const hostile = "\x1b[31mstarting\x1b[0m\r\tstep\nerror: " ++ text_utils.repeat("x", 500) ++ " \xff\xfe end\n";
+    const escaped = "\\x1b[31mstarting\\x1b[0m\\x0aerror: boom \\xff end";
+    for ([_][]const u8{ hostile, escaped }) |result| {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 3 sh hostile.sh\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"command\":\"sh hostile.sh\"}", 3, result)};
+        var projection = try build(alloc, &entries, &details, cols);
+        defer projection.deinit(alloc);
+        const bytes = projection.entry_actions.items[0].override.bytes;
+        const newline = std.mem.findScalar(u8, bytes, '\n') orelse return error.TestExpectedEqual;
+        const reason = bytes[newline + 1 ..];
+        try std.testing.expect(std.mem.findScalar(u8, reason, '\n') == null);
+        try std.testing.expect(std.mem.find(u8, reason, "✗ exit 3 · error: ") != null);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(reason) <= cols);
+        try std.testing.expect(std.mem.find(u8, reason, "starting") == null);
+        var index: usize = 0;
+        while (index < reason.len) : (index += 1) {
+            if (skipSgrSequence(reason, &index)) {
+                index -= 1;
+                continue;
+            }
+            try std.testing.expect(reason[index] >= 0x20 and reason[index] != 0x7f);
+        }
+    }
+}
+
+test "the turn summary leads with a recap of what the turn changed and ran" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited main.zig +2 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 2 sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "  3s (↑1 ↓2)", .class = .turn_summary } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("edit_file"),
+            .activity_kind = .edit,
+            .arguments_json = @constCast("{\"path\":\"main.zig\"}"),
+            .outcome = .completed,
+        },
+        storyCommandDetail(2, "{\"command\":\"sh build.sh\"}", 2, null),
+        storyCommandDetail(3, "{\"command\":\"sh build.sh\"}", 0, null),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "  1 file changed +2 -1 · ran 2 commands ✓ · 3s (↑1 ↓2)",
+        projection.entry_actions.items[3].override.bytes,
+    );
+
+    // When the longer row would not fit, the turn summary stays as it was.
+    var narrow = try build(alloc, &entries, &details, 30);
+    defer narrow.deinit(alloc);
+    try std.testing.expect(narrow.entry_actions.items[3] == .keep);
+
+    // A turn that only read files says so; a turn with no tools keeps its line.
+    const reads = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "  1s", .class = .turn_summary } },
+    };
+    const read_details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("read_file"),
+        .activity_kind = .read,
+        .arguments_json = @constCast("{\"path\":\"a.zig\"}"),
+        .outcome = .completed,
+    }};
+    var read_projection = try build(alloc, &reads, &read_details, 120);
+    defer read_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("  Explored 1 file · 1s", read_projection.entry_actions.items[1].override.bytes);
+    var quiet = try build(alloc, reads[1..], &.{}, 120);
+    defer quiet.deinit(alloc);
+    try std.testing.expect(quiet.entry_actions.items[0] == .keep);
+
+    // A turn that started subagents did more than explore, so its line stays.
+    const delegated = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to helper · Check one-off cleanup\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "  1s", .class = .turn_summary } },
+    };
+    const delegated_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"helper\",\"message\":\"Check one-off cleanup\"}"),
+            .outcome = .completed,
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .arguments_json = @constCast("{\"path\":\"a.zig\"}"),
+            .outcome = .completed,
+        },
+    };
+    var delegated_projection = try build(alloc, &delegated, &delegated_details, 120);
+    defer delegated_projection.deinit(alloc);
+    try std.testing.expect(delegated_projection.entry_actions.items[2] == .keep);
+}
+
+/// Reads a fuzz input one choice at a time; past its end every byte is 0.
+const StoryFuzzBytes = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn byte(self: *StoryFuzzBytes) u8 {
+        if (self.index >= self.bytes.len) return 0;
+        defer self.index += 1;
+        return self.bytes[self.index];
+    }
+
+    fn chunk(self: *StoryFuzzBytes, max: usize) []const u8 {
+        const wanted = self.byte() % (max + 1);
+        const len = @min(wanted, self.bytes.len -| self.index);
+        defer self.index += len;
+        return self.bytes[self.index..][0..len];
+    }
+};
+
+/// Builds one compact group and its turn summary from fuzz bytes: core status
+/// lines from a fixed set, with model arguments and command output taken from
+/// the input, and checks that every line fits the width and carries no
+/// control byte but a style's escape.
+fn checkStoryRows(input: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fuzz: StoryFuzzBytes = .{ .bytes = input };
+
+    const statuses = [_][]const u8{
+        "● Ran sh test.sh\n",
+        "● Exited 1 sh test.sh\n",
+        "● Read desktop/src/main.ts\n",
+        "● Edited main.zig +2 / -1\n",
+        "● Failed main.zig: old_string not found\n",
+        "● sent to reviewer · review\n",
+        "▪ Cancelled sleep 30 · What can fx do differently?",
+        "⊘ Denied by auto agent rm -rf build\n",
+        "● Searched createWindow(\n",
+    };
+    const Tool = struct { name: []const u8, kind: types.ToolActivityKind, key: []const u8 };
+    const tools = [_]Tool{
+        .{ .name = "shell", .kind = .command, .key = "command" },
+        .{ .name = "read_file", .kind = .read, .key = "path" },
+        .{ .name = "grep_files", .kind = .read, .key = "pattern" },
+        .{ .name = "glob_files", .kind = .list, .key = "pattern" },
+        .{ .name = "edit_file", .kind = .edit, .key = "path" },
+        .{ .name = "write_file", .kind = .write, .key = "path" },
+        .{ .name = "subagent", .kind = .subagent, .key = "agent" },
+        .{ .name = "web_search", .kind = .read, .key = "query" },
+    };
+    const outcomes = [_]?types.ToolOutcomeKind{ null, .completed, .failed, .denied, .cancelled, .deferred };
+
+    const max_calls = 12;
+    var entries: [max_calls + 1]TranscriptEntry = undefined;
+    var details: [max_calls]ToolDetailRecord = undefined;
+    const count = 1 + fuzz.byte() % max_calls;
+    for (0..count) |index| {
+        const entry_id: u32 = @intCast(index + 1);
+        const tool = tools[fuzz.byte() % tools.len];
+        entries[index] = .{ .raw_bytes = .{
+            .id = entry_id,
+            .bytes = statuses[fuzz.byte() % statuses.len],
+            .class = .tool_status,
+        } };
+        const arguments_json: ?[]u8 = switch (fuzz.byte() % 4) {
+            0 => null,
+            1 => try arena.dupe(u8, fuzz.chunk(64)),
+            2 => blk: {
+                var out: std.Io.Writer.Allocating = .init(arena);
+                try out.writer.print("{{\"action\":\"run\",\"{s}\":", .{tool.key});
+                std.json.Stringify.value(fuzz.chunk(48), .{}, &out.writer) catch try out.writer.writeAll("\"\"");
+                try out.writer.writeByte('}');
+                break :blk out.written();
+            },
+            else => try arena.dupe(u8, "{}"),
+        };
+        const result = fuzz.chunk(160);
+        details[index] = .{
+            .entry_id = entry_id,
+            .tool_name = @constCast(tool.name),
+            .activity_kind = tool.kind,
+            .arguments_json = arguments_json,
+            .result = if (result.len == 0) null else try arena.dupe(u8, result),
+            .outcome = outcomes[fuzz.byte() % outcomes.len],
+            .command_process_presentation = switch (fuzz.byte() % 5) {
+                0 => null,
+                1 => .{ .exit_code = 0 },
+                2 => .{ .exit_code = fuzz.byte() },
+                3 => .timed_out,
+                else => .{ .signal = 9 },
+            },
+        };
+    }
+    entries[count] = .{ .raw_bytes = .{ .id = @intCast(count + 1), .bytes = "  2s (↑1 ↓2)", .class = .turn_summary } };
+    const cols: u16 = 1 + @as(u16, fuzz.byte()) % 160;
+
+    var projection = try build(alloc, entries[0 .. count + 1], details[0..count], cols);
+    defer projection.deinit(alloc);
+    for (projection.entry_actions.items) |action| {
+        if (action != .override) continue;
+        var lines = std.mem.splitScalar(u8, action.override.bytes, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            // Apart from the styles fx writes, every byte is terminal-safe.
+            var plain: std.Io.Writer.Allocating = .init(arena);
+            var index: usize = 0;
+            while (index < line.len) {
+                if (skipSgrSequence(line, &index)) continue;
+                try plain.writer.writeByte(line[index]);
+                index += 1;
+            }
+            try std.testing.expect(text_utils.isTerminalSafe(plain.written()));
+        }
+    }
+}
+
+fn fuzzStoryRows(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [2048]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try checkStoryRows(buffer[0..len]);
+}
+
+test "story rows fit the width and stay plain text for fuzzed arguments and output" {
+    try std.testing.fuzz({}, fuzzStoryRows, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x02\x00\x01\x02\x0ash test.sh\x00\x01\x02\x01",
+            "\x05\x01\x02\x01\x10{\"path\":\"a.zig\"}\x00\x01\x01\x63",
+        }) ++ @import("fuzz_corpus").tool_story_rows.*),
+    });
 }

@@ -4327,7 +4327,7 @@ describe("fx mcp call", () => {
       await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The rows a direct call of the tool gets, in the command's group.
-      expect(scrollback).toContain("● 4 tool calls · 3 MCP calls · 1 command");
+      expect(scrollback).toContain("● Ran 1 shell command ✓");
       expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
       expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
       expect(scrollback).not.toContain("Running MCP");

@@ -1110,7 +1110,8 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("direct auto complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      const completedIndex = scrollback.indexOf("└ Ran pwd");
+      // The group's only call is its header.
+      const completedIndex = scrollback.indexOf("● Ran pwd");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
       expect(streamTextIndex).toBeGreaterThanOrEqual(0);
@@ -1233,10 +1234,12 @@ describe("effect-aware command permissions", () => {
       expect(running).toContain("Running ./fxc110-stream.sh");
       expectNoOutputRows(running);
 
-      await activeSession.waitForText("1 failed", TIMEOUT);
+      // The last command failed, so the group ends in ✗, and its reason line
+      // shows one line of the error while the full output stays in Ctrl-O.
+      const header = "● Ran 3 shell commands ✗";
+      await activeSession.waitForText(header, TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
-      expect(completed).toContain("3 tool calls");
-      expect(completed).toContain("1 failed");
+      expect(completed).toContain("✗ exit 7 · FXC110_FAILED_STDERR");
       for (const script of scripts) expect(completed).toContain(script.name);
       expectNoOutputRows(completed);
 
@@ -1251,7 +1254,7 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendKeys("C-o");
       await activeSession.waitForPane(
-        pane => pane.includes("3 tool calls") && !pane.includes("esc close · pgup/pgdn scroll"),
+        pane => pane.includes(header) && !pane.includes("esc close · pgup/pgdn scroll"),
         TIMEOUT,
       );
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -1271,7 +1274,7 @@ describe("effect-aware command permissions", () => {
         height: 32,
       });
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.waitForText("3 tool calls", TIMEOUT);
+      await activeSession.waitForText(header, TIMEOUT);
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
@@ -1324,21 +1327,22 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
-      const narrowRow = narrow.split("\n").find((line) => line.includes("└ Ran printf ok"));
+      // The group's only call is its header, and its ✓ stays after the clip.
+      const narrowRow = narrow.split("\n").find((line) => line.includes("● Ran printf ok"));
       expect(narrowRow).toBeDefined();
-      expect(narrowRow).toEndWith("…");
+      expect(narrowRow).toEndWith("… ✓");
       expect(narrowRow).not.toContain("omega >/dev/null");
 
       await activeSession.resizeWindow(240, 32);
       const wide = await activeSession.captureFullScrollback();
-      const wideRow = wide.split("\n").find((line) => line.includes("└ Ran printf ok"));
-      expect(wideRow).toBe(`└ Ran ${command}`);
+      const wideRow = wide.split("\n").find((line) => line.includes("● Ran printf ok"));
+      expect(wideRow).toBe(`● Ran ${command} ✓`);
 
       await activeSession.sendText("Run the next prepared command.");
       await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
       const workspaceRow = workspaceWide.split("\n").find((line) =>
-        line.includes("└ Ran printf '%s' absolute-path-prefix-"),
+        line.includes("● Ran printf '%s' absolute-path-prefix-"),
       );
       expect(workspaceRow).toContain(" ./file >/dev/null");
       expect(workspaceRow).not.toContain(root.workspace);
@@ -2025,7 +2029,7 @@ describe("effect-aware command permissions", () => {
       expect(compactScrollback).not.toContain(
         "Auto agent approved this request: Running command.",
       );
-      expect(compactScrollback).toContain("└ Ran");
+      expect(compactScrollback).toContain("● Ran printf approved");
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -2425,7 +2429,8 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
-      expect(pane).toContain("1 denied");
+      // The held call is its group's header, which names the caution.
+      expect(pane).toContain(`● Safety caution ${command}`);
       expect(pane).toContain(`Safety caution ${command}`);
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
@@ -2461,7 +2466,7 @@ describe("effect-aware command permissions", () => {
         (value) => value.includes(`Safety caution ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain("1 denied");
+      expect(resumedPane).toContain(`● Safety caution ${command}`);
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);

@@ -1146,7 +1146,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const cases = [
         {
           name: "denied",
-          outcome: "1 denied",
+          // The group's only call is its header, which says it was denied.
+          outcome: "● Denied file",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1466,13 +1467,15 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       await session.waitForPane(
         (pane) =>
           pane.includes("long path edits complete") &&
-          pane.includes("● 2 tool calls · 2 edit"),
+          /^● Edited packages\/\S*… \+2 -2$/m.test(pane),
         TIMEOUT,
       );
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
 
       const grid = await session.capturePaneGrid();
-      const rows = grid.filter((line) => line.includes("Edited packages/"));
+      const header = grid.find((line) => line.startsWith("● Edited packages/"));
+      expect([...(header ?? "").trimEnd()].length).toBeLessThanOrEqual(width);
+      const rows = grid.filter((line) => /^[├└] Edited packages\//.test(line));
       expect(rows).toHaveLength(2);
       for (const row of rows) {
         expect([...row.trimEnd()].length).toBeLessThanOrEqual(width);
@@ -1480,7 +1483,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       }
 
       const escapes = await session.capturePaneEscapes();
-      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
+      const styledLines = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
+      // The header keeps the group's counts and their colors after its clipped path.
+      expect(styledLines[0]).toContain("\x1b[38;5;71m+2");
+      expect(styledLines[0]).toContain("\x1b[38;5;167m-2");
+      const styledRows = styledLines.slice(1);
       expect(styledRows).toHaveLength(2);
       for (const row of styledRows) {
         expect(row).toContain("\x1b[38;5;71m+1");

@@ -12584,7 +12584,7 @@ test "current compact projection groups tool rows without mutating entries" {
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245m2 tool calls · 1 read · 1 edit · 1 failed\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead 1 file · 1 failed\x1b[0m\n" ++
             "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
             "\x1b[38;5;245m└ Edit failed\x1b[0m",
     ) != null);
@@ -12601,9 +12601,9 @@ test "current compact projection finalizes tool groups from turn finished fallba
         fallback_disposition: ?transcript_blocks.ToolFallbackDisposition,
         summary_text: []const u8,
     }{
-        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "1 tool call · 1 read · 1 unreported" },
-        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "1 tool call · 1 read · 1 not executed" },
-        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "1 cancelled" },
+        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "Tool completion was not reported" },
+        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "Tool was not executed" },
+        .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "Tool cancelled" },
         .{ .call_id = "failed", .provisional = false, .turn_outcome = .failed, .detail_outcome = .failed, .fallback_disposition = null, .summary_text = "Tool failed" },
     };
 
@@ -14497,7 +14497,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
         );
         var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
         defer compact.deinit(std.testing.allocator);
-        try std.testing.expect(std.mem.find(u8, compact.bytes, "1 not executed") != null);
+        try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") != null);
         return err;
     };
 
@@ -14512,7 +14512,7 @@ fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
     try std.testing.expect(detail.fallback_disposition == null);
     var compact = try runtime.prepareTranscriptSource(std.testing.allocator, null);
     defer compact.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 not executed") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Tool was not executed") == null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Late completion") != null);
 }
 
@@ -15419,12 +15419,12 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}3 tool calls · 3 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read 3 files\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
     const group_b_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_b_header);
@@ -15460,7 +15460,7 @@ test "finality candidates keep a mixed legacy turn at its earliest rendered tool
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        "{s}●\x1b[0m {s}Read finality fixture\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);

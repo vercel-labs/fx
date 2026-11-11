@@ -1227,8 +1227,8 @@ printf '${trailingMarker}   '
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, doneMarker);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).toContain("└ Ran ./command-output-controls.sh");
+      // The group's only call is its header, marked with the result.
+      expect(compact).toContain("● Ran ./command-output-controls.sh ✓");
       expect(compact).not.toContain(`│ ${ansiMarker}`);
       expect(compact).not.toContain(`│ ${crMarker}`);
       expect(compact).not.toContain("│ TAB");
@@ -1856,7 +1856,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toMatch(/^● Ran awk .*✓$/m);
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
@@ -1936,7 +1936,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(tailMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
+      // Only the compact view marks the result and recaps the turn.
+      await active.waitForText("Ran 1 command ✓", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
       expect(restored).not.toContain("lines more (ctrl+o to view)");
@@ -2014,7 +2015,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toMatch(/^● Ran awk .*✓$/m);
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
@@ -2672,7 +2673,8 @@ test.skipIf(!tmuxAvailable())(
     const finalMarker = "ORDER_REPRO_DONE";
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
-    const statusLine = "└ Ran pwd";
+    // The group's only call is its header, marked with the result.
+    const statusLine = "● Ran pwd ✓";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -5053,7 +5055,8 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("1 failed");
+      // The failure control ran last, and the deferred call does not count.
+      expect(scrollback).toContain("● Ran 2 shell commands ✗");
       expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
       expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
@@ -7196,8 +7199,7 @@ printf '${stdoutTail2}\\n'
     let active: TmuxSession | null = null;
 
     function expectCompactCommandOutput(pane: string): void {
-      expect(pane).toContain("● 1 tool call · 1 command");
-      expect(pane).toContain("Ran ./resume-command-output.sh");
+      expect(pane).toContain("● Ran ./resume-command-output.sh ✓");
       expect(pane).not.toContain("lines more (ctrl+o to view)");
       expect(pane).not.toContain(firstMarker);
       expect(pane).not.toContain("RESUME_COMMAND_TAIL");

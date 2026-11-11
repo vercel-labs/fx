@@ -687,9 +687,10 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
+    // The session's input and its stop share one row with its latest state.
     expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
-    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
-    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    expect(row("├ Observed ")).toBeUndefined();
+    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand} · 2 calls`);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -753,10 +754,11 @@ test.skipIf(!tmuxAvailable())(
     await Bun.sleep(300);
 
     // The main view keeps each row on one line and trails what does not fit.
+    // The session's input and its stop share one row, whose note stays.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
-    const mainObserved = mainRows.find((line) => line.startsWith("├ Observed "));
-    expect(mainObserved).toBeDefined();
-    expect(mainObserved).toEndWith("…");
+    const mainSession = mainRows.find((line) => line.startsWith("└ Stopped "));
+    expect(mainSession).toBeDefined();
+    expect(mainSession).toEndWith("… · 2 calls");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
@@ -802,7 +804,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("C-o");
     await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("├ Observed echo word0");
+    expect(scrollback).toContain("└ Stopped echo word0");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
     expect(scrollback).not.toContain("action: interact");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -885,9 +887,10 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
-    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
+    // The session's input and its stop share one row with its latest state.
     expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
-    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    expect(row("├ Observed ")).toBeUndefined();
+    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand} · 2 calls`);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT * 2,

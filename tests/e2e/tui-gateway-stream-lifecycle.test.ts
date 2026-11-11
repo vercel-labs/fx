@@ -3065,7 +3065,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The prompt shows once in the history; the resume line above it
         // names the session by the same text.
         expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
-        expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
+        expect(scrollback.split("● Read before.txt").length - 1).toBe(1);
         expect(scrollback.split(finalText).length - 1).toBe(outcome === "finish" ? 1 : 0);
         expect(queuedGateway.requests).toHaveLength(3);
         expect(session.isAlive()).toBe(true);
@@ -3139,7 +3139,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(scrollback).not.toContain("Cancelled");
       expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
-      expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
+      expect(scrollback.split("● Read before.txt").length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(queuedGateway.requests).toHaveLength(3);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5335,8 +5335,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspacePath = join(artifacts, "workspace");
       const stderrPath = join(artifacts, "stderr.log");
       const readFilename = "ACTIVE_PERMISSION_READ_SENTINEL.txt";
-      const toolHeader = "● 1 tool call · 1 read";
-      const toolMarker = `└ Read ${readFilename}`;
+      // The group's only call is its header.
+      const toolHeader = `● Read ${readFilename}`;
       const activeBefore = "ACTIVE_PERMISSION_BEFORE_SENTINEL\n";
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";
@@ -5393,7 +5393,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           return heldGateway.requests.length === 2 &&
             hold.started &&
             visible.includes(toolHeader) &&
-            visible.includes(toolMarker) &&
             visible.includes("Generating");
         },
         "the permissions panel during held post-tool continuation",
@@ -6362,7 +6361,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const nextFinalText = "INSTRUCTION_REFRESH_NEXT_TURN_FINAL";
       const currentInstruction = "NESTED_CURRENT_INSTRUCTION_SENTINEL";
       const refreshLabel = "Reading project instructions before continuing:";
-      const header = "● 2 tool calls · 2 commands";
+      // The deferred call did not run, so the group ran one command.
+      const header = "● Ran 1 shell command ✓";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(nested, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -6551,12 +6551,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
-      // The unsupported name has the MCP prefix, so it counts as an MCP call.
-      const header = "● 2 tool calls · 1 command · 1 MCP call · 1 failed";
+      // The failed call is not a command, so the header keeps the command's
+      // mark and counts the failure on its own, and its reason shows below it.
+      const header = "● Ran 1 shell command ✓ · 1 failed";
       const failedRow = `├ Failed ${unsupportedToolName}`;
+      const reasonRow = `│ ✗ Unsupported tool: ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
-      expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
+      expect(compact).toContain(`${header}\n${failedRow}\n${reasonRow}\n${completedRow}`);
       expect(countOccurrences(compact, `Failed ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(compact, `Ran ${supportedCommand}`)).toBe(1);
       expect(compact).not.toContain(`Running ${unsupportedToolName}`);
@@ -6619,7 +6621,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.capturePane();
-      expect(resumed).toContain(`${header}\n${failedRow}\n${completedRow}`);
+      expect(resumed).toContain(`${header}\n${failedRow}\n${reasonRow}\n${completedRow}`);
       expect(countOccurrences(resumed, `Failed ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(resumed, `Ran ${supportedCommand}`)).toBe(1);
       expect(unsupportedGateway.requests).toHaveLength(2);
@@ -7011,7 +7013,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● 5 tool calls · 4 subagent calls · 1 read");
+        expect(compact).toContain("● Started 3 subagents · 1 failed");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
         expect(compact).not.toContain("sent to Invalid Agent");
         for (let index = 0; index < tasks.length; index += 1) {
@@ -7045,7 +7047,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● 5 tool calls · 4 subagent calls · 1 read");
+        expect(resumed).toContain("● Started 3 subagents · 1 failed");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
         expect(resumed).toContain("sent to helper · Check one-off cleanup");
         expect(resumed).toContain("sent to checker · Check replay again");
@@ -7263,7 +7265,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
 
       const compact = await session.captureFullScrollback();
-      expect(compact).toContain("● 3 tool calls · 3 commands");
+      expect(compact).toContain("● Ran 3 shell commands ✓");
       expect(compact).toContain(
         "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
       );
@@ -7273,7 +7275,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(countOccurrences(compact, `Ran ${thirdCommand}`)).toBe(1);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
+      await session.waitForText("● Ran 3 shell commands ✓", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
@@ -7320,7 +7322,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
+      await session.waitForText("● Ran 3 shell commands ✓", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -7336,7 +7338,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● 3 tool calls · 3 commands");
+      expect(resumed).toContain("● Ran 3 shell commands ✓");
       expect(resumed).toContain(
         "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
       );
