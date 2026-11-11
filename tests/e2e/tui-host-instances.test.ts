@@ -1871,9 +1871,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("NOTE_ONE go");
         await session.waitForPane((pane) => pane.includes("rm -rf"), 15_000);
-        // From fx 2, fx 1 comes first.
+        // From fx 2, the note counts the two waiting instances.
         await switchAgent(session, "next");
-        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("need you"), 15_000);
+        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("require attention"), 15_000);
         expect(pane).toContain("2 agents require attention · fx 2/3 \u2193");
         expect(pane).not.toContain("main");
       });
