@@ -733,6 +733,10 @@ pub fn Runtime(comptime App: type) type {
                 app.hiddenAgentWaitingNote(waiting_note_buf)
             else
                 "";
+            const subagent_wait = if (comptime @hasDecl(App, "subagentWaitStatus"))
+                app.subagentWaitStatus()
+            else
+                @import("app_agents_runtime.zig").SubagentWait{};
             // Shares the buffer: the footer shows it only without a waiting note.
             const working_note: []const u8 = if (comptime @hasDecl(App, "hiddenAgentWorkingNote"))
                 (if (waiting_note.len == 0) app.hiddenAgentWorkingNote(waiting_note_buf) else "")
@@ -868,6 +872,8 @@ pub fn Runtime(comptime App: type) type {
                 .agent_label = if (comptime @hasDecl(App, "footerAgentLabel")) app.footerAgentLabel() else "",
                 .waiting_note = waiting_note,
                 .working_note = working_note,
+                .subagent_wait = subagent_wait.label,
+                .subagent_wait_since_ms = subagent_wait.since_ms,
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
@@ -1716,6 +1722,14 @@ pub fn Runtime(comptime App: type) type {
                 pending_card.?.overlaps_flow_endpoint(prepared.cursor.cursor_col)
             else
                 false;
+            // A queued-message card took its separator from the shell's
+            // cursor, which a terminal reset puts back at 1,1 while this frame
+            // reprints a transcript that can end mid-row, as when a switch
+            // shows another agent. It starts below this frame's endpoint
+            // instead, so it never paints over the endpoint's row.
+            if (!pending_submission_card) if (pending_card) |*card| if (prepared_transcript) |*prepared| {
+                card.leading_advance_rows = pendingCardLeadingAdvanceRows(prepared.cursor.cursor_col);
+            };
             var pending_paint_ctx = if (pending_preview_overlaps_flow) null else if (pending_card) |card|
                 PendingCardPaintContext.init(
                     card,
@@ -2056,9 +2070,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         // The open agent list takes the footer from the shown agent's
-        // approval or question, so the list stays visible while it previews
-        // an agent that is waiting. The prompt itself is untouched and
-        // returns when the list closes.
+        // approval or question, so the list stays visible while the agent on
+        // screen is waiting. The prompt itself is untouched and returns when
+        // the list closes.
         fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.approval_prompt.projection();

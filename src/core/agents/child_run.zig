@@ -52,6 +52,10 @@ pub const ChildRun = struct {
     /// Its turn was interrupted only to hand off to the user's image or
     /// `$skill`, so the work ends done rather than cancelled.
     handed_off: bool = false,
+    /// How often the run's request waited for the user. Only the first
+    /// wait lets the parent's message send it again, so a request that
+    /// fails the same way can't go back and forth between them.
+    waits: u8 = 0,
     /// The work a turn the parent didn't start opened in the parent's log,
     /// until that turn ends: the user's, or one the child's own child's
     /// report woke. Never `work_id`, which only the parent's works fill.

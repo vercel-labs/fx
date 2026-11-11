@@ -1,12 +1,14 @@
 //! The agent list ↓, Ctrl+X, and `/agents` open: a count, then one row per
 //! open agent, in columns. Each fx comes first, named "main", or "fx 2"
-//! while several are open, with its subagents under it on one branch:
+//! while several are open, with its subagents under it on a branch, and a
+//! subagent's own subagents under that one:
 //!
-//!   Agents 3
+//!   Agents 4
 //!
-//!   main        Fix the login bug   working         main    opus 4-7 high
-//!   ├ reviewer  Review the parser   needs approval  main    opus 4-7
-//!   └ tester    Run the auth tests  idle            tester  gpt-5.4-mini
+//!   main          Fix the login bug   working         main    opus 4-7 high
+//!   ├ reviewer    Review the parser   needs approval  main    opus 4-7
+//!   │ └ checker   Check one fix       working         main    opus 4-7
+//!   └ tester      Run the auth tests  idle            tester  gpt-5.4-mini
 
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -31,6 +33,31 @@ pub const max_inline_rows: u16 = heading_rows + max_agent_rows;
 const agents_beside_heading: usize = 3;
 
 const untitled = "new session";
+
+/// The columns a subagent's row gives its branch.
+fn branchWidth(row: AgentsMenuRow) usize {
+    if (!row.subagent) return 0;
+    return if (row.nested) 2 * branch_width else branch_width;
+}
+
+/// Whether no later row of `rows[index]`'s branch follows: the next one on
+/// it, past any of its own subagents, before the branch it hangs off ends.
+fn lastOnBranch(rows: []const AgentsMenuRow, index: usize) bool {
+    const nested = rows[index].nested;
+    for (rows[index + 1 ..]) |next| {
+        if (!next.subagent) return true;
+        if (next.nested == nested) return false;
+        if (nested) return true;
+    }
+    return true;
+}
+
+/// The row of the subagent nested row `index` hangs off.
+fn parentRow(rows: []const AgentsMenuRow, index: usize) usize {
+    var at = index;
+    while (at > 0 and rows[at].nested) at -= 1;
+    return at;
+}
 const column_gap: usize = 2;
 const branch_width: usize = 2;
 /// The state column: as wide as the longest state, "needs approval".
@@ -53,7 +80,7 @@ fn headingRowCount(projection: AgentsMenuProjection, row_budget: u16) u16 {
 }
 
 pub fn menuRowCount(projection: AgentsMenuProjection, row_budget: u16) u16 {
-    if (projection.rows.len == 0) return 0;
+    if (!projection.active()) return 0;
     return @intCast(@min(row_budget, headingRowCount(projection, row_budget) + projection.rows.len));
 }
 
@@ -101,7 +128,7 @@ const Columns = struct {
         var profile: usize = 0;
         var model: usize = 0;
         for (projection.rows) |row| {
-            const branch = if (row.subagent) branch_width else 0;
+            const branch = branchWidth(row);
             name = @max(name, branch + text_utils.terminalSafeVisibleWidth(row.name));
             title = @max(title, text_utils.terminalSafeVisibleWidth(titleOf(row)));
             profile = @max(profile, text_utils.terminalSafeVisibleWidth(row.profile));
@@ -196,14 +223,15 @@ fn composeAgentRow(alloc: Allocator, projection: AgentsMenuProjection, index: us
     var name_start = indent;
     var name_width = columns.name;
     if (row.subagent) {
-        // The branch runs down a fx's subagents and ends at the last one. It
+        // The branch runs down a fx's subagents and ends at the last one, and
+        // a subagent's own subagents hang off it on a branch of their own. It
         // is dim on every row, the selected one too, so it reads as one line.
-        const last = index + 1 == rows.len or !rows[index + 1].subagent;
         try line.appendSlice(alloc, ui_render.dim_style);
-        try line.appendSlice(alloc, if (last) "└ " else "├ ");
+        if (row.nested) try line.appendSlice(alloc, if (lastOnBranch(rows, parentRow(rows, index))) "  " else "│ ");
+        try line.appendSlice(alloc, if (lastOnBranch(rows, index)) "└ " else "├ ");
         try line.appendSlice(alloc, ui_render.reset_style);
-        name_start += branch_width;
-        name_width -|= branch_width;
+        name_start += branchWidth(row);
+        name_width -|= branchWidth(row);
     }
     try appendCell(alloc, &line, name_start, row.name, name_width, plain);
     try appendCell(alloc, &line, columns.titleStart(indent), titleOf(row), columns.title, dim);
@@ -240,17 +268,24 @@ pub fn composeAgentsMenuRow(
 }
 
 const hint_variants = [_][]const u8{
-    "↑↓ preview     enter switch     esc back",
-    "↑↓ preview  enter switch  esc back",
-    "↑↓ preview  enter  esc",
+    "↑↓ move     enter switch     esc back",
+    "↑↓ move  enter switch  esc back",
+    "↑↓ move  enter  esc",
     "enter switch  esc back",
 };
 
 const closable_hint_variants = [_][]const u8{
-    "↑↓ preview     enter switch     delete close     esc back",
-    "↑↓ preview  enter switch  delete close  esc back",
-    "↑↓ preview  enter  delete close  esc",
+    "↑↓ move     enter switch     delete close     esc back",
+    "↑↓ move  enter switch  delete close  esc back",
+    "↑↓ move  enter  delete close  esc",
     "enter switch  esc back",
+};
+
+const search_hint_variants = [_][]const u8{
+    "↑↓ move     enter switch     esc clear",
+    "↑↓ move  enter switch  esc clear",
+    "↑↓ move  enter  esc clear",
+    "enter switch  esc clear",
 };
 
 const armed_hint_variants = [_][]const u8{
@@ -262,9 +297,10 @@ const armed_instance_hint_variants = [_][]const u8{
 };
 
 /// Delete closes a subagent's or an instance's row after a second press
-/// confirms it.
+/// confirms it; while there is a search, it erases the search instead.
 pub fn hintVariants(projection: AgentsMenuProjection) []const []const u8 {
     if (projection.close_armed) return if (projection.selected_instance) &armed_instance_hint_variants else &armed_hint_variants;
+    if (projection.search.len > 0) return &search_hint_variants;
     if (projection.selected_closable) return &closable_hint_variants;
     return &hint_variants;
 }
@@ -321,6 +357,18 @@ test "the agent list counts the agents, then shows each one's name, title, state
     }
 }
 
+test "a search counts what it matched, and keeps the list open when nothing does" {
+    const matched: AgentsMenuProjection = .{ .rows = test_team[1..2], .search = "TEST" };
+    const heading = try testRow(matched, 0, 80, max_inline_rows);
+    defer std.testing.allocator.free(heading.text);
+    try std.testing.expectEqualStrings("  Agents 1", heading.text);
+    try std.testing.expectEqual(@as(u16, 3), menuRowCount(matched, max_inline_rows));
+    try std.testing.expectEqualStrings("↑↓ move     enter switch     esc clear", hintVariants(matched)[0]);
+
+    try expectRows(.{ .search = "nobody" }, 80, max_inline_rows, &.{ "  Agents 0", "" });
+    try std.testing.expect(!(AgentsMenuProjection{}).active());
+}
+
 test "the agent list draws an unselected row dim, with its name plain and a state that waits for the user bright" {
     const alloc = std.testing.allocator;
     const projection: AgentsMenuProjection = .{ .rows = &test_team, .selected = 0 };
@@ -367,6 +415,27 @@ test "the agent list puts each fx's subagents under it on a branch that ends at 
         "  fx 2        Trace the resize flake  has a question  main",
         "  └ scout     Map the session store   working         main",
         "  fx 3        new session             idle            main",
+    });
+}
+
+test "a subagent's own subagents hang off its branch, which goes on past them to its next sibling" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .profile = "main", .state = "working", .state_tone = .active },
+        .{ .name = "lead", .subagent = true, .title = "Plan the fix", .profile = "main", .state = "idle" },
+        .{ .name = "helper", .subagent = true, .nested = true, .title = "Check one fix", .profile = "main", .state = "working", .state_tone = .active },
+        .{ .name = "checker", .subagent = true, .nested = true, .title = "Run the tests", .profile = "main", .state = "idle" },
+        .{ .name = "tester", .subagent = true, .title = "Run the auth tests", .profile = "tester", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .nested = true, .title = "Map the store", .profile = "main", .state = "idle" },
+    };
+    try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
+        "  Agents 6",
+        "",
+        "  main         Fix the login bug   working         main",
+        "  ├ lead       Plan the fix        idle            main",
+        "  │ ├ helper   Check one fix       working         main",
+        "  │ └ checker  Run the tests       idle            main",
+        "  └ tester     Run the auth tests  idle            tester",
+        "    └ scout    Map the store       idle            main",
     });
 }
 

@@ -5267,6 +5267,7 @@ fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
         .content_delta => |chunk| runtime_assistant_stream.onStreamContentChunk(ctx.stream, chunk),
         .reasoning_delta => |chunk| runtime_assistant_stream.onStreamReasoningChunk(ctx.stream, chunk),
         .tool_input_delta => |chunk| runtime_assistant_stream.onStreamToolInputChunk(ctx.stream, chunk),
+        .tool_input_progress => |progress| runtime_assistant_stream.onStreamToolInputProgress(ctx.stream, progress.id, progress.arguments),
         .tool_started => |tool| if (ctx.required_vision)
             onRequiredVisionStreamToolStart(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json)
         else
@@ -5891,6 +5892,32 @@ fn keptToolboxMenu(
     debug_trace.logf("toolbox", "menu kept bytes={d} entries={d} shortened={}", .{ bounded.menu.len, entries.len, bounded.shortened });
     // Only a new menu is news: a kept one shortens nothing again.
     return .{ .menu = kept.get().?, .note = null, .shortened = bounded.shortened };
+}
+
+test "a toolbox change noted before a compaction is noted again after it, and the menu stays" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var agent: runtime_agent.Agent = .{};
+    defer agent.deinit(std.testing.allocator);
+    const first = [_]toolbox.Entry{ .{ .kind = .mcp_server, .name = "fixture" }, .{ .kind = .mcp_server, .name = "outside" } };
+    const now = first[0..1];
+
+    const sent = try keptToolboxMenu(arena, &agent.toolbox_menu, &first, "", .{});
+    const menu = try arena.dupe(u8, sent.menu);
+    try std.testing.expect((try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{})).note != null);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{})).note);
+
+    // The compaction drops the turn that held the note.
+    agent.dropHistory(std.testing.allocator);
+    const after = try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{});
+    try std.testing.expectEqualStrings(menu, after.menu);
+    try std.testing.expect(std.mem.find(u8, after.note.?, "MCP servers: fixture") != null);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{})).note);
+
+    // Nothing changed since the menu: a compaction adds no note.
+    agent.dropHistory(std.testing.allocator);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try keptToolboxMenu(arena, &agent.toolbox_menu, &first, "", .{})).note);
 }
 
 test "the toolbox menu stays as first sent, and each change is noted once" {

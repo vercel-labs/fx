@@ -1,0 +1,9 @@
+{
+  "spec": [
+    {"name": "preview", "config": "agents-menu-mutation-preview", "rule": "ScreenOnlyOnEnter", "bug": "a move shows the row it lands on, as fx did before this change"},
+    {"name": "enter_noop", "config": "agents-menu-mutation-enter-noop", "rule": "EnterShowsSelection", "bug": "Enter closes the list without showing the highlighted row"},
+    {"name": "open_first", "config": "agents-menu-mutation-open-first", "rule": "OpensOnScreen", "bug": "the list opens on its first row instead of the agent on screen"},
+    {"name": "pin", "config": "agents-menu-mutation-pin", "rule": "SelectionKept", "bug": "the highlight snaps back to the agent on screen when the rows change"},
+    {"name": "stale_sel", "config": "agents-menu-mutation-stale-sel", "rule": "SelListed", "bug": "the highlight stays on an agent that closed"}
+  ]
+}

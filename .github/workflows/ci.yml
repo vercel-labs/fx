@@ -754,10 +754,10 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
 
-  # The subagent steering and stop-then-message models and the session-write
-  # model, and the drivers that run a built fx along them. Only the design
-  # configs and the session-write witnesses run here; the planted bugs and fx's
-  # old defects stay local (both check.sh scripts with no arguments): they
+  # The subagent steering and stop-then-message models, the session-write and
+  # live sessions models, and the drivers that run a built fx along them. Only
+  # the design configs and the session witnesses run here; the planted bugs and
+  # fx's old defects stay local (both check.sh scripts with no arguments): they
   # measure the checks, not the code.
   tla-subagent:
     name: TLA+ subagent and session-write models
@@ -784,7 +784,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.14"
-      - name: Model-check subagent messages and session writes, and drive fx along the models
+      - name: Model-check subagent messages, session writes, and live sessions, and drive fx along the models
         if: needs.ci-need.outputs.subagent == 'true'
         run: |
           set -euo pipefail
@@ -793,10 +793,11 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
           tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep
-          tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted
+          tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted live-holds live-simulate live-witness-stale live-witness-idle-parent live-witness-open-fails-on-scan
           bun tests/tla/drivers/subagent/driver.ts
           bun test ./tests/tla/drivers/subagent/stop-message.test.ts
           bun test ./tests/tla/drivers/session/write.test.ts
+          bun test ./tests/tla/drivers/session/live.test.ts
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})

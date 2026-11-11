@@ -136,6 +136,9 @@ pub const ForkMenuProjection = struct {
     points: []const session_adapter.Session.ForkPoint = &.{},
     selected: usize = 0,
     window_start: usize = 0,
+    /// While the menu asks whether the fork takes copies of the session's
+    /// subagents: how many it can copy (D97).
+    question: ?usize = null,
 
     pub fn active(self: ForkMenuProjection) bool {
         return self.points.len > 0;
@@ -186,6 +189,8 @@ pub const AgentsMenuRow = struct {
     name: []const u8,
     /// A subagent, drawn on its instance's branch.
     subagent: bool = false,
+    /// A subagent's own subagent, drawn on its parent's branch.
+    nested: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
     /// The agent profile it runs in.
@@ -214,9 +219,13 @@ pub const AgentsMenuProjection = struct {
     selected_instance: bool = false,
     /// The first Delete armed the selected row's close.
     close_armed: bool = false,
+    /// What the user typed in the composer to search the list; `rows` holds
+    /// the agents that match it.
+    search: []const u8 = "",
 
+    /// A search that matches nothing still shows the list, with no rows.
     pub fn active(self: AgentsMenuProjection) bool {
-        return self.rows.len > 0;
+        return self.rows.len > 0 or self.search.len > 0;
     }
 };
 
@@ -480,6 +489,12 @@ pub const RenderContext = struct {
     /// Hidden subagents working, such as "1 subagent working", shown on the
     /// right only when nothing else is.
     working_note: []const u8 = "",
+    /// The activity row while the agent on screen is idle and its own
+    /// subagents still work, such as "• waiting on 3 subagents · ↓ to view".
+    subagent_wait: []const u8 = "",
+    /// When `subagent_wait`'s clock started, 0 without one; its bullet blinks
+    /// in step with that clock's seconds.
+    subagent_wait_since_ms: i64 = 0,
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
@@ -730,7 +745,13 @@ pub fn frameOwnedActivityProjection(
         .none => {},
     }
     if (compaction != .none) return compaction;
-    return turnActivityProjection(buf, shell, ctx);
+    const turn = turnActivityProjection(buf, shell, ctx);
+    if (turn == .none and ctx.subagent_wait.len > 0) {
+        // Narrow rows drop the key hint rather than wrap onto a second row.
+        const short = if (std.mem.find(u8, ctx.subagent_wait, " · ")) |end| ctx.subagent_wait[0..end] else null;
+        return fitStatusLabel(.{ .label = ctx.subagent_wait, .short_label = short, .tone = .live }, shell.layout.cols);
+    }
+    return turn;
 }
 
 /// A status with a short form shows it when the full label is wider than the
@@ -767,7 +788,19 @@ pub fn frameActivityBlink(ctx: RenderContext) ?bool {
             return activity_status.activityBlinkVisible(activity_status.compactionClock(ctx.stream, op), ctx.now_ms);
         }
     }
+    if (subagentWaitShown(ctx)) {
+        // No turn clock while idle: blink on the wait's own clock, so each
+        // displayed second is one on/off period.
+        return activity_status.activityBlinkVisible(.{ .turn_started_ms = ctx.subagent_wait_since_ms }, ctx.now_ms);
+    }
     return activity_status.activityBlinkVisible(ctx.stream, ctx.now_ms);
+}
+
+/// Whether the activity row is the "waiting on N subagents" one: nothing of
+/// the agent's own turn is going on or still being written out.
+fn subagentWaitShown(ctx: RenderContext) bool {
+    return ctx.subagent_wait.len > 0 and !ctx.stream.active and !ctx.pending_prompt_activity and
+        !ctx.writing_response and !ctx.completed_assistant_presentation_tail;
 }
 
 fn turnActivityProjection(
@@ -1024,6 +1057,49 @@ test "frame compaction overrides idle and tool activity but not blocking feedbac
     try std.testing.expectEqual(ActivityProjection.Tone.neutral, frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.tone);
     try std.testing.expect(state.dismiss(id, state.snapshot.revision));
     ctx.compaction = state.snapshot;
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
+}
+
+test "an idle agent waiting on its subagents shows a live row that a turn or question replaces" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    var ctx: RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "test",
+        .input = &input,
+    };
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
+
+    ctx.subagent_wait = "• waiting on 3 subagents · ↓ to view";
+    const waiting = frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking;
+    try std.testing.expectEqualStrings("• waiting on 3 subagents · ↓ to view", waiting.label);
+    try std.testing.expectEqual(ActivityProjection.Tone.live, waiting.tone);
+    // A row narrower than the label drops the key hint instead of wrapping.
+    shell.layout.cols = 30;
+    try std.testing.expectEqualStrings("• waiting on 3 subagents", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    shell.layout.cols = 0;
+    // Without a clock, the frame phase drives the blink.
+    ctx.now_ms = 10_000;
+    try std.testing.expectEqual(@as(?bool, null), frameActivityBlink(ctx));
+    // With a clock, each of its seconds starts with the bullet on.
+    ctx.subagent_wait_since_ms = 10_300;
+    ctx.now_ms = 10_500;
+    try std.testing.expectEqual(@as(?bool, true), frameActivityBlink(ctx));
+    ctx.now_ms = 10_900;
+    try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
+    ctx.now_ms = 11_300;
+    try std.testing.expectEqual(@as(?bool, true), frameActivityBlink(ctx));
+    ctx.subagent_wait_since_ms = 0;
+
+    ctx.pending_prompt_activity = true;
+    try std.testing.expectEqualStrings("• Thinking", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.pending_prompt_activity = false;
+
+    ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
     try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
 }
 
