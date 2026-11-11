@@ -189,6 +189,8 @@ pub const AgentsMenuRow = struct {
     name: []const u8,
     /// A subagent, drawn on its instance's branch.
     subagent: bool = false,
+    /// A subagent's own subagent, drawn on its parent's branch.
+    nested: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
     /// The agent profile it runs in.
@@ -217,9 +219,13 @@ pub const AgentsMenuProjection = struct {
     selected_instance: bool = false,
     /// The first Delete armed the selected row's close.
     close_armed: bool = false,
+    /// What the user typed to search the list; `rows` holds the agents that
+    /// match it.
+    search: []const u8 = "",
 
+    /// A search that matches nothing still shows the list, with no rows.
     pub fn active(self: AgentsMenuProjection) bool {
-        return self.rows.len > 0;
+        return self.rows.len > 0 or self.search.len > 0;
     }
 };
 

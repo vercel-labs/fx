@@ -488,8 +488,7 @@ pub const Server = struct {
         return !r.stdio and r.auth.revoking() != null;
     }
 
-    /// The status the last sign-out's revocation was answered with, 0 when
-    /// it couldn't be sent or read; null before an answer.
+    /// The auth client's `revoke_answer`; null for a stdio server.
     pub fn revocationAnswer(r: *const Server) ?u16 {
         if (r.stdio) return null;
         return r.auth.revocationAnswer();

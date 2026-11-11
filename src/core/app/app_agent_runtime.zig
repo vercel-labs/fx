@@ -687,6 +687,19 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !?[]const u8 {
             const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            // A wait, or a status that names no agent, concerns every
+            // subagent this agent runs, so its row names them as its host
+            // lists them now: `waiting for reviewer, builder`.
+            if (try tool_presentation.subagentRoster(arena, call)) |roster| {
+                const subagent_host = ctx.subagent_host orelse return null;
+                return subagent_host.rosterNames(arena, roster == .working) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => blk: {
+                        debug_trace.logf("subagent", "roster unavailable for row call_id={s} err={s}", .{ call.id, @errorName(err) });
+                        break :blk null;
+                    },
+                };
+            }
             return tool_presentation.resolveTerminalDisplayTarget(
                 arena,
                 ctx.tool_registry,
@@ -1699,7 +1712,11 @@ fn formatToolAction(
             display_target orelse spec.label_arg_default,
         );
     }
-    if (try tool_presentation.subagentAction(arena, call, switch (state) {
+    // The subagents a call that concerns them all names reach its row as
+    // the call's resolved target.
+    var subagent_call = call;
+    if (display_target) |target| subagent_call.resolved_display_target = target;
+    if (try tool_presentation.subagentAction(arena, subagent_call, switch (state) {
         .active => .active,
         .completed => .completed,
         .denied => .{ .stopped = denied_label.? },
