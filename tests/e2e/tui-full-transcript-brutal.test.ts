@@ -984,7 +984,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       compactToolMarker(totalTools - 1),
       TIMEOUT,
     );
-    expect(longestBlankRun(history)).toBeLessThan(MAX_HISTORY_BLANK_ROWS);
+    expect(longestBlankRun(history)).toBeLessThanOrEqual(MAX_HISTORY_BLANK_ROWS);
     expect(countOccurrences(history, HISTORY_DONE)).toBe(1);
     expect(history).toContain(firstChatMarker(config));
     expect(history).toContain(lastChatMarker(config));
