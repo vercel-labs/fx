@@ -125,12 +125,17 @@ pub const ChildAgent = struct {
 
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
-/// is doing now. It opens on the agent on screen, and moving through it moves
-/// only the highlight: Enter shows the highlighted agent, and Esc or Ctrl+X
-/// close the list with the agent on screen unchanged.
+/// is doing now. It opens on the agent on screen, and its highlight is a
+/// preview: moving it shows the agent it lands on, Enter keeps that agent,
+/// and Esc or Ctrl+X go back to `origin`. Up on the first row closes it with
+/// the agent shown kept (`tests/tla/agents_menu/spec/AgentsMenu.tla`).
 /// A row Delete closes in the agent list: a subagent, or an instance with
 /// null for the first.
 const CloseTarget = struct { agent: ?*ChildAgent };
+
+/// An agent in the switch list: a subagent, or an instance with null for the
+/// first.
+const ListedAgent = struct { agent: ?*ChildAgent };
 
 pub const AgentsMenu = struct {
     open: bool = false,
@@ -138,9 +143,15 @@ pub const AgentsMenu = struct {
     /// `switchList` last found `highlight` there.
     selected: usize = 0,
     window_start: usize = 0,
-    /// The highlighted agent while `open`. It stays on its agent while rows
+    /// The highlighted agent while `open`, which is the agent on screen
+    /// unless a search hides that one. It stays on its agent while rows
     /// start, reorder, and close around it.
     highlight: Highlight = .on_screen,
+    /// The agent the list opened on, which Esc, Ctrl+X, and Ctrl+C show
+    /// again, while `open`. Once it closed they keep the agent shown:
+    /// `dropHosted` puts it back on `.on_screen`, and a closed first
+    /// instance is no longer listed.
+    origin: Highlight = .on_screen,
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?CloseTarget = null,
@@ -159,10 +170,10 @@ pub const AgentsMenu = struct {
         self.* = .{};
     }
 
-    /// The agent the list highlights: one agent, null for the first
-    /// instance, compared by address only; or the agent on screen, once the
-    /// highlighted agent closed. `dropHosted` puts it back on the agent on
-    /// screen before it frees the agent, so it never names a freed agent or
+    /// One agent the list keeps, null for the first instance, compared by
+    /// address only; or the agent on screen, once that agent closed.
+    /// `dropHosted` puts the highlight and the origin back on the agent on
+    /// screen before it frees the agent, so neither names a freed agent or
     /// one that took its address.
     pub const Highlight = union(enum) {
         on_screen,
@@ -1075,8 +1086,46 @@ pub fn Runtime(comptime App: type) type {
 
         /// The switch order, with each instance's subagents sorted
         /// (`sortSubagentGroups`) and each subagent's own right under it
-        /// (`nestSubagents`).
+        /// (`nestSubagents`). While the agent list is open, only the agents
+        /// its search matches, and the list's highlight is found among them.
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
+            const start = out.items.len;
+            try fullSwitchList(app, out);
+            if (!menuActive(app)) return;
+            const menu = &app.instances.agents_menu;
+            const search = searchText(app);
+            if (search.len > 0) {
+                var kept = start;
+                for (out.items[start..]) |target| {
+                    if (!matchesSearch(app, target, search)) continue;
+                    out.items[kept] = target;
+                    kept += 1;
+                }
+                out.shrinkRetainingCapacity(kept);
+            }
+            // Activity can change while the menu is open. Keep the highlighted
+            // agent, not its previous row, for navigation, Enter, and Delete;
+            // once it left the rows, the highlight moves to the agent on screen.
+            const listed = out.items[start..];
+            const at = switch (menu.highlight) {
+                .on_screen => null,
+                .agent => |agent| positionIn(listed, agent),
+            };
+            if (at) |position| {
+                menu.selected = position;
+            } else if (positionIn(listed, app.agent_on_screen)) |position| {
+                menu.highlight = .on_screen;
+                menu.selected = position;
+            } else {
+                // A search hides the agent on screen too: the first match
+                // takes the highlight and keeps it while the rows change.
+                menu.highlight = if (listed.len > 0) .{ .agent = listed[0] } else .on_screen;
+                menu.selected = 0;
+            }
+        }
+
+        /// Every open agent in switch order, whatever the agent list's search.
+        fn fullSwitchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
             defer app.alloc.free(entries);
@@ -1094,24 +1143,9 @@ pub fn Runtime(comptime App: type) type {
             sortSubagentGroups(entries, switch_order);
             nestSubagents(entries, switch_order, order[hosted.len + 1 ..]);
             try out.ensureUnusedCapacity(app.alloc, switch_order.len);
-            const search = searchText(app);
             for (switch_order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
-                const target: ?*ChildAgent = if (position == 0) null else hosted[position - 1];
-                if (search.len > 0 and !matchesSearch(app, target, search)) continue;
-                out.appendAssumeCapacity(target);
-            }
-            // Activity can change while the menu is open. Keep the highlighted
-            // agent, not its previous row, for navigation, Enter, and Delete;
-            // once it closed, the highlight moves to the agent on screen.
-            if (menuActive(app)) {
-                const menu = &app.instances.agents_menu;
-                const at = switch (menu.highlight) {
-                    .on_screen => null,
-                    .agent => |agent| positionIn(out.items, agent),
-                };
-                if (at == null) menu.highlight = .on_screen;
-                menu.selected = at orelse positionIn(out.items, app.agent_on_screen) orelse 0;
+                out.appendAssumeCapacity(if (position == 0) null else hosted[position - 1]);
             }
         }
 
@@ -1119,6 +1153,20 @@ pub fn Runtime(comptime App: type) type {
         fn searchText(app: *App) []const u8 {
             if (!menuActive(app)) return "";
             return app.input_runtime.edit_state.input.items;
+        }
+
+        /// The agent on the row just above `target`'s in the full switch
+        /// order, which takes `target`'s place on screen when it closes. A
+        /// subagent's own subagents are listed under it, so the row is above
+        /// its whole branch, as it is above an instance's subagents. Null when
+        /// `target` is the first row, or not listed.
+        fn rowAbove(app: *App, target: ?*ChildAgent) !?ListedAgent {
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try fullSwitchList(app, &order);
+            const at = positionIn(order.items, target) orelse return null;
+            if (at == 0) return null;
+            return .{ .agent = order.items[at - 1] };
         }
 
         /// Whether agent `target`'s name or title has `search` in it, case aside.
@@ -1399,7 +1447,8 @@ pub fn Runtime(comptime App: type) type {
             return app.instances.agents_menu.open;
         }
 
-        /// Opens the agent list with the agent on screen highlighted.
+        /// Opens the agent list on the agent on screen, which Esc and Ctrl+X
+        /// go back to.
         pub fn openMenu(app: *App) !void {
             if (comptime !@hasField(App, "instances")) return;
             listRestoredSubagents(app);
@@ -1410,6 +1459,7 @@ pub fn Runtime(comptime App: type) type {
             menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
             menu.window_start = 0;
             menu.highlight = .{ .agent = app.agent_on_screen };
+            menu.origin = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
             setDraftAside(app);
             menu.open = true;
@@ -1421,8 +1471,8 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Closes the list, keeping on screen the agent it shows. Another
-        /// surface taking the footer closes it this way.
+        /// Closes the list, keeping on screen the agent it shows. A paste and
+        /// another surface taking the footer close it this way.
         pub fn closeMenu(app: *App) bool {
             if (!menuActive(app)) return false;
             endMenu(app);
@@ -1434,6 +1484,7 @@ pub fn Runtime(comptime App: type) type {
             const menu = &app.instances.agents_menu;
             menu.open = false;
             menu.highlight = .on_screen;
+            menu.origin = .on_screen;
             menu.close_armed = null;
             putDraftBack(app);
             app.shell.render_requests.request(.footer);
@@ -1459,27 +1510,91 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Copies the open list's search out of the composer and empties it,
+        /// so a switch can carry it on to the arriving agent's composer. Null
+        /// with no search, or when the copy can't be made, which drops it.
+        /// The caller frees the copy.
+        fn takeSearch(app: *App) ?[]u8 {
+            const text = app.input_runtime.edit_state.input.items;
+            if (text.len == 0) return null;
+            const copy = app.alloc.dupe(u8, text) catch {
+                debug_trace.logf("host", "agent list search dropped bytes={d} reason=out_of_memory", .{text.len});
+                return null;
+            };
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            return copy;
+        }
+
+        /// Types `text`, a search `takeSearch` carried, into the composer,
+        /// the open list's search box.
+        fn putSearchBack(app: *App, text: []const u8) void {
+            app.input_runtime.textReplacementState().replace(app.alloc, text) catch {
+                debug_trace.logf("host", "agent list search dropped bytes={d} reason=out_of_memory", .{text.len});
+            };
+        }
+
         /// The composer's search changed, so rows came or went: the list
-        /// scrolls back to its top, and a close the first Delete armed lapses.
+        /// scrolls back to its top, a close the first Delete armed lapses,
+        /// and when the highlight moved to another row the list shows its
+        /// agent, as a move does.
         pub fn searchChanged(app: *App) void {
             if (!menuActive(app)) return;
             const menu = &app.instances.agents_menu;
             menu.close_armed = null;
             menu.window_start = 0;
+            previewHighlight(app) catch |err| {
+                debug_trace.logf("host", "agent list search preview failed err={s}; keeping agent={s}", .{ @errorName(err), nameOf(app.agent_on_screen) });
+            };
+            debug_trace.eventf("host", "agents_menu_search", .{}, "bytes={d} agent={s}", .{ searchText(app).len, nameOf(app.agent_on_screen) });
             app.shell.render_requests.request(.footer);
         }
 
-        /// Esc, Ctrl+X, Ctrl+C, and a paste: closes the list. The agent on
-        /// screen stays, since moving the highlight never changed it.
+        /// Shows the agent on the highlighted row when another is on screen,
+        /// and keeps the highlight on it. After a search edit that is the
+        /// agent on screen when it still matches, else the first match
+        /// (`tests/tla/agents_menu/spec/AgentsMenu.tla` PreviewOnSearch).
+        /// With no match there is no row, and the agent shown stays.
+        fn previewHighlight(app: *App) !void {
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try switchList(app, &order);
+            if (order.items.len == 0) return;
+            const menu = &app.instances.agents_menu;
+            const target = order.items[@min(menu.selected, order.items.len - 1)];
+            menu.highlight = .{ .agent = target };
+            if (target != app.agent_on_screen) try show(app, target);
+        }
+
+        /// Esc, Ctrl+X, and Ctrl+C: closes the list and shows again the agent
+        /// it opened on. If that agent closed meanwhile, the one shown stays
+        /// (`tests/tla/agents_menu/spec/AgentsMenu.tla` BackToOrigin).
         pub fn backMenu(app: *App) !bool {
             if (!menuActive(app)) return false;
+            const origin = app.instances.agents_menu.origin;
             endMenu(app);
+            switch (origin) {
+                .agent => |agent| {
+                    var order: std.ArrayList(?*ChildAgent) = .empty;
+                    defer order.deinit(app.alloc);
+                    try switchList(app, &order);
+                    if (positionIn(order.items, agent) != null) {
+                        try show(app, agent);
+                    } else {
+                        debug_trace.logf("host", "agents menu origin closed; keeping agent={s}", .{nameOf(app.agent_on_screen)});
+                    }
+                },
+                .on_screen => debug_trace.logf("host", "agents menu origin closed; keeping agent={s}", .{nameOf(app.agent_on_screen)}),
+            }
             debug_trace.eventf("host", "agents_menu_back", .{}, "agent={s}", .{nameOf(app.agent_on_screen)});
             return true;
         }
 
         /// Moves the list's highlight by `delta`, keeping it in view in
-        /// `row_budget` rows. The agent on screen stays until Enter.
+        /// `row_budget` rows, and shows the agent it lands on: the list
+        /// previews by switching (`tests/tla/agents_menu/spec/AgentsMenu.tla`
+        /// PreviewOnMove). Up on the first row has nothing above it, so it
+        /// closes the list and keeps the agent shown (UpOnTopCloses); Down on
+        /// the last row stays there.
         pub fn moveMenu(app: *App, delta: i32, row_budget: u16) !bool {
             if (!menuActive(app)) return false;
             disarmClose(app);
@@ -1488,18 +1603,26 @@ pub fn Runtime(comptime App: type) type {
             try switchList(app, &order);
             if (order.items.len == 0) return true;
             const menu = &app.instances.agents_menu;
+            const current = @min(menu.selected, order.items.len - 1);
+            if (delta < 0 and current == 0) {
+                endMenu(app);
+                debug_trace.eventf("host", "agents_menu_closed", .{}, "agent={s} reason=first_row", .{nameOf(app.agent_on_screen)});
+                return true;
+            }
             const last: i64 = @intCast(order.items.len - 1);
-            const current: i64 = @intCast(@min(menu.selected, order.items.len - 1));
-            menu.selected = @intCast(std.math.clamp(current + delta, 0, last));
+            menu.selected = @intCast(std.math.clamp(@as(i64, @intCast(current)) + delta, 0, last));
             const target = order.items[menu.selected];
             menu.highlight = .{ .agent = target };
+            if (target != app.agent_on_screen) try show(app, target);
             menu.window_start = agents_menu_presentation.windowStart(menuProjection(app), row_budget);
             app.shell.render_requests.request(.footer);
-            debug_trace.eventf("host", "agents_menu_moved", .{}, "position={d} agent={s}", .{ menu.selected + 1, nameOf(target) });
+            debug_trace.eventf("host", "agents_menu_previewed", .{}, "position={d} agent={s}", .{ menu.selected + 1, nameOf(target) });
             return true;
         }
 
-        /// Enter: closes the list and shows the highlighted agent.
+        /// Enter: closes the list and keeps the highlighted agent on screen,
+        /// which the preview already shows; a list that changed under it
+        /// shows it now.
         pub fn submitMenu(app: *App) !bool {
             if (!menuActive(app)) return false;
             var order: std.ArrayList(?*ChildAgent) = .empty;
@@ -1610,9 +1733,9 @@ pub fn Runtime(comptime App: type) type {
 
         /// Closes instance `target`, null for the first, and every subagent in
         /// its tree, as `/close` does on its screen. When one of them is on
-        /// screen, the next instance takes its place, and the list stays open
-        /// with the agent on screen highlighted. Call only while another
-        /// instance runs.
+        /// screen, the row above it takes its place, or the next instance
+        /// when it is the first row, and the list stays open with the agent
+        /// on screen highlighted. Call only while another instance runs.
         fn closeInstanceFromMenu(app: *App, target: ?*ChildAgent) !void {
             const menu = &app.instances.agents_menu;
             if (target) |child| try closeInstance(app, child) else try closeFirstInstance(app);
@@ -1719,7 +1842,10 @@ pub fn Runtime(comptime App: type) type {
         /// Drops subagent `child`, which its host closed, and every subagent
         /// it started, each before the agent that started it, as `/close`
         /// drops an instance's tree. When one of them is on screen, the agent
-        /// that started `child` takes its place.
+        /// on the row above `child` takes its place, as it does for a closed
+        /// instance (`tests/tla/agents_menu/spec/AgentsMenu.tla`
+        /// CloseShowsRowAbove); the agent that started `child` does when
+        /// `child` is not listed.
         fn closeBranch(app: *App, child: *ChildAgent) !void {
             var branch: std.ArrayList(*ChildAgent) = .empty;
             defer branch.deinit(app.alloc);
@@ -1728,7 +1854,10 @@ pub fn Runtime(comptime App: type) type {
                 if (entry != child and descendsFrom(app, entry, child)) try branch.append(app.alloc, entry);
             }
             const parent: ?*ChildAgent = if (ownerOf(app, hostOf(app, child))) |owner| hostedOf(app, owner) else null;
-            if (inBranch(branch.items, app.agent_on_screen)) try show(app, parent);
+            if (inBranch(branch.items, app.agent_on_screen)) {
+                const above = try rowAbove(app, child);
+                try show(app, if (above) |row| row.agent else parent);
+            }
             const menu = &app.instances.agents_menu;
             stopSet(app, branch.items, null);
             debug_trace.eventf("host", "subagent_closed", .{}, "agent={s} subagents={d}", .{ child.id, branch.items.len - 1 });
@@ -1992,8 +2121,12 @@ pub fn Runtime(comptime App: type) type {
             const arriving = screenOf(app, target);
             if (leaving == arriving) return;
             // The open list's search box lends the composer: each agent keeps
-            // its own draft, and the arriving one's is set aside in turn.
+            // its own draft, and the arriving one's is set aside in turn. The
+            // search typed in the box goes on with the list, which shows each
+            // agent it highlights by switching to it.
             const searching = menuActive(app);
+            const search = if (searching) takeSearch(app) else null;
+            defer if (search) |text| app.alloc.free(text);
             if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
@@ -2003,7 +2136,10 @@ pub fn Runtime(comptime App: type) type {
             std.mem.swap(AssistantPacer, &app.pacer, &arriving.pacer);
             std.mem.swap(bool, &app.fast_mode, &arriving.fast_mode);
             arriving.draft.restore(app.alloc, app.input_runtime.composerStashView());
-            if (searching) setDraftAside(app);
+            if (searching) {
+                setDraftAside(app);
+                if (search) |text| putSearchBack(app, text);
+            }
             app.agent_on_screen = target;
             app.screen_owner = if (target) |child| &child.agent else null;
         }
@@ -2413,9 +2549,9 @@ pub fn Runtime(comptime App: type) type {
         /// Closes instance `child` and every subagent in its tree: their
         /// workers stop, a run in flight ends cancelled, and their sessions
         /// are saved and closed, each subagent's before the agent that started
-        /// it. When one of
-        /// them is on screen, the next instance is shown first. The rest of
-        /// the host keeps running.
+        /// it. When one of them is on screen, the row above `child` is shown
+        /// first, or the next instance when `child` is the first row. The
+        /// rest of the host keeps running.
         pub fn closeInstance(app: *App, child: *ChildAgent) !void {
             try closeTree(app, &child.agent, child, nextInstanceAfter(app, child), child.id);
             dropHosted(app, child);
@@ -2472,11 +2608,13 @@ pub fn Runtime(comptime App: type) type {
             if (saved.* == null and app_session_runtime.Runtime(App).savedSessionId(agent) != null) saved.* = agent;
         }
 
-        /// Shows `next` when instance `root`, which `hosted` holds or null for
-        /// the first, or a subagent of its tree is on screen, then stops and
-        /// drops every subagent in the tree, each before the agent that
-        /// started it. The
-        /// instance's own turn is cancelled; its teardown is the caller's.
+        /// When instance `root`, which `hosted` holds or null for the first,
+        /// or a subagent of its tree is on screen, shows the agent on the row
+        /// above the instance's, as the agent list orders them, or `next`
+        /// when it is the first row (`tests/tla/agents_menu/spec/AgentsMenu.tla`
+        /// CloseShowsRowAbove). Then stops and drops every subagent in the
+        /// tree, each before the agent that started it. The instance's own
+        /// turn is cancelled; its teardown is the caller's.
         fn closeTree(app: *App, root: *AppAgent, hosted: ?*ChildAgent, next: ?*ChildAgent, label: []const u8) !void {
             var tree: std.ArrayList(*ChildAgent) = .empty;
             defer tree.deinit(app.alloc);
@@ -2484,7 +2622,10 @@ pub fn Runtime(comptime App: type) type {
                 if (entry.agent.role == .subagent and rootInstance(app, entry) == root) try tree.append(app.alloc, entry);
             }
             const on_screen = app.agent_on_screen;
-            if (on_screen == hosted or inBranch(tree.items, on_screen)) try show(app, next);
+            if (on_screen == hosted or inBranch(tree.items, on_screen)) {
+                const above = try rowAbove(app, hosted);
+                try show(app, if (above) |row| row.agent else next);
+            }
             // The instance's own host stops first, so no work the close ends
             // owes a report into the tree.
             const root_host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) root.session_persistence.subagent_host else null;
@@ -2569,6 +2710,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "instances")) {
                 const menu = &app.instances.agents_menu;
                 if (menu.highlight == .agent and menu.highlight.agent == child) menu.highlight = .on_screen;
+                if (menu.origin == .agent and menu.origin.agent == child) menu.origin = .on_screen;
             }
             if (!released) return;
             child.screen.deinit(app.alloc);
