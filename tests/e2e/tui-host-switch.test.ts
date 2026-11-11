@@ -1526,12 +1526,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // approval main shows for it.
         expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}writer {2,}\S/m);
         expect(over).toMatch(/^ {2}\u2514 writer .*needs approval/m);
-        // A digit searches the list, so it can't answer the prompt under it.
-        // Esc clears the search, then closes the list.
+        // A digit goes in the list's search box, so it can't answer the
+        // prompt under it. Esc clears the search, then closes the list.
         await session.sendKeys("1");
-        await session.waitForText('matching "1"', 10_000);
+        await session.waitForText("esc clear", 10_000);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes('matching "1"'), 10_000);
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes("esc clear"), 10_000);
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
         expect(back).toContain("Subagent writer needs permission");
@@ -1976,7 +1976,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         expect(await session.capturePane()).not.toContain(LIST_HINT);
 
-        // Ctrl+X opens the list; typing there searches it, not the draft.
+        // Ctrl+X opens the list and sets the draft aside: typing there
+        // searches the list.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendLiteral("q");
@@ -2001,42 +2002,66 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
   test(
-    "typing in the agent list searches it by name and title, and Enter opens the match",
+    "typing in the agent list searches it from the composer, and Enter opens the match",
     async () => {
       await withReviewer(async (session) => {
         await session.sendLiteral("EDGE_KEEP_ME");
         await session.waitForPane((pane) => pane.includes("main \u00b7 ctrl+x"), 10_000);
         await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        // The draft is set aside, so the composer is the search box.
+        const opened = await session.waitForPane((pane) => pane.includes(LIST_HINT) && !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        expect(opened).toContain("Agents 2");
 
         // Case aside, only reviewer's name has it, so main's row goes.
         await session.sendLiteral("VIEW");
-        const found = await session.waitForPane((pane) => pane.includes('Agents 1 matching "VIEW"'), 10_000);
+        const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "VIEW"), 10_000);
         expect(found).toMatch(subagentRow("reviewer"));
         expect(found).toContain("esc clear");
         expect(found).not.toContain("delete close");
 
         // Nothing matches: the list stays open, with no rows.
         await session.sendLiteral("q");
-        const none = await session.waitForPane((pane) => pane.includes('Agents 0 matching "VIEWq"'), 10_000);
+        const none = await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "VIEWq"), 10_000);
         expect(none).not.toMatch(subagentRow("reviewer"));
 
-        // Backspace takes a letter off; Esc clears the search, not the list.
+        // Backspace edits the search; Esc clears it, not the list.
         await session.sendKeys("BSpace");
-        await session.waitForText('Agents 1 matching "VIEW"', 10_000);
+        await session.waitForPane((pane) => pane.includes("Agents 1") && !composerContains(pane, "VIEWq"), 10_000);
         await session.sendKeys("Escape");
         const cleared = await session.waitForPane((pane) => pane.includes("Agents 2") && pane.includes("esc back"), 10_000);
-        expect(cleared).not.toContain("matching");
+        expect(composerContains(cleared, "VIEW")).toBe(false);
 
-        // Enter opens the match, and main's draft never took the letters.
+        // Enter opens the match, with its own empty composer.
         await session.sendLiteral("rev");
-        await session.waitForText('Agents 1 matching "rev"', 10_000);
+        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "rev"), 10_000);
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        expect(composerContains(child, "rev")).toBe(false);
+
+        // /agents opens the list with an empty search box, and leaves the
+        // composer empty when it closes.
+        await session.sendLiteral("/agents");
+        await session.sendKeys("Enter");
+        const listed = await session.waitForPane((pane) => pane.includes(LIST_HINT), 10_000);
+        expect(composerContains(listed, "/agents")).toBe(false);
+        await session.sendKeys("Escape");
+        const closed = await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        expect(composerContains(closed, "/agents")).toBe(false);
+
+        // Back on main, its draft is as it was typed.
         await showAgent(session, "main");
-        const main = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_KEEP_ME"), 10_000);
+        const main = await session.waitForPane((pane) => composerContains(pane, "EDGE_KEEP_ME"), 10_000);
         expect(main).not.toContain("EDGE_KEEP_MEVIEW");
         expect(main).not.toContain("EDGE_KEEP_MErev");
+
+        // Ctrl+P lends the composer to the model picker; Ctrl+X from there
+        // opens the list on the same draft, which comes back when it closes.
+        await session.sendKeys("C-p");
+        await session.waitForPane((pane) => !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT) && composerContains(pane, "EDGE_KEEP_ME"), 10_000);
       });
     },
     TIMEOUT,
