@@ -5430,6 +5430,9 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     // The turn fails with the notice as its text, as the other loop stops
     // do, so a parent agent's report says why it ended.
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, deps.finalized_outcome.?);
+    // fx saved the failed turn, so the host hears that it kept it.
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .kept_failure), deps.finalized_disposition);
+    try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
     try std.testing.expect(textContains(&deps, "no shell effect"));
     try std.testing.expect(std.mem.find(u8, deps.history_assistant_text.?, "no shell effect") != null);
     try std.testing.expectEqual(@as(usize, 0), deps.system_notices.items.len);

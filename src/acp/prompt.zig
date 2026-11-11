@@ -70,6 +70,8 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const command_output_text = @import("command_output_text.zig");
+const CommandOutputText = command_output_text.CommandOutputText;
 const tool_projection_mod = @import("../core/tooling/tool_projection.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_admission = @import("../core/tooling/tool_admission.zig");
@@ -198,6 +200,20 @@ const ToolCallCard = enum {
     finished,
 };
 
+/// What one call's command output holds back, per stream.
+const CommandOutputTail = struct {
+    /// Owned.
+    call_id: []u8,
+    streams: std.EnumArray(command_output_content.Stream, CommandOutputText) = .initFill(.{}),
+
+    fn held(self: *const CommandOutputTail) bool {
+        for (self.streams.values) |output| {
+            if (output.pending_len > 0) return true;
+        }
+        return false;
+    }
+};
+
 /// Pure final admission for every ACP model request. A persisted or
 /// reconfigured session cannot issue an ultrafast request unless the current
 /// Gateway catalog still verifies the selected model capability.
@@ -247,6 +263,12 @@ const AcpContext = struct {
     /// card stands. Keys are owned copies of provider call ids so the ID
     /// stays stable from permission review through execution.
     published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
+    /// Calls whose command output ended partway through a character. A
+    /// command's worker thread sends its output, and keeps sending after
+    /// `yield_time_ms` while the turn goes on, so this list has its own lock
+    /// and the worker never reads `published_tool_calls`.
+    command_output_tails: std.ArrayList(CommandOutputTail) = .empty,
+    command_output_mutex: std.Io.Mutex = .init,
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
@@ -265,10 +287,19 @@ const AcpContext = struct {
     saw_host_steering_open: bool = false,
     closed_host_steering: bool = false,
 
+    /// Frees the turn's tool-call state: the published cards and any command
+    /// output still held back.
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+        for (self.command_output_tails.items) |tail| {
+            if (tail.held()) {
+                debug_trace.logf("acp", "command output tail dropped at turn end call_id={s}", .{tail.call_id});
+            }
+            self.alloc.free(tail.call_id);
+        }
+        self.command_output_tails.deinit(self.alloc);
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -470,7 +501,54 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    /// Sends one chunk of a command's output as progress, holding back a
+    /// character the chunk cuts off. Runs on the command's worker thread.
+    fn sendCommandOutput(self: *AcpContext, call_id: []const u8, stream: command_output_content.Stream, chunk: []const u8) !void {
+        const io = io_mod.getIo();
+        self.command_output_mutex.lockUncancelable(io);
+        defer self.command_output_mutex.unlock(io);
+        const held = self.commandOutputTailIndex(call_id);
+        if (held == null and std.unicode.utf8ValidateSlice(chunk)) return self.sendToolCallProgressText(call_id, chunk);
+        const index = held orelse index: {
+            const owned_id = try self.alloc.dupe(u8, call_id);
+            errdefer self.alloc.free(owned_id);
+            try self.command_output_tails.append(self.alloc, .{ .call_id = owned_id });
+            break :index self.command_output_tails.items.len - 1;
+        };
+        const tail = &self.command_output_tails.items[index];
+        const text = try tail.streams.getPtr(stream).append(self.alloc, chunk);
+        defer self.alloc.free(text);
+        if (!tail.held()) self.alloc.free(self.command_output_tails.swapRemove(index).call_id);
+        if (text.len > 0) try self.sendToolCallProgressText(call_id, text);
+    }
+
+    /// Sends what a call's command output held back, escaped, once its
+    /// output ends or its card gets its final update.
+    fn finishCommandOutput(self: *AcpContext, call_id: []const u8) !void {
+        const io = io_mod.getIo();
+        self.command_output_mutex.lockUncancelable(io);
+        defer self.command_output_mutex.unlock(io);
+        const index = self.commandOutputTailIndex(call_id) orelse return;
+        var tail = self.command_output_tails.swapRemove(index);
+        defer self.alloc.free(tail.call_id);
+        for (&tail.streams.values) |*output| {
+            if (output.pending_len == 0) continue;
+            const text = try output.finish(self.alloc);
+            defer self.alloc.free(text);
+            try self.sendToolCallProgressText(call_id, text);
+        }
+    }
+
+    /// Caller holds `command_output_mutex`.
+    fn commandOutputTailIndex(self: *const AcpContext, call_id: []const u8) ?usize {
+        for (self.command_output_tails.items, 0..) |tail, index| {
+            if (std.mem.eql(u8, tail.call_id, call_id)) return index;
+        }
+        return null;
+    }
+
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        try self.finishCommandOutput(tool_call_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
@@ -483,6 +561,7 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
+        try self.finishCommandOutput(tool_call_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
@@ -2277,6 +2356,16 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (disposition == .length_limited) {
         ctx.stop_reason = .max_output_tokens;
+    } else if (disposition == .step_limited) {
+        // The turn keeps its prompt and tool calls for a follow-up, so it is
+        // not a refusal, which ACP drops from the next prompt
+        // (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut).
+        ctx.stop_reason = .max_model_turns;
+    } else if (disposition == .kept_failure) {
+        // fx saved this failed turn, so the next prompt holds it. ACP drops a
+        // refused turn from the next prompt, so the turn ends with end_turn
+        // (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut).
+        ctx.stop_reason = .end_turn;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
@@ -3368,7 +3457,11 @@ fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !
     try pushText(raw_ctx, .{ .operational = payload.preview });
 }
 
-fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
+fn pushCommandOutputComplete(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const id = lifecycle_id orelse return;
+    try ctx.finishCommandOutput(id.call_id);
+}
 
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -3390,10 +3483,10 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
     return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
 }
 
-fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
+fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
-    try ctx.sendToolCallProgressText(id.call_id, chunk);
+    try ctx.sendCommandOutput(id.call_id, stream, chunk);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
@@ -4417,6 +4510,127 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
     }
 }
 
+const ProgressCapture = struct {
+    alloc: Allocator,
+    out: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+        const self: *ProgressCapture = @ptrCast(@alignCast(raw.?));
+        try self.out.appendSlice(self.alloc, bytes);
+    }
+
+    /// The in_progress text `call_id` got, in order. Checks that every frame
+    /// is valid UTF-8 and that no progress follows the call's final update.
+    fn progressText(self: *const ProgressCapture, call_id: []const u8) ![]u8 {
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(self.alloc);
+        var finished = false;
+        var frames = std.mem.splitScalar(u8, self.out.items, '\n');
+        while (frames.next()) |frame| {
+            if (frame.len == 0) continue;
+            try std.testing.expect(std.unicode.utf8ValidateSlice(frame));
+            const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, frame, .{});
+            defer parsed.deinit();
+            const update = parsed.value.object.get("params").?.object.get("update").?.object;
+            if (!std.mem.eql(u8, update.get("toolCallId").?.string, call_id)) continue;
+            try std.testing.expect(!finished);
+            if (!std.mem.eql(u8, update.get("status").?.string, "in_progress")) {
+                finished = true;
+                continue;
+            }
+            for (update.get("content").?.array.items) |item| {
+                try text.appendSlice(self.alloc, item.object.get("content").?.object.get("text").?.string);
+            }
+        }
+        try std.testing.expect(finished);
+        return text.toOwnedSlice(self.alloc);
+    }
+};
+
+test "ACP command progress joins characters split per call and stream and escapes the rest" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var capture: ProgressCapture = .{ .alloc = alloc };
+    defer capture.out.deinit(alloc);
+    state.writer = jsonrpc.Writer.initCallback(&capture, ProgressCapture.write);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    const first: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_first" };
+    const second: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_second" };
+    try onCommandOutputChunk(&ctx, second, .stdout, "go ");
+    try onCommandOutputChunk(&ctx, first, .stdout, "a\xd0");
+    try onCommandOutputChunk(&ctx, second, .stdout, "\xe2\x82");
+    try onCommandOutputChunk(&ctx, first, .stderr, "\xf0\x90");
+    try onCommandOutputChunk(&ctx, first, .stdout, "\xafb");
+    try onCommandOutputChunk(&ctx, second, .stdout, "\xac");
+    try onCommandOutputChunk(&ctx, first, .stderr, "\x90\x80");
+    try onCommandOutputChunk(&ctx, first, .stdout, "\xff\xd0");
+    try std.testing.expectEqual(@as(usize, 1), ctx.command_output_tails.items.len);
+    try pushCommandOutputComplete(&ctx, first);
+    try ctx.sendToolCallError(first.call_id, "failed");
+    try onCommandOutputChunk(&ctx, second, .stdout, "\xf0\x90");
+    try ctx.sendToolCallCompletedWithCommandResult(second.call_id, "completed", null);
+    try std.testing.expectEqual(@as(usize, 0), ctx.command_output_tails.items.len);
+
+    const first_text = try capture.progressText(first.call_id);
+    defer alloc.free(first_text);
+    try std.testing.expectEqualStrings("a\xd0\xafb\xf0\x90\x90\x80\\xff\\xd0", first_text);
+    const second_text = try capture.progressText(second.call_id);
+    defer alloc.free(second_text);
+    try std.testing.expectEqualStrings("go \xe2\x82\xac\\xf0\\x90", second_text);
+}
+
+test "ACP command output from a worker thread keeps its own lock beside the turn's cards" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var capture: ProgressCapture = .{ .alloc = alloc };
+    defer capture.out.deinit(alloc);
+    state.writer = jsonrpc.Writer.initCallback(&capture, ProgressCapture.write);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    const rounds = 200;
+    // A command that outlived its yield keeps printing from its worker
+    // thread, splitting characters on both streams.
+    const Worker = struct {
+        fn run(context: *AcpContext) !void {
+            const id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_worker" };
+            for (0..rounds) |_| {
+                try onCommandOutputChunk(context, id, .stdout, "\xd0");
+                try onCommandOutputChunk(context, id, .stderr, "\xf0\x9f\x98");
+                try onCommandOutputChunk(context, id, .stdout, "\xaf\n");
+                try onCommandOutputChunk(context, id, .stderr, "\x80");
+            }
+        }
+    };
+    // fx installs its process Io before it starts any thread; a test sets up
+    // its fallback Io on first use, so do that before the worker starts.
+    _ = io_mod.getIo();
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+    // Meanwhile the turn goes on: other calls print, finish, and get cards.
+    for (0..rounds) |index| {
+        var buffer: [32]u8 = undefined;
+        const call_id = try std.mem.print(&buffer, "call_main_{d}", .{index});
+        try onCommandOutputChunk(&ctx, .{ .turn_id = 1, .call_id = call_id }, .stdout, "\xe2\x82");
+        try ctx.sendToolCallCompletedWithCommandResult(call_id, "done", null);
+        try ctx.published_tool_calls.ensureUnusedCapacity(alloc, 1);
+        ctx.published_tool_calls.putAssumeCapacity(try alloc.dupe(u8, call_id), .finished);
+    }
+    worker.join();
+    try ctx.sendToolCallCompletedWithCommandResult("call_worker", "done", null);
+    try std.testing.expectEqual(@as(usize, 0), ctx.command_output_tails.items.len);
+
+    const worker_text = try capture.progressText("call_worker");
+    defer alloc.free(worker_text);
+    try std.testing.expectEqualStrings(text_utils.repeat("\xd0\xaf\n\xf0\x9f\x98\x80", rounds), worker_text);
+    const main_text = try capture.progressText("call_main_7");
+    defer alloc.free(main_text);
+    try std.testing.expectEqualStrings("\\xe2\\x82", main_text);
+}
+
 test "ACP message IDs rotate when the logical message kind resumes" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
@@ -5316,15 +5530,27 @@ test "ACP deps validate malformed registered calls" {
     try std.testing.expectEqualStrings("web_fetch field \"url\" must be a string", result.failure);
 }
 
-test "ACP finalization maps failed turns and provider length" {
+test "ACP finalization maps each turn ending to its stop reason" {
+    // `acp` is what `fx acp` sends and `libfx` is what libfx's result carries.
+    // A failed turn fx keeps in its history ends with end_turn, one it leaves
+    // out ends with refusal (refused for libfx), and a step-limit stop ends
+    // with max_turn_requests (max_model_turns for libfx).
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
         expected: acp_types.StopReason,
+        acp: []const u8,
+        libfx: []const u8,
     }{
-        .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens },
-        .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens },
-        .{ .outcome = .failed, .disposition = null, .expected = .refused },
+        .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens, .acp = "max_tokens", .libfx = "max_output_tokens" },
+        .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens, .acp = "max_tokens", .libfx = "max_output_tokens" },
+        .{ .outcome = .failed, .disposition = .step_limited, .expected = .max_model_turns, .acp = "max_turn_requests", .libfx = "max_model_turns" },
+        .{ .outcome = .failed, .disposition = .kept_failure, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
+        .{ .outcome = .failed, .disposition = null, .expected = .refused, .acp = "refusal", .libfx = "refused" },
+        .{ .outcome = .paused, .disposition = null, .expected = .refused, .acp = "refusal", .libfx = "refused" },
+        .{ .outcome = .completed, .disposition = null, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
+        .{ .outcome = .completed, .disposition = .completed, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
+        .{ .outcome = .interrupted, .disposition = null, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
     };
 
     for (cases) |case| {
@@ -5337,6 +5563,17 @@ test "ACP finalization maps failed turns and provider length" {
         try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
 
         try std.testing.expectEqual(case.expected, ctx.stop_reason);
+        for ([_]acp_types.PromptProtocol{ .acp, .libfx }) |protocol| {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try acp_types.writePromptResponse(&out.writer, ctx.stop_reason, protocol);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(
+                if (protocol == .acp) case.acp else case.libfx,
+                parsed.value.object.get("stopReason").?.string,
+            );
+        }
     }
 }
 

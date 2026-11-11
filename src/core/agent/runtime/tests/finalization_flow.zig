@@ -355,6 +355,9 @@ test "processQueuedPrompt stops repeated malformed calls before another provider
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    // fx saved this failed turn, so the host hears that it kept it
+    // (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut).
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .kept_failure), hooks.finalized_disposition);
     try std.testing.expectEqualStrings(notice, hooks.history_assistant_text.?);
     try std.testing.expectEqualStrings(notice, hooks.finish_assistant_text.?);
     try std.testing.expect(
@@ -510,7 +513,12 @@ test "processQueuedPrompt step limit pushes configured notice and finish event" 
         hooks.history_turns.items[0],
     ) orelse return error.TestExpectedTurnSummary;
     try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
-    try std.testing.expect(hooks.finalized_disposition == null);
+    // A step-limit stop carries its own disposition, so a host can tell it
+    // from every other failed turn (`tests/tla/acp/AcpStopReasons.tla`).
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .step_limited), hooks.finalized_disposition);
+    // An explicit disposition wins over kept_failure, and the turn is saved.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
 }
 
 test "processQueuedPrompt step limit persists malformed argument failure execution" {
@@ -630,6 +638,158 @@ test "partial stream failure persists failed terminal reason" {
         hooks.history_turns.items[0].interrupted.terminal_reason,
     );
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+// Every way a turn can end as failed or paused: a finished prompt is attached
+// exactly where fx saves the turn in the history, and the host hears
+// `kept_failure` for a failed turn it saved. An explicit disposition stays.
+// The next request is built from the saved history, so a saved turn is a turn
+// the next request holds (`tests/tla/acp/AcpStopReasons.tla`
+// RefusalLeavesTurnOut, DroppedTurnRefuses).
+test "a failed turn answers kept_failure exactly when fx saves it, for every ending" {
+    const alloc = std.testing.allocator;
+    const read_call = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};
+    const search_start = [_]ToolCall{toolCall("provider_search", "web_search", "{}")};
+    const search_repeat = [_]ToolCall{toolCall("provider_search_repeat", "web_search", "{}")};
+    const cases = [_]struct {
+        name: []const u8,
+        completions: []const FakeCompletion,
+        outcome: types.TurnPresentationOutcome = .failed,
+        /// The turn is in the saved history, with a finished prompt attached.
+        saved: bool,
+        /// What `processQueuedPrompt` returns, when it fails.
+        err: ?anyerror = null,
+        /// A disposition the ending passes itself.
+        explicit: ?types.ProviderCompletionDisposition = null,
+        /// A Stop hook that continues once, so the first reply is a retained candidate.
+        stop_hook: bool = false,
+        recovery_checkpoint: bool = false,
+        step_limit: ?usize = null,
+    }{
+        // The turn is left out.
+        .{
+            .name = "an HTTP failure with nothing to keep",
+            .completions = &.{.{ .status = .bad_request, .err_body = "bad" }},
+            .saved = false,
+        },
+        .{
+            .name = "an error with nothing saved",
+            .completions = &.{.{ .stream_error = error.TestProviderFailure }},
+            .saved = false,
+            .err = error.TestProviderFailure,
+        },
+        .{
+            .name = "a pause for review of an uncertain tool",
+            .completions = &.{
+                .{ .streamed_tool_starts = &search_start, .stream_error_after_tool_starts = error.ReadFailed },
+                .{ .tool_calls = &search_repeat, .finish_reason = .provider_error },
+            },
+            .outcome = .paused,
+            .saved = false,
+            .recovery_checkpoint = true,
+        },
+        // The turn is saved.
+        .{
+            .name = "an HTTP failure after partial text",
+            .completions = &.{.{ .chunks = &.{"partial"}, .status = .bad_request, .err_body = "bad" }},
+            .saved = true,
+        },
+        .{
+            .name = "an HTTP failure after a tool step",
+            .completions = &.{ .{ .tool_calls = &read_call }, .{ .status = .bad_request, .err_body = "bad" } },
+            .saved = true,
+        },
+        .{
+            .name = "an HTTP failure after a Stop hook candidate",
+            .completions = &.{
+                .{ .chunks = &.{"candidate"}, .content = "candidate" },
+                .{ .status = .bad_request, .err_body = "bad" },
+            },
+            .saved = true,
+            .stop_hook = true,
+        },
+        .{
+            .name = "a stream cut after partial text",
+            .completions = &.{.{ .chunks = &.{"partial"}, .stream_error_after_chunks = error.TestProviderFailure }},
+            .saved = true,
+            .err = error.TestProviderFailure,
+        },
+        .{
+            .name = "an error after a tool step",
+            .completions = &.{ .{ .tool_calls = &read_call }, .{ .stream_error = error.TestProviderFailure } },
+            .saved = true,
+            .err = error.TestProviderFailure,
+        },
+        .{
+            .name = "an error after a Stop hook candidate",
+            .completions = &.{
+                .{ .content = "candidate" },
+                .{ .chunks = &.{"partial"}, .stream_error_after_chunks = error.TestProviderFailure },
+            },
+            .saved = true,
+            .err = error.TestProviderFailure,
+            .stop_hook = true,
+        },
+        // An ending that names its own disposition keeps it.
+        .{
+            .name = "the step limit",
+            .completions = &.{.{ .tool_calls = &read_call }},
+            .saved = true,
+            .explicit = .step_limited,
+            .step_limit = 1,
+        },
+    };
+
+    for (cases) |case| {
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.enable_recovery_checkpoint = case.recovery_checkpoint;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.gateway_retry_count = 0;
+        if (case.step_limit) |limit| config.agent_step_limit = limit;
+        var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+        defer lifecycle_runtime.deinit();
+        var handler = StopTestHandler{ .alloc = alloc, .action = .{ .continue_once = "verify" } };
+        defer handler.deinit();
+        const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
+
+        const result = if (case.stop_hook)
+            runFakePromptWithLifecycle(&gateway, &hooks, config, fixture.job(), testLifecycleContext(view, alloc, fixture.workspace_root))
+        else
+            runFakePrompt(&gateway, &hooks, config, fixture.job());
+        if (case.err) |expected| try std.testing.expectError(expected, result) else try result;
+
+        std.testing.expectEqual(case.outcome, hooks.finalized_outcome.?) catch |err| {
+            std.debug.print("ending: {s}\n", .{case.name});
+            return err;
+        };
+        const expected_disposition: ?types.ProviderCompletionDisposition = if (case.explicit) |explicit|
+            explicit
+        else if (case.outcome == .failed and case.saved)
+            .kept_failure
+        else
+            null;
+        std.testing.expectEqual(@as(usize, 1), hooks.finalization_count) catch |err| {
+            std.debug.print("ending: {s}\n", .{case.name});
+            return err;
+        };
+        // A finished prompt is attached exactly where the turn is saved.
+        std.testing.expectEqual(case.saved, hooks.finish_event_count == 1) catch |err| {
+            std.debug.print("ending: {s}: finish event count {d}\n", .{ case.name, hooks.finish_event_count });
+            return err;
+        };
+        std.testing.expectEqual(case.saved, hooks.history_turns.items.len == 1) catch |err| {
+            std.debug.print("ending: {s}: history turns {d}\n", .{ case.name, hooks.history_turns.items.len });
+            return err;
+        };
+        std.testing.expectEqual(expected_disposition, hooks.finalized_disposition) catch |err| {
+            std.debug.print("ending: {s}: disposition {any}\n", .{ case.name, hooks.finalized_disposition });
+            return err;
+        };
+    }
 }
 
 test "processQueuedPrompt emits exactly one structured prompt finish per terminal outcome" {
@@ -1214,6 +1374,7 @@ test "common Stop step limit retains candidate and current-turn execution" {
         deps.finish_presentation_text.?,
     );
     try std.testing.expectEqualStrings("Agent step limit reached; continue with a follow-up prompt if needed.", turn.assistant);
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .step_limited), deps.finalized_disposition);
     try std.testing.expectEqual(@as(usize, 2), turn.execution.tool_steps.len);
     try std.testing.expectEqualStrings("candidate", turn.execution.tool_steps[0].assistant.?);
     try std.testing.expectEqualStrings(
@@ -2347,4 +2508,64 @@ test "TurnFinalizationGuard runs PostTurnEnd after failed finish prompt publicat
     try std.testing.expectEqual(@as(u64, 9), hook_capture.turn_ids[0]);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hook_capture.outcomes[0]);
     try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .completed), hook_capture.dispositions[0]);
+}
+
+test "TurnFinalizationGuard fills kept_failure only for a failed finish with a finished prompt and no disposition" {
+    const alloc = std.testing.allocator;
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    const runtime_deps = deps.deps();
+    const Case = struct {
+        outcome: types.TurnPresentationOutcome,
+        disposition: ?types.ProviderCompletionDisposition,
+        finished: bool,
+        expected: ?types.ProviderCompletionDisposition,
+    };
+    const cases = [_]Case{
+        // The rule: failed, no disposition, a finished prompt.
+        .{ .outcome = .failed, .disposition = null, .finished = true, .expected = .kept_failure },
+        // A turn fx did not save has no finished prompt.
+        .{ .outcome = .failed, .disposition = null, .finished = false, .expected = null },
+        // An explicit disposition always wins.
+        .{ .outcome = .failed, .disposition = .step_limited, .finished = true, .expected = .step_limited },
+        .{ .outcome = .failed, .disposition = .length_limited, .finished = true, .expected = .length_limited },
+        .{ .outcome = .failed, .disposition = .length_limited, .finished = false, .expected = .length_limited },
+        .{ .outcome = .failed, .disposition = .kept_failure, .finished = false, .expected = .kept_failure },
+        // No other outcome is a failure.
+        .{ .outcome = .completed, .disposition = null, .finished = true, .expected = null },
+        .{ .outcome = .completed, .disposition = .completed, .finished = true, .expected = .completed },
+        .{ .outcome = .interrupted, .disposition = null, .finished = true, .expected = null },
+        .{ .outcome = .paused, .disposition = null, .finished = true, .expected = null },
+        .{ .outcome = .paused, .disposition = null, .finished = false, .expected = null },
+    };
+
+    for (cases, 0..) |case, index| {
+        var hook_capture = PostTurnEndFinalizationCapture{};
+        var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+        defer hook_runtime.deinit();
+        try hook_runtime.registerPostTurnEnd(.{
+            .name = "capture",
+            .ctx = &hook_capture,
+            .run = PostTurnEndFinalizationCapture.run,
+        });
+        var finalization = TurnFinalizationGuard.init(
+            &runtime_deps,
+            @intCast(index + 1),
+            testLifecycleContext(hook_runtime.freeze(), alloc, "/tmp/workspace"),
+        );
+        defer finalization.deinit();
+        const finished: ?types.FinishedPrompt = if (case.finished) try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("notice"),
+            } },
+        }) else null;
+        try finalization.finish(case.outcome, case.disposition, finished);
+
+        // The host hears it, and so does the PostTurnEnd hook.
+        try std.testing.expectEqual(case.expected, deps.finalized_disposition);
+        try std.testing.expectEqual(@as(usize, 1), hook_capture.calls);
+        try std.testing.expectEqual(case.expected, hook_capture.dispositions[0]);
+        try std.testing.expectEqual(case.outcome, hook_capture.outcomes[0]);
+    }
 }

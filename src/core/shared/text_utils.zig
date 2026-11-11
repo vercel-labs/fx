@@ -499,6 +499,25 @@ fn validUtf8SequenceLength(raw: []const u8, index: usize) ?usize {
     return sequence_len;
 }
 
+/// The most bytes of one UTF-8 sequence a buffer can end partway through. A
+/// sequence is at most four bytes, so only the last three can start one that
+/// the buffer cut short.
+pub const max_incomplete_utf8_tail = 3;
+
+/// Number of bytes at the end of `bytes` that start a UTF-8 sequence the buffer
+/// cut short, at most `max_incomplete_utf8_tail`. A byte that never starts a
+/// sequence, and a buffer that ends in continuation bytes alone, have none.
+pub fn incompleteUtf8Tail(bytes: []const u8) usize {
+    var back: usize = 1;
+    while (back <= @min(max_incomplete_utf8_tail, bytes.len)) : (back += 1) {
+        const byte = bytes[bytes.len - back];
+        if (byte & 0b1100_0000 == 0b1000_0000) continue;
+        const needed = std.unicode.utf8ByteSequenceLength(byte) catch return 0;
+        return if (needed > back) back else 0;
+    }
+    return 0;
+}
+
 /// Returns true when `raw` is valid printable terminal text and
 /// `encodeTerminalSafe` would preserve it byte-for-byte.
 pub fn isTerminalSafe(raw: []const u8) bool {
@@ -1173,6 +1192,45 @@ test "isModelSafeText rejects nul bytes and invalid utf-8" {
     try std.testing.expect(isModelSafeText("hello"));
     try std.testing.expect(!isModelSafeText("hello\x00world"));
     try std.testing.expect(!isModelSafeText("\xff"));
+}
+
+test "incompleteUtf8Tail counts the bytes of a sequence the buffer cut short" {
+    const cases = [_]struct { bytes: []const u8, tail: usize }{
+        .{ .bytes = "", .tail = 0 },
+        .{ .bytes = "plain", .tail = 0 },
+        .{ .bytes = "a\xd0", .tail = 1 },
+        .{ .bytes = "a\xd0\xaf", .tail = 0 },
+        .{ .bytes = "a\xe2", .tail = 1 },
+        .{ .bytes = "a\xe2\x82", .tail = 2 },
+        .{ .bytes = "a\xe2\x82\xac", .tail = 0 },
+        .{ .bytes = "a\xf0", .tail = 1 },
+        .{ .bytes = "a\xf0\x9f", .tail = 2 },
+        .{ .bytes = "a\xf0\x9f\x98", .tail = 3 },
+        .{ .bytes = "a\xf0\x9f\x98\x80", .tail = 0 },
+        // A byte that never starts a sequence is not a tail, and neither is a
+        // buffer that ends in continuation bytes alone.
+        .{ .bytes = "a\xff", .tail = 0 },
+        .{ .bytes = "a\xf8\x80", .tail = 0 },
+        .{ .bytes = "\x9f", .tail = 0 },
+        .{ .bytes = "\x9f\x9f\x9f", .tail = 0 },
+        .{ .bytes = "a\xf0\x9f\x9f\x9f", .tail = 0 },
+        // The lead of an earlier sequence is out of reach of the last three.
+        .{ .bytes = "\xf0\x9f\x98\x80\xd0", .tail = 1 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.tail, incompleteUtf8Tail(case.bytes));
+}
+
+test "incompleteUtf8Tail agrees with every cut of every character width" {
+    const characters = [_][]const u8{ "\xd0\xaf", "\xe2\x82\xac", "\xf0\x9f\x98\x80" };
+    for (characters) |character| {
+        for (1..character.len + 1) |cut| {
+            var buffer: [1 + 4]u8 = undefined;
+            buffer[0] = 'a';
+            @memcpy(buffer[1..][0..cut], character[0..cut]);
+            const expected = if (cut == character.len) 0 else cut;
+            try std.testing.expectEqual(expected, incompleteUtf8Tail(buffer[0 .. 1 + cut]));
+        }
+    }
 }
 
 test "sanitizeModelText returns replacement text for unsafe input" {
