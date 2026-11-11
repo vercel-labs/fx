@@ -816,12 +816,17 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendText("SWITCH_USER");
           await until("the held start", () => existsSync(`${startHeld}.1`), 20_000);
           await until("main's message", () => state.noteCalled, 20_000);
-          await Bun.sleep(300);
+          // The gateway sees main's request before fx runs the message it
+          // returns. Close only once main shows the message working, which it
+          // does while the message waits for the start; a close before that
+          // makes the message start a new worker instead.
+          await session.waitForPane((pane) => pane.includes("worker working \u00b7 SWITCH_START_NOTE"), 15_000);
           await selectAgent(session, "worker");
           await session.sendKeys("BSpace");
           await session.waitForText("press delete again to close this subagent", 10_000);
           await session.sendKeys("BSpace");
-          await session.waitForPane((pane) => !/^ {4}worker \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+          // The closed worker leaves the list, which stays open on main.
+          await session.waitForPane((pane) => !subagentRow("worker").test(pane) && mainRow().test(pane) && pane.includes("esc back"), 15_000);
           await session.sendKeys("Escape");
           await session.waitForText("SWITCH_MAIN_DONE", 30_000);
           // The close refused the message; it neither joined the closed
