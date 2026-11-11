@@ -14,6 +14,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
+const chat_completions_protocol = @import("../gateway/chat_completions_protocol.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -738,17 +739,21 @@ fn streamAgentCompletion(
         vercel_failure_diagnostics.FailureDiagnostics{}
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
-    if (result.status != .ok) return .{ .failed = .{
-        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
-        .http_status = result.status,
-        .detail = result.err_body,
-        .diagnostics = .{
-            .schema = diagnostics.schema,
-            .request_shape = diagnostics.request_shape,
+    if (result.status != .ok) return .{
+        .failed = .{
+            .kind = gatewayFailureKind(alloc, result.status, result.err_body),
+            .http_status = result.status,
+            // The body can echo the credential it refused, and it reaches the
+            // screen and the trace.
+            .detail = if (result.err_body) |body| try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret() orelse "") else null,
+            .diagnostics = .{
+                .schema = diagnostics.schema,
+                .request_shape = diagnostics.request_shape,
+            },
+            .retry_after_seconds = result.retry_after_seconds,
+            .ownership = .owned,
         },
-        .retry_after_seconds = result.retry_after_seconds,
-        .ownership = .owned,
-    } };
+    };
     return .{ .completed = .{
         .completion = result.completion,
         .ownership = .owned,
