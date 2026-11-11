@@ -668,7 +668,15 @@ pub const Runtime = struct {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
                     const sent = sentResult(&buf, agent);
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = if (ready.user_closed) try userClosedResult(alloc, sent, agent) else sent });
+                    if (!ready.created) return self.encodeManaged(alloc, .{ .ok = true, .result = sent });
+                    var scratch = std.heap.ArenaAllocator.init(alloc);
+                    defer scratch.deinit();
+                    // The list is extra: without it the answer still goes.
+                    const idle = self.idleOthers(scratch.allocator(), ready.child_id) catch |err| unread: {
+                        debug_trace.eventf("mailbox", "idle_list_unavailable", .{}, "child={s} err={s}", .{ ready.child_id, @errorName(err) });
+                        break :unread &.{};
+                    };
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = try startedResult(scratch.allocator(), sent, agent, ready.user_closed, idle) });
                 },
                 .completed => |completed| {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
@@ -1098,6 +1106,7 @@ pub const Runtime = struct {
         else
             self.reportOutput(a, end) catch "";
         const agent = self.childName(a, end.child_id) catch end.child_id;
+        const idle = !notice and self.idleAfterEnd(a, end);
         sink.post(self, .{ .report = .{
             .agent = agent,
             .child_id = end.child_id,
@@ -1107,6 +1116,7 @@ pub const Runtime = struct {
             .output = output,
             .dropped = dropped.count,
             .end = end.end,
+            .idle = idle,
         } }) catch |err| {
             // A report stays owed in the log; a notice is lost.
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason={s} notice={}", .{ end.child_id, end.work_id, @errorName(err), notice });
@@ -1115,15 +1125,45 @@ pub const Runtime = struct {
         if (notice) {
             debug_trace.eventf("mailbox", "notice_queued", .{}, "to={s} from={s} dropped={d}", .{ self.ownerName(), end.child_id, dropped.count });
         } else {
-            debug_trace.eventf("mailbox", "report_queued", .{}, "to={s} from={s} work={s} dropped={d} started_by={s} cause={s}", .{
+            debug_trace.eventf("mailbox", "report_queued", .{}, "to={s} from={s} work={s} dropped={d} started_by={s} cause={s} idle={}", .{
                 self.ownerName(),
                 end.child_id,
                 end.work_id,
                 dropped.count,
                 @tagName(end.end.started_by),
                 if (end.end.cause) |cause| @tagName(cause) else "none",
+                idle,
             });
         }
+    }
+
+    /// Whether `end`'s child is idle once its report goes. Read before the
+    /// slot starts the next message waiting for the child (`workEnded`), so
+    /// a waiting message counts (`tests/tla/subagent/StopMessage.tla`
+    /// IdleNoteHonest).
+    fn idleAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) bool {
+        const facts: IdleFacts = blk: {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            var facts: IdleFacts = .{
+                .leftovers = end.leftovers.len > 0,
+                .user_closed = if (end.end.cause) |cause| cause == .user_close else false,
+                .closing = self.closingIndexLocked(end.child_id) != null,
+                .waiting = self.hasPendingLocked(end.child_id),
+                .turn_waiting = self.inTurnWorkLocked(end.child_id),
+            };
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            facts.open = if (self.managed.state_store.load(a)) |loaded| open: {
+                var registry = loaded;
+                break :open registry.findById(end.child_id) != null;
+            } else |err| unread: {
+                debug_trace.eventf("mailbox", "idle_unknown", .{}, "child={s} work_id={s} err={s}", .{ end.child_id, end.work_id, @errorName(err) });
+                break :unread false;
+            };
+            break :blk facts;
+        };
+        return facts.idle();
     }
 
     /// What a report says about the work: the child's reply, or how it
@@ -1478,6 +1518,62 @@ pub const Runtime = struct {
         return names.items;
     }
 
+    /// What a subagent is doing, as `status` says it.
+    const ChildState = enum {
+        awaiting_approval,
+        working,
+        interrupted,
+        finished,
+        idle,
+
+        fn label(self: ChildState) []const u8 {
+            return switch (self) {
+                .awaiting_approval => "waiting for an approval",
+                .working => "working",
+                .interrupted => "interrupted",
+                .finished => "finished",
+                .idle => "idle",
+            };
+        }
+    };
+
+    /// Under `admission_mutex`.
+    fn childStateLocked(self: *const Runtime, child: child_state.Child) ChildState {
+        if (child.phase == .awaiting_approval) return .awaiting_approval;
+        if (self.isBusyLocked(child.id)) return .working;
+        return switch (child.phase) {
+            .interrupted => .interrupted,
+            .finished => .finished,
+            else => .idle,
+        };
+    }
+
+    /// How many idle subagents a new subagent's start names; it counts the
+    /// rest.
+    const max_named_idle: usize = 8;
+
+    /// The names of this host's subagents other than `except_child_id` that
+    /// `status` would list as idle with no message waiting, in its order:
+    /// those a new subagent's start names
+    /// (`tests/tla/subagent/StopMessage.tla` NamesTheIdle). Allocated in
+    /// `alloc`, which should be an arena: the registry it reads stays there.
+    fn idleOthers(self: *Runtime, alloc: Allocator, except_child_id: []const u8) ![]const []const u8 {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = try self.managed.state_store.load(alloc);
+        var names: std.ArrayList([]const u8) = .empty;
+        for (registry.children) |child| {
+            const name = child.agentName() orelse continue;
+            if (std.mem.eql(u8, child.id, except_child_id)) continue;
+            if (self.closingIndexLocked(child.id) != null or self.hasPendingLocked(child.id)) continue;
+            if (self.childStateLocked(child) != .idle) continue;
+            try names.append(alloc, name);
+        }
+        return names.items;
+    }
+
     /// `status`: each subagent, or the one named, with what it is doing.
     fn statusOf(self: *Runtime, alloc: Allocator, agent: ?[]const u8) !ManagedExecutionResult {
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1502,13 +1598,8 @@ pub const Runtime = struct {
             for (self.pending.items) |item| {
                 if (std.mem.eql(u8, item.child_id, child.id)) waiting += 1;
             }
-            const state = if (child.phase == .awaiting_approval) "waiting for an approval" else if (self.isBusyLocked(child.id)) "working" else switch (child.phase) {
-                .interrupted => "interrupted",
-                .finished => "finished",
-                else => "idle",
-            };
             if (listed > 0) try out.writer.writeByte('\n');
-            try out.writer.print("{s}: {s}", .{ name, state });
+            try out.writer.print("{s}: {s}", .{ name, self.childStateLocked(child).label() });
             if (waiting > 0) try out.writer.print(", {d} waiting message{s}", .{ waiting, if (waiting == 1) "" else "s" });
             if (child.last_outcome) |outcome| try out.writer.print(", last work {s}", .{@tagName(outcome)});
             try out.writer.print(", reports {s}", .{@tagName(child.report_rule)});
@@ -3635,10 +3726,98 @@ fn sentResult(buf: []u8, agent: []const u8) []const u8 {
     return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
 }
 
-/// `message`'s answer when it starts a new child under the name of one the
-/// user closed.
-fn userClosedResult(alloc: Allocator, sent: []const u8, agent: []const u8) ![]const u8 {
-    return alloc.print("{s} The user closed the earlier {s}, so this one starts with no history.", .{ sent, agent });
+/// What decides whether a child is idle once its work's report goes
+/// (`Runtime.idleAfterEnd`).
+const IdleFacts = struct {
+    /// The parent's messages the ended turn never took, which become its
+    /// next work.
+    leftovers: bool = false,
+    /// The user closed the child, which ended the work.
+    user_closed: bool = false,
+    /// A close of the child is under way.
+    closing: bool = false,
+    /// A message from the parent waits to start the child's next turn.
+    waiting: bool = false,
+    /// A turn the parent didn't start waits to open.
+    turn_waiting: bool = false,
+    /// The child is still in the registry.
+    open: bool = false,
+
+    fn idle(self: IdleFacts) bool {
+        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting;
+    }
+};
+
+test "a child is idle after its report only when nothing starts its next turn or ends it" {
+    try std.testing.expect((IdleFacts{ .open = true }).idle());
+    try std.testing.expect(!(IdleFacts{}).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .leftovers = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .user_closed = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .closing = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .waiting = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .turn_waiting = true }).idle());
+}
+
+/// `message`'s answer when it starts a new child: `sent`, then, when the
+/// user closed the child that had its name or other subagents are idle,
+/// that it starts with no history, and up to `Runtime.max_named_idle` of
+/// the idle ones with a count of the rest. A parent tends to start a new
+/// subagent for each task and leave the finished ones idle; this keeps them
+/// in view, so it sends related work to one that has the context and closes
+/// those it no longer needs. Caller owns the result.
+fn startedResult(alloc: Allocator, sent: []const u8, agent: []const u8, user_closed: bool, idle: []const []const u8) ![]const u8 {
+    if (!user_closed and idle.len == 0) return alloc.dupe(u8, sent);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    // An allocating writer fails only when it cannot grow.
+    writeStarted(&out.writer, sent, agent, user_closed, idle) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeStarted(writer: *std.Io.Writer, sent: []const u8, agent: []const u8, user_closed: bool, idle: []const []const u8) std.Io.Writer.Error!void {
+    if (user_closed) {
+        try writer.print("{s} The user closed the earlier {s}, so this one starts with no history.", .{ sent, agent });
+    } else {
+        try writer.print("{s} {s} is new and starts with no history.", .{ sent, agent });
+    }
+    if (idle.len == 0) return;
+    try writer.writeAll(" Idle subagents, each with its own context: ");
+    const named = @min(idle.len, Runtime.max_named_idle);
+    for (idle[0..named], 0..) |name, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try writer.writeAll(name);
+    }
+    if (idle.len > named) try writer.print(", and {d} more", .{idle.len - named});
+    try writer.writeAll(". Send related work to one of them instead of a new name, and close the ones you no longer need.");
+}
+
+test "a new subagent's answer names the idle ones, up to a limit" {
+    const alloc = std.testing.allocator;
+    const sent = "Sent to tester, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.";
+    const plain = try startedResult(alloc, sent, "tester", false, &.{});
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(sent, plain);
+
+    const closed = try startedResult(alloc, sent, "tester", true, &.{});
+    defer alloc.free(closed);
+    try std.testing.expectEqualStrings(sent ++ " The user closed the earlier tester, so this one starts with no history.", closed);
+
+    const one = try startedResult(alloc, sent, "tester", false, &.{"reviewer"});
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings(sent ++ " tester is new and starts with no history. Idle subagents, each with its own context: reviewer. Send related work to one of them instead of a new name, and close the ones you no longer need.", one);
+
+    const both = try startedResult(alloc, sent, "tester", true, &.{ "reviewer", "fixer" });
+    defer alloc.free(both);
+    try std.testing.expect(std.mem.find(u8, both, "The user closed the earlier tester, so this one starts with no history. Idle subagents, each with its own context: reviewer, fixer. Send") != null);
+
+    const names = [_][]const u8{ "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10" };
+    const many = try startedResult(alloc, sent, "tester", false, &names);
+    defer alloc.free(many);
+    try std.testing.expect(std.mem.find(u8, many, "context: a1, a2, a3, a4, a5, a6, a7, a8, and 2 more. Send") != null);
+    const eight = try startedResult(alloc, sent, "tester", false, names[0..8]);
+    defer alloc.free(eight);
+    try std.testing.expect(std.mem.find(u8, eight, "a7, a8. Send") != null);
+    try std.testing.expect(std.mem.find(u8, eight, "more") == null);
 }
 
 /// `message`'s refusal when the child's running turn already holds as many

@@ -61,6 +61,15 @@ function latestUserIsReport(raw: string): boolean {
   const latest = JSON.stringify(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
   return latest.includes(REPORT_HEADER);
 }
+
+/** The JSON line of the report in the request's latest user message, or
+ * null when that message is not a report. */
+function latestReport(raw: string): Record<string, unknown> | null {
+  const text = contentText(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+  const at = text.indexOf(REPORT_HEADER);
+  if (at < 0) return null;
+  return JSON.parse(text.slice(at + REPORT_HEADER.length).trim().split("\n")[0]!);
+}
 const DEFAULT_MODEL = "spacexai/grok-4.7";
 /** What fx says when it cannot connect to the model catalog and drops fast
  * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
@@ -919,6 +928,20 @@ type ShellResult = {
 
 function shellResult(body: string, callId: string): ShellResult {
   return JSON.parse(toolResultOutput(body, callId)) as ShellResult;
+}
+
+/** The text of tool result `callId` anywhere in the request, or null. */
+function toolResultAnywhere(body: string, callId: string): string | null {
+  return hasToolResult(body, callId) ? toolResultOutput(body, callId) : null;
+}
+
+function hasToolResult(body: string, callId: string): boolean {
+  return gatewayRequest(body).prompt.some((message) =>
+    Array.isArray(message.content) &&
+    (message.content as Array<Record<string, unknown>>).some((part) =>
+      part.type === "tool-result" && part.toolCallId === callId
+    )
+  );
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
@@ -9817,6 +9840,224 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 15_000);
+
+  // Main tends to start a new subagent for each task and leave the finished
+  // ones idle. A new subagent's start names the idle ones, and each report
+  // says its subagent is idle, so main can send related work to one that
+  // has the context, or close it.
+  test("a new subagent's start names the idle ones, and each report says its subagent is idle", async () => {
+    const root = createFixtureRoot("subagent-idle-reuse");
+    const tracePath = join(root.root, "trace.log");
+    const tasks = {
+      first: "Reply exactly IDLE_FIRST_DONE without using tools.",
+      second: "Reply exactly IDLE_SECOND_DONE without using tools.",
+      third: "Reply exactly IDLE_THIRD_DONE without using tools.",
+      again: "Reply exactly IDLE_FIRST_AGAIN without using tools.",
+    };
+    const message = (id: string, agent: string, text: string) =>
+      fakeGatewayToolCall(id, "subagent", { request: { action: "message", agent, message: text } });
+    const results: Record<string, string> = {};
+    const reports: Record<string, unknown>[] = [];
+    const seenWorks = new Set<string>();
+    let releaseSecond: () => void = () => {};
+    const secondHeld = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // first's second turn carries its first task too, so it goes first.
+        if (body.includes(tasks.again)) return fakeGatewayFinalText("IDLE_FIRST_AGAIN");
+        if (body.includes(tasks.second)) {
+          // second keeps working until third has reported, so third's
+          // start finds it busy.
+          await secondHeld;
+          return fakeGatewayFinalText("IDLE_SECOND_DONE");
+        }
+        if (body.includes(tasks.third)) return fakeGatewayFinalText("IDLE_THIRD_DONE");
+        if (body.includes(tasks.first)) return fakeGatewayFinalText("IDLE_FIRST_DONE");
+        return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+      }
+      // A report can join main's turn at a step boundary, so each result is
+      // taken wherever it is, once.
+      const fresh: string[] = [];
+      for (const id of ["idle_first", "idle_second", "idle_third", "idle_again"]) {
+        if (id in results) continue;
+        const text = toolResultAnywhere(body, id);
+        if (text === null) continue;
+        results[id] = text;
+        fresh.push(id);
+      }
+      const report = latestReport(body);
+      if (report && !seenWorks.has(String(report.work_id))) {
+        seenWorks.add(String(report.work_id));
+        reports.push(report);
+        const output = String(report.output);
+        if (output.includes("IDLE_FIRST_DONE")) return message("idle_second", "second", tasks.second);
+        if (output.includes("IDLE_THIRD_DONE")) {
+          releaseSecond();
+          return message("idle_again", "first", tasks.again);
+        }
+        return fakeGatewayFinalText(`IDLE_REPORT_READ ${String(report.agent)}`);
+      }
+      if (fresh.includes("idle_second")) return message("idle_third", "third", tasks.third);
+      if (fresh.length > 0) return fakeGatewayFinalText(`IDLE_SENT ${fresh.join(" ")}`);
+      if (Object.keys(results).length > 0) return fakeGatewayFinalText("IDLE_NOTHING_NEW");
+      return message("idle_first", "first", tasks.first);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Exercise idle subagents."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent" },
+        timeoutMs: 30_000,
+      });
+      releaseSecond();
+      if (run.code !== 0) {
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+        throw new Error(`idle subagent flow failed: code=${run.code}\nstdout=${run.stdout}\nstderr=${run.stderr}\ntrace=${trace}`);
+      }
+      const answer = (id: string) => String(JSON.parse(results[id]!).result);
+      // The first subagent starts with no other: its answer is as before.
+      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      // A new subagent's start names the idle one.
+      expect(answer("idle_second")).toContain("second is new and starts with no history.");
+      expect(answer("idle_second")).toContain("Idle subagents, each with its own context: first.");
+      expect(answer("idle_second")).toContain("Send related work to one of them instead of a new name, and close the ones you no longer need.");
+      // A working subagent is not idle: third's start names first only.
+      expect(answer("idle_third")).toContain("Idle subagents, each with its own context: first.");
+      expect(answer("idle_third")).not.toContain("second");
+      // A message to a subagent that exists starts its turn and names none.
+      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      // Every report of a finished work says its subagent is idle now.
+      expect(reports.map((report) => report.agent).sort()).toEqual(["first", "first", "second", "third"]);
+      for (const report of reports) {
+        expect(report.outcome).toBe("completed");
+        expect(report.next).toBe(`${String(report.agent)} is idle now and keeps this conversation. Send it related work, or close it once you no longer need that context.`);
+      }
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      releaseSecond();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  // A failed work leaves its subagent idle, and its report says so.
+  test("a failed subagent's report still says it is idle", async () => {
+    const root = createFixtureRoot("subagent-idle-failure");
+    const task = "IDLE_FAILURE: perform the prepared task once.";
+    let failed: Record<string, unknown> | null = null;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "idle_failure")) return fakeGatewayFinalText("IDLE_FAILURE_SENT");
+      const report = latestReport(body);
+      if (report) {
+        failed = report;
+        return fakeGatewayFinalText("IDLE_FAILURE_OBSERVED");
+      }
+      if (body.includes('"name":"subagent"')) {
+        return fakeGatewayToolCall("idle_failure", "subagent", { request: { action: "message", agent: "flaky", message: task } });
+      }
+      if (body.includes(task)) {
+        return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
+          status: 401, headers: { "content-type": "application/json" },
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Observe a failed subagent."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        timeoutMs: 15_000,
+      });
+      expect(run.code).toBe(0);
+      expect(failed).not.toBeNull();
+      expect(failed!.outcome).toBe("failed");
+      expect(String(failed!.output)).toContain("HTTP 401");
+      expect(failed!.next).toBe("flaky is idle now and keeps this conversation. Send it related work, or close it once you no longer need that context.");
+      expect(parseAskJson(run.stdout).output).toContain("IDLE_FAILURE_OBSERVED");
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  // fx is killed after a subagent finished and before main took its report.
+  // The resumed session posts the owed report once, and it says the
+  // subagent is idle.
+  test("a report owed when fx is killed arrives once after resume and says its subagent is idle", async () => {
+    const root = createFixtureRoot("subagent-idle-crash");
+    const tracePath = join(root.root, "trace.log");
+    const task = "Reply exactly IDLE_KEEPER_DONE without using tools.";
+    const resumePrompt = "Continue after the restart.";
+    const reports: Record<string, unknown>[] = [];
+    let mainHeld = false;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return body.includes(task) ? fakeGatewayFinalText("IDLE_KEEPER_DONE") : fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+      }
+      const report = latestReport(body);
+      if (report) {
+        reports.push(report);
+        return fakeGatewayFinalText("IDLE_KEEPER_REPORT_READ");
+      }
+      if (promptText(body).includes(resumePrompt)) return fakeGatewayFinalText("IDLE_RESUMED");
+      // Main's turn never ends before the kill, so the report stays owed.
+      if (hasCurrentToolResult(body, "idle_keeper")) {
+        mainHeld = true;
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayToolCall("idle_keeper", "subagent", { request: { action: "message", agent: "keeper", message: task } });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const first = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "Start the keeper."], {
+      cwd: root.workspace,
+      env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent", FX_SOUND: "0" },
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    try {
+      // Wait until the keeper's finish is saved as owing a report, while
+      // main's request is held.
+      const deadline = Date.now() + 15_000;
+      let parentId = "";
+      for (;;) {
+        let finished: any;
+        try {
+          parentId = existsSync(join(root.home, ".fx", "sessions", "v2")) ? rootSessionIds(root.home)[0] ?? "" : "";
+          finished = parentId ? childLines(root.home, parentId).find((line) => line.kind === "child_finished") : undefined;
+        } catch {
+          // A log fx is still writing can end mid-line.
+        }
+        if (mainHeld && finished?.data?.report === true) break;
+        if (Date.now() > deadline) throw new Error(`the keeper's report was never owed: held=${mainHeld} finished=${JSON.stringify(finished)}`);
+        await Bun.sleep(20);
+      }
+      first.kill(9);
+      await first.exited;
+      expect(reports).toHaveLength(0);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", parentId, resumePrompt], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent" },
+        timeoutMs: 20_000,
+      });
+      if (resumed.code !== 0) throw new Error(`resume failed: code=${resumed.code}\nstdout=${resumed.stdout}\nstderr=${resumed.stderr}`);
+      // The owed report arrives once, and says the keeper is idle.
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.agent).toBe("keeper");
+      expect(reports[0]!.outcome).toBe("completed");
+      expect(String(reports[0]!.output)).toContain("IDLE_KEEPER_DONE");
+      expect(reports[0]!.next).toBe("keeper is idle now and keeps this conversation. Send it related work, or close it once you no longer need that context.");
+      expect(resumed.stderr).not.toMatch(/panic:|unreachable/);
+    } finally {
+      first.kill(9);
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("sibling subagents start before either terminal result is awaited", async () => {
     const root = createFixtureRoot("subagent-sibling-start-order");

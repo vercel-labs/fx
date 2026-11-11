@@ -323,6 +323,8 @@ pub const ReportPost = struct {
     dropped: usize = 0,
     /// Who started a report's work and why it was cancelled.
     end: subagent_child_state.EndFacts = .{},
+    /// Whether a report's child is idle once it goes.
+    idle: bool = false,
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
 
@@ -350,6 +352,7 @@ pub const ReportPost = struct {
             .text = try handoff_alloc.dupe(u8, text),
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
             .end = if (delivery == .report) delivery.report.end else .{},
+            .idle = delivery == .report and delivery.report.idle,
         };
         if (delivery == .message) {
             // The others are freed by their own errdefers above.
@@ -405,6 +408,10 @@ test "a report's hand-off keeps the count a user's stop dropped, and who started
     try std.testing.expectEqual(@as(usize, 2), post.dropped);
     try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
     try std.testing.expectEqual(end, post.end);
+    try std.testing.expect(!post.idle);
+    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } });
+    defer idle.destroy();
+    try std.testing.expect(idle.idle);
 }
 
 /// Queues a host's delivery for the main loop, without waiting.
@@ -2197,6 +2204,7 @@ pub fn Runtime(comptime App: type) type {
                     .output = post.text,
                     .dropped = post.dropped,
                     .end = post.end,
+                    .idle = post.idle,
                 }, limit),
                 .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
