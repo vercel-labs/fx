@@ -10278,10 +10278,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
     const started = new Set<string>();
     const reports: string[] = [];
+    const seenWorks = new Set<string>();
     const gateway = startDynamicFakeGateway((body) => {
-      // Each sibling's report starts a turn of its own.
+      // A sibling's report starts the ask's next turn, and the other's can
+      // join that turn, so each new one is taken wherever it is, once.
       if (latestUserIsReport(body)) {
-        reports.push(latestUserText(body));
+        for (const report of allReports(body)) {
+          if (seenWorks.has(String(report.work_id))) continue;
+          seenWorks.add(String(report.work_id));
+          reports.push(String(report.output));
+        }
         return fakeGatewayFinalText("SIBLING_REPORT_SEEN");
       }
       if (
