@@ -1367,13 +1367,17 @@ pub fn Runtime(comptime App: type) type {
                         try recordRouteRecoveryNotice(app, status);
                         if (comptime agents.hasAgentField(App, "child_run")) {
                             app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
-                            if (!was_waiting and app.shell.worker_status_state().waitsForUser()) app_agents_runtime.Runtime(App).noteChildWaiting(app, agent, status);
+                            const waiting = app.shell.worker_status_state().waitsForUser();
+                            if (!was_waiting and waiting) app_agents_runtime.Runtime(App).noteChildWaiting(app, agent, status);
+                            // A wait the user ended leaves nothing for the parent to answer.
+                            if (!waiting) agent.worker.parent_may_continue.store(false, .seq_cst);
                         }
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
                             app.shell.render_requests.request(.footer);
                         }
+                        if (comptime agents.hasAgentField(App, "child_run")) agent.worker.parent_may_continue.store(false, .seq_cst);
                     },
                     // The serving provider already appears on the ctrl+o
                     // network record; nothing interactive consumes the event

@@ -599,6 +599,40 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent whose request fails again after main's resend asks main to tell the user, and waits",
+    async () => {
+      let childCalls = 0;
+      const notes = { resend: false, user: false };
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          return refused();
+        }
+        if (body.includes("Only the user can continue it") && !notes.user) {
+          notes.user = true;
+          return text("main_told", "SWITCH_MAIN_TELLS_USER");
+        }
+        if (body.includes("waits for a follow-up") && !notes.resend) {
+          notes.resend = true;
+          return toolCall("main_go_on", "subagent", { request: { action: "message", agent: "worker", message: "go on" } });
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_WAIT_TASK" } });
+        }
+        return text("main_wait", "SWITCH_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_TELLS_USER", 30_000);
+        // One resend from main, then the wait is the user's: no third try.
+        await Bun.sleep(1500);
+        expect(notes.resend).toBe(true);
+        expect(childCalls).toBe(2);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent the user stops tells main which files it changed before it ended",
     async () => {
       let childCalls = 0;
