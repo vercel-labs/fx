@@ -554,6 +554,8 @@ function startFakeChatGptOAuth(
     rejectRefresh?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     modelsResponse?: () => Promise<Response | void>;
+    revokeStatus?: number;
+    revokeDelayMs?: number;
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
@@ -567,6 +569,7 @@ function startFakeChatGptOAuth(
     method: string;
     path: string;
     authorization: string | null;
+    contentType: string | null;
     body: string | null;
   }> = [];
   const server = Bun.serve({
@@ -574,7 +577,8 @@ function startFakeChatGptOAuth(
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
-      const body = url.pathname === "/chatgpt/responses" || url.pathname === "/chatgpt/token"
+      const body = url.pathname === "/chatgpt/responses" || url.pathname === "/chatgpt/token" ||
+          url.pathname === "/oauth/revoke"
         ? await request.text()
         : null;
       if (url.pathname === "/chatgpt/responses" && body?.includes(TITLE_GENERATION_MARKER)) {
@@ -584,8 +588,14 @@ function startFakeChatGptOAuth(
         method: request.method,
         path: url.pathname,
         authorization: request.headers.get("authorization"),
+        contentType: request.headers.get("content-type"),
         body,
       });
+      if (url.pathname === "/oauth/revoke") {
+        if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
+        // OpenAI answers a revocation with an empty 200, also for a token it no longer knows.
+        return new Response(null, { status: options.revokeStatus ?? 200 });
+      }
       if (url.pathname === "/oauth/authorize") {
         const redirectUri = url.searchParams.get("redirect_uri");
         const state = url.searchParams.get("state");
@@ -637,10 +647,22 @@ function startFakeChatGptOAuth(
     env: {
       FX_TEST_CHATGPT_ISSUER_URL: baseUrl,
       FX_TEST_CHATGPT_TOKEN_URL: `${baseUrl}/chatgpt/token`,
+      FX_TEST_CHATGPT_REVOKE_URL: `${baseUrl}/oauth/revoke`,
       FX_TEST_OPENAI_CODEX_MODELS_URL: `${baseUrl}/chatgpt/models`,
       FX_TEST_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
     },
     baseUrl,
+    /** The form of every revocation request, in arrival order. */
+    revocations() {
+      return requests
+        .filter((request) => request.path === "/oauth/revoke")
+        .map((request) => ({
+          method: request.method,
+          contentType: request.contentType,
+          authorization: request.authorization,
+          form: Object.fromEntries(new URLSearchParams(request.body ?? "")),
+        }));
+    },
     setModels(next: typeof models) {
       models = next;
     },
@@ -1539,6 +1561,94 @@ tmuxTest("provider recovery stays signed out when no replacement is connected", 
   expect(pane).not.toContain("grok · current");
   expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
   expect(gateway.requests).toHaveLength(0);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+async function waitForCodexRevocations(count: number): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (chatgptOauth!.revocations().length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${count} Codex revocations; saw ${chatgptOauth!.revocations().length}`);
+    }
+    await Bun.sleep(20);
+  }
+}
+
+tmuxTest("/logout revokes the Codex login in the background", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-tui-codex-logout-revoke-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/logout codex");
+  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await waitForCodexRevocations(1);
+  expect(chatgptOauth.revocations()[0]!.form).toEqual({
+    token: "chatgpt-refresh", token_type_hint: "refresh_token", client_id: CODEX_CLIENT_ID,
+  });
+  expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+  // The answer was a 200, so no warning follows the sign-out.
+  await openProviderPicker(session);
+  await session.sendKeys("Escape");
+  expect(await session.capturePane()).not.toContain("could not be confirmed");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("/logout warns when OpenAI doesn't confirm the Codex revocation", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-tui-codex-logout-revoke-failure-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ revokeStatus: 503 });
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/logout codex");
+  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await session.waitForText("could not be confirmed", TIMEOUT);
+  const pane = (await session.capturePane()).replace(/\s+/g, " ");
+  expect(pane).toContain("The local Codex session was removed, but remote revocation could not be confirmed.");
+  expect(chatgptOauth.revocations()).toHaveLength(1);
+  expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("fx quits promptly while a Codex revocation still waits", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-tui-codex-logout-quit-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ revokeDelayMs: 40_000 });
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/logout codex");
+  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await waitForCodexRevocations(1);
+  const started = Date.now();
+  await session.sendText("/quit");
+  await session.waitForSessionEnd(TIMEOUT);
+  // Shutdown waits up to 2 s for a revocation in flight, then cancels it.
+  expect(Date.now() - started).toBeLessThan(8_000);
+  expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
@@ -5142,6 +5252,141 @@ test("Grok logout removes malformed and unsafe local credentials", async () => {
     }
   } finally {
     grok.stop();
+  }
+});
+
+const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_REVOCATION_WARNING = "fx logout: local Codex session removed, but remote revocation could not be confirmed";
+
+function codexLogoutEnv(testHome: string, revokeUrl: string): Record<string, string | undefined> {
+  return {
+    HOME: testHome,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_TEST_CHATGPT_REVOKE_URL: revokeUrl,
+  };
+}
+
+test("Codex logout revokes the saved login at OpenAI", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-revoke-"));
+  const codex = startFakeChatGptOAuth();
+  try {
+    writeSeededChatGptLogin(home, codex.accessToken);
+    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const result = await runFx(["logout", "codex"], {
+      env: codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL),
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed out of Codex.");
+    expect(result.stderr).toBe("");
+    expect(existsSync(authPath)).toBe(false);
+    expect(codex.revocations()).toEqual([{
+      method: "POST",
+      contentType: "application/x-www-form-urlencoded",
+      authorization: null,
+      form: { token: "chatgpt-refresh", token_type_hint: "refresh_token", client_id: CODEX_CLIENT_ID },
+    }]);
+  } finally {
+    codex.stop();
+  }
+});
+
+for (const failure of ["is refused with 503", "can't connect", "gets no answer"] as const) {
+  test(`Codex logout removes the local login when its revocation ${failure}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-logout-revoke-failure-"));
+    const codex = startFakeChatGptOAuth(
+      failure === "is refused with 503" ? { revokeStatus: 503 } :
+        failure === "gets no answer" ? { revokeDelayMs: 40_000 } : {},
+    );
+    // A port that was just listening and is now closed refuses the connection.
+    const closed = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null) });
+    const closedUrl = `http://127.0.0.1:${closed.port}/oauth/revoke`;
+    closed.stop(true);
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      const authPath = join(home, ".fx", "chatgpt-auth.json");
+      const started = Date.now();
+      const result = await runFx(["logout", "codex"], {
+        env: codexLogoutEnv(home, failure === "can't connect" ? closedUrl : codex.env.FX_TEST_CHATGPT_REVOKE_URL),
+        timeoutMs: 40_000,
+      });
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("Signed out of Codex.");
+      expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
+      expect(result.stderr).not.toContain("chatgpt-refresh");
+      expect(existsSync(authPath)).toBe(false);
+      // The OAuth transport gives a request without its own deadline 15 s.
+      expect(Date.now() - started).toBeLessThan(30_000);
+      expect(codex.revocations()).toHaveLength(failure === "can't connect" ? 0 : 1);
+    } finally {
+      codex.stop();
+    }
+  }, 60_000);
+}
+
+test("Codex logout removes an unreadable saved login without sending it", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-unreadable-"));
+  const codex = startFakeChatGptOAuth();
+  try {
+    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    for (const failure of ["malformed", "unsafe"]) {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      if (failure === "malformed") writeFileSync(authPath, "{invalid-json");
+      else chmodSync(authPath, 0o644);
+
+      const result = await runFx(["logout", "codex"], {
+        env: codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL),
+        timeoutMs: TIMEOUT,
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toContain("Signed out of Codex.");
+      expect(result.stderr).toContain(CODEX_REVOCATION_WARNING);
+      expect(existsSync(authPath)).toBe(false);
+      expect(codex.revocations()).toHaveLength(0);
+      expect(result.stderr).not.toContain(codex.accessToken);
+    }
+  } finally {
+    codex.stop();
+  }
+});
+
+test("Codex logout without a saved login sends nothing", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-missing-"));
+  const codex = startFakeChatGptOAuth();
+  try {
+    const result = await runFx(["logout", "codex"], {
+      env: codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL),
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("No Codex login session found.");
+    expect(result.stderr).toBe("");
+    expect(codex.requests).toHaveLength(0);
+  } finally {
+    codex.stop();
+  }
+});
+
+test("Codex logouts started together revoke the login once", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-together-"));
+  const codex = startFakeChatGptOAuth({ revokeDelayMs: 200 });
+  try {
+    writeSeededChatGptLogin(home, codex.accessToken);
+    const env = codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL);
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => runFx(["logout", "codex"], { env, timeoutMs: TIMEOUT })),
+    );
+    for (const result of results) {
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stderr).toBe("");
+    }
+    expect(results.filter((result) => result.stdout.includes("Signed out of Codex."))).toHaveLength(1);
+    expect(results.filter((result) => result.stdout.includes("No Codex login session found."))).toHaveLength(3);
+    expect(codex.revocations()).toHaveLength(1);
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+  } finally {
+    codex.stop();
   }
 });
 
