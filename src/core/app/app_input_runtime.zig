@@ -1755,11 +1755,12 @@ pub fn Runtime(comptime App: type) type {
 
         /// While the agent list is open it takes every key, ahead of the
         /// prompts and composer of the agent on screen: ↑ and ↓ move the
-        /// highlight, Enter shows the highlighted agent, and Esc, Ctrl+X, and
-        /// Ctrl+C close the list. A paste closes it too, keeping the agent on
-        /// screen, and lands in its composer; mouse input passes through. Any
-        /// other key does nothing, so none edits the agent's draft or answers
-        /// its prompt behind the list. Returns whether the list took `event`.
+        /// highlight, Enter shows the highlighted agent, Backspace or Delete
+        /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C close the
+        /// list. A paste closes it too, keeping the agent on screen, and
+        /// lands in its composer; mouse input passes through. Any other key
+        /// does nothing, so none edits the agent's draft or answers its
+        /// prompt behind the list. Returns whether the list took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1767,6 +1768,7 @@ pub fn Runtime(comptime App: type) type {
                 .raw => |raw| raw.byte == 127 or raw.byte == 8,
                 .action => |decoded| switch (decoded.action) {
                     .remapped_byte => |byte| byte == 127 or byte == 8,
+                    .delete_next => true,
                     else => false,
                 },
                 else => false,
@@ -1789,6 +1791,7 @@ pub fn Runtime(comptime App: type) type {
                 .action => |decoded| switch (decoded.action) {
                     .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
+                    .delete_next => _ = try pressAgentsMenuClose(app),
                     .escape, .open_agent_list => {
                         _ = try backAgentsMenu(app);
                         _ = disarmEscapeClear(app);

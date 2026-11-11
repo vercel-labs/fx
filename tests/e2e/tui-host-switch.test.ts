@@ -2180,9 +2180,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForPane((pane) => !pane.includes("press delete again to close this subagent")
           && mainRow().test(pane) && !pane.includes("delete close"), 10_000);
         await session.sendKeys("Down");
-        await session.sendKeys("BSpace");
+        // The forward Delete key arms and closes, as Backspace does.
+        await session.sendKeys("DC");
         await session.waitForText("press delete again to close this subagent", 10_000);
-        await session.sendKeys("BSpace");
+        await session.sendKeys("DC");
         const closed = await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
         // Main is on screen again, and the reviewer's turn ended with the close.
         expect(closed).toContain("SWITCH_USER review it");
