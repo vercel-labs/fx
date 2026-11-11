@@ -1340,6 +1340,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // working without the row shows main's count is 0.
           const mainScreen = await session.waitForPane((pane) => pane.includes("1 subagent working") && !pane.includes("waiting on"), 15_000);
           expect(mainScreen).not.toContain("waiting on");
+          // The list draws lead's helper under lead, on a branch of its own.
+          await session.sendKeys("Down");
+          const list = await session.waitForPane((pane) => /^ {4}\u2514 helper /m.test(pane), 10_000);
+          expect(list).toMatch(/^ {2}\u2514 lead /m);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
           // Lead, the helper's parent, waits on it.
           await showAgent(session, "lead");
           await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);

@@ -68,7 +68,7 @@ export function listRows(paneEscapes: string): Array<{ name: string; instance: b
   const rows: Array<{ name: string; instance: boolean; selected: boolean }> = [];
   for (const line of paneEscapes.split("\n")) {
     const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
-    const row = /^ {2}(?:(fx \d+|main)|[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
+    const row = /^ {2}(?:(fx \d+|main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
     if (row) rows.push({ name: (row[1] ?? row[2])!, instance: row[1] !== undefined, selected: line.includes("\x1b[1m") });
   }
   return rows;
