@@ -2644,6 +2644,113 @@ test "a tool's notice follows the rules its step delivered, and the next turn ex
     }
 }
 
+test "a step that ends on a repeated failure joins its notes and notice before the steering it takes, and the next turn extends the request (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/a.txt", .data = "a" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const notice = "notice from a tool";
+
+    // The last step of each case reads a file in a folder with its own rules,
+    // which raises a notice, and ends the turn on a repeated failure unless
+    // the user steers it on. The steering is taken at the step's end, after
+    // the boundaries at the top of each step. Repeated malformed arguments
+    // is the third such end, but a step of only malformed calls reaches no
+    // folder and runs no tool, so it holds neither a note nor a notice.
+    const failing = [_]ToolCall{toolCall("shell_failing", "shell", "{\"command\":\"false\"}")};
+    const failing_and_read = [_]ToolCall{
+        toolCall("shell_failing_last", "shell", "{\"command\":\"false\"}"),
+        toolCall("read_nested", "read_file", "{\"path\":\"nested/a.txt\"}"),
+    };
+    const shell_completions = [_]FakeCompletion{
+        .{ .tool_calls = &failing },
+        .{ .tool_calls = &failing },
+        .{ .tool_calls = &failing_and_read },
+        .{ .content = "Done" },
+    };
+    const shell_plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "read output", .system_notice = notice } },
+    };
+    const invalid_output = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"missing field\"]}}";
+    const invalid = [_]ToolCall{toolCall("shell_invalid", "shell", "{\"command\":\"\"}")};
+    const invalid_and_read = [_]ToolCall{
+        // Other arguments, so the result does not carry the note for a call
+        // that failed before, and the two results are the same text.
+        toolCall("shell_invalid_last", "shell", "{\"command\":\" \"}"),
+        toolCall("read_nested", "read_file", "{\"path\":\"nested/a.txt\"}"),
+    };
+    const validation_completions = [_]FakeCompletion{
+        .{ .tool_calls = &invalid },
+        .{ .tool_calls = &invalid_and_read },
+        .{ .content = "Done" },
+    };
+    // The shell calls fail the registered tool's own validation and never
+    // run, so only the read has a plan.
+    const validation_plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "read output", .system_notice = notice } },
+    };
+    const validation_results = [_]?[]const u8{ invalid_output, invalid_output };
+    const Case = struct {
+        name: []const u8,
+        completions: []const FakeCompletion,
+        plans: []const test_support.FakeExecPlan,
+        validation_results: []const ?[]const u8 = &.{},
+        steering_take_at: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "the same shell call fails in three steps", .completions = &shell_completions, .plans = &shell_plans, .steering_take_at = 4 },
+        .{ .name = "the same shell validation error comes twice", .completions = &validation_completions, .plans = &validation_plans, .validation_results = &validation_results, .steering_take_at = 3 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var fixture = PromptFixture{ .workspace_root = workspace };
+        var job = fixture.job();
+        job.model = @constCast("anthropic/claude-sonnet-5.5");
+        job.permission_mode = .auto;
+
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = registry;
+        hooks.exec_plans = case.plans;
+        hooks.validation_results = case.validation_results;
+        hooks.steering_messages = &.{"typed steering text"};
+        hooks.steering_take_at = case.steering_take_at;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        // The request after the last step sends its results, the rules its
+        // read reached, the notice, then the steering.
+        try std.testing.expectEqual(case.completions.len, gateway.request_bodies.items.len);
+        const last = gateway.request_bodies.items.len - 1;
+        try expectBodyContainsInOrder(&gateway, last, &.{ "read output", "NOTE_SCOPE_RULE", notice, "typed steering text" });
+
+        // The next turn's request opens with that whole request.
+        var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+        defer next_gateway.deinit();
+        var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer next_hooks.deinit();
+        next_hooks.context_enabled = true;
+        next_hooks.context_registry = registry;
+        var next_job = fixture.job();
+        next_job.model = job.model;
+        next_job.permission_mode = .auto;
+        next_job.prompt = @constCast("second prompt");
+        next_job.history = hooks.history_turns.items;
+        try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+        try test_support.expectPromptExtends(gateway.request_bodies.items[last], next_gateway.request_bodies.items[0]);
+    }
+}
+
 test "a tool's notice stays in a turn cancelled once the step's last result is in" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{

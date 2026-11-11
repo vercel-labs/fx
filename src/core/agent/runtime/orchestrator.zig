@@ -161,6 +161,22 @@ fn flushBoundaryNotices(
     boundary_notices.clearRetainingCapacity();
 }
 
+/// Adds what a step held for its boundary to the turn: the notes its calls'
+/// gate queued, then its tools' notices. A step that takes steering before
+/// its next request does this first, since the saved turn restores a
+/// boundary's notes before its steering (D93); the top of the next step does
+/// the same for a step that goes on without it.
+fn flushStepBoundary(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    pending_context_notes: *std.ArrayList(ChatMessage),
+    boundary_notices: *std.ArrayList(ChatMessage),
+) !void {
+    try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
+    pending_context_notes.clearRetainingCapacity();
+    try flushBoundaryNotices(arena, within_turn_suffix, boundary_notices);
+}
+
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
     if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
@@ -12453,7 +12469,7 @@ fn processQueuedPromptLoop(
             &step_batch,
         );
         if (malformed_arguments_retry.finishBatch()) {
-            try flushBoundaryNotices(arena, &within_turn_suffix, &boundary_notices);
+            try flushStepBoundary(arena, &within_turn_suffix, &pending_context_notes, &boundary_notices);
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
@@ -12485,7 +12501,7 @@ fn processQueuedPromptLoop(
             return;
         }
         if (terminal_validation_retry.finishBatch()) {
-            try flushBoundaryNotices(arena, &within_turn_suffix, &boundary_notices);
+            try flushStepBoundary(arena, &within_turn_suffix, &pending_context_notes, &boundary_notices);
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
@@ -12510,7 +12526,7 @@ fn processQueuedPromptLoop(
             return;
         }
         if (shell_execution_failure_retry.finishBatch(step_batch.step_changed_files)) {
-            try flushBoundaryNotices(arena, &within_turn_suffix, &boundary_notices);
+            try flushStepBoundary(arena, &within_turn_suffix, &pending_context_notes, &boundary_notices);
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
