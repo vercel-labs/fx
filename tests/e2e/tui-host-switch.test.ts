@@ -392,7 +392,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
         // Main's session commands stay on main's screen, /clear and /reset
         // included: on a subagent they would replace its saved conversation.
-        for (const command of ["/new", "/clear", "/reset"]) {
+        for (const command of ["/new", "/clear", "/reset", "/fork", "/resume"]) {
           await session.sendText(command);
           await session.waitForText(`${command} works on main's screen`, 15_000);
         }
