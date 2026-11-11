@@ -253,6 +253,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SHELL_QUIET_NOTICE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SKIP_ONBOARDING": {
       "job": "test",
       "stability": "internal"

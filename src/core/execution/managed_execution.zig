@@ -11,6 +11,7 @@ const execution_router = @import("router.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
+const quiet_notice = @import("quiet_notice.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -19,6 +20,14 @@ const captured_stop_settle_timeout_ms: i64 = if (builtin.is_test)
     100
 else
     command_runner.termination_settle_timeout_ms + 1_000;
+
+/// The quiet limit (`quiet_notice.zig`), or the shorter one the end-to-end
+/// tests set with `FX_TEST_SHELL_QUIET_NOTICE_MS`. Read when a wait or a
+/// result needs it, since `Runtime.init` also runs at compile time as a
+/// default field value.
+fn quietLimitMs() u64 {
+    return quiet_notice.limitFromValue(io_mod.getenv("FX_TEST_SHELL_QUIET_NOTICE_MS"));
+}
 
 pub const StartCapturedInput = struct {
     execution_id: []const u8,
@@ -93,6 +102,12 @@ pub const Snapshot = struct {
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
     error_name: ?[]u8 = null,
+    /// How long a running captured command has run and printed nothing, and
+    /// whether that quiet time has reached the limit
+    /// (`quiet_notice.zig`). Null and false on every other snapshot.
+    running_ms: ?u64 = null,
+    quiet_ms: ?u64 = null,
+    quiet_notice: bool = false,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.execution_id);
@@ -198,6 +213,10 @@ const Entry = struct {
     stderr_bytes: usize = 0,
     output_truncated: bool = false,
     output_incomplete: bool = false,
+    /// When the entry was made, and when its command last printed: its
+    /// start until then. Guarded by `mutex`.
+    started_ms: i64 = 0,
+    last_output_ms: i64 = 0,
     delivery: contract.DeliveryState = .{},
     active_waiter: ?u64 = null,
     preempted_waiter: ?u64 = null,
@@ -289,6 +308,8 @@ const Entry = struct {
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
         };
+        entry.started_ms = io_mod.milliTimestamp();
+        entry.last_output_ms = entry.started_ms;
         return entry;
     }
 
@@ -426,6 +447,7 @@ const Entry = struct {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
+        self.last_output_ms = io_mod.milliTimestamp();
         if (self.replay_capture) |capture| {
             capture.appendAccepted(self.arena.allocator(), stream, chunk);
         }
@@ -895,20 +917,26 @@ pub const Runtime = struct {
             return error.ExecutionBusy;
         }
         entry.active_waiter = waiter_id;
+        // The wait ends at its ceiling, or when the command reaches the quiet
+        // limit after the wait saw it under it (`quiet_notice.poll`).
+        const limit_ms = quietLimitMs();
+        var quiet_wait = quiet_notice.beginWait(io_mod.milliTimestamp(), entry.last_output_ms, wait_ceiling_ms, limit_ms);
         entry.mutex.unlock(zio);
         defer self.clearActiveWaiter(entry, waiter_id);
-        const started_ms = io_mod.milliTimestamp();
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
             const preempted = entry.preempted_waiter == waiter_id;
+            const last_output_ms = entry.last_output_ms;
             entry.mutex.unlock(zio);
             if (preempted) return error.WaitPreempted;
             if (terminal) break;
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) return error.Cancelled;
             }
-            if (io_mod.milliTimestamp() - started_ms >= wait_ceiling_ms) break;
+            const step = quiet_notice.poll(quiet_wait, io_mod.milliTimestamp(), last_output_ms, limit_ms);
+            quiet_wait = step.wait;
+            if (step.end != null) break;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
@@ -1224,6 +1252,18 @@ pub const Runtime = struct {
             try alloc.dupe(u8, name)
         else
             null;
+        // Only a running captured command reports its time: a terminal
+        // session waits for input by design.
+        const times = if (entry.backend() == .captured)
+            quiet_notice.timesFor(
+                !entry.isTerminal(),
+                io_mod.milliTimestamp(),
+                entry.started_ms,
+                entry.last_output_ms,
+                quietLimitMs(),
+            )
+        else
+            null;
         return .{
             .reservation_id = reservation_id,
             .snapshot = .{
@@ -1251,6 +1291,9 @@ pub const Runtime = struct {
                 else
                     entry.stderr_bytes,
                 .error_name = error_name,
+                .running_ms = if (times) |value| value.running_ms else null,
+                .quiet_ms = if (times) |value| value.quiet_ms else null,
+                .quiet_notice = if (times) |value| value.notice else false,
             },
         };
     }
