@@ -488,6 +488,7 @@
     "src/core/shell_command/command_effect.zig": "Reads the flags of git and other commands the agent runs.",
     "src/core/shell_command/command_lex.zig": "Reads the flags of timeout, env, and other wrapper commands the agent runs.",
     "src/core/terminal/shell_resolver.zig": "Checks the -i fx passes to the user's shell.",
-    "src/core/tooling/command_policy.zig": "Reads the flags of git and other commands the agent runs, for permission decisions."
+    "src/core/tooling/command_policy.zig": "Reads the flags of git and other commands the agent runs, for permission decisions.",
+    "src/ui/transcript/tool_group_projection.zig": "Reads git's -C and -c in commands the agent runs, to show them in short form."
   }
 }
