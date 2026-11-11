@@ -185,9 +185,9 @@ async function waitForSettledChild(fixture: Fixture, id: string, children: numbe
   throw new Error(`the parent never settled after its child: ${kinds.join(",")}`);
 }
 
-function spawnAsk(fixture: Fixture, gateway: any, args: string[]) {
+function spawnAsk(fixture: Fixture, gateway: any, args: string[], cwd = fixture.workspace) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
-    cwd: fixture.workspace,
+    cwd,
     env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
     stdio: "ignore",
   });
@@ -3415,6 +3415,529 @@ test("fx session reads a session another process holds, and reads past a torn ta
     // Only a writer cuts a torn tail.
     expect(readFileSync(path)).toEqual(torn);
   } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+/// `fx sessions --live --json [args]` from `cwd`: it succeeds, writes nothing
+/// on stderr, and names its shape.
+async function liveSessions(fixture: Fixture, gateway: any, args: string[] = [], cwd = fixture.workspace) {
+  const result = await command(fixture, gateway, ["sessions", "--live", "--json", ...args], cwd);
+  expect(result.stderr).toBe("");
+  expect(result.code).toBe(0);
+  const listed = JSON.parse(result.stdout);
+  expect(listed.kind).toBe("live_sessions");
+  expect(listed.count).toBe(listed.sessions.length);
+  return listed;
+}
+
+/// The saved root sessions that are not in `known`.
+function newRoots(fixture: Fixture, known: string[]): string[] {
+  return rootSessionIds(fixture.home).filter((id) => !known.includes(id));
+}
+
+/// The model a session's log saved with it, the newest `prefs` line's.
+function savedModel(fixture: Fixture, id: string): string {
+  const prefs = logLines(fixture.home, id).filter((line: any) => line.kind === "set" && line.key === "prefs");
+  return (prefs.at(-1) as any).value.model;
+}
+
+/// The logs of the sessions `ids`, to show a read wrote nothing.
+function logBytesOf(fixture: Fixture, ids: string[]) {
+  return ids.map((id) => readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")));
+}
+
+test("fx sessions --live lists the sessions other fx processes hold, with their subagents, and drops a killed one", async () => {
+  const fixture = createFixture("fx-v2-live-");
+  mkdirSync(join(fixture.root, "other"));
+  const other = realpathSync(join(fixture.root, "other"));
+  let mainHeld = false;
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      childHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("live-delegate")) return fakeGatewayFinalText("LIVE_SENT");
+    if (body.includes("Delegate the live review.")) {
+      return fakeGatewayToolCall("live-delegate", "subagent", { request: { action: "message", agent: "reviewer", message: "Review the live change." } });
+    }
+    if (body.includes("Hold the live turn.")) {
+      mainHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("LIVE_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  try {
+    // A saved session that no process holds is never live.
+    const saved = JSON.parse((await ask(fixture, gateway, ["A saved live question."])).stdout).session_id;
+    expect(await liveSessions(fixture, gateway)).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+    const none = await command(fixture, gateway, ["sessions", "--live"]);
+    expect(none.code).toBe(0);
+    expect(none.stderr).toBe("");
+    expect(none.stdout).toBe("[sessions] no live sessions\n");
+
+    holders.push(spawnAsk(fixture, gateway, ["Hold the live turn."]));
+    await until(() => mainHeld, "the held turn");
+    const [working] = newRoots(fixture, [saved]);
+    await waitForLog(fixture, working!, "turn_started");
+    holders.push(spawnAsk(fixture, gateway, ["Delegate the live review."], other));
+    await until(() => childHeld, "the subagent's request");
+    const [delegating] = newRoots(fixture, [saved, working!]);
+    // The parent's turn ends with the receipt while its subagent works.
+    await waitForLog(fixture, delegating!, "turn_committed");
+    const childId = childLines(fixture.home, delegating!)[0].child;
+    const before = logBytesOf(fixture, [working!, delegating!, childId]);
+
+    // This workspace has one live session; the other workspace's is left out.
+    const here = await liveSessions(fixture, gateway);
+    expect(here.sessions).toEqual([{
+      id: working,
+      // A session in its first turn has no title yet.
+      title: "Untitled session",
+      workspace_root: fixture.workspace,
+      saved_model: savedModel(fixture, working!),
+      state: "working",
+      created_at_ms: expect.any(Number),
+      updated_at_ms: expect.any(Number),
+      agents: [],
+    }]);
+
+    const all = await liveSessions(fixture, gateway, ["--all"]);
+    expect(all.sessions.map((entry: any) => entry.id)).toEqual([delegating, working]);
+    expect(all.sessions[0]).toMatchObject({ workspace_root: other, state: "idle", title: "Delegate the live review." });
+    expect(all.sessions[0].agents).toEqual([
+      { name: "reviewer", address: `${delegating}/reviewer`, id: childId, state: "working", agents: [] },
+    ]);
+
+    const text = await command(fixture, gateway, ["sessions", "--live", "--all"]);
+    expect(text.code).toBe(0);
+    expect(text.stderr).toBe("");
+    expect(text.stdout.replace(/updated [^\n]+/g, "updated <time>")).toBe([
+      "[sessions] 2 live",
+      " - Delegate the live review.",
+      `   id=${delegating} | idle | saved model ${savedModel(fixture, delegating!)} | updated <time>`,
+      `   workspace=${other}`,
+      `   - reviewer | working | ${delegating}/reviewer`,
+      " - Untitled session",
+      `   id=${working} | working | saved model ${savedModel(fixture, working!)} | updated <time>`,
+      `   workspace=${fixture.workspace}`,
+      "",
+    ].join("\n"));
+
+    // Listing took no lock that stayed and wrote nothing.
+    expect(logBytesOf(fixture, [working!, delegating!, childId])).toEqual(before);
+
+    // A killed process frees its lock, so its session drops off on the next run.
+    holders[1]!.child.kill("SIGKILL");
+    await holders[1]!.exited;
+    expect((await liveSessions(fixture, gateway, ["--all"])).sessions.map((entry: any) => entry.id)).toEqual([working]);
+    holders[0]!.child.kill("SIGKILL");
+    await holders[0]!.exited;
+    expect(await liveSessions(fixture, gateway, ["--all"])).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+    // The saved listing is unchanged.
+    const listed = JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout);
+    expect(listed.kind).toBe("sessions");
+    expect(listed.sessions.map((entry: any) => entry.id).sort()).toEqual([saved, working, delegating].sort());
+  } finally {
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx session --tail prints the last turns of a held session under their own numbers, and writes nothing", async () => {
+  const fixture = createFixture("fx-v2-tail-");
+  let held = false;
+  const gateway = replyToLatest([
+    ["Tail turn one.", "TAIL_ANSWER_ONE"],
+    ["Tail turn two.", "TAIL_ANSWER_TWO"],
+    ["Tail turn three.", "TAIL_ANSWER_THREE"],
+    ["Tail turn held.", null],
+  ], () => (held = true));
+  let holder: ReturnType<typeof spawnAsk> | undefined;
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Tail turn one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Tail turn two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Tail turn three."])).code).toBe(0);
+    holder = spawnAsk(fixture, gateway, ["--resume", id, "Tail turn held."]);
+    await until(() => held, "the held turn");
+    const before = logBytesOf(fixture, [id]);
+
+    const text = await command(fixture, gateway, ["session", id, "--tail", "2"]);
+    expect(text.code).toBe(0);
+    expect(text.stderr).toBe("");
+    expect(text.stdout).toContain("history_len: 3\nfirst_turn: 2\n");
+    expect(text.stdout).toContain("[turn 2]");
+    expect(text.stdout).toContain("[turn 3]");
+    expect(text.stdout).not.toContain("[turn 1]");
+    expect(text.stdout).toContain("Tail turn two.");
+    expect(text.stdout).toContain("TAIL_ANSWER_THREE");
+    expect(text.stdout).not.toContain("Tail turn one.");
+    // The turn in progress is not saved as a turn yet.
+    expect(text.stdout).not.toContain("Tail turn held.");
+
+    const json = JSON.parse((await command(fixture, gateway, ["session", id, "--tail", "2", "--json"])).stdout);
+    expect(json.kind).toBe("session_detail");
+    expect(json.history_len).toBe(3);
+    expect(json.first_turn).toBe(2);
+    expect(json.history.map((turn: any) => turn.user.text)).toEqual(["Tail turn two.", "Tail turn three."]);
+    expect(json.history[1].assistant).toBe("TAIL_ANSWER_THREE");
+
+    // More than the session has prints all of it.
+    const wide = JSON.parse((await command(fixture, gateway, ["session", "--id", id, "--tail", "1000", "--json"])).stdout);
+    expect(wide.first_turn).toBe(1);
+    expect(wide.history).toHaveLength(3);
+    // `last` reads the newest session the same way.
+    const last = JSON.parse((await command(fixture, gateway, ["session", "last", "--tail", "1", "--json"])).stdout);
+    expect(last.id).toBe(id);
+    expect(last.history.map((turn: any) => turn.user.text)).toEqual(["Tail turn three."]);
+    // Without --tail the detail is as it was.
+    const whole = JSON.parse((await command(fixture, gateway, ["session", id, "--json"])).stdout);
+    expect(whole.history).toHaveLength(3);
+    expect(whole.first_turn).toBeUndefined();
+
+    expect(logBytesOf(fixture, [id])).toEqual(before);
+  } finally {
+    holder?.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx session shows saved control bytes as visible escapes, with --tail and without", async () => {
+  const fixture = createFixture("fx-v2-escape-");
+  const saved = "TITLE \x1b]0;owned\x07 CLEAR \x1b[2J\nSECOND\tLINE";
+  const gateway = replyToLatest([
+    ["Escape turn one.", "PLAIN_ANSWER"],
+    ["Escape turn two.", saved],
+  ]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Escape turn one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Escape turn two."])).code).toBe(0);
+    for (const args of [["session", id], ["session", id, "--tail", "1"]]) {
+      const shown = await command(fixture, gateway, args);
+      expect(shown.code).toBe(0);
+      expect(shown.stderr).toBe("");
+      // The terminal gets no escape or bell, and lines and tabs stay.
+      expect(shown.stdout).not.toMatch(/[\x1b\x07]/);
+      expect(shown.stdout).toContain("TITLE \\x1b]0;owned\\x07 CLEAR \\x1b[2J\nSECOND\tLINE\n");
+    }
+    // JSON keeps the saved text as it is.
+    const json = JSON.parse((await command(fixture, gateway, ["session", id, "--tail", "1", "--json"])).stdout);
+    expect(json.history[0].assistant).toBe(saved);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx session <id>/<agent> reads a subagent by the name its parent gave it", async () => {
+  const fixture = createFixture("fx-v2-agent-read-");
+  let round: 1 | 2 = 1;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("Review round two.") ? "AGENT_REVIEW_TWO" : "AGENT_REVIEW_ONE");
+    if (isReportTurn(body)) return fakeGatewayFinalText(round === 1 ? "AGENT_REPORT_ONE" : "AGENT_REPORT_TWO");
+    const call = round === 1 ? "agent-one" : "agent-two";
+    if (body.includes(call)) return fakeGatewayFinalText(round === 1 ? "AGENT_SENT_ONE" : "AGENT_SENT_TWO");
+    return fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: round === 1 ? "Review round one." : "Review round two." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["First agent review."])).stdout).session_id;
+    round = 2;
+    expect((await ask(fixture, gateway, ["--resume", id, "Second agent review."])).code).toBe(0);
+    const childId = childLines(fixture.home, id)[0].child;
+    const before = logBytesOf(fixture, [id, childId]);
+
+    const whole = await command(fixture, gateway, ["session", `${id}/reviewer`, "--json"]);
+    expect(whole.code).toBe(0);
+    expect(whole.stderr).toBe("");
+    const detail = JSON.parse(whole.stdout);
+    expect(detail).toMatchObject({ kind: "session_detail", id: childId, address: `${id}/reviewer`, history_len: 2 });
+    expect(detail.history.map((turn: any) => turn.assistant)).toEqual(["AGENT_REVIEW_ONE", "AGENT_REVIEW_TWO"]);
+
+    const tail = JSON.parse((await command(fixture, gateway, ["session", `${id}/reviewer`, "--tail", "1", "--json"])).stdout);
+    expect(tail).toMatchObject({ id: childId, address: `${id}/reviewer`, history_len: 2, first_turn: 2 });
+    expect(tail.history.map((turn: any) => turn.assistant)).toEqual(["AGENT_REVIEW_TWO"]);
+    const text = await command(fixture, gateway, ["session", "--id", `${id}/reviewer`, "--tail", "1"]);
+    expect(text.code).toBe(0);
+    expect(text.stdout).toContain(`[session] ${childId}\naddress: ${id}/reviewer\n`);
+    expect(text.stdout).toContain("[turn 2]");
+    expect(text.stdout).toContain("AGENT_REVIEW_TWO");
+    expect(text.stdout).not.toContain("AGENT_REVIEW_ONE");
+
+    // An unknown name fails and names the agents the session has.
+    const unknown = await command(fixture, gateway, ["session", `${id}/nobody`, "--json"]);
+    expect(unknown.code).toBe(1);
+    expect(JSON.parse(unknown.stdout)).toMatchObject({ kind: "session", code: "AgentNotFound" });
+    expect(JSON.parse(unknown.stdout).error).toBe(`session ${id} has no agent named nobody; its agents: reviewer`);
+    const unknownText = await command(fixture, gateway, ["session", `${id}/nobody`]);
+    expect(unknownText.code).toBe(1);
+    expect(unknownText.stderr).toBe(`fx session: session ${id} has no agent named nobody; its agents: reviewer\n`);
+    const deeper = await command(fixture, gateway, ["session", `${id}/reviewer/helper`, "--json"]);
+    expect(deeper.code).toBe(1);
+    expect(JSON.parse(deeper.stdout).error).toBe(`session ${id}/reviewer has no agent named helper; it has no agents`);
+    // A part no subagent can have is named, with the rule it breaks.
+    const rule = 'agent names are lowercase letters, digits, "_", and "-", start with a letter or digit, and are at most 64 bytes';
+    for (const [target, message] of [
+      [`${id}/Reviewer`, `Reviewer is not an agent name; ${rule}`],
+      [`${id}/reviewer/x.y`, `x.y is not an agent name; ${rule}`],
+      [`${id}/`, `${id}/ has an empty agent name`],
+      [`${id}//reviewer`, `${id}//reviewer has an empty agent name`],
+      [`${id}/a/b/c/d/e`, `${id}/a/b/c/d/e goes more than 4 agents deep`],
+    ]) {
+      const bad = await command(fixture, gateway, ["session", target!, "--json"]);
+      expect(bad.code).toBe(1);
+      expect(JSON.parse(bad.stdout)).toMatchObject({ kind: "session", code: "InvalidAgentAddress", error: message });
+      const badText = await command(fixture, gateway, ["session", target!]);
+      expect(badText.code).toBe(1);
+      expect(badText.stderr).toBe(`fx session: ${message}\n`);
+    }
+    // A root that is not a session id is still an invalid session id.
+    const noRoot = await command(fixture, gateway, ["session", "/reviewer", "--json"]);
+    expect(noRoot.code).toBe(1);
+    expect(JSON.parse(noRoot.stdout).code).toBe("InvalidSessionId");
+    // A child is still reached only through its parent.
+    const direct = await command(fixture, gateway, ["session", childId, "--json"]);
+    expect(direct.code).toBe(1);
+    expect(JSON.parse(direct.stdout).code).toBe("SessionNotFound");
+
+    expect(logBytesOf(fixture, [id, childId])).toEqual(before);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx sessions --live and fx session --tail refuse bad flags with exit 2", async () => {
+  const fixture = createFixture("fx-v2-live-flags-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("FLAGS_ANSWER")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["A flags question."])).stdout).session_id;
+    for (const value of ["0", "1001", "abc", "-1"]) {
+      const bad = await command(fixture, gateway, ["session", id, "--tail", value]);
+      expect(bad.code).toBe(2);
+      expect(bad.stdout).toBe("");
+      expect(bad.stderr).toContain(`fx session: --tail takes a whole number from 1 to 1000, not ${value}\n`);
+      const json = await command(fixture, gateway, ["session", id, "--tail", value, "--json"]);
+      expect(json.code).toBe(2);
+      expect(json.stderr).toBe("");
+      expect(JSON.parse(json.stdout)).toMatchObject({ kind: "session", error: `--tail takes a whole number from 1 to 1000, not ${value}` });
+    }
+    const missing = await command(fixture, gateway, ["session", id, "--tail"]);
+    expect(missing.code).toBe(2);
+    expect(missing.stderr).toContain("--tail");
+    const recover = await command(fixture, gateway, ["session", "recover", id, "--tail", "1"]);
+    expect(recover.code).toBe(2);
+
+    for (const flags of [["--cursor", `v1:1:${id}`], ["--limit", "5"]]) {
+      const bad = await command(fixture, gateway, ["sessions", "--live", ...flags]);
+      expect(bad.code).toBe(2);
+      expect(bad.stdout).toBe("");
+      expect(bad.stderr).toContain(`fx sessions: --live lists every live session, so it takes no ${flags[0]}\n`);
+      const json = await command(fixture, gateway, ["sessions", ...flags, "--live", "--json"]);
+      expect(json.code).toBe(2);
+      expect(json.stderr).toBe("");
+      expect(JSON.parse(json.stdout)).toMatchObject({ kind: "sessions", error: `--live lists every live session, so it takes no ${flags[0]}` });
+    }
+
+    const sessionsHelp = await command(fixture, gateway, ["sessions", "--help"]);
+    expect(sessionsHelp.stdout).toContain("--live");
+    const sessionHelp = await command(fixture, gateway, ["session", "--help"]);
+    expect(sessionHelp.stdout).toContain("--tail <1-1000>");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx sessions --live lists a live session whose log is damaged, skips a folder it cannot open, and keeps a subagent whose log is gone", async () => {
+  const fixture = createFixture("fx-v2-live-faults-");
+  let mainHeld = false;
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      childHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("fault-delegate")) return fakeGatewayFinalText("FAULT_SENT");
+    if (body.includes("Delegate the fault review.")) {
+      return fakeGatewayToolCall("fault-delegate", "subagent", { request: { action: "message", agent: "checker", message: "Check the fault." } });
+    }
+    if (body.includes("Hold the damaged turn.")) {
+      mainHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("FAULT_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  const locked: string[] = [];
+  try {
+    const first = await ask(fixture, gateway, ["A damaged live question."]);
+    const damaged = JSON.parse(first.stdout).session_id;
+    const shut = JSON.parse((await ask(fixture, gateway, ["A shut folder question."])).stdout).session_id;
+    holders.push(spawnAsk(fixture, gateway, ["--resume", damaged, "Hold the damaged turn."]));
+    await until(() => mainHeld, "the held turn");
+    holders.push(spawnAsk(fixture, gateway, ["Delegate the fault review."]));
+    await until(() => childHeld, "the subagent's request");
+    const [delegating] = newRoots(fixture, [damaged, shut]);
+    await waitForLog(fixture, delegating!, "turn_committed");
+    const childId = childLines(fixture.home, delegating!)[0].child;
+
+    // A flipped byte inside the held session's log: it is still live, and
+    // its state can't be read.
+    flipMiddleByte(join(storeRoot(fixture.home), damaged, "log.jsonl"));
+    // A saved folder nobody can open is not live, and the scan goes on.
+    chmodSync(join(storeRoot(fixture.home), shut), 0o000);
+    locked.push(join(storeRoot(fixture.home), shut));
+    // A subagent whose own log is gone is still listed from its parent's.
+    rmSync(join(storeRoot(fixture.home), childId), { recursive: true, force: true });
+
+    const listed = await liveSessions(fixture, gateway);
+    const byId = new Map(listed.sessions.map((entry: any) => [entry.id, entry]));
+    expect([...byId.keys()].sort()).toEqual([damaged, delegating].sort());
+    expect(byId.get(damaged)).toMatchObject({ state: "unknown", saved_model: null, agents: [] });
+    expect((byId.get(delegating!) as any).agents).toEqual([
+      { name: "checker", address: `${delegating}/checker`, id: childId, state: "working", agents: [] },
+    ]);
+    // Reading the missing subagent fails as missing.
+    const gone = await command(fixture, gateway, ["session", `${delegating}/checker`, "--tail", "1", "--json"]);
+    expect(gone.code).toBe(1);
+    expect(JSON.parse(gone.stdout).code).toBe("SessionNotFound");
+  } finally {
+    for (const path of locked) chmodSync(path, 0o700);
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+/// The newest user text of a Gateway request.
+function latestUserPlainText(body: string): string {
+  const user = (JSON.parse(body).prompt ?? []).filter((message: any) => message.role === "user").at(-1);
+  if (!user) return "";
+  if (typeof user.content === "string") return user.content;
+  return (user.content ?? []).map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("");
+}
+
+test("fx sessions --live leaves out a subagent its parent closed for good", async () => {
+  const fixture = createFixture("fx-v2-live-closed-");
+  let held = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("Come back.") ? "GONER_BACK" : "CLOSED_CHILD_ANSWER");
+    if (isReportTurn(body)) return fakeGatewayFinalText("CLOSED_REPORT_READ");
+    const latest = latestUserPlainText(body);
+    if (latest.includes("Start the goner again.")) {
+      if (!body.includes("again-goner")) return fakeGatewayToolCall("again-goner", "subagent", { request: { action: "message", agent: "goner", message: "Come back." } });
+      return fakeGatewayFinalText("GONER_STARTED_AGAIN");
+    }
+    if (latest.includes("Start two helpers.")) {
+      if (!body.includes("start-keeper")) return fakeGatewayToolCall("start-keeper", "subagent", { request: { action: "message", agent: "keeper", message: "Keep going." } });
+      if (!body.includes("start-goner")) return fakeGatewayToolCall("start-goner", "subagent", { request: { action: "message", agent: "goner", message: "Finish and go." } });
+      return fakeGatewayFinalText("BOTH_SENT");
+    }
+    if (latest.includes("Close the goner.")) {
+      if (!body.includes("close-goner")) return fakeGatewayToolCall("close-goner", "subagent", { request: { action: "close", agent: "goner" } });
+      return fakeGatewayFinalText("GONER_CLOSED");
+    }
+    if (latest.includes("Hold the closed check.")) {
+      held = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("CLOSED_UNEXPECTED");
+  }, { classifierDecision: "clear" });
+  let holder: ReturnType<typeof spawnAsk> | undefined;
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Start two helpers."])).stdout).session_id;
+    await waitForSettledChild(fixture, id, 2);
+    expect((await ask(fixture, gateway, ["--resume", id, "Close the goner."])).code).toBe(0);
+    const keeper = childLines(fixture.home, id).find((line) => line.data.agent === "keeper").child;
+    expect(childLines(fixture.home, id).some((line) => line.kind === "child_finished" && line.data.closed === true)).toBe(true);
+    holder = spawnAsk(fixture, gateway, ["--resume", id, "Hold the closed check."]);
+    await until(() => held, "the held turn");
+
+    const listed = await liveSessions(fixture, gateway);
+    expect(listed.sessions.map((entry: any) => entry.id)).toEqual([id]);
+    expect(listed.sessions[0].agents).toEqual([{ name: "keeper", address: `${id}/keeper`, id: keeper, state: "idle", agents: [] }]);
+    // A closed subagent still reads by its name: its turns stay saved.
+    const goner = await command(fixture, gateway, ["session", `${id}/goner`, "--tail", "1", "--json"]);
+    expect(goner.code).toBe(0);
+    expect(JSON.parse(goner.stdout).history.map((turn: any) => turn.assistant)).toEqual(["CLOSED_CHILD_ANSWER"]);
+    const closedGoner = JSON.parse(goner.stdout).id;
+
+    // A new subagent under the closed one's name takes the name: the list
+    // shows it, and the address reads it, not the closed one.
+    holder.child.kill("SIGKILL");
+    await holder.exited;
+    held = false;
+    // fx ask exits only after its subagent's report, so the work is done.
+    expect((await ask(fixture, gateway, ["--resume", id, "Start the goner again."])).code).toBe(0);
+    holder = spawnAsk(fixture, gateway, ["--resume", id, "Hold the closed check."]);
+    await until(() => held, "the second held turn");
+    const again = await liveSessions(fixture, gateway);
+    const agents = again.sessions[0].agents;
+    expect(agents.map((agent: any) => agent.name)).toEqual(["keeper", "goner"]);
+    const newGoner = agents[1].id;
+    expect(newGoner).not.toBe(closedGoner);
+    const read = JSON.parse((await command(fixture, gateway, ["session", `${id}/goner`, "--json"])).stdout);
+    expect(read.id).toBe(newGoner);
+    expect(read.history.map((turn: any) => turn.assistant)).toEqual(["GONER_BACK"]);
+  } finally {
+    holder?.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test.skipIf(!tmuxAvailable())("fx sessions --live shows an interactive fx's subagent and that subagent's own subagent", async () => {
+  const fixture = createFixture("fx-v2-live-nested-");
+  let helperHeld = false;
+  const typed = ["Start the nested review."];
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isAppChildRequest(body, typed)) {
+      if (body.includes('You are the subagent \\"helper\\"')) {
+        helperHeld = true;
+        return new Promise<Response>(() => {});
+      }
+      if (body.includes("lead-sub")) return fakeGatewayFinalText("LEAD_STARTED_HELPER");
+      return fakeGatewayToolCall("lead-sub", "subagent", { request: { action: "message", agent: "helper", message: "Help with the nested review." } });
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("MAIN_READ_LEAD");
+    if (body.includes("main-sub")) return fakeGatewayFinalText("MAIN_SENT_LEAD");
+    return fakeGatewayToolCall("main-sub", "subagent", { request: { action: "message", agent: "lead", message: "Lead the nested review." } });
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.sendText(typed[0]!);
+    await until(() => helperHeld, "the helper's request");
+    await scrollbackContains(app.session, "MAIN_READ_LEAD");
+    const [id] = rootSessionIds(fixture.home);
+    const leadId = childLines(fixture.home, id!).find((line) => line.data.agent === "lead").child;
+    const helperId = childLines(fixture.home, leadId).find((line) => line.data.agent === "helper").child;
+    await until(() => logLines(fixture.home, id!).filter((line) => line.kind === "turn_started").length === logLines(fixture.home, id!).filter((line) => line.kind === "turn_committed").length, "main's turns to end");
+
+    const listed = await liveSessions(fixture, gateway);
+    expect(listed.sessions.map((entry: any) => entry.id)).toEqual([id]);
+    expect(listed.sessions[0].state).toBe("idle");
+    expect(listed.sessions[0].agents).toEqual([{
+      name: "lead",
+      address: `${id}/lead`,
+      id: leadId,
+      state: "idle",
+      agents: [{ name: "helper", address: `${id}/lead/helper`, id: helperId, state: "working", agents: [] }],
+    }]);
+    const text = await command(fixture, gateway, ["sessions", "--live"]);
+    expect(text.stdout).toContain(`   - lead | idle | ${id}/lead\n     - helper | working | ${id}/lead/helper\n`);
+    // The helper has no finished turn yet; lead has one.
+    const helper = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead/helper`, "--tail", "1", "--json"])).stdout);
+    expect(helper).toMatchObject({ id: helperId, address: `${id}/lead/helper`, history_len: 0, history: [] });
+    const lead = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead`, "--tail", "1", "--json"])).stdout);
+    expect(lead.history.map((turn: any) => turn.assistant)).toEqual(["LEAD_STARTED_HELPER"]);
+  } finally {
+    await app?.session.kill();
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

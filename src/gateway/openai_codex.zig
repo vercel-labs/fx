@@ -7,6 +7,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -325,13 +326,18 @@ pub fn streamPrepared(
             error.StreamTooLong => try alloc.dupe(u8, "OpenAI Codex error response exceeded the local limit"),
             else => return err,
         };
-        return .{ .failed = .{
-            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
-            .http_status = response.head.status,
-            .detail = body,
-            .retry_after_seconds = retry_after,
-            .ownership = .owned,
-        } };
+        const kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body);
+        return .{
+            .failed = .{
+                .kind = kind,
+                .http_status = response.head.status,
+                // The body can quote the token this request sent, and the detail
+                // reaches the transcript and the trace.
+                .detail = try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret()),
+                .retry_after_seconds = retry_after,
+                .ownership = .owned,
+            },
+        };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;

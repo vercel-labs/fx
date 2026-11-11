@@ -936,7 +936,7 @@ const FinishData = struct {
 
 /// Pure: whether folded child `entry`'s newest line closed it for good.
 /// Data this fx can't read closes nothing.
-fn foldedClosed(entry: session_adapter.Child) bool {
+pub fn foldedClosed(entry: session_adapter.Child) bool {
     if (entry.open) return false;
     const bytes = entry.finish_data orelse return false;
     var buf: [256]u8 = undefined;
@@ -944,6 +944,32 @@ fn foldedClosed(entry: session_adapter.Child) bool {
     const Wire = struct { closed: ?bool = null };
     const wire = json_decode.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
     return wire.closed orelse false;
+}
+
+/// Pure: the name folded child `entry` goes by, from its newest spawn's
+/// data, or null for a one-off, a name that is not an agent name, or data
+/// this fx can't read. The name is copied into `arena`.
+pub fn foldedName(arena: Allocator, entry: session_adapter.Child) ?[]const u8 {
+    const bytes = entry.spawn_data orelse return null;
+    const Wire = struct { agent: ?[]const u8 = null };
+    const wire = json_decode.parseFromSliceLeaky(Wire, arena, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    const name = wire.agent orelse return null;
+    return if (domain.validAgentName(name)) name else null;
+}
+
+test "a folded child's name is its spawn's agent, when it is an agent name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entry: session_adapter.Child = .{ .id = @constCast("c"), .work_id = @constCast("w"), .open = false, .outcome = .ok, .spawn_data = null, .finish_data = null, .seq = 1 };
+    try std.testing.expectEqual(@as(?[]const u8, null), foldedName(arena, entry));
+    entry.spawn_data = @constCast("{\"agent\":\"reviewer\",\"fingerprint\":\"ab\"}");
+    try std.testing.expectEqualStrings("reviewer", foldedName(arena, entry).?);
+    // A one-off, a name fx never gives, and data it can't read have none.
+    for ([_][]const u8{ "{\"fingerprint\":\"ab\"}", "{\"agent\":\"Bad Name\"}", "{\"agent\":\"a\\u001b[31m\"}", "not json", "{\"agent\":7}" }) |data| {
+        entry.spawn_data = @constCast(data);
+        try std.testing.expectEqual(@as(?[]const u8, null), foldedName(arena, entry));
+    }
 }
 
 /// Pure: the batch that closes idle child `child` for good in its parent's

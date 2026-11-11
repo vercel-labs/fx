@@ -8802,13 +8802,220 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Sign-in expired · opening /login", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
     try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload }, modes);
     try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
-    // The status line says fx is opening the sign-in; no reason notice.
-    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    // The gateway's reason shows once while fx waits for the sign-in.
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "token expired") != null);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+fn waitingTextStarting(hooks: *const FakeAgentRuntimeDeps, prefix: []const u8) bool {
+    for (hooks.route_recovery_statuses.items) |*status| {
+        if (status.kind == .waiting and std.mem.startsWith(u8, status.text.slice(), prefix)) return true;
+    }
+    return false;
+}
+
+test "processQueuedPrompt resends a login the gateway refuses after a refresh that worked, without a sign-in" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"refused for now\"}}";
+    // Two refused waits: the first send and its replay, then the resend
+    // and its replay.
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_models.items.len);
+    try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+    for (gateway.request_api_keys.items[1..]) |key| try std.testing.expectEqualStrings("token-after", key);
+    // No sign-in: the login just refreshed is good.
+    try std.testing.expect(needUserText(&hooks) == null);
+    try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
+    // Each resend reads the stored login again, and its 401 gets a forced
+    // refresh of its own, so the login is checked again on every resend.
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
+    // The reason shows once, not once per resend.
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "refused for now") != null);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt waits for a sign-in when a refused login's refresh stops working" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"refused for now\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "signed in answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+    // The first forced refresh works; the refresh token is revoked before
+    // the resend, so the second finds nothing.
+    hooks.credential_refresh_force_successes = 1;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    hooks.continue_on_need_user = &continue_flag;
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
+    try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
+    const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
+    try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(runtime_deps.CredentialRefreshMode, hooks.credential_refresh_modes.items, &.{.force}));
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt waits for a sign-in on a subscription 401 after a refresh that worked" {
+    const alloc = std.testing.allocator;
+    for ([_]types.CredentialSource{ .chatgpt_subscription, .grok_subscription }) |source| {
+        const refused = "{\"error\":{\"message\":\"subscription refused\"}}";
+        const completions = [_]FakeCompletion{
+            .{ .status = .unauthorized, .err_body = refused },
+            .{ .status = .unauthorized, .err_body = refused },
+            .{ .content = "signed in answer" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+        var fixture = PromptFixture{};
+        var continue_flag: std.atomic.Value(bool) = .init(false);
+        hooks.continue_on_need_user = &continue_flag;
+        var config = fixture.config();
+        config.recovery_continue_flag = &continue_flag;
+        var job = fixture.job();
+        job.credential_source = source;
+
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        // Only an fx login on AI Gateway retries a refused login; a
+        // subscription signs in again, as before, and shows no provider
+        // error while it waits.
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+        try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
+        try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+        const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
+        try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+        try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    }
+}
+
+test "processQueuedPrompt resends after a sign-in during a sign-in resend that then gets a gateway error" {
+    const alloc = std.testing.allocator;
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+        // The wait's own resend: the user signs in while it is on the wire,
+        // and the gateway answers 503.
+        .{ .status = .service_unavailable, .err_body = "{\"error\":{\"message\":\"try later\"}}", .set_before_answer = &continue_flag },
+        .{ .content = "answer after the sign-in" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{"token-before"};
+    hooks.credential_refresh_fail_force = true;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt ends the turn on a refused login after a refresh when the host cannot ask" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"refused for now\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt waiting for a sign-in resends on its own and finishes when the login works again" {
+    const alloc = std.testing.allocator;
+    const expired = "{\"error\":{\"message\":\"token expired\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = expired },
+        .{ .status = .unauthorized, .err_body = expired },
+        .{ .content = "answer once the login works" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{"token-before"};
+    // No refresh works and nobody signs in: only the timed resends happen.
+    hooks.credential_refresh_fail_force = true;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "Sign-in expired · waiting "));
+    // The timed resends kept the sign-in status: no retry status between them.
+    for (hooks.route_recovery_statuses.items) |*status| {
+        try std.testing.expect(status.kind != .retrying);
+    }
+    // The reason shows once across both waits.
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 

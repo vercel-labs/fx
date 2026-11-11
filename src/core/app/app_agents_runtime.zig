@@ -132,18 +132,6 @@ pub const ChildAgent = struct {
 /// null for the first.
 const CloseTarget = struct { agent: ?*ChildAgent };
 
-const max_search_bytes = 32;
-
-/// A key that edits the agent list's search.
-pub const SearchEdit = union(enum) {
-    /// A printable key, added at the end; a full search takes no more.
-    add: u8,
-    /// Backspace or Delete: takes the last letter off.
-    erase,
-    /// Esc: empties it.
-    clear,
-};
-
 pub const AgentsMenu = struct {
     open: bool = false,
     /// The highlighted agent's place in the switch list, from 0, as
@@ -156,10 +144,9 @@ pub const AgentsMenu = struct {
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?CloseTarget = null,
-    /// What the user typed to search the list, which then shows only the
-    /// agents whose name or title has it, case aside. Emptied when it closes.
-    search_buf: [max_search_bytes]u8 = undefined,
-    search_len: usize = 0,
+    /// The draft of the agent on screen, set aside while the composer is
+    /// the list's search box, and back in the composer once the list closes.
+    draft: ?composer_stash.State = null,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
@@ -168,11 +155,8 @@ pub const AgentsMenu = struct {
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
         self.rows.deinit(alloc);
         self.names.deinit(alloc);
+        if (self.draft) |*draft| draft.deinit(alloc);
         self.* = .{};
-    }
-
-    pub fn search(self: *const AgentsMenu) []const u8 {
-        return self.search_buf[0..self.search_len];
     }
 
     /// The agent the list highlights: one agent, null for the first
@@ -1117,7 +1101,7 @@ pub fn Runtime(comptime App: type) type {
             sortSubagentGroups(entries, switch_order);
             nestSubagents(entries, switch_order, order[hosted.len + 1 ..]);
             try out.ensureUnusedCapacity(app.alloc, switch_order.len);
-            const search = if (menuActive(app)) app.instances.agents_menu.search() else "";
+            const search = searchText(app);
             for (switch_order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
                 const target: ?*ChildAgent = if (position == 0) null else hosted[position - 1];
@@ -1136,6 +1120,12 @@ pub fn Runtime(comptime App: type) type {
                 if (at == null) menu.highlight = .on_screen;
                 menu.selected = at orelse positionIn(out.items, app.agent_on_screen) orelse 0;
             }
+        }
+
+        /// What the user typed in the composer to search the open list.
+        fn searchText(app: *App) []const u8 {
+            if (!menuActive(app)) return "";
+            return app.input_runtime.edit_state.input.items;
         }
 
         /// Whether agent `target`'s name or title has `search` in it, case aside.
@@ -1428,6 +1418,7 @@ pub fn Runtime(comptime App: type) type {
             menu.window_start = 0;
             menu.highlight = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
+            setDraftAside(app);
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
                 order.items.len,
@@ -1451,35 +1442,38 @@ pub fn Runtime(comptime App: type) type {
             menu.open = false;
             menu.highlight = .on_screen;
             menu.close_armed = null;
-            menu.search_len = 0;
+            putDraftBack(app);
             app.shell.render_requests.request(.footer);
         }
 
-        /// A key that edits the open list's search. False when `edit` has
-        /// nothing to erase or clear, so Backspace, Delete, and Esc do what
-        /// they do with no search.
-        pub fn editSearch(app: *App, edit: SearchEdit) bool {
-            if (!menuActive(app)) return false;
+        /// Sets the on-screen agent's draft aside, so the composer is the
+        /// open list's search box.
+        fn setDraftAside(app: *App) void {
             const menu = &app.instances.agents_menu;
-            switch (edit) {
-                .add => |byte| if (menu.search_len < menu.search_buf.len) {
-                    menu.search_buf[menu.search_len] = byte;
-                    menu.search_len += 1;
-                },
-                .erase => {
-                    if (menu.search_len == 0) return false;
-                    menu.search_len -= 1;
-                },
-                .clear => {
-                    if (menu.search_len == 0) return false;
-                    menu.search_len = 0;
-                },
+            if (menu.draft != null) return;
+            menu.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
+        }
+
+        /// Gives the composer its draft back, dropping the search typed in it.
+        fn putDraftBack(app: *App) void {
+            const menu = &app.instances.agents_menu;
+            if (menu.draft) |*draft| {
+                const search_bytes = app.input_runtime.edit_state.input.items.len;
+                if (search_bytes > 0) debug_trace.logf("host", "agent list search dropped bytes={d}", .{search_bytes});
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                draft.restore(app.alloc, app.input_runtime.composerStashView());
+                menu.draft = null;
             }
+        }
+
+        /// The composer's search changed, so rows came or went: the list
+        /// scrolls back to its top, and a close the first Delete armed lapses.
+        pub fn searchChanged(app: *App) void {
+            if (!menuActive(app)) return;
+            const menu = &app.instances.agents_menu;
             menu.close_armed = null;
             menu.window_start = 0;
-            debug_trace.eventf("host", "agents_menu_search", .{}, "bytes={d}", .{menu.search_len});
             app.shell.render_requests.request(.footer);
-            return true;
         }
 
         /// Esc, Ctrl+X, Ctrl+C, and a paste: closes the list. The agent on
@@ -1549,7 +1543,7 @@ pub fn Runtime(comptime App: type) type {
                     .name = name,
                     .subagent = subagent != null,
                     // A search lists its matches flat, since their parents may not match.
-                    .nested = if (subagent) |child| menu.search_len == 0 and parentSubagent(app, child) != null else false,
+                    .nested = if (subagent) |child| searchText(app).len == 0 and parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
@@ -1561,7 +1555,7 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
-            if (order.items.len == 0) return .{ .rows = menu.rows.items, .search = menu.search() };
+            if (order.items.len == 0) return .{ .rows = menu.rows.items, .search = searchText(app) };
             const chosen = order.items[@min(menu.selected, order.items.len - 1)];
             const closable = deleteCloses(app, chosen);
             return .{
@@ -1571,7 +1565,7 @@ pub fn Runtime(comptime App: type) type {
                 .selected_closable = closable,
                 .selected_instance = isInstance(chosen),
                 .close_armed = closable and armedFor(menu, chosen),
-                .search = menu.search(),
+                .search = searchText(app),
             };
         }
 
@@ -2004,6 +1998,10 @@ pub fn Runtime(comptime App: type) type {
             const leaving = screenOf(app, app.agent_on_screen);
             const arriving = screenOf(app, target);
             if (leaving == arriving) return;
+            // The open list's search box lends the composer: each agent keeps
+            // its own draft, and the arriving one's is set aside in turn.
+            const searching = menuActive(app);
+            if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
             std.mem.swap(AssistantPacer, &app.pacer, &leaving.pacer);
@@ -2012,6 +2010,7 @@ pub fn Runtime(comptime App: type) type {
             std.mem.swap(AssistantPacer, &app.pacer, &arriving.pacer);
             std.mem.swap(bool, &app.fast_mode, &arriving.fast_mode);
             arriving.draft.restore(app.alloc, app.input_runtime.composerStashView());
+            if (searching) setDraftAside(app);
             app.agent_on_screen = target;
             app.screen_owner = if (target) |child| &child.agent else null;
         }
