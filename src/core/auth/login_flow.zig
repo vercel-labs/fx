@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -2200,16 +2201,12 @@ const WithholdingTokenFixture = struct {
 
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -2223,26 +2220,15 @@ const WithholdingTokenFixture = struct {
         return self.io_backend.io();
     }
 
-    fn wakeAccept(self: *@This()) void {
-        var wake_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_backend.io();
-        const address = std.Io.net.IpAddress{
-            .ip4 = .loopback(self.server.socket.address.getPort()),
-        };
-        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
-        stream.close(zio);
-    }
-
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         self.accepted.store(true, .seq_cst);

@@ -106,7 +106,8 @@ type RootOptions = {
     | "startup_exit"
     | "startup_exit_after_delay"
     | "startup_garbage"
-    | "exit_after_result";
+    | "exit_after_result"
+    | "typed_arguments";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
   operationTimeoutMs?: number;
@@ -1627,6 +1628,103 @@ describe("modern MCP stdio compatibility", () => {
     expect(gateway.requests.at(-1)?.body).not.toContain(
       "Repeated MCP tool call blocked: two equivalent attempts failed",
     );
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("typed MCP arguments the model wrote as text reach the server as their schema's types", async () => {
+    const root = createRoot("typed-arguments-repaired", MODERN_FIXTURE, { mode: "typed_arguments" });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("typed_call", "toolbox", {
+        run: TOOL_NAME,
+        arguments: {
+          text: "40",
+          limit: "40",
+          count: "7",
+          verbose: "true",
+          queries: "[\"sum:requests{*}\"]",
+          filter: "{\"env\":\"prod\"}",
+          either: "40",
+        },
+      }),
+      fakeGatewayFinalText("Typed MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Typed MCP arguments complete.");
+    const wire = readWire(root.wireLogPath);
+    // Only the string fields keep the model's text.
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([{
+        text: "40",
+        limit: 40,
+        count: 7,
+        verbose: true,
+        queries: ["sum:requests{*}"],
+        filter: { env: "prod" },
+        either: "40",
+      }]);
+    const typedResult = toolResultText(gateway.requests[2]!.body, "typed_call");
+    expect(typedResult).toContain("TYPED_ARGUMENTS_OK");
+    expect(typedResult).not.toContain("-32602");
+    // One trace line per changed field, with no argument values in it.
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    const repaired = trace.split("\n").filter((line) => line.includes("MCP argument sent as its schema's type"));
+    expect(repaired.map((line) => line.match(/field=(\S+) type=(\S+)/)?.slice(1))).toEqual([
+      ["limit", "number"],
+      ["count", "integer"],
+      ["verbose", "boolean"],
+      ["queries", "array"],
+      ["filter", "object"],
+    ]);
+    for (const line of repaired) {
+      expect(line).toContain("server=fixture tool=echo");
+      expect(line).not.toContain("requests");
+      expect(line).not.toContain("prod");
+    }
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("MCP arguments that aren't their schema's type reach the server as the model wrote them", async () => {
+    const root = createRoot("typed-arguments-kept", MODERN_FIXTURE, { mode: "typed_arguments" });
+    const sent = {
+      text: "true",
+      limit: "forty",
+      count: "4.5",
+      verbose: "True",
+      queries: "[\"unclosed\"",
+      filter: "[1]",
+      either: "40",
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("kept_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("kept_call", "toolbox", { run: TOOL_NAME, arguments: sent }),
+      fakeGatewayFinalText("Kept MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([sent]);
+    // The server's own error reaches the model.
+    const keptResult = toolResultText(gateway.requests[2]!.body, "kept_call");
+    expect(keptResult).toContain("-32602");
+    expect(keptResult).toContain("validating /properties/limit");
+    expect(readFileSync(root.traceLogPath, "utf8")).not.toContain("MCP argument sent as its schema's type");
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
