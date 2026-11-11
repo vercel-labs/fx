@@ -2004,7 +2004,9 @@ fn quietNoticeText(buffer: *[quiet_notice_max_bytes]u8, quiet_ms: u64) []const u
         std.mem.print(buffer, "No output for {d} min. " ++ quiet_notice_check, .{minutes})
     else
         std.mem.print(buffer, "No output for {d} s. " ++ quiet_notice_check, .{quiet_ms / std.time.ms_per_s});
-    return text catch unreachable;
+    // The buffer fits every notice (see the comptime check above); the check
+    // alone stands in if it ever does not.
+    return text catch quiet_notice_check;
 }
 
 const quiet_notice_check = "Check whether this command is still working or has hung; a server or watcher can stay quiet while it works.";

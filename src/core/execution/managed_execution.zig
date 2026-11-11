@@ -1001,6 +1001,10 @@ pub const Runtime = struct {
                 if (prepared.snapshot.state == .running) {
                     prepared.snapshot.state = .lost;
                     prepared.snapshot.output_incomplete = true;
+                    // Time fields belong to a running command only.
+                    prepared.snapshot.running_ms = null;
+                    prepared.snapshot.quiet_ms = null;
+                    prepared.snapshot.quiet_notice = false;
                     if (prepared.snapshot.error_name) |name| alloc.free(name);
                     prepared.snapshot.error_name = try alloc.dupe(
                         u8,
@@ -1837,9 +1841,14 @@ test "captured stop returns lost when its worker cannot settle" {
                 finished.store(true, .seq_cst);
                 return;
             };
+            // A lost result carries no running time, quiet time, or notice:
+            // those belong to a command still running.
             lost.store(
                 stopped.snapshot.state == .lost and
                     stopped.snapshot.output_incomplete and
+                    stopped.snapshot.running_ms == null and
+                    stopped.snapshot.quiet_ms == null and
+                    !stopped.snapshot.quiet_notice and
                     if (stopped.snapshot.error_name) |name|
                         std.mem.eql(u8, name, "StopSettlementTimedOut")
                     else

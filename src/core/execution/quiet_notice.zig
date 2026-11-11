@@ -49,12 +49,12 @@ pub fn quietMs(now_ms: i64, last_output_ms: i64) u64 {
 }
 
 /// How long the command has run.
-pub fn runningMs(now_ms: i64, started_ms: i64) u64 {
+fn runningMs(now_ms: i64, started_ms: i64) u64 {
     return elapsedMs(started_ms, now_ms);
 }
 
 /// The result asks the model to check the command.
-pub fn noticeDue(quiet_ms: u64, limit_ms: u64) bool {
+fn noticeDue(quiet_ms: u64, limit_ms: u64) bool {
     return quiet_ms >= limit_ms;
 }
 
