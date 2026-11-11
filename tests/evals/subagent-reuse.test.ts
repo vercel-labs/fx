@@ -79,7 +79,7 @@ function subagentCalls(fxHome: string, sessionId: string): SubagentCall[] {
 
 describe("eval: subagent reuse", () => {
   test(
-    "main sends a related second task to the subagent it already used, and leaves no extra idle subagent",
+    "main gives the fix to the reviewer it kept, and leaves no extra idle subagent",
     async () => {
       workDir = createWorkDir();
       home = createIsolatedTestHome();
