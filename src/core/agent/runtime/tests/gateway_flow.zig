@@ -8788,8 +8788,9 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
-    // The refresh token is rejected, so only a new sign-in helps.
+    // The store still holds the rejected token, and the refresh token is
+    // rejected, so only a new sign-in helps.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after" };
     hooks.credential_refresh_fail_force = true;
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
@@ -8804,7 +8805,7 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqualStrings("Sign-in expired · opening /login", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload }, modes);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, modes);
     try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
     // The status line says fx is opening the sign-in; no reason notice.
@@ -9514,7 +9515,8 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.credential_refresh_tokens = &.{ "still-stale", "fresh-after-401" };
+    // The store still holds the rejected token, so only a forced refresh helps.
+    hooks.credential_refresh_tokens = &.{ "still-stale", "still-stale", "fresh-after-401" };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -9527,9 +9529,36 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt replays a fx login 401 with the token another process stored, without a forced refresh" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{
+            .status = .unauthorized,
+            .err_body = "{\"error\":{\"message\":\"expired\"}}",
+        },
+        .{ .content = "Done." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    // Another fx process refreshed the shared login after this one read it.
+    hooks.credential_refresh_tokens = &.{ "read-before-401", "stored-by-other-fx", "must-not-use" };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_api_keys.items.len);
+    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+    try std.testing.expectEqualStrings("read-before-401", gateway.request_api_keys.items[0]);
+    try std.testing.expectEqualStrings("stored-by-other-fx", gateway.request_api_keys.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -9708,8 +9737,7 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("selected-login-token", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
@@ -9737,9 +9765,7 @@ test "processQueuedPrompt reports the selected login after refresh failure witho
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("key", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);

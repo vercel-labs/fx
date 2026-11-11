@@ -17,8 +17,17 @@ import {
   TITLE_GENERATION_MARKER,
   fakeGatewayFinalText,
   fakeResponsesTitleDefault,
+  startDynamicFakeGateway,
   startFakeGateway,
 } from "./tmux-helpers";
+import {
+  bearer,
+  rotateFxLogin,
+  startFakeIssuer,
+  storedFxLoginToken,
+  unauthorized,
+  writeFxLogin as writeSharedFxLogin,
+} from "./fx-login-fakes";
 import { logLines, savedSessionIds } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
@@ -598,6 +607,54 @@ test(
     } finally {
       gateway.stop();
       oauth.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
+  "fx ask replays a rejected request with the login another fx already renewed, without refreshing",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-renewed-elsewhere-"));
+    const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+    writeSharedFxLogin(home, issuer.issuerUrl, "launch-token");
+    let mainRequests = 0;
+    // Another fx renews the shared login after this one read it, so the
+    // gateway rejects the copy this one sends first.
+    const gateway = startDynamicFakeGateway(() => {
+      mainRequests += 1;
+      if (mainRequests > 1) return fakeGatewayFinalText("RENEWED_ELSEWHERE_RESPONSE");
+      rotateFxLogin(home, "other-fx-token");
+      return unauthorized();
+    });
+
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "exercise the shared login"], {
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+        },
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain("RENEWED_ELSEWHERE_RESPONSE");
+      expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token", "other-fx-token"]);
+      expect(issuer.refreshes).toHaveLength(0);
+      expect(storedFxLoginToken(home)).toBe("other-fx-token");
+    } finally {
+      gateway.stop();
+      issuer.stop();
       rmSync(home, { recursive: true, force: true });
     }
   },

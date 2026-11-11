@@ -5308,6 +5308,32 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
+/// Renews the credential the provider rejected with 401 for one replay: the
+/// stored credential when another fx process already replaced the rejected
+/// token, and a forced refresh only when the store still holds it, because
+/// every forced refresh rotates the sign-in all fx processes share
+/// (`tests/e2e/auth-refresh.test.ts` "fx ask replays a rejected request with
+/// the login another fx already renewed, without refreshing").
+fn renewRejectedCredentialForJob(
+    deps: *const AgentRuntimeDeps,
+    alloc: Allocator,
+    job: QueuedPrompt,
+    active_api_key: *[]const u8,
+    owned_api_key: *?[]u8,
+    trace_ctx: TraceContext,
+) !bool {
+    // The reload frees the active key when it owns it, so keep the rejected
+    // bytes for the comparison.
+    const rejected = try alloc.dupe(u8, active_api_key.*);
+    defer secret.zeroAndFree(alloc, rejected);
+    if (try refreshGatewayCredentialForJob(deps, alloc, job, .reload, active_api_key, owned_api_key, trace_ctx) and
+        !std.mem.eql(u8, active_api_key.*, rejected))
+    {
+        return true;
+    }
+    return refreshGatewayCredentialForJob(deps, alloc, job, .force, active_api_key, owned_api_key, trace_ctx);
+}
+
 const ProviderAdmission = struct {
     stream: *runtime_assistant_stream.StreamChunkContext,
 
@@ -8624,11 +8650,10 @@ fn processQueuedPromptLoop(
                 .already_replayed = auth_retry_used,
             });
             if (auth_replay == .refresh_and_replay) {
-                if (try refreshGatewayCredentialForJob(
+                if (try renewRejectedCredentialForJob(
                     deps,
                     std.heap.c_allocator,
                     job,
-                    .force,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
