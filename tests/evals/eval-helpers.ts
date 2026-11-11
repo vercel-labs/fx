@@ -512,6 +512,10 @@ export async function runFx(
       NO_COLOR: "1",
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
+      // Spawned runs must stay silent: fx plays host audio through afplay on
+      // macOS even when stdout and stderr are pipes. A test that exercises
+      // sound passes its own FX_SOUND value.
+      FX_SOUND: "0",
     };
     for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (value === undefined) {
