@@ -1,7 +1,7 @@
 // Connects the requests the real fx binary sent to TLC.
 //
 // 1. Each captured agent request becomes PromptCache blocks: the tools, then
-//    the stable instruction groups (base, skills, project, mcp), the turn
+//    the stable instruction groups (base, the toolbox menu, project), the turn
 //    context, the runtime notes, then one block per user message and per run
 //    of assistant and tool messages; a run whose tool result carries a
 //    delivered <scoped-rules> block is "asstc", PromptCache's message carrier.
@@ -71,7 +71,7 @@ export interface RuntimeResult {
 
 const tlaDir = join(TLA_ROOT, "prompt_context");
 const SPECS = ["PromptCache.tla", "PromptCacheTrace.tla"];
-const ORDER = ["base", "skills", "project", "mcp", "ctx", "rt"] as const;
+const ORDER = ["base", "menu", "project", "ctx", "rt"] as const;
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 const short = (text: string) => sha(text).slice(0, 16);
@@ -82,15 +82,19 @@ const SKILL_TEXT = "Explicitly invoked skill content for this query:";
 /** Opens the short note an older fx saved in place of a named skill's text (src/core/skills/skill_invocation.zig skill_used_open_tag). */
 const SKILL_USED = "<fx-skill-used>";
 
-type SystemKind = (typeof ORDER)[number] | (typeof INSERTED)[number] | "other";
+type SystemKind = (typeof ORDER)[number] | (typeof INSERTED)[number] | "catalog" | "other";
 
 function systemKind(content: string): SystemKind {
   // Rules delivered at tool time: scoped rules with the guidance preamble, but no project rules.
   if (content.includes("<scoped-rules") && !content.includes("<project-rules")) return "scoped";
   if (content.startsWith(SKILL_TEXT)) return "skill";
-  if (content.startsWith("Skills provide task instructions") || content.includes("<available_skills>")) return "skills";
-  if (content.startsWith("<project-instructions-guidance>") || content.includes("<project-rules")) return "project";
-  if (content.startsWith("Configured MCP servers")) return "mcp";
+  // The project rules open with their guidance, checked first because a repository's own AGENTS.md may name the menu's tag.
+  if (content.startsWith("<project-instructions-guidance>")) return "project";
+  // The toolbox menu (src/core/tooling/toolbox.zig renderTo), which lists the skills, MCP servers and tools behind toolbox in place of a skill catalog and an MCP catalog. A skipped skill's warning may lead it.
+  if (content.includes("<toolbox>\n")) return "menu";
+  // The catalogs the menu replaced: fx sends them only when toolbox is not advertised, which this driver does not model.
+  if (content.startsWith("Skills provide task instructions") || content.includes("<available_skills>") || content.startsWith("Configured MCP servers")) return "catalog";
+  if (content.includes("<project-rules")) return "project";
   if (content.startsWith("<fx-turn-context>")) return "ctx";
   if (content.startsWith("Runtime context:") || content.startsWith("<response_language_control>")) return "rt";
   return "other";
@@ -162,12 +166,17 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       groups.at(-1)!.messages.push(i);
       continue;
     }
+    if (kind === "catalog") {
+      errors.push(`system message ${i} is a skill or MCP catalog, which the toolbox menu replaced`);
+      groups.push({ kind, messages: [i] });
+      continue;
+    }
     if (kind === "scoped" || kind === "skill") {
-      // Today's fx: rules delivered this turn follow the MCP group and move
-      // after the project rules on later turns; a named skill's text comes
-      // right before the turn context.
+      // Today's fx: rules delivered this turn follow the project rules and
+      // move into them on later turns; a named skill's text comes right
+      // before the turn context.
       const after = groups.at(-1)!.kind;
-      const allowed = kind === "scoped" ? ["project", "mcp"] : ["mcp", "scoped"];
+      const allowed = kind === "scoped" ? ["project"] : ["project", "scoped"];
       if (!allowed.includes(after)) errors.push(`system message ${i} (${kind}) follows ${after}`);
       groups.push({ kind, messages: [i] });
       continue;
@@ -371,7 +380,7 @@ export function simulate(observed: ObservedRequest[], family: Family): TimelineR
 export function timelineMarkdown(rows: TimelineRow[]): string {
   const lines = [
     "Diagnostic timeline, computed by bridge.ts simulate(); TLC gives the verdicts.",
-    "Block order: tools, base, skills, project, mcp, turn context, runtime notes, then the conversation. Rules delivered",
+    "Block order: tools, base, toolbox menu, project, turn context, runtime notes, then the conversation. Rules delivered",
     "mid-session ride on the tool result that reached them (asstc); before P6 they and a named skill's text added blocks before the turn context.",
     "",
     "| request | session | worktree | first | context changed | blocks | manual markers | all markers | blocks read |",
