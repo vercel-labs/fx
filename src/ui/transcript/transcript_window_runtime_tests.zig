@@ -496,3 +496,36 @@ test "a resume that brings back the cycle before the newest compaction keeps it 
     try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
     try expectWindowMatchesEntries(&runtime);
 }
+
+test "a resume from the session picker keeps the cycle before the newest compaction through its screen reset" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    // The picker switches sessions with a terminal reset, which paints the
+    // prepared flow. The entries must outlive it, or the next frame, which
+    // paints from the entries, erases the rows the reset showed.
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+    // Painted and still on screen: the next sync keeps it.
+    if (runtime.notebook.pending_resume_source) |*source| source.deinit(alloc);
+    runtime.notebook.pending_resume_source = null;
+    try commitStableFrame(alloc, &runtime);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    // Scrolled into terminal history: the next sync drops it.
+    const anchor = &runtime.transcript_commit_state.stable;
+    anchor.history_visual_offset = anchor.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}

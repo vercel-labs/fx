@@ -7149,10 +7149,16 @@ pub const TranscriptRuntime = struct {
 
     /// The screen is about to be cleared and replayed from the entries: the
     /// drops held for rows on screen can go, so the replay starts at the
-    /// held cycle.
+    /// held cycle. A resumed transcript not painted yet is the exception: the
+    /// clear replays its prepared flow, which still shows the cycle before
+    /// the newest compaction, so those entries stay until they scroll off.
     pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
         if (window.pending_drops.items.len == 0) return;
+        if (self.notebook.pending_resume_source != null) {
+            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
+            return;
+        }
         var ready = window.pending_drops;
         window.pending_drops = .empty;
         defer ready.deinit(alloc);
