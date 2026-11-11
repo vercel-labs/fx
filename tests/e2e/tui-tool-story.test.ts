@@ -241,10 +241,13 @@ test.skipIf(!tmuxAvailable())(
       childReply: (task) => task.includes("Review") ? "No bugs found." : "24 tests passed.",
     });
     const lines = paneLines(pane);
+    // The two waits share one row; the status keeps its own.
     const rows = treeRows(group(lines, "● Started 2 subagents"));
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(4);
     expect(rows[0]).toContain("reviewer");
     expect(rows[1]).toContain("tester");
+    expect(rows.filter((row) => row.includes("waited for"))).toHaveLength(1);
+    expect(rows[3]).toContain("checked");
   },
   TIMEOUT * 2,
 );

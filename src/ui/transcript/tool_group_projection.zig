@@ -1001,7 +1001,7 @@ const StoryRowKind = enum {
     read,
     /// The same subagent: its messages, status, and close.
     subagent,
-    /// A subagent wait or status that names no agent.
+    /// A subagent wait or status that names no agent, keyed by its action.
     subagent_wait,
 };
 
@@ -1054,7 +1054,7 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             // A report row carries no call; only a bare wait or status
             // joins other subagent rows.
             const action = storyArgString(scratch, record, "action") orelse return .{};
-            if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) return .{ .kind = .subagent_wait };
+            if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) return .{ .kind = .subagent_wait, .key = action };
             return .{};
         },
         else => return .{},
@@ -1088,14 +1088,14 @@ fn collectStoryRows(
                 break :blk null;
             },
             .subagent_wait => blk: {
-                // An agent's own row already shows its state, so a bare
-                // wait adds nothing once an agent row exists.
-                var wait_row: ?*StoryRow = null;
+                // A bare wait or status says what main did while its
+                // subagents worked, so it keeps a row of its own. Later
+                // calls with the same action join it with their latest state;
+                // a status and a wait stay apart, so neither hides the other.
                 for (rows.items) |*row| {
-                    if (row.identity.kind == .subagent) break :blk row;
-                    if (row.identity.kind == .subagent_wait) wait_row = row;
+                    if (row.identity.kind == .subagent_wait and std.mem.eql(u8, row.identity.key, identity.key)) break :blk row;
                 }
-                break :blk wait_row;
+                break :blk null;
             },
             .command, .read => blk: {
                 if (rows.items.len == 0) break :blk null;
@@ -1105,7 +1105,6 @@ fn collectStoryRows(
             },
         };
         if (target) |row| {
-            if (identity.kind == .subagent_wait and row.identity.kind == .subagent) continue;
             row.count += 1;
             if (storyRowCallFailed(detail)) row.failures += 1;
             row.entry = entry;
@@ -4458,21 +4457,23 @@ test "one file read in parts shares a row" {
     try std.testing.expectEqualStrings("● Read src/main.zig · 3 parts", projection.entry_actions.items[0].override.bytes);
 }
 
-test "subagent waits and status calls fold into the agents' rows" {
+test "repeated bare subagent waits share one row of their own" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● sent to tester · run the tests\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "● waited for reviewer, tester\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "● checked reviewer, tester\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● waited for tester\n", .class = .tool_status } },
     };
     const args = [_][]const u8{
         "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}",
         "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"run the tests\"}",
         "{\"action\":\"wait\"}",
         "{\"action\":\"status\"}",
+        "{\"action\":\"wait\"}",
     };
-    var details: [4]ToolDetailRecord = undefined;
+    var details: [5]ToolDetailRecord = undefined;
     for (&details, args, 0..) |*detail, arguments_json, index| detail.* = .{
         .entry_id = @intCast(index + 1),
         .tool_name = @constCast("subagent"),
@@ -4482,17 +4483,23 @@ test "subagent waits and status calls fold into the agents' rows" {
     };
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
+    // Main's waits share one row that shows the latest of them, and its
+    // status keeps its own row, so each says what main did.
     try std.testing.expectEqualStrings(
         "● Started 2 subagents\n" ++
             "├ sent to reviewer · review the change\n" ++
-            "└ sent to tester · run the tests",
+            "├ sent to tester · run the tests\n" ++
+            "├ waited for tester\n" ++
+            "└ checked reviewer, tester",
         projection.entry_actions.items[0].override.bytes,
     );
 
-    // Waits with no agent row yet share one row of their own.
-    var waits = try build(alloc, entries[2..], details[2..], 120);
+    // Two waits alone are one row, which is the group's header.
+    const lone_entries = [_]TranscriptEntry{ entries[2], entries[4] };
+    const lone_details = [_]ToolDetailRecord{ details[2], details[4] };
+    var waits = try build(alloc, &lone_entries, &lone_details, 120);
     defer waits.deinit(alloc);
-    try std.testing.expectEqualStrings("● checked reviewer, tester", waits.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● waited for tester", waits.entry_actions.items[0].override.bytes);
 }
 
 test "saved arguments that are not usable leave rows unmerged" {

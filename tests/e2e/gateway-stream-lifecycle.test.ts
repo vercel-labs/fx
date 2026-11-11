@@ -8003,7 +8003,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(3);
           await tui.waitForPane((pane) => /^[• ] Running \(/m.test(pane), 15000);
           await tui.sendKeys("C-c");
-          await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
+          // The cancelled call is its group's header, and the cancellation
+          // block below it says "Cancelled".
+          await tui.waitForPane((pane) => /cancelled/i.test(pane) && hasEmptyComposer(pane), 15000);
           const roots = rootSessionIds(root.home);
           expect(roots).toHaveLength(1);
           const sessionId = roots[0]!;
