@@ -1522,8 +1522,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-x");
         const over = await session.waitForText(LIST_HINT, 10_000);
         expect(over).not.toContain("Apply this change?");
-        // Its row names the profile it runs in.
+        // Its row names the profile it runs in, and says it waits for the
+        // approval main shows for it.
         expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}writer {2,}\S/m);
+        expect(over).toMatch(/^ {2}\u2514 writer .*needs approval/m);
         await session.sendKeys("1");
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);

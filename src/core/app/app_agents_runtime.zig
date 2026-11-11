@@ -1073,7 +1073,7 @@ pub fn Runtime(comptime App: type) type {
                 .role = child.agent.role,
                 .root = if (child.agent.role == .subagent) instanceOrdinal(app, rootInstance(app, child)) else 0,
                 .parent = if (parentSubagent(app, child)) |parent| (if (std.mem.findScalar(*ChildAgent, hosted, parent)) |index| index + 1 else null) else null,
-                .working = instanceState(&child.agent, requestWaitsForUser(app, child)) == .working,
+                .working = stateOf(app, child) == .working,
                 .reply_at_ms = @max(child.saved_reply_at_ms, latestReplyAt(child.agent.session.agent.history.items)),
             };
             const order = try app.alloc.alloc(usize, 2 * (hosted.len + 1));
@@ -1234,9 +1234,9 @@ pub fn Runtime(comptime App: type) type {
         /// Main loop only: it reads every agent's prompts.
         pub fn busiest(app: *App) Busiest {
             var most: InstanceState = .idle;
-            if (firstOpen(app)) most = moreUrgent(most, instanceState(&app.main_agent, requestWaitsForUser(app, null)));
+            if (firstOpen(app)) most = moreUrgent(most, stateOf(app, null));
             for (app.child_agents.items) |child| {
-                most = moreUrgent(most, instanceState(&child.agent, requestWaitsForUser(app, child)));
+                most = moreUrgent(most, stateOf(app, child));
             }
             return busyAs(most) orelse .idle;
         }
@@ -1248,13 +1248,13 @@ pub fn Runtime(comptime App: type) type {
         /// Main loop only: it reads every agent's prompts.
         pub fn busyAgentElsewhere(app: *App, buf: []u8) ?BusyAgent {
             if (app.agent_on_screen != null and firstOpen(app)) {
-                if (busyAs(instanceState(&app.main_agent, requestWaitsForUser(app, null)))) |doing| {
+                if (busyAs(stateOf(app, null))) |doing| {
                     return .{ .name = noteName(app, null, buf), .doing = doing };
                 }
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                if (busyAs(instanceState(&child.agent, requestWaitsForUser(app, child)))) |doing| {
+                if (busyAs(stateOf(app, child))) |doing| {
                     return .{ .name = noteName(app, child, buf), .doing = doing };
                 }
             }
@@ -1288,14 +1288,15 @@ pub fn Runtime(comptime App: type) type {
             return changed;
         }
 
-        /// The footer note for hidden subagents with a turn going or queued,
-        /// such as "1 subagent working", so the agent on screen shows that
-        /// work goes on elsewhere; empty when none is.
+        /// The footer note for hidden subagents that work, such as "1
+        /// subagent working", so the agent on screen shows that work goes on
+        /// elsewhere; empty when none does. One that waits for the user is
+        /// in the waiting note, or on screen, instead.
         pub fn workingNote(app: *App, buf: []u8) []const u8 {
             var count: usize = 0;
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent or child == app.agent_on_screen) continue;
-                if (turnInFlight(&child.agent)) count += 1;
+                if (stateOf(app, child) == .working) count += 1;
             }
             if (count == 0) return "";
             return std.mem.print(buf, "{d} subagent{s} working", .{ count, if (count == 1) "" else "s" }) catch "";
@@ -1472,7 +1473,7 @@ pub fn Runtime(comptime App: type) type {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 const model = provider_runtime.modelOf(app, agent);
-                const state = instanceState(agent, requestWaitsForUser(app, target));
+                const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
@@ -1953,6 +1954,17 @@ pub fn Runtime(comptime App: type) type {
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
+        }
+
+        /// What agent `target`, null for the first instance, waits for or
+        /// does. A subagent whose approval or question its instance's screen
+        /// shows for it still waits on it.
+        fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
+            if (target) |child| {
+                if (app.approval_lender == child) return .needs_approval;
+                if (app.question_lender == child) return .has_question;
+            }
+            return instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
         }
 
         /// Whether agent `target`'s status row, null for the first instance,
