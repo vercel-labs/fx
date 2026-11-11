@@ -4660,6 +4660,24 @@ fn pushWaitingHttpFailureReason(
     }
 }
 
+/// Names the Vercel team a refused login was sent for, and how to choose
+/// another. fx resends with the same team, so a team the gateway refuses
+/// fails on every resend, and the user cannot switch teams while the request
+/// waits.
+fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: QueuedPrompt) !void {
+    const team = job.gateway_team_label orelse job.gateway_team orelse return;
+    const message = try std.fmt.allocPrint(
+        arena,
+        "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        .{team},
+    );
+    if (deps.push_interactive_notice) |push| {
+        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+    } else {
+        try deps.push_system_notice(deps.ctx, message);
+    }
+}
+
 const UserAnswer = enum { resend, cancelled, switch_model };
 
 /// Reports a failure that needs the user and waits for their answer.
@@ -5284,10 +5302,19 @@ fn unsafeNoRetryReason(
         .assistant_output;
 }
 
+fn optionalBytesEqual(current: ?[]const u8, next: []const u8) bool {
+    const value = current orelse return false;
+    return std.mem.eql(u8, value, next);
+}
+
+/// Refreshes the job's login. When the host returns another Vercel team, such
+/// as one the user picked while the request waited for a sign-in, the job
+/// sends that team from its next request on; `job_arena` owns the copy.
 fn refreshGatewayCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
-    job: QueuedPrompt,
+    job: *QueuedPrompt,
+    job_arena: Allocator,
     mode: CredentialRefreshMode,
     active_api_key: *[]const u8,
     owned_api_key: *?[]u8,
@@ -5308,9 +5335,27 @@ fn refreshGatewayCredentialForJob(
         );
         return false;
     } orelse return false;
+    var owns_token = true;
+    defer if (owns_token) secret.zeroAndFree(alloc, refreshed.token);
+    defer if (refreshed.gateway_team) |team| alloc.free(team);
+    defer if (refreshed.gateway_team_label) |label| alloc.free(label);
+    if (refreshed.gateway_team) |team| if (!optionalBytesEqual(job.gateway_team, team)) {
+        const team_copy = try job_arena.dupe(u8, team);
+        const label_copy = if (refreshed.gateway_team_label) |label| try job_arena.dupe(u8, label) else null;
+        job.gateway_team = team_copy;
+        job.gateway_team_label = label_copy;
+        debug_trace.eventf(
+            "gateway",
+            "request_team_changed",
+            trace_ctx,
+            "source={s} mode={s}",
+            .{ @tagName(source), @tagName(mode) },
+        );
+    };
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
-    owned_api_key.* = refreshed;
-    active_api_key.* = refreshed;
+    owned_api_key.* = refreshed.token;
+    active_api_key.* = refreshed.token;
+    owns_token = false;
     debug_trace.eventf(
         "gateway",
         "credential_refreshed",
@@ -6035,6 +6080,10 @@ fn processQueuedPromptInner(
         null;
     job.gateway_team = if (borrowed_job.gateway_team) |gateway_team|
         try arena.dupe(u8, gateway_team)
+    else
+        null;
+    job.gateway_team_label = if (borrowed_job.gateway_team_label) |label|
+        try arena.dupe(u8, label)
     else
         null;
 
@@ -7374,7 +7423,7 @@ fn processQueuedPromptLoop(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    initial_job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
     finalization: *TurnFinalizationGuard,
@@ -7393,6 +7442,9 @@ fn processQueuedPromptLoop(
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
 ) !void {
+    // A refresh can move the job to another Vercel team (see
+    // `refreshGatewayCredentialForJob`), so the loop keeps its own copy.
+    var job = initial_job;
     var request_capabilities = initial_request_capabilities;
     // The image route core's turn state. This loop is its shell: it runs each
     // effect `image_route.step` returns and feeds the result back.
@@ -7855,7 +7907,8 @@ fn processQueuedPromptLoop(
                 _ = try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
-                    job,
+                    &job,
+                    arena,
                     if (credential_reload_pending) .reload else .if_needed,
                     &active_api_key,
                     &owned_refreshed_api_key,
@@ -8670,7 +8723,8 @@ fn processQueuedPromptLoop(
                 if (try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
-                    job,
+                    &job,
+                    arena,
                     .force,
                     &active_api_key,
                     &owned_refreshed_api_key,
@@ -8680,6 +8734,7 @@ fn processQueuedPromptLoop(
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
                     model_request.credential.direct.secret_bytes = active_api_key;
+                    model_request.credential.direct.tenant_context = job.gateway_team;
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
@@ -8982,6 +9037,7 @@ fn processQueuedPromptLoop(
             {
                 if (!auth_reason_shown) {
                     try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
+                    try pushRefusedTeamHint(deps, arena, job);
                     auth_reason_shown = true;
                 }
                 _ = try request_recovery.failed(.{ .kind = .refused });

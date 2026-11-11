@@ -141,6 +141,9 @@ pub const QueuedPrompt = struct {
     provider: model_provider.ProviderId = .gateway,
     api_key: []u8,
     gateway_team: ?[]u8 = null,
+    /// The team's slug, which fx shows the user. Null when the login has no
+    /// slug; fx then names the team by `gateway_team`.
+    gateway_team_label: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
@@ -3314,6 +3317,7 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     alloc.free(prompt.model);
     secret.zeroAndFree(alloc, prompt.api_key);
     if (prompt.gateway_team) |team| alloc.free(team);
+    if (prompt.gateway_team_label) |label| alloc.free(label);
     if (prompt.account_id) |account_id| alloc.free(account_id);
     types.freeHistoryTurnSlice(alloc, prompt.history);
     if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);

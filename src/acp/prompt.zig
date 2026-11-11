@@ -2164,15 +2164,18 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
-    return server.refreshModelCredential(
+    // The server refuses a team change during a request, so the request
+    // keeps its team.
+    const token = (try server.refreshModelCredential(
         @ptrCast(ctx.state),
         alloc,
         source,
         mode,
         expected_account_id,
-    );
+    )) orelse return null;
+    return .{ .token = token };
 }
 
 /// The prompt's session while it is still the active one.

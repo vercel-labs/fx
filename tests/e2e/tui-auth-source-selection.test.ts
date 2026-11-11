@@ -29,6 +29,7 @@ import {
   fakeGatewaySse,
   fakeGatewayToolCall,
   heldFakeGatewayFinalText,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -2344,6 +2345,84 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("POLL_503_RECOVERY_RESPONSE", TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a team picked during a sign-in wait sends the waiting request with that team",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-team-change-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    // The first answer says the login expired. After that, AI Gateway
+    // refuses the first team and takes the login for the second.
+    gateway = startDynamicFakeGateway(() => {
+      const requests = gateway!.requests;
+      const team = requests[requests.length - 1]?.headers.get("x-vercel-ai-gateway-team");
+      if (requests.length > 1 && team === "team_456") return fakeGatewayFinalText("TEAM_CHANGE_RESPONSE");
+      return new Response(JSON.stringify({ error: { message: requests.length === 1 ? "token expired" : "not allowed for this team" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    // The refresh token is rejected, so fx opens a sign-in, and its team
+    // choice comes while the request waits.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer on the team I pick.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("› Vercel Labs", TIMEOUT);
+    await session.sendLiteral("other");
+    await session.waitForText("› Other Team", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Other Team (other-team).", TIMEOUT);
+    await session.waitForText("TEAM_CHANGE_RESPONSE", TIMEOUT);
+    // The waiting request was sent again with the team just picked.
+    const last = gateway.requests[gateway.requests.length - 1]!;
+    expect(last.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  90_000,
+);
+
+tmuxTest(
+  "a refused login names the team fx sent and how to choose another",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-refused-team-notice-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "not allowed for this team" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer with the team fx has.");
+    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    const refused = await session.captureFullScrollback();
+    expect(refused).toContain("not allowed for this team");
+    expect(refused).toContain("Vercel team example-internal-team");
+    expect(refused).toContain("press Esc twice, run /login, choose another team, and send it again");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,

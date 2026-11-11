@@ -2201,7 +2201,7 @@ fn refreshGatewayCredential(
     source: credentials.Source,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -2215,7 +2215,8 @@ fn refreshGatewayCredential(
         expected_account_id,
     )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
-    return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = try adoptRefreshedAskCredential(ctx, alloc, &refreshed) };
 }
 
 fn adoptRefreshedAskCredential(
@@ -5127,6 +5128,37 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "fx ask refuses a refreshed login on another team" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "stale-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // Another fx process saved the login on another team while this request
+    // ran; fx ask does not move a request to it.
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_456"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    try std.testing.expectError(error.CredentialAuthorityChanged, adoptRefreshedAskCredential(&ctx, alloc, &refreshed));
+    try std.testing.expectEqualStrings("stale-token", ctx.api_key);
+    try std.testing.expectEqualStrings("team_123", ctx.gateway_team.?);
 }
 
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
