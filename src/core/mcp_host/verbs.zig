@@ -508,6 +508,32 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
     return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
 }
 
+/// Why an edit isn't made, ending a sentence like "Couldn't add NAME to FILE: ...".
+/// The reader's own words for an entry it would skip; for a misspelled key, the
+/// key and the fix, so a person or an agent can follow it. The key is the
+/// file's text, so it is made terminal-safe.
+fn refusalWords(arena: Allocator, refusal: config_file.Refusal) ![]const u8 {
+    switch (refusal) {
+        .entry => |problem| return project_config.entryProblemWords(problem),
+        .misspelled => |misspelled| {
+            const key = try safe(arena, misspelled.key());
+            const real = misspelled.real();
+            return arena.print(
+                "the key \"{s}\" looks like a misspelling of \"{s}\". Move its servers into \"{s}\", delete \"{s}\", then run the command again",
+                .{ key, real, real, key },
+            );
+        },
+    }
+}
+
+/// A refusal for the trace log: a fixed word, never an entry's text.
+fn refusalToken(refusal: config_file.Refusal) []const u8 {
+    return switch (refusal) {
+        .entry => |problem| @tagName(problem),
+        .misspelled => "misspelled_key",
+    };
+}
+
 /// fx's words for an error, never its name.
 pub fn describe(err: anyerror) []const u8 {
     return switch (err) {
@@ -792,10 +818,18 @@ pub fn toolDescription(arena: Allocator, raw: []const u8) !?[]const u8 {
 fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, entry: config_file.Entry, login_after: bool) !u8 {
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
-    _ = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
+    const updated = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
         try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
+    switch (updated) {
+        .refused => |refusal| {
+            debug_trace.logf("mcp", "MCP add refused server={s} file={s} why={s}", .{ name, @tagName(file), refusalToken(refusal) });
+            try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try refusalWords(arena, refusal) });
+            return 1;
+        },
+        .added, .removed, .missing => {},
+    }
     c.hosts.changed(c.hosts.context);
     try c.out.print("Added {s} to {s}.\n", .{ name, fileLabel(file) });
     const other: config_file.File = if (file == .project) .profile else .project;
@@ -820,6 +854,9 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
 /// login, signs in the way `login` does, waiting for the browser. Without a
 /// browser to open, it names the command instead, since taking a pasted
 /// address back is `login`'s. The server stays added whatever happens here.
+/// The host may not list the server by now, and then there is nothing to sign
+/// in to: `add` saves only what the reader loads, but the reader holds a server
+/// back while a ${VAR} in it isn't set, and another fx may have changed the file.
 fn signInAfterAdd(c: Context, arena: Allocator, name: []const u8) !void {
     var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
     defer waiter.deinit();
@@ -869,6 +906,11 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     const url = switch (updated) {
         .removed => |u| u,
+        .refused => |refusal| {
+            debug_trace.logf("mcp", "MCP remove refused server={s} file={s} why={s}", .{ try safe(arena, name), @tagName(file), refusalToken(refusal) });
+            try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try refusalWords(arena, refusal) });
+            return 1;
+        },
         .added, .missing => null,
     };
     defer if (url) |u| c.gpa.free(u);

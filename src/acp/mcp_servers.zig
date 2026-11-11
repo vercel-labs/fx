@@ -558,6 +558,33 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
 }
 
+test "ACP MCP parser takes the same addresses as before: every one the endpoint rule refuses is InvalidUrl, whatever its reason" {
+    const alloc = std.testing.allocator;
+    const refused = [_][]const u8{
+        "http://example.com/mcp",
+        "http://localhost.:8080/mcp",
+        "http://127.0.0.2:8080/mcp",
+        "http://localhost/mcp",
+        "https://u:p@x.example/mcp",
+        "https://x.example/mcp#part",
+        "https:///mcp",
+        "ftp://x.example/mcp",
+        "https://",
+    };
+    for (refused) |url| {
+        const json = try alloc.print("{{\"mcpServers\":[{{\"type\":\"http\",\"name\":\"remote\",\"url\":\"{s}\",\"headers\":[]}}]}}", .{url});
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidUrl, parse(alloc, json));
+    }
+    for ([_][]const u8{ "https://x.example/mcp", "HTTPS://x.example/mcp", "http://localhost:4321/mcp", "http://127.0.0.1:4321/mcp", "http://[::1]:4321/mcp" }) |url| {
+        const json = try alloc.print("{{\"mcpServers\":[{{\"type\":\"http\",\"name\":\"remote\",\"url\":\"{s}\",\"headers\":[]}}]}}", .{url});
+        defer alloc.free(json);
+        var configs = try parse(alloc, json);
+        defer configs.deinit(alloc);
+        try std.testing.expectEqualStrings(url, try configs.items.items[0].remoteUrl());
+    }
+}
+
 test "ACP MCP parser handles fuzzed request bytes" {
     try std.testing.fuzz({}, fuzzParse, .{
         .corpus = &(@import("fuzz_seed").slices(.{
