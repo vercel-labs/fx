@@ -9,6 +9,7 @@ const model_request_budget = @import("model_request_budget.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 const web_search_provider = @import("web_search_provider.zig");
+const web_search_slots = @import("web_search_slots.zig");
 const test_builtin_tools = if (@import("builtin").is_test)
     @import("../../builtins/tools.zig")
 else
@@ -85,6 +86,9 @@ pub const Runtime = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     config_mutex: std.Io.Mutex = .init,
+    /// The slot order and what the current team has refused, shared by
+    /// every agent this host runs and by the search worker below.
+    slots: web_search_slots.State = .{},
     fallback_cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(config: Config) Runtime {
@@ -112,6 +116,10 @@ pub const Runtime = struct {
         self.worker_model = inputs.worker_model;
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url = inputs.gateway_chat_url;
+        // A turn for another team makes it current, so a late refusal from
+        // the previous team's requests blocks nothing for this one
+        // (`tests/tla/web_search/WebSearchSlots.tla` SwitchTeam).
+        _ = self.slots.view(inputs.gateway_team);
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -141,15 +149,17 @@ pub const Runtime = struct {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
         var policy = self.policy;
+        var preferred_override = false;
         if (self.provider) |provider| {
             if (try provider.preferredBackends()) |preferred_backends| {
                 policy.preferred_backends = preferred_backends;
+                preferred_override = true;
             }
         }
-        const selected_backend = web_search_policy.selectBackend(policy, .{
+        const features: web_search_policy.InputFeatures = .{
             .has_allowed_domains = hasValues(input.allowed_domains),
             .has_blocked_domains = hasValues(input.blocked_domains),
-        }) orelse return error.UnsupportedWebSearchFeatures;
+        };
         if (!model_request_budget.searchWorkerInputFitsLimit(
             if (self.provider) |provider| provider.input_overhead_bytes else 0,
             input.query,
@@ -157,8 +167,82 @@ pub const Runtime = struct {
             input.blocked_domains,
             self.policy.max_input_bytes,
         )) return error.WebSearchRequestTooLarge;
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
+        // A Gateway refusal of the search tool blocks that slot for the team
+        // and tries the next one, as model requests do; each slot is tried
+        // at most once.
+        var tried: u8 = 0;
+        while (true) {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            const selected = try self.selectWorkerBackend(policy, preferred_override, inputs.gateway_team, features, tried);
+            return self.executeBackend(alloc, input, inputs.borrowed(), selected.backend, cancel_flag, on_progress, progress_ctx, started_at_ms) catch |err| {
+                if (err != error.WebSearchToolRefused) return err;
+                const slot = selected.slot orelse return err;
+                tried |= @as(u8, 1) << @backingInt(slot);
+                const newly = self.slots.block(inputs.gateway_team, tried);
+                debug_trace.logf("web_search", "worker slot refused slot={s} newly_blocked={d}", .{ slot.name(), newly });
+                continue;
+            };
+        }
+    }
+
+    const WorkerSelection = struct {
+        backend: web_search_policy.BackendPolicy,
+        slot: ?web_search_slots.Slot = null,
+    };
+
+    /// The worker's backend: the first Gateway-run slot the team has not
+    /// refused, or the policy's choice when the slots do not apply. The
+    /// worker skips the native slot, which needs the model's own request.
+    fn selectWorkerBackend(
+        self: *Runtime,
+        policy: web_search_policy.WebSearchPolicy,
+        preferred_override: bool,
+        team: ?[]const u8,
+        features: web_search_policy.InputFeatures,
+        tried: u8,
+    ) error{ UnsupportedWebSearchFeatures, NoWebSearchBackendLeft }!WorkerSelection {
+        const slot_backend = if (self.provider) |provider| provider.slot_backend_fn else null;
+        if (preferred_override or slot_backend == null) {
+            if (tried != 0) return error.NoWebSearchBackendLeft;
+            return .{ .backend = web_search_policy.selectBackend(policy, features) orelse return error.UnsupportedWebSearchFeatures };
+        }
+        // As in web_search_policy.selectBackend: relaxed filters need their
+        // own opt-in.
+        if (!policy.strict_filters and (features.has_allowed_domains or features.has_blocked_domains)) {
+            return error.UnsupportedWebSearchFeatures;
+        }
+        const view = self.slots.view(team);
+        var blocked = view.blocked | tried;
+        // A slot the team allows whose backend cannot take the request's
+        // filters is unsupported, not unavailable.
+        var unsupported = false;
+        while (true) {
+            const slot = web_search_slots.resolve(view.order, blocked, false);
+            if (slot == .none) {
+                return if (unsupported) error.UnsupportedWebSearchFeatures else error.NoWebSearchBackendLeft;
+            }
+            blocked |= @as(u8, 1) << @backingInt(slot);
+            const id = slot_backend.?(slot) orelse continue;
+            for (policy.backend_policies) |backend| {
+                if (!backend.id.eql(id)) continue;
+                if (web_search_policy.backendCanSatisfy(backend, features)) return .{ .backend = backend, .slot = slot };
+                unsupported = true;
+            }
+        }
+    }
+
+    fn executeBackend(
+        self: *Runtime,
+        alloc: Allocator,
+        input: web_search_contract.Request,
+        inputs: Inputs,
+        selected_backend: web_search_policy.BackendPolicy,
+        cancel_flag: *std.atomic.Value(bool),
+        on_progress: ?web_search_contract.ProgressFn,
+        progress_ctx: ?*anyopaque,
+        started_at_ms: i64,
+    ) !ExecutionOutput {
         const request = web_search_contract.ProviderRequest{
             .backend = selected_backend.id,
             .query = input.query,
@@ -173,7 +257,7 @@ pub const Runtime = struct {
         };
 
         const transport_started_at_ms = self.clock.now();
-        var response = self.executeProvider(alloc, inputs.borrowed(), request, on_progress, progress_ctx) catch |err| {
+        var response = self.executeProvider(alloc, inputs, request, on_progress, progress_ctx) catch |err| {
             if (shouldRecordFailedNetworkCall(err)) {
                 recordNetworkCall(inputs.worker_model, transport_started_at_ms, self.clock.now(), 0, null, null, @errorName(err));
             }
@@ -341,13 +425,27 @@ const FakeProvider = struct {
     configured_inputs_seen: bool = false,
     response_kind: enum { empty, source, incomplete, interleaved_incomplete } = .empty,
     transport_error: ?enum { cancelled, timeout } = null,
+    /// Backends AI Gateway refuses for the team, as a search tool refusal.
+    refused: []const web_search_contract.SearchBackendId = &.{},
+    /// Whether the backends follow the web search slots: exa is the
+    /// primary backend and parallel the secondary.
+    slot_backends: bool = false,
 
     fn provider(self: *@This()) web_search_provider.Provider {
         return .{
             .context = @ptrCast(self),
             .policy = test_policy,
             .preferred_backends_fn = preferredBackends,
+            .slot_backend_fn = if (self.slot_backends) slotBackend else null,
             .execute_fn = executeProvider,
+        };
+    }
+
+    fn slotBackend(slot: web_search_slots.Slot) ?web_search_contract.SearchBackendId {
+        return switch (slot) {
+            .exa => test_primary_backend,
+            .parallel => test_secondary_backend,
+            .native, .perplexity, .none => null,
         };
     }
 
@@ -382,6 +480,9 @@ const FakeProvider = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
         self.last_backend = request.backend;
+        for (self.refused) |backend| {
+            if (backend.eql(request.backend)) return error.WebSearchToolRefused;
+        }
         if (self.transport_error) |transport_error| {
             return switch (transport_error) {
                 .cancelled => error.Cancelled,
@@ -529,6 +630,40 @@ test "runtime invokes primary backend after allow" {
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(test_primary_backend.eql(fake.last_backend.?));
+}
+
+test "a refused worker backend blocks its slot and the worker tries the next slot once" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{ .slot_backends = true, .refused = &.{test_primary_backend} };
+    var runtime = fakeRuntime(&fake);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    var output = try runtime.execute(alloc, input, &cancel_flag);
+    defer output.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
+    const exa_bit = @as(u8, 1) << @backingInt(web_search_slots.Slot.exa);
+    try std.testing.expectEqual(exa_bit, runtime.slots.blockedFor(null));
+
+    // The next search starts at the slot that works.
+    var again = try runtime.execute(alloc, input, &cancel_flag);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
+}
+
+test "a worker whose team refuses every slot stops after one try each" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{ .slot_backends = true, .refused = &.{ test_primary_backend, test_secondary_backend } };
+    var runtime = fakeRuntime(&fake);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    try std.testing.expectError(error.NoWebSearchBackendLeft, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectError(error.NoWebSearchBackendLeft, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
 test "runtime invokes secondary backend after allow" {

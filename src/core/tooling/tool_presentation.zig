@@ -299,7 +299,9 @@ pub const RunCommandActivity = struct {
 pub fn isProviderSearchAlias(name: []const u8) bool {
     return std.mem.eql(u8, name, "exa_search") or
         std.mem.eql(u8, name, "perplexity_search") or
-        std.mem.eql(u8, name, "parallel_search");
+        std.mem.eql(u8, name, "parallel_search") or
+        // The model provider's own search, under the name fx advertises it with.
+        std.mem.eql(u8, name, "native_web_search");
 }
 
 fn projectRunCommandActivitySource(

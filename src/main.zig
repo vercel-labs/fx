@@ -5542,6 +5542,7 @@ test {
     _ = @import("core/tooling/web_fetch_runtime.zig");
     _ = @import("core/tooling/web_search_policy.zig");
     _ = @import("core/tooling/web_search_runtime.zig");
+    _ = @import("core/tooling/web_search_slots.zig");
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
     _ = @import("tools/web/content.zig");

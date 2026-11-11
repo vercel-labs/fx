@@ -22,6 +22,7 @@ test {
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
     _ = @import("core/tooling/toolbox.zig");
+    _ = @import("core/tooling/web_search_slots.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/credentials.zig");

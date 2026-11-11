@@ -1,4 +1,5 @@
 const std = @import("std");
+const web_search_slots = @import("web_search_slots.zig");
 const toolbox = @import("toolbox.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -247,6 +248,8 @@ pub const Context = struct {
     web_fetch_artifact_error: ?anyerror = null,
     web_search_runtime_ready: bool = false,
     web_search_backend: ?tool_dispatch.WebSearchBackend = null,
+    /// The host's web search slots, which subagent configs share.
+    web_search_slots: ?*web_search_slots.State = null,
     web_search_progress_ctx: ?*anyopaque = null,
     on_web_search_progress: ?tool_dispatch.WebSearchProgressFn = null,
     web_fetch_progress_ctx: ?*anyopaque = null,

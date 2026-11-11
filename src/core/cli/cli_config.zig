@@ -286,6 +286,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{ "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers" }, .hint = "use fx mcp approve or reject" },
         .{ .keys = &.{"context_limits"}, .hint = profile_paths.displayText("use --context-limit for one run, or edit ~/.fx/settings.json") },
         .{ .keys = &.{"provider_order"}, .hint = profile_paths.displayText("use --provider-order for one run, or edit ~/.fx/settings.json") },
+        .{ .keys = &.{"web_search_backends"}, .hint = profile_paths.displayText("edit ~/.fx/settings.json") },
         .{ .keys = &.{ "yolo_acknowledged", "fast_mode_model_bound", "skill_match_fuzzy" }, .hint = "fx manages it" },
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
@@ -458,7 +459,7 @@ pub const resolved_keys = [_][]const u8{
     "sound.attention_required", "sound.max",              "sound.turn_end",
     "startup_scrollback",       "status_line.context",    "status_line.session",
     "status_line.workspace",    "theme",                  "ultrafast_mode",
-    "update_channel",
+    "update_channel",           "web_search_backends",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -501,6 +502,11 @@ pub fn effectiveValue(
         return .{ .value = .{ .array = array } };
     }
     if (eql(u8, key, "provider_strict")) return boolean(state.provider_strict);
+    if (eql(u8, key, "web_search_backends")) {
+        var array: std.json.Array = .init(arena);
+        for (state.web_search_backends.items()) |slot| try array.append(.{ .string = slot.name() });
+        return .{ .value = .{ .array = array } };
+    }
     if (eql(u8, key, "review_model")) return if (state.review_model.len == 0) .none else string(state.review_model);
     if (eql(u8, key, "session_titles")) return boolean(state.session_title_generation);
     if (eql(u8, key, "cache_warming")) return boolean(state.cache_warming);

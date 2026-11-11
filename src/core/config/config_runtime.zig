@@ -4,6 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const web_search_slots = @import("../tooling/web_search_slots.zig");
 const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -56,6 +57,8 @@ pub const Settings = struct {
     /// Where built-in tools are offered, by tool. Profile-only.
     tool_placement: tool_placement.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
+    /// The web search slots in order; null keeps the default.
+    web_search_backends: ?web_search_slots.Order = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
     ultrafast_mode: ?bool = null,
@@ -225,6 +228,7 @@ pub const ConfigDiagnosticCause = enum {
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
+    invalid_web_search_backends,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -279,6 +283,12 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
     }
     if (diagnostic.cause == .invalid_ultrafast_mode_override) {
         try writer.writeAll("; FX_ULTRAFAST must be a boolean value");
+    }
+    if (diagnostic.cause == .invalid_web_search_backends) {
+        try writer.print(
+            "; web_search_backends must be an array of at most {d} different names from exa, native, parallel, and perplexity",
+            .{web_search_slots.max_order_len},
+        );
     }
 }
 
@@ -1003,6 +1013,7 @@ fn diagnosticCauseForParseError(err: anyerror) ConfigDiagnosticCause {
         error.InvalidToolPlacementValue,
         => .invalid_tool_placement,
         error.InvalidSkillSymlinkAuthorities => .invalid_skill_symlink_authorities,
+        error.InvalidWebSearchBackends => .invalid_web_search_backends,
         else => .malformed_settings,
     };
 }
@@ -1766,6 +1777,10 @@ fn parseProfileOnlyFields(
         settings.tool_placement = try tool_placement.parseJsonObject(tool_placement_value);
     }
 
+    if (root.object.get("web_search_backends")) |value| {
+        settings.web_search_backends = try parseWebSearchBackends(value);
+    }
+
     if (root.object.get("first_call_tool_choice")) |first_call_tool_choice_value| {
         const value = first_call_tool_choice_value;
         if (value != .string) return error.InvalidFirstCallToolChoiceType;
@@ -1975,6 +1990,25 @@ fn pathHasDotDotComponent(path: []const u8) bool {
     return false;
 }
 
+/// Parses `web_search_backends`: an array of at most four different slot
+/// names. An unknown or repeated name is a settings error, which drops the
+/// layer with a diagnostic, as every other invalid profile key does.
+fn parseWebSearchBackends(value: std.json.Value) error{InvalidWebSearchBackends}!web_search_slots.Order {
+    if (value != .array) return error.InvalidWebSearchBackends;
+    const items = value.array.items;
+    if (items.len > web_search_slots.max_order_len) return error.InvalidWebSearchBackends;
+    var names: [web_search_slots.max_order_len][]const u8 = undefined;
+    for (items, 0..) |item, index| {
+        if (item != .string) return error.InvalidWebSearchBackends;
+        names[index] = item.string;
+    }
+    var offending: []const u8 = "";
+    return web_search_slots.parseOrder(names[0..items.len], &offending) catch {
+        debug_trace.logf("core", "invalid web_search_backends entry={s}", .{offending});
+        return error.InvalidWebSearchBackends;
+    };
+}
+
 fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
     if (root.object.get("provider_order")) |order_value| {
         if (order_value != .array) return error.InvalidProviderOrderType;
@@ -2049,6 +2083,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     target.context_limits.merge(incoming.context_limits);
     target.tool_placement.merge(incoming.tool_placement);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
+    if (incoming.web_search_backends) |value| target.web_search_backends = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
     if (incoming.ultrafast_mode) |value| target.ultrafast_mode = value;
@@ -2962,6 +2997,38 @@ test "slash menu categories parses merges and rejects invalid types" {
         error.InvalidSlashMenuCategoriesType,
         parseSettingsJson(std.testing.allocator, "{\"slash_menu_categories\":\"off\"}"),
     );
+}
+
+test "web_search_backends parses, merges, and refuses bad names" {
+    var absent = try parseSettingsJson(std.testing.allocator, "{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.web_search_backends == null);
+
+    var order = try parseSettingsJson(std.testing.allocator, "{\"web_search_backends\":[\"parallel\",\"EXA\"]}");
+    defer order.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(web_search_slots.Slot, &.{ .parallel, .exa }, order.web_search_backends.?.items());
+
+    var empty = try parseSettingsJson(std.testing.allocator, "{\"web_search_backends\":[]}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), empty.web_search_backends.?.items().len);
+
+    for ([_][]const u8{
+        "{\"web_search_backends\":[\"bing\"]}",
+        "{\"web_search_backends\":[\"exa\",\"exa\"]}",
+        "{\"web_search_backends\":[\"exa\",\"native\",\"parallel\",\"perplexity\",\"exa\"]}",
+        "{\"web_search_backends\":\"exa\"}",
+        "{\"web_search_backends\":[1]}",
+    }) |json| {
+        try std.testing.expectError(error.InvalidWebSearchBackends, parseSettingsJson(std.testing.allocator, json));
+    }
+    try std.testing.expectEqual(ConfigDiagnosticCause.invalid_web_search_backends, diagnosticCauseForParseError(error.InvalidWebSearchBackends));
+
+    var target: Settings = .{};
+    defer target.deinit(std.testing.allocator);
+    var incoming = try parseSettingsJson(std.testing.allocator, "{\"web_search_backends\":[\"native\"]}");
+    defer incoming.deinit(std.testing.allocator);
+    try mergeSettings(&target, &incoming, std.testing.allocator);
+    try std.testing.expectEqualSlices(web_search_slots.Slot, &.{.native}, target.web_search_backends.?.items());
 }
 
 test "first_call_tool_choice parses merges and round trips" {
@@ -4950,6 +5017,12 @@ test "the settings list gives the types, values, and bounds the settings parser 
             defer alloc.free(json);
             try expectSettingForTest(layer, key.name, json, true);
         };
+        // A list of listed names takes each name alone.
+        if (key.kind == .strings) for (key.values) |value| {
+            const json = try alloc.print("[\"{s}\"]", .{value});
+            defer alloc.free(json);
+            try expectSettingForTest(layer, key.name, json, true);
+        };
         if (key.minimum) |minimum| {
             const at = try alloc.print("{d}", .{minimum});
             defer alloc.free(at);
@@ -4969,8 +5042,19 @@ test "the settings list gives the types, values, and bounds the settings parser 
         if (key.max_items) |max_items| {
             var items: std.Io.Writer.Allocating = .init(alloc);
             defer items.deinit();
-            try items.writer.writeAll("[\"slug-0\"");
-            for (1..max_items) |index| try items.writer.print(", \"slug-{d}\"", .{index});
+            // A key with listed names takes them; any other takes any string.
+            const item = struct {
+                fn item(listed: []const []const u8, index: usize, writer: *std.Io.Writer) !void {
+                    if (index < listed.len) return writer.print("\"{s}\"", .{listed[index]});
+                    try writer.print("\"slug-{d}\"", .{index});
+                }
+            }.item;
+            try items.writer.writeByte('[');
+            try item(key.values, 0, &items.writer);
+            for (1..max_items) |index| {
+                try items.writer.writeAll(", ");
+                try item(key.values, index, &items.writer);
+            }
             const full = try alloc.print("{s}]", .{items.written()});
             defer alloc.free(full);
             const over = try alloc.print("{s}, \"slug-{d}\"]", .{ items.written(), max_items });

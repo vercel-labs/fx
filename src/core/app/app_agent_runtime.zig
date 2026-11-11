@@ -480,6 +480,7 @@ pub fn Runtime(comptime App: type) type {
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
+                ctx.web_search_slots = &app.web_search_runtime.slots;
                 ctx.web_search_runtime_ready = false;
                 ctx.web_search_progress_ctx = @ptrCast(agent);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
@@ -1002,6 +1003,7 @@ pub fn Runtime(comptime App: type) type {
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
+                ctx.web_search_slots = &app.web_search_runtime.slots;
             }
         }
 
@@ -1637,6 +1639,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_order = if (job.provider == .gateway) job.agent_settings.provider_order else &.{},
                 .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
+                .web_search = if (comptime @hasField(App, "web_search_runtime")) &app.web_search_runtime.slots else null,
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
                 .session_child_capability = session_child_capability,

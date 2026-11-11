@@ -3014,6 +3014,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     configureUltrafastStartup(state, &startup);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
+    state.web_search_runtime.slots.setOrder(startup.web_search_backends);
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;

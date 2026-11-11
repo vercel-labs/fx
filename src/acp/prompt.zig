@@ -570,6 +570,7 @@ const AcpContext = struct {
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
             .web_search_backend = if (provider_capabilities.fx_search) self.state.web_search_runtime.dispatchBackend() else null,
+            .web_search_slots = &self.state.web_search_runtime.slots,
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
@@ -1438,6 +1439,7 @@ fn buildAgentConfig(
         .advertised_functions = sections.advertised_functions,
         .initial_dynamic_tools = sections.initial_dynamic_tools orelse state.host_tools.dynamic_tools,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
+        .web_search = &state.web_search_runtime.slots,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
