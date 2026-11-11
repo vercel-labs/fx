@@ -2101,6 +2101,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // after its model.
           expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
           expect(list).toMatch(/^ {2}\u2514 idler {2,}.* {2,}idle {2,}\S+\s*$/m);
+          expect(list).not.toMatch(/ {2}main\s*$/m);
           await session.sendKeys("Escape");
           await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
         }, (home) => {

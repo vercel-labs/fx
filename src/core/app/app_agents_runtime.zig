@@ -556,7 +556,8 @@ const OrderEntry = struct {
     /// The switch position of the subagent that started this one; null when
     /// an instance did.
     parent: ?usize = null,
-    /// Its own urgency, or its most urgent own subagent's (`raiseParents`).
+    /// Its own urgency, or its most urgent own subagent's (`raiseParents`),
+    /// so an idle subagent whose child works sorts with the working ones.
     urgency: Urgency = .idle,
     reply_at_ms: i64 = 0,
 };
