@@ -69,17 +69,22 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
-    // A close names the subagent it removes, with nothing to preview.
-    if (std.mem.eql(u8, action, "close")) {
-        const raw_closed = tool_args.optionalStringArg(args, "agent") orelse return null;
-        const closed = try text_utils.encodeTerminalSafe(scratch, raw_closed, 64);
+    // Every other action says what it does to whom, with nothing to preview.
+    if (action_words.get(action)) |words| {
+        const named = tool_args.optionalStringArg(args, "agent");
+        // A call that concerns every subagent, a wait or a status that names
+        // none, names them when its host listed them in the call's
+        // `resolved_display_target`; without the list it says "subagents".
+        const roster = if (words.target != null or named == null) call.resolved_display_target else null;
+        const raw_target = roster orelse words.target orelse named orelse words.no_agent orelse return null;
+        const target = try text_utils.encodeTerminalSafe(scratch, raw_target, if (roster != null) 96 else 64);
         const label = switch (state) {
-            .active, .pending => try alloc.print("closing {s}", .{closed.bytes}),
+            .active, .pending => try alloc.print("{s} {s}", .{ words.doing, target.bytes }),
             .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
-                try alloc.print("couldn't close {s}", .{closed.bytes})
+                try alloc.print("couldn't {s} {s}", .{ words.verb, target.bytes })
             else
-                try alloc.print("{s} {s}", .{ reason, closed.bytes }),
-            .identity, .completed, .feedback => try alloc.print("closed {s}", .{closed.bytes}),
+                try alloc.print("{s} {s}", .{ reason, target.bytes }),
+            .identity, .completed, .feedback => try alloc.print("{s} {s}", .{ words.done, target.bytes }),
         };
         errdefer alloc.free(label);
         return .{ .label = label, .detail = try alloc.dupe(u8, "") };
@@ -119,6 +124,215 @@ pub fn subagentAction(
     return .{ .label = label, .detail = detail };
 }
 
+/// How a subagent row words an action other than a message: what it names
+/// always (`target`), or when the call names no agent (`no_agent`).
+const ActionWords = struct {
+    verb: []const u8,
+    doing: []const u8,
+    done: []const u8,
+    target: ?[]const u8 = null,
+    no_agent: ?[]const u8 = null,
+};
+
+const action_words = std.StaticStringMap(ActionWords).initComptime(.{
+    .{ "close", ActionWords{ .verb = "close", .doing = "closing", .done = "closed" } },
+    .{ "stop", ActionWords{ .verb = "stop", .doing = "stopping", .done = "stopped" } },
+    .{ "status", ActionWords{ .verb = "check", .doing = "checking", .done = "checked", .no_agent = "subagents" } },
+    // A wait takes every report, whatever agent it names.
+    .{ "wait", ActionWords{ .verb = "wait for", .doing = "waiting for", .done = "waited for", .target = "subagents" } },
+});
+
+/// Which of its caller's subagents a `subagent` call concerns when it
+/// concerns them all, so its row can name them: those working for a `wait`,
+/// whose reports it waits for, and every open one for a `status` that names
+/// none. Null for any other call.
+pub const SubagentRoster = enum { working, open };
+
+pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?SubagentRoster {
+    if (!std.mem.eql(u8, call.name, "subagent")) return null;
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const outer = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    const args = if (outer.get("request")) |request| switch (request) {
+        .object => |object| object,
+        else => return null,
+    } else outer;
+    const action = tool_args.optionalStringArg(args, "action") orelse return null;
+    if (std.mem.eql(u8, action, "wait")) return .working;
+    if (std.mem.eql(u8, action, "status") and tool_args.optionalStringArg(args, "agent") == null) return .open;
+    return null;
+}
+
+/// The `agent` a `subagent` call names, read from its arguments while they
+/// still stream in and may stop anywhere: the `request` object's, or the
+/// call's own when it has no `request`. Null until that name is a complete
+/// string, and for a name with an escape in it, which a row would show
+/// wrongly; the finished call's row names it once its arguments parse. The
+/// result is a slice of `json`.
+pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
+    // Each open object or array, so a key is known from a value.
+    var containers: [8]u8 = undefined;
+    var depth: usize = 0;
+    var expect_key = false;
+    var after_agent_key = false;
+    var i: usize = 0;
+    while (i < json.len) {
+        const byte = json[i];
+        switch (byte) {
+            '{', '[' => {
+                if (depth == containers.len) return null;
+                containers[depth] = byte;
+                depth += 1;
+                expect_key = byte == '{';
+                after_agent_key = false;
+                i += 1;
+            },
+            '}', ']' => {
+                if (depth == 0) return null;
+                depth -= 1;
+                expect_key = false;
+                after_agent_key = false;
+                i += 1;
+            },
+            ',' => {
+                expect_key = depth > 0 and containers[depth - 1] == '{';
+                after_agent_key = false;
+                i += 1;
+            },
+            '"' => {
+                const start = i + 1;
+                var end = start;
+                var escaped = false;
+                while (end < json.len and json[end] != '"') {
+                    if (json[end] == '\\') {
+                        escaped = true;
+                        end += 1;
+                    }
+                    end += 1;
+                }
+                // The string is still streaming in.
+                if (end >= json.len) return null;
+                const text = json[start..end];
+                i = end + 1;
+                if (expect_key) {
+                    expect_key = false;
+                    after_agent_key = !escaped and (depth == 1 or depth == 2) and std.mem.eql(u8, text, "agent");
+                } else {
+                    if (after_agent_key) return if (escaped or text.len == 0) null else text;
+                    after_agent_key = false;
+                }
+            },
+            ':', ' ', '\t', '\n', '\r' => i += 1,
+            else => {
+                // A number or literal is no name.
+                after_agent_key = false;
+                i += 1;
+            },
+        }
+    }
+    return null;
+}
+
+test "a streaming subagent call names its agent once the whole name arrives" {
+    const cases = [_]struct { json: []const u8, agent: ?[]const u8 }{
+        .{ .json = "", .agent = null },
+        .{ .json = "{\"request\":{\"action\":\"message\",\"ag", .agent = null },
+        .{ .json = "{\"request\":{\"action\":\"message\",\"agent\":\"revi", .agent = null },
+        .{ .json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\"", .agent = "reviewer" },
+        .{ .json = "{\"request\": {\"action\": \"message\", \"agent\" : \"reviewer\", \"message\": \"Rev", .agent = "reviewer" },
+        .{ .json = "{\"action\":\"close\",\"agent\":\"tester\"}", .agent = "tester" },
+        // The message comes first and quotes a key; only the request's own
+        // key counts.
+        .{ .json = "{\"request\":{\"message\":\"say \\\"agent\\\":\\\"x\\\"\",\"agent\":\"builder\"", .agent = "builder" },
+        .{ .json = "{\"request\":{\"message\":\"say \\\"agent\\\":\\\"x\\\"", .agent = null },
+        .{ .json = "{\"request\":{\"agent\":\"a\\u001b[2J\"", .agent = null },
+        .{ .json = "{\"request\":{\"agent\":7,\"message\":\"x\"", .agent = null },
+        .{ .json = "{\"request\":{\"agent\":\"\"", .agent = null },
+        .{ .json = "{\"request\":{\"options\":{\"inner\":{\"agent\":\"deep\"}}", .agent = null },
+        .{ .json = "{\"agent\"", .agent = null },
+    };
+    for (cases) |case| {
+        const got = subagentStreamedAgent(case.json);
+        if (case.agent) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedAgent);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+}
+
+test "subagent rows name the subagents a call concerns when their host listed them" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8 }{
+        .{ .args = "{\"action\":\"wait\"}", .state = .active, .label = "waiting for reviewer, builder" },
+        .{ .args = "{\"request\":{\"action\":\"wait\"}}", .state = .completed, .label = "waited for reviewer, builder" },
+        .{ .args = "{\"action\":\"wait\",\"agent\":\"tester\"}", .state = .active, .label = "waiting for reviewer, builder" },
+        .{ .args = "{\"action\":\"status\"}", .state = .active, .label = "checking reviewer, builder" },
+        .{ .args = "{\"action\":\"status\"}", .state = .completed, .label = "checked reviewer, builder" },
+        // A call that names its agent keeps that name.
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .completed, .label = "checked tester" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .completed, .label = "closed tester" },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = case.args, .resolved_display_target = "reviewer, builder" };
+        const action = (try subagentAction(alloc, call, case.state)).?;
+        defer action.deinit(alloc);
+        try std.testing.expectEqualStrings(case.label, action.label);
+    }
+    const unsafe: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}", .resolved_display_target = "a\x1b[2J, b" };
+    const action = (try subagentAction(alloc, unsafe, .active)).?;
+    defer action.deinit(alloc);
+    try std.testing.expect(text_utils.isTerminalSafe(action.label));
+}
+
+test "a finished wait or status row names the subagents its saved result lists" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, output: []const u8, line: ?[]const u8 }{
+        .{ .args = "{\"action\":\"wait\"}", .output = "{\"ok\":true,\"result\":\"A report or message arrived.\",\"error_code\":null,\"subagents\":[\"reviewer\",\"builder\"]}", .line = "waited for reviewer, builder" },
+        .{ .args = "{\"request\":{\"action\":\"status\"}}", .output = "{\"ok\":true,\"result\":\"reviewer: idle\",\"error_code\":null,\"subagents\":[\"reviewer\"]}", .line = "checked reviewer" },
+        // Saved before results listed them, or with none to list.
+        .{ .args = "{\"action\":\"wait\"}", .output = "{\"ok\":true,\"result\":\"A report or message arrived.\",\"error_code\":null}", .line = null },
+        .{ .args = "{\"action\":\"wait\"}", .output = "{\"ok\":true,\"result\":\"x\",\"subagents\":[]}", .line = null },
+        .{ .args = "{\"action\":\"wait\"}", .output = "{\"ok\":false,\"error_code\":\"wait_unavailable\",\"subagents\":[\"reviewer\"]}", .line = null },
+        .{ .args = "{\"action\":\"wait\"}", .output = "{\"ok\":true,\"subagents\":[\"reviewer\",7]}", .line = null },
+        // A call about one subagent keeps its own row.
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .output = "{\"ok\":true,\"result\":\"tester: idle\",\"subagents\":[\"reviewer\"]}", .line = null },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "c", .name = "subagent", .arguments_json = case.args };
+        const line = try subagentStatusLine(alloc, call, case.output);
+        defer if (line) |value| alloc.free(value);
+        if (case.line) |want| {
+            try std.testing.expectEqualStrings(want, line orelse return error.TestExpectedLine);
+        } else {
+            try std.testing.expect(line == null);
+        }
+    }
+    const unsafe = (try subagentStatusLine(alloc, .{ .id = "c", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }, "{\"ok\":true,\"subagents\":[\"a\\u001b[2J\"]}")).?;
+    defer alloc.free(unsafe);
+    try std.testing.expect(text_utils.isTerminalSafe(unsafe));
+}
+
+test "only a wait and a status that names no agent concern every subagent" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { name: []const u8 = "subagent", args: []const u8, roster: ?SubagentRoster }{
+        .{ .args = "{\"action\":\"wait\"}", .roster = .working },
+        .{ .args = "{\"request\":{\"action\":\"wait\",\"agent\":\"tester\"}}", .roster = .working },
+        .{ .args = "{\"action\":\"status\"}", .roster = .open },
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .roster = null },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"hi\"}", .roster = null },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .roster = null },
+        .{ .args = "{", .roster = null },
+        .{ .name = "shell", .args = "{\"action\":\"wait\"}", .roster = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.roster, try subagentRoster(alloc, .{ .id = "c", .name = case.name, .arguments_json = case.args }));
+    }
+}
+
 /// The preview a subagent row shows for `raw`: runs of whitespace, line
 /// breaks included, become one space, made terminal-safe and cut to 120
 /// bytes. Caller owns the result.
@@ -155,6 +369,16 @@ pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) 
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
+    // A wait, or a status that names no agent, names the subagents its
+    // result lists, so the row reads the same live and after a resume.
+    if (try subagentRoster(alloc, call) != null) {
+        if (try resultRoster(alloc, parsed.value.object)) |names| {
+            defer alloc.free(names);
+            var named = call;
+            named.resolved_display_target = names;
+            return formatSubagentPlainAction(alloc, named, .completed);
+        }
+    }
     if (tool_args.optionalStringArg(parsed.value.object, "delivery")) |value| {
         const delivery = std.meta.stringToEnum(types.SteeringDelivery, value) orelse return null;
         const ok = parsed.value.object.get("ok") orelse return null;
@@ -166,6 +390,22 @@ pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) 
     const ok = parsed.value.object.get("ok") orelse return null;
     if (ok != .bool or !ok.bool) return null;
     return formatSubagentPlainAction(alloc, call, .pending);
+}
+
+/// The subagents a successful result lists in `subagents`, joined with ", ",
+/// or null when it lists none. The caller owns the result.
+fn resultRoster(alloc: Allocator, result: std.json.ObjectMap) Allocator.Error!?[]u8 {
+    const ok = result.get("ok") orelse return null;
+    if (ok != .bool or !ok.bool) return null;
+    const listed = result.get("subagents") orelse return null;
+    if (listed != .array or listed.array.items.len == 0) return null;
+    const names = try alloc.alloc([]const u8, listed.array.items.len);
+    defer alloc.free(names);
+    for (listed.array.items, names) |name, *slot| {
+        if (name != .string) return null;
+        slot.* = name.string;
+    }
+    return try std.mem.join(alloc, ", ", names);
 }
 
 /// Only structured child terminal failures change the failure label.
@@ -207,6 +447,15 @@ test "subagent rows project request identity state and bounded safe previews" {
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .completed, .label = "closed tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .active, .label = "closing tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't close tester", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .active, .label = "stopping tester", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .completed, .label = "stopped tester", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .completed, .label = "waited for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "Cancelled" }, .label = "Cancelled subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\",\"agent\":\"tester\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Denied" }, .label = "Denied tester", .detail = "" },
+        .{ .args = "{\"action\":\"status\"}", .state = .completed, .label = "checked subagents", .detail = "" },
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't check tester", .detail = "" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
@@ -214,7 +463,7 @@ test "subagent rows project request identity state and bounded safe previews" {
         try std.testing.expectEqualStrings(case.label, action.label);
         try std.testing.expectEqualStrings(case.detail, action.detail);
     }
-    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"wait\"}" }) |args| {
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
         try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
     }
     const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;

@@ -159,7 +159,18 @@ pub const ProvisionalToolStatuses = struct {
             observed_kind = presentation.activity_kind;
             break :resource formatted;
         } else null;
-        const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
+        // A subagent call's row names its subagent once its arguments hold
+        // the name, while they stream in or once complete, and keeps a name
+        // it already shows; the first string in them is its action.
+        const is_subagent = std.mem.eql(u8, tool_name, "subagent");
+        if (is_subagent) {
+            observed_label = tooling_presentation.subagentStreamedAgent(arguments_json orelse "") orelse self.trackedLabel(tool_id);
+        }
+        const shown_label = if (is_subagent and observed_label != null)
+            (try text_utils.encodeTerminalSafe(scratch.allocator(), observed_label.?, 64)).bytes
+        else
+            observed_label;
+        const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, shown_label);
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
@@ -183,6 +194,33 @@ pub const ProvisionalToolStatuses = struct {
                 .text = label,
             },
         }) catch {};
+    }
+
+    /// Names the subagent a streaming `subagent` call's row is for as soon
+    /// as its arguments so far hold the whole name, so the row reads
+    /// `Managing reviewer` while the rest of the call streams in.
+    pub fn observeArguments(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        turn_id: u64,
+        tool_id: []const u8,
+        arguments: []const u8,
+    ) !void {
+        const index = self.findTracked(tool_id) orelse return;
+        const status = self.tracked.items[index];
+        if (!std.mem.eql(u8, status.tool_name, "subagent") or status.label_value != null) return;
+        if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
+            .ineligible => return,
+            .eligible => |metadata| metadata,
+        };
+        try self.publish(hooks, alloc, turn_id, status.id, status.tool_name, metadata.activity_kind, metadata.action_label, null, arguments);
+    }
+
+    fn trackedLabel(self: *const ProvisionalToolStatuses, id: []const u8) ?[]const u8 {
+        const index = self.findTracked(id) orelse return null;
+        return self.tracked.items[index].label_value;
     }
 
     pub fn finishMalformedToolArguments(
@@ -1675,6 +1713,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.toolbox,
+    test_builtin_tools.subagent,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -2029,6 +2068,49 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
+}
+
+test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, "subagent");
+    const action = eligibleActionLabel("subagent");
+    var named_buf: [512]u8 = undefined;
+    const named = try formatProvisionalProgressLabel(&named_buf, action, "reviewer");
+
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, null);
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("● Managing\x1b[0m", capture.events.items[1].progress.text);
+    // Part of the name is not yet a name.
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"revi");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\"");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expectEqualStrings("sub_1", capture.events.items[2].provisional.id.call_id);
+    try std.testing.expectEqualStrings(named, capture.events.items[3].progress.text);
+    // The rest of the call streams in without another publication.
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    // The stream's final start keeps the name.
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review it\"}}");
+    try std.testing.expectEqualStrings(named, capture.events.items[5].progress.text);
+
+    // A call without `request` starts with its action, which the stream's
+    // hint would name; the row names its subagent instead.
+    try statuses.publish(&hooks, alloc, 7, "sub_2", "subagent", kind, action, "message", "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"Run it\"}");
+    var tester_buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&tester_buf, action, "tester"), capture.events.items[7].progress.text);
+
+    // Other tools and unknown calls are left alone.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
+    const before = capture.events.items.len;
+    try statuses.observeArguments(&hooks, alloc, 7, "read_1", "{\"agent\":\"reviewer\"");
+    try statuses.observeArguments(&hooks, alloc, 7, "missing", "{\"agent\":\"reviewer\"");
+    try std.testing.expectEqual(before, capture.events.items.len);
 }
 
 test "provisional toolbox labels decode escaped UTF-8 and encode terminal controls before copying" {

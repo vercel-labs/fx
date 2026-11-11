@@ -180,6 +180,8 @@ function startAuthFixture(
     body: string;
   }> = [];
   const validTokens = new Set([ACCESS_INITIAL, ACCESS_REFRESHED]);
+  // A scope the server asks for on top of a valid token: a step-up.
+  let moreScopes: string | null = null;
   let authorizationRequests = 0;
   let tokenExchanges = 0;
   let refreshes = 0;
@@ -235,6 +237,14 @@ function startAuthFixture(
               "www-authenticate": options.omitScopes
                 ? `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
                 : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="${options.challengeScope ?? "tools.read"}"`,
+            },
+          });
+        }
+        if (moreScopes) {
+          return new Response("", {
+            status: 403,
+            headers: {
+              "www-authenticate": `Bearer error="insufficient_scope", scope="${moreScopes}", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
             },
           });
         }
@@ -416,6 +426,10 @@ function startAuthFixture(
     requests,
     /** The access tokens the server takes; a test may withdraw them. */
     validTokens,
+    /** From now on, a valid token gets a 403 asking for `scope` too; null stops it. */
+    askForMoreScopes(scope: string | null) {
+      moreScopes = scope;
+    },
     get authorizationRequests() {
       return authorizationRequests;
     },
@@ -977,6 +991,23 @@ describe("MCP login", () => {
       expect(await statusOf(root)).toBe("not_started");
     }, 60_000);
   }
+
+  test("a logout whose revocation can't reach the server says the tokens may stay valid", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // A port that was just listening and is now closed refuses the connection.
+    const closed = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null) });
+    const revokeUrl = `http://127.0.0.1:${closed.port}/revoke`;
+    closed.stop(true);
+    seedV2Credential(root, auth, { revocation_endpoint: revokeUrl });
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
+    expect(logout.stderr).toBe("");
+    expect(logout.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
 
   test("fx mcp login says why the server refused the sign-in, in its words", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -2325,6 +2356,25 @@ describe("MCP login", () => {
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
 
+  // A held server has no session to sign out of, so its logout removes the
+  // saved login without revoking it, and says that.
+  test("a logout of a held server says its login wasn't revoked at its server", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    const storePath = seedV2Credential(root, auth);
+    const doc = JSON.parse(readFileSync(storePath, "utf8"));
+    doc.servers[0].workspace = root.workspace;
+    writeFileSync(storePath, JSON.stringify(doc));
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(done.stderr).toBe("");
+    expect(done.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(readFileSync(storePath, "utf8")).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
   test("a logout while another fx keeps the saved logins busy changes nothing and says so", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -2518,6 +2568,53 @@ describe("MCP login", () => {
       unlinkSync(join(root.home, "Library", "Keychains"));
     }
   }, 60_000);
+
+  // The login read again after a slow first Keychain read can still be
+  // refused, or the server can ask for more scopes: either way the server
+  // waits for a sign-in, as it does when the store was read at once.
+  for (const [what, refuse] of [
+    ["the server refuses", (fixture: AuthFixture) => fixture.validTokens.clear()],
+    ["the server asks more scopes of", (fixture: AuthFixture) => fixture.askForMoreScopes("tools.call")],
+  ] as const) {
+    test.skipIf(process.platform !== "darwin")(`a login read again after a slow Keychain that ${what} leaves the server needing a login`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 400, body: { error: "invalid_grant" } } });
+      const root = createRoot(auth);
+      mkdirSync(join(root.home, "Library"), { recursive: true });
+      symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+      const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+      const env = {
+        ...baseEnv(root), USER: account, FX_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+        FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
+      };
+      let paused: number | null = null;
+      let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+      try {
+        expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+        expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+        refuse(auth);
+        // The next fx's first Keychain read hangs, and fx cuts it at its budget.
+        watcher = pauseNextKeychainRead(account);
+        const showing = runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 40_000 });
+        paused = await watcher.pid;
+        expect(paused).not.toBeNull();
+        const shown = await showing;
+        expect(shown.stdout).toMatch(/status +needs login/);
+        expect(shown.stdout).not.toMatch(/status +(ready|failed)/);
+        expect(auth.tokenExchanges).toBe(1);
+        // A step-up keeps the login for what it already had.
+        if (what === "the server asks more scopes of") {
+          expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+        }
+      } finally {
+        releaseProcess(paused);
+        watcher?.stop();
+        try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+        // Only the link goes, never the Keychains it points at.
+        unlinkSync(join(root.home, "Library", "Keychains"));
+      }
+    }, 60_000);
+  }
 
   test("a configured oauth.resource reaches the authorization server as written", async () => {
     upstream = startModernMcpHttpFixture("json");

@@ -819,7 +819,7 @@ fn postAcpReport(
     const alloc = std.heap.c_allocator;
     const text = switch (delivery) {
         .report => |report| try subagent_reports.message(alloc, report, state.max_tool_result_bytes),
-        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, state.max_tool_result_bytes, null),
+        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, state.max_tool_result_bytes, null, message.user_typed),
     };
     var owns_text = true;
     defer if (owns_text) alloc.free(text);

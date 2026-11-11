@@ -351,6 +351,17 @@ pub const Store = struct {
         }
     }
 
+    /// A child's stored title, read without opening it; null when it has
+    /// none yet. Caller owns it.
+    pub fn childTitle(store: *Store, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        var peeked = try store.manager.peek(alloc, child_id);
+        defer peeked.deinit(alloc);
+        const raw = peeked.state.title orelse return null;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
+    }
+
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
@@ -2314,6 +2325,20 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
+        return childrenOf(alloc, &state);
+    }
+
+    /// The children this session had at the end of the turn before
+    /// `before_turn`, a `ForkPoint.turn`, each as its newest work stood
+    /// then: what `fork` can copy (D97). Free with `freeChildren`.
+    pub fn forkChildren(self: *Session, alloc: Allocator, before_turn: u64) ![]Child {
+        if (before_turn == 0) return error.InvalidForkPoint;
+        var state = try self.store.manager.stateAt(self.id(), .{ .turn = before_turn - 1 });
+        defer state.deinit(self.store.manager.gpa);
+        return childrenOf(alloc, &state);
+    }
+
+    fn childrenOf(alloc: Allocator, state: *const sm.State) ![]Child {
         const out = try alloc.alloc(Child, state.children.items.len);
         var built: usize = 0;
         errdefer {
@@ -2740,7 +2765,11 @@ pub const Session = struct {
         host: Host,
         /// The title the source shows; the fork gets it marked as a fork.
         title: ?[]const u8 = null,
+        /// The children the fork takes a copy of, from `forkChildren` (D97).
+        children: []const ChildCopy = &.{},
     };
+
+    pub const ChildCopy = sm.ChildCopy;
 
     /// A new session holding this one's log up to the end of the turn before
     /// `options.before_turn`, under a new id (D58). The manager copies the
@@ -2754,6 +2783,7 @@ pub const Session = struct {
             .at = .{ .turn = options.before_turn - 1 },
             .workspace = options.workspace,
             .host = options.host,
+            .children = options.children,
         });
         errdefer handle.release();
         const copy = try init(alloc, self.store, handle, false);
@@ -5832,6 +5862,12 @@ test "a child opens under the id its parent names, and its parent folds its line
         try testing.expectEqualStrings(child_id, child.id());
         try testing.expectEqualStrings("Be brief.", child.childInstructions());
         try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+        // Its title reads from the store without opening it.
+        try testing.expect((try t.store.childTitle(alloc, child_id)) == null);
+        try child.rename("Review the parser");
+        const title = (try t.store.childTitle(alloc, child_id)).?;
+        defer alloc.free(title);
+        try testing.expectEqualStrings("Review the parser", title);
     }
     try parent.appendChildLines(&.{.{ .finished = .{ .child = child_id, .work_id = "w1", .outcome = .ok, .data = "{}" } }});
 
@@ -5892,6 +5928,7 @@ test "the manager guards child lines, and a child without a log reopens under it
     // Closed before its first turn, as a crash would leave it: nothing on disk.
     (try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Stay short."))).close();
     try testing.expectError(error.NotFound, t.store.childHistory(alloc, child_id));
+    try testing.expectError(error.NotFound, t.store.childTitle(alloc, child_id));
     const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", testSeed(&model));
     defer child.close();
     try testing.expectEqualStrings(child_id, child.id());

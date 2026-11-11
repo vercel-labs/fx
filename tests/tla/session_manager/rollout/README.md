@@ -15,7 +15,7 @@ stress config for each, and the planted bugs in `mutants.json`.
 | `pr-1081/PR1081Subagents.tla` | Persistent child work, backend inheritance, crash repair, parent lifetime and hidden child discovery |
 | `pr-1082/PR1082Commands.tla` | Read-only inspection, safe-prefix recovery, root listing, tombstones and orphan cleanup |
 | `pr-1091/PR1091Harness.tla` | tmux backend environment and explicit 168-cell end/fault/reentry coverage accounting, not product fault semantics |
-| `pr-1092/PR1092Steering.tla` | Cancelled turn selection of marked steering/restored steering/feedback with stable tool-step anchors |
+| `pr-1092/PR1092Steering.tla` | Cancelled turn selection of marked steering/restored steering/feedback/fx's recovery prompts with stable tool-step anchors |
 | `pr-1099/PR1099FIFO.tla` | FIFO cleanup reader lifetime and eventual join under explicit scheduler/I/O fairness |
 | `pr-1116/PR1116Blobs.tla` | Whole streamed bodies, immutable session blobs, references and original-file deletion |
 | `pr-1116/PR1116Migration.tla` | Resumable older-v2 handle/settings migration with blob/map/terminal/removal order |

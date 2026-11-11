@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_frame = @import("../shared/agent_frame.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const cache_warmer = @import("../agent/runtime/cache_warmer.zig");
@@ -1806,7 +1807,9 @@ pub const SessionRuntime = struct {
     ) void {
         if (isCurrentCompactionCheckpoint(turn)) {
             self.disarmCacheWarming("history_compacted");
-            self.agent.clearHistory(alloc);
+            // The conversation goes on after compacting: it keeps its toolbox
+            // menu (`tests/tla/toolbox/Toolbox.tla` MenuFixed).
+            self.agent.dropHistory(alloc);
             self.unversioned_history_len = 0;
         }
         self.agent.history.appendAssumeCapacity(turn);
@@ -1820,7 +1823,7 @@ pub const SessionRuntime = struct {
     pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
         const uncertain = self.unversioned_history_len != 0;
         self.disarmCacheWarming("history_compacted");
-        self.agent.clearHistory(alloc);
+        self.agent.dropHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
         self.agent.fresh = false;
@@ -2508,14 +2511,64 @@ fn appendContextNoteChatMessages(
 /// Steering comes from whoever drives this session, so compaction keeps it as
 /// user text rather than a generated notice. A subagent's report or message
 /// a boundary took is not the user's, so it stays ordinary text in its own
-/// frame. Empty entries only mark a checkpoint boundary. Borrows `text`.
+/// frame. fx's own prompt to a stalled turn is steering the user never typed:
+/// it comes back as the plain user text the turn sent, never as the user's
+/// words. Empty entries only mark a checkpoint boundary. Borrows `text`.
 fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
+    if (recovery_prompt.fromSaved(text)) |prompt| {
+        return .{ .role = .user, .content = prompt, .recovery_prompt = true };
+    }
     return .{
         .role = .user,
         .content = text,
         .restored_steering = true,
         .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "a recovery prompt a turn sent after its last step ends the saved turn as the turn sent it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls = [_]core_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("a"),
+        .output_bytes = 1,
+        .stored_output_bytes = 1,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var files = [_]core_types.FileEvidence{.{
+        .path = @constCast("a"),
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+    }};
+    const prompt = try recovery_prompt.saved(arena, "Summarize what you just did.");
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = prompt, .after_tool_step_count = 1 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &messages, .{ .tool_steps = &steps, .files = &files, .steering = &steering });
+
+    // The turn's last request ended with the prompt and the update, so the
+    // next request ends the turn with both, and nothing the turn never sent
+    // follows them, though the turn read a file.
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expect(messages.items[2].recovery_prompt);
+    try std.testing.expectEqualStrings("Summarize what you just did.", messages.items[2].content.?);
+    try std.testing.expect(messages.items[3].restored_steering);
+    try std.testing.expectEqualStrings("later update", messages.items[3].content.?);
+
+    var user_only: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &user_only, .{ .tool_steps = &steps, .files = &files, .steering = steering[1..] });
+    try std.testing.expectEqual(@as(usize, 3), user_only.items.len);
+    try std.testing.expectEqualStrings("later update", user_only.items[2].content.?);
 }
 
 test "a restored subagent frame is never the user's text" {
