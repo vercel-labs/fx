@@ -14,6 +14,8 @@ import type {
 // The scenario's command row shows its steps in short form.
 export const ACTIVE_TOOL_MARKER = "Running sleep, printf, sleep";
 export const TERMINAL_TOOL_MARKER = "Ran sleep, printf, sleep";
+// Ctrl+O shows the scenario's command in full.
+export const EXPANDED_TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
@@ -482,7 +484,7 @@ function assertActiveToolPlacementScenario(
   ].includes(frame.event)) {
     assertMarkerCount(failures, frame, activeMarker, 0);
     if (frame.event !== "active-tool-command-output-expanded-shrink") {
-      assertMarkerCount(failures, frame, terminalMarker, 1);
+      assertMarkerCount(failures, frame, EXPANDED_TERMINAL_TOOL_MARKER, 1);
     }
     assertSemanticScrollbackMarkerCount(
       failures,
@@ -495,7 +497,7 @@ function assertActiveToolPlacementScenario(
       assertSemanticScrollbackMarkerCount(
         failures,
         frame,
-        terminalMarker,
+        EXPANDED_TERMINAL_TOOL_MARKER,
         1,
         "active-tool-terminal-scrollback-once",
       );

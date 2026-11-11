@@ -3119,7 +3119,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared Ctrl-O cancellation check.");
-      await active.waitForText(streamMarker, TIMEOUT);
+      // The running row shows the inline script's steps in short form.
+      await active.waitForText("Running printf, sleep", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
@@ -3186,7 +3187,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await active.waitForText("Running sh -c", TIMEOUT);
+      // The inline script shows its steps in short form.
+      await active.waitForText("Running printf, sleep, printf", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, TIMEOUT);
@@ -3260,7 +3262,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${lineMarker} 001`),
         TIMEOUT,
       );
@@ -3425,7 +3427,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${commandMarker} 00005`),
         TIMEOUT,
       );
@@ -3513,7 +3515,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command and ask the prepared question.");
-      await active.waitForText(commandMarker, TIMEOUT);
+      // The command's row shows its inline script's steps in short form.
+      await active.waitForText("printf, sleep", TIMEOUT);
       await active.sendKeys("C-o");
       await active.waitForText(questionMarker, TIMEOUT);
 
@@ -4277,7 +4280,9 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", actionTimeout);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForText("CTRL_O_HANDOFF_FIRST_RUNNING", actionTimeout);
+      // The first command's row appears when it starts, with the steps of its
+      // inline script in short form.
+      await active.waitForText("Running touch, printf, sleep +1 more", actionTimeout);
       const beforeHandoff = await active.captureFullScrollback();
       expect(countOccurrences(beforeHandoff, bulletMarker)).toBe(1);
       expect(countOccurrences(beforeHandoff, codeMarker)).toBe(1);
@@ -4473,7 +4478,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running sh -c") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${streamPrefix}004`),
         TIMEOUT,
       );
@@ -4575,7 +4580,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const afterFileRejection = await active.waitForPane(
         (pane) =>
-          pane.includes("Ran sh -c") &&
+          pane.includes("Ran printf, sleep, printf") &&
           !pane.includes("Apply this change?"),
         TIMEOUT,
       );

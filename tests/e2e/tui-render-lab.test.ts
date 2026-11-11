@@ -458,7 +458,8 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
   ];
   for (const entry of cases) {
     const grid = [
-      "● Ran sleep, printf, sleep",
+      // The expanded view shows the command in full.
+      "● Ran sleep 1; i=1",
       "────────────────",
       "❯",
       "────────────────",

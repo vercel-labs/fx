@@ -4813,7 +4813,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the cooperative steering fixture.");
-      await session.waitForText("Running while", TIMEOUT);
+      await session.waitForText("Running sleep, printf", TIMEOUT);
       await session.pasteText(firstSteering);
       await session.sendKeys("Enter");
       await session.sendText(secondSteering);
@@ -4961,7 +4961,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the rich steering tool fixture.");
-      await session.waitForText("Running while", TIMEOUT);
+      await session.waitForText("Running sleep, printf", TIMEOUT);
       await session.sendText(`/image ${imagePath}`);
       await session.waitForText("attached image: steering-image.png", TIMEOUT);
       await session.sendText(steering);
@@ -5062,7 +5062,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the failed steering tool fixture.");
-      await session.waitForText("Running while", TIMEOUT);
+      await session.waitForText("Running sleep, printf", TIMEOUT);
       await session.sendText(steering);
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
@@ -7394,7 +7394,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 });
 
-test.skipIf(!tmuxAvailable())("command rows reclip to the live width while running and after settling", async () => {
+test.skipIf(!tmuxAvailable())("long command rows show their steps while running and after settling", async () => {
   const stripSgr = (value: string) => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
   const hasToolResult = (raw: string) => {
     try {
@@ -7432,22 +7432,19 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("run the reclip probe");
 
-    // While the command runs, the active row reclips to the live width
-    // instead of keeping the frozen compact-bound marker.
+    // While the command runs, the active row shows its steps in short form
+    // instead of the frozen compact-bound marker.
     await session.waitForPane((pane) => pane.includes("Running printf"), TIMEOUT);
     const runningRow = stripSgr(await session.capturePane()).split("\n")
       .find((line) => line.includes("Running printf"));
-    expect(runningRow).toBeDefined();
-    expect(runningRow!).toContain(tail);
-    expect(runningRow!).not.toContain("...");
+    expect(runningRow).toBe("● Running printf, sleep, printf");
 
-    // After settling, the completed row keeps the full command too.
+    // After settling, the completed row keeps the short form too.
     await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE"), TIMEOUT);
     const ranRow = stripSgr(await session.captureFullScrollback()).split("\n")
       .find((line) => line.includes("Ran printf"));
-    expect(ranRow).toBeDefined();
-    expect(ranRow!).toContain(tail);
-    expect(ranRow!).not.toContain("...");
+    expect(ranRow).toBe("● Ran printf, sleep, printf ✓");
+    expect(stripSgr(await session.captureFullScrollback())).not.toContain(tail);
 
     await session.sendText("/quit");
     await waitForCondition(() => session!.paneStatus().dead, "fx exit");

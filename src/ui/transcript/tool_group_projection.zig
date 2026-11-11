@@ -1743,6 +1743,14 @@ const plain_programs = std.StaticStringMap(void).initComptime(.{
     .{"realpath"}, .{"readlink"}, .{"seq"},   .{"watch"}, .{"uname"},    .{"whoami"},
 });
 
+/// Shells whose `-c` flag runs the script that follows it.
+const shell_programs = std.StaticStringMap(void).initComptime(.{
+    .{"sh"}, .{"bash"}, .{"zsh"}, .{"dash"}, .{"ksh"},
+});
+
+/// How deep the short form looks into `sh -c` scripts inside `sh -c` scripts.
+const short_command_max_depth = 2;
+
 /// Programs that run a script named by their first argument.
 const interpreter_programs = std.StaticStringMap(void).initComptime(.{
     .{"sh"},      .{"bash"}, .{"zsh"}, .{"dash"}, .{"fish"}, .{"python"},
@@ -1775,6 +1783,10 @@ const ShortStep = struct {
     after_pipe: bool = false,
     /// A loop header or a block's end, which the short form leaves out.
     dropped: bool = false,
+    /// A shell's `-c` came, so the next token is the script it runs.
+    script_flag: bool = false,
+    /// The script a `sh -c` step runs, whose own steps the short form shows.
+    inline_script: ?[]const u8 = null,
 };
 
 fn isWordToken(token: command_lex.ArgvToken) bool {
@@ -1826,6 +1838,18 @@ fn addShortToken(step: *ShortStep, token: command_lex.ArgvToken) void {
         return;
     }
     if (step.closed) return;
+    if (step.script_flag) {
+        step.inline_script = value;
+        step.closed = true;
+        return;
+    }
+    // `sh -c`, `bash -lc`: the next token is the script the shell runs.
+    if (step.word_count == 0 and shell_programs.has(step.program) and !token.quoted and
+        value.len > 1 and value[0] == '-' and value[1] != '-' and std.mem.findScalar(u8, value, 'c') != null)
+    {
+        step.script_flag = true;
+        return;
+    }
     if (step.skip_next) {
         step.skip_next = false;
         return;
@@ -1840,8 +1864,8 @@ fn addShortToken(step: *ShortStep, token: command_lex.ArgvToken) void {
         if (step.word_count == step.words.len) step.closed = true;
         return;
     }
-    // An interpreter's first argument names the script it runs.
-    if (step.word_count == 0 and interpreter_programs.has(step.program) and !token.quoted and value.len > 0 and value[0] != '-') {
+    // An interpreter's first argument names the script it runs, quoted or not.
+    if (step.word_count == 0 and interpreter_programs.has(step.program) and value.len > 0 and value[0] != '-') {
         step.words[0] = shortProgramName(value);
         if (std.mem.startsWith(u8, step.words[0], "./")) step.words[0] = step.words[0][2..];
         step.word_count = 1;
@@ -1859,13 +1883,23 @@ fn isEnvAssignment(value: []const u8) bool {
     return true;
 }
 
+/// The errors of the short-form step walk, which recurses into `sh -c`
+/// scripts and so cannot infer them.
+const ShortStepError = std.mem.Allocator.Error || std.Io.Writer.Error;
+
 fn finishShortStep(
     scratch: std.mem.Allocator,
     steps: *std.ArrayList([]const u8),
     raw_steps: *usize,
     step: ShortStep,
-) !void {
+    depth: usize,
+) ShortStepError!void {
     if (step.program.len == 0 and !step.after_wrapper) return;
+    // A `sh -c` step shows the steps of its script, when they lex.
+    if (step.inline_script) |script| if (depth < short_command_max_depth) {
+        const before = steps.items.len;
+        if (try collectShortSteps(scratch, script, steps, raw_steps, depth + 1) and steps.items.len > before) return;
+    };
     raw_steps.* += 1;
     if (step.dropped or step.program.len == 0 or shell_setup_programs.has(step.program)) return;
     if (step.after_pipe and output_filter_programs.has(step.program)) return;
@@ -1875,11 +1909,33 @@ fn finishShortStep(
     try steps.append(scratch, text.written());
 }
 
-/// Whether the token at `index` is the `(` of a `$(`, right after the `$`.
-fn isSubstitutionStart(command: []const u8, tokens: []const command_lex.ArgvToken, index: usize) bool {
+/// The closing byte of the expansion that the token at `index` opens: `)`
+/// for the `(` of a `$(`, and `}` for a `{` right after a `$` or with no
+/// space after it, as in `${name}` and `{1..80}`. A `{ cmd; }` group has the
+/// space, so it opens no expansion. Null for other tokens.
+fn expansionClose(command: []const u8, tokens: []const command_lex.ArgvToken, index: usize) ?u8 {
     const token = tokens[index];
-    if (token.quoted or !std.mem.eql(u8, token.value, "(") or token.start == 0) return false;
-    return command[token.start - 1] == '$';
+    if (token.quoted or token.value.len != 1) return null;
+    const after_dollar = token.start > 0 and command[token.start - 1] == '$';
+    return switch (token.value[0]) {
+        '(' => if (after_dollar) ')' else null,
+        '{' => if (after_dollar or (token.end < command.len and !std.ascii.isWhitespace(command[token.end]))) '}' else null,
+        else => null,
+    };
+}
+
+/// Whether the token at `index` is the file descriptor of a redirection
+/// right after it, as the `2` in `2>&1`.
+fn isRedirectionFd(tokens: []const command_lex.ArgvToken, index: usize) bool {
+    const token = tokens[index];
+    if (token.quoted or token.value.len == 0 or index + 1 >= tokens.len) return false;
+    for (token.value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    const next = tokens[index + 1];
+    return !next.quoted and next.start == token.end and redirection_operators.has(next.value);
+}
+
+fn expansionOpen(close: u8) u8 {
+    return if (close == ')') '(' else '{';
 }
 
 fn gapHasNewline(command: []const u8, from: usize, to: usize) bool {
@@ -1927,33 +1983,63 @@ fn formatShortCommand(scratch: std.mem.Allocator, short: ShortCommand, base_styl
 /// short_command_max_len bytes keeps its full text. Null when the command
 /// keeps its text or does not lex. The steps live in `scratch`.
 fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8) !?ShortCommand {
+    var steps: std.ArrayList([]const u8) = .empty;
+    var raw_steps: usize = 0;
+    if (!try collectShortSteps(scratch, command, &steps, &raw_steps, 0)) return null;
+    // The same step twice in a row shows once.
+    var shown: std.ArrayList([]const u8) = .empty;
+    for (steps.items) |text| {
+        if (shown.items.len > 0 and std.mem.eql(u8, shown.items[shown.items.len - 1], text)) continue;
+        try shown.append(scratch, text);
+    }
+    if (shown.items.len == 0) return null;
+    if (raw_steps <= 1 and command.len <= short_command_max_len) return null;
+    // A command that is already its own short form keeps its text.
+    if (shown.items.len == 1 and std.mem.eql(u8, shown.items[0], command)) return null;
+    const kept = @min(shown.items.len, short_command_max_steps);
+    return .{ .steps = shown.items[0..kept], .more = shown.items.len - kept };
+}
+
+/// Appends the steps `command` runs to `steps`, and counts every step it has,
+/// shown or not, in `raw_steps`. False when the command does not lex.
+fn collectShortSteps(
+    scratch: std.mem.Allocator,
+    command: []const u8,
+    steps: *std.ArrayList([]const u8),
+    raw_steps: *usize,
+    depth: usize,
+) ShortStepError!bool {
     const argv = command_lex.tokenize_argv(scratch, command) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        else => return false,
     };
     const tokens = argv.tokens;
 
-    var steps: std.ArrayList([]const u8) = .empty;
-    var raw_steps: usize = 0;
     var step: ShortStep = .{};
     var index: usize = 0;
     while (index <= tokens.len) : (index += 1) {
         const at_end = index == tokens.len;
         const token: ?command_lex.ArgvToken = if (at_end) null else tokens[index];
-        // A command substitution, `$( ... )`, belongs to the step around it.
-        if (!at_end and isSubstitutionStart(command, tokens, index)) {
-            var depth: usize = 0;
+        // A comment runs to the end of its line.
+        if (!at_end and !tokens[index].quoted and std.mem.startsWith(u8, tokens[index].raw, "#")) {
+            while (index + 1 < tokens.len and !gapHasNewline(command, tokens[index].end, tokens[index + 1].start)) index += 1;
+            continue;
+        }
+        // A command substitution, `$( ... )`, and an expansion such as
+        // `{1..80}` or `${name}` belong to the word around them.
+        if (!at_end) if (expansionClose(command, tokens, index)) |close| {
+            var nesting: usize = 0;
             while (index < tokens.len) : (index += 1) {
                 const inner = tokens[index];
-                if (inner.quoted) continue;
-                if (std.mem.eql(u8, inner.value, "(")) depth += 1;
-                if (std.mem.eql(u8, inner.value, ")")) {
-                    depth -= 1;
-                    if (depth == 0) break;
+                if (inner.quoted or inner.value.len != 1) continue;
+                if (inner.value[0] == expansionOpen(close)) nesting += 1;
+                if (inner.value[0] == close) {
+                    nesting -= 1;
+                    if (nesting == 0) break;
                 }
             }
             continue;
-        }
+        };
         const operator = if (token) |t| !t.quoted and command_operators.has(t.value) else false;
         const new_line = if (token) |t| index > 0 and gapHasNewline(command, tokens[index - 1].end, t.start) else false;
         const heredoc_end = blk: {
@@ -1972,11 +2058,12 @@ fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8) !?ShortCom
             break :blk true;
         };
         if (at_end or operator or new_line or heredoc_end) {
-            try finishShortStep(scratch, &steps, &raw_steps, step);
+            try finishShortStep(scratch, steps, raw_steps, step, depth);
             step = .{ .after_pipe = operator and std.mem.eql(u8, token.?.value, "|") };
             if (operator or heredoc_end or at_end) continue;
         }
         const t = token.?;
+        if (isRedirectionFd(tokens, index)) continue;
         if (!t.quoted and redirection_operators.has(t.value)) {
             // A redirection's target is not a word of the step.
             index += 1;
@@ -1984,18 +2071,7 @@ fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8) !?ShortCom
         }
         addShortToken(&step, t);
     }
-    // The same step twice in a row shows once.
-    var shown: std.ArrayList([]const u8) = .empty;
-    for (steps.items) |text| {
-        if (shown.items.len > 0 and std.mem.eql(u8, shown.items[shown.items.len - 1], text)) continue;
-        try shown.append(scratch, text);
-    }
-    if (shown.items.len == 0) return null;
-    if (raw_steps <= 1 and command.len <= short_command_max_len) return null;
-    // A command that is already its own short form keeps its text.
-    if (shown.items.len == 1 and std.mem.eql(u8, shown.items[0], command)) return null;
-    const kept = @min(shown.items.len, short_command_max_steps);
-    return .{ .steps = shown.items[0..kept], .more = shown.items.len - kept };
+    return true;
 }
 
 /// Replaces the command a command row ends with by its short form, so a long
@@ -4863,7 +4939,17 @@ test "a long shell command shows its steps in short form" {
         .{ .command = "for i in $(seq 1 96); do printf 'marker %03d\\n' \"$i\"; sleep 0.03; done", .short = "printf, sleep" },
         .{ .command = "echo \"$(date)\" started && npm test -- --run --reporter=dot --bail", .short = "echo, npm test" },
         .{ .command = "cat AGENTS.md && printf 'executed\\n' >> executions.log", .short = "cat, printf" },
+        // A comment runs to the end of its line.
+        .{ .command = "# large lifecycle\nprintf 'LARGE_MARKER\\n' && seq 1 200000 > /dev/null", .short = "printf, seq" },
+        .{ .command = "npm test -- --run --reporter=dot --bail # watch the flaky one && retry", .short = "npm test" },
+        // A shell's `-c` script shows its own steps.
+        .{ .command = "sh -c 'printf \"CTRL_O_LIVE_HEAD\\n\"; sleep 1; printf \"CTRL_O_LIVE_TAIL\\n\"'", .short = "printf, sleep, printf" },
+        .{ .command = "zsh -lc 'for i in {1..80}; do printf \"%03d\\n\" \"$i\"; done; sleep 2; : > done.txt'", .short = "printf, sleep" },
+        .{ .command = "bash -c \"cd desktop && npm ci && npm run build -- --mode production\"", .short = "npm ci, npm run build" },
+        // A `{ ...; }` group is not an expansion, so its commands show.
+        .{ .command = "{ make lint; make test; } 2>&1 | tail -40 && echo \"${status:-ok}\"", .short = "make lint, make test, echo" },
         .{ .command = "$(git rev-parse --show-toplevel)/scripts/check.sh --fast && make lint", .short = "check.sh, make lint" },
+        .{ .command = "exec python3 '/Users/example/fx/terminal-session-fixture.py' '/Users/example/fx/state.json'", .short = "python3 terminal-session-fixture.py" },
         .{ .command = "cat <<'EOF' > notes.txt\nfirst line && more\nEOF\nsleep 300", .short = "cat, sleep" },
         .{ .command = "printf ok && printf '%s' alpha-beta-gamma-delta-epsilon-zeta-eta-theta >/dev/null", .short = "printf" },
         .{ .command = "make && npm test && cargo build --release && go vet ./... && zig build", .short = "make, npm test, cargo build +2 more" },

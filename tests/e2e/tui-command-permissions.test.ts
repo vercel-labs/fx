@@ -748,6 +748,15 @@ function expectNoHostileExecutables(root: IsolatedRoot) {
   }
 }
 
+// Where each copy of a row starts in `text`, in order. Both commands of the
+// two-command fixture show as `touch, printf` in short form, so their rows
+// are told apart by position.
+function rowPositions(text: string, row: string): number[] {
+  const positions: number[] = [];
+  for (let at = text.indexOf(row); at >= 0; at = text.indexOf(row, at + 1)) positions.push(at);
+  return positions;
+}
+
 function largeEffectfulCommand(marker: string) {
   const command = [
     ...Array.from(
@@ -856,13 +865,10 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("history feedback live complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      expect(scrollback.indexOf("first command completed")).toBeGreaterThanOrEqual(0);
-      expect(scrollback.indexOf("second command completed")).toBeGreaterThan(
-        scrollback.indexOf("first command completed"),
-      );
-      expect(scrollback.indexOf(feedback)).toBeGreaterThan(
-        scrollback.indexOf("second command completed"),
-      );
+      const [firstRow, secondRow] = rowPositions(scrollback, "Ran touch, printf");
+      expect(firstRow).toBeGreaterThanOrEqual(0);
+      expect(secondRow).toBeGreaterThan(firstRow!);
+      expect(scrollback.indexOf(feedback)).toBeGreaterThan(secondRow!);
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
       expect(rawAnsiScrollback).toContain(feedback);
       expect(existsSync(join(root.workspace, "history-feedback-first.txt"))).toBe(true);
@@ -917,13 +923,10 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendKeys("Enter");
       await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
-      expect(pickerScrollback.indexOf("first command completed")).toBeGreaterThanOrEqual(0);
-      expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(
-        pickerScrollback.indexOf("first command completed"),
-      );
-      expect(pickerScrollback.indexOf("second command completed")).toBeGreaterThan(
-        pickerScrollback.indexOf(feedback),
-      );
+      const [pickerFirstRow, pickerSecondRow] = rowPositions(pickerScrollback, "Ran touch, printf");
+      expect(pickerFirstRow).toBeGreaterThanOrEqual(0);
+      expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(pickerFirstRow!);
+      expect(pickerSecondRow).toBeGreaterThan(pickerScrollback.indexOf(feedback));
       await activeSession.sendText("Continue through interactive resume.");
       await activeSession.waitForText("history feedback picker resume complete", TIMEOUT);
       expect(pickerGateway.requests).toHaveLength(1);
@@ -2276,7 +2279,8 @@ describe("effect-aware command permissions", () => {
           foregroundFxRow(ttyPath, binary);
           process.kill(fixture.pid, 0);
 
-          await activeSession.waitForText("Running exec python3", TIMEOUT);
+          // `exec` drops out of the short form; the script's name stays.
+          await activeSession.waitForText("Running python3 terminal-session-fixture.py", TIMEOUT);
           await activeSession.sendLiteralText("q");
           await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
@@ -2321,7 +2325,7 @@ describe("effect-aware command permissions", () => {
         expect(JSON.parse(pwdResult).output_delta).toContain(root.workspace);
 
         const scrollback = await activeSession.captureFullScrollback();
-        const completedIndex = scrollback.indexOf("Ran exec python3");
+        const completedIndex = scrollback.indexOf("Ran python3 terminal-session-fixture.py");
         const finalIndex = scrollback.indexOf(`TTY_SESSION_FINAL_${sandbox}`);
         const followupIndex = scrollback.indexOf("Run pwd through the user profile.");
         const pwdFinalIndex = scrollback.indexOf(`TTY_SESSION_PWD_FINAL_${sandbox}`);

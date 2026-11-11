@@ -672,7 +672,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       });
       await terminal.waitForStableComposer(15_000);
       await terminal.sendText(task);
-      await terminal.waitForText("STEER_WINDOW_8d4", 15_000);
+      // The command's row shows its steps in short form while it runs.
+      await terminal.waitForText("Running printf, sleep", 15_000);
       await terminal.sendText(steering);
       await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
       await terminal.waitForText("STEER_DONE_8d4", 20_000);
