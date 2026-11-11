@@ -1533,8 +1533,8 @@ const App = struct {
         return resumed;
     }
 
-    pub fn forkBeforeSelectedPrompt(self: *App, agent: *agents.Agent) ![]u8 {
-        return SessionAppRuntime.forkBeforeSelectedPrompt(self, agent);
+    pub fn submitForkMenu(self: *App, agent: *agents.Agent, bring: ?bool) !?[]u8 {
+        return SessionAppRuntime.submitForkMenu(self, agent, bring);
     }
 
     pub fn loadMoreSessionPicker(self: *App, agent: *agents.Agent) !bool {
@@ -5753,7 +5753,8 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try app.input_runtime.edit_state.setText(alloc, "main draft");
 
     // The list opens on main; ↓ moves the highlight to the first subagent,
-    // and main stays on screen with its draft.
+    // and main stays on screen, its draft set aside while the composer is
+    // the list's search box.
     try runtime.openMenu(&app);
     try std.testing.expect(runtime.menuActive(&app));
     try std.testing.expectEqual(@as(usize, 0), menu.selected);
@@ -5761,7 +5762,8 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try std.testing.expectEqual(@as(usize, 1), menu.selected);
     try std.testing.expect(app.agent_on_screen == null);
     try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("main draft", menu.draft.?.edit.input.items);
 
     // On to the last row, which stays put past the end. Main stays on screen.
     _ = try runtime.moveMenu(&app, 1, 10);
@@ -5793,13 +5795,14 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
 
     // The list opens on the subagent on screen. A draft typed on it stays
-    // with it while ↑ moves to main, and when Enter brings main back.
+    // with it, set aside while ↑ moves to main, and when Enter brings main back.
     try app.input_runtime.edit_state.setText(alloc, "first draft");
     try runtime.openMenu(&app);
     try std.testing.expectEqual(@as(usize, 1), menu.selected);
     _ = try runtime.moveMenu(&app, -1, 10);
     try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expectEqualStrings("first draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("first draft", menu.draft.?.edit.input.items);
     _ = try runtime.submitMenu(&app);
     try std.testing.expect(app.agent_on_screen == null);
     try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);

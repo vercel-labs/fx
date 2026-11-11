@@ -945,8 +945,8 @@ Settled on 2026-09-28:
   failed switch leaves the current session in place. While a switch is
   pending, the current session's turn may still end and its children may
   still finish, but no turn or child starts; the current session closes
-  only after its children are joined, and closing the next one instead
-  abandons the switch. **Why:** found by the trace check of `Wiring`:
+  only after its children are joined, which the switch stops first
+  (D97), and closing the next one instead abandons the switch. **Why:** found by the trace check of `Wiring`:
   every ACP switch in the E2E runs opened the next session first, which
   the spec's single session slot did not allow. **Alternative:** close the
   current session first, which leaves ACP without a session when the next
@@ -1183,14 +1183,16 @@ Settled for `/fork` (2026-10-02):
   to end. (Until D53 removed the switch, the line named `--sessions-v2`
   and `/fork` refused without it.)
   Subagent children and hosted terminals stay with the source, since the
-  fold counts children only after a fork point. The adapter adds two
+  fold counts children only after a fork point; since D97, the fork can
+  take a copy of each child. The adapter adds two
   calls: `forkPoints`, each turn's prompt and number, and
   `fork(before_turn, …)`. **Why:** the manager already forks at turn
   boundaries, so the feature adds no format and no new way to write a
   log. **Alternative:** fork after the chosen turn's reply; or copy the
   log in fx instead of the manager. `Fork.tla` models the manager's fork
   at a boundary with blob links. `Wiring.tla` gains `Fork`:
-  between turns and with no child running, a session that never existed
+  between turns, also while a child of the source runs, which the switch
+  then stops (D97), a session that never existed
   becomes the one to switch to, and the source is not written
   (`ForkIsNewSession`, `ForkLeavesSource`, `ForkBetweenTurns`).
   `trace/check_wiring_traces.py` checks the `wiring` traces of `/fork`
@@ -1783,6 +1785,63 @@ as it was sent):
   page. Saving them with the turn costs one short line per call.
   **Alternative:** keep records in memory only, or in a separate file,
   which a resume and a fork would have to join back to their turns.
+- **D97 Decision:** a session switch keeps the session's subagents, and
+  `/fork` can take a copy of each of them.
+  - **Switch:** `/fork`, `/resume`, `/new`, `/clear` and `/reset` stop the
+    session's subagents before its close joins their slot threads, as
+    `/close` and quit do (`stopSubagentsForSwitch`). Only the work they
+    have running ends, as cancelled and owing no report. None is closed
+    for good, so the session's log still lists them: reopened, it shows
+    them, and each takes new work with its history. A line in the session
+    the switch opens says how many tasks it stopped. Before, the close
+    joined a hosted child's slot thread while that thread waited for the
+    main loop to end its run, and the app froze. `Wiring.tla` gains the
+    one-threaded main loop: a close is `StartClose`, then `Close`, and
+    starts only once the children are joined (`StoppedFirst`), so a
+    started close always ends (`SwitchEnds`, under `LiveSpec`). The trace
+    check takes each `Close` line as both steps.
+  - **Fork:** when the session had subagents at the chosen prompt, the
+    menu asks once, `Bring N subagents into the fork?`: Enter or `y`
+    forks with a copy of each, `n` or Esc without. A subagent made after
+    that prompt is not offered, nor one closed for good, nor one whose
+    newest work there was lost, which had no log to copy (D33). Each copy is a
+    new child session of the fork whose lines are the child's own up to
+    the fork point, byte for byte, and the fork's first batch registers
+    each copy as one finished work item with the child's spawn data
+    (`openForkWithChildren`; `stateAt` reads the children as they stood at
+    the fork point). A child's turn can hold many work items, so its cut
+    is the time of the fork point's line, not a turn: a turn open there
+    ends in the copy as cancelled, as Esc ends one, and so does the copy's
+    registration. A copy's finish says it owes no report, so not even an
+    interrupted work wakes the fork. Every copy is on disk before the
+    fork, so the fork never names a copy that is missing and has all of
+    them or none. A failure before the fork is published deletes the
+    copies it made; a crash between
+    the copies and the fork can leave a copy no session names, which
+    nothing lists. That copy is not a spawned child of any session, so it
+    is outside `Subagents.tla`'s `NoOrphanChild`; writing the fork first
+    would instead leave the fork naming a copy that is missing. The source
+    and its children are never written. A child's own subagents are not
+    copied. A fork's copies are registered after the lines it copied, so
+    when a fork is itself forked at a point inside those lines, such as
+    before its first own prompt, `stateAt` gives it each copy whose source
+    child those lines show at that point, standing as that child stood
+    there. It traces a copy of a copy back through each `forked_from`, and
+    leaves out a copy whose trail is gone.
+  - **Why:** the switch fix sits in the one step all five commands share
+    and reuses `/close`'s stop. The copy is made by the manager, as a fork
+    is, so it adds no format beyond `forked_from` on a child, and stays
+    checkable byte for byte.
+  - **Alternative:** refuse to switch while a subagent works, which can
+    block a switch for hours; keep subagents running across the switch,
+    which needs a background lifecycle; let the fork own the source's
+    children, which two sessions would then write.
+  - **Models:** `ForkChildren.tla` models the question, the copies and the
+    registration (`OnlyEligible`, `CopyAtPoint`, `RegisteredExist`,
+    `AllOrNone`); a line written in the fork point's own millisecond after
+    the copy may fall on either side. `trace/ForkLog.tla` accepts a
+    child's copy that ends inside a turn only when its next line ends the
+    turn as cancelled, and checks its lines against the fork point's time.
 
 ## Design Risks And Failure Behavior
 

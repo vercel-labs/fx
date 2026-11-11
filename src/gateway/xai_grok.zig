@@ -7,6 +7,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -334,13 +335,18 @@ pub fn streamPrepared(
             alloc.free(bounded_body);
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
-        return .{ .failed = .{
-            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
-            .http_status = response.head.status,
-            .detail = body,
-            .retry_after_seconds = retry_after,
-            .ownership = .owned,
-        } };
+        const kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body);
+        return .{
+            .failed = .{
+                .kind = kind,
+                .http_status = response.head.status,
+                // The body can quote the token this request sent, and the detail
+                // reaches the transcript and the trace.
+                .detail = try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret()),
+                .retry_after_seconds = retry_after,
+                .ownership = .owned,
+            },
+        };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
@@ -954,7 +960,12 @@ test "xAI Grok error-body reader accepts the exact bound and replaces one beyond
         if (fixture.failure) |err| return err;
         try std.testing.expectEqual(stream_provider.FailureKind.rate_limited, result.failed.kind);
         if (mode == .error_body_exact) {
-            try std.testing.expectEqual(max_error_body_bytes, result.failed.detail.?.len);
+            // The reader keeps a body at the bound; masking the request's
+            // token then replaces one that large with its own fixed message.
+            try std.testing.expectEqualStrings(
+                "Provider error details exceeded the local limit",
+                result.failed.detail.?,
+            );
         } else {
             try std.testing.expectEqualStrings(
                 "xAI Grok error response exceeded the local limit",

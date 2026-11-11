@@ -1958,8 +1958,6 @@ pub const Runtime = struct {
             o.needs_login = r.flags[i].needs_login;
             o.signed_in = r.flags[i].signed_in;
             o.signing_in = r.loginFor(i) != null;
-            // One left without a login by a store fx can't read isn't asked
-            // to sign in: it's down until the store reads.
             if (try r.unreadText(a, i)) |why| {
                 o.state = .failed;
                 o.needs_login = false;
@@ -2108,7 +2106,8 @@ pub const Runtime = struct {
     }
 
     /// Why server `i` has no login, in `alloc`, when that's because the
-    /// store of saved logins couldn't be read; null otherwise.
+    /// store of saved logins couldn't be read; null otherwise. Such a server
+    /// isn't asked to sign in: it's down until the store reads.
     fn unreadText(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
         const err = r.store_unread orelse return null;
         if (!r.flags[i].needs_login) return null;

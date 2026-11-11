@@ -34,6 +34,7 @@ const io_mod = @import("../shared/io.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -143,6 +144,9 @@ pub const AgentsMenu = struct {
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?CloseTarget = null,
+    /// The draft of the agent on screen, set aside while the composer is
+    /// the list's search box, and back in the composer once the list closes.
+    draft: ?composer_stash.State = null,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
@@ -151,6 +155,7 @@ pub const AgentsMenu = struct {
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
         self.rows.deinit(alloc);
         self.names.deinit(alloc);
+        if (self.draft) |*draft| draft.deinit(alloc);
         self.* = .{};
     }
 
@@ -240,6 +245,24 @@ fn instanceState(agent: *agents.Agent, request_waits: bool) InstanceState {
 /// Whether one of `agent`'s turns is going or queued.
 fn turnInFlight(agent: *agents.Agent) bool {
     return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
+}
+
+/// Whether a request that waits for `need` is one a subagent's parent may
+/// send again: a refused or a day-old one. A sign-in, credits, the content
+/// filter, a request too long, or one that crashed fx twice is the user's.
+fn parentMayResend(need: @FieldType(types.RouteRecoveryStatus, "need")) bool {
+    return switch (need orelse return false) {
+        .rejected, .stale => true,
+        .sign_in, .quota, .content_filter, .too_long, .crash_loop => false,
+    };
+}
+
+test "a subagent's parent may send again only a refused or a day-old request" {
+    try std.testing.expect(parentMayResend(.rejected));
+    try std.testing.expect(parentMayResend(.stale));
+    for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
+        try std.testing.expect(!parentMayResend(need));
+    }
 }
 
 /// Slot threads and the main loop both use the hand-off list.
@@ -509,6 +532,9 @@ pub const SubagentWait = struct {
 const OrderEntry = struct {
     role: agents.Role,
     root: usize = 0,
+    /// The switch position of the subagent that started this one; null when
+    /// an instance did.
+    parent: ?usize = null,
     working: bool = false,
     reply_at_ms: i64 = 0,
 };
@@ -600,6 +626,30 @@ fn sortSubagentGroups(entries: []const OrderEntry, order: []usize) void {
         sort_utils.sort(usize, order[start..end], ctx, Context.lessThan);
         start = end;
     }
+}
+
+/// Puts each subagent's own subagents right under it, in the order `order`
+/// already has them, so the list draws a tree. `scratch` is as long as
+/// `order`.
+fn nestSubagents(entries: []const OrderEntry, order: []usize, scratch: []usize) void {
+    @memcpy(scratch, order);
+    var next: usize = 0;
+    for (scratch) |position| {
+        if (position != 0 and entries[position - 1].parent != null) continue;
+        next = placeWithChildren(entries, scratch, position, order, next);
+    }
+    std.debug.assert(next == order.len);
+}
+
+fn placeWithChildren(entries: []const OrderEntry, flat: []const usize, position: usize, out: []usize, next: usize) usize {
+    out[next] = position;
+    var at = next + 1;
+    for (flat) |child| {
+        if (child == 0) continue;
+        const parent = entries[child - 1].parent orelse continue;
+        if (parent == position) at = placeWithChildren(entries, flat, child, out, at);
+    }
+    return at;
 }
 
 fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *usize) void {
@@ -942,10 +992,16 @@ pub fn Runtime(comptime App: type) type {
         /// screen. Brings in the subagents main's session started before a
         /// restart first.
         pub fn hasAnotherAgent(app: *App) bool {
+            listRestoredSubagents(app);
+            return openAgentCount(app) > 1;
+        }
+
+        /// Puts the subagents of every instance's session in the switch
+        /// list, those started before a restart too (`syncChildList`).
+        pub fn listRestoredSubagents(app: *App) void {
             syncChildList(app) catch |err| {
                 debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
             };
-            return openAgentCount(app) > 1;
         }
 
         /// How many agents are open: the instances, the first one included,
@@ -1018,7 +1074,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The switch order, with each instance's subagents sorted
-        /// (`sortSubagentGroups`).
+        /// (`sortSubagentGroups`) and each subagent's own right under it
+        /// (`nestSubagents`).
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
@@ -1026,17 +1083,23 @@ pub fn Runtime(comptime App: type) type {
             for (hosted, entries) |child, *entry| entry.* = .{
                 .role = child.agent.role,
                 .root = if (child.agent.role == .subagent) instanceOrdinal(app, rootInstance(app, child)) else 0,
-                .working = instanceState(&child.agent, requestWaitsForUser(app, child)) == .working,
+                .parent = if (parentSubagent(app, child)) |parent| (if (std.mem.findScalar(*ChildAgent, hosted, parent)) |index| index + 1 else null) else null,
+                .working = stateOf(app, child) == .working,
                 .reply_at_ms = @max(child.saved_reply_at_ms, latestReplyAt(child.agent.session.agent.history.items)),
             };
-            const order = try app.alloc.alloc(usize, hosted.len + 1);
+            const order = try app.alloc.alloc(usize, 2 * (hosted.len + 1));
             defer app.alloc.free(order);
-            switchOrder(entries, order);
-            sortSubagentGroups(entries, order);
-            try out.ensureUnusedCapacity(app.alloc, order.len);
-            for (order) |position| {
+            const switch_order = order[0 .. hosted.len + 1];
+            switchOrder(entries, switch_order);
+            sortSubagentGroups(entries, switch_order);
+            nestSubagents(entries, switch_order, order[hosted.len + 1 ..]);
+            try out.ensureUnusedCapacity(app.alloc, switch_order.len);
+            const search = searchText(app);
+            for (switch_order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
-                out.appendAssumeCapacity(if (position == 0) null else hosted[position - 1]);
+                const target: ?*ChildAgent = if (position == 0) null else hosted[position - 1];
+                if (search.len > 0 and !matchesSearch(app, target, search)) continue;
+                out.appendAssumeCapacity(target);
             }
             // Activity can change while the menu is open. Keep the highlighted
             // agent, not its previous row, for navigation, Enter, and Delete;
@@ -1050,6 +1113,19 @@ pub fn Runtime(comptime App: type) type {
                 if (at == null) menu.highlight = .on_screen;
                 menu.selected = at orelse positionIn(out.items, app.agent_on_screen) orelse 0;
             }
+        }
+
+        /// What the user typed in the composer to search the open list.
+        fn searchText(app: *App) []const u8 {
+            if (!menuActive(app)) return "";
+            return app.input_runtime.edit_state.input.items;
+        }
+
+        /// Whether agent `target`'s name or title has `search` in it, case aside.
+        fn matchesSearch(app: *App, target: ?*ChildAgent, search: []const u8) bool {
+            var buf: [instance_name_bytes]u8 = undefined;
+            return ascii_case.containsIgnoreCase(noteName(app, target, &buf), search) or
+                ascii_case.containsIgnoreCase(targetAgent(app, target).session_title.items, search);
         }
 
         /// How the waiting note names agent `child`, null for the first
@@ -1185,9 +1261,9 @@ pub fn Runtime(comptime App: type) type {
         /// Main loop only: it reads every agent's prompts.
         pub fn busiest(app: *App) Busiest {
             var most: InstanceState = .idle;
-            if (firstOpen(app)) most = moreUrgent(most, instanceState(&app.main_agent, requestWaitsForUser(app, null)));
+            if (firstOpen(app)) most = moreUrgent(most, stateOf(app, null));
             for (app.child_agents.items) |child| {
-                most = moreUrgent(most, instanceState(&child.agent, requestWaitsForUser(app, child)));
+                most = moreUrgent(most, stateOf(app, child));
             }
             return busyAs(most) orelse .idle;
         }
@@ -1199,13 +1275,13 @@ pub fn Runtime(comptime App: type) type {
         /// Main loop only: it reads every agent's prompts.
         pub fn busyAgentElsewhere(app: *App, buf: []u8) ?BusyAgent {
             if (app.agent_on_screen != null and firstOpen(app)) {
-                if (busyAs(instanceState(&app.main_agent, requestWaitsForUser(app, null)))) |doing| {
+                if (busyAs(stateOf(app, null))) |doing| {
                     return .{ .name = noteName(app, null, buf), .doing = doing };
                 }
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                if (busyAs(instanceState(&child.agent, requestWaitsForUser(app, child)))) |doing| {
+                if (busyAs(stateOf(app, child))) |doing| {
                     return .{ .name = noteName(app, child, buf), .doing = doing };
                 }
             }
@@ -1239,14 +1315,15 @@ pub fn Runtime(comptime App: type) type {
             return changed;
         }
 
-        /// The footer note for hidden subagents with a turn going or queued,
-        /// such as "1 subagent working", so the agent on screen shows that
-        /// work goes on elsewhere; empty when none is.
+        /// The footer note for hidden subagents that work, such as "1
+        /// subagent working", so the agent on screen shows that work goes on
+        /// elsewhere; empty when none does. One that waits for the user is
+        /// in the waiting note, or on screen, instead.
         pub fn workingNote(app: *App, buf: []u8) []const u8 {
             var count: usize = 0;
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent or child == app.agent_on_screen) continue;
-                if (turnInFlight(&child.agent)) count += 1;
+                if (stateOf(app, child) == .working) count += 1;
             }
             if (count == 0) return "";
             return std.mem.print(buf, "{d} subagent{s} working", .{ count, if (count == 1) "" else "s" }) catch "";
@@ -1325,9 +1402,7 @@ pub fn Runtime(comptime App: type) type {
         /// Opens the agent list with the agent on screen highlighted.
         pub fn openMenu(app: *App) !void {
             if (comptime !@hasField(App, "instances")) return;
-            syncChildList(app) catch |err| {
-                debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
-            };
+            listRestoredSubagents(app);
             var order: std.ArrayList(?*ChildAgent) = .empty;
             defer order.deinit(app.alloc);
             try switchList(app, &order);
@@ -1336,6 +1411,7 @@ pub fn Runtime(comptime App: type) type {
             menu.window_start = 0;
             menu.highlight = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
+            setDraftAside(app);
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
                 order.items.len,
@@ -1359,6 +1435,37 @@ pub fn Runtime(comptime App: type) type {
             menu.open = false;
             menu.highlight = .on_screen;
             menu.close_armed = null;
+            putDraftBack(app);
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Sets the on-screen agent's draft aside, so the composer is the
+        /// open list's search box.
+        fn setDraftAside(app: *App) void {
+            const menu = &app.instances.agents_menu;
+            if (menu.draft != null) return;
+            menu.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
+        }
+
+        /// Gives the composer its draft back, dropping the search typed in it.
+        fn putDraftBack(app: *App) void {
+            const menu = &app.instances.agents_menu;
+            if (menu.draft) |*draft| {
+                const search_bytes = app.input_runtime.edit_state.input.items.len;
+                if (search_bytes > 0) debug_trace.logf("host", "agent list search dropped bytes={d}", .{search_bytes});
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                draft.restore(app.alloc, app.input_runtime.composerStashView());
+                menu.draft = null;
+            }
+        }
+
+        /// The composer's search changed, so rows came or went: the list
+        /// scrolls back to its top, and a close the first Delete armed lapses.
+        pub fn searchChanged(app: *App) void {
+            if (!menuActive(app)) return;
+            const menu = &app.instances.agents_menu;
+            menu.close_armed = null;
+            menu.window_start = 0;
             app.shell.render_requests.request(.footer);
         }
 
@@ -1423,11 +1530,13 @@ pub fn Runtime(comptime App: type) type {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 const model = provider_runtime.modelOf(app, agent);
-                const state = instanceState(agent, requestWaitsForUser(app, target));
+                const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
+                    // A search lists its matches flat, since their parents may not match.
+                    .nested = if (subagent) |child| searchText(app).len == 0 and parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
@@ -1439,7 +1548,7 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
-            if (order.items.len == 0) return .{ .rows = menu.rows.items };
+            if (order.items.len == 0) return .{ .rows = menu.rows.items, .search = searchText(app) };
             const chosen = order.items[@min(menu.selected, order.items.len - 1)];
             const closable = deleteCloses(app, chosen);
             return .{
@@ -1449,6 +1558,7 @@ pub fn Runtime(comptime App: type) type {
                 .selected_closable = closable,
                 .selected_instance = isInstance(chosen),
                 .close_armed = closable and armedFor(menu, chosen),
+                .search = searchText(app),
             };
         }
 
@@ -1777,6 +1887,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The subagent that started subagent `child`; null when an instance
+        /// did.
+        fn parentSubagent(app: *App, child: *const ChildAgent) ?*ChildAgent {
+            const owner = ownerOf(app, hostOf(app, child)) orelse return null;
+            const hosted = hostedOf(app, owner) orelse return null;
+            return if (hosted.agent.role == .subagent) hosted else null;
+        }
+
         /// The agent whose own subagent host is `host`.
         fn ownerOf(app: *App, host: ?*subagent_tool_host.Runtime) ?*AppAgent {
             const wanted = host orelse return null;
@@ -1873,6 +1991,10 @@ pub fn Runtime(comptime App: type) type {
             const leaving = screenOf(app, app.agent_on_screen);
             const arriving = screenOf(app, target);
             if (leaving == arriving) return;
+            // The open list's search box lends the composer: each agent keeps
+            // its own draft, and the arriving one's is set aside in turn.
+            const searching = menuActive(app);
+            if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
             std.mem.swap(AssistantPacer, &app.pacer, &leaving.pacer);
@@ -1881,6 +2003,7 @@ pub fn Runtime(comptime App: type) type {
             std.mem.swap(AssistantPacer, &app.pacer, &arriving.pacer);
             std.mem.swap(bool, &app.fast_mode, &arriving.fast_mode);
             arriving.draft.restore(app.alloc, app.input_runtime.composerStashView());
+            if (searching) setDraftAside(app);
             app.agent_on_screen = target;
             app.screen_owner = if (target) |child| &child.agent else null;
         }
@@ -1895,6 +2018,17 @@ pub fn Runtime(comptime App: type) type {
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
+        }
+
+        /// What agent `target`, null for the first instance, waits for or
+        /// does. A subagent whose approval or question its instance's screen
+        /// shows for it still waits on it.
+        fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
+            if (target) |child| {
+                if (app.approval_lender == child) return .needs_approval;
+                if (app.question_lender == child) return .has_question;
+            }
+            return instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
         }
 
         /// Whether agent `target`'s status row, null for the first instance,
@@ -2360,6 +2494,38 @@ pub fn Runtime(comptime App: type) type {
             dropSet(app, tree.items);
         }
 
+        /// Stops and drops the subagents in `root`'s tree before a session
+        /// switch closes `root`'s session, as `/close` stops an instance's
+        /// tree, so the subagent host never joins a slot thread that waits
+        /// for this loop (`tests/tla/session_manager/Wiring.tla` SwitchEnds,
+        /// D97). Nothing is closed for good: the session's log keeps them,
+        /// so its next open lists them again, and only the work they had
+        /// running ends, as cancelled, owing no report. When one of them is
+        /// on screen, `root` takes its place. Returns how many had work
+        /// running.
+        pub fn stopSubagentsForSwitch(app: *App, root: *AppAgent) !usize {
+            var tree: std.ArrayList(*ChildAgent) = .empty;
+            defer tree.deinit(app.alloc);
+            var working: usize = 0;
+            for (app.child_agents.items) |entry| {
+                if (entry.agent.role != .subagent or rootInstance(app, entry) != root) continue;
+                try tree.append(app.alloc, entry);
+                if (entry.agent.child_run) |*run| {
+                    if (run.inFlight()) working += 1;
+                }
+            }
+            if (tree.items.len == 0) return 0;
+            const hosted = hostedOf(app, root);
+            if (inBranch(tree.items, app.agent_on_screen)) try show(app, hosted);
+            // The root's host stops first, so no work the switch ends owes
+            // a report into the tree.
+            const root_host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) root.session_persistence.subagent_host else null;
+            stopSet(app, tree.items, root_host);
+            debug_trace.eventf("host", "switch_stopped_subagents", .{}, "subagents={d} working={d}", .{ tree.items.len, working });
+            dropSet(app, tree.items);
+            return working;
+        }
+
         /// The open instance after `child` in launch order, wrapping to the
         /// first open one; null is the first instance in `main_agent`.
         fn nextInstanceAfter(app: *App, child: *const ChildAgent) ?*ChildAgent {
@@ -2556,6 +2722,24 @@ pub fn Runtime(comptime App: type) type {
             defer alloc.free(work_id);
             debug_trace.eventf("host", "user_work_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, work_id, @tagName(outcome) });
             host.endUserWork(run.child_id, work_id, outcome, reply);
+        }
+
+        /// A subagent's request that starts waiting for the user waits for
+        /// its parent too: the parent hears of it, and its message sends the
+        /// request again (`noteChildWaiting`).
+        pub fn noteChildWaiting(app: *App, agent: *AppAgent, status: types.RouteRecoveryStatus) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            const first = if (agent.child_run) |*run| first: {
+                run.waits +|= 1;
+                break :first run.waits == 1;
+            } else false;
+            const resend = first and parentMayResend(status.need);
+            agent.worker.parent_may_continue.store(resend, .seq_cst);
+            // The part the parent can use, without the keys for the user.
+            const text = status.text.slice();
+            host.noteChildWaiting(child.id, child.displayName(), if (std.mem.find(u8, text, " \u{b7} ")) |at| text[0..at] else text, resend);
         }
 
         /// Keeps a child's terminal provider error for the parent.
@@ -2897,6 +3081,63 @@ test "sorting subagents keeps every instance in place and every subagent under i
             const here = entries[after - 1];
             try std.testing.expect(above.working or !here.working);
             if (!above.working) try std.testing.expect(above.reply_at_ms >= here.reply_at_ms);
+        }
+    }
+}
+
+test "a subagent's own subagents come right under it, in their sorted order" {
+    // Main's lead works and started helper and checker; tester replied last.
+    const entries = [_]OrderEntry{
+        .{ .role = .subagent, .working = true },
+        .{ .role = .subagent, .parent = 1, .reply_at_ms = 5 },
+        .{ .role = .subagent, .reply_at_ms = 9 },
+        .{ .role = .subagent, .parent = 1, .working = true },
+    };
+    var order: [entries.len + 1]usize = undefined;
+    var scratch: [entries.len + 1]usize = undefined;
+    switchOrder(&entries, &order);
+    sortSubagentGroups(&entries, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 3, 2 }, &order);
+    nestSubagents(&entries, &order, &scratch);
+    // Main, lead, checker, helper, tester.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3 }, &order);
+}
+
+test "nesting keeps every agent and instance in place, and puts each subagent's own right under it, for random hosts" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_7e57);
+    const random = prng.random();
+    var buf: [24]OrderEntry = undefined;
+    var sorted: [buf.len + 1]usize = undefined;
+    var order: [buf.len + 1]usize = undefined;
+    var scratch: [buf.len + 1]usize = undefined;
+    for (0..10_000) |_| {
+        const entries = randomEntries(random, &buf);
+        for (entries, 0..) |*entry, index| {
+            entry.working = random.boolean();
+            entry.reply_at_ms = random.uintAtMost(u8, 3);
+            if (entry.role != .subagent or index == 0 or random.boolean()) continue;
+            // Two levels: a parent is one of the same tree's subagents that
+            // an instance started.
+            const candidate = random.uintLessThan(usize, index);
+            const parent = entries[candidate];
+            if (parent.role == .subagent and parent.root == entry.root and parent.parent == null) entry.parent = candidate + 1;
+        }
+        const len = entries.len + 1;
+        switchOrder(entries, sorted[0..len]);
+        sortSubagentGroups(entries, sorted[0..len]);
+        @memcpy(order[0..len], sorted[0..len]);
+        nestSubagents(entries, order[0..len], scratch[0..len]);
+        for (sorted[0..len], order[0..len]) |before, after| {
+            try std.testing.expect(std.mem.findScalar(usize, order[0..len], before) != null);
+            if (before == 0 or entries[before - 1].role == .instance) try std.testing.expectEqual(before, after);
+        }
+        for (order[0..len], 0..) |position, at| {
+            if (position == 0) continue;
+            const parent = entries[position - 1].parent orelse continue;
+            var back = at - 1;
+            while (order[back] != parent) : (back -= 1) {
+                try std.testing.expectEqual(@as(?usize, parent), entries[order[back] - 1].parent);
+            }
         }
     }
 }

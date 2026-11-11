@@ -21,6 +21,7 @@ test {
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
+    _ = @import("core/mcp/features/tools.zig");
     _ = @import("core/tooling/toolbox.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
@@ -34,6 +35,7 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/fuzzy_match.zig");
     _ = @import("core/shared/types.zig");
+    _ = @import("core/workspace/network_metrics.zig");
     _ = @import("core/shell_command/command_classification.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/command_lex.zig");

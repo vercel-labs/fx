@@ -190,23 +190,56 @@ pub const ForkMenu = struct {
     /// The first menu line shown. It starts past the end, which shows the
     /// newest prompts, and moves only as far as keeps the selection whole.
     window_start: usize = std.math.maxInt(usize),
+    /// Once Enter chose a prompt where the session had subagents: those it
+    /// had there, while the menu asks whether the fork takes copies of the
+    /// ones it can (D97). Null while the prompts show.
+    question: ?[]session_adapter.Child = null,
 
     pub fn active(self: *const ForkMenu) bool {
         return self.points.len > 0;
     }
 
+    pub fn asking(self: *const ForkMenu) bool {
+        return self.question != null;
+    }
+
     /// Moves the selection, stopping at the oldest and the newest prompt.
+    /// The question keeps the chosen prompt.
     pub fn move(self: *ForkMenu, delta: i32) void {
-        if (self.points.len == 0) return;
+        if (self.points.len == 0 or self.asking()) return;
         const next = @as(i64, @intCast(self.selected)) + delta;
         self.selected = @intCast(std.math.clamp(next, 0, @as(i64, @intCast(self.points.len - 1))));
     }
 
     pub fn close(self: *ForkMenu, alloc: Allocator) void {
         session_adapter.Session.freeForkPoints(alloc, self.points);
+        if (self.question) |children| session_adapter.freeChildren(alloc, children);
         self.* = .{};
     }
 };
+
+test "the fork menu's question keeps the chosen prompt, and closing frees it (D97)" {
+    const alloc = std.testing.allocator;
+    const points = try alloc.alloc(session_adapter.Session.ForkPoint, 2);
+    points[0] = .{ .turn = 1, .prompt = try alloc.dupe(u8, "first") };
+    points[1] = .{ .turn = 2, .prompt = try alloc.dupe(u8, "second") };
+    const children = try alloc.alloc(session_adapter.Child, 1);
+    children[0] = .{
+        .id = try alloc.dupe(u8, "kid"),
+        .work_id = try alloc.dupe(u8, "w1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = try alloc.dupe(u8, "{}"),
+        .finish_data = null,
+        .seq = 4,
+    };
+    var menu: ForkMenu = .{ .points = points, .selected = 1, .question = children };
+    try std.testing.expect(menu.asking());
+    menu.move(-1);
+    try std.testing.expectEqual(@as(usize, 1), menu.selected);
+    menu.close(alloc);
+    try std.testing.expect(!menu.active() and !menu.asking());
+}
 
 pub const SessionPickerCatalogCache = struct {
     ready: bool = false,
@@ -848,6 +881,9 @@ pub const Persistence = struct {
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
     fork_menu: ForkMenu = .{},
+    /// How many subagent tasks the last switch stopped, for its notice in
+    /// the session it opens (D97).
+    switch_stopped_tasks: usize = 0,
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
@@ -874,7 +910,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 31) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 32) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -897,6 +933,7 @@ pub const Persistence = struct {
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
         storage.fork_menu = .{};
+        storage.switch_stopped_tasks = 0;
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;

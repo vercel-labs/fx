@@ -227,6 +227,7 @@ pub const GatewayJsonResult = union(enum) {
 
 pub const StreamCallback = agent_stream_provider.StreamCallback;
 pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
+pub const ToolInputProgressCallback = agent_stream_provider.ToolInputProgressCallback;
 
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
 /// Max time the post-stream body drain may take before the pooled connection
@@ -474,7 +475,7 @@ fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     };
-    const result = if (client) |own| try own.fetch(options) else try fetchOnOpenJob(options);
+    const result = if (client) |own| try fetchWithClient(own, options) else try fetchOnOpenJob(options);
 
     return .{
         .status = result.status,
@@ -744,10 +745,11 @@ pub fn postGatewayCompletion(
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const result = client.fetch(.{
+        const result = fetchWithClient(&client, .{
             .location = .{ .url = request_url },
             .method = .POST,
             .payload = payload,
+            .redirect_behavior = .unhandled,
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
@@ -1691,6 +1693,7 @@ pub const StreamRequest = struct {
     admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
+    on_tool_input_progress: ?ToolInputProgressCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
     /// Long-lived pooled HTTP client owned by the provider runtime. When set,
     /// requests reuse pooled keep-alive connections instead of dialing per
@@ -2220,6 +2223,7 @@ fn streamGatewayCompletionCoreWithOptions(
             on_tool_start,
             request.on_reasoning_chunk,
             request.on_tool_input_chunk,
+            request.on_tool_input_progress,
             cancel_flag,
             .{ .requested_model = model, .ctx = trace_ctx },
             expected_provider_tool_name,
@@ -2716,26 +2720,63 @@ pub fn openRequestOnJob(
     return job.waitForOpen(uri, options, no_deadline, &never_cancelled, &reused);
 }
 
+/// The error behind a failed read of a response body. The body reader keeps
+/// an error of its own only for broken chunk framing; a failed read on the
+/// connection, such as one its deadline cancelled, leaves `bodyErr()` null, so
+/// it must not be unwrapped as `std.http.Client.fetch` does
+/// (https://codeberg.org/ziglang/zig/issues/36296).
+fn bodyReadError(response: *const std.http.Client.Response) anyerror {
+    if (response.bodyErr()) |err| return err;
+    if (response.request.connection) |connection| {
+        if (connection.stream_reader.err) |err| return err;
+    }
+    return error.ReadFailed;
+}
+
 /// `std.http.Client.fetch` with the connection opened by `openRequestOnJob`,
 /// for an operation that `runBoundedHttpOperation` runs. Redirects are not
 /// followed: `options.redirect_behavior` must be `.unhandled`, and the
 /// caller gets the 3xx status.
 pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
     std.debug.assert(options.redirect_behavior == .unhandled);
-    const uri = switch (options.location) {
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+    return fetchOnRequest(&opened.request, options);
+}
+
+/// `std.http.Client.fetch` on a client the caller owns, without its panic on
+/// a body read that fails. Redirects are not followed, as in `fetchOnOpenJob`.
+pub fn fetchWithClient(client: *std.http.Client, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    std.debug.assert(options.redirect_behavior == .unhandled);
+    var req = try client.request(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer req.deinit();
+    return fetchOnRequest(&req, options);
+}
+
+fn fetchMethod(options: std.http.Client.FetchOptions) std.http.Method {
+    return options.method orelse if (options.payload != null) .POST else .GET;
+}
+
+fn fetchUri(options: std.http.Client.FetchOptions) !std.Uri {
+    return switch (options.location) {
         .url => |url| try std.Uri.parse(url),
         .uri => |uri| uri,
     };
-    var opened = try openRequestOnJob(options.method orelse if (options.payload != null) .POST else .GET, uri, .{
+}
+
+fn fetchRequestOptions(options: std.http.Client.FetchOptions) std.http.Client.RequestOptions {
+    return .{
         .redirect_behavior = .unhandled,
         .headers = options.headers,
         .extra_headers = options.extra_headers,
         .privileged_headers = options.privileged_headers,
         .keep_alive = options.keep_alive,
-    });
-    defer opened.deinit();
-    const req = &opened.request;
+    };
+}
 
+/// Sends an opened request and reads its answer as `std.http.Client.fetch`
+/// does, except that a failed body read returns `bodyReadError`.
+fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
     if (options.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = try req.sendBodyUnflushed(&.{});
@@ -2749,7 +2790,7 @@ pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.Fe
     var response = try req.receiveHead(&.{});
     const response_writer = options.response_writer orelse {
         _ = response.reader(&.{}).discardRemaining() catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr().?,
+            error.ReadFailed => return bodyReadError(&response),
         };
         return .{ .status = response.head.status };
     };
@@ -2767,7 +2808,7 @@ pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.Fe
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
+        error.ReadFailed => return bodyReadError(&response),
         else => |e| return e,
     };
     return .{ .status = response.head.status };
@@ -4658,7 +4699,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -4684,6 +4725,7 @@ pub fn consumeGatewaySseStream(
         on_tool_start,
         on_reasoning_chunk,
         null,
+        null,
         cancel_flag,
         null,
         null,
@@ -4700,6 +4742,7 @@ fn consumeSseStreamTraced(
     on_tool_start: ?ToolStartCallback,
     on_reasoning_chunk: ?StreamCallback,
     on_tool_input_chunk: ?StreamCallback,
+    on_tool_input_progress: ?ToolInputProgressCallback,
     cancel_flag: *std.atomic.Value(bool),
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
@@ -4914,6 +4957,7 @@ fn consumeSseStreamTraced(
                 if (delta_value != .string) continue;
                 try record.arguments.appendSlice(alloc, delta_value.string);
                 if (on_tool_input_chunk) |callback| callback(callback_ctx, delta_value.string);
+                if (on_tool_input_progress) |callback| callback(callback_ctx, record.id.items, record.arguments.items);
             } else {
                 record.state = .ended;
             }
@@ -5456,7 +5500,7 @@ fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, null, null, null);
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null);
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");

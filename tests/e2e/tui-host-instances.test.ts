@@ -1028,6 +1028,67 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/new in a launched instance stops its working subagent first, and the instance goes on (D97)",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-tree-")));
+      const releases: Array<() => void> = [];
+      const respond = (body: string): Response | Promise<Response> => {
+        const texts = userTexts(body);
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return text("switch_reported", "SWITCH_MAIN_REPORTED");
+        }
+        // The subagent's request waits until the test ends.
+        if (texts.join("\n").includes("SLOW_TASK")) {
+          return new Promise((resolve) => releases.push(() => resolve(text("slow_done", "SLOW_DONE"))));
+        }
+        if (texts.at(-1)?.includes("SWITCH_USER")) {
+          if (answered(body)) return text("switch_final", "SWITCH_MAIN_FINAL");
+          return call("switch_sub", "subagent", { request: { action: "message", agent: "slowpoke", message: "SLOW_TASK take your time" } });
+        }
+        if (texts.at(-1)?.includes("AFTER_NEW")) return text("after_new", "AFTER_NEW_ANSWER");
+        return answerByLetter(body);
+      };
+      try {
+        let oldId = "";
+        await withHost(respond, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_A saved");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_USER start a slow helper");
+          await session.waitForText("SWITCH_MAIN_FINAL", 45_000);
+          await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
+          oldId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
+          // A new session in fx 2 while slowpoke still works.
+          await session.sendText("/new");
+          await session.waitForText("stopped 1 running subagent task", 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("AFTER_NEW go on");
+          await session.waitForText("AFTER_NEW_ANSWER", 30_000);
+          // fx 2 moved to its new session, and fx 1 kept its own.
+          await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && ids[1] !== oldId), 15_000);
+          await session.sendText("/exit");
+          await session.waitForSessionEnd(15_000);
+        });
+        // slowpoke's work ended cancelled, and slowpoke stays in the old session.
+        const log = readFileSync(join(home, ".fx", "sessions", "v2", oldId, "log.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const finishes = log.filter((line) => line.kind === "child_finished");
+        expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
+        expect(JSON.stringify(finishes[0].data ?? "")).not.toContain('\\"closed\\":true');
+      } finally {
+        for (const release of releases) release();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "a restored later instance lists its subagents under it again, with their conversations",
     async () => {
       const home = createIsolatedTestHome();
