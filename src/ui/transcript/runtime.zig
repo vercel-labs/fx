@@ -4687,6 +4687,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
+    "resume_handoff_repaint_pending",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
     "last_visible_transcript_partial_skip_rows",
@@ -4930,6 +4931,11 @@ pub const TranscriptRuntime = struct {
     /// shell rows before the renderer has had a chance to respect
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
+    /// The last stable frame handed a resumed transcript's flow to the commit
+    /// anchor and invalidated it, so the rows it painted are on screen with
+    /// no anchor until the next stable frame. The transcript window holds
+    /// every drop until then.
+    resume_handoff_repaint_pending: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -7190,9 +7196,10 @@ pub const TranscriptRuntime = struct {
     /// rows released into terminal history.
     fn transcriptWindowDropHold(self: *TranscriptRuntime, alloc: Allocator) !TranscriptWindowDropHold {
         if (self.fullTranscriptActive()) return .all;
-        // A resumed transcript not painted yet: everything it holds is about
-        // to be on screen.
-        if (self.notebook.pending_resume_source != null) return .all;
+        // A resumed transcript not painted yet, or painted and handed off
+        // with no anchor yet: everything it holds is on screen or about to
+        // be.
+        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
             .stable => |anchor| anchor.history_visual_offset,
@@ -10836,6 +10843,7 @@ pub const TranscriptRuntime = struct {
             transition.retention_identity = .{};
 
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
+            self.resume_handoff_repaint_pending = pending_resume_bytes > 0;
             if (pending_resume_bytes > 0) {
                 self.invalidateTranscriptAnchor("resume publication retained source handoff");
                 if (transition.target_flow_owned) {
