@@ -58,7 +58,7 @@
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
     {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000},
-    {"name": "mcp_call_error_text", "module": "fx", "test": "a tool error's text reaches stderr terminal-safe whatever bytes the server sends", "iterations": 150000},
+    {"name": "mcp_call_error_text", "module": "fx", "test": "a reply's text reaches stderr terminal-safe whatever bytes the server sends", "iterations": 150000},
     {"name": "unsupported_tool_name", "module": "fx", "test": "an unsupported tool's name stays one run of visible text whatever bytes the model sends", "iterations": 300000}
   ]
 }

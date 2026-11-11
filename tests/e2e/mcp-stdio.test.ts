@@ -80,6 +80,7 @@ type RootOptions = {
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "tool_protocol_error"
     | "image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
@@ -109,7 +110,7 @@ type RootOptions = {
     | "exit_after_result";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
-  /** The text a `tool_failure` server's error carries, in place of its plain two lines. */
+  /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
   failureText?: string;
   operationTimeoutMs?: number;
   restartLimit?: number;
@@ -4074,6 +4075,23 @@ describe("fx mcp call", () => {
       `fx mcp call: ${TOOL_NAME} returned an error:\n` +
         "Invalid input: labels require at least one item\nretry rejected\n" +
         "\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dgood\nlast\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a protocol error's message with control bytes shows as visible escapes, and the call exits 1", async () => {
+    // The message is the server's own, in a JSON-RPC error that answers
+    // tools/call: a window title, a bell, a clear screen, a C1 control
+    // sequence introducer, DEL, a carriage return that would overwrite the
+    // line, and plain text around them.
+    const failureText = "bad\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rafter\r\nlast line";
+    const root = bridgeRoot("bridge-protocol-error-bytes", {}, { mode: "tool_protocol_error", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain(
+      "fx mcp call: MCP protocol error -32000: " +
+        "bad\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dafter\nlast line\nout=0",
     );
     for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
     expect(toolCalls(root)).toHaveLength(1);

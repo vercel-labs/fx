@@ -8,7 +8,8 @@ const pidPath = process.env.FX_MCP_PID_PATH;
 const resultText = "p".repeat(Number(process.env.FX_MCP_RESULT_PAD_BYTES ?? "0")) +
   (process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT");
 const mode = process.env.FX_MCP_MODE ?? "normal";
-// FX_MCP_FAILURE_TEXT is a JSON string: the text a `tool_failure` error carries.
+// FX_MCP_FAILURE_TEXT is a JSON string: the text a `tool_failure` error carries,
+// or the message of a `tool_protocol_error` JSON-RPC error.
 const failureText = process.env.FX_MCP_FAILURE_TEXT === undefined
   ? "Invalid input: labels require at least one item\nretry rejected"
   : JSON.parse(process.env.FX_MCP_FAILURE_TEXT);
@@ -624,6 +625,11 @@ function handle(message) {
           }],
         },
       });
+      return;
+    }
+    if (mode === "tool_protocol_error") {
+      // An error answering the call itself, not a tool result with isError.
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failureText } });
       return;
     }
     if (mode === "crash_always") process.exit(42);
