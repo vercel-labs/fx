@@ -104,7 +104,7 @@ const ObservedEvents = struct {
                 call.output();
             },
             .tool_started => call.output(),
-            .tool_input_delta => {},
+            .tool_input_delta, .tool_input_progress => {},
         };
         self.upstream.emit(event);
     }

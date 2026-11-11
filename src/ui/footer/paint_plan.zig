@@ -1004,6 +1004,8 @@ pub fn composeFooterFrame(
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .sessions)
         try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .fork and ctx.fork_menu.question != null)
+        try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, &fork_menu_presentation.question_hint_variants)
     else if (input.show_picker and input.picker_kind == .fork)
         try input_presentation.composeForkMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .agents)

@@ -1807,7 +1807,9 @@ pub const SessionRuntime = struct {
     ) void {
         if (isCurrentCompactionCheckpoint(turn)) {
             self.disarmCacheWarming("history_compacted");
-            self.agent.clearHistory(alloc);
+            // The conversation goes on after compacting: it keeps its toolbox
+            // menu (`tests/tla/toolbox/Toolbox.tla` MenuFixed).
+            self.agent.dropHistory(alloc);
             self.unversioned_history_len = 0;
         }
         self.agent.history.appendAssumeCapacity(turn);
@@ -1821,7 +1823,7 @@ pub const SessionRuntime = struct {
     pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
         const uncertain = self.unversioned_history_len != 0;
         self.disarmCacheWarming("history_compacted");
-        self.agent.clearHistory(alloc);
+        self.agent.dropHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
         self.agent.fresh = false;
