@@ -123,20 +123,16 @@ pub const ChildAgent = struct {
     }
 };
 
+/// An agent in the switch list, such as the row Delete closes or the row
+/// above a closed agent: a subagent, or an instance with null for the first.
+const ListedAgent = struct { agent: ?*ChildAgent };
+
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
 /// is doing now. It opens on the agent on screen, and its highlight is a
 /// preview: moving it shows the agent it lands on, Enter keeps that agent,
 /// and Esc or Ctrl+X go back to `origin`. Up on the first row closes it with
 /// the agent shown kept (`tests/tla/agents_menu/spec/AgentsMenu.tla`).
-/// A row Delete closes in the agent list: a subagent, or an instance with
-/// null for the first.
-const CloseTarget = struct { agent: ?*ChildAgent };
-
-/// An agent in the switch list: a subagent, or an instance with null for the
-/// first.
-const ListedAgent = struct { agent: ?*ChildAgent };
-
 pub const AgentsMenu = struct {
     open: bool = false,
     /// The highlighted agent's place in the switch list, from 0, as
@@ -154,7 +150,7 @@ pub const AgentsMenu = struct {
     origin: Highlight = .on_screen,
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
-    close_armed: ?CloseTarget = null,
+    close_armed: ?ListedAgent = null,
     /// The draft of the agent on screen, set aside while the composer is
     /// the list's search box, and back in the composer once the list closes.
     draft: ?composer_stash.State = null,
