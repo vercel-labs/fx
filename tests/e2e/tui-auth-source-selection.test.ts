@@ -379,6 +379,17 @@ function startFakeCreditsGateway() {
   };
 }
 
+// A 200 answer that starts at once and then sends one byte a second, so it is
+// still arriving when fx's request limit ends.
+function drippingResponse(): Response {
+  return new Response(new ReadableStream({
+    async pull(controller) {
+      await Bun.sleep(1_000);
+      controller.enqueue(new TextEncoder().encode(" "));
+    },
+  }));
+}
+
 function startFakeOAuth(
   accessToken: string | null,
   revocationEndpoint?: string,
@@ -389,6 +400,7 @@ function startFakeOAuth(
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
     revokeDelayMs?: number;
+    revokeDrip?: boolean;
     discoveryDelayMs?: number;
     teamsDelayMs?: number;
     rejectRefreshGrant?: boolean;
@@ -500,6 +512,7 @@ function startFakeOAuth(
               typeof tokenTypeHint === "string" ? tokenTypeHint : "missing",
             validForm,
           };
+          if (options.revokeDrip) return drippingResponse();
           return Response.json(
             !validForm ? { error: providerDetail } : { revoked: true },
             { status: !validForm ? 400 : 200 },
@@ -636,6 +649,7 @@ function startFakeGrokOAuth(options: {
   rejectRefresh?: boolean;
   beforeRefreshResponse?: () => void | Promise<void>;
   revokeStatus?: number;
+  revokeDrip?: boolean;
   userinfoSub?: string;
   modelsResponse?: () => Promise<Response | void>;
 } = {}) {
@@ -733,6 +747,7 @@ function startFakeGrokOAuth(options: {
         if (valid && options.revokeStatus && options.revokeStatus !== 200) {
           return Response.json({ error: "revocation unavailable" }, { status: options.revokeStatus });
         }
+        if (valid && options.revokeDrip) return drippingResponse();
         return Response.json(valid ? { revoked: true } : { error: "invalid" }, {
           status: valid ? 200 : 400,
         });
@@ -4709,6 +4724,32 @@ test("Grok logout removes local credentials when remote revocation fails", async
   }
 });
 
+test("Grok logout survives a revocation answer still arriving at its limit", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-logout-revoke-drip-"));
+  const grok = startFakeGrokOAuth({ revokeDrip: true });
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    const authPath = join(home, ".fx", "grok-auth.json");
+    const result = await runFx(["logout", "grok"], {
+      env: {
+        HOME: home,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_TEST_GROK_REVOKE_URL: grok.env.FX_TEST_GROK_REVOKE_URL,
+      },
+      timeoutMs: 40_000,
+    });
+    expect(result.stderr).not.toContain("panic");
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed out of Grok.");
+    expect(result.stderr).toContain("remote revocation could not be confirmed");
+    expect(existsSync(authPath)).toBe(false);
+    expect(grok.requests.filter((request) => request.path === "/oauth2/revoke")).toHaveLength(1);
+  } finally {
+    grok.stop();
+  }
+}, 60_000);
+
 test("Grok logout removes malformed and unsafe local credentials", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-grok-logout-unreadable-"));
   const grok = startFakeGrokOAuth();
@@ -6734,6 +6775,32 @@ tmuxTest(
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
+);
+
+tmuxTest(
+  "logout keeps fx running when the issuer's revocation answer is still arriving at its limit",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-logout-revoke-drip-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { revokeDrip: true });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForText("Signed out of fx.", TIMEOUT);
+    await waitForRevocations(oauth, 1);
+    // Each revocation runs to its 15 s limit before fx reports it.
+    await session.waitForText("remote session could not be revoked", 60_000);
+    expect(readFileSync(stderrPath, "utf8")).not.toContain("panic");
+    const draft = "STILL_RUNNING_AFTER_LOGOUT";
+    await session.sendLiteral(draft);
+    await session.waitForPane((pane) => pane.includes(draft), TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  120_000,
 );
 
 tmuxTest(
