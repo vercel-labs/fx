@@ -4,10 +4,11 @@
 //! whatever credential the request uses. See
 //! https://vercel.com/docs/ai-gateway/token-pass.
 //!
-//! The Gateway has no API that says whether a team has Token Pass or how
-//! much credit remains, so fx keeps the featured model list here and learns
-//! that a team has Token Pass when a response names `token-pass` as the
-//! provider that served it. This file imports only the standard library.
+//! The model catalog does not mark the featured models, so fx keeps their
+//! list here. fx learns that a team has Token Pass when a response names
+//! `token-pass` as the provider that served it, or when the credits endpoint
+//! reports the team's Token Pass credit. This file imports only the standard
+//! library.
 const std = @import("std");
 
 /// The featured models Token Pass credit pays for. Vercel can change this
@@ -88,7 +89,18 @@ pub const Tracker = struct {
     /// Records the provider that served a request. Returns true when the
     /// status changed.
     pub fn observeServedBy(self: *Tracker, served_by: []const u8) bool {
-        if (!isTokenPassProvider(served_by) or self.status == .active) return false;
+        if (!isTokenPassProvider(served_by)) return false;
+        return self.markActive();
+    }
+
+    /// Records that the credits endpoint reported the team's Token Pass
+    /// credit. Returns true when the status changed.
+    pub fn observeCredit(self: *Tracker) bool {
+        return self.markActive();
+    }
+
+    fn markActive(self: *Tracker) bool {
+        if (self.status == .active) return false;
         self.status = .active;
         return true;
     }
@@ -183,6 +195,11 @@ test "token pass: the tracker turns active once on a token-pass response" {
     // A later fallback to another provider does not end the subscription.
     try std.testing.expect(!tracker.observeServedBy("baseten"));
     try std.testing.expectEqual(Status.active, tracker.status);
+
+    var from_credits: Tracker = .{};
+    try std.testing.expect(from_credits.observeCredit());
+    try std.testing.expect(!from_credits.observeCredit());
+    try std.testing.expectEqual(Status.active, from_credits.status);
 }
 
 test "token pass: denied causes come from the documented messages" {

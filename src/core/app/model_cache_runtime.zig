@@ -604,6 +604,13 @@ pub const Runtime = struct {
         }
     }
 
+    /// Records that the credits endpoint reported this team's Token Pass credit.
+    pub fn observeTokenPassCredit(self: *Self) void {
+        if (self.token_pass.observeCredit()) {
+            debug_trace.logf("catalog", "token pass status=active source=credits", .{});
+        }
+    }
+
     pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
         return self.token_pass.status;
     }

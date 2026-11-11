@@ -1390,15 +1390,19 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
-            // The Gateway reports no Token Pass balance, so point at the
-            // dashboard tab that shows it.
             if (comptime @hasField(App, "model_cache")) {
-                if (snapshot.err_message == null and app.model_cache.tokenPassStatus() == .active) {
-                    try app.writeDomainNotice(.{
-                        .topic = "credits",
-                        .tone = .neutral,
-                        .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
-                    }, true);
+                if (snapshot.err_message == null) {
+                    if (snapshot.token_pass != null) {
+                        app.model_cache.observeTokenPassCredit();
+                    } else if (app.model_cache.tokenPassStatus() == .active) {
+                        // The team uses Token Pass, but the Gateway reported
+                        // no Token Pass credit: point at the tab that has it.
+                        try app.writeDomainNotice(.{
+                            .topic = "credits",
+                            .tone = .neutral,
+                            .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
+                        }, true);
+                    }
                 }
             }
         }

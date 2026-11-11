@@ -4544,6 +4544,48 @@ describe("cli: credits", () => {
     TIMEOUT,
   );
 
+  test(
+    "fx credits reports the team's Token Pass credit in text and JSON",
+    async () => {
+      const home = createIsolatedTestHome();
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () =>
+          Response.json({
+            balance: "12.50",
+            token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+          }),
+      });
+
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "credits-fake-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_GATEWAY_CREDITS_URL: `http://127.0.0.1:${server.port}/v1/credits`,
+        };
+        const json = await runFx(["credits", "--json"], { env });
+        expect(json.code).toBe(0);
+        expect(json.stderr).toBe("");
+        expect(JSON.parse(json.stdout.trim()).token_pass).toEqual({
+          remaining: "79.92906",
+          resets_at: "2026-12-05T08:00:00.000Z",
+        });
+
+        const text = await runFx(["credits"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stdout).toContain("[credits] token_pass_remaining=79.92906\n");
+        expect(text.stdout).toContain("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n");
+      } finally {
+        server.stop(true);
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "fx credits --json returns credits JSON or exits non-zero",
     async () => {

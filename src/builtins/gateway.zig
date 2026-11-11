@@ -873,8 +873,47 @@ fn creditsSnapshotFromJsonValue(
     if (obj.get("plan")) |field| {
         if (field == .string) snapshot.plan = try alloc.dupe(u8, field.string);
     }
+    // The team's Token Pass credit, or null when it has no active Token Pass.
+    if (obj.get("token_pass")) |field| {
+        if (field == .object) {
+            if (field.object.get("remaining")) |remaining| {
+                if (remaining == .string) {
+                    snapshot.token_pass = .{ .remaining = try alloc.dupe(u8, remaining.string) };
+                    if (field.object.get("resets_at")) |resets_at| {
+                        if (resets_at == .string) snapshot.token_pass.?.resets_at = try alloc.dupe(u8, resets_at.string);
+                    }
+                }
+            }
+        }
+    }
 
     return snapshot;
+}
+
+test "built-in credits provider reads the Token Pass credit" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"balance\":\"12.50\",\"token_pass\":{\"remaining\":\"79.92906\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("79.92906", snapshot.token_pass.?.remaining);
+    try std.testing.expectEqualStrings("2026-12-05T08:00:00.000Z", snapshot.token_pass.?.resets_at.?);
+
+    for ([_][]const u8{
+        "{\"balance\":\"1\",\"token_pass\":null}",
+        "{\"balance\":\"1\",\"token_pass\":{\"remaining\":79}}",
+        "{\"balance\":\"1\"}",
+    }) |body| {
+        var none = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+        defer none.deinit();
+        var without = try creditsSnapshotFromJsonValue(std.testing.allocator, none.value);
+        defer without.deinit(std.testing.allocator);
+        try std.testing.expect(without.token_pass == null);
+    }
 }
 
 fn creditsErrorSnapshot(

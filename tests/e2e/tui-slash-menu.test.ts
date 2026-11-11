@@ -3323,7 +3323,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         usage: (url) => {
           if (url.pathname !== "/coding-agent/v1/credits") return null;
           creditsRequests.push(url.pathname);
-          return Response.json({ balance: "12.50", total_used: "1.25" });
+          return Response.json({ balance: "12.50", total_used: "1.25", token_pass: null });
         },
       });
       session = await TmuxSession.create({
@@ -3434,11 +3434,73 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 2);
       expect(await scrollbackCount(covers)).toBe(1);
 
+      // The Gateway reports no Token Pass credit for this team, so /credits
+      // points at the dashboard tab instead.
       await session.sendText("/credits");
       await session.waitForText("Token Pass credit is a separate balance.", 10_000);
       expect(creditsRequests).toHaveLength(1);
 
       expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "/credits shows the Token Pass balance and marks the team as having Token Pass",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const tokenPassModel = "zai/glm-5.3-flash";
+      gateway = startFakeGateway([], {
+        models: [
+          { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+        ],
+        usage: (url) => {
+          if (url.pathname !== "/coding-agent/v1/credits") return null;
+          return Response.json({
+            balance: "12.50",
+            total_used: "1.25",
+            token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+          });
+        },
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-token-pass-credits-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+          FX_MODEL: "provider/plain-model",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/credits");
+      await session.waitForText("token_pass_remaining=79.92906", 10_000);
+      await session.waitForText("token_pass_resets_at=2026-12-05T08:00:00.000Z", 5_000);
+
+      // fx now knows the team has Token Pass, so a switch to a Token Pass
+      // model does not point at the Token Pass docs.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${tokenPassModel}`, 5_000);
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass covers this model");
+      expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
