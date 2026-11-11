@@ -1469,6 +1469,19 @@ describe("custom connection errors name the setting", () => {
     } finally { f.close(); }
   }, 15000);
 
+  test("headers: when headers on more than one connection can't be sent, each is named with its connection", async () => {
+    const f = fixture();
+    try {
+      connection(f).headers = { "X-Org": { env: "FX_PROBE_ORG" } };
+      (f.settings.providers as Record<string, any>).remote.headers = { "X-Team": { env: "FX_PROBE_TEAM" } };
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROBE_ORG: undefined, FX_PROBE_TEAM: "" }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe("fx: 2 headers can't be sent: X-Org of connection local reads FX_PROBE_ORG, which is not set; X-Team of connection remote reads FX_PROBE_TEAM, which is empty. Set or fix each variable, or remove its header from ~/.fx/settings.json\n");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
   const changed = "fx ask: This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session.\n";
   test.each([
     ["its protocol", (f: ReturnType<typeof fixture>) => { connection(f).protocol = "anthropic-messages"; }],

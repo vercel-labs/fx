@@ -448,34 +448,54 @@ fn refusedProviderSetting(alloc: Allocator, at: *configured_provider.FailurePath
     return null;
 }
 
-/// Names the first header whose environment variable cannot be sent, by the
-/// rule the transport applies (`configured_provider.header_value`).
+/// Names each header whose environment variable cannot be sent, by the rule
+/// the transport applies (`configured_provider.header_value`), with its
+/// connection: the error doesn't say which connection's request failed, so
+/// a message about one header must not stand for another's.
 fn headerVariableMessage(alloc: Allocator) Allocator.Error!?[]u8 {
     var registry = loadConfiguredProviders(alloc) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
     defer registry.deinit(alloc);
-    var first: ?[]u8 = null;
-    errdefer if (first) |message| alloc.free(message);
-    var more: usize = 0;
+    var listed: std.ArrayList(u8) = .empty;
+    defer listed.deinit(alloc);
+    var only: ?[]u8 = null;
+    defer if (only) |message| alloc.free(message);
+    var count: usize = 0;
     for (registry.definitions) |definition| {
         for (definition.headers) |header| {
-            const problem: []const u8 = switch (configured_provider.header_value(io_mod.getenv(header.env))) {
-                .usable => continue,
-                .unset => profile_paths.displayText("which is not set; set it, or remove the header from ~/.fx/settings.json"),
-                .empty => profile_paths.displayText("which is empty; set it, or remove the header from ~/.fx/settings.json"),
-                .too_long => std.fmt.comptimePrint("whose value is longer than {d} bytes; shorten it", .{configured_provider.max_header_value_bytes}),
-                .unsendable => "whose value has a character a header can't carry; fix the variable",
-            };
-            if (first != null) {
-                more += 1;
-                continue;
-            }
-            first = try alloc.print("the header {s} of connection {s} reads {s}, {s}", .{ header.name, definition.id, header.env, problem });
+            const state = configured_provider.header_value(io_mod.getenv(header.env));
+            if (state == .usable) continue;
+            count += 1;
+            if (count == 1) only = try alloc.print("the header {s} of connection {s} reads {s}, {s}", .{ header.name, definition.id, header.env, headerProblem(state, true) });
+            if (count > max_listed_headers) continue;
+            if (count > 1) try listed.appendSlice(alloc, "; ");
+            try listed.print(alloc, "{s} of connection {s} reads {s}, {s}", .{ header.name, definition.id, header.env, headerProblem(state, false) });
         }
     }
-    const message = first orelse return null;
-    if (more == 0) return message;
-    defer alloc.free(message);
-    return try alloc.print("{s} ({d} more header{s} too)", .{ message, more, if (more == 1) "" else "s" });
+    if (count == 0) return null;
+    if (count == 1) {
+        defer only = null;
+        return only.?;
+    }
+    const advice = profile_paths.displayText("Set or fix each variable, or remove its header from ~/.fx/settings.json");
+    const unlisted = count -| max_listed_headers;
+    if (unlisted == 0) return try alloc.print("{d} headers can't be sent: {s}. {s}", .{ count, listed.items, advice });
+    return try alloc.print("{d} headers can't be sent: {s} ({d} more). {s}", .{ count, listed.items, unlisted, advice });
+}
+
+const max_listed_headers = 3;
+
+/// Why a header's variable can't be sent; with `fix`, also what to do.
+fn headerProblem(state: configured_provider.HeaderValue, fix: bool) []const u8 {
+    return switch (state) {
+        .usable => "which can be sent",
+        .unset => if (fix) profile_paths.displayText("which is not set; set it, or remove the header from ~/.fx/settings.json") else "which is not set",
+        .empty => if (fix) profile_paths.displayText("which is empty; set it, or remove the header from ~/.fx/settings.json") else "which is empty",
+        .too_long => if (fix)
+            std.fmt.comptimePrint("whose value is longer than {d} bytes; shorten it", .{configured_provider.max_header_value_bytes})
+        else
+            std.fmt.comptimePrint("whose value is longer than {d} bytes", .{configured_provider.max_header_value_bytes}),
+        .unsendable => if (fix) "whose value has a character a header can't carry; fix the variable" else "whose value has a character a header can't carry",
+    };
 }
 
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
