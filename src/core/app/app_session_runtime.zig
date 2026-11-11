@@ -94,7 +94,21 @@ const resumePageLimitForRows = session_persistence.resumePageLimitForRows;
 
 /// What the footer draws of `menu`.
 pub fn forkMenuProjection(menu: *const session_persistence.ForkMenu) render_input.ForkMenuProjection {
-    return .{ .points = menu.points, .selected = menu.selected, .window_start = menu.window_start };
+    return .{
+        .points = menu.points,
+        .selected = menu.selected,
+        .window_start = menu.window_start,
+        .question = if (menu.question) |children| copyableCount(children) else null,
+    };
+}
+
+/// How many of `children` a fork can take a copy of (D97).
+fn copyableCount(children: []const session_adapter.Child) usize {
+    var count: usize = 0;
+    for (children) |child| {
+        if (subagent_child_state.copyableAtFork(child)) count += 1;
+    }
+    return count;
 }
 
 const Allocator = std.mem.Allocator;
@@ -973,6 +987,26 @@ pub fn Runtime(comptime App: type) type {
             // first keeps the app's selection across sessions.
             if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
+            try noteStoppedSubagentTasks(app, agent);
+        }
+
+        fn stopSubagentsForSwitch(app: *App, agent: *AppAgent) !usize {
+            if (comptime !@hasField(App, "child_agents")) return 0;
+            return @import("app_agents_runtime.zig").Runtime(App).stopSubagentsForSwitch(app, agent);
+        }
+
+        /// Says, in the session a switch opened, how many subagent tasks the
+        /// switch stopped; the subagents stay in the session it left (D97).
+        fn noteStoppedSubagentTasks(app: *App, agent: *AppAgent) !void {
+            const stopped = agent.session_persistence.switch_stopped_tasks;
+            agent.session_persistence.switch_stopped_tasks = 0;
+            if (stopped == 0) return;
+            var buf: [128]u8 = undefined;
+            const body = if (stopped == 1)
+                "stopped 1 running subagent task; the subagent stays in the previous session"
+            else
+                try std.mem.print(&buf, "stopped {d} running subagent tasks; the subagents stay in the previous session", .{stopped});
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = body }, true);
         }
 
         /// Whether `agent`, an instance launched after the first, runs the
@@ -981,9 +1015,8 @@ pub fn Runtime(comptime App: type) type {
         fn runsProcessModel(app: *App, agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "role")) return false;
             if (agent == &app.main_agent or agent.role != .instance) return false;
-            const model = agent.session_persistence.process_model_override orelse return false;
-            const preferences = agent.session_persistence.session_preferences orelse return false;
-            return std.mem.eql(u8, preferences.model, model);
+            if (agent.session_persistence.session_preferences == null) return false;
+            return provider_runtime.runsProcessModel(app, agent);
         }
 
         fn releaseLiveSessionTransitionHold(app: *App, agent: *AppAgent) void {
@@ -1084,6 +1117,10 @@ pub fn Runtime(comptime App: type) type {
             // it to the next transition, which reads it again.
             if (agent.session_persistence.next_session_preferences) |*previous| previous.deinit(app.alloc);
             agent.session_persistence.next_session_preferences = savedPreferences(app, agent);
+            // The session's subagents stop before its host joins their slot
+            // threads, as /close and quit stop them (D97;
+            // `tests/tla/session_manager/Wiring.tla` SwitchEnds).
+            agent.session_persistence.switch_stopped_tasks = try stopSubagentsForSwitch(app, agent);
             closeWritableSession(app, agent);
             app.stopStream(agent);
             app.shell.clearTranscript(app.alloc);
@@ -1374,6 +1411,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionWarmup(app: *App) void {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+            // The subagents the session started before count at once, so the
+            // footer offers the list before it is first opened.
+            if (comptime @hasField(App, "child_agents")) @import("app_agents_runtime.zig").Runtime(App).listRestoredSubagents(app);
         }
 
         pub fn resumeSelectedSession(app: *App, agent: *AppAgent) !bool {
@@ -1391,6 +1431,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, agent, v2, .session);
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
             startPendingResume(app, agent);
             return true;
         }
@@ -1423,15 +1464,50 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Forks the session before the fork menu's selected prompt and
-        /// switches to the fork, which opens before the source closes (D58).
-        /// Returns that prompt's text for the composer; caller owns it.
-        pub fn forkBeforeSelectedPrompt(app: *App, agent: *AppAgent) ![]u8 {
+        /// Enter on `/fork`'s menu, and the answer to its question (D97). On
+        /// the prompts, Enter (`bring` null) asks whether the fork takes
+        /// copies of the subagents the session had at the chosen prompt, or
+        /// forks at once when it had none to copy. The answer forks with a
+        /// copy of each of them or of none. Returns the chosen prompt's text
+        /// for the composer once it forked, else null; caller owns it.
+        pub fn submitForkMenu(app: *App, agent: *AppAgent, bring: ?bool) !?[]u8 {
+            const menu = &agent.session_persistence.fork_menu;
+            if (menu.question) |children| {
+                const yes = bring orelse return null;
+                if (!yes) return try forkBeforeSelectedPrompt(app, agent, &.{});
+                var arena = std.heap.ArenaAllocator.init(app.alloc);
+                defer arena.deinit();
+                var copies: std.ArrayList(session_adapter.Session.ChildCopy) = .empty;
+                for (children) |child| {
+                    if (!subagent_child_state.copyableAtFork(child)) continue;
+                    try copies.append(arena.allocator(), try subagent_child_state.forkCopy(arena.allocator(), child));
+                }
+                return try forkBeforeSelectedPrompt(app, agent, copies.items);
+            }
+            const source = agent.session_persistence.v2 orelse return error.SessionStoreUnavailable;
+            const children = try source.forkChildren(app.alloc, menu.points[menu.selected].turn);
+            if (copyableCount(children) == 0) {
+                session_adapter.freeChildren(app.alloc, children);
+                return try forkBeforeSelectedPrompt(app, agent, &.{});
+            }
+            menu.question = children;
+            app.shell.render_requests.request(.footer);
+            return null;
+        }
+
+        /// Forks the session before the fork menu's selected prompt, with
+        /// `copies` of its subagents (D97), and switches to the fork, which
+        /// opens before the source closes (D58). Returns that prompt's text
+        /// for the composer; caller owns it.
+        fn forkBeforeSelectedPrompt(app: *App, agent: *AppAgent, copies: []const session_adapter.Session.ChildCopy) ![]u8 {
             const menu = &agent.session_persistence.fork_menu;
             const points = menu.points;
             const point = points[menu.selected];
+            // `copies` borrow the question's children until the fork is made.
+            const question = menu.question;
             menu.* = .{};
             defer session_adapter.Session.freeForkPoints(app.alloc, points);
+            defer if (question) |children| session_adapter.freeChildren(app.alloc, children);
             const source = agent.session_persistence.v2 orelse return error.SessionStoreUnavailable;
             const source_id = try app.alloc.dupe(u8, source.id());
             defer app.alloc.free(source_id);
@@ -1442,6 +1518,7 @@ pub fn Runtime(comptime App: type) type {
                 .workspace = app.workspace_root,
                 .host = .app,
                 .title = cachedSessionTitle(agent),
+                .children = copies,
             });
             var fork_owned = true;
             errdefer if (fork_owned) fork.close();
@@ -1450,6 +1527,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, agent, fork, .{ .fork = source_id });
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
             return prompt;
         }
 
@@ -2349,13 +2427,43 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.v2) |v2| {
                 if (result.session_error != null) return result;
                 const preferences = agent.session_persistence.session_preferences orelse return result;
-                v2.setPreferences(preferences) catch |err| {
+                // An instance launched after the first runs the --model or
+                // FX_MODEL model in its preferences; the session keeps its own
+                // unless this change picked one.
+                var without_run_model: ?session_codec.DurableSessionPreferences = null;
+                defer if (without_run_model) |*value| value.deinit(app.alloc);
+                if (patch.model == null and runsProcessModel(app, agent)) {
+                    without_run_model = withSavedModel(app.alloc, v2, preferences) catch |err| {
+                        result.session_error = err;
+                        warnDegraded(app, agent, err) catch {};
+                        return result;
+                    };
+                }
+                v2.setPreferences(without_run_model orelse preferences) catch |err| {
                     result.session_error = err;
                     warnDegraded(app, agent, err) catch {};
                 };
                 return result;
             }
             return result;
+        }
+
+        /// `preferences` with the model and provider `v2` has saved in place of
+        /// theirs. Caller owns.
+        fn withSavedModel(
+            alloc: Allocator,
+            v2: *session_adapter.Session,
+            preferences: session_codec.DurableSessionPreferences,
+        ) !session_codec.DurableSessionPreferences {
+            var saved = try v2.currentPreferences(alloc);
+            defer saved.deinit(alloc);
+            var copy = try preferences.dupe(alloc);
+            errdefer copy.deinit(alloc);
+            const model = try alloc.dupe(u8, saved.model);
+            alloc.free(copy.model);
+            copy.model = model;
+            copy.provider = saved.provider;
+            return copy;
         }
 
         pub fn activeSessionId(agent: *AppAgent) ?[]const u8 {

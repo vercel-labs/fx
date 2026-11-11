@@ -227,6 +227,7 @@ pub const GatewayJsonResult = union(enum) {
 
 pub const StreamCallback = agent_stream_provider.StreamCallback;
 pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
+pub const ToolInputProgressCallback = agent_stream_provider.ToolInputProgressCallback;
 
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
 /// Max time the post-stream body drain may take before the pooled connection
@@ -1691,6 +1692,7 @@ pub const StreamRequest = struct {
     admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
+    on_tool_input_progress: ?ToolInputProgressCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
     /// Long-lived pooled HTTP client owned by the provider runtime. When set,
     /// requests reuse pooled keep-alive connections instead of dialing per
@@ -2220,6 +2222,7 @@ fn streamGatewayCompletionCoreWithOptions(
             on_tool_start,
             request.on_reasoning_chunk,
             request.on_tool_input_chunk,
+            request.on_tool_input_progress,
             cancel_flag,
             .{ .requested_model = model, .ctx = trace_ctx },
             expected_provider_tool_name,
@@ -4658,7 +4661,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -4684,6 +4687,7 @@ pub fn consumeGatewaySseStream(
         on_tool_start,
         on_reasoning_chunk,
         null,
+        null,
         cancel_flag,
         null,
         null,
@@ -4700,6 +4704,7 @@ fn consumeSseStreamTraced(
     on_tool_start: ?ToolStartCallback,
     on_reasoning_chunk: ?StreamCallback,
     on_tool_input_chunk: ?StreamCallback,
+    on_tool_input_progress: ?ToolInputProgressCallback,
     cancel_flag: *std.atomic.Value(bool),
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
@@ -4914,6 +4919,7 @@ fn consumeSseStreamTraced(
                 if (delta_value != .string) continue;
                 try record.arguments.appendSlice(alloc, delta_value.string);
                 if (on_tool_input_chunk) |callback| callback(callback_ctx, delta_value.string);
+                if (on_tool_input_progress) |callback| callback(callback_ctx, record.id.items, record.arguments.items);
             } else {
                 record.state = .ended;
             }
@@ -5456,7 +5462,7 @@ fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, null, null, null);
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null);
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");

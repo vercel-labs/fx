@@ -832,7 +832,7 @@ fn non_empty_string_field(object: std.json.ObjectMap, name: []const u8) ?[]const
     return value.string;
 }
 
-fn isMutationFileAction(action: types.FileEvidenceAction) bool {
+pub fn isMutationFileAction(action: types.FileEvidenceAction) bool {
     return switch (action) {
         .write, .edit => true,
         else => false,
