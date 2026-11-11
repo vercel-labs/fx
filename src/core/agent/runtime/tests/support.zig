@@ -537,6 +537,9 @@ pub const FakeAgentRuntimeDeps = struct {
     swap_link_on_execute_name: ?[]const u8 = null,
     swap_link_on_execute: ?[]const u8 = null,
     swap_link_target_on_execute: ?[]const u8 = null,
+    create_file_on_execute_name: ?[]const u8 = null,
+    create_file_on_execute_path: ?[]const u8 = null,
+    create_file_on_execute_content: []const u8 = "",
     static_context_text: ?[]const u8 = null,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
@@ -1423,6 +1426,8 @@ pub const FakeAgentRuntimeDeps = struct {
         var should_return_ordinary_cancel = false;
         var swap_link: ?[]const u8 = null;
         var swap_target: ?[]const u8 = null;
+        var create_file: ?[]const u8 = null;
+        var create_content: []const u8 = "";
         {
             self.execute_mutex.lockUncancelable(io_mod.getIo());
             defer self.execute_mutex.unlock(io_mod.getIo());
@@ -1514,6 +1519,15 @@ pub const FakeAgentRuntimeDeps = struct {
                     self.swap_link_target_on_execute = null;
                 }
             }
+            if (self.create_file_on_execute_name) |name| {
+                if (std.mem.eql(u8, name, call.name)) {
+                    create_file = self.create_file_on_execute_path;
+                    create_content = self.create_file_on_execute_content;
+                    self.create_file_on_execute_name = null;
+                    self.create_file_on_execute_path = null;
+                    self.create_file_on_execute_content = "";
+                }
+            }
         }
 
         if (swap_link) |link| {
@@ -1521,6 +1535,11 @@ pub const FakeAgentRuntimeDeps = struct {
             var cwd = std.Io.Dir.cwd();
             cwd.deleteFile(io_mod.getIo(), link) catch {};
             try cwd.symLink(io_mod.getIo(), target, link, .{ .is_directory = true });
+        }
+        if (create_file) |path| {
+            var file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), create_content);
         }
         if (should_return_ordinary_cancel) return error.Cancelled;
         if (should_cancel) {

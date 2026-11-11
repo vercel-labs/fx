@@ -2723,6 +2723,69 @@ fn preparedCallApplicableTargetsFresh(
     };
 }
 
+/// A target that did not exist when the step was prepared and that brings no
+/// new scoped instructions is safe to run, so a read after an earlier write in
+/// the same step is not skipped (test "same-batch read of a file an earlier
+/// call created runs when no scoped instructions apply" in
+/// src/core/agent/runtime/tests/tool_flow.zig). Returns true only when the
+/// call prepared as `.legacy_target_resolution` resolves now and the registry
+/// has nothing new to deliver for it. The call keeps its legacy preparation,
+/// so execution still classifies it.
+fn lateResolvedCallMayRun(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    context_delivery_state: *const context_contract.DeliveryState,
+    step_ctx: TraceContext,
+    tool_call: ToolCall,
+    maybe_preparation: ?tool_preparation.Result,
+) !bool {
+    const context_registry = deps.context_registry orelse return false;
+    const preparation = maybe_preparation orelse return false;
+    const stale_candidate = switch (preparation) {
+        .terminal => return false,
+        .candidate => |*candidate| candidate,
+    };
+    const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
+        arena,
+        tool_call,
+        deps.tool_registry,
+        config.workspace_root,
+        config.access_scope,
+        stale_candidate,
+    )) orelse return false;
+    // The probe is only a question to the registry.
+    var resolved_candidate: tool_preparation.Candidate = .{
+        .kind = .registered,
+        .applicable_targets = late_targets,
+    };
+    defer resolved_candidate.deinit(arena);
+    if (try candidateHasApplicableContextDelta(
+        arena,
+        context_registry,
+        config,
+        context_delivery_state,
+        resolved_candidate,
+    )) {
+        debug_trace.eventf(
+            "tool",
+            "applicable_targets_resolved_with_scope",
+            step_ctx,
+            "call_id={s} name={s} targets={d}",
+            .{ tool_call.id, tool_call.name, late_targets.len },
+        );
+        return false;
+    }
+    debug_trace.eventf(
+        "tool",
+        "applicable_targets_resolved",
+        step_ctx,
+        "call_id={s} name={s} targets={d}",
+        .{ tool_call.id, tool_call.name, late_targets.len },
+    );
+    return true;
+}
+
 fn parallelApplicableTargetsFresh(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -11330,7 +11393,29 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            if (!applicable_targets_fresh) {
+            const applicable_targets_resolved_late = if (applicable_targets_fresh)
+                false
+            else
+                lateResolvedCallMayRun(
+                    arena,
+                    deps,
+                    config,
+                    &context_delivery_state,
+                    step_ctx,
+                    tool_call,
+                    preparation_batch.preparations[tool_call_index],
+                ) catch |err| {
+                    return settleFailedContextGate(
+                        deps,
+                        &stream_ctx.provisional_statuses,
+                        stream_ctx.alloc,
+                        turn_id,
+                        effective_tool_calls[tool_call_index..],
+                        advertised_dynamic_tool_names,
+                        err,
+                    );
+                };
+            if (!applicable_targets_fresh and !applicable_targets_resolved_late) {
                 try appendNotExecutedToolResult(
                     deps,
                     &stream_ctx.provisional_statuses,
