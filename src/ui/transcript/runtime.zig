@@ -10444,6 +10444,35 @@ pub const TranscriptRuntime = struct {
         target.history_visual_offset = planned_history.visual_offset;
         target.normal_buffer_recovery_pending =
             planned_history.normal_buffer_recovery_pending;
+        // A recovering frame can commit stable without writing rows its
+        // receipt owed: a source rewrite, or a rebase that owes nothing,
+        // drops that debt. The anchor must say the rows are owed, because a
+        // frame that releases only the rows leaving the screen top never
+        // replays them and they stay missing from native scrollback. A resize
+        // owns its own debt, and its history offsets count rows at another
+        // width, so only a same-geometry recovery without reflow debt counts.
+        switch (self.transcript_commit_state) {
+            .recovering => |receipt| if (receipt.remaining_semantic_rows > resolved.accepted.semantic_rows and
+                receipt.remaining_resize_reflow_rows == 0 and
+                receipt.attempt_cols == self.layout.cols and
+                self.resize_history_row_delta == null and
+                !target.normal_buffer_recovery_pending and
+                target.history_visual_offset < target.visual_offset)
+            {
+                target.history_catchup_pending = true;
+                debug_trace.logf(
+                    "scroll",
+                    "transcript_history_debt_flagged owed_rows={d} history={d} viewport={d} dropped_receipt_rows={d}",
+                    .{
+                        target.visual_offset - target.history_visual_offset,
+                        target.history_visual_offset,
+                        target.visual_offset,
+                        receipt.remaining_semantic_rows - resolved.accepted.semantic_rows,
+                    },
+                );
+            },
+            .invalid, .stable => {},
+        }
         var materialized = resolveMaterializedEndpoint(
             target,
             source_endpoint_cursor_row,

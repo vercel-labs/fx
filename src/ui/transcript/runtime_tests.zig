@@ -15035,6 +15035,123 @@ test "catch-up release materializes history before staging a larger finality hol
     }
 }
 
+const recovered_base_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n" ++
+    "row-08\nrow-09\nrow-10\nrow-11\n";
+const recovered_mid_rows = "row-12\nrow-13\nrow-14\n";
+const recovered_grown_flow = recovered_base_flow ++ recovered_mid_rows ++ "row-15\n";
+// The rewrite changes the last row the receipt's flow ends with, so it is
+// not a prefix growth, and leaves every row a replay would write intact.
+const recovered_rewrite_flow = recovered_base_flow ++ recovered_mid_rows ++ "row-15 rewrite\n";
+const recovered_growth_flow = recovered_rewrite_flow ++ "row-16\n";
+
+/// Leaves the runtime recovering: a frame whose terminal write fails commits
+/// a receipt that owes the four rows it wanted to scroll.
+fn leaveRecoveringReceiptForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var base = try testSource(alloc, recovered_base_flow, runtime.layout.cols);
+    defer base.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &base);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &base, &base_prepared);
+
+    var grown = try testSource(alloc, recovered_grown_flow, runtime.layout.cols);
+    defer grown.deinit(alloc);
+    var grown_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &grown);
+    defer grown_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(runtime, alloc, &grown, &grown_prepared);
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+}
+
+fn commitRecoveredFrameForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    flow: []const u8,
+) !void {
+    var source = try testSource(alloc, flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &source, &prepared);
+}
+
+test "recovered frame that leaves history behind the viewport flags the debt" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+
+    // A source rewrite drops the receipt's debt, so the frame commits stable
+    // with the four rows it never wrote still above the viewport.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 8), anchor.history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 12), anchor.visual_offset);
+    try std.testing.expect(anchor.history_catchup_pending);
+}
+
+test "compatible growth after a recovered frame replays the rows it never wrote" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+
+    // Only compatible growth follows, and the finality floor sits at the
+    // target, so a frame that releases just the rows leaving the screen top
+    // would leave the gap in scrollback for good.
+    var source = try testSource(alloc, recovered_growth_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    try std.testing.expect(!transition.document_append.isEmpty());
+    try std.testing.expectEqual(transition.visual_offset, transition.history_visual_offset);
+}
+
+test "recovered frame that leaves no debt is not flagged" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+
+    // The same flow again writes the rows the receipt owed.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_grown_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(anchor.visual_offset, anchor.history_visual_offset);
+    try std.testing.expect(!anchor.history_catchup_pending);
+}
+
 test "partial finality release bounds append before staging withheld viewport" {
     const alloc = std.testing.allocator;
     const committed_flow =
