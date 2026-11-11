@@ -5816,6 +5816,45 @@ test "the agent list previews each agent by switching, keeps every draft where i
     try std.testing.expectEqualStrings("second", second.displayName());
 }
 
+test "a search edit that makes the agent list show another agent keeps the cursor and selection where they were in the search" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const edit = &app.input_runtime.edit_state;
+    const first = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    first.name = try alloc.dupe(u8, "reviewer");
+
+    // The list opens on main. The user typed "rview", moved the cursor back
+    // after the r, and typed e there: "review" matches only reviewer, which
+    // the list shows at once, and the cursor stays after the e.
+    try runtime.openMenu(&app);
+    try edit.setText(alloc, "review");
+    edit.cursor = 2;
+    runtime.searchChanged(&app);
+    try std.testing.expect(app.agent_on_screen == first);
+    try std.testing.expectEqualStrings("review", edit.input.items);
+    try std.testing.expectEqual(@as(usize, 2), edit.cursor);
+    try std.testing.expectEqual(@as(?usize, null), edit.selection_anchor);
+
+    // A selection in the search comes along too.
+    try edit.setText(alloc, "second");
+    edit.cursor = 3;
+    edit.selection_anchor = 1;
+    runtime.searchChanged(&app);
+    try std.testing.expect(app.agent_on_screen == second);
+    try std.testing.expectEqualStrings("second", edit.input.items);
+    try std.testing.expectEqual(@as(usize, 3), edit.cursor);
+    try std.testing.expectEqual(@as(?usize, 1), edit.selection_anchor);
+}
+
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
   startDynamicFakeGateway,
@@ -2036,6 +2037,36 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("fx 1/3"), 10_000);
         expect(shownAnswers(back)).toEqual(["HOST_ANSWER_A"]);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a search edit in the middle of the search keeps the cursor there when the list shows the new match",
+    async () => {
+      await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForComposer(15_000);
+
+        // "f 3" matches no row, so fx 1 stays shown.
+        await session.sendKeys("C-x");
+        await waitForSelected(session, "fx 1");
+        await session.sendLiteral("f 3");
+        await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "f 3"), 10_000);
+
+        // Left twice puts the cursor after the f, and an x there makes "fx 3",
+        // whose one match the list shows at once. The cursor stays after the
+        // x, so the Z typed next lands there and not at the end.
+        await session.sendKeys("Left");
+        await session.sendKeys("Left");
+        await session.sendLiteral("x");
+        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "fx 3") && shownAnswers(pane).length === 0, 10_000);
+        await session.sendLiteral("Z");
+        const typed = await session.waitForPane((pane) => composerContains(pane, "fxZ 3") || composerContains(pane, "fx 3Z"), 10_000);
+        expect(composerContains(typed, "fxZ 3")).toBe(true);
       });
     },
     TIMEOUT,
