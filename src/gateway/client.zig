@@ -475,7 +475,7 @@ fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     };
-    const result = if (client) |own| try own.fetch(options) else try fetchOnOpenJob(options);
+    const result = if (client) |own| try fetchWithClient(own, options) else try fetchOnOpenJob(options);
 
     return .{
         .status = result.status,
@@ -745,10 +745,11 @@ pub fn postGatewayCompletion(
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const result = client.fetch(.{
+        const result = fetchWithClient(&client, .{
             .location = .{ .url = request_url },
             .method = .POST,
             .payload = payload,
+            .redirect_behavior = .unhandled,
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
@@ -2719,26 +2720,63 @@ pub fn openRequestOnJob(
     return job.waitForOpen(uri, options, no_deadline, &never_cancelled, &reused);
 }
 
+/// The error behind a failed read of a response body. The body reader keeps
+/// an error of its own only for broken chunk framing; a failed read on the
+/// connection, such as one its deadline cancelled, leaves `bodyErr()` null, so
+/// it must not be unwrapped as `std.http.Client.fetch` does
+/// (https://codeberg.org/ziglang/zig/issues/36296).
+fn bodyReadError(response: *const std.http.Client.Response) anyerror {
+    if (response.bodyErr()) |err| return err;
+    if (response.request.connection) |connection| {
+        if (connection.stream_reader.err) |err| return err;
+    }
+    return error.ReadFailed;
+}
+
 /// `std.http.Client.fetch` with the connection opened by `openRequestOnJob`,
 /// for an operation that `runBoundedHttpOperation` runs. Redirects are not
 /// followed: `options.redirect_behavior` must be `.unhandled`, and the
 /// caller gets the 3xx status.
 pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
     std.debug.assert(options.redirect_behavior == .unhandled);
-    const uri = switch (options.location) {
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+    return fetchOnRequest(&opened.request, options);
+}
+
+/// `std.http.Client.fetch` on a client the caller owns, without its panic on
+/// a body read that fails. Redirects are not followed, as in `fetchOnOpenJob`.
+pub fn fetchWithClient(client: *std.http.Client, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    std.debug.assert(options.redirect_behavior == .unhandled);
+    var req = try client.request(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer req.deinit();
+    return fetchOnRequest(&req, options);
+}
+
+fn fetchMethod(options: std.http.Client.FetchOptions) std.http.Method {
+    return options.method orelse if (options.payload != null) .POST else .GET;
+}
+
+fn fetchUri(options: std.http.Client.FetchOptions) !std.Uri {
+    return switch (options.location) {
         .url => |url| try std.Uri.parse(url),
         .uri => |uri| uri,
     };
-    var opened = try openRequestOnJob(options.method orelse if (options.payload != null) .POST else .GET, uri, .{
+}
+
+fn fetchRequestOptions(options: std.http.Client.FetchOptions) std.http.Client.RequestOptions {
+    return .{
         .redirect_behavior = .unhandled,
         .headers = options.headers,
         .extra_headers = options.extra_headers,
         .privileged_headers = options.privileged_headers,
         .keep_alive = options.keep_alive,
-    });
-    defer opened.deinit();
-    const req = &opened.request;
+    };
+}
 
+/// Sends an opened request and reads its answer as `std.http.Client.fetch`
+/// does, except that a failed body read returns `bodyReadError`.
+fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
     if (options.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = try req.sendBodyUnflushed(&.{});
@@ -2752,7 +2790,7 @@ pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.Fe
     var response = try req.receiveHead(&.{});
     const response_writer = options.response_writer orelse {
         _ = response.reader(&.{}).discardRemaining() catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr().?,
+            error.ReadFailed => return bodyReadError(&response),
         };
         return .{ .status = response.head.status };
     };
@@ -2770,7 +2808,7 @@ pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.Fe
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
+        error.ReadFailed => return bodyReadError(&response),
         else => |e| return e,
     };
     return .{ .status = response.head.status };
