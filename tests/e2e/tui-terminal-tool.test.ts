@@ -311,8 +311,9 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain('\\"state\\":\\"completed\\"');
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
-    expect(scrollback).toContain("Observed sleep 2; printf CAPTURED_DONE");
+    // The session's rows show its launch command's steps in short form.
+    expect(scrollback).toContain("Ran sleep, printf");
+    expect(scrollback).toContain("Observed sleep, printf");
     expect(scrollback).not.toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
@@ -367,7 +368,7 @@ test.skipIf(!tmuxAvailable())(
     await active.sendKeys("Enter");
     await active.waitForText("PHASE_TWO_READY", TIMEOUT);
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Stopped printf HANDOFF_READY; sleep 30");
+    expect(scrollback).toContain("Stopped printf, sleep");
     expect(scrollback).not.toContain(`Stopped session ${sessionId}`);
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
@@ -688,16 +689,16 @@ test.skipIf(!tmuxAvailable())(
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     // The session's input and its stop share one row with its latest state.
-    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("├ Ran ")).toBe("├ Ran echo, sleep");
     expect(row("├ Observed ")).toBeUndefined();
-    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand} · 2 calls`);
+    expect(row("└ Stopped ")).toBe("└ Stopped echo, sleep · 2 calls");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
 );
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O shows session launch commands in full while the main view trails them",
+  "Ctrl-O shows session launch commands in full while the main view shortens them",
   async () => {
     const fixture = createFixture("fx-shell-full-transcript-width-");
     const words = Array.from({ length: 30 }, (_, index) => `word${index}`).join(" ");
@@ -753,12 +754,11 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
     await Bun.sleep(300);
 
-    // The main view keeps each row on one line and trails what does not fit.
+    // The main view shows the launch command's steps in short form.
     // The session's input and its stop share one row, whose note stays.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
     const mainSession = mainRows.find((line) => line.startsWith("└ Stopped "));
-    expect(mainSession).toBeDefined();
-    expect(mainSession).toEndWith("… · 2 calls");
+    expect(mainSession).toBe("└ Stopped echo, sleep · 2 calls");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
@@ -804,7 +804,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("C-o");
     await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("└ Stopped echo word0");
+    expect(scrollback).toContain("└ Stopped echo, sleep · 2 calls");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
     expect(scrollback).not.toContain("action: interact");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -888,9 +888,9 @@ test.skipIf(!tmuxAvailable())(
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     // The session's input and its stop share one row with its latest state.
-    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("├ Ran ")).toBe("├ Ran echo, sleep");
     expect(row("├ Observed ")).toBeUndefined();
-    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand} · 2 calls`);
+    expect(row("└ Stopped ")).toBe("└ Stopped echo, sleep · 2 calls");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT * 2,

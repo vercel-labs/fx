@@ -1616,8 +1616,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared watcher and stop it.");
       const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
       // The session's input and its stop share one row with its latest state.
-      expect(live).toContain("Ran cat <<'EOF' launch marker line EOF sleep 300");
-      expect(live).toContain("Stopped cat <<'EOF' launch marker line EOF sleep 300 · 2 calls");
+      expect(live).toContain("├ Ran cat, sleep");
+      expect(live).toContain("└ Stopped cat, sleep · 2 calls");
       expect(live).not.toContain("Observed shell-1");
 
       await active.sendText("/quit");
@@ -1635,8 +1635,8 @@ test.skipIf(!tmuxAvailable())(
         height: 30,
       });
       const resumed = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(resumed).toContain("Ran cat <<'EOF' launch marker line EOF sleep 300");
-      expect(resumed).toContain("Stopped cat <<'EOF' launch marker line EOF sleep 300 · 2 calls");
+      expect(resumed).toContain("├ Ran cat, sleep");
+      expect(resumed).toContain("└ Stopped cat, sleep · 2 calls");
       expect(resumed).not.toContain("Observed shell-1");
       expect(resumed).not.toContain("Stopped shell-1");
       expect(resumedGateway.requests).toHaveLength(0);
@@ -2015,7 +2015,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toMatch(/^● Ran awk .*✓$/m);
+      expect(compact).toContain("● Ran awk, printf, sleep +1 more ✓");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
@@ -5069,7 +5069,8 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("Read nested/input.txt");
       expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Exited 7 ${failureCommand}`);
+      // The failure control's steps show in short form; `exit` drops out.
+      expect(scrollback).toContain("Exited 7 printf");
       expect(scrollback).not.toContain("│ exit code 7");
     }
 
@@ -8833,14 +8834,14 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     // The replayed row abbreviates against the live workspace and reclips to
     // the live width instead of keeping the frozen compact-bound marker.
     // The launch and its observe share one session row, which is the group's
-    // header.
-    const row = scrollback.split("\n").find((line) => line.includes("cd ./alpha"));
+    // header and shows the launch command's steps in short form.
+    const row = scrollback.split("\n").find((line) => line.includes("Observed printf"));
     expect(row).toBeDefined();
-    expect(row!).toContain(tail);
+    expect(row!).toContain(" · 2 calls");
     expect(row!).not.toContain("...");
     // Session-action rows resolve the launch command through the live root
     // instead of falling back to the raw session id.
-    expect(scrollback).toContain("Observed cd ./alpha");
+    expect(scrollback).toContain("Observed printf");
     expect(scrollback).not.toContain("Observed shell-1");
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);

@@ -11,8 +11,9 @@ import type {
   RenderLabManifest,
 } from "./types";
 
-export const ACTIVE_TOOL_MARKER = "Running sleep 1; i=1";
-export const TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
+// The scenario's command row shows its steps in short form.
+export const ACTIVE_TOOL_MARKER = "Running sleep, printf, sleep";
+export const TERMINAL_TOOL_MARKER = "Ran sleep, printf, sleep";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";

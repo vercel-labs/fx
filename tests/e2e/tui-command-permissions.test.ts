@@ -1327,27 +1327,25 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
-      // The group's only call is its header, and its ✓ stays after the clip.
-      const narrowRow = narrow.split("\n").find((line) => line.includes("● Ran printf ok"));
-      expect(narrowRow).toBeDefined();
-      expect(narrowRow).toEndWith("… ✓");
-      expect(narrowRow).not.toContain("omega >/dev/null");
+      // The command is long, so its row shows its steps in short form at every
+      // width; Ctrl-O keeps the full command.
+      const narrowRow = narrow.split("\n").find((line) => line.includes("● Ran printf"));
+      expect(narrowRow).toBe("● Ran printf ✓");
 
       await activeSession.resizeWindow(240, 32);
-      // The resize reprojects the row on a later frame, so wait for it.
-      await activeSession.waitForPane((pane) => pane.includes(`● Ran ${command} ✓`), TIMEOUT);
+      // The resize redraws the row on a later frame, so wait for it.
+      await activeSession.waitForPane((pane) => pane.includes("● Ran printf ✓"), TIMEOUT);
       const wide = await activeSession.captureFullScrollback();
-      const wideRow = wide.split("\n").find((line) => line.includes("● Ran printf ok"));
-      expect(wideRow).toBe(`● Ran ${command} ✓`);
+      const wideRow = wide.split("\n").find((line) => line.includes("● Ran printf"));
+      expect(wideRow).toBe("● Ran printf ✓");
 
       await activeSession.sendText("Run the next prepared command.");
       await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
-      const workspaceRow = workspaceWide.split("\n").find((line) =>
-        line.includes("● Ran printf '%s' absolute-path-prefix-"),
-      );
-      expect(workspaceRow).toContain(" ./file >/dev/null");
-      expect(workspaceRow).not.toContain(root.workspace);
+      // The second command is long too, and its row never shows the
+      // workspace path.
+      expect(workspaceWide.split("\n").filter((line) => line === "● Ran printf ✓")).toHaveLength(2);
+      expect(workspaceWide).not.toContain(root.workspace);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

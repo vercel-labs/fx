@@ -11,6 +11,7 @@ const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const command_lex = @import("../../core/shell_command/command_lex.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
@@ -1147,8 +1148,11 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) 
         } orelse if (row.detail) |record| record.tool_name else "tool activity";
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
-    const phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
-    const display = try highlightCommandPhrase(scratch, phrase, row.detail, style.text_style) orelse phrase;
+    const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
+    const display = if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
+        short
+    else
+        try highlightCommandPhrase(scratch, full_phrase, row.detail, style.text_style) orelse full_phrase;
     const passed_after_failing = row.failures > 0 and row.detail != null and
         row.detail.?.outcome != null and !storyCallFailed(row.detail);
     const suffix: []const u8 = if (row.count < 2) "" else switch (row.identity.kind) {
@@ -1603,6 +1607,332 @@ fn reprojectTruncatedCommandPhrase(
     const label = body[0 .. body.len - tail.len];
     if (label.len == 0 or label[label.len - 1] != ' ') return null;
     return try scratch.print("{s}{s}", .{ label, command });
+}
+
+/// A one-step command up to this many bytes keeps its full text in a row.
+const short_command_max_len = 60;
+
+/// Programs that change the shell's own state rather than run work, so a
+/// step that starts with one says nothing about what the command did.
+const shell_setup_programs = std.StaticStringMap(void).initComptime(.{
+    .{"cd"},     .{"pushd"}, .{"popd"},  .{"export"},   .{"set"},    .{"unset"},
+    .{"source"}, .{"."},     .{"true"},  .{":"},        .{"exit"},   .{"wait"},
+    .{"trap"},   .{"shopt"}, .{"alias"}, .{"ulimit"},   .{"umask"},  .{"["},
+    .{"[["},     .{"test"},  .{"break"}, .{"continue"}, .{"return"},
+});
+
+/// Shell words that lead into the command after them.
+const leading_keywords = std.StaticStringMap(void).initComptime(.{
+    .{"if"}, .{"then"}, .{"else"}, .{"elif"}, .{"do"}, .{"while"}, .{"until"}, .{"!"},
+});
+
+/// Shell words whose whole step runs no program of its own, such as a loop's
+/// header or its end.
+const step_keywords = std.StaticStringMap(void).initComptime(.{
+    .{"for"}, .{"select"}, .{"case"}, .{"esac"}, .{"done"}, .{"fi"}, .{"in"}, .{"function"},
+});
+
+/// Programs that run the program after them.
+const wrapper_programs = std.StaticStringMap(void).initComptime(.{
+    .{"sudo"}, .{"time"},    .{"nohup"}, .{"exec"},    .{"command"},
+    .{"env"},  .{"builtin"}, .{"nice"},  .{"timeout"},
+});
+
+/// Programs that only reshape the output of the step before a pipe.
+const output_filter_programs = std.StaticStringMap(void).initComptime(.{
+    .{"head"},   .{"tail"}, .{"grep"}, .{"rg"},   .{"egrep"}, .{"fgrep"},
+    .{"jq"},     .{"sed"},  .{"awk"},  .{"sort"}, .{"uniq"},  .{"wc"},
+    .{"cut"},    .{"tr"},   .{"tee"},  .{"less"}, .{"more"},  .{"cat"},
+    .{"column"}, .{"fold"}, .{"nl"},
+});
+
+/// Programs whose next words are arguments, not subcommands.
+const plain_programs = std.StaticStringMap(void).initComptime(.{
+    .{"echo"},     .{"printf"},   .{"cat"},   .{"ls"},    .{"grep"},     .{"rg"},
+    .{"find"},     .{"fd"},       .{"sed"},   .{"awk"},   .{"head"},     .{"tail"},
+    .{"sleep"},    .{"rm"},       .{"cp"},    .{"mv"},    .{"mkdir"},    .{"rmdir"},
+    .{"touch"},    .{"chmod"},    .{"chown"}, .{"ln"},    .{"wc"},       .{"sort"},
+    .{"uniq"},     .{"cut"},      .{"tr"},    .{"tee"},   .{"xargs"},    .{"which"},
+    .{"test"},     .{"pwd"},      .{"date"},  .{"curl"},  .{"wget"},     .{"jq"},
+    .{"diff"},     .{"stat"},     .{"du"},    .{"df"},    .{"ps"},       .{"kill"},
+    .{"pkill"},    .{"pgrep"},    .{"open"},  .{"tar"},   .{"unzip"},    .{"zip"},
+    .{"ssh"},      .{"scp"},      .{"rsync"}, .{"file"},  .{"basename"}, .{"dirname"},
+    .{"realpath"}, .{"readlink"}, .{"seq"},   .{"watch"}, .{"uname"},    .{"whoami"},
+});
+
+/// Programs that run a script named by their first argument.
+const interpreter_programs = std.StaticStringMap(void).initComptime(.{
+    .{"sh"},      .{"bash"}, .{"zsh"}, .{"dash"}, .{"fish"}, .{"python"},
+    .{"python3"}, .{"node"}, .{"bun"}, .{"deno"}, .{"ruby"}, .{"perl"},
+    .{"php"},     .{"tsx"},
+});
+
+const command_operators = std.StaticStringMap(void).initComptime(.{
+    .{";"}, .{"("}, .{")"}, .{"{"}, .{"}"}, .{"|"}, .{"||"}, .{"&"}, .{"&&"},
+});
+
+const redirection_operators = std.StaticStringMap(void).initComptime(.{
+    .{"<"},  .{">"},  .{">>"}, .{"<<"},  .{"<<<"}, .{"<&"}, .{"<>"},
+    .{">|"}, .{">&"}, .{"&>"}, .{"&>>"},
+});
+
+/// One step of a shell command as the short form shows it.
+const ShortStep = struct {
+    program: []const u8 = "",
+    words: [2][]const u8 = .{ "", "" },
+    word_count: usize = 0,
+    /// The step's own words are done: a flag, a path, or quoted text ended
+    /// them, or its program takes none.
+    closed: bool = false,
+    /// A wrapper such as `timeout` came first, so its flags and its number
+    /// are skipped until the program it runs.
+    after_wrapper: bool = false,
+    /// git's `-C <dir>` and `-c <key=value>` take the next token.
+    skip_next: bool = false,
+    after_pipe: bool = false,
+    /// A loop header or a block's end, which the short form leaves out.
+    dropped: bool = false,
+};
+
+fn isWordToken(token: command_lex.ArgvToken) bool {
+    if (token.quoted or token.value.len == 0) return false;
+    if (!std.ascii.isLower(token.value[0])) return false;
+    for (token.value) |byte| {
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-' or byte == '_' or byte == ':')) return false;
+    }
+    return true;
+}
+
+fn looksLikeWrapperArgument(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (value[0] == '-') return true;
+    // A duration or a count: "30", "5m", "1.5s".
+    if (!std.ascii.isDigit(value[0])) return false;
+    for (value) |byte| if (!(std.ascii.isDigit(byte) or byte == '.' or std.ascii.isLower(byte))) return false;
+    return true;
+}
+
+/// A program as the short form names it: the base name of a path, except a
+/// script in the current folder ("./build.sh"), which stays as written.
+fn shortProgramName(value: []const u8) []const u8 {
+    const slash = std.mem.findScalarLast(u8, value, '/') orelse return value;
+    if (std.mem.startsWith(u8, value, "./") and slash == 1) return value;
+    return value[slash + 1 ..];
+}
+
+fn addShortToken(step: *ShortStep, token: command_lex.ArgvToken) void {
+    const value = token.value;
+    if (step.program.len == 0) {
+        if (command_lex.is_safe_env_assignment(value) or isEnvAssignment(value)) return;
+        // The `$` of a leading `$( ... )`, whose program comes after it.
+        if (!token.quoted and std.mem.eql(u8, value, "$")) return;
+        if (step.after_wrapper and looksLikeWrapperArgument(value)) return;
+        if (wrapper_programs.has(value)) {
+            step.after_wrapper = true;
+            return;
+        }
+        if (!token.quoted and leading_keywords.has(value)) return;
+        if (!token.quoted and step_keywords.has(value)) {
+            step.program = value;
+            step.dropped = true;
+            step.closed = true;
+            return;
+        }
+        step.program = shortProgramName(value);
+        if (plain_programs.has(step.program)) step.closed = true;
+        return;
+    }
+    if (step.closed) return;
+    if (step.skip_next) {
+        step.skip_next = false;
+        return;
+    }
+    if (step.word_count == 0 and std.mem.eql(u8, step.program, "git") and token.value.len > 0 and value[0] == '-') {
+        step.skip_next = std.mem.eql(u8, value, "-C") or std.mem.eql(u8, value, "-c");
+        return;
+    }
+    if (isWordToken(token)) {
+        step.words[step.word_count] = value;
+        step.word_count += 1;
+        if (step.word_count == step.words.len) step.closed = true;
+        return;
+    }
+    // An interpreter's first argument names the script it runs.
+    if (step.word_count == 0 and interpreter_programs.has(step.program) and !token.quoted and value.len > 0 and value[0] != '-') {
+        step.words[0] = shortProgramName(value);
+        if (std.mem.startsWith(u8, step.words[0], "./")) step.words[0] = step.words[0][2..];
+        step.word_count = 1;
+    }
+    step.closed = true;
+}
+
+fn isEnvAssignment(value: []const u8) bool {
+    const eq = std.mem.findScalar(u8, value, '=') orelse return false;
+    if (eq == 0) return false;
+    for (value[0..eq], 0..) |byte, index| {
+        const ok = byte == '_' or std.ascii.isAlphabetic(byte) or (index > 0 and std.ascii.isDigit(byte));
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn finishShortStep(
+    scratch: std.mem.Allocator,
+    steps: *std.ArrayList([]const u8),
+    raw_steps: *usize,
+    step: ShortStep,
+) !void {
+    if (step.program.len == 0 and !step.after_wrapper) return;
+    raw_steps.* += 1;
+    if (step.dropped or step.program.len == 0 or shell_setup_programs.has(step.program)) return;
+    if (step.after_pipe and output_filter_programs.has(step.program)) return;
+    var text: std.Io.Writer.Allocating = .init(scratch);
+    try text.writer.writeAll(step.program);
+    for (step.words[0..step.word_count]) |word| try text.writer.print(" {s}", .{word});
+    try steps.append(scratch, text.written());
+}
+
+/// Whether the token at `index` is the `(` of a `$(`, right after the `$`.
+fn isSubstitutionStart(command: []const u8, tokens: []const command_lex.ArgvToken, index: usize) bool {
+    const token = tokens[index];
+    if (token.quoted or !std.mem.eql(u8, token.value, "(") or token.start == 0) return false;
+    return command[token.start - 1] == '$';
+}
+
+fn gapHasNewline(command: []const u8, from: usize, to: usize) bool {
+    if (from >= to) return false;
+    return std.mem.findScalar(u8, command[from..to], '\n') != null;
+}
+
+/// A shell command's short form: the first steps it runs, and how many more.
+const ShortCommand = struct {
+    steps: []const []const u8,
+    more: usize,
+};
+
+const short_command_max_steps = 3;
+
+/// The short form as plain text, such as "npm ci, npm run build".
+fn shortCommand(scratch: std.mem.Allocator, command: []const u8) !?[]const u8 {
+    const short = try shortCommandSteps(scratch, command) orelse return null;
+    return try formatShortCommand(scratch, short, null);
+}
+
+/// Writes a short form, with every step made terminal-safe. With a style,
+/// each step takes the shell palette on its own, so every step's program
+/// shows in the same color, and the ", " between them stays plain.
+fn formatShortCommand(scratch: std.mem.Allocator, short: ShortCommand, base_style: ?[]const u8) ![]const u8 {
+    const profile = if (base_style != null) code_highlight_languages.resolve("sh") else null;
+    const variant: code_highlight.Theme = if (shared_theme.current().light) .light else .dark;
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    for (short.steps, 0..) |step, position| {
+        if (position > 0) try out.writer.writeAll(", ");
+        const safe = try scratch.print("{f}", .{text_utils.terminalSafe(step)});
+        if (profile) |shell| {
+            const style = base_style.?;
+            try out.writer.writeAll(try code_highlight.highlight(scratch, safe, shell, variant, if (style.len > 0) style else null));
+        } else try out.writer.writeAll(safe);
+    }
+    if (short.more > 0) try out.writer.print(" +{d} more", .{short.more});
+    return out.written();
+}
+
+/// The steps a shell command runs, by program and subcommand, without flags,
+/// arguments, `cd`, variables, wrappers, and output filters, so
+/// "cd desktop && npm ci --no-audit && npm run build -- --mode production"
+/// is "npm ci, npm run build". A one-step command of at most
+/// short_command_max_len bytes keeps its full text. Null when the command
+/// keeps its text or does not lex. The steps live in `scratch`.
+fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8) !?ShortCommand {
+    const argv = command_lex.tokenize_argv(scratch, command) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const tokens = argv.tokens;
+
+    var steps: std.ArrayList([]const u8) = .empty;
+    var raw_steps: usize = 0;
+    var step: ShortStep = .{};
+    var index: usize = 0;
+    while (index <= tokens.len) : (index += 1) {
+        const at_end = index == tokens.len;
+        const token: ?command_lex.ArgvToken = if (at_end) null else tokens[index];
+        // A command substitution, `$( ... )`, belongs to the step around it.
+        if (!at_end and isSubstitutionStart(command, tokens, index)) {
+            var depth: usize = 0;
+            while (index < tokens.len) : (index += 1) {
+                const inner = tokens[index];
+                if (inner.quoted) continue;
+                if (std.mem.eql(u8, inner.value, "(")) depth += 1;
+                if (std.mem.eql(u8, inner.value, ")")) {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+            }
+            continue;
+        }
+        const operator = if (token) |t| !t.quoted and command_operators.has(t.value) else false;
+        const new_line = if (token) |t| index > 0 and gapHasNewline(command, tokens[index - 1].end, t.start) else false;
+        const heredoc_end = blk: {
+            const t = token orelse break :blk false;
+            if (t.quoted or !std.mem.startsWith(u8, t.value, "<<") or std.mem.eql(u8, t.value, "<<<")) break :blk false;
+            // A here-document: skip its delimiter and its body, which ends
+            // the step at the closing delimiter.
+            if (index + 1 >= tokens.len) {
+                index = tokens.len - 1;
+                break :blk true;
+            }
+            const delimiter = tokens[index + 1].value;
+            var end = index + 2;
+            while (end < tokens.len and !std.mem.eql(u8, tokens[end].value, delimiter)) : (end += 1) {}
+            index = @min(end, tokens.len - 1);
+            break :blk true;
+        };
+        if (at_end or operator or new_line or heredoc_end) {
+            try finishShortStep(scratch, &steps, &raw_steps, step);
+            step = .{ .after_pipe = operator and std.mem.eql(u8, token.?.value, "|") };
+            if (operator or heredoc_end or at_end) continue;
+        }
+        const t = token.?;
+        if (!t.quoted and redirection_operators.has(t.value)) {
+            // A redirection's target is not a word of the step.
+            index += 1;
+            continue;
+        }
+        addShortToken(&step, t);
+    }
+    // The same step twice in a row shows once.
+    var shown: std.ArrayList([]const u8) = .empty;
+    for (steps.items) |text| {
+        if (shown.items.len > 0 and std.mem.eql(u8, shown.items[shown.items.len - 1], text)) continue;
+        try shown.append(scratch, text);
+    }
+    if (shown.items.len == 0) return null;
+    if (raw_steps <= 1 and command.len <= short_command_max_len) return null;
+    // A command that is already its own short form keeps its text.
+    if (shown.items.len == 1 and std.mem.eql(u8, shown.items[0], command)) return null;
+    const kept = @min(shown.items.len, short_command_max_steps);
+    return .{ .steps = shown.items[0..kept], .more = shown.items.len - kept };
+}
+
+/// Replaces the command a command row ends with by its short form, so a long
+/// command does not fill the row, and colors each step. `base_style` is the
+/// row's text style, as for highlightCommandPhrase. The full command stays in
+/// Ctrl+O and in approval prompts. Null when the row keeps its full command.
+fn shortenCommandPhrase(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+    base_style: []const u8,
+) !?[]const u8 {
+    const record = detail orelse return null;
+    if (record.activity_kind != .command) return null;
+    const display = record.command_display orelse return null;
+    if (display.len == 0 or phrase.len <= display.len or !std.mem.endsWith(u8, phrase, display)) return null;
+    const label = phrase[0 .. phrase.len - display.len];
+    if (label[label.len - 1] != ' ') return null;
+    const short = try shortCommandSteps(scratch, display) orelse return null;
+    return try scratch.print("{s}{s}", .{ label, try formatShortCommand(scratch, short, base_style) });
 }
 
 /// Shell-highlight the command portion of a command phrase ("Running <cmd>",
@@ -2836,7 +3166,7 @@ test "completed command rows shell-highlight quoted strings without coloring the
     try std.testing.expect(std.mem.find(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
 
-test "minimal completed command rows reproject stored arguments at the current width" {
+test "completed command rows reproject stored commands, then show their short form" {
     const alloc = std.testing.allocator;
     const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
     const arguments_json = try alloc.print(
@@ -2865,20 +3195,15 @@ test "minimal completed command rows reproject stored arguments at the current w
         },
     };
 
+    // The frozen "..." row gets its full command back, and a command this
+    // long shows in short form at every width.
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
-    const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    // The row carries styling (the command verb token), so the clip closes
-    // it, and the pass mark stays after the clip.
-    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m ✓"));
-    try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
+    try std.testing.expectEqualStrings("● Ran \x1b[38;5;252mprintf\x1b[39m ✓", narrow.entry_actions.items[0].override.bytes);
 
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "● Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8) ++ " ✓",
-        wide.entry_actions.items[0].override.bytes,
-    );
+    try std.testing.expectEqualStrings("● Ran \x1b[38;5;252mprintf\x1b[39m ✓", wide.entry_actions.items[0].override.bytes);
 
     const legacy_details = [_]ToolDetailRecord{
         .{
@@ -2920,10 +3245,8 @@ test "minimal completed command rows reproject stored arguments at the current w
     };
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "● Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path  ✓",
-        relative.entry_actions.items[0].override.bytes,
-    );
+    // The `cd` step drops out of the short form.
+    try std.testing.expectEqualStrings("● Ran \x1b[38;5;252mprintf\x1b[39m ✓", relative.entry_actions.items[0].override.bytes);
 
     const compatibility_entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
@@ -2945,10 +3268,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     }};
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "● Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8) ++ " ✓",
-        compatibility.entry_actions.items[0].override.bytes,
-    );
+    try std.testing.expectEqualStrings("● Installed skill \x1b[38;5;252mprintf\x1b[39m ✓", compatibility.entry_actions.items[0].override.bytes);
 }
 
 test "completed session and tty command rows reproject stored commands at the current width" {
@@ -3305,10 +3625,11 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         defer projection.deinit(alloc);
         const row = projection.entry_actions.items[0].override.bytes;
 
-        // The frozen marker is gone, the full command is present, and the
-        // row keeps its own label rather than the stored prediction.
+        // The frozen marker is gone, the command shows in short form, and
+        // the row keeps its own label rather than the stored prediction.
         try std.testing.expect(std.mem.find(u8, row, "...") == null);
-        try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
+        try std.testing.expect(std.mem.find(u8, row, "alpha-beta") == null);
+        try std.testing.expect(std.mem.find(u8, row, "printf") != null);
         // A one-call group is its own header line.
         const expected_prefix = try alloc.print("● {s} ", .{case.label});
         defer alloc.free(expected_prefix);
@@ -4214,10 +4535,9 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
     defer projection.deinit(alloc);
     const rows = projection.entry_actions.items[0].override.bytes;
 
-    // The prose prefix stays plain in full; the trailing command highlights.
-    try std.testing.expect(std.mem.find(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
+    // The prose prefix stays plain; the trailing command shows in short form,
+    // with each step's program highlighted and the ", " between them plain.
+    try std.testing.expect(std.mem.endsWith(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m, \x1b[38;5;252mprintf\x1b[39m"));
 }
 
 test "a deferred call keeps its own row and does not count as a run" {
@@ -4380,6 +4700,75 @@ test "a command that failed before the last one still counts in the header" {
     var last = try build(alloc, &entries, &last_failed, 120);
     defer last.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, last.entry_actions.items[0].override.bytes, "● Ran 3 shell commands ✗\n"));
+}
+
+test "a long shell command shows its steps in short form" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { command: []const u8, short: ?[]const u8 }{
+        .{ .command = "cd desktop && npm ci --no-audit --no-fund --loglevel=error && npm run build -- --mode production", .short = "npm ci, npm run build" },
+        .{ .command = "gh issue list -R vercel-labs/fx --state open --limit 300 --json number,title,labels --jq 'length'; gh label list -R vercel-labs/fx", .short = "gh issue list, gh label list" },
+        .{ .command = "cd desktop && git status --short --branch && git log --oneline -5", .short = "git status, git log" },
+        .{ .command = "git fetch origin --quiet && git rev-list --left-right --count HEAD...origin/main", .short = "git fetch origin, git rev-list" },
+        // Variables, wrappers, redirections, and output filters drop out.
+        .{ .command = "FORCE_COLOR=0 CI=1 timeout 300 zig build test --summary all 2>&1 | tail -20", .short = "zig build test" },
+        .{ .command = "git -C /Users/example/fx worktree add --detach /Users/example/worktrees/task origin/main", .short = "git worktree add" },
+        .{ .command = "cd tests/e2e && FX_SOUND=0 bun test tui-tool-story.test.ts", .short = "bun test" },
+        .{ .command = "cd /tmp && sh ./scripts/run-everything.sh --verbose", .short = "sh run-everything.sh" },
+        .{ .command = "make; echo \"exit: $?\"", .short = "make, echo" },
+        .{ .command = "for i in $(seq 1 96); do printf 'marker %03d\\n' \"$i\"; sleep 0.03; done", .short = "printf, sleep" },
+        .{ .command = "echo \"$(date)\" started && npm test -- --run --reporter=dot --bail", .short = "echo, npm test" },
+        .{ .command = "cat AGENTS.md && printf 'executed\\n' >> executions.log", .short = "cat, printf" },
+        .{ .command = "$(git rev-parse --show-toplevel)/scripts/check.sh --fast && make lint", .short = "check.sh, make lint" },
+        .{ .command = "cat <<'EOF' > notes.txt\nfirst line && more\nEOF\nsleep 300", .short = "cat, sleep" },
+        .{ .command = "printf ok && printf '%s' alpha-beta-gamma-delta-epsilon-zeta-eta-theta >/dev/null", .short = "printf" },
+        .{ .command = "make && npm test && cargo build --release && go vet ./... && zig build", .short = "make, npm test, cargo build +2 more" },
+        // Loops and conditions show the commands inside them.
+        .{ .command = "while true; do curl -s localhost:3000 && break; sleep 1; done", .short = "curl, sleep" },
+        .{ .command = "if [ -f package.json ]; then npm test; fi", .short = "npm test" },
+        .{ .command = "for f in src/*.zig; do zig fmt --check \"$f\"; done", .short = "zig fmt" },
+        // Short one-step commands, and commands that do not lex, stay whole.
+        .{ .command = "git status --short --branch", .short = null },
+        .{ .command = "pwd", .short = null },
+        .{ .command = "sh test.sh", .short = null },
+        .{ .command = "echo 'unclosed && ls -la /a/very/long/path/that/goes/on/and/on/for/a/while", .short = null },
+        .{ .command = "cd desktop", .short = null },
+    };
+    for (cases) |case| {
+        const short = try shortCommand(arena, case.command);
+        if (case.short) |expected| {
+            try std.testing.expectEqualStrings(expected, short orelse return error.TestExpectedShortForm);
+        } else {
+            try std.testing.expect(short == null);
+        }
+    }
+}
+
+test "a command row shows the short form and keeps its label" {
+    const alloc = std.testing.allocator;
+    const command = "cd desktop && npm ci --no-audit --no-fund --loglevel=error && npm run build -- --mode production";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 2 " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read src/main.ts\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"" ++ command ++ "\"}", 2, null),
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .arguments_json = @constCast("{\"path\":\"src/main.ts\"}") },
+    };
+    details[0].command_display = @constCast(command);
+    details[0].command_action_label = @constCast("Ran");
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next();
+    const row = lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, row, "├ Exited 2 "));
+    try std.testing.expect(std.mem.find(u8, row, "--no-audit") == null);
+    try std.testing.expect(std.mem.find(u8, row, "npm") != null);
+    try std.testing.expect(std.mem.find(u8, row, "build") != null);
 }
 
 test "a long command keeps its merge note when its row is clipped" {
@@ -4732,6 +5121,31 @@ fn checkStoryRows(input: []const u8) !void {
     }
     entries[count] = .{ .raw_bytes = .{ .id = @intCast(count + 1), .bytes = "  2s (↑1 ↓2)", .class = .turn_summary } };
     const cols: u16 = 1 + @as(u16, fuzz.byte()) % 160;
+
+    // Some shell calls get a recorded command, which the row can show in
+    // short form. Inputs that end before here keep every row as it was.
+    const pieces = [_][]const u8{
+        "cd desktop",    "&&",            "git status",     "--short",    "|",        "head -5",
+        "'quoted && x'", "npm run build", ";",              "FOO=1",      "sudo",     "<<EOF",
+        "EOF",           "\n",            "2>&1",           "timeout 30", "./run.sh", "echo done",
+        "gh issue list", "-R",            "vercel-labs/fx", "\"",         "\\",       "git -C x fetch",
+    };
+    for (0..count) |index| {
+        if (details[index].activity_kind != .command or fuzz.byte() % 2 != 1) continue;
+        var raw: std.Io.Writer.Allocating = .init(arena);
+        const piece_count = 1 + fuzz.byte() % 12;
+        for (0..piece_count) |piece| {
+            if (piece > 0) try raw.writer.writeByte(' ');
+            if (fuzz.byte() % 4 == 0) try raw.writer.writeAll(fuzz.chunk(12)) else try raw.writer.writeAll(pieces[fuzz.byte() % pieces.len]);
+        }
+        const display = try arena.print("{f}", .{text_utils.terminalSafe(raw.written())});
+        details[index].command_display = display;
+        entries[index] = .{ .raw_bytes = .{
+            .id = @intCast(index + 1),
+            .bytes = try arena.print("● Ran {s}\n", .{display}),
+            .class = .tool_status,
+        } };
+    }
 
     var projection = try build(alloc, entries[0 .. count + 1], details[0..count], cols);
     defer projection.deinit(alloc);

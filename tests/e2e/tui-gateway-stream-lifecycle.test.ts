@@ -6428,7 +6428,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(markerPath, "utf8")).toBe("executed\n");
       expect(compact).toContain(`${header}\n`);
       expect(compact).toContain(refreshLabel);
-      expect(compact).toContain(`Ran ${command}`);
+      // The command shows its steps in short form.
+      expect(compact).toContain("└ Ran cat, printf");
       expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       for (const output of [compact, escapes]) {
         expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
@@ -7266,9 +7267,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const compact = await session.captureFullScrollback();
       expect(compact).toContain("● Ran 3 shell commands ✓");
-      expect(compact).toContain(
-        "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
-      );
+      // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
+      expect(compact).toContain("├ Ran pwd\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
       expect(countOccurrences(compact, `Ran ${firstDisplayCommand}`)).toBe(1);
       expect(compact).not.toContain(`Ran ${firstCommand}`);
@@ -7339,9 +7339,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
       expect(resumed).toContain("● Ran 3 shell commands ✓");
-      expect(resumed).toContain(
-        "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
-      );
+      expect(resumed).toContain("├ Ran pwd\n");
       expect(resumed).toContain(`Ran ${firstDisplayCommand}`);
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
