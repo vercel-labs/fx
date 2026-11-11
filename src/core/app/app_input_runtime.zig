@@ -957,6 +957,9 @@ pub fn Runtime(comptime App: type) type {
                     if (app.shell.fullTranscriptActive()) return .done;
                     if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    // The list sets the draft aside itself, so the model
+                    // picker's goes back to the composer first.
+                    restoreModelPickerDraft(app);
                     try app.openAgentsMenu();
                 }
                 return .done;
