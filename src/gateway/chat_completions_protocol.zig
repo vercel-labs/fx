@@ -719,7 +719,10 @@ pub const Reducer = struct {
         const root = try object(parsed.value);
         if (non_null(root, "error") != null) return error.ProviderError;
         try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
-        try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        // An empty model carries no identity, like an omitted or null model.
+        if (non_null(root, "model")) |model| {
+            if ((try string(model)).len != 0) try self.accept_identity(&self.response_model, model, configured_provider.max_model_bytes);
+        }
         const choices_value = root.get("choices") orelse return error.InvalidChunk;
         if (choices_value != .array) return error.InvalidChunk;
         const choices = choices_value.array.items;
@@ -733,22 +736,31 @@ pub const Reducer = struct {
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
-            const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
-            if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
+            // Some proxies send the usage trailer as the finished choice
+            // again without its finish_reason. A reason that is present must
+            // still match.
+            if (non_null(choice, "finish_reason")) |value| {
+                if (!std.mem.eql(u8, try string(value), @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
+            }
             var fields = delta.iterator();
             while (fields.next()) |field| {
                 if (std.mem.eql(u8, field.key_ptr.*, "role")) {
                     if (field.value_ptr.* != .string or !std.mem.eql(u8, field.value_ptr.string, "assistant")) return error.InconsistentFinishReason;
                 } else if (std.mem.eql(u8, field.key_ptr.*, "content")) {
                     if (field.value_ptr.* != .null and (field.value_ptr.* != .string or field.value_ptr.string.len != 0)) return error.InconsistentFinishReason;
+                } else if (std.mem.eql(u8, field.key_ptr.*, "function_call")) {
+                    if (field.value_ptr.* != .null and !empty_function_call(field.value_ptr.*)) return error.InconsistentFinishReason;
                 } else return error.InconsistentFinishReason;
             }
             try self.accept_usage(non_null(root, "usage") orelse return error.InconsistentFinishReason, true);
             return .{};
         }
         if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
-        // These fields carry semantics outside this codec's text/function subset.
-        for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
+        // These fields carry semantics outside this codec's text/function
+        // subset. Some servers put an all-empty legacy function_call on every
+        // chunk; it says nothing, so it counts as absent.
+        if (non_null(delta, "function_call")) |value| if (!empty_function_call(value)) return error.InvalidChunk;
+        if (non_null(delta, "audio") != null) return error.InvalidChunk;
         const reasoning_delta = try self.accept_reasoning(delta);
         const content_start = self.content.items.len;
         if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
@@ -925,8 +937,9 @@ pub const Reducer = struct {
         self.usage_final_fields = final_fields;
     }
 
-    /// Requires finish_reason followed by [DONE]. Filter and refusal are
-    /// explicit errors. A reply the output limit cut off returns with the
+    /// Requires finish_reason followed by [DONE], or by the end of the stream
+    /// when consume_stream reads it. Filter and refusal are explicit errors.
+    /// A reply the output limit cut off returns with the
     /// `length` reason, as the Gateway and Responses providers return it, so
     /// the agent loop can resend it; it never runs that reply's partial calls.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
@@ -1000,6 +1013,22 @@ fn object(value: std.json.Value) Error!std.json.ObjectMap {
     return if (value == .object) value.object else error.InvalidChunk;
 }
 
+/// A legacy function_call placeholder: an object whose only fields, name and
+/// arguments, are absent, null, or empty.
+fn empty_function_call(value: std.json.Value) bool {
+    if (value != .object) return false;
+    var fields = value.object.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "name") and !std.mem.eql(u8, field.key_ptr.*, "arguments")) return false;
+        switch (field.value_ptr.*) {
+            .null => {},
+            .string => |text| if (text.len != 0) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
 fn string(value: std.json.Value) Error![]const u8 {
     return if (value == .string) value.string else error.InvalidChunk;
 }
@@ -1036,6 +1065,8 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// Thin stream consumer, not a network transport. The source owns blocking-I/O
 /// cancellation. EventSink receives synchronous presentation-only text. Stops
 /// exactly at framed [DONE], without waiting for EOF or consuming another event.
+/// A stream that ends after the finished choice without [DONE] also completes;
+/// one that ends before any finish_reason is IncompleteStream.
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
 /// `progress`, when set, is told about each data event.
@@ -1053,7 +1084,13 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
             error.StreamTooLarge => return if (event_limited) error.EventTooLarge else error.StreamTooLarge,
             else => return err,
         };
-        const chunk = data orelse return error.IncompleteStream;
+        const chunk = data orelse {
+            // Some servers close the stream after the finished choice without
+            // [DONE]. That reply is whole; one that ends before it is not.
+            if (reducer.phase != .finished) return error.IncompleteStream;
+            reducer.phase = .done;
+            return reducer.finish(cancel_flag.load(.seq_cst));
+        };
         const deltas = try reducer.accept(chunk, cancel_flag.load(.seq_cst));
         if (events) |sink| {
             for (deltas.reasoning) |delta| if (delta) |text| {
@@ -2127,6 +2164,102 @@ test "chat completions terminal usage cannot introduce content tools or a differ
     try std.testing.expectError(error.IncompleteStream, reducer.finish(false));
 }
 
+test "chat completions usage trailers may omit the repeated finish reason" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_tools| {
+        for ([_][]const u8{ "", ",\"finish_reason\":null" }) |reason| {
+            var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+            defer reducer.deinit();
+            try test_accept(&reducer, if (with_tools) test_call else test_text);
+            try test_accept(&reducer, if (with_tools) test_tools_finish else test_stop);
+            const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}}{s}}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{reason});
+            defer alloc.free(trailer);
+            try std.testing.expect((try reducer.accept(trailer, false)).content == null);
+            try test_accept(&reducer, "[DONE]");
+            var result = try reducer.finish(false);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(?u64, 16), result.completed.completion.usage.input_tokens);
+            try std.testing.expectEqual(@as(?u64, 6), result.completed.completion.usage.output_tokens);
+            try std.testing.expectEqual(@as(usize, if (with_tools) 1 else 0), result.completed.completion.tool_calls.len);
+        }
+    }
+    // Without its reason the trailer is held to the same rules: no late
+    // content, tools, or refusal, and usage is still required.
+    for ([_][]const u8{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{}]},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"blocked\"}}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}",
+        "{\"choices\":[{\"index\":0,\"delta\":{}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}",
+    }) |trailer| {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        try test_accept(&reducer, test_stop);
+        try std.testing.expectError(error.InconsistentFinishReason, reducer.accept(trailer, false));
+        try std.testing.expectError(error.StreamClosed, reducer.finish(false));
+    }
+}
+
+test "chat completions treats an empty legacy function_call as absent" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"name\":\"\",\"arguments\":\"\"}",
+        "{}",
+        "{\"name\":null,\"arguments\":null}",
+        "{\"name\":\"\"}",
+    }) |function_call| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}");
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}");
+        const finish = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"\",\"role\":\"assistant\",\"function_call\":{s}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}}}", .{function_call});
+        defer alloc.free(finish);
+        try test_accept(&reducer, finish);
+        // A repeated terminal choice may carry the same placeholder.
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"function_call\":{s}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}}}", .{function_call});
+        defer alloc.free(trailer);
+        try test_accept(&reducer, trailer);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("ok", result.completed.completion.content.?);
+        try std.testing.expectEqual(@as(usize, 0), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.input_tokens);
+    }
+    // A legacy call that says anything, or is not an object, is still refused,
+    // and so is audio.
+    for ([_][]const u8{
+        "\"function_call\":{\"name\":\"read_file\",\"arguments\":\"\"}",
+        "\"function_call\":{\"name\":\"\",\"arguments\":\"{}\"}",
+        "\"function_call\":{\"name\":\"\",\"arguments\":\"\",\"id\":\"\"}",
+        "\"function_call\":{\"name\":1}",
+        "\"function_call\":\"\"",
+        "\"function_call\":[]",
+        "\"audio\":{}",
+    }) |field| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        const finish = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{{s}}},\"finish_reason\":\"stop\"}}]}}", .{field});
+        defer alloc.free(finish);
+        try std.testing.expectError(error.InvalidChunk, reducer.accept(finish, false));
+    }
+    for ([_][]const u8{
+        "{\"name\":\"read_file\",\"arguments\":\"\"}",
+        "{\"name\":\"\",\"arguments\":\"{}\"}",
+        "\"\"",
+    }) |function_call| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        try test_accept(&reducer, test_stop);
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"function_call\":{s}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}}}", .{function_call});
+        defer alloc.free(trailer);
+        try std.testing.expectError(error.InconsistentFinishReason, reducer.accept(trailer, false));
+    }
+}
+
 test "chat completions repeated terminal choices reject invalid or conflicting usage" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { usage: []const u8, seed_usage: bool = false, expected: Error = error.InvalidChunk }{
@@ -2339,7 +2472,38 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
         try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
     }
-    for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_stop ++ "\n\n", "data: " ++ test_stop ++ "\n\ndata: [DONE]", "data: " ++ test_stop ++ "\n\ndata: [DONE]\n" }) |truncated| {
+    // A stream that ends after the finished choice completes without [DONE],
+    // with the usage of any trailer that arrived whole. A [DONE] cut short
+    // is dropped at EOF like any other unterminated event.
+    for ([_]struct { wire: []const u8, input_tokens: ?u64 }{
+        .{ .wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\n", .input_tokens = null },
+        .{ .wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n", .input_tokens = 5 },
+        .{ .wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}", .input_tokens = null },
+        .{ .wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]", .input_tokens = null },
+        .{ .wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n", .input_tokens = null },
+    }) |case| {
+        for ([_]usize{ 1, 7, 1024 }) |size| {
+            const buffer = try alloc.alloc(u8, size);
+            defer alloc.free(buffer);
+            var fixed = std.Io.Reader.fixed(case.wire);
+            var source = fixed.limited(.unlimited, buffer);
+            var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled, null);
+            defer result.deinit(alloc);
+            try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+            try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
+            try std.testing.expectEqual(case.input_tokens, result.completed.completion.usage.input_tokens);
+        }
+    }
+    // A stream that ends before any finish_reason is still cut off, including
+    // one whose finish event never got its blank line.
+    for ([_][]const u8{
+        "",
+        "data: [DONE]\n\n",
+        "data: " ++ test_text ++ "\n\n",
+        "data: " ++ test_text ++ "\n\ndata: [DONE]",
+        "data: " ++ test_text ++ "\n\ndata: " ++ test_stop,
+        "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n",
+    }) |truncated| {
         var source = std.Io.Reader.fixed(truncated);
         try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
     }
@@ -2377,6 +2541,13 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
     const with_tool = smith.boolWeighted(1, 1);
     var arguments: stream_fuzz.Text = .{};
     try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+    // The benign shapes some servers send: an empty model, an empty legacy
+    // function_call on the finish, a usage trailer with or without the
+    // finished choice, and no [DONE].
+    const empty_model = smith.boolWeighted(1, 1);
+    const with_placeholder = smith.boolWeighted(1, 1);
+    const trailer = smith.valueRangeAtMost(u8, 0, 2);
+    const without_done = smith.boolWeighted(1, 1);
 
     var wire_buffer: std.Io.Writer.Allocating = .init(arena);
     const wire = &wire_buffer.writer;
@@ -2386,7 +2557,9 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
         }
     }
     for (try content.pieces(arena), 0..) |piece, index| {
-        if (index == 0) {
+        if (index == 0 and empty_model) {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"id\":\"chat-1\",\"model\":\"\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{f}}},\"finish_reason\":null}}]}}", piece);
+        } else if (index == 0) {
             try stream_fuzz.appendEvent(wire, smith, "{{\"id\":\"chat-1\",\"model\":\"resolved-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{f}}},\"finish_reason\":null}}]}}", piece);
         } else {
             try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{f}}}}}]}}", piece);
@@ -2401,7 +2574,15 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
             }
         }
     }
-    try wire.print("data: {s}\n\ndata: [DONE]\n\n", .{if (with_tool) test_tools_finish else test_stop});
+    const reason = if (with_tool) "tool_calls" else "stop";
+    const placeholder = if (with_placeholder) "\"function_call\":{\"name\":\"\",\"arguments\":\"\"}" else "";
+    try wire.print("data: {{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{{s}}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{ if (empty_model) "" else "resolved-model", placeholder, reason });
+    switch (trailer) {
+        0 => {},
+        1 => try wire.writeAll("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n"),
+        else => try wire.writeAll("data: {\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n"),
+    }
+    if (!without_done) try wire.writeAll("data: [DONE]\n\n");
 
     const read_buffer = try stream_fuzz.readBuffer(arena, smith);
     var fixed = std.Io.Reader.fixed(wire_buffer.written());
@@ -2416,12 +2597,60 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
     try deltas.expectEqual(content.text.items, reasoning.text.items);
     try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call-1", arguments.text.items);
+    try std.testing.expectEqual(@as(?u64, if (trailer == 0) null else 7), completion.usage.input_tokens);
 }
 
 test "chat completions streams give the same result however they are cut into events and reads" {
     try std.testing.fuzz({}, fuzzChunkedStream, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").chat_completions_stream.*),
     });
+}
+
+test "chat completions streams that end after the finished choice keep every finish rule" {
+    const alloc = std.testing.allocator;
+    const cancelled = std.atomic.Value(bool).init(false);
+    {
+        var source = std.Io.Reader.fixed("data: " ++ test_call ++ "\n\ndata: " ++ test_tools_finish ++ "\n\n");
+        var result = try consume_stream(alloc, &source, test_tool_request(), .{}, null, &cancelled, null);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
+    }
+    {
+        var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n");
+        var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.length, result.completed.completion.finish_reason.?);
+    }
+    for ([_]struct { wire: []const u8, failure: Error }{
+        // A call delivered without its finish never runs.
+        .{ .wire = "data: " ++ test_call ++ "\n\n", .failure = error.IncompleteStream },
+        .{ .wire = "data: " ++ test_call ++ "\n\ndata: " ++ test_tools_finish, .failure = error.IncompleteStream },
+        .{ .wire = "data: " ++ test_text ++ "\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n", .failure = error.ContentFiltered },
+        .{ .wire = "data: " ++ test_call ++ "\n\ndata: " ++ test_stop ++ "\n\n", .failure = error.InconsistentFinishReason },
+        .{ .wire = "data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"no\"},\"finish_reason\":\"stop\"}]}\n\n", .failure = error.Refused },
+    }) |case| {
+        var source = std.Io.Reader.fixed(case.wire);
+        try std.testing.expectError(case.failure, consume_stream(alloc, &source, test_tool_request(), .{}, null, &cancelled, null));
+    }
+}
+
+test "chat completions accepts every benign stream variant in one reply" {
+    const alloc = std.testing.allocator;
+    // An empty model in every chunk, an empty legacy function_call on the
+    // finish, a usage trailer without its finish_reason, and no [DONE].
+    const wire = "data: {\"id\":\"chat-1\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" ++
+        "data: {\"id\":\"chat-1\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n" ++
+        "data: {\"id\":\"chat-1\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"function_call\":{\"name\":\"\",\"arguments\":\"\"}},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"id\":\"chat-1\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n";
+    const cancelled = std.atomic.Value(bool).init(false);
+    var source = std.Io.Reader.fixed(wire);
+    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+    try std.testing.expectEqualStrings("chat-1", result.completed.completion.generation_id.?);
+    try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
 }
 
 test "chat completions reducer caps events content identities arguments tools and nesting" {
@@ -2522,6 +2751,44 @@ test "chat completions accepts empty name fragments without losing arguments" {
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("read_file", result.completed.completion.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
+}
+
+test "chat completions empty models carry no identity" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_model| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}");
+        try std.testing.expectEqual(null, reducer.response_model);
+        if (with_model) try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"served-model\",\"choices\":[{\"index\":0,\"delta\":{}}]}");
+        try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}");
+        try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}");
+        if (with_model) {
+            try std.testing.expectEqualStrings("served-model", reducer.response_model.?);
+        } else try std.testing.expectEqual(null, reducer.response_model);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("ok", result.completed.completion.content.?);
+        try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    }
+}
+
+test "chat completions empty models keep identity validation" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { chunk: []const u8, failure: Error }{
+        .{ .chunk = "{\"model\":7,\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.InvalidChunk },
+        .{ .chunk = "{\"id\":\"\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.InvalidChunk },
+        .{ .chunk = "{\"model\":\"" ++ text_utils.repeat("m", configured_provider.max_model_bytes + 1) ++ "\",\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.IdentityTooLarge },
+        .{ .chunk = "{\"model\":\"other\",\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.ConflictingIdentity },
+    }) |case| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        try test_accept(&reducer, "{\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{}}]}");
+        try std.testing.expectError(case.failure, reducer.accept(case.chunk, false));
+    }
 }
 
 test "chat completions accepts echoed models up to the request model limit" {
