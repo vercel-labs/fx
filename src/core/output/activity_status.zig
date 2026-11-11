@@ -13,12 +13,13 @@ pub fn compactionClock(operation: compaction_activity.Operation) StreamState {
     return .{ .turn_started_ms = turn_clock.compactionMarks(operation).started_ms };
 }
 
-/// How far a running compaction has got, as `<step>/<steps> <what it does>`.
+/// The step a running compaction is on. Only the summary takes long, so the
+/// row names the step and does not count the steps.
 fn compactionStepLabel(stage: compaction_activity.Stage) []const u8 {
     return switch (stage) {
-        .preparation => "1/3 preparing",
-        .summary => "2/3 summarizing",
-        .publication => "3/3 saving",
+        .preparation => "preparing",
+        .summary => "summarizing",
+        .publication => "saving",
     };
 }
 
@@ -49,6 +50,23 @@ pub fn compactionProjection(
     // The step goes after the clock, so a narrow row loses the step first.
     if (step) |text| out.print(" · {s}", .{text}) catch {};
     return .{ .turn_thinking = .{ .label = out.buffered() } };
+}
+
+/// The transcript line a successful compaction leaves, with the time its row
+/// showed last, such as `Context compacted (2m10s)`. Null for any other
+/// outcome, and when `buf` cannot hold the whole line.
+pub fn compactionDoneNotice(buf: []u8, op: compaction_activity.Operation) ?[]const u8 {
+    const feedback = switch (op.phase) {
+        .terminal => |value| value,
+        .preparing, .running, .stopping => return null,
+    };
+    if (feedback.outcome != .succeeded) return null;
+    const seconds = turn_clock.seconds(turn_clock.compactionMarks(op), op.settled_at_ms) orelse return null;
+    var out: std.Io.Writer = .fixed(buf);
+    out.writeAll("Context compacted (") catch return null;
+    writeElapsed(&out, seconds) catch return null;
+    out.writeByte(')') catch return null;
+    return out.buffered();
 }
 
 fn compactionFeedbackLabel(feedback: compaction_activity.Feedback) []const u8 {
@@ -293,15 +311,15 @@ test "every compaction counts its own time from zero and shows its step" {
     var buf: [256]u8 = undefined;
     for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
         const id = state.begin(origin, 1, 3_500);
-        try std.testing.expectEqualStrings("• Compacting (0s) · 1/3 preparing", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting (0s) · preparing", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
         state.running(id, .summary);
-        try std.testing.expectEqualStrings("• Compacting (0s) · 2/3 summarizing", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
-        try std.testing.expectEqualStrings("• Compacting (1m2s) · 2/3 summarizing", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
-        try std.testing.expectEqualStrings("• Compacting (1h0m0s) · 2/3 summarizing", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting (0s) · summarizing", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting (1m2s) · summarizing", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting (1h0m0s) · summarizing", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
         try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_000));
         try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_500));
         state.running(id, .publication);
-        try std.testing.expectEqualStrings("• Compacting (2s) · 3/3 saving", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting (2s) · saving", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
         state.stopping(id);
         try std.testing.expectEqualStrings("• Stopping compaction (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
         state.settle(id, .{ .outcome = .succeeded }, 5_500);
@@ -323,7 +341,7 @@ test "the turn row goes on after a compaction from the time it showed before" {
     const id = state.begin(.automatic, 1, began);
     syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began);
     state.running(id, .summary);
-    try std.testing.expectEqualStrings("• Compacting (40s) · 2/3 summarizing", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting (40s) · summarizing", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .succeeded, .publication = .committed }, began + 40_000);
     syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began + 40_000);
     try std.testing.expectEqualStrings("• Running (10m15s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 40_000).?);
@@ -331,11 +349,41 @@ test "the turn row goes on after a compaction from the time it showed before" {
     try std.testing.expectEqual(@as(u64, 100), stream.token_progress.input_tokens);
 }
 
+test "a finished compaction leaves a line with its own time, only when it succeeded" {
+    var state: compaction_activity.State = .{};
+    var buf: [64]u8 = undefined;
+    const id = state.begin(.automatic, 1, 1_000);
+    try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
+    state.running(id, .summary);
+    try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
+    state.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, 131_400);
+    try std.testing.expectEqualStrings("Context compacted (2m10s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
+    const quick = state.begin(.manual, null, 5_000);
+    state.settle(quick, .{ .outcome = .succeeded, .publication = .committed }, 5_400);
+    try std.testing.expectEqualStrings("Context compacted (0s)", compactionDoneNotice(&buf, state.snapshot.operation.?).?);
+    for ([_]compaction_activity.Feedback{
+        .{ .outcome = .no_op },
+        .{ .outcome = .busy },
+        .{ .outcome = .cancelled },
+        .{ .outcome = .failed, .stage = .summary },
+    }) |feedback| {
+        const other = state.begin(.manual, null, 6_000);
+        state.settle(other, feedback, 9_000);
+        try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) == null);
+    }
+    // A buffer too small for the line gives no line, not a cut one.
+    const long = state.begin(.automatic, 1, 1_000);
+    state.settle(long, .{ .outcome = .succeeded, .publication = .committed }, 131_000);
+    try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) != null);
+    var small: [10]u8 = undefined;
+    try std.testing.expect(compactionDoneNotice(&small, state.snapshot.operation.?) == null);
+}
+
 test "compaction terminal feedback is static scoped and publication honest" {
     var state: compaction_activity.State = .{};
     var buf: [256]u8 = undefined;
     const id = state.begin(.manual, null, 1_000);
-    try std.testing.expectEqualStrings("• Compacting (0s) · 1/3 preparing", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting (0s) · preparing", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .failed, .stage = .publication, .publication = .uncertain }, 1_500);
     const failed = compactionProjection(&buf, state.snapshot, 9_000).turn_thinking;
     try std.testing.expectEqual(ActivityProjection.Tone.danger, failed.tone);
