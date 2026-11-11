@@ -14953,6 +14953,198 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
 }
 
+const debt_anchor_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n" ++
+    "row-08\nrow-09\nrow-10\nrow-11\n";
+const debt_rewritten_grown_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n" ++
+    "row-08\nrow-09\nrow-10\nrow-11 rewritten\n" ++
+    "row-12\nrow-13\n";
+
+/// Commits a stable frame of twelve rows, then marks the four rows above the
+/// viewport as not yet in history: the state a recovered frame leaves.
+fn installStableAnchorWithHistoryDebtForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    catchup_pending: bool,
+) !void {
+    var source = try testSource(alloc, debt_anchor_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &source, &prepared);
+    const anchor = &runtime.transcript_commit_state.stable;
+    try std.testing.expect(anchor.visual_offset > 4);
+    anchor.history_visual_offset = 4;
+    anchor.history_catchup_pending = catchup_pending;
+    anchor.normal_buffer_recovery_pending = false;
+}
+
+const DebtFrameForTest = struct {
+    semantic_rows: u32,
+    terminal_scroll_rows: u16,
+    appends: bool,
+    history_visual_offset: u32,
+};
+
+/// Plans and seals one frame over `flow` without committing it.
+fn sealDebtFrameForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    flow: []const u8,
+    destructive: bool,
+) !DebtFrameForTest {
+    var source = try testSource(alloc, flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(runtime, prepared.selection);
+    if (destructive) {
+        try plan.invalidation.append(.{
+            .reason = .partial_write,
+            .top = runtime.owned_top_row,
+            .bottom = runtime.layout.content_bottom,
+        });
+    }
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    return .{
+        .semantic_rows = facts.semantic_rows,
+        .terminal_scroll_rows = scroll_plan.terminal_scroll_rows,
+        .appends = !transition.document_append.isEmpty(),
+        .history_visual_offset = transition.history_visual_offset,
+    };
+}
+
+fn expectDebtFrameHeld(frame: DebtFrameForTest) !void {
+    // Rows above the viewport sit on no screen, so a frame without a replay
+    // for them must not scroll them: the terminal would push blank rows into
+    // native scrollback and history would claim rows nothing wrote.
+    try std.testing.expectEqual(@as(u32, 0), frame.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), frame.terminal_scroll_rows);
+    try std.testing.expect(!frame.appends);
+    try std.testing.expectEqual(@as(u32, 4), frame.history_visual_offset);
+}
+
+fn expectDebtFrameReplayed(frame: DebtFrameForTest) !void {
+    try std.testing.expect(frame.semantic_rows > 0);
+    try std.testing.expect(frame.terminal_scroll_rows > 0);
+    try std.testing.expect(frame.appends);
+    try std.testing.expect(frame.history_visual_offset > 4);
+}
+
+test "stable frame after a source rewrite scrolls no rows its anchor cannot replay" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, false);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, false);
+    try expectDebtFrameHeld(frame);
+}
+
+test "stable frame under a destructive invalidation scrolls no rows its anchor cannot replay" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, false);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, true);
+    try expectDebtFrameHeld(frame);
+}
+
+test "stable frame after a source rewrite replays the owed rows when a catch-up is pending" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, true);
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, false);
+    try expectDebtFrameReplayed(frame);
+}
+
+test "stable frame under a destructive invalidation replays the owed rows when a catch-up is pending" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, true);
+
+    // The plan cannot see the invalidation, so the replay must not wait on it.
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, true);
+    try expectDebtFrameReplayed(frame);
+}
+
+test "compatible stable frame without a replay range grants no owed rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, true);
+    // The committed layout no longer matches the anchor, so neither a history
+    // replay nor an append on the retained screen can write the owed rows.
+    runtime.committed_frame_layout.layout_id +%= 1;
+
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_anchor_flow ++ "row-12\nrow-13\n", false);
+    try expectDebtFrameHeld(frame);
+}
+
+test "history debt a stable frame could not write is replayed by the next frame" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, false);
+
+    var rewritten = try testSource(alloc, debt_rewritten_grown_flow, runtime.layout.cols);
+    defer rewritten.deinit(alloc);
+    var rewritten_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &rewritten);
+    defer rewritten_prepared.deinit(alloc);
+    try commitPreparedForTest(&runtime, alloc, &rewritten, &rewritten_prepared);
+
+    // The held frame wrote nothing for the debt, so history stays and the
+    // next frame owes the replay.
+    const held = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 4), held.history_visual_offset);
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+    try std.testing.expect(held.history_catchup_pending);
+
+    const next = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow ++ "row-14\n", false);
+    try expectDebtFrameReplayed(next);
+}
+
 test "catch-up release materializes history before staging a larger finality hold" {
     const alloc = std.testing.allocator;
     const committed_flow =
