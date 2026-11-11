@@ -2723,7 +2723,8 @@ pub fn openRequestOnJob(
 /// The error behind a failed read of a response body. The body reader keeps
 /// an error of its own only for broken chunk framing; a failed read on the
 /// connection, such as one its deadline cancelled, leaves `bodyErr()` null, so
-/// it must not be unwrapped as `std.http.Client.fetch` does.
+/// it must not be unwrapped as `std.http.Client.fetch` does
+/// (https://codeberg.org/ziglang/zig/issues/36296).
 fn bodyReadError(response: *const std.http.Client.Response) anyerror {
     if (response.bodyErr()) |err| return err;
     if (response.request.connection) |connection| {
