@@ -195,11 +195,8 @@ fn appendCell(
 }
 
 fn composeHeadingRow(alloc: Allocator, projection: AgentsMenuProjection, width: u16) !std.ArrayList(u8) {
-    var buf: [96]u8 = undefined;
-    const text = if (projection.search.len > 0)
-        std.mem.print(&buf, "Agents {d} matching \"{s}\"", .{ projection.rows.len, projection.search }) catch "Agents"
-    else
-        std.mem.print(&buf, "Agents {d}", .{projection.rows.len}) catch "Agents";
+    var buf: [32]u8 = undefined;
+    const text = std.mem.print(&buf, "Agents {d}", .{projection.rows.len}) catch "Agents";
     return row_text.composeTextRow(alloc, text, width, ui_render.selected_completion_style, indentWidth(width));
 }
 
@@ -360,15 +357,15 @@ test "the agent list counts the agents, then shows each one's name, title, state
     }
 }
 
-test "a search heads the list with what it matched, and keeps the list open when nothing does" {
+test "a search counts what it matched, and keeps the list open when nothing does" {
     const matched: AgentsMenuProjection = .{ .rows = test_team[1..2], .search = "TEST" };
     const heading = try testRow(matched, 0, 80, max_inline_rows);
     defer std.testing.allocator.free(heading.text);
-    try std.testing.expectEqualStrings("  Agents 1 matching \"TEST\"", heading.text);
+    try std.testing.expectEqualStrings("  Agents 1", heading.text);
     try std.testing.expectEqual(@as(u16, 3), menuRowCount(matched, max_inline_rows));
     try std.testing.expectEqualStrings("↑↓ move     enter switch     esc clear", hintVariants(matched)[0]);
 
-    try expectRows(.{ .search = "nobody" }, 80, max_inline_rows, &.{ "  Agents 0 matching \"nobody\"", "" });
+    try expectRows(.{ .search = "nobody" }, 80, max_inline_rows, &.{ "  Agents 0", "" });
     try std.testing.expect(!(AgentsMenuProjection{}).active());
 }
 

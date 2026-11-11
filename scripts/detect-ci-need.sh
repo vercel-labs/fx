@@ -27,12 +27,13 @@
 # tests/tla/drivers/lib/ and tests/tla/drivers/graph.mjs.
 #
 # subagent: the TLA+ subagent and session-write models job model-checks the
-# design configs of tests/tla/subagent/ and the session-write model in
-# tests/tla/session/, and drives a built fx along them, which takes a few
-# minutes. A pull request runs it only when it touches src/core/subagent/,
-# src/core/session/, src/core/agent/worker_runtime.zig,
+# design configs of tests/tla/subagent/ and the session-write and live
+# sessions models in tests/tla/session/, and drives a built fx along them,
+# which takes a few minutes. A pull request runs it only when it touches
+# src/core/subagent/, src/core/session/, src/core/agent/worker_runtime.zig,
 # src/core/agent/runtime/parallel_execution.zig, those models, their drivers
-# in tests/tla/drivers/subagent/ and tests/tla/drivers/session/write.test.ts,
+# in tests/tla/drivers/subagent/, tests/tla/drivers/session/write.test.ts and
+# tests/tla/drivers/session/live.test.ts,
 # the shared code in tests/tla/lib/ and tests/tla/drivers/lib/, or the
 # helpers the drivers load: tests/e2e/tmux-helpers.ts and
 # tests/evals/eval-helpers.ts.
@@ -127,8 +128,8 @@ while IFS= read -r path; do
       require_mcp "$path: shared driver code changed"
       require_transcript_window "$path: shared driver code changed"
       require_subagent "$path: shared driver code changed" ;;
-    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts)
-      require_subagent "$path: subagent or session-write driver changed" ;;
+    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts)
+      require_subagent "$path: subagent, session-write, or live sessions driver changed" ;;
     tests/tla/drivers/transcript_window/*)
       require_transcript_window "$path: transcript window driver changed" ;;
     tests/tla/drivers/graph.mjs)
@@ -153,8 +154,8 @@ while IFS= read -r path; do
       require_transcript_window "$path: transcript window model changed" ;;
     src/core/subagent/* | src/core/session/* | src/core/agent/worker_runtime.zig | src/core/agent/runtime/parallel_execution.zig)
       require_subagent "$path: subagent or session-write code changed" ;;
-    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write*)
-      require_subagent "$path: subagent or session-write model changed" ;;
+    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-*)
+      require_subagent "$path: subagent, session-write, or live sessions model changed" ;;
     tests/tla/lib/*)
       require_subagent "$path: shared model-check code changed" ;;
     tests/e2e/tmux-helpers.ts | tests/evals/eval-helpers.ts)
