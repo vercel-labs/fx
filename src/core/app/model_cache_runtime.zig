@@ -388,6 +388,11 @@ fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool
     return filter == .all or providerFilter(provider) == filter;
 }
 
+/// Whether the provider tab `filter` lists `item`, whatever is typed.
+pub fn modelProviderFilterKeeps(item: ModelMenuItem, filter: ModelProviderFilter) bool {
+    return providerMatchesFilter(item.provider, filter);
+}
+
 pub const Runtime = struct {
     const Self = @This();
 
