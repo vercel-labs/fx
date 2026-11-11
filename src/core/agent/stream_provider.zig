@@ -16,6 +16,9 @@ const Allocator = std.mem.Allocator;
 /// Transport parser callback shapes. Provider boundaries expose `EventSink`;
 /// concrete reducers may use these adapters internally.
 pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: []const u8) void;
+/// A streamed tool call's id and its arguments so far, which may stop
+/// anywhere. Both are borrowed for the call only.
+pub const ToolInputProgressCallback = *const fn (ctx: *anyopaque, id: []const u8, arguments: []const u8) void;
 pub const ToolStartCallback = *const fn (
     ctx: *anyopaque,
     tool_id: []const u8,
@@ -35,6 +38,13 @@ pub const Event = union(enum) {
         arguments_json: ?[]const u8 = null,
     },
     tool_input_delta: []const u8,
+    /// The arguments a streamed tool call has so far, by its id, so a row
+    /// can name what the call is for before it is complete. Borrowed only
+    /// for synchronous event delivery.
+    tool_input_progress: struct {
+        id: []const u8,
+        arguments: []const u8,
+    },
 };
 
 pub const EventSink = struct {
@@ -58,6 +68,10 @@ pub const EventSink = struct {
 
     pub fn onToolInputChunk(context: *anyopaque, chunk: []const u8) void {
         fromContext(context).emit(.{ .tool_input_delta = chunk });
+    }
+
+    pub fn onToolInputProgress(context: *anyopaque, id: []const u8, arguments: []const u8) void {
+        fromContext(context).emit(.{ .tool_input_progress = .{ .id = id, .arguments = arguments } });
     }
 
     pub fn onToolStart(
