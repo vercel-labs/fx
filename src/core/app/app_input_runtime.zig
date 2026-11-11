@@ -1748,6 +1748,13 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).pressCloseKey(app);
         }
 
+        /// Edits the agent list's search; false when there was nothing to
+        /// erase or clear, so the key does what it does with no search.
+        fn editAgentsMenuSearch(app: *App, edit: app_agents_runtime.SearchEdit) bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).editSearch(app, edit);
+        }
+
         fn disarmAgentsMenuClose(app: *App) void {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return;
             app_agents_runtime.Runtime(App).disarmClose(app);
@@ -1757,10 +1764,12 @@ pub fn Runtime(comptime App: type) type {
         /// prompts and composer of the agent on screen: ↑ and ↓ move the
         /// highlight, Enter shows the highlighted agent, Backspace or Delete
         /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C close the
-        /// list. A paste closes it too, keeping the agent on screen, and
-        /// lands in its composer; mouse input passes through. Any other key
-        /// does nothing, so none edits the agent's draft or answers its
-        /// prompt behind the list. Returns whether the list took `event`.
+        /// list. A printable key searches the list; while there is a search,
+        /// Backspace and Delete erase it and Esc clears it. A paste closes
+        /// the list too, keeping the agent on screen, and lands in its
+        /// composer; mouse input passes through. Any other key does nothing,
+        /// so none edits the agent's draft or answers its prompt behind the
+        /// list. Returns whether the list took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1779,8 +1788,11 @@ pub fn Runtime(comptime App: type) type {
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
-                    127, 8 => _ = try pressAgentsMenuClose(app),
+                    127, 8 => if (!editAgentsMenuSearch(app, .erase)) {
+                        _ = try pressAgentsMenuClose(app);
+                    },
                     3, 24 => _ = try backAgentsMenu(app),
+                    ' '...'~' => _ = editAgentsMenuSearch(app, .{ .add = raw.byte }),
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     else => if (raw.byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(
@@ -1791,8 +1803,14 @@ pub fn Runtime(comptime App: type) type {
                 .action => |decoded| switch (decoded.action) {
                     .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
-                    .delete_next => _ = try pressAgentsMenuClose(app),
-                    .escape, .open_agent_list => {
+                    .delete_next => if (!editAgentsMenuSearch(app, .erase)) {
+                        _ = try pressAgentsMenuClose(app);
+                    },
+                    .escape => {
+                        if (!editAgentsMenuSearch(app, .clear)) _ = try backAgentsMenu(app);
+                        _ = disarmEscapeClear(app);
+                    },
+                    .open_agent_list => {
                         _ = try backAgentsMenu(app);
                         _ = disarmEscapeClear(app);
                     },
