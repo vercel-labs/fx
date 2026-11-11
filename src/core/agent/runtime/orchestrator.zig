@@ -3696,14 +3696,7 @@ fn recoveryToolEvidence(
                     else => .uncertain,
                 };
             }
-            // fx runs local calls only once their completion succeeds, so the
-            // local calls of a failed completion never ran. A call the
-            // provider runs itself may have, beside them or in the stream.
-            for (value.tool_calls) |call| {
-                if (call.provenance == .provider_executed) return .uncertain;
-            }
-            if (stream_ctx.saw_provider_tool_start) return .uncertain;
-            return .proven_unexecuted;
+            return .uncertain;
         }
     }
     if (stream_ctx.saw_provider_tool_start) return .uncertain;
@@ -3718,6 +3711,28 @@ noinline fn effectiveRecoveryToolEvidence(
 ) resend_strategy.ToolEvidence {
     const observed = recoveryToolEvidence(completion, stream_ctx);
     return if (observed == .none) preserved else observed;
+}
+
+/// The tool evidence a settled attempt leaves. fx runs a completion's local
+/// calls only when it settles as completed, so an attempt that broke off or
+/// ended in a provider error never ran them. A completed attempt keeps
+/// `effectiveRecoveryToolEvidence`: its calls run next, and one may start
+/// before fx saves its intent. A call the provider runs itself may have run
+/// either way.
+fn settledAttemptToolEvidence(
+    preserved: resend_strategy.ToolEvidence,
+    completion: types.ModelCompletion,
+    disposition: types.ProviderCompletionDisposition,
+    stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
+) resend_strategy.ToolEvidence {
+    const evidence = effectiveRecoveryToolEvidence(preserved, completion, stream_ctx);
+    if (disposition != .interrupted and disposition != .provider_failure) return evidence;
+    if (evidence != .uncertain or completion.tool_calls.len == 0) return evidence;
+    if (stream_ctx.saw_provider_tool_start) return .uncertain;
+    for (completion.tool_calls) |call| {
+        if (call.provenance == .provider_executed) return .uncertain;
+    }
+    return .proven_unexecuted;
 }
 
 fn restoredRecoveryToolEvidence(
@@ -8884,9 +8899,10 @@ fn processQueuedPromptLoop(
                     false,
                     recovery_cause,
                     recovery_strategy,
-                    effectiveRecoveryToolEvidence(
+                    settledAttemptToolEvidence(
                         preserved_tool_evidence,
                         response_completion,
+                        settled_disposition,
                         &stream_ctx,
                     ),
                     step_ctx,
@@ -9186,9 +9202,10 @@ fn processQueuedPromptLoop(
                     );
                 }
                 if (retries) {
-                    const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                    const failure_tool_evidence = settledAttemptToolEvidence(
                         preserved_tool_evidence,
                         attempt_completion,
+                        attempt_disposition,
                         &stream_ctx,
                     );
                     _ = try request_recovery.failed(.{ .kind = failure_kind.? });
