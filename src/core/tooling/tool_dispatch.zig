@@ -1,4 +1,5 @@
 const std = @import("std");
+const web_search_slots = @import("web_search_slots.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -381,9 +382,19 @@ pub const ProviderAdvertisementError = std.mem.Allocator.Error || std.Io.Writer.
     InvalidGatewayAdvertisement,
 };
 
+/// What a provider-run tool's advertisement may depend on: the request's
+/// model and the web search slots its team has left.
+pub const ProviderAdvertisementContext = struct {
+    model: []const u8 = "",
+    web_search: web_search_slots.View = .{},
+};
+
+/// Writes the tool's advertisement for one request. Writing nothing leaves
+/// the tool out of that request.
 pub const WriteProviderAdvertisementFn = *const fn (
     std.mem.Allocator,
     *std.Io.Writer,
+    ProviderAdvertisementContext,
 ) ProviderAdvertisementError!void;
 
 pub const LabelArgKind = enum {

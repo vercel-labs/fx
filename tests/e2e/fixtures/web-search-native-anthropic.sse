@@ -1,0 +1,108 @@
+data: {"type":"stream-start","warnings":[]}
+
+data: {"type":"response-metadata","id":"msg_example","modelId":"claude-fable-5-2"}
+
+data: {"type":"custom","kind":"anthropic.message_start","providerMetadata":{"anthropic":{"id":"msg_example","model":"claude-fable-5-2","usage":{"service_tier":"standard","input_tokens":2855,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":16,"inference_geo":"global","speed":"standard"}}}}
+
+data: {"type":"tool-input-start","id":"srvtoolu_example01","toolName":"native_web_search","providerExecuted":true}
+
+data: {"type":"tool-input-delta","id":"srvtoolu_example01","delta":"{\"query"}
+
+data: {"type":"tool-input-delta","id":"srvtoolu_example01","delta":"\": \"lat"}
+
+data: {"type":"tool-input-delta","id":"srvtoolu_example01","delta":"est sta"}
+
+data: {"type":"tool-input-delta","id":"srvtoolu_example01","delta":"ble Zig"}
+
+data: {"type":"tool-input-delta","id":"srvtoolu_example01","delta":" releas"}
+
+data: {"type":"tool-input-delta","id":"srvtoolu_example01","delta":"e\"}"}
+
+data: {"type":"tool-input-end","id":"srvtoolu_example01"}
+
+data: {"type":"tool-call","toolCallId":"srvtoolu_example01","toolName":"native_web_search","input":"{\"query\": \"latest stable Zig release\"}","providerExecuted":true}
+
+data: {"type":"tool-result","toolCallId":"srvtoolu_example01","toolName":"native_web_search","result":[{"url":"https://zig.guide/","title":"Welcome","pageAge":"310 days ago","encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://en.wikipedia.org/wiki/Zig_(programming_language)","title":"Zig (programming language)","pageAge":null,"encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://en.wikipedia.org/wiki/ZXID","title":"ZXID","pageAge":null,"encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://daily.dev/blog/zig-0-16-new-features-release-date-developers-need-to-know/","title":"Zig 0.16: New Features, Release Date, and What Developers Need to Know","pageAge":"169 days ago","encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://en.wikipedia.org/wiki/Zeta_(programming_language)","title":"Zeta (programming language)","pageAge":null,"encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://en.wikipedia.org/wiki/ZBar","title":"ZBar","pageAge":null,"encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"http://mise-versions.jdx.dev/tools/zig","title":"zig","pageAge":"209 days ago","encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://github.com/ziglang/zig/releases","title":"Releases \u00b7 ziglang/zig \u00b7 GitHub","pageAge":"438 days ago","encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"},{"url":"https://en.wikipedia.org/wiki/Zstd","title":"Zstd","pageAge":null,"encryptedContent":"EXAMPLE_ENCRYPTED_CONTENT","type":"web_search_result"}],"providerMetadata":{"anthropic":{"caller":{"type":"direct"}}}}
+
+data: {"type":"source","sourceType":"url","id":"o6BMgSGoXDBemuSk","url":"https://zig.guide/","title":"Welcome","providerMetadata":{"anthropic":{"pageAge":"310 days ago"}}}
+
+data: {"type":"source","sourceType":"url","id":"oK7EylHFfKLKiv4A","url":"https://en.wikipedia.org/wiki/Zig_(programming_language)","title":"Zig (programming language)","providerMetadata":{"anthropic":{"pageAge":null}}}
+
+data: {"type":"source","sourceType":"url","id":"1NmyBFGkjdz8yLuT","url":"https://en.wikipedia.org/wiki/ZXID","title":"ZXID","providerMetadata":{"anthropic":{"pageAge":null}}}
+
+data: {"type":"source","sourceType":"url","id":"qQzELc8GsxgbOfXk","url":"https://daily.dev/blog/zig-0-16-new-features-release-date-developers-need-to-know/","title":"Zig 0.16: New Features, Release Date, and What Developers Need to Know","providerMetadata":{"anthropic":{"pageAge":"169 days ago"}}}
+
+data: {"type":"source","sourceType":"url","id":"LtAwbiCljUBOLxe1","url":"https://en.wikipedia.org/wiki/Zeta_(programming_language)","title":"Zeta (programming language)","providerMetadata":{"anthropic":{"pageAge":null}}}
+
+data: {"type":"source","sourceType":"url","id":"GgRcE6Y5PeP3HkSE","url":"https://en.wikipedia.org/wiki/ZBar","title":"ZBar","providerMetadata":{"anthropic":{"pageAge":null}}}
+
+data: {"type":"source","sourceType":"url","id":"zvSq2ciySRshUmo7","url":"http://mise-versions.jdx.dev/tools/zig","title":"zig","providerMetadata":{"anthropic":{"pageAge":"209 days ago"}}}
+
+data: {"type":"source","sourceType":"url","id":"XCQT8h5LRgU4VWpJ","url":"https://github.com/ziglang/zig/releases","title":"Releases \u00b7 ziglang/zig \u00b7 GitHub","providerMetadata":{"anthropic":{"pageAge":"438 days ago"}}}
+
+data: {"type":"source","sourceType":"url","id":"xzwXokQ2nBhWIOvg","url":"https://en.wikipedia.org/wiki/Zstd","title":"Zstd","providerMetadata":{"anthropic":{"pageAge":null}}}
+
+data: {"type":"reasoning-start","id":"2"}
+
+data: {"type":"reasoning-delta","id":"2","delta":""}
+
+data: {"type":"reasoning-delta","id":"2","delta":"","providerMetadata":{"anthropic":{"signature":"CAQSzwsKEAgTGAI4AUIIdGhpbmtpbmcSDPLG2foC5pHjI6FISxoMOFGXiNB3Qe/uYwURIjBC8dkuzp+5+wJ+WlIfGp09yKiLGlBjTHRdRBCflYQ4qvx7CVDmGU6AcK/uLZYjL2cq7Ap4anzewiSch16ulhJaZ90lr45rfQJXusN+8UczIPkzVOeCeJkUDk8RlSANqP8S48lrYwTF6hxpEfPgkQkKVLcPxPBjlfG7B8IbDJgHfFRKaI2BmzJjC774CtADBvZnBFGpspE/co+TXbldZ66KJWIwiiGPfQnuq4pkv9UPXRkzmJ0OmMUTKJevhlMXTUldJANo9ro5+IUA/QalK9g/uTjBgOPHdKlIuqw5aivrvhWrR2R/0/BHqPbub1xElMIxnyOhhVEpJLlpFbYwIQEA6TGSDLa0EhggIQ1GTSmY3V1c67g2gqPYSQtM/e33/mvfgphQ4brzdzlKdcVRJ2Y4vHwibAAFcTo2YgXnxiODUYexsuxOxP3lYQwP8iQz6TJN6OjtHnecnY9d+/QIDBh/hrHaB8EtVuVvyil7TVeRmTOPJGsF8mi+iF1p4ub6GY4PUxKqbloLNYnhrrx6Uif0bIQyILkzAAfUFKPghLf5p/8I58HxLOH/ICs2DpKuURmJ+7NvSaPDFFXNfwJAQbtruyY3Cxg0gSJSeCAOOf/Ir0h0R5esnYeM5JPkOyoaVqQHtWDKxzo3VlyqnvHye86vrRK9XxXsyAAg8oV81B5y1s49qz0Z8QvLadOAIfhmWcg6tS6x8KgDbxI2wr9LXqGkq7tP6tqNt77h88v/ojcgMbfRUd9Z5FDf45U0+0TeLaGV1aK1wn9cXqjCNKWO41aETel+Dop1Ce+xK1R6OdTCUIy4u+yq3NH95Gnd0c8h0znDnJUB1Xbbr5UBpEbJNB1gdyBQ8ykFDJK3tIOqbqG0dzgY5LU1KHXRwHxifP1YiKI3kvk6wBa1xTr0p/xMYfY45n3TXrvFzZ0uPeXv/l43fccJEzqiCm5H+kTpdgoi41D31iRwkPFVmOJuu/XaK+Kvk14dQBfuPfOXcXtysj1J31M9ua9u6x/ASXw35r2z2g4SI6Z0SRC+coDdPi1yANYquD8UrIownyfpG1U3qWtKy5H3zYCchOsVkQDFErVBIUNWMXuAZ04GS0Hvqg11coZGcT3JrZLF3GLQFcEdLMW355jB9If1zGE5tvJVnrFQqksiy7pTmlZ0jA6gQktV+4rIQK6PKmb3PE61wXB3jHO38iErVdk595Izi80Yvqk9vCSP9pBHUu+/5AALwiHydEgOcSr+4HWTacMmtBKtJmJ/B44XVB74Dphg/NJj0wou0qXWj561Lm+kfRTxjxtbm/LWpYQaFNxamy0oOYxeZI4AE3++sDN+bPU2ttEWqOB6qm+yMDPvVdGt6yZMJnEOUPkxvoSgkevXX/khKRu77vIhAWy2CNx1OiOuDGXcZtXdxFs9+xlOH3cGln3gV3bpfbUxkypjk8kcuTgGmU09Iq6kZIL9iiroerm+/1CUjBzo2CECp/cl5nFtsDGxjLt0n30SP1CyBiq38ena0A/pWLrY1b7pXwymzZ92h9xT5Eixkq3+UYt0u8F/rfhTClnLDWY3bk0uLtxJVnDRGlJCmJCcpGbxlwFXBkZ21QjA9KTzjfQXqqfm6EeKdi0grsBV4Tq/ikPmvlvQINyNCW3luHCQkvdtmXh2o4IPgjpscgA85v0vsWaAmmOQACNKHZe9Km+RH9rx/Z5RErsbZZalCO9oF0wUwTmjUwY++KVpdeb6QiD9OY7Ay4o9smjbnb1C63zp2O1Qw3eklqU3Cp8wibrp20t7zIOh9qZU/iCYoM6sJ/XeXxpmaz7tM1omdHieD+BhSgLCLMvTlvHKjY8rFUkXMFPEe1vr77kuc4CmHYz0U0xy6/xs6ElDZL9NDegAFR7oIuXFHeDCmxMFMXM/+BpJn2CnLsmmMI5gzBRZsvCJsBgB"}}}
+
+data: {"type":"reasoning-end","id":"2"}
+
+data: {"type":"text-start","id":"3"}
+
+data: {"type":"text-delta","id":"3","delta":"Z"}
+
+data: {"type":"text-delta","id":"3","delta":"ig 0.16.0 "}
+
+data: {"type":"text-delta","id":"3","delta":"(April 13, 2026"}
+
+data: {"type":"text-delta","id":"3","delta":") is the newest stable version"}
+
+data: {"type":"text-delta","id":"3","delta":" I can confirm"}
+
+data: {"type":"text-end","id":"3","citations":[{"source":{"type":"source","sourceType":"url","id":"http://mise-versions.jdx.dev/tools/zig","url":"http://mise-versions.jdx.dev/tools/zig","title":"zig","providerMetadata":{"anthropic":{"type":"web_search_result_location","cited_text":"# zig\nGeneral-purpose programming language and toolchain\n\ncore:zig\u00b70.16.0\u00b723 versions\u00b724,926 downloads\n\nInstall with mise:\n\nmise use zig@latest\n\n## Do...","url":"http://mise-versions.jdx.dev/tools/zig","title":"zig","encrypted_index":"EXAMPLE_ENCRYPTED_INDEX"}}},"citedText":"# zig\nGeneral-purpose programming language and toolchain\n\ncore:zig\u00b70.16.0\u00b723 versions\u00b724,926 downloads\n\nInstall with mise:\n\nmise use zig@latest\n\n## Do..."}],"providerMetadata":{"anthropic":{"citations":[{"type":"web_search_result_location","cited_text":"# zig\nGeneral-purpose programming language and toolchain\n\ncore:zig\u00b70.16.0\u00b723 versions\u00b724,926 downloads\n\nInstall with mise:\n\nmise use zig@latest\n\n## Do...","url":"http://mise-versions.jdx.dev/tools/zig","title":"zig","encrypted_index":"EXAMPLE_ENCRYPTED_INDEX"}]}}}
+
+data: {"type":"text-start","id":"4"}
+
+data: {"type":"text-delta","id":"4","delta":", though "}
+
+data: {"type":"text-end","id":"4"}
+
+data: {"type":"text-start","id":"5"}
+
+data: {"type":"text-delta","id":"5","delta":"Wikiped"}
+
+data: {"type":"text-delta","id":"5","delta":"ia's infobox points"}
+
+data: {"type":"text-delta","id":"5","delta":" to a 0.17 \""}
+
+data: {"type":"text-delta","id":"5","delta":"(Beta)\" dated"}
+
+data: {"type":"text-delta","id":"5","delta":" 2 October 2026"}
+
+data: {"type":"text-end","id":"5","citations":[{"source":{"type":"source","sourceType":"url","id":"https://en.wikipedia.org/wiki/Zig_(programming_language)","url":"https://en.wikipedia.org/wiki/Zig_(programming_language)","title":"Zig (programming language)","providerMetadata":{"anthropic":{"type":"web_search_result_location","cited_text":"- Developer: Zig Software Foundation\n\n- Stable release: 0.17 (Beta) / 2 October 2026; 36 days ago\n\n- Implementation language: Zig\n\n- Filename extensio...","url":"https://en.wikipedia.org/wiki/Zig_(programming_language)","title":"Zig (programming language)","encrypted_index":"EXAMPLE_ENCRYPTED_INDEX"}}},"citedText":"- Developer: Zig Software Foundation\n\n- Stable release: 0.17 (Beta) / 2 October 2026; 36 days ago\n\n- Implementation language: Zig\n\n- Filename extensio..."}],"providerMetadata":{"anthropic":{"citations":[{"type":"web_search_result_location","cited_text":"- Developer: Zig Software Foundation\n\n- Stable release: 0.17 (Beta) / 2 October 2026; 36 days ago\n\n- Implementation language: Zig\n\n- Filename extensio...","url":"https://en.wikipedia.org/wiki/Zig_(programming_language)","title":"Zig (programming language)","encrypted_index":"EXAMPLE_ENCRYPTED_INDEX"}]}}}
+
+data: {"type":"text-start","id":"6"}
+
+data: {"type":"text-delta","id":"6","delta":", so"}
+
+data: {"type":"text-delta","id":"6","delta":" check"}
+
+data: {"type":"text-delta","id":"6","delta":" wh"}
+
+data: {"type":"text-delta","id":"6","delta":"ether "}
+
+data: {"type":"text-delta","id":"6","delta":"0.17 has land"}
+
+data: {"type":"text-delta","id":"6","delta":"ed: http://mise-vers"}
+
+data: {"type":"text-delta","id":"6","delta":"ions.jdx.dev"}
+
+data: {"type":"text-delta","id":"6","delta":"/tools/zig"}
+
+data: {"type":"text-end","id":"6"}
+
+data: {"type":"finish","finishReason":{"unified":"stop","raw":"end_turn"},"usage":{"inputTokens":{"total":14025,"noCache":14025,"cacheRead":0,"cacheWrite":0},"outputTokens":{"total":549,"text":195,"reasoning":354},"raw":{"service_tier":"standard","input_tokens":14025,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":549,"inference_geo":"global","speed":"standard","output_tokens_details":{"thinking_tokens":354},"server_tool_use":{"web_search_requests":1,"web_fetch_requests":0}}},"providerMetadata":{"anthropic":{"usage":{"service_tier":"standard","input_tokens":14025,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":549,"inference_geo":"global","speed":"standard","output_tokens_details":{"thinking_tokens":354},"server_tool_use":{"web_search_requests":1,"web_fetch_requests":0}},"stopSequence":null,"serviceTier":"standard","inputTransformations":[],"iterations":null,"container":null,"contextManagement":null},"gateway":{"routing":{"originalModelId":"anthropic/claude-fable-5.2","resolvedProvider":"anthropic","fallbacksAvailable":["bedrock","vertexAnthropic"],"canonicalSlug":"anthropic/claude-fable-5.2","finalProvider":"anthropic","modelAttemptCount":1,"modelAttempts":[{"canonicalSlug":"anthropic/claude-fable-5.2","success":true,"providerAttemptCount":1,"providerAttempts":[{"provider":"anthropic","credentialType":"system","success":true,"startTime":0,"endTime":0,"providerRequestId":"example","statusCode":200,"providerResponseId":"example","inferenceEndpoint":{"slug":"example","scope":"global"}}]}],"totalProviderAttemptCount":1,"clientSessionId":"session_example","clientSessionIdSource":"fingerprint"},"cost":"0.14416","marketCost":"0.14416","surchargeCost":"0.0001","gatewayCost":"0.14426","inferenceCost":"0.13416","inputInferenceCost":"0.1122","outputInferenceCost":"0.02196","providerAllowlistCost":"0.0001","generationId":"gen_EXAMPLE","billableWebSearchCalls":1}}}
+

@@ -1778,6 +1778,13 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
         {
             return "parallel_search";
         }
+        if (std.mem.eql(u8, tool_type.string, "provider") and
+            std.mem.eql(u8, name.string, "native_web_search"))
+        {
+            for ([_][]const u8{ "anthropic.web_search_20250305", "openai.web_search", "google.google_search" }) |native_id| {
+                if (std.mem.eql(u8, id.string, native_id)) return "native_web_search";
+            }
+        }
     }
     return null;
 }

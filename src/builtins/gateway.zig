@@ -29,6 +29,7 @@ const shared_types = @import("../core/shared/types.zig");
 const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
+const web_search_slots = @import("../core/tooling/web_search_slots.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
@@ -118,6 +119,7 @@ pub const default_web_search_provider = web_search_provider.Provider{
     .policy = default_web_search_policy,
     .input_overhead_bytes = web_search_system_prompt.len,
     .preferred_backends_fn = resolvePreferredWebSearchBackends,
+    .slot_backend_fn = backendForSlot,
     .execute_fn = executeWebSearchProvider,
 };
 
@@ -305,16 +307,27 @@ fn buildAgentToolsJson(
     }
 
     for (request.tools.advertised_names) |name| {
+        if (request.tools.advertisedFunction(name)) |function| {
+            if (!first) try out.writer.writeByte(',');
+            first = false;
+            try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, function);
+            continue;
+        }
+        const tool = request.tools.registry.lookup(name) orelse return error.AdvertisedToolNotRegistered;
+        const write_advertisement = tool.write_provider_advertisement_fn orelse
+            return error.AdvertisedToolSchemaMissing;
+        var advertisement: std.Io.Writer.Allocating = .init(alloc);
+        defer advertisement.deinit();
+        try write_advertisement(alloc, &advertisement.writer, .{
+            .model = request.model,
+            .web_search = request.tools.web_search,
+        });
+        // A provider tool with nothing to send, such as web search with no
+        // slot left for the team, stays out of this request.
+        if (advertisement.written().len == 0) continue;
         if (!first) try out.writer.writeByte(',');
         first = false;
-        if (request.tools.advertisedFunction(name)) |function| {
-            try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, function);
-        } else {
-            const tool = request.tools.registry.lookup(name) orelse return error.AdvertisedToolNotRegistered;
-            const write_advertisement = tool.write_provider_advertisement_fn orelse
-                return error.AdvertisedToolSchemaMissing;
-            try write_advertisement(alloc, &out.writer);
-        }
+        try out.writer.writeAll(advertisement.written());
     }
     for (request.tools.additional_functions) |tool| {
         if (toolNameSelected(request.tools.advertised_names, tool.name)) continue;
@@ -1001,11 +1014,63 @@ pub fn preferredWebSearchBackendsOverride(raw: ?[]const u8) !?[]const web_search
     return error.InvalidWebSearchBackend;
 }
 
-pub fn selectedWebSearchBackend() !web_search_contract.SearchBackendId {
+/// The search tool one request carries, caller owned, or null for none: the
+/// first usable slot of the view's order for `model`
+/// (`src/core/tooling/web_search_slots.zig`). The internal
+/// `FX_WEB_SEARCH_BACKEND` replaces the order with its one backend.
+pub fn webSearchToolJson(alloc: Allocator, model: []const u8, view: web_search_slots.View) !?[]u8 {
+    var effective = view;
     if (try preferredWebSearchBackendsOverride(io_mod.getenv("FX_WEB_SEARCH_BACKEND"))) |backends| {
-        return backends[0];
+        effective.order = .{ .len = 1 };
+        effective.order.slots[0] = slotForBackend(backends[0]);
     }
-    return default_web_search_backend_order[0];
+    const slot = effective.slot(web_search_slots.nativeSupported(model));
+    const backend = switch (slot) {
+        .none => return null,
+        .native => return try alloc.dupe(u8, nativeSearchToolJson(web_search_slots.nativeFamily(model).?)),
+        .exa => exa_search_backend_id,
+        .parallel => parallel_search_backend_id,
+        .perplexity => perplexity_search_backend_id,
+    };
+    const policy = default_web_search_policy;
+    const provider_tools = try providerToolsJson(alloc, .{
+        .backend = backend,
+        .max_results = policy.max_results,
+        .max_output_tokens = policy.max_output_tokens,
+        .max_output_chars = policy.max_output_chars,
+    });
+    defer alloc.free(provider_tools);
+    if (provider_tools.len < 2 or provider_tools[0] != '[' or provider_tools[provider_tools.len - 1] != ']') {
+        return error.InvalidGatewayAdvertisement;
+    }
+    return try alloc.dupe(u8, provider_tools[1 .. provider_tools.len - 1]);
+}
+
+/// The provider's own search tool. Every family uses the name
+/// `native_web_search`, which AI Gateway maps back in the stream, so it never
+/// meets fx's own `web_search` tool.
+fn nativeSearchToolJson(family: web_search_slots.NativeFamily) []const u8 {
+    return switch (family) {
+        .anthropic => "{\"type\":\"provider\",\"id\":\"anthropic.web_search_20250305\",\"name\":\"native_web_search\",\"args\":{\"maxUses\":8}}",
+        .openai => "{\"type\":\"provider\",\"id\":\"openai.web_search\",\"name\":\"native_web_search\",\"args\":{}}",
+        .google => "{\"type\":\"provider\",\"id\":\"google.google_search\",\"name\":\"native_web_search\",\"args\":{}}",
+    };
+}
+
+fn slotForBackend(backend: web_search_contract.SearchBackendId) web_search_slots.Slot {
+    if (backend.eql(perplexity_search_backend_id)) return .perplexity;
+    if (backend.eql(parallel_search_backend_id)) return .parallel;
+    return .exa;
+}
+
+/// The Gateway backend of a Gateway-run slot, for the search worker.
+pub fn backendForSlot(slot: web_search_slots.Slot) ?web_search_contract.SearchBackendId {
+    return switch (slot) {
+        .exa => exa_search_backend_id,
+        .parallel => parallel_search_backend_id,
+        .perplexity => perplexity_search_backend_id,
+        .native, .none => null,
+    };
 }
 
 fn resolvePreferredWebSearchBackends(_: ?*anyopaque) !?[]const web_search_contract.SearchBackendId {
@@ -1169,6 +1234,9 @@ pub fn executeGatewayWorker(
         @constCast(request.cancel_flag),
     );
     defer stream.deinit(alloc);
+    if (stream.status == .bad_request and web_search_slots.refusedSlots(stream.err_body orelse "") != 0) {
+        return error.WebSearchToolRefused;
+    }
     if (stream.status != .ok) return error.GatewayRequestFailed;
     return normalizeGatewayCompletion(alloc, request, stream.completion, on_progress, progress_ctx);
 }

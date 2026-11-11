@@ -115,7 +115,16 @@ fn writeKey(jw: *std.json.Stringify, key: settings_keys.Key) !void {
             try jw.objectField("items");
             try jw.beginObject();
             try field(jw, "type", "string");
+            if (key.values.len > 0) {
+                try jw.objectField("enum");
+                try jw.write(key.values);
+            }
             try jw.endObject();
+            // A list of listed names takes each name once.
+            if (key.values.len > 0) {
+                try jw.objectField("uniqueItems");
+                try jw.write(true);
+            }
             if (key.max_items) |max_items| {
                 try jw.objectField("maxItems");
                 try jw.write(max_items);

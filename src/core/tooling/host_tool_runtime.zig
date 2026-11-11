@@ -249,6 +249,7 @@ fn irreversible(_: tool_dispatch.ToolInput) bool {
 fn writeTestProviderAdvertisement(
     _: Allocator,
     writer: *std.Io.Writer,
+    _: tool_dispatch.ProviderAdvertisementContext,
 ) tool_dispatch.ProviderAdvertisementError!void {
     try writer.writeAll("{\"type\":\"provider\",\"id\":\"gateway.test_search\",\"name\":\"test_search\",\"args\":{}}");
 }

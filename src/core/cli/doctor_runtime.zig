@@ -248,6 +248,7 @@ fn configLayerRejected(
             .retired_skill_match_fuzzy,
             .invalid_context_limits,
             .invalid_tool_placement,
+            .invalid_web_search_backends,
             .invalid_ultrafast_mode_override,
             .invalid_skill_symlink_authorities,
             => return true,

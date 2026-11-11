@@ -1,4 +1,5 @@
 const std = @import("std");
+const web_search_slots = @import("../../tooling/web_search_slots.zig");
 const toolbox = @import("../../tooling/toolbox.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const types = @import("../../shared/types.zig");
@@ -64,6 +65,10 @@ pub const Config = struct {
     /// of its `order` preference.
     provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
+    /// The host's web search slots. Each request carries the view for its
+    /// team, and a Gateway refusal of the search tool is recorded here; null
+    /// sends the default order.
+    web_search: ?*web_search_slots.State = null,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,

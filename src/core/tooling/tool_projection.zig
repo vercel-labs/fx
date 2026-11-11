@@ -192,6 +192,7 @@ const test_grep_files = blk: {
 fn writeTestWebSearchProviderAdvertisement(
     _: Allocator,
     writer: *std.Io.Writer,
+    _: tool_dispatch.ProviderAdvertisementContext,
 ) tool_dispatch.ProviderAdvertisementError!void {
     try writer.writeAll("{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{}}");
 }
@@ -370,6 +371,7 @@ const test_read_tool_result = blk: {
 fn writeTestMirrorProviderAdvertisement(
     _: Allocator,
     writer: *std.Io.Writer,
+    _: tool_dispatch.ProviderAdvertisementContext,
 ) tool_dispatch.ProviderAdvertisementError!void {
     try writer.writeAll("{\"type\":\"provider\",\"id\":\"gateway.mirror_search\",\"name\":\"mirror_search\",\"args\":{}}");
 }

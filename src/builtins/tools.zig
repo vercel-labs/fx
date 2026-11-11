@@ -391,22 +391,16 @@ pub const web_fetch = ToolSpec{
     .irreversible_fn = web_fetch_impl.isIrreversible,
 };
 
+/// Writes the search tool of the request's first usable slot, or nothing
+/// when no slot is left (`src/core/tooling/web_search_slots.zig`).
 fn writeWebSearchGatewayAdvertisement(
     alloc: Allocator,
     writer: *std.Io.Writer,
+    context: tool_dispatch.ProviderAdvertisementContext,
 ) tool_dispatch.ProviderAdvertisementError!void {
-    const policy = builtin_gateway.default_web_search_policy;
-    const provider_tools = try builtin_gateway.providerToolsJson(alloc, .{
-        .backend = try builtin_gateway.selectedWebSearchBackend(),
-        .max_results = policy.max_results,
-        .max_output_tokens = policy.max_output_tokens,
-        .max_output_chars = policy.max_output_chars,
-    });
-    defer alloc.free(provider_tools);
-    if (provider_tools.len < 2 or provider_tools[0] != '[' or provider_tools[provider_tools.len - 1] != ']') {
-        return error.InvalidGatewayAdvertisement;
-    }
-    try writer.writeAll(provider_tools[1 .. provider_tools.len - 1]);
+    const tool_json = try builtin_gateway.webSearchToolJson(alloc, context.model, context.web_search) orelse return;
+    defer alloc.free(tool_json);
+    try writer.writeAll(tool_json);
 }
 
 pub const web_search = ToolSpec{
@@ -1211,7 +1205,7 @@ test "built-in web_search owns its Gateway provider advertisement" {
 
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try write_advertisement(std.testing.allocator, &out.writer);
+    try write_advertisement(std.testing.allocator, &out.writer, .{ .model = "xai/grok-4" });
     const json = try out.toOwnedSlice();
     defer std.testing.allocator.free(json);
 

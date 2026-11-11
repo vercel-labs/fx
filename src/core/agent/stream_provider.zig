@@ -1,4 +1,5 @@
 const std = @import("std");
+const web_search_slots = @import("../tooling/web_search_slots.zig");
 const observation = @import("runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -199,6 +200,8 @@ pub const ToolSelection = struct {
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     additional_functions: []const model_tool_schema.FunctionSchema = &.{},
     selected_dynamic: []const DynamicFunctionTool = &.{},
+    /// The web search slot order and the slots this request's team refused.
+    web_search: web_search_slots.View = .{},
 
     pub fn advertisedFunction(self: ToolSelection, name: []const u8) ?model_tool_schema.FunctionSchema {
         for (self.advertised_functions) |function| {

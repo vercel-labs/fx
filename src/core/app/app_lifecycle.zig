@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const env_settings = @import("../config/env_settings.zig");
+const web_search_slots = @import("../tooling/web_search_slots.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -255,6 +256,8 @@ pub const StartupState = struct {
     /// empty keeps the reviewer's compiled default.
     review_model: []u8 = &.{},
     first_call_tool_choice: types.ToolChoice = .auto,
+    /// The web search slots in order, from `web_search_backends`.
+    web_search_backends: web_search_slots.Order = web_search_slots.default_order,
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
@@ -921,6 +924,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.effort = settings.effort orelse .auto;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
+    state.web_search_backends = settings.web_search_backends orelse web_search_slots.default_order;
     state.provider_strict = settings.provider_strict orelse false;
     if (settings.provider_order) |order| {
         const owned_order = try alloc.alloc([]const u8, order.len);

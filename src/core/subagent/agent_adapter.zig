@@ -328,6 +328,7 @@ pub fn run(
             .advertised_tool_names = child_tool_names,
             .advertised_functions = child_functions,
             .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
+            .web_search = config.tool_context.web_search_slots,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,

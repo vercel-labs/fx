@@ -1134,6 +1134,7 @@ const AskContext = struct {
             .on_web_fetch_progress = onWebFetchProgress,
             .web_search_runtime_ready = false,
             .web_search_backend = if (provider_capabilities.fx_search) self.web_search_runtime.dispatchBackend() else null,
+            .web_search_slots = &self.web_search_runtime.slots,
             .web_search_progress_ctx = @ptrCast(self),
             .on_web_search_progress = onWebSearchProgress,
             .model_capability_resolver = .{
@@ -1678,6 +1679,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.provider_strict = startup.provider_strict;
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
+    ctx.web_search_runtime.slots.setOrder(startup.web_search_backends);
     ctx.permission_mode = permission_mode;
     ctx.reviewer_model = startup.review_model;
     ctx.mode_id = mode_id;
@@ -1911,6 +1913,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
+        .web_search = &ctx.web_search_runtime.slots,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,

@@ -67,6 +67,7 @@
   { "file": "tui-status-session.test.ts", "weight": 45 },
   { "file": "tui-terminal-tool.test.ts", "weight": 177 },
   { "file": "tui-transcript-window.test.ts", "weight": 42 },
+  { "file": "tui-web-search-slots.test.ts", "weight": 7 },
   { "file": "ultrafast-fake-gateway.test.ts", "weight": 8 },
   { "file": "vision-route-fake-gateway.test.ts", "weight": 20 },
   { "file": "web-fetch-fake-network.test.ts", "weight": 3 },
@@ -75,5 +76,6 @@
   { "file": "web-search-fake-gateway.test.ts", "weight": 5 },
   { "file": "web-search-live.test.ts", "weight": 1 },
   { "file": "web-search-permission-progress.test.ts", "weight": 11 },
+  { "file": "web-search-slots.test.ts", "weight": 9 },
   { "file": "yolo-permission-mode.test.ts", "weight": 29 }
 ]

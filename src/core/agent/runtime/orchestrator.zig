@@ -19,6 +19,7 @@ const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const web_search_slots = @import("../../tooling/web_search_slots.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
@@ -3074,6 +3075,7 @@ test "provider executed result reports one observed request only for search alia
         "exa_search",
         "parallel_search",
         "perplexity_search",
+        "native_web_search",
     };
     for (aliases) |name| {
         const result = providerExecutedResult(.{
@@ -4674,6 +4676,47 @@ fn waitForUser(
         };
     };
     return if (try request_recovery.waitForSend() != null) .resend else .cancelled;
+}
+
+/// The search slots a request may use: its team's view without the slots
+/// already refused to this request.
+fn searchView(slots: ?*web_search_slots.State, team: ?[]const u8, refused: u8) web_search_slots.View {
+    var view = if (slots) |state| state.view(team) else web_search_slots.View{};
+    view.blocked |= refused;
+    return view;
+}
+
+/// The search slots a Gateway 400 refuses, or 0 for any other failure.
+fn searchToolRefusal(failure: agent_stream_provider.Failure) u8 {
+    if (failure.kind != .invalid_request) return 0;
+    return web_search_slots.refusedSlots(failure.detail orelse "");
+}
+
+/// One notice for each slot this refusal newly blocked, naming what the
+/// request uses now.
+fn pushSearchSlotNotices(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    newly: u8,
+    next: web_search_slots.Slot,
+) !void {
+    for (web_search_slots.configurable) |slot| {
+        if (newly & (@as(u8, 1) << @backingInt(slot)) == 0) continue;
+        const message = switch (next) {
+            .none => try arena.print("Web search: {s} is not available for this team; continuing without web search.", .{slot.name()}),
+            .native => try arena.print("Web search: {s} is not available for this team; using the model's own search.", .{slot.name()}),
+            else => try arena.print("Web search: {s} is not available for this team; using {s}.", .{ slot.name(), next.name() }),
+        };
+        try deps.push_system_notice(deps.ctx, message);
+    }
+}
+
+test "a Gateway search tool refusal names its slots and nothing else does" {
+    const refusal = "{\"error\":{\"message\":\"Gateway-executed tool(s) are not available for this team: gateway.exa_search. Remove the tool(s) to proceed.\",\"type\":\"invalid_request_error\"}}";
+    try std.testing.expectEqual(@as(u8, 1), searchToolRefusal(.{ .kind = .invalid_request, .detail = @constCast(refusal) }));
+    try std.testing.expectEqual(@as(u8, 0), searchToolRefusal(.{ .kind = .server_error, .detail = @constCast(refusal) }));
+    try std.testing.expectEqual(@as(u8, 0), searchToolRefusal(.{ .kind = .invalid_request, .detail = @constCast("invalid tool schema") }));
+    try std.testing.expectEqual(@as(u8, 0), searchToolRefusal(.{ .kind = .invalid_request }));
 }
 
 fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
@@ -7768,6 +7811,11 @@ fn processQueuedPromptLoop(
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var request_size_retries: usize = 0;
+        // Search slots this request moved past after Gateway refusals, and
+        // the slots refused to it, which it never sends again even when the
+        // team's shared set no longer holds them.
+        var search_slot_moves: usize = 0;
+        var search_refused: u8 = 0;
         // The images the last request refused for its size carried.
         var request_images_last_refused: ?usize = null;
         var recovery_has_unexecuted_tool_start = false;
@@ -8095,6 +8143,7 @@ fn processQueuedPromptLoop(
                     .advertised_names = config.advertised_tool_names,
                     .advertised_functions = config.advertised_functions,
                     .selected_dynamic = advertised_dynamic_tools,
+                    .web_search = searchView(config.web_search, job.gateway_team, search_refused),
                 },
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
@@ -8838,6 +8887,34 @@ fn processQueuedPromptLoop(
                     continue;
                 }
             }
+            // AI Gateway refused the request's search tool for this team.
+            // Nothing ran, so the request goes again at once with the next
+            // slot; each slot is passed at most once
+            // (`tests/tla/web_search/WebSearchSlots.tla` BoundedSends).
+            if (response_failure) |failure| if (config.web_search) |slots| if (!config.cancel_flag.load(.seq_cst) and
+                attemptReplaySafe(&stream_ctx) and
+                search_slot_moves < web_search_slots.max_order_len)
+            {
+                const refused = searchToolRefusal(failure);
+                if (refused != 0) {
+                    const newly = slots.block(job.gateway_team, refused);
+                    search_slot_moves += 1;
+                    search_refused |= refused;
+                    const next = searchView(slots, job.gateway_team, search_refused).slot(web_search_slots.nativeSupported(gateway_model));
+                    debug_trace.eventf("gateway", "web_search_slot_refused", step_ctx, "refused={d} newly={d} next={s} moves={d}", .{
+                        refused,
+                        newly,
+                        next.name(),
+                        search_slot_moves,
+                    });
+                    try pushSearchSlotNotices(deps, arena, newly, next);
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    reset_stream_for_next_attempt = true;
+                    continue;
+                }
+            };
             const settled_disposition = if (streamSucceeded(stream_result))
                 types.classifyProviderCompletion(response_completion)
             else

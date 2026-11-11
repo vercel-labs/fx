@@ -251,13 +251,14 @@ function unavailable(): Response {
   });
 }
 
-// A request the gateway refuses, as it did a tool a team's providers don't
-// allow; fx waits for the user, or the parent, to send it again.
+// A request the gateway refuses; fx waits for the user, or the parent, to
+// send it again. A refused web search tool would not do: fx moves to the next
+// search slot on its own.
 function refused(): Response {
   return new Response(JSON.stringify({
     error: {
       type: "invalid_request_error",
-      message: "Gateway-executed tool(s) are not available for this team: gateway.exa_search.",
+      message: "The request is not valid for this model.",
     },
   }), { status: 400, headers: { "content-type": "application/json" } });
 }

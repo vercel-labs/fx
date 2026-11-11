@@ -1,6 +1,7 @@
 const std = @import("std");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
+const web_search_slots = @import("web_search_slots.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -16,6 +17,10 @@ pub const Inputs = struct {
 
 pub const PreferredBackendsFn = *const fn (?*anyopaque) anyerror!?[]const web_search_contract.SearchBackendId;
 
+/// The provider's backend for a web search slot, or null for a slot the
+/// provider does not run itself.
+pub const SlotBackendFn = *const fn (web_search_slots.Slot) ?web_search_contract.SearchBackendId;
+
 pub const ExecuteFn = *const fn (
     ?*anyopaque,
     Allocator,
@@ -30,6 +35,8 @@ pub const Provider = struct {
     policy: web_search_policy.WebSearchPolicy,
     input_overhead_bytes: usize = 0,
     preferred_backends_fn: PreferredBackendsFn,
+    /// Set when the provider's backends follow the web search slots.
+    slot_backend_fn: ?SlotBackendFn = null,
     execute_fn: ExecuteFn,
 
     pub fn preferredBackends(self: Provider) !?[]const web_search_contract.SearchBackendId {
