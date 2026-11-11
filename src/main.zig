@@ -5873,6 +5873,69 @@ test "the agent list holds a subagent among the working ones until its finished 
     try std.testing.expectEqualStrings("idle", applied.rows[1].state);
 }
 
+/// What main's "waiting on N subagents" row counts, with `children` owned by
+/// main. The host is only compared, never read, so it is set for this call
+/// alone: the list reads a host it is given.
+fn waitCountOwnedByMain(app: *App, children: []const *app_agents_runtime.ChildAgent) usize {
+    var owner_host: subagent_tool_host.Runtime = undefined;
+    app.main_agent.session_persistence.subagent_host = &owner_host;
+    for (children) |child| child.parent_host = &owner_host;
+    defer {
+        app.main_agent.session_persistence.subagent_host = null;
+        for (children) |child| child.parent_host = null;
+    }
+    return App.AgentsAppRuntime.subagentWaitCount(app);
+}
+
+test "an idle agent's waiting row counts a subagent until its finished turn is applied" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const finishing = try addTestChildAgent(&app, "finishing");
+    const asking = try addTestChildAgent(&app, "asking");
+    const children = [_]*app_agents_runtime.ChildAgent{ finishing, asking };
+    defer finishing.agent.session.agent.history.deinit(alloc);
+    defer asking.agent.session.agent.history.deinit(alloc);
+    defer {
+        var left = finishing.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+        left.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
+
+    // The finishing subagent's worker has ended its turn, but the loop has not
+    // applied the finish yet. The list shows it working, so main's row counts
+    // it too.
+    try finishing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    try std.testing.expect(!finishing.agent.worker.isProcessing());
+    try runtime.openMenu(&app);
+    try std.testing.expectEqualStrings("working", runtime.menuProjection(&app).rows[1].state);
+    try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
+
+    // Once the loop has applied the finish, nothing is left to wait for.
+    var events = finishing.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try std.testing.expectEqualStrings("idle", runtime.menuProjection(&app).rows[1].state);
+    try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
+
+    // A subagent that waits for the user's approval is still one main waits on,
+    // though the list shows it as needing approval.
+    asking.agent.worker.worker_processing = true;
+    defer asking.agent.worker.worker_processing = false;
+    app.approval_lender = asking;
+    defer app.approval_lender = null;
+    try std.testing.expectEqualStrings("needs approval", runtime.menuProjection(&app).rows[2].state);
+    try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
+}
+
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });

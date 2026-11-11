@@ -121,6 +121,13 @@ pub const ChildAgent = struct {
         if (self.agent.child_run) |*run| if (run.inFlight()) return true;
         return turnInFlight(&self.agent) or self.agent.worker.hasPendingEvents();
     }
+
+    /// Whether it has events for the loop to handle or assistant text left to
+    /// pace out in `pacer`, the pacer that holds its text: its own slot's
+    /// while it is hidden, the app's while it is on screen (`pacerOf`).
+    fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+    }
 };
 
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
@@ -698,10 +705,10 @@ pub fn Runtime(comptime App: type) type {
             try body(context, app, agent);
         }
 
-        /// True when `child` has events for the loop to handle or assistant
-        /// text left to pace out.
+        /// True when the hidden `child` has events for the loop to handle or
+        /// assistant text left to pace out.
         pub fn hasPendingWork(child: *ChildAgent) bool {
-            return child.agent.worker.hasPendingEvents() or child.screen.pacer.hasPending();
+            return child.hasUnapplied(&child.screen.pacer);
         }
 
         /// Handles the work of every hidden agent that has any, each in its
@@ -1330,7 +1337,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// How many of the agent on screen's own subagents have a turn going
-        /// while its own turn has ended; 0 while it has a turn of its own.
+        /// while its own turn has ended; 0 while it has a turn of its own. A
+        /// subagent whose turn has ended but is not applied yet counts too,
+        /// as `stateOf` shows it working in the list.
         pub fn subagentWaitCount(app: *App) usize {
             const screen = agents.screenAgentOf(app);
             if (turnInFlight(screen)) return 0;
@@ -1338,7 +1347,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent) continue;
                 if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent)) count += 1;
+                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
             }
             return count;
         }
@@ -2012,8 +2021,13 @@ pub fn Runtime(comptime App: type) type {
         /// turn reads the run installed on the agent until its last event is
         /// applied, so nothing replaces that run before then.
         fn turnGoing(app: *App, child: *ChildAgent) bool {
-            const pacer = if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
-            return child.workGoing() or pacer.hasPending();
+            return child.workGoing() or pacerOf(app, child).hasPending();
+        }
+
+        /// The pacer that holds `child`'s assistant text: the app's while the
+        /// child is on screen, its own slot's otherwise.
+        fn pacerOf(app: *App, child: *ChildAgent) *AssistantPacer {
+            return if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
         }
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
@@ -2025,8 +2039,7 @@ pub fn Runtime(comptime App: type) type {
         /// finish while the reply is shown. Its reply reaches the history
         /// only after that.
         fn resultPending(app: *App, child: *ChildAgent) bool {
-            const pacer = if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
-            return child.agent.worker.hasPendingEvents() or pacer.hasPending();
+            return child.hasUnapplied(pacerOf(app, child));
         }
 
         /// What agent `target`, null for the first instance, waits for or
