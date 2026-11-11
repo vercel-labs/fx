@@ -695,7 +695,11 @@ const StoryTally = struct {
     read_paths: std.ArrayList([]const u8) = .empty,
     /// read_file calls whose saved arguments name no path, as in old records.
     unnamed_reads: usize = 0,
-    searches: usize = 0,
+    /// Searches by tool and pattern, each once, so a pattern searched in
+    /// two folders counts as one.
+    search_keys: std.ArrayList([]const u8) = .empty,
+    /// Searches that name no pattern, as in old records, and other listings.
+    unkeyed_searches: usize = 0,
     web_searches: usize = 0,
     web_reads: usize = 0,
     commands: usize = 0,
@@ -801,8 +805,10 @@ const StoryTally = struct {
                     self.web_searches += 1;
                 } else if (std.mem.eql(u8, name, "web_fetch")) {
                     self.web_reads += 1;
+                } else if (try storySearchKey(scratch, record)) |key| {
+                    try addDistinct(&self.search_keys, scratch, key);
                 } else {
-                    self.searches += 1;
+                    self.unkeyed_searches += 1;
                 }
             },
             .subagent => {
@@ -941,8 +947,9 @@ fn formatStoryHeader(
         try w.writeAll("Searched the toolbox");
     } else if (reads > 0) {
         try w.print("Read {d} {s}", .{ reads, pluralWord(reads, "file", "files") });
-    } else if (tally.searches > 0) {
-        try w.print("Searched for {d} {s}", .{ tally.searches, pluralWord(tally.searches, "pattern", "patterns") });
+    } else if (tally.search_keys.items.len + tally.unkeyed_searches > 0) {
+        const searches = tally.search_keys.items.len + tally.unkeyed_searches;
+        try w.print("Searched for {d} {s}", .{ searches, pluralWord(searches, "pattern", "patterns") });
     } else if (tally.opens > 0) {
         try w.print("Opened {d} {s}", .{ tally.opens, pluralWord(tally.opens, "file", "files") });
     } else if (tally.other_failures > 0) {
@@ -1004,6 +1011,8 @@ const StoryRowKind = enum {
     subagent,
     /// A subagent wait or status that names no agent, keyed by its action.
     subagent_wait,
+    /// The same pattern with the same search tool, in one folder or several.
+    search,
 };
 
 const StoryIdentity = struct {
@@ -1019,7 +1028,74 @@ const StoryRow = struct {
     count: usize = 1,
     /// How many of the calls that share the row failed.
     failures: usize = 0,
+    /// The folders a search row looked in, each once, in the order of its
+    /// calls; "" for a search that named none.
+    search_paths: std.ArrayList([]const u8) = .empty,
 };
+
+/// The key that joins searches for the same pattern with the same tool,
+/// wherever they look. Null for other calls.
+fn storySearchKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const name = record.tool_name;
+    if (!std.mem.eql(u8, name, "grep_files") and !std.mem.eql(u8, name, "glob_files")) return null;
+    const pattern = storyArgString(scratch, record, "pattern") orelse return null;
+    return try scratch.print("{s}\x00{s}", .{ name, pattern });
+}
+
+fn addSearchPath(scratch: std.mem.Allocator, row: *StoryRow, detail: ?*const ToolDetailRecord) !void {
+    if (row.identity.kind != .search) return;
+    const record = detail orelse return;
+    const path = storyArgString(scratch, record, "path") orelse "";
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    try StoryTally.addDistinct(&row.search_paths, scratch, if (trimmed.len == 0 and path.len > 0) "/" else trimmed);
+}
+
+/// How many leading parts two paths share, split at "/".
+fn sharedPathParts(a: []const u8, b: []const u8) usize {
+    var a_parts = std.mem.splitScalar(u8, a, '/');
+    var b_parts = std.mem.splitScalar(u8, b, '/');
+    var count: usize = 0;
+    while (a_parts.next()) |a_part| {
+        const b_part = b_parts.next() orelse break;
+        if (!std.mem.eql(u8, a_part, b_part)) break;
+        count += 1;
+    }
+    return count;
+}
+
+/// A folder by the part of its path after the `shared` leading parts. The
+/// shared folder itself shows by its last part, and no path shows as ".".
+fn folderName(path: []const u8, shared: usize) []const u8 {
+    if (path.len == 0) return ".";
+    var rest = path;
+    var skipped: usize = 0;
+    while (skipped < shared) : (skipped += 1) {
+        const slash = std.mem.findScalar(u8, rest, '/') orelse {
+            rest = "";
+            break;
+        };
+        rest = rest[slash + 1 ..];
+    }
+    if (rest.len > 0) return rest;
+    const last = std.mem.findScalarLast(u8, path, '/') orelse return path;
+    return if (last + 1 < path.len) path[last + 1 ..] else path;
+}
+
+/// Names the folders of a search row by the part of each path that differs
+/// from the others, so "/w/reviews" and "/w/docs" are "reviews, docs". Up
+/// to three show, then "+N more". Every name is terminal-safe.
+fn searchFolderNames(scratch: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
+    var shared: usize = std.math.maxInt(usize);
+    for (paths[1..]) |path| shared = @min(shared, sharedPathParts(paths[0], path));
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    const shown = @min(paths.len, short_command_max_steps);
+    for (paths[0..shown], 0..) |path, position| {
+        if (position > 0) try out.writer.writeAll(", ");
+        try out.writer.print("{f}", .{text_utils.terminalSafe(folderName(path, shared))});
+    }
+    if (paths.len > shown) try out.writer.print(" +{d} more", .{paths.len - shown});
+    return out.written();
+}
 
 fn storyRowCallFailed(detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
@@ -1045,8 +1121,9 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             if (command.len > 0) return .{ .kind = .command, .key = command };
             return .{};
         },
-        .read => {
-            if (!std.mem.eql(u8, record.tool_name, "read_file")) return .{};
+        .read, .list => {
+            if (try storySearchKey(scratch, record)) |key| return .{ .kind = .search, .key = key };
+            if (kind != .read or !std.mem.eql(u8, record.tool_name, "read_file")) return .{};
             const path = storyArgString(scratch, record, "path") orelse return .{};
             return .{ .kind = .read, .key = path };
         },
@@ -1082,7 +1159,7 @@ fn collectStoryRows(
 
         const target: ?*StoryRow = switch (identity.kind) {
             .single => null,
-            .session, .subagent => blk: {
+            .session, .subagent, .search => blk: {
                 for (rows.items) |*row| {
                     if (row.identity.kind == identity.kind and std.mem.eql(u8, row.identity.key, identity.key)) break :blk row;
                 }
@@ -1111,6 +1188,7 @@ fn collectStoryRows(
             row.entry = entry;
             row.entry_id = entry_id;
             row.detail = detail;
+            try addSearchPath(scratch, row, detail);
             continue;
         }
         try rows.append(scratch, .{
@@ -1120,6 +1198,7 @@ fn collectStoryRows(
             .identity = identity,
             .failures = if (storyRowCallFailed(detail)) 1 else 0,
         });
+        try addSearchPath(scratch, &rows.items[rows.items.len - 1], detail);
     }
     return rows;
 }
@@ -1149,10 +1228,17 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) 
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
-    const display = if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
+    const phrase = if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
         short
     else
         try highlightCommandPhrase(scratch, full_phrase, row.detail, style.text_style) orelse full_phrase;
+    // A pattern searched in several folders names them, so its calls do not
+    // look like one search made twice.
+    const many_folders = row.identity.kind == .search and row.search_paths.items.len > 1;
+    const display = if (many_folders)
+        try scratch.print("{s} in {s}", .{ phrase, try searchFolderNames(scratch, row.search_paths.items) })
+    else
+        phrase;
     const passed_after_failing = row.failures > 0 and row.detail != null and
         row.detail.?.outcome != null and !storyCallFailed(row.detail);
     const suffix: []const u8 = if (row.count < 2) "" else switch (row.identity.kind) {
@@ -1162,6 +1248,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) 
             try scratch.print(" ×{d}", .{row.count}),
         .session => try scratch.print(" · {d} calls", .{row.count}),
         .read => try scratch.print(" · {d} parts", .{row.count}),
+        .search => if (many_folders) "" else try scratch.print(" ×{d}", .{row.count}),
         .single, .subagent, .subagent_wait => "",
     };
     return .{
@@ -4606,6 +4693,65 @@ test "repeated runs of one command share a row that keeps the earlier failures" 
     try std.testing.expect(std.mem.startsWith(u8, failed_bytes, "● Ran \x1b[38;5;252msh\x1b[39m test.sh ×3 ✗\n"));
     // The reason comes from the latest run: its first line that names a failure.
     try std.testing.expect(std.mem.find(u8, failed_bytes, "  ✗ exit 1 · FAIL quits on click") != null);
+}
+
+fn storySearchDetail(entry_id: u32, tool_name: []const u8, kind: types.ToolActivityKind, arguments_json: []const u8) ToolDetailRecord {
+    return .{
+        .entry_id = entry_id,
+        .tool_name = @constCast(tool_name),
+        .activity_kind = kind,
+        .arguments_json = @constCast(arguments_json),
+        .outcome = .completed,
+    };
+}
+
+test "searches for one pattern share a row that names their folders" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched P0\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched P0\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Matched *triage*\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        storySearchDetail(1, "grep_files", .read, "{\"pattern\":\"P0\",\"path\":\"/Users/example/fx/reviews\"}"),
+        storySearchDetail(2, "grep_files", .read, "{\"pattern\":\"P0\",\"path\":\"/Users/example/fx/docs/\"}"),
+        storySearchDetail(3, "glob_files", .list, "{\"pattern\":\"*triage*\",\"path\":\"/Users/example/fx\"}"),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    // The header counts patterns, not calls.
+    try std.testing.expectEqualStrings(
+        "● Searched for 2 patterns\n├ Searched P0 in reviews, docs\n└ Matched *triage*",
+        std.mem.trimEnd(u8, projection.entry_actions.items[0].override.bytes, "\n"),
+    );
+
+    // The same pattern in the same folder twice is one search made twice.
+    var again = try build(alloc, entries[0..2], &.{ details[0], storySearchDetail(2, "grep_files", .read, details[0].arguments_json.?) }, 120);
+    defer again.deinit(alloc);
+    try std.testing.expectEqualStrings("● Searched P0 ×2", std.mem.trimEnd(u8, again.entry_actions.items[0].override.bytes, "\n"));
+
+    // A grep and a glob for the same text do different things, so they keep
+    // their own rows.
+    const mixed = [_]ToolDetailRecord{ details[0], storySearchDetail(2, "glob_files", .list, "{\"pattern\":\"P0\"}") };
+    var apart = try build(alloc, entries[0..2], &mixed, 120);
+    defer apart.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, apart.entry_actions.items[0].override.bytes, "● Searched for 2 patterns\n├ Searched P0\n└ Searched P0"));
+}
+
+test "search folder names stay terminal-safe and short" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("reviews, docs", try searchFolderNames(arena, &.{ "/w/reviews", "/w/docs" }));
+    // The shared folder itself shows by its last part, and no path as ".".
+    try std.testing.expectEqualStrings("w, docs", try searchFolderNames(arena, &.{ "/w", "/w/docs" }));
+    try std.testing.expectEqualStrings("., src", try searchFolderNames(arena, &.{ "", "src" }));
+    try std.testing.expectEqualStrings("a/x, b/y", try searchFolderNames(arena, &.{ "/r/a/x", "/r/b/y" }));
+    try std.testing.expectEqualStrings("a, b, c +2 more", try searchFolderNames(arena, &.{ "/r/a", "/r/b", "/r/c", "/r/d", "/r/e" }));
+    // A path from the model never reaches the terminal as raw control bytes.
+    const hostile = try searchFolderNames(arena, &.{ "/w/a\x1b]0;owned\x07", "/w/b" });
+    try std.testing.expect(std.mem.findScalar(u8, hostile, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, hostile, 0x07) == null);
 }
 
 test "input to a running session and its stop are not new commands" {

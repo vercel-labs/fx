@@ -75,6 +75,19 @@ const SUBAGENTS: StoryStep[] = [
   { at: 5, text: "Both subagents finished." },
 ];
 
+const SEARCHES: StoryStep[] = [
+  {
+    at: 0,
+    text: "I will look for the createWindow callers.",
+    calls: [
+      { name: "grep_files", input: { pattern: "createWindow", path: "desktop/src" } },
+      { name: "grep_files", input: { pattern: "createWindow", path: "desktop" } },
+      { name: "glob_files", input: { pattern: "*.ts", path: "desktop" } },
+    ],
+  },
+  { at: 3, text: "Two files use createWindow." },
+];
+
 const HOSTILE: StoryStep[] = [
   { at: 0, text: "I will run the script.", calls: [sh("sh hostile.sh")] },
   { at: 1, text: "The script failed." },
@@ -228,6 +241,27 @@ test.skipIf(!tmuxAvailable())(
     const full = await session.waitForText("esc close", TIMEOUT);
     expect(full.split("sh test.sh").length - 1).toBeGreaterThanOrEqual(3);
     expect(full.split("Read desktop/src/main.ts").length - 1).toBeGreaterThanOrEqual(3);
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "one pattern searched in two folders shares a row that names them",
+  async () => {
+    const { session, pane } = await runStory(SEARCHES, {
+      prompt: "who calls createWindow?",
+      finalText: "Two files use createWindow.",
+    });
+    const lines = paneLines(pane);
+    // The header counts patterns, not calls.
+    expect(treeRows(group(lines, "● Searched for 2 patterns"))).toEqual([
+      "├ Searched createWindow in src, desktop",
+      "└ Matched *.ts",
+    ]);
+
+    await session.sendKeys("C-o");
+    const full = await session.waitForText("esc close", TIMEOUT);
+    expect(full.split("Searched createWindow").length - 1).toBeGreaterThanOrEqual(2);
   },
   TIMEOUT * 2,
 );
