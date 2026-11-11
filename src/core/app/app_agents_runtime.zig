@@ -34,6 +34,7 @@ const io_mod = @import("../shared/io.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -131,6 +132,18 @@ pub const ChildAgent = struct {
 /// null for the first.
 const CloseTarget = struct { agent: ?*ChildAgent };
 
+const max_search_bytes = 32;
+
+/// A key that edits the agent list's search.
+pub const SearchEdit = union(enum) {
+    /// A printable key, added at the end; a full search takes no more.
+    add: u8,
+    /// Backspace or Delete: takes the last letter off.
+    erase,
+    /// Esc: empties it.
+    clear,
+};
+
 pub const AgentsMenu = struct {
     open: bool = false,
     /// The highlighted agent's place in the switch list, from 0, as
@@ -143,6 +156,10 @@ pub const AgentsMenu = struct {
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?CloseTarget = null,
+    /// What the user typed to search the list, which then shows only the
+    /// agents whose name or title has it, case aside. Emptied when it closes.
+    search_buf: [max_search_bytes]u8 = undefined,
+    search_len: usize = 0,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
@@ -152,6 +169,10 @@ pub const AgentsMenu = struct {
         self.rows.deinit(alloc);
         self.names.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn search(self: *const AgentsMenu) []const u8 {
+        return self.search_buf[0..self.search_len];
     }
 
     /// The agent the list highlights: one agent, null for the first
@@ -1089,9 +1110,12 @@ pub fn Runtime(comptime App: type) type {
             sortSubagentGroups(entries, switch_order);
             nestSubagents(entries, switch_order, order[hosted.len + 1 ..]);
             try out.ensureUnusedCapacity(app.alloc, switch_order.len);
+            const search = if (menuActive(app)) app.instances.agents_menu.search() else "";
             for (switch_order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
-                out.appendAssumeCapacity(if (position == 0) null else hosted[position - 1]);
+                const target: ?*ChildAgent = if (position == 0) null else hosted[position - 1];
+                if (search.len > 0 and !matchesSearch(app, target, search)) continue;
+                out.appendAssumeCapacity(target);
             }
             // Activity can change while the menu is open. Keep the highlighted
             // agent, not its previous row, for navigation, Enter, and Delete;
@@ -1105,6 +1129,13 @@ pub fn Runtime(comptime App: type) type {
                 if (at == null) menu.highlight = .on_screen;
                 menu.selected = at orelse positionIn(out.items, app.agent_on_screen) orelse 0;
             }
+        }
+
+        /// Whether agent `target`'s name or title has `search` in it, case aside.
+        fn matchesSearch(app: *App, target: ?*ChildAgent, search: []const u8) bool {
+            var buf: [instance_name_bytes]u8 = undefined;
+            return ascii_case.containsIgnoreCase(noteName(app, target, &buf), search) or
+                ascii_case.containsIgnoreCase(targetAgent(app, target).session_title.items, search);
         }
 
         /// How the waiting note names agent `child`, null for the first
@@ -1413,7 +1444,35 @@ pub fn Runtime(comptime App: type) type {
             menu.open = false;
             menu.highlight = .on_screen;
             menu.close_armed = null;
+            menu.search_len = 0;
             app.shell.render_requests.request(.footer);
+        }
+
+        /// A key that edits the open list's search. False when `edit` has
+        /// nothing to erase or clear, so Backspace, Delete, and Esc do what
+        /// they do with no search.
+        pub fn editSearch(app: *App, edit: SearchEdit) bool {
+            if (!menuActive(app)) return false;
+            const menu = &app.instances.agents_menu;
+            switch (edit) {
+                .add => |byte| if (menu.search_len < menu.search_buf.len) {
+                    menu.search_buf[menu.search_len] = byte;
+                    menu.search_len += 1;
+                },
+                .erase => {
+                    if (menu.search_len == 0) return false;
+                    menu.search_len -= 1;
+                },
+                .clear => {
+                    if (menu.search_len == 0) return false;
+                    menu.search_len = 0;
+                },
+            }
+            menu.close_armed = null;
+            menu.window_start = 0;
+            debug_trace.eventf("host", "agents_menu_search", .{}, "bytes={d}", .{menu.search_len});
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         /// Esc, Ctrl+X, Ctrl+C, and a paste: closes the list. The agent on
@@ -1482,7 +1541,8 @@ pub fn Runtime(comptime App: type) type {
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
-                    .nested = if (subagent) |child| parentSubagent(app, child) != null else false,
+                    // A search lists its matches flat, since their parents may not match.
+                    .nested = if (subagent) |child| menu.search_len == 0 and parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
@@ -1494,7 +1554,7 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
-            if (order.items.len == 0) return .{ .rows = menu.rows.items };
+            if (order.items.len == 0) return .{ .rows = menu.rows.items, .search = menu.search() };
             const chosen = order.items[@min(menu.selected, order.items.len - 1)];
             const closable = deleteCloses(app, chosen);
             return .{
@@ -1504,6 +1564,7 @@ pub fn Runtime(comptime App: type) type {
                 .selected_closable = closable,
                 .selected_instance = isInstance(chosen),
                 .close_armed = closable and armedFor(menu, chosen),
+                .search = menu.search(),
             };
         }
 

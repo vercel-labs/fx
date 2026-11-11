@@ -80,7 +80,7 @@ fn headingRowCount(projection: AgentsMenuProjection, row_budget: u16) u16 {
 }
 
 pub fn menuRowCount(projection: AgentsMenuProjection, row_budget: u16) u16 {
-    if (projection.rows.len == 0) return 0;
+    if (!projection.active()) return 0;
     return @intCast(@min(row_budget, headingRowCount(projection, row_budget) + projection.rows.len));
 }
 
@@ -195,8 +195,11 @@ fn appendCell(
 }
 
 fn composeHeadingRow(alloc: Allocator, projection: AgentsMenuProjection, width: u16) !std.ArrayList(u8) {
-    var buf: [32]u8 = undefined;
-    const text = std.mem.print(&buf, "Agents {d}", .{projection.rows.len}) catch "Agents";
+    var buf: [96]u8 = undefined;
+    const text = if (projection.search.len > 0)
+        std.mem.print(&buf, "Agents {d} matching \"{s}\"", .{ projection.rows.len, projection.search }) catch "Agents"
+    else
+        std.mem.print(&buf, "Agents {d}", .{projection.rows.len}) catch "Agents";
     return row_text.composeTextRow(alloc, text, width, ui_render.selected_completion_style, indentWidth(width));
 }
 
@@ -281,6 +284,13 @@ const closable_hint_variants = [_][]const u8{
     "enter switch  esc back",
 };
 
+const search_hint_variants = [_][]const u8{
+    "↑↓ move     enter switch     esc clear",
+    "↑↓ move  enter switch  esc clear",
+    "↑↓ move  enter  esc clear",
+    "enter switch  esc clear",
+};
+
 const armed_hint_variants = [_][]const u8{
     "press delete again to close this subagent",
 };
@@ -290,9 +300,10 @@ const armed_instance_hint_variants = [_][]const u8{
 };
 
 /// Delete closes a subagent's or an instance's row after a second press
-/// confirms it.
+/// confirms it; while there is a search, it erases the search instead.
 pub fn hintVariants(projection: AgentsMenuProjection) []const []const u8 {
     if (projection.close_armed) return if (projection.selected_instance) &armed_instance_hint_variants else &armed_hint_variants;
+    if (projection.search.len > 0) return &search_hint_variants;
     if (projection.selected_closable) return &closable_hint_variants;
     return &hint_variants;
 }
@@ -347,6 +358,18 @@ test "the agent list counts the agents, then shows each one's name, title, state
         defer std.testing.allocator.free(row.text);
         try std.testing.expectEqual(row_index == 3, row.selected);
     }
+}
+
+test "a search heads the list with what it matched, and keeps the list open when nothing does" {
+    const matched: AgentsMenuProjection = .{ .rows = test_team[1..2], .search = "TEST" };
+    const heading = try testRow(matched, 0, 80, max_inline_rows);
+    defer std.testing.allocator.free(heading.text);
+    try std.testing.expectEqualStrings("  Agents 1 matching \"TEST\"", heading.text);
+    try std.testing.expectEqual(@as(u16, 3), menuRowCount(matched, max_inline_rows));
+    try std.testing.expectEqualStrings("↑↓ move     enter switch     esc clear", hintVariants(matched)[0]);
+
+    try expectRows(.{ .search = "nobody" }, 80, max_inline_rows, &.{ "  Agents 0 matching \"nobody\"", "" });
+    try std.testing.expect(!(AgentsMenuProjection{}).active());
 }
 
 test "the agent list draws an unselected row dim, with its name plain and a state that waits for the user bright" {
