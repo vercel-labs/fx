@@ -306,29 +306,39 @@ pub fn Runtime(comptime App: type) type {
             }
             defer if (hold_turn_start) agent.worker.releaseTurnStartHold();
             if (logout_provider == .grok) return logoutGrok(app, agent);
-            if (logout_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not durably sign out of Codex. The current source is unchanged.",
-                    });
-                    return;
-                };
-                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
-                    try app.auth.reconcileAfterChatGptLogout(app.alloc)
-                else
-                    false;
-                applyCredentialChange(app, changed);
-                try writeAuthNotice(app, switch (outcome) {
-                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
-                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
-                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
-                });
-                try reconcileSubscriptionLogout(app, agent, .codex);
-                return;
-            }
+            if (logout_provider == .codex) return logoutCodex(app, agent);
             return logoutFxLogin(app);
+        }
+
+        /// Signs out of Codex locally, then revokes its refresh token at
+        /// OpenAI in the background.
+        fn logoutCodex(app: *App, agent: *AppAgent) !void {
+            const local = chatgpt_oauth.logoutLocally(std.heap.c_allocator) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably sign out of Codex. The current source is unchanged.",
+                });
+                return;
+            };
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .codex = token } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            const outcome = local.result;
+            const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
+                try app.auth.reconcileAfterChatGptLogout(app.alloc)
+            else
+                false;
+            applyCredentialChange(app, changed);
+            try writeAuthNotice(app, switch (outcome.deletion) {
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
+            });
+            if (outcome.revocation_failed) {
+                try writeRemoteRevocationWarning(app, .chatgpt_subscription);
+            }
+            try reconcileSubscriptionLogout(app, agent, .codex);
+            try startRemoteRevocation(app, &revocation);
         }
 
         /// Signs out of Grok locally, then revokes its refresh token at the
@@ -413,10 +423,11 @@ pub fn Runtime(comptime App: type) type {
             try writeAuthNotice(app, .{
                 .topic = "auth",
                 .tone = .warning,
-                .body = if (source == .grok_subscription)
-                    "The local Grok session was removed, but remote revocation could not be confirmed."
-                else
-                    login_flow.remote_revocation_warning,
+                .body = switch (source) {
+                    .grok_subscription => "The local Grok session was removed, but remote revocation could not be confirmed.",
+                    .chatgpt_subscription => "The local Codex session was removed, but remote revocation could not be confirmed.",
+                    else => login_flow.remote_revocation_warning,
+                },
             });
         }
 
@@ -824,6 +835,17 @@ pub fn Runtime(comptime App: type) type {
                     cancelPromptRetryAfterAuth(app, agent);
                     debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
+                    // A request waits for this sign-in, and its saved login
+                    // may still work: it tries that login once now, and the
+                    // notice says how to try again.
+                    if (requestWaitsForSignIn(app)) if (expiredWhileWaitingNotice(sign_in_source, err)) |body| {
+                        debug_trace.logf("auth", "sign-in code expired; the waiting request tries its saved login source={t}", .{sign_in_source});
+                        try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                        if (comptime @hasDecl(@TypeOf(agent.worker), "requestRecoverySignInClosed")) {
+                            agent.worker.requestRecoverySignInClosed();
+                        }
+                        return;
+                    };
                     try writeLoginError(app, sign_in_source, err);
                 },
                 .succeeded => |completed| {
@@ -1706,7 +1728,11 @@ pub fn Runtime(comptime App: type) type {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
-            const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            // Read before the choice reloads the credential.
+            const body = if (teamInUse(app, team))
+                try app.alloc.print("Using Vercel team {s} ({s}).", .{ team.name, team.slug })
+            else
+                try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
             if (validation == .rejected or validation == .catalog_unreachable) {
                 cancelPromptRetryAfterAuth(app, agent);
@@ -1797,6 +1823,19 @@ pub fn Runtime(comptime App: type) type {
             }, true);
             try resumePromptAfterAuth(app, agent);
             return true;
+        }
+
+        /// Whether fx already sends with an fx login on this team, so choosing
+        /// it again changes nothing the user should hear about.
+        fn teamInUse(app: *App, team: anytype) bool {
+            if (comptime !@hasField(@TypeOf(app.auth), "selected_credential")) return false;
+            const credential = app.auth.selected_credential orelse return false;
+            if (credential.source != .fx_login) return false;
+            const current = credential.gatewayTeam() orelse return false;
+            if (comptime @hasField(@TypeOf(team), "id")) {
+                if (std.mem.eql(u8, current, team.id)) return true;
+            }
+            return std.mem.eql(u8, current, team.slug);
         }
 
         /// Sign-in launched from the inline `/provider` picker. Esc must close
@@ -2232,6 +2271,25 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
             }
+        }
+
+        /// The notice for a sign-in that expired while a request waited for
+        /// it, or null for any other failure, which keeps its usual notice.
+        fn expiredWhileWaitingNotice(source: credentials.Source, err: anyerror) ?[]const u8 {
+            return switch (source) {
+                .chatgpt_subscription => switch (err) {
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => "Codex sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+                .grok_subscription => switch (err) {
+                    error.GrokLoginTimedOut, error.LoginTimedOut => "Grok sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+                else => switch (err) {
+                    error.ExpiredToken, error.LoginTimedOut => "The Vercel sign-in code expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+            };
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {

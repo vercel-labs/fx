@@ -853,11 +853,14 @@ pub const RemoteRevocation = union(enum) {
     fx_login: oauth_session.Session,
     /// The Grok refresh token. Owned; allocated with `std.heap.c_allocator`.
     grok: []u8,
+    /// The Codex refresh token. Owned; allocated with `std.heap.c_allocator`.
+    codex: []u8,
 
     pub fn source(self: RemoteRevocation) credentials.Source {
         return switch (self) {
             .fx_login => .fx_login,
             .grok => .grok_subscription,
+            .codex => .chatgpt_subscription,
         };
     }
 
@@ -865,7 +868,7 @@ pub const RemoteRevocation = union(enum) {
         const alloc = std.heap.c_allocator;
         switch (self.*) {
             .fx_login => |*session| session.deinit(alloc),
-            .grok => |token| secret.zeroAndFree(alloc, token),
+            .grok, .codex => |token| secret.zeroAndFree(alloc, token),
         }
         self.* = undefined;
     }
@@ -904,6 +907,7 @@ const RemoteRevocationTask = struct {
         const revoked: anyerror!void = switch (self.target) {
             .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, transport.provider(), session),
             .grok => |token| grok_oauth.revokeToken(alloc, transport.provider(), token),
+            .codex => |token| chatgpt_oauth.revokeToken(alloc, transport.provider(), token),
         };
         revoked catch |err| {
             debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });

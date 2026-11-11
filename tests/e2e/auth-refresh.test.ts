@@ -211,8 +211,17 @@ function writeExpiredSubscriptionLogin(home: string, provider: Subscription, acc
   chmodSync(authPath, 0o600);
 }
 
-/** Codex's or Grok's sign-in and model endpoints, answering refreshes after `beforeTokenResponse`. */
-function startFakeSubscription(provider: Subscription, refreshedAccessToken: string, beforeTokenResponse: () => Promise<void>) {
+/**
+ * Codex's or Grok's sign-in and model endpoints, answering refreshes after
+ * `beforeTokenResponse`. `respond`, when given, answers model requests in
+ * place of the default reply.
+ */
+function startFakeSubscription(
+  provider: Subscription,
+  refreshedAccessToken: string,
+  beforeTokenResponse: () => Promise<void>,
+  respond?: (request: Request) => Response,
+) {
   const tokenRequests: string[] = [];
   /** Each model request's headers. */
   const modelRequests: string[] = [];
@@ -238,6 +247,7 @@ function startFakeSubscription(provider: Subscription, refreshedAccessToken: str
       const body = await request.text();
       if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
       modelRequests.push(JSON.stringify([...request.headers.entries()]));
+      if (respond) return respond(request);
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "SUBSCRIPTION_ASK_DONE" })}\n\n` +
           'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
@@ -312,6 +322,52 @@ for (const provider of ["codex", "grok"] as const) {
           expect(headers).toContain(fresh);
           expect(headers).not.toContain(stale);
         }
+      } finally {
+        gateway.stop();
+        fake.stop();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+}
+
+// A provider's error can quote the token it refused, and fx shows the error,
+// so the token must not come with it.
+for (const provider of ["codex", "grok"] as const) {
+  test(
+    `a ${provider} error that quotes the token fx sent shows without the token`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), `fx-auth-error-mask-${provider}-e2e-`));
+      const stale = subscriptionAccessToken(provider, "stale");
+      const fresh = subscriptionAccessToken(provider, "fresh");
+      const fake = startFakeSubscription(provider, fresh, async () => {}, (request) => {
+        const token = (request.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+        return Response.json({ error: { message: `token ${token} is not allowed here` } }, { status: 400 });
+      });
+      writeExpiredSubscriptionLogin(home, provider, stale);
+      // Unused: keeps fx away from the real gateway.
+      const gateway = startFakeGateway([]);
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        ...fake.env,
+      };
+
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "hello"], { env, timeoutMs: TIMEOUT });
+        const output = `${result.stdout}\n${result.stderr}`;
+        expect(result.code, output).not.toBe(0);
+        // fx sent the refreshed token, and the provider quoted it back.
+        expect(fake.modelRequests.some((headers) => headers.includes(fresh))).toBe(true);
+        expect(output).toContain("is not allowed here");
+        expect(output).not.toContain(fresh);
       } finally {
         gateway.stop();
         fake.stop();
