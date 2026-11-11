@@ -15,10 +15,23 @@
 #   pin         the highlight snaps back to the agent on screen   SelectionKept
 #   stale-sel   the highlight stays on an agent that closed       SelListed
 #
+# spec/RowOrder.tla models how a subagent's row changes when its turn ends: its
+# label comes from the worker and its place from the history the main loop
+# applies later, and the two must come from the same applied update.
+# row-order.cfg is the design and must pass. The planted bug below must be
+# caught by the rule it names; the second config checks the place rule alone:
+#
+#   worker-flag       the label follows the worker flag alone, so a finished
+#                     turn that is not applied shows idle at its old place
+#                                                              IdleRowIsApplied
+#   worker-flag-flip  the same bug, seen as a row that moves with no change
+#                     of label                              PlaceChangesWithLabel
+#
 # tests/tla/drivers/agents_menu/ runs the built zig-out/bin/fx along the model:
 # binary-to-spec.ts has TLC check seeded key sequences the binary ran
-# (spec/TraceAgentsMenu.tla), and spec-to-binary.ts replays model behaviors
-# against the binary and compares every state.
+# (spec/TraceAgentsMenu.tla), spec-to-binary.ts replays model behaviors
+# against the binary and compares every state, and row-order.ts has TLC check
+# the frames of the list while subagents finish (spec/TraceRowOrder.tla).
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -37,4 +50,7 @@ MCAgentsMenu agents-menu-mutation-enter-noop EnterShowsSelection
 MCAgentsMenu agents-menu-mutation-open-first OpensOnScreen
 MCAgentsMenu agents-menu-mutation-pin SelectionKept
 MCAgentsMenu agents-menu-mutation-stale-sel SelListed
+MCRowOrder row-order -
+MCRowOrder row-order-mutation-worker-flag IdleRowIsApplied
+MCRowOrder row-order-mutation-worker-flag-flip PlaceChangesWithLabel
 VERDICTS

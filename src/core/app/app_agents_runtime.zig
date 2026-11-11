@@ -2021,15 +2021,34 @@ pub fn Runtime(comptime App: type) type {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
+        /// Whether the turn `child`'s worker has finished is still being
+        /// applied: its events wait for the loop, or its pacer holds the
+        /// finish while the reply is shown. Its reply reaches the history
+        /// only after that.
+        fn resultPending(app: *App, child: *ChildAgent) bool {
+            const pacer = if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
+            return child.agent.worker.hasPendingEvents() or pacer.hasPending();
+        }
+
         /// What agent `target`, null for the first instance, waits for or
         /// does. A subagent whose approval or question its instance's screen
-        /// shows for it still waits on it.
+        /// shows for it still waits on it. A subagent whose turn has ended
+        /// but is not applied yet is still working: the list places it by the
+        /// newest reply in its history, so its state and its place change
+        /// together, as `tests/tla/agents_menu/spec/RowOrder.tla`
+        /// PlaceChangesWithLabel requires.
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
             }
-            return instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const child = target orelse return state;
+            if (child.agent.role != .subagent) return state;
+            return switch (state) {
+                .idle, .finished => if (resultPending(app, child)) .working else state,
+                .working, .needs_approval, .has_question, .needs_you => state,
+            };
         }
 
         /// Whether agent `target`'s status row, null for the first instance,

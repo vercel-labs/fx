@@ -196,6 +196,7 @@ EnvStart(a) ==
     /\ UNCHANGED <<onScreen, open, armed>>
 
 \* An instance's subagents reorder: one starts or finishes work.
+\* tests/tla/agents_menu/spec/RowOrder.tla models what makes them reorder.
 EnvReorder(p) ==
     /\ EnvEvents
     /\ p \in AliveInsts

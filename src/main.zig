@@ -5808,6 +5808,68 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try std.testing.expectEqualStrings("second", second.displayName());
 }
 
+test "the agent list holds a subagent among the working ones until its finished turn is applied" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const reviewer = try addTestChildAgent(&app, "reviewer");
+    const tester = try addTestChildAgent(&app, "tester");
+    defer reviewer.agent.session.agent.history.deinit(alloc);
+    defer tester.agent.session.agent.history.deinit(alloc);
+    defer {
+        var left = tester.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+        left.deinit(alloc);
+    }
+    const user: types.UserTurn = .{ .text = @constCast("task") };
+    // The reviewer replied earlier, and its reply is in its history.
+    try reviewer.agent.session.agent.history.append(alloc, .{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("reviewed"),
+        .execution = .{ .turn_summary = .{ .completed_at_ms = 100 } },
+    } });
+    // The tester's worker has finished its turn, but the loop has not applied
+    // the finish yet, so its history holds no reply.
+    try tester.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    try std.testing.expect(!tester.agent.worker.isProcessing());
+
+    var order: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
+    defer order.deinit(alloc);
+    try runtime.switchList(&app, &order);
+    try std.testing.expectEqual(@as(usize, 3), order.items.len);
+    // It stays above the reviewer, as it will once its reply is in the
+    // history, instead of dropping below it for the frames in between.
+    try std.testing.expectEqualStrings("tester", order.items[1].?.id);
+    try std.testing.expectEqualStrings("reviewer", order.items[2].?.id);
+    try runtime.openMenu(&app);
+    const pending = runtime.menuProjection(&app);
+    try std.testing.expectEqualStrings("working", pending.rows[1].state);
+
+    // The loop applies the finish: its reply is in the history, and the list
+    // keeps the same order.
+    var events = tester.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try tester.agent.session.agent.history.append(alloc, .{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("tested"),
+        .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } },
+    } });
+    order.clearRetainingCapacity();
+    try runtime.switchList(&app, &order);
+    try std.testing.expectEqualStrings("tester", order.items[1].?.id);
+    try std.testing.expectEqualStrings("reviewer", order.items[2].?.id);
+    const applied = runtime.menuProjection(&app);
+    try std.testing.expectEqualStrings("idle", applied.rows[1].state);
+}
+
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
