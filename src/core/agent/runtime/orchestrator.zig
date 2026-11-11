@@ -3728,9 +3728,8 @@ fn settledAttemptToolEvidence(
     const evidence = effectiveRecoveryToolEvidence(preserved, completion, stream_ctx);
     if (disposition != .interrupted and disposition != .provider_failure) return evidence;
     if (evidence != .uncertain or completion.tool_calls.len == 0) return evidence;
-    if (stream_ctx.saw_provider_tool_start) return .uncertain;
-    for (completion.tool_calls) |call| {
-        if (call.provenance == .provider_executed) return .uncertain;
+    if (stream_ctx.saw_provider_tool_start or hasProviderExecutedCall(completion.tool_calls)) {
+        return .uncertain;
     }
     return .proven_unexecuted;
 }
