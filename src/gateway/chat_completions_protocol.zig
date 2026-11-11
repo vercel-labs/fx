@@ -192,6 +192,42 @@ fn check_json_depth(text: []const u8) Error!void {
     if (json_depth.exceeds(text)) return error.JsonTooDeep;
 }
 
+/// Takes ownership of `body` and returns the caller-owned copy with
+/// `credential` masked, as `redact_error_detail` masks it: the detail reaches
+/// the turn, its events, and the saved session, so a server that quotes the
+/// request's own key back must not put it there. With no credential, returns
+/// `body` itself.
+pub fn redactOwnedErrorBody(alloc: Allocator, body: []u8, credential: ?[]const u8) Allocator.Error![]u8 {
+    const secret = credential orelse return body;
+    defer alloc.free(body);
+    return redact_error_detail(alloc, body, secret);
+}
+
+test "an owned error body loses the credential it quotes, and stays bounded" {
+    const alloc = std.testing.allocator;
+    const raw = try alloc.dupe(u8, "refused secret-token");
+    const kept = try redactOwnedErrorBody(alloc, raw, null);
+    defer alloc.free(kept);
+    try std.testing.expectEqual(raw.ptr, kept.ptr);
+
+    const echoed = try alloc.dupe(u8, "{\"error\":{\"message\":\"refused secret-token\"}}");
+    const masked = try redactOwnedErrorBody(alloc, echoed, "secret-token");
+    defer alloc.free(masked);
+    try std.testing.expect(std.mem.find(u8, masked, "secret-token") == null);
+    try std.testing.expect(std.mem.find(u8, masked, "refused") != null);
+
+    // A body past the local limit becomes a fixed message.
+    const huge = try alloc.alloc(u8, 1 << 20);
+    @memset(huge, 'x');
+    const bounded = try redactOwnedErrorBody(alloc, huge, "secret-token");
+    defer alloc.free(bounded);
+    try std.testing.expect(bounded.len < 128);
+
+    const empty = try redactOwnedErrorBody(alloc, try alloc.dupe(u8, ""), "");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+}
+
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later
 /// diagnostic decoding cannot restore an escaped credential.
 pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []const u8) Allocator.Error![]u8 {
@@ -212,18 +248,9 @@ pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []cons
     errdefer alloc.free(detail);
     const encoded = try std.json.Stringify.valueAlloc(alloc, credential, .{});
     defer alloc.free(encoded);
-    mask_error_bytes(detail, encoded[1 .. encoded.len - 1]);
-    mask_error_bytes(detail, credential);
+    text_utils.maskLiteral(detail, encoded[1 .. encoded.len - 1]);
+    text_utils.maskLiteral(detail, credential);
     return detail;
-}
-
-fn mask_error_bytes(detail: []u8, value: []const u8) void {
-    if (value.len == 0) return;
-    var remaining = detail;
-    while (std.mem.find(u8, remaining, value)) |index| {
-        @memset(remaining[index..][0..value.len], '*');
-        remaining = remaining[index + value.len ..];
-    }
 }
 
 test "chat completions error masking survives JSON and recovery decoding" {

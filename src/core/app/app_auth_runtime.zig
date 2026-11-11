@@ -824,6 +824,17 @@ pub fn Runtime(comptime App: type) type {
                     cancelPromptRetryAfterAuth(app, agent);
                     debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
+                    // A request waits for this sign-in, and its saved login
+                    // may still work: it tries that login once now, and the
+                    // notice says how to try again.
+                    if (requestWaitsForSignIn(app)) if (expiredWhileWaitingNotice(sign_in_source, err)) |body| {
+                        debug_trace.logf("auth", "sign-in code expired; the waiting request tries its saved login source={t}", .{sign_in_source});
+                        try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                        if (comptime @hasDecl(@TypeOf(agent.worker), "requestRecoverySignInClosed")) {
+                            agent.worker.requestRecoverySignInClosed();
+                        }
+                        return;
+                    };
                     try writeLoginError(app, sign_in_source, err);
                 },
                 .succeeded => |completed| {
@@ -1706,7 +1717,11 @@ pub fn Runtime(comptime App: type) type {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
-            const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            // Read before the choice reloads the credential.
+            const body = if (teamInUse(app, team))
+                try app.alloc.print("Using Vercel team {s} ({s}).", .{ team.name, team.slug })
+            else
+                try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
             if (validation == .rejected or validation == .catalog_unreachable) {
                 cancelPromptRetryAfterAuth(app, agent);
@@ -1797,6 +1812,19 @@ pub fn Runtime(comptime App: type) type {
             }, true);
             try resumePromptAfterAuth(app, agent);
             return true;
+        }
+
+        /// Whether fx already sends with an fx login on this team, so choosing
+        /// it again changes nothing the user should hear about.
+        fn teamInUse(app: *App, team: anytype) bool {
+            if (comptime !@hasField(@TypeOf(app.auth), "selected_credential")) return false;
+            const credential = app.auth.selected_credential orelse return false;
+            if (credential.source != .fx_login) return false;
+            const current = credential.gatewayTeam() orelse return false;
+            if (comptime @hasField(@TypeOf(team), "id")) {
+                if (std.mem.eql(u8, current, team.id)) return true;
+            }
+            return std.mem.eql(u8, current, team.slug);
         }
 
         /// Sign-in launched from the inline `/provider` picker. Esc must close
@@ -2232,6 +2260,25 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
             }
+        }
+
+        /// The notice for a sign-in that expired while a request waited for
+        /// it, or null for any other failure, which keeps its usual notice.
+        fn expiredWhileWaitingNotice(source: credentials.Source, err: anyerror) ?[]const u8 {
+            return switch (source) {
+                .chatgpt_subscription => switch (err) {
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => "Codex sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+                .grok_subscription => switch (err) {
+                    error.GrokLoginTimedOut, error.LoginTimedOut => "Grok sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+                else => switch (err) {
+                    error.ExpiredToken, error.LoginTimedOut => "The Vercel sign-in code expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+            };
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
