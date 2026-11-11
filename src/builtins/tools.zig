@@ -166,19 +166,19 @@ const toolbox_description =
 const install_skill_description =
     "Install a skill into fx's skill storage when the user asks. Pass the source as given; fx checks it.";
 const ask_user_question_description = std.fmt.comptimePrint(
-    "Ask the user 1-{d} multiple-choice questions when a decision blocks you, such as a preference the workspace cannot answer.",
+    "Ask the user 1-{d} multiple-choice questions when a decision blocks you, such as a preference the workspace cannot answer. The user can also type an answer, so do not add an \"Other\" option.",
     .{question_answer.max_questions},
 );
 const ask_user_question_option_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "label", .json_type = .string, .description = "1-5 words." },
-        .{ .name = "description", .json_type = .string },
+        .{ .name = "label", .json_type = .string, .description = "1-5 words of plain text." },
+        .{ .name = "description", .json_type = .string, .description = "Markdown, on one or more lines." },
     },
     .required = &.{"label"},
 };
 const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "question", .json_type = .string },
+        .{ .name = "question", .json_type = .string, .description = "Markdown, on one or more lines." },
         .{ .name = "options", .json_type = .array, .bounds = &.{ .min_items = 2, .max_items = 6 }, .shape = &.{ .array_objects = &ask_user_question_option_schema } },
     },
     .required = &.{ "question", "options" },
@@ -839,9 +839,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "9c769118b4f20c09973c328171d3023dacc352be40b29d6d0573efe857628a4a"
+            "1311a51c8fe6d2e3fc664578834b457ab47900492989473f759cc0dbbd8c9edd"
         else
-            "ebb9ef710340e303e1e265aacbc7b7eb908c3624909a8c5faa0691b2aac2e50b",
+            "72ca6c6656c3a115a4b68609c6ad4f53cd52224bda10b767708ce30154c606a4",
         &actual_hex,
     );
 }
@@ -1375,11 +1375,14 @@ test "built-in ask_user_question owns product metadata schema and callbacks" {
     try std.testing.expectEqualStrings(ask_user_question_description, ask_user_question.description);
     try std.testing.expect(std.mem.find(u8, ask_user_question.description, "when a decision blocks you") != null);
     try std.testing.expect(std.mem.find(u8, ask_user_question.description, "the workspace cannot answer") != null);
+    try std.testing.expect(std.mem.find(u8, ask_user_question.description, "The user can also type an answer") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":\"ask_user_question\"") != null);
     try std.testing.expect(std.mem.startsWith(u8, ask_user_question.description, "Ask the user 1-20 multiple-choice questions"));
     try std.testing.expect(std.mem.find(u8, schema_json, "\"questions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":20") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"options\":{\"type\":\"array\",\"minItems\":2,\"maxItems\":6") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"label\":{\"type\":\"string\",\"description\":\"1-5 words.\"}") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"question\":{\"type\":\"string\",\"description\":\"Markdown, on one or more lines.\"}") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"label\":{\"type\":\"string\",\"description\":\"1-5 words of plain text.\"}") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"description\":{\"type\":\"string\",\"description\":\"Markdown, on one or more lines.\"}") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"question\",\"options\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"questions\"]") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.ask_user_question, ask_user_question.executor_kind);

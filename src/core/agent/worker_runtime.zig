@@ -435,6 +435,7 @@ const OwnedQuestionOption = struct {
 
 const OwnedQuestionEntry = struct {
     question: []u8,
+    markdown: bool = false,
     options: []OwnedQuestionOption,
     submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
 };
@@ -3145,7 +3146,7 @@ fn dupeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: types.QuestionBatchEn
         const desc_dup: ?[]u8 = if (src.description) |d| try alloc.dupe(u8, d) else null;
         options_dup[filled] = .{ .label = label_dup, .description = desc_dup };
     }
-    return .{ .question = question_dup, .options = options_dup, .submission = entry.submission };
+    return .{ .question = question_dup, .markdown = entry.markdown, .options = options_dup, .submission = entry.submission };
 }
 
 fn freeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: OwnedQuestionEntry) void {
@@ -3213,7 +3214,7 @@ fn dupePendingEntrySnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionEntr
         const desc_dup: ?[]const u8 = if (src.description) |d| try alloc.dupe(u8, d) else null;
         options_dup[filled] = .{ .label = label_dup, .description = desc_dup };
     }
-    return .{ .question = question_dup, .options = options_dup, .submission = pending.submission };
+    return .{ .question = question_dup, .markdown = pending.markdown, .options = options_dup, .submission = pending.submission };
 }
 
 fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatch) !PendingQuestionBatchSnapshot {
@@ -8251,7 +8252,7 @@ test "question batch snapshot answer and cancellation" {
         .{ .label = "Yes", .description = "Do it" },
         .{ .label = "No", .description = null },
     };
-    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .markdown = true, .options = &options }};
 
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -8260,6 +8261,7 @@ test "question batch snapshot answer and cancellation" {
     var snapshot = try waitForQuestionSnapshot(&runtime);
     defer snapshot.deinit(alloc);
     try std.testing.expectEqualStrings("Continue?", snapshot.entries[0].question);
+    try std.testing.expect(snapshot.entries[0].markdown);
     try std.testing.expectEqualStrings("Yes", snapshot.entries[0].options[0].label);
     try std.testing.expect(snapshot.entries[0].question.ptr != entries[0].question.ptr);
     try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);

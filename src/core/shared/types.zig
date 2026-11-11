@@ -2853,6 +2853,10 @@ pub const QuestionOption = struct {
 
 pub const QuestionBatchEntry = struct {
     question: []const u8,
+    /// The question and the option descriptions are Markdown and may have
+    /// several lines, as `ask_user_question` sends them. Other prompts show
+    /// their text as written.
+    markdown: bool = false,
     options: []const QuestionOption,
     /// Submission prompts return JSON {"value": string} or {"option": index},
     /// keeping typed text distinct from action labels such as Decline.
