@@ -40,6 +40,7 @@ const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
 const catalog_state = @import("../core/mcp/catalog_state.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
+const acp_questions = @import("questions.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
@@ -490,6 +491,12 @@ const AcpContext = struct {
         self.markCardFinished(tool_call_id);
     }
 
+    /// A client that takes form elicitation answers fx's own questions.
+    fn questionRequester(self: *AcpContext) ?tool_runtime.QuestionRequester {
+        if (!self.state.client_elicitation.supports(.form)) return null;
+        return .{ .context = @ptrCast(self), .request = requestAcpQuestions };
+    }
+
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
@@ -533,6 +540,7 @@ const AcpContext = struct {
             .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
             .first_call_tool_choice = session.first_call_tool_choice,
+            .question_requester = self.questionRequester(),
             .permission_mode = self.captured_permission_mode orelse session.permission_mode,
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
@@ -2313,7 +2321,9 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
     try ctx.state.cfg.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.state.workspace_root,
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
-        .interactive = false,
+        // A client with a question form gets the TUI's notes; any other is a
+        // run with no question UI.
+        .interactive = ctx.state.client_elicitation.supports(.form),
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
     }, arena, messages);
 }
@@ -3478,6 +3488,36 @@ fn respondToAcpMcpInput(
     for (responses) |*response| response.deinit(alloc);
     alloc.free(responses);
     return result;
+}
+
+/// Asks the user fx's own questions (`ask_user_question`) through the
+/// client's form, `elicitation/create`, and waits as long as the user takes,
+/// as the TUI does. Returns one answer per question, or null when the user
+/// declines or cancels the form, or a stop of the turn withdraws it.
+fn requestAcpQuestions(
+    raw_ctx: ?*anyopaque,
+    alloc: Allocator,
+    entries: []const types.QuestionBatchEntry,
+) anyerror!?[][]u8 {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
+    const state = ctx.state;
+    const params = try acp_questions.createParams(alloc, ctx.session_id, entries);
+    defer alloc.free(params);
+    const outbound_id = (try server.beginOutboundRequest(state, .elicitation)) orelse
+        return error.TooManyPendingRequests;
+    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, "elicitation/create", params) catch |err| {
+        server.discardOutboundRequest(state, outbound_id);
+        return err;
+    };
+    var response = server.awaitOutboundResponse(state, outbound_id, .elicitation) orelse return null;
+    defer response.deinit(state.alloc);
+    if (response.cancelled) return null;
+    if (response.error_json != null) {
+        debug_trace.logf("acp", "client answered fx's questions with an error; the question fails", .{});
+        return error.QuestionFormFailed;
+    }
+    const result = response.result_json orelse return error.InvalidQuestionAnswer;
+    return acp_questions.answersFromResult(alloc, entries, result);
 }
 
 fn requestAcpElicitation(

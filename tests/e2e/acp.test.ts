@@ -7949,6 +7949,128 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  const askTwoQuestions = JSON.stringify({
+    questions: [
+      { question: "Which database?", options: [{ label: "Staging", description: "The shared one" }, { label: "Local" }] },
+      { question: "Run the tests?", options: [{ label: "Yes" }, { label: "No" }] },
+    ],
+  });
+
+  async function startQuestionSession(
+    root: ReturnType<typeof createIsolatedRoot>,
+    gateway: ReturnType<typeof startFakeGateway>,
+    clientCapabilities: Record<string, unknown>,
+  ) {
+    client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    expect(created.error).toBeUndefined();
+    await client.readLine();
+    return created.result.sessionId as string;
+  }
+
+  test(
+    "ACP asks fx's own questions through the client's form and gives the model the answers",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-ask-form-");
+      const gateway = startFakeGateway([
+        fakeGatewaySerializedToolCall("ask_form", "ask_user_question", askTwoQuestions, "I need two answers."),
+        finalText("Thanks for the answers."),
+      ]);
+      try {
+        const sessionId = await startQuestionSession(root, gateway, { elicitation: { form: {} } });
+        const forms: any[] = [];
+        client!.setElicitationHandler((params) => {
+          forms.push(params);
+          return {
+            action: "accept",
+            content: { question_1: "Other", question_1_other: "The new one", question_2: "Yes" },
+          };
+        });
+        const result = await runPrompt(client!, "Ask me what you need.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+
+        expect(forms).toHaveLength(1);
+        expect(forms[0].sessionId).toBe(sessionId);
+        expect(forms[0].mode).toBe("form");
+        const properties = forms[0].requestedSchema.properties;
+        expect(properties.question_1.title).toBe("Which database?");
+        expect(properties.question_1.oneOf.map((choice: any) => choice.const)).toEqual(["Staging", "Local", "Other"]);
+        expect(properties.question_1_other.type).toBe("string");
+        expect(forms[0].requestedSchema.required).toEqual(["question_1", "question_2"]);
+
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(acpToolResultText(gateway.requests[1]!.body, "ask_form"))).toEqual([
+          { question: "Which database?", answer: "The new one" },
+          { question: "Run the tests?", answer: "Yes" },
+        ]);
+        // A client with a question form gets the TUI's notes.
+        expect(gateway.requests[0]!.body).not.toContain("no question UI");
+        expect(gateway.requests[0]!.body).toContain("after changing files, verify with focused checks");
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP takes a declined question form as a cancelled question",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-ask-declined-");
+      const gateway = startFakeGateway([
+        fakeGatewaySerializedToolCall("ask_declined", "ask_user_question", askTwoQuestions),
+        finalText("I'll go on without the answers."),
+      ]);
+      try {
+        await startQuestionSession(root, gateway, { elicitation: { form: {} } });
+        client!.setElicitationHandler(() => ({ action: "decline" }));
+        const result = await runPrompt(client!, "Ask me what you need.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(acpToolResultText(gateway.requests[1]!.body, "ask_declined")).toContain("(user cancelled the question)");
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP without a question form tells the model there is no question UI, as before",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-ask-no-form-");
+      const gateway = startFakeGateway([
+        fakeGatewaySerializedToolCall("ask_no_form", "ask_user_question", askTwoQuestions),
+        finalText("I'll ask in plain text."),
+      ]);
+      try {
+        await startQuestionSession(root, gateway, { elicitation: { url: {} } });
+        const forms: any[] = [];
+        client!.setElicitationHandler((params) => {
+          forms.push(params);
+          return { action: "accept", content: {} };
+        });
+        const result = await runPrompt(client!, "Ask me what you need.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(forms).toHaveLength(0);
+        expect(gateway.requests[0]!.body).toContain("no question UI");
+        expect(acpToolResultText(gateway.requests[1]!.body, "ask_no_form")).toContain("only available in the interactive shell");
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "malformed local tool arguments recover with a normal final stop",
     async () => {

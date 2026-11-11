@@ -262,6 +262,11 @@ pub const Context = struct {
     /// Lets a turn that is not interactive still ask the user questions: a
     /// subagent's, whose questions show on its own screen and on main's.
     ask_user_questions: bool = false,
+    /// Answers `ask_user_question` for a host that shows questions itself,
+    /// such as an ACP client that takes `elicitation/create`. It wins over
+    /// the worker's question queue that `interactive` and
+    /// `ask_user_questions` choose.
+    question_requester: ?QuestionRequester = null,
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     lifecycle_scope: hooks.Scope = .{
         .kind = .interactive,
@@ -1738,8 +1743,18 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .command_timeout_ms = ctx.command_timeout_ms,
-        .ask_question_ctx = if (ctx.interactive or ctx.ask_user_questions) ctx.worker else null,
-        .ask_question_batch = if (ctx.interactive or ctx.ask_user_questions) requestQuestionBatchWithWorker else null,
+        .ask_question_ctx = if (ctx.question_requester) |requester|
+            requester.context
+        else if (ctx.interactive or ctx.ask_user_questions)
+            ctx.worker
+        else
+            null,
+        .ask_question_batch = if (ctx.question_requester) |requester|
+            requester.request
+        else if (ctx.interactive or ctx.ask_user_questions)
+            requestQuestionBatchWithWorker
+        else
+            null,
         .web_fetch_runtime = ctx.web_fetch_runtime,
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
@@ -1780,6 +1795,12 @@ pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void 
         session_id,
     );
 }
+
+/// A host's own way to answer the user questions of `ask_user_question`.
+pub const QuestionRequester = struct {
+    context: *anyopaque,
+    request: tool_dispatch.AskQuestionBatchFn,
+};
 
 fn requestQuestionBatchWithWorker(
     raw_ctx: ?*anyopaque,
@@ -8542,4 +8563,26 @@ test "vision cancellation stops later batches and does not surface the outage ti
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), fixture.call_count);
+}
+
+test "a host's question requester answers ask_user_question ahead of the worker's queue" {
+    const Fixture = struct {
+        var marker: u8 = 0;
+        fn request(_: ?*anyopaque, _: Allocator, _: []const types.QuestionBatchEntry) anyerror!?[][]u8 {
+            return null;
+        }
+    };
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var ctx = rt.context();
+    ctx.interactive = false;
+    try std.testing.expect(typedDispatchContext(ctx, arena_state.allocator()).ask_question_batch == null);
+
+    ctx.question_requester = .{ .context = @ptrCast(&Fixture.marker), .request = Fixture.request };
+    const dispatch = typedDispatchContext(ctx, arena_state.allocator());
+    try std.testing.expect(dispatch.ask_question_ctx.? == @as(*anyopaque, @ptrCast(&Fixture.marker)));
+    try std.testing.expect(dispatch.ask_question_batch.? == @as(tool_dispatch.AskQuestionBatchFn, Fixture.request));
 }
