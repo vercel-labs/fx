@@ -2237,6 +2237,56 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "a scoped rules note delivered in the Vision outage notice's step comes before it, and the resumed request extends the last one",
+    async () => {
+      const root = createIsolatedRoot();
+      mkdirSync(join(root.workspace, "sub"), { recursive: true });
+      copyFileSync(IMAGE_PATH, join(root.workspace, "sub", "logo.png"));
+      writeFileSync(join(root.workspace, "sub", "a.txt"), "plain text file\n");
+      writeFileSync(join(root.workspace, "sub", "AGENTS.md"), "SUBRULES_MARKER: describe images briefly.\n");
+      const gateway = startImageGateway([
+        // One step: a read that reaches the folder with its own rules, and the
+        // Vision call whose outage hands the model a notice.
+        sseToolCalls([
+          { toolName: "read_file", input: { path: "sub/a.txt" }, toolCallId: "read_a" },
+          { toolName: "vision", input: { paths: ["sub/logo.png"], focus: "describe the image" }, toolCallId: "vision_outage" },
+        ]),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("second turn answered"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "Describe sub/logo.png."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("Vision unavailable final answer");
+        const turnEnd = gateway.chatRequests.length - 1;
+        const lastBody = gateway.chatRequests[turnEnd].body;
+        expect(lastBody).toContain(VISION_OUTAGE_NOTICE);
+        expect(lastBody).toContain("SUBRULES_MARKER");
+        // The step's notes come before its steering at the boundary.
+        expect(lastBody.indexOf("SUBRULES_MARKER")).toBeLessThan(lastBody.indexOf(VISION_OUTAGE_NOTICE));
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second turn answered");
+        expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
+        expectPromptExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "cold resume rebases image ids and preserves authority across both model-switch directions",
     async () => {
       const root = createIsolatedRoot();
