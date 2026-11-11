@@ -2076,6 +2076,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(mains).toHaveLength(1);
         const resumed = await launch(`--resume ${mains[0]}`);
         await resumed.waitForComposer(15_000);
+        // The restored subagent counts at once, so the footer offers the list.
+        await resumed.waitForPane((pane) => pane.includes("main \u2193"), 10_000);
         // Its title comes from its saved session, before its conversation is opened.
         await resumed.sendKeys("Down");
         await resumed.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}/m.test(pane), 15_000);
