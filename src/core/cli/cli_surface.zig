@@ -1656,11 +1656,14 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
-                return switch (outcome) {
+                if (outcome.revocation_failed) {
+                    try writeStderr(deps, "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                }
+                return switch (outcome.deletion) {
                     .deleted => result: {
                         try writeStdout(deps, "Signed out of Codex.\n");
                         break :result .handled_success;
