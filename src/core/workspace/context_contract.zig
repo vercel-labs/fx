@@ -221,12 +221,13 @@ fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
     hasher.update(&bytes);
 }
 
+/// The context of a session's instructions. It names no file a turn attaches,
+/// since those would change the instructions the provider cached: a turn's
+/// attachments reach the model as a note, through `LaterContextInput`
+/// (`AttachedFiles`).
 pub const InitialContextInput = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
-    targets: []const ApplicableTarget = &.{},
-    omissions: []const ContextOmissionInput = &.{},
-    omission_summary: ?ContextOmissionSummary = null,
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
@@ -752,6 +753,16 @@ test "image attachments project to borrowed file context targets" {
         @as(usize, 0),
         (try applicableTargetsForImages(std.testing.allocator, &.{})).len,
     );
+}
+
+test "the instructions' context cannot name a file a turn attaches" {
+    // A file named there would change the instructions the provider cached;
+    // attachments reach the model as a note through LaterContextInput.
+    try std.testing.expect(!@hasField(InitialContextInput, "targets"));
+    try std.testing.expect(!@hasField(InitialContextInput, "omissions"));
+    try std.testing.expect(!@hasField(InitialContextInput, "omission_summary"));
+    try std.testing.expect(@hasField(LaterContextInput, "targets"));
+    try std.testing.expect(@hasField(LaterContextInput, "omissions"));
 }
 
 test "minimum shared model context contract snapshot" {

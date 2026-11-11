@@ -4752,8 +4752,6 @@ const TestContextRegistryFixture = struct {
     var gather_calls: usize = 0;
     var process_calls: usize = 0;
     var gather_error: ?context_contract.ProviderError = null;
-    var expected_target_paths: []const []const u8 = &.{};
-    var targets_match: bool = false;
     var expected_queued_image: ?[]const u8 = null;
     var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
@@ -4764,8 +4762,6 @@ const TestContextRegistryFixture = struct {
         gather_calls = 0;
         process_calls = 0;
         gather_error = null;
-        expected_target_paths = &.{};
-        targets_match = false;
         expected_queued_image = null;
         queued_image_folder_rules = false;
         expected_static_context = expected_static;
@@ -4773,17 +4769,8 @@ const TestContextRegistryFixture = struct {
         transient_permission_mode = null;
     }
 
-    fn gather(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
+    fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
         gather_calls += 1;
-        targets_match = input.targets.len == expected_target_paths.len;
-        if (targets_match) {
-            for (input.targets, expected_target_paths) |target, expected_path| {
-                if (target.kind != .file or !std.mem.eql(u8, target.path, expected_path)) {
-                    targets_match = false;
-                    break;
-                }
-            }
-        }
         if (gather_error) |err| return err;
         var result: context_contract.ProviderContext = .{
             .content = try alloc.dupe(u8, test_registry_static_context),
@@ -4823,7 +4810,6 @@ const TestContextRegistryFixture = struct {
         process_calls += 1;
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
-        if (expected_gather_calls > 0) try std.testing.expect(targets_match);
         queued_image_folder_rules = deps.image_folder_rules;
         if (expected_queued_image) |path| {
             try std.testing.expectEqual(@as(usize, 1), job.images.len);
@@ -8533,10 +8519,9 @@ test "default fx ask keeps image paths out of the initial context and has the ru
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
-    // The instructions' context names no target, so an image never changes
-    // them; the turn carries the image's path and the runtime delivers its
-    // folder's rules as a note.
-    try std.testing.expect(TestContextRegistryFixture.targets_match);
+    // The instructions' context cannot name a target, so an image never
+    // changes them; the turn carries the image's path and the runtime
+    // delivers its folder's rules as a note.
     try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 
