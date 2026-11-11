@@ -2303,13 +2303,15 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the failing MCP fixture once.");
+      // The failed call's reason shows on the line below its row.
       await tui.waitForText(
-        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`,
+        "✗ Invalid input: labels require at least one item retry rejected",
         20_000,
       );
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`└ Failed ${TOOL_NAME}\n  ✗ Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",

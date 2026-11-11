@@ -652,7 +652,11 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
 fn storyArgs(scratch: std.mem.Allocator, record: *const ToolDetailRecord) ?std.json.ObjectMap {
     const json = record.arguments_json orelse return null;
     const value = std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{}) catch return null;
-    return if (value == .object) value.object else null;
+    if (value != .object) return null;
+    // A call can wrap its fields in {"request": {...}}, which core unwraps the
+    // same way (src/core/tooling/tool_presentation.zig).
+    if (value.object.get("request")) |request| return if (request == .object) request.object else null;
+    return value.object;
 }
 
 fn storyArgString(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?[]const u8 {
@@ -713,6 +717,9 @@ const StoryTally = struct {
     /// command, whose result the mark already shows. A command that passed on
     /// a retry shares one row with its failures and does not count.
     earlier_command_failures: usize = 0,
+    /// toolbox calls that open a tool or search for one, which read no file.
+    tool_opens: usize = 0,
+    toolbox_searches: usize = 0,
     subagent_calls: usize = 0,
     subagent_names: std.ArrayList([]const u8) = .empty,
     /// Reports and messages from subagents, which show as subagent calls
@@ -787,6 +794,8 @@ const StoryTally = struct {
             .read, .list => {
                 if (std.mem.eql(u8, name, "read_file")) {
                     if (storyArgString(scratch, record, "path")) |path| try addDistinct(&self.read_paths, scratch, path) else self.unnamed_reads += 1;
+                } else if (std.mem.eql(u8, name, "toolbox")) {
+                    if (storyArgString(scratch, record, "open") != null) self.tool_opens += 1 else self.toolbox_searches += 1;
                 } else if (std.mem.eql(u8, name, "web_search") or isProviderSearchName(name)) {
                     self.web_searches += 1;
                 } else if (std.mem.eql(u8, name, "web_fetch")) {
@@ -925,6 +934,10 @@ fn formatStoryHeader(
         try w.print("Read {d} web {s}", .{ tally.web_reads, pluralWord(tally.web_reads, "page", "pages") });
     } else if (tally.web_searches > 0) {
         try w.writeAll("Searched the web");
+    } else if (tally.tool_opens > 0) {
+        try w.print("Opened {d} {s}", .{ tally.tool_opens, pluralWord(tally.tool_opens, "tool", "tools") });
+    } else if (tally.toolbox_searches > 0) {
+        try w.writeAll("Searched the toolbox");
     } else if (reads > 0) {
         try w.print("Read {d} {s}", .{ reads, pluralWord(reads, "file", "files") });
     } else if (tally.searches > 0) {
@@ -4309,6 +4322,37 @@ test "input to a running session and its stop are not new commands" {
     const follow_bytes = follow_ups.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● Stopped "));
     try std.testing.expect(std.mem.endsWith(u8, follow_bytes, " · 2 calls ✓") or std.mem.endsWith(u8, follow_bytes, " · 2 calls"));
+}
+
+test "toolbox lookups and wrapped arguments name what the group did" {
+    const alloc = std.testing.allocator;
+    // A toolbox open reads no file, so it is not a search or a read.
+    const opened = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Opened mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed mcp_fixture_echo: Invalid input\n", .class = .tool_status } },
+    };
+    const opened_details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .read, .outcome = .completed, .arguments_json = @constCast("{\"open\":\"mcp_fixture_echo\"}") },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .failed, .arguments_json = @constCast("{\"run\":\"mcp_fixture_echo\"}") },
+    };
+    var opened_projection = try build(alloc, &opened, &opened_details, 100);
+    defer opened_projection.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, opened_projection.entry_actions.items[0].override.bytes, "● Opened 1 tool · 1 failed\n"));
+
+    // Fields inside {"request": {...}} count like top-level ones.
+    const run = "{\"request\":{\"action\":\"run\",\"command\":\"npm run dev\",\"tty\":true}}";
+    const stop = "{\"request\":{\"action\":\"stop\",\"session_id\":\"shell-7\"}}";
+    const session = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Stopped npm run dev\n", .class = .tool_status } },
+    };
+    const session_details = [_]ToolDetailRecord{
+        storyCommandDetail(1, run, 0, null),
+        storyCommandDetail(2, stop, 0, null),
+    };
+    var session_projection = try build(alloc, &session, &session_details, 100);
+    defer session_projection.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, session_projection.entry_actions.items[0].override.bytes, "● Ran 1 shell command ✓\n"));
 }
 
 test "a command that failed before the last one still counts in the header" {

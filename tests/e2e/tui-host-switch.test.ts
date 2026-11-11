@@ -2583,7 +2583,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, async (session) => {
         await session.sendText("SWITCH_USER run them");
         const pane = await session.waitForText("MAIN_CLOSE_DONE", 60_000);
-        expect(pane).toContain("\u2514 closed tester");
+        // The close is its group's only row, so it is the group's header.
+        expect(pane).toContain("\u25cf closed tester");
         // Main alone again: no agent indicator, and ↓ opens no list, which
         // would take the next key; the composer shows it instead.
         await session.waitForPane((value) => !value.includes("main \u2193"), 10_000);

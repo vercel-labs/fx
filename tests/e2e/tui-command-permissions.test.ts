@@ -1334,6 +1334,8 @@ describe("effect-aware command permissions", () => {
       expect(narrowRow).not.toContain("omega >/dev/null");
 
       await activeSession.resizeWindow(240, 32);
+      // The resize reprojects the row on a later frame, so wait for it.
+      await activeSession.waitForPane((pane) => pane.includes(`● Ran ${command} ✓`), TIMEOUT);
       const wide = await activeSession.captureFullScrollback();
       const wideRow = wide.split("\n").find((line) => line.includes("● Ran printf ok"));
       expect(wideRow).toBe(`● Ran ${command} ✓`);

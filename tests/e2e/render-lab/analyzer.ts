@@ -565,8 +565,13 @@ function assertActiveActivitySequence(
   const submittedRows = lines.flatMap((line, row) =>
     line.includes(submittedMarker) ? [row] : []
   );
+  // A group with one call has no summary row: the call is the group's
+  // header, so its activity row is also its group row.
   const groupRows = lines.flatMap((line, row) =>
-    line.includes("tool call") && row < lines.length - 1 ? [row] : []
+    (line.includes("tool call") || (line.startsWith("● ") && line.includes(activeMarker))) &&
+      row < lines.length - 1
+      ? [row]
+      : []
   );
   const activityRows = lines.flatMap((line, row) =>
     line.includes(activeMarker) ? [row] : []
@@ -584,7 +589,7 @@ function assertActiveActivitySequence(
   const submittedRow = submittedRows[0]!;
   const groupRow = groupRows[0]!;
   const activityRow = activityRows[0]!;
-  if (submittedRow >= groupRow || groupRow >= activityRow) {
+  if (submittedRow >= groupRow || groupRow > activityRow) {
     push(
       failures,
       "active-tool-activity-marker-order",
