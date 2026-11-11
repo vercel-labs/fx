@@ -14953,33 +14953,66 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
 }
 
-const debt_anchor_flow =
+const debt_base_flow =
     "row-00\nrow-01\nrow-02\nrow-03\n" ++
     "row-04\nrow-05\nrow-06\nrow-07\n" ++
     "row-08\nrow-09\nrow-10\nrow-11\n";
-const debt_rewritten_grown_flow =
-    "row-00\nrow-01\nrow-02\nrow-03\n" ++
-    "row-04\nrow-05\nrow-06\nrow-07\n" ++
-    "row-08\nrow-09\nrow-10\nrow-11 rewritten\n" ++
-    "row-12\nrow-13\n";
+const debt_mid_rows = "row-12\nrow-13\nrow-14\n";
+const debt_grown_flow = debt_base_flow ++ debt_mid_rows ++ "row-15\n";
+// Each rewrite changes the last row it has in common with the one before, so
+// it is not a prefix growth, and leaves the rows a replay would write intact.
+const debt_rewrite_1_flow = debt_base_flow ++ debt_mid_rows ++ "row-15 rewrite 1\n";
+const debt_rewrite_2_flow = debt_base_flow ++ debt_mid_rows ++ "row-15 rewrite 2\nrow-16\n";
+const debt_rewrite_3_flow = debt_base_flow ++ debt_mid_rows ++ "row-15 rewrite 3\nrow-16\nrow-17\n";
+const debt_growth_flow = debt_rewrite_2_flow ++ "row-17\n";
 
-/// Commits a stable frame of twelve rows, then marks the four rows above the
-/// viewport as not yet in history: the state a recovered frame leaves.
-fn installStableAnchorWithHistoryDebtForTest(
-    runtime: *TranscriptRuntime,
-    alloc: Allocator,
-    catchup_pending: bool,
-) !void {
-    var source = try testSource(alloc, debt_anchor_flow, runtime.layout.cols);
+const debt_history_for_test: u32 = 8;
+
+/// Leaves a stable anchor whose history trails the viewport by four rows, the
+/// way a recovery does: a frame whose terminal write fails leaves a receipt
+/// that owes rows, and the next frame, over a rewritten source, drops that
+/// debt and commits stable.
+fn leaveHistoryDebtForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var base = try testSource(alloc, debt_base_flow, runtime.layout.cols);
+    defer base.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &base);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &base, &base_prepared);
+
+    var grown = try testSource(alloc, debt_grown_flow, runtime.layout.cols);
+    defer grown.deinit(alloc);
+    var grown_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &grown);
+    defer grown_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(runtime, alloc, &grown, &grown_prepared);
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+
+    var rewritten = try testSource(alloc, debt_rewrite_1_flow, runtime.layout.cols);
+    defer rewritten.deinit(alloc);
+    var rewritten_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &rewritten);
+    defer rewritten_prepared.deinit(alloc);
+    try commitPreparedForTest(runtime, alloc, &rewritten, &rewritten_prepared);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(debt_history_for_test, anchor.history_visual_offset);
+    try std.testing.expectEqual(debt_history_for_test + 4, anchor.visual_offset);
+    try std.testing.expect(!anchor.history_catchup_pending);
+    try std.testing.expect(!anchor.normal_buffer_recovery_pending);
+}
+
+/// Commits one more rewritten frame over the debt. It cannot replay the owed
+/// rows, so it holds them and flags the next frame to replay.
+fn holdHistoryDebtForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    var source = try testSource(alloc, debt_rewrite_2_flow, runtime.layout.cols);
     defer source.deinit(alloc);
     var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
     defer prepared.deinit(alloc);
     try commitPreparedForTest(runtime, alloc, &source, &prepared);
-    const anchor = &runtime.transcript_commit_state.stable;
-    try std.testing.expect(anchor.visual_offset > 4);
-    anchor.history_visual_offset = 4;
-    anchor.history_catchup_pending = catchup_pending;
-    anchor.normal_buffer_recovery_pending = false;
+    const held = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(debt_history_for_test, held.history_visual_offset);
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+    try std.testing.expect(held.history_catchup_pending);
 }
 
 const DebtFrameForTest = struct {
@@ -15010,7 +15043,7 @@ fn sealDebtFrameForTest(
     var plan = testPaintPlan(runtime, prepared.selection);
     if (destructive) {
         try plan.invalidation.append(.{
-            .reason = .partial_write,
+            .reason = .external_clear,
             .top = runtime.owned_top_row,
             .bottom = runtime.layout.content_bottom,
         });
@@ -15040,14 +15073,14 @@ fn expectDebtFrameHeld(frame: DebtFrameForTest) !void {
     try std.testing.expectEqual(@as(u32, 0), frame.semantic_rows);
     try std.testing.expectEqual(@as(u16, 0), frame.terminal_scroll_rows);
     try std.testing.expect(!frame.appends);
-    try std.testing.expectEqual(@as(u32, 4), frame.history_visual_offset);
+    try std.testing.expectEqual(debt_history_for_test, frame.history_visual_offset);
 }
 
 fn expectDebtFrameReplayed(frame: DebtFrameForTest) !void {
     try std.testing.expect(frame.semantic_rows > 0);
     try std.testing.expect(frame.terminal_scroll_rows > 0);
     try std.testing.expect(frame.appends);
-    try std.testing.expect(frame.history_visual_offset > 4);
+    try std.testing.expect(frame.history_visual_offset > debt_history_for_test);
 }
 
 test "stable frame after a source rewrite scrolls no rows its anchor cannot replay" {
@@ -15057,49 +15090,51 @@ test "stable frame after a source rewrite scrolls no rows its anchor cannot repl
         .owned_top_row = 1,
     };
     defer runtime.deinit(alloc);
-    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, false);
+    try leaveHistoryDebtForTest(&runtime, alloc);
 
-    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, false);
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_2_flow, false);
     try expectDebtFrameHeld(frame);
 }
 
-test "stable frame under a destructive invalidation scrolls no rows its anchor cannot replay" {
+test "stable frame under an external clear scrolls no rows its anchor cannot replay" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(20, 8, 4),
         .owned_top_row = 1,
     };
     defer runtime.deinit(alloc);
-    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, false);
+    try leaveHistoryDebtForTest(&runtime, alloc);
 
-    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, true);
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_2_flow, true);
     try expectDebtFrameHeld(frame);
 }
 
-test "stable frame after a source rewrite replays the owed rows when a catch-up is pending" {
+test "stable frame after a source rewrite replays the owed rows once a frame held them" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(20, 8, 4),
         .owned_top_row = 1,
     };
     defer runtime.deinit(alloc);
-    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, true);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    try holdHistoryDebtForTest(&runtime, alloc);
 
-    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, false);
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_3_flow, false);
     try expectDebtFrameReplayed(frame);
 }
 
-test "stable frame under a destructive invalidation replays the owed rows when a catch-up is pending" {
+test "stable frame under an external clear replays the owed rows once a frame held them" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(20, 8, 4),
         .owned_top_row = 1,
     };
     defer runtime.deinit(alloc);
-    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, true);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    try holdHistoryDebtForTest(&runtime, alloc);
 
     // The plan cannot see the invalidation, so the replay must not wait on it.
-    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow, true);
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_rewrite_3_flow, true);
     try expectDebtFrameReplayed(frame);
 }
 
@@ -15110,12 +15145,13 @@ test "compatible stable frame without a replay range grants no owed rows" {
         .owned_top_row = 1,
     };
     defer runtime.deinit(alloc);
-    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, true);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    try holdHistoryDebtForTest(&runtime, alloc);
     // The committed layout no longer matches the anchor, so neither a history
     // replay nor an append on the retained screen can write the owed rows.
     runtime.committed_frame_layout.layout_id +%= 1;
 
-    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_anchor_flow ++ "row-12\nrow-13\n", false);
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_growth_flow, false);
     try expectDebtFrameHeld(frame);
 }
 
@@ -15126,23 +15162,11 @@ test "history debt a stable frame could not write is replayed by the next frame"
         .owned_top_row = 1,
     };
     defer runtime.deinit(alloc);
-    try installStableAnchorWithHistoryDebtForTest(&runtime, alloc, false);
+    try leaveHistoryDebtForTest(&runtime, alloc);
+    try holdHistoryDebtForTest(&runtime, alloc);
 
-    var rewritten = try testSource(alloc, debt_rewritten_grown_flow, runtime.layout.cols);
-    defer rewritten.deinit(alloc);
-    var rewritten_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &rewritten);
-    defer rewritten_prepared.deinit(alloc);
-    try commitPreparedForTest(&runtime, alloc, &rewritten, &rewritten_prepared);
-
-    // The held frame wrote nothing for the debt, so history stays and the
-    // next frame owes the replay.
-    const held = runtime.transcript_commit_state.stable;
-    try std.testing.expectEqual(@as(u32, 4), held.history_visual_offset);
-    try std.testing.expect(held.visual_offset > held.history_visual_offset);
-    try std.testing.expect(held.history_catchup_pending);
-
-    const next = try sealDebtFrameForTest(&runtime, alloc, debt_rewritten_grown_flow ++ "row-14\n", false);
-    try expectDebtFrameReplayed(next);
+    const frame = try sealDebtFrameForTest(&runtime, alloc, debt_growth_flow, false);
+    try expectDebtFrameReplayed(frame);
 }
 
 test "catch-up release materializes history before staging a larger finality hold" {
