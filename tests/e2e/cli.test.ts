@@ -21,6 +21,7 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  envWithoutFxHome,
   FX_BIN,
   HAS_API_KEY,
   REPO_ROOT,
@@ -1573,11 +1574,10 @@ describe("cli: status", () => {
   test(
     "fx status --json returns valid status JSON",
     async () => {
-      // A fresh profile, so a developer's own settings can't leak in,
-      // including through FX_HOME.
+      // A fresh profile, so a developer's own settings can't leak in.
       const home = createIsolatedTestHome();
       try {
-        const r = await runFx(["status", "--json"], { env: { HOME: home, FX_HOME: undefined } });
+        const r = await runFx(["status", "--json"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("status");
@@ -2244,17 +2244,22 @@ describe("cli: permissions", () => {
   test(
     "fx permissions --json returns valid permissions JSON",
     async () => {
-      const r = await runFx(["permissions", "--json"]);
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(json.kind).toBe("permissions");
-      expect(json).toHaveProperty("mode");
-      expect(json).toHaveProperty("grant_count");
-      expect(json.grant_scope).toBe("session");
-      expect(json.runtime_grants_available).toBe(false);
-      expect(json.rules_scope).toBe("persistent_config");
-      expect(Array.isArray(json.rules)).toBe(true);
-      expect(Array.isArray(json.grants)).toBe(true);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["permissions", "--json"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(json.kind).toBe("permissions");
+        expect(json).toHaveProperty("mode");
+        expect(json).toHaveProperty("grant_count");
+        expect(json.grant_scope).toBe("session");
+        expect(json.runtime_grants_available).toBe(false);
+        expect(json.rules_scope).toBe("persistent_config");
+        expect(Array.isArray(json.rules)).toBe(true);
+        expect(Array.isArray(json.grants)).toBe(true);
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
@@ -3846,15 +3851,21 @@ describe("cli: removed task and background commands", () => {
   test(
     "fx task, fx tasks, and fx background are not commands",
     async () => {
-      for (const command of ["task", "tasks"]) {
-        const result = await runFx([command], { env: NO_GATEWAY_AUTH });
-        expect(result.code).toBe(2);
-        expect(result.stderr).toContain(`fx: unknown command ${command} (did you mean ask?)`);
+      const home = createIsolatedTestHome();
+      try {
+        const env = { ...NO_GATEWAY_AUTH, HOME: home };
+        for (const command of ["task", "tasks"]) {
+          const result = await runFx([command], { env });
+          expect(result.code).toBe(2);
+          expect(result.stderr).toContain(`fx: unknown command ${command} (did you mean ask?)`);
+        }
+        // A word that isn't close to a command is a first prompt for a session.
+        const background = await runFx(["background"], { env });
+        expect(background.code).toBe(1);
+        expect(background.stderr).toContain("fx requires an interactive terminal (TTY).");
+      } finally {
+        cleanupIsolatedTestHome(home);
       }
-      // A word that isn't close to a command is a first prompt for a session.
-      const background = await runFx(["background"], { env: NO_GATEWAY_AUTH });
-      expect(background.code).toBe(1);
-      expect(background.stderr).toContain("fx requires an interactive terminal (TTY).");
     },
     TIMEOUT,
   );
@@ -4204,7 +4215,7 @@ describe("cli: models", () => {
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
         env: {
-          ...process.env,
+          ...envWithoutFxHome(),
           ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
         },
         stdout: "pipe",
@@ -4472,13 +4483,18 @@ describe("cli: models", () => {
   test.skipIf(!HAS_API_KEY)(
     "fx models --json returns valid models JSON",
     async () => {
-      const r = await runFx(["models", "--json"], { timeoutMs: 30_000 });
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(json.kind).toBe("models");
-      expect(json).toHaveProperty("count");
-      expect(Array.isArray(json.ids)).toBe(true);
-      expect(json.ids.length).toBeGreaterThan(0);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["models", "--json"], { env: { HOME: home }, timeoutMs: 30_000 });
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(json.kind).toBe("models");
+        expect(json).toHaveProperty("count");
+        expect(Array.isArray(json.ids)).toBe(true);
+        expect(json.ids.length).toBeGreaterThan(0);
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     30_000,
   );
@@ -4547,12 +4563,17 @@ describe("cli: credits", () => {
   test.skipIf(!HAS_API_KEY)(
     "fx credits --json returns credits JSON or exits non-zero",
     async () => {
-      const r = await runFx(["credits", "--json"], { timeoutMs: 30_000 });
-      if (r.code === 0 && r.stdout.trim()) {
-        const json = JSON.parse(r.stdout.trim());
-        expect(json.kind).toBe("credits");
-      } else {
-        expect(r.code).not.toBe(0);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["credits", "--json"], { env: { HOME: home }, timeoutMs: 30_000 });
+        if (r.code === 0 && r.stdout.trim()) {
+          const json = JSON.parse(r.stdout.trim());
+          expect(json.kind).toBe("credits");
+        } else {
+          expect(r.code).not.toBe(0);
+        }
+      } finally {
+        cleanupIsolatedTestHome(home);
       }
     },
     30_000,
@@ -5005,28 +5026,33 @@ describe("cli: ask success", () => {
     "fx ask stdin resource overflow has distinct text and JSON errors",
     async () => {
       const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x78);
+      const home = createIsolatedTestHome();
+      try {
+        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const textResult = await runFx(["ask", "--auto", "--no-save"], {
+          env,
+          stdin: oversized,
+          timeoutMs: 60_000,
+        });
+        expect(textResult.code).toBe(1);
+        expect(textResult.stdout).toBe("");
+        expect(textResult.stderr).toBe(
+          "fx ask: prompt exceeds the local input safety limit\n",
+        );
 
-      const textResult = await runFx(["ask", "--auto", "--no-save"], {
-        env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
-        stdin: oversized,
-        timeoutMs: 60_000,
-      });
-      expect(textResult.code).toBe(1);
-      expect(textResult.stdout).toBe("");
-      expect(textResult.stderr).toBe(
-        "fx ask: prompt exceeds the local input safety limit\n",
-      );
-
-      const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
-        env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
-        stdin: oversized,
-        timeoutMs: 60_000,
-      });
-      expect(jsonResult.code).toBe(1);
-      expect(jsonResult.stderr).toBe("");
-      expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
-      );
+        const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
+          env,
+          stdin: oversized,
+          timeoutMs: 60_000,
+        });
+        expect(jsonResult.code).toBe(1);
+        expect(jsonResult.stderr).toBe("");
+        expect(jsonResult.stdout).toBe(
+          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+        );
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     120_000,
   );
@@ -5709,19 +5735,24 @@ describe("cli: ask success", () => {
   test.skipIf(!HAS_API_KEY)(
     "fx ask --json --no-save --auto returns valid JSON with output",
     async () => {
-      const r = await runFx(
-        ["ask", "--json", "--no-save", "--auto", "Say exactly: hello world"],
-        { timeoutMs: 60_000 },
-      );
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(typeof json.output).toBe("string");
-      expect(json.output.length).toBeGreaterThan(0);
-      expect(typeof json.final_output).toBe("string");
-      expect(json.final_output.length).toBeGreaterThan(0);
-      expect(typeof json.model).toBe("string");
-      expect(Array.isArray(json.tool_calls)).toBe(true);
-      expect(typeof json.steps).toBe("number");
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(
+          ["ask", "--json", "--no-save", "--auto", "Say exactly: hello world"],
+          { env: { HOME: home }, timeoutMs: 60_000 },
+        );
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(typeof json.output).toBe("string");
+        expect(json.output.length).toBeGreaterThan(0);
+        expect(typeof json.final_output).toBe("string");
+        expect(json.final_output.length).toBeGreaterThan(0);
+        expect(typeof json.model).toBe("string");
+        expect(Array.isArray(json.tool_calls)).toBe(true);
+        expect(typeof json.steps).toBe("number");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     60_000,
   );
@@ -5793,9 +5824,14 @@ describe("cli: error handling", () => {
   test(
     "fx ask with no prompt exits 2",
     async () => {
-      const r = await runFx(["ask"]);
-      expect(r.code).toBe(2);
-      expect(r.stderr).toContain("missing prompt");
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["ask"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
+        expect(r.code).toBe(2);
+        expect(r.stderr).toContain("missing prompt");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
@@ -5863,39 +5899,45 @@ describe("cli: workspace access", () => {
   test(
     "workspace launch modifiers preserve ask help and report friendly option errors",
     async () => {
-      const enabled = {
-        ...NO_GATEWAY_AUTH,
-      };
+      const home = createIsolatedTestHome();
+      try {
+        const enabled = {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+        };
 
-      const help = await runFx(
-        ["--add-dir", "/tmp/shared", "ask", "--help"],
-        { env: enabled },
-      );
-      expect(help.code).toBe(0);
-      expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
-      expect(help.stderr).toBe("");
+        const help = await runFx(
+          ["--add-dir", "/tmp/shared", "ask", "--help"],
+          { env: enabled },
+        );
+        expect(help.code).toBe(0);
+        expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
+        expect(help.stderr).toBe("");
 
-      const missing = await runFx(["--add-dir"], { env: enabled });
-      expect(missing.code).toBe(2);
-      expect(missing.stderr).toContain("fx: --add-dir needs a value\n");
-      expect(missing.stderr).not.toContain("InvalidFlag");
+        const missing = await runFx(["--add-dir"], { env: enabled });
+        expect(missing.code).toBe(2);
+        expect(missing.stderr).toContain("fx: --add-dir needs a value\n");
+        expect(missing.stderr).not.toContain("InvalidFlag");
 
-      // A repeated flag is not an error: the launch gets past parsing and
-      // stops only because this run has no terminal.
-      const duplicate = await runFx(
-        ["--no-additional-dirs", "--no-additional-dirs"],
-        { env: enabled },
-      );
-      expect(duplicate.code).toBe(1);
-      expect(duplicate.stderr).toBe("fx requires an interactive terminal (TTY).\n");
+        // A repeated flag is not an error: the launch gets past parsing and
+        // stops only because this run has no terminal.
+        const duplicate = await runFx(
+          ["--no-additional-dirs", "--no-additional-dirs"],
+          { env: enabled },
+        );
+        expect(duplicate.code).toBe(1);
+        expect(duplicate.stderr).toBe("fx requires an interactive terminal (TTY).\n");
 
-      const badMode = await runFx(["--permission-mode", "never"], { env: enabled });
-      expect(badMode.code).toBe(2);
-      expect(badMode.stderr).toContain("fx: --permission-mode accepts ask, auto, or full-access\n");
+        const badMode = await runFx(["--permission-mode", "never"], { env: enabled });
+        expect(badMode.code).toBe(2);
+        expect(badMode.stderr).toContain("fx: --permission-mode accepts ask, auto, or full-access\n");
 
-      const beforeCommand = await runFx(["--auto", "status"], { env: enabled });
-      expect(beforeCommand.code).toBe(2);
-      expect(beforeCommand.stderr).toBe("fx: agent-run flags such as --permission-mode apply to a session and to fx ask, fx pr, fx issue, and fx acp\n");
+        const beforeCommand = await runFx(["--auto", "status"], { env: enabled });
+        expect(beforeCommand.code).toBe(2);
+        expect(beforeCommand.stderr).toBe("fx: agent-run flags such as --permission-mode apply to a session and to fx ask, fx pr, fx issue, and fx acp\n");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
