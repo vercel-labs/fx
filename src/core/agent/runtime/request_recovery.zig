@@ -242,8 +242,9 @@ pub const RequestRecovery = struct {
     }
 
     /// Reports a failed send. Returns the send the module asks for at once,
-    /// which only compaction does. Any other kind makes the module wait or
-    /// ask the user; the caller then calls `waitForSend`.
+    /// which only compaction and a sign-in failure the user already answered
+    /// do. Any other kind makes the module wait or ask the user; the caller
+    /// then calls `waitForSend`.
     pub fn failed(self: *RequestRecovery, failure: Failure) !?Send {
         // An answer given before this failure answers nothing, except a
         // sign-in that finished while a resend for one was on the wire: the
@@ -774,6 +775,32 @@ test "a sign-in that finishes while a sign-in resend is on the wire sends again 
     try std.testing.expectEqual(Send{}, (try request.failed(.{ .kind = .sign_in })).?);
     try std.testing.expectEqual(@as(u16, 3), request.attempt());
     try std.testing.expect(!continue_flag.load(.seq_cst));
+}
+
+test "a sign-in during a sign-in resend that then fails on the way waits briefly, then resends" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    // The user signs in while that resend is on the wire, and the connection
+    // drops. The turn loop's transient sites take their send from
+    // `waitForSend`, so `failed` must not hand one back here.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expect(try request.failed(.{ .kind = .dropped }) == null);
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 3), request.attempt());
 }
 
 test "a continue or a closed sign-in before an ordinary failure answers nothing" {

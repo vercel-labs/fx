@@ -212,6 +212,9 @@ pub const FakeCompletion = struct {
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
+    /// Set while this request is on the wire, before its answer, as when
+    /// the user signs in during a resend.
+    set_before_answer: ?*std.atomic.Value(bool) = null,
 };
 
 /// Fails a model request whose prompt ends on an assistant message, and one the
@@ -293,6 +296,7 @@ pub const FakeGateway = struct {
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        if (completion.set_before_answer) |flag| flag.store(true, .seq_cst);
         if (completion.pre_admission_error) |err| return err;
         try request.admission.admit();
         self.admitted_requests += 1;

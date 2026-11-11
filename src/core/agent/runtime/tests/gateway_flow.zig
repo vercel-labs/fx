@@ -8921,13 +8921,43 @@ test "processQueuedPrompt waits for a sign-in on a subscription 401 after a refr
         try runFakePrompt(&gateway, &hooks, config, job);
 
         // Only an fx login on AI Gateway retries a refused login; a
-        // subscription signs in again, as before.
+        // subscription signs in again, as before, and shows no provider
+        // error while it waits.
         try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
         try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
+        try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
         const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
         try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     }
+}
+
+test "processQueuedPrompt resends after a sign-in during a sign-in resend that then gets a gateway error" {
+    const alloc = std.testing.allocator;
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+        // The wait's own resend: the user signs in while it is on the wire,
+        // and the gateway answers 503.
+        .{ .status = .service_unavailable, .err_body = "{\"error\":{\"message\":\"try later\"}}", .set_before_answer = &continue_flag },
+        .{ .content = "answer after the sign-in" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{"token-before"};
+    hooks.credential_refresh_fail_force = true;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt ends the turn on a refused login after a refresh when the host cannot ask" {

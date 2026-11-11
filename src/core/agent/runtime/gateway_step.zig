@@ -5,6 +5,7 @@ const image_route = @import("../../images/image_route.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
@@ -294,19 +295,10 @@ test "the trace's error message masks the credential a provider quotes back" {
 fn traceErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8, credential: ?[]const u8) ![]u8 {
     const masked = try alloc.dupe(u8, detail);
     defer alloc.free(masked);
-    if (credential) |secret| maskEvery(masked, secret);
+    if (credential) |secret| text_utils.maskLiteral(masked, secret);
     const message = try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, status, masked);
-    if (credential) |secret| maskEvery(message, secret);
+    if (credential) |secret| text_utils.maskLiteral(message, secret);
     return message;
-}
-
-fn maskEvery(text: []u8, secret: []const u8) void {
-    if (secret.len == 0) return;
-    var rest = text;
-    while (std.mem.find(u8, rest, secret)) |at| {
-        @memset(rest[at..][0..secret.len], '*');
-        rest = rest[at + secret.len ..];
-    }
 }
 
 test "the trace's error message masks the key before clipping and after decoding" {

@@ -333,18 +333,18 @@ if (options.selfCheck) {
   const mutants = [
     {
       name: "resends at once after a failure",
-      target: ".refused => if (!polled)\n            waitAfter(state, failure, now_ms)",
-      planted: ".refused => if (!polled)\n            sendNow(state, now_ms, .{})",
+      target: "        else\n            waitAfter(state, failure, now_ms),\n        .too_long",
+      planted: "        else\n            sendNow(state, now_ms, .{}),\n        .too_long",
     },
     {
       name: "asks for a sign-in when the gateway refuses a fresh login",
-      target: "        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (!polled)",
-      planted: "        .refused => askUser(state, .sign_in, now_ms),\n        .offline, .dropped, .unreadable, .server, .rate_limited => if (!polled)",
+      target: "        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (polled and !signed_in)",
+      planted: "        .refused => askUser(state, .sign_in, now_ms),\n        .offline, .dropped, .unreadable, .server, .rate_limited => if (polled and !signed_in)",
     },
     {
       name: "opens a second sign-in when its own resend fails on the way",
-      target: "        else\n            waitForSignInAgain(state, now_ms),\n        .too_long",
-      planted: "        else\n            waitAfter(state, failure, now_ms),\n        .too_long",
+      target: ".refused => if (polled and !signed_in)\n            waitForSignInAgain(state, now_ms)",
+      planted: ".refused => if (polled and !signed_in)\n            waitAfter(state, failure, now_ms)",
     },
     {
       name: "never resends while waiting for a sign-in",

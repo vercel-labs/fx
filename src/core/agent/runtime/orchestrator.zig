@@ -4605,11 +4605,12 @@ fn needsUserFailureKind(
     };
 }
 
-/// Whether a 401 on a login fx has just refreshed retries with that login
-/// instead of asking for a sign-in. Only an fx login on AI Gateway does: the
-/// refresh proved the login good, so the refusal is the gateway's, and the
-/// status says so. A ChatGPT or Grok subscription signs in again as before.
-fn refusedLoginRetries(credential_source: ?types.CredentialSource) bool {
+/// Whether the request uses an fx login on AI Gateway. Only such a login
+/// retries a 401 that follows a refresh that worked, since the refresh proved
+/// the login good and the refusal is the gateway's (vercel-labs/fx#1858), and
+/// only its sign-in wait shows the provider's reason, which the gateway
+/// builtin masks. A ChatGPT or Grok subscription signs in again as before.
+fn gatewayLogin(credential_source: ?types.CredentialSource) bool {
     const source = credential_source orelse return false;
     return source == .fx_login;
 }
@@ -8976,7 +8977,7 @@ fn processQueuedPromptLoop(
             // reason once; Esc during the wait falls through to the cancel
             // path below. A host that cannot ask ends the turn as before.
             if (response_failure) |failure| if (failure.kind == .unauthorized and auth_retry_used and
-                refusedLoginRetries(job.credential_source) and
+                gatewayLogin(job.credential_source) and
                 request_recovery.canAskUser() and !config.cancel_flag.load(.seq_cst))
             {
                 if (!auth_reason_shown) {
@@ -9012,9 +9013,10 @@ fn processQueuedPromptLoop(
                 if (needsUserFailureKind(arena, failure, job.credential_source)) |kind| {
                     // The provider's reason stays visible while fx waits, and
                     // after Esc, so the user knows what to change. A wait for
-                    // a sign-in resends now and then, and shows its reason
-                    // once.
-                    if (kind != .sign_in or !auth_reason_shown) {
+                    // a sign-in resends now and then; for an fx login it shows
+                    // the gateway's reason once, and for another provider
+                    // none, as on main, since fx opens the sign-in.
+                    if (kind != .sign_in or (gatewayLogin(job.credential_source) and !auth_reason_shown)) {
                         try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
                         http_failure_notice_shown = true;
                         if (kind == .sign_in) auth_reason_shown = true;

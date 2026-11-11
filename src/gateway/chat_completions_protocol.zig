@@ -248,18 +248,9 @@ pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []cons
     errdefer alloc.free(detail);
     const encoded = try std.json.Stringify.valueAlloc(alloc, credential, .{});
     defer alloc.free(encoded);
-    mask_error_bytes(detail, encoded[1 .. encoded.len - 1]);
-    mask_error_bytes(detail, credential);
+    text_utils.maskLiteral(detail, encoded[1 .. encoded.len - 1]);
+    text_utils.maskLiteral(detail, credential);
     return detail;
-}
-
-fn mask_error_bytes(detail: []u8, value: []const u8) void {
-    if (value.len == 0) return;
-    var remaining = detail;
-    while (std.mem.find(u8, remaining, value)) |index| {
-        @memset(remaining[index..][0..value.len], '*');
-        remaining = remaining[index + value.len ..];
-    }
 }
 
 test "chat completions error masking survives JSON and recovery decoding" {

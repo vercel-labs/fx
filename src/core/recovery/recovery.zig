@@ -324,13 +324,14 @@ fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
         // A sign-in wait's own resend that fails on the way says nothing
         // about the login, so the request waits for the sign-in again and fx
         // opens no second one (`tests/tla/recovery/Recovery.tla`
-        // PollKeepsSignIn).
-        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (!polled)
-            waitAfter(state, failure, now_ms)
-        else if (signed_in)
-            resendAfterSignIn(state, now_ms)
+        // PollKeepsSignIn). After a sign-in that finished while it was on
+        // the wire, it is an ordinary failure: a short wait, then a resend
+        // that loads the new login. The turn loop takes a transient
+        // failure's send from that wait, so none goes out at once here.
+        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (polled and !signed_in)
+            waitForSignInAgain(state, now_ms)
         else
-            waitForSignInAgain(state, now_ms),
+            waitAfter(state, failure, now_ms),
         .too_long => if (state.flags.compacted) askUser(state, .too_long, now_ms) else compactAndSend(state, now_ms),
         .rejected => askUser(state, .rejected, now_ms),
         // The user signed in while a resend with the old login was on the
@@ -1188,16 +1189,21 @@ test "a sign-in resend that fails on the way keeps the sign-in wait, so fx opens
         // wait away.
         try testing.expectEqualStrings("Sign-in expired · waiting 3m 10s · next try in 3m 00s", kept.status.?.text.slice());
         try testing.expectEqual(@as(u64, 371_000), state.wait_until_ms);
-        // A sign-in that finished while that resend was on the wire sends at
-        // once with the new login.
+        // After a sign-in that finished while that resend was on the wire,
+        // the failure is an ordinary one: a short wait, then a resend with
+        // the new login. `failed` hands back no send, since the turn loop
+        // takes a transient failure's send from the wait.
         var signed_in: State = .{};
         _ = startNew(&signed_in, 0, false);
         _ = fail(&signed_in, .sign_in, 1_000);
         _ = step(&signed_in, .tick, 181_000);
         _ = step(&signed_in, .user_continue, 181_500);
-        const resent = fail(&signed_in, kind, 182_000);
-        try testing.expectEqual(Send{}, resent.send.?);
-        try testing.expectEqualStrings("Signed in · retrying · attempt 3", resent.status.?.text.slice());
+        const waited = fail(&signed_in, kind, 182_000);
+        try testing.expect(waited.send == null);
+        try testing.expectEqual(Status.Kind.waiting, waited.status.?.kind);
+        const retry = tickUntilSend(&signed_in, 182_000);
+        try testing.expect(retry.plan.send != null);
+        try testing.expectEqual(@as(u16, 3), signed_in.attempt);
     }
     // A failure of an ordinary resend still waits as before.
     var ordinary: State = .{};
@@ -1595,14 +1601,18 @@ const SimHost = struct {
         };
         if (event == .failed and was_outstanding) {
             switch (event.failed.kind) {
-                .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (was_sign_in_resend) {
-                    // It waits for the sign-in again, or resends at once
-                    // for a sign-in that finished while it was on the wire.
-                    if (plan.send == null) try testing.expectEqual(Status.Need.sign_in, plan.status.?.need.?);
-                } else {
+                .offline, .dropped, .unreadable, .server, .rate_limited, .refused => {
+                    // Never a send at once: the turn loop takes a transient
+                    // failure's send from the wait. A sign-in wait's own
+                    // resend waits for the sign-in again, unless the user
+                    // signed in while it was on the wire.
                     try testing.expect(plan.send == null);
-                    try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
-                    host.transient_failure_ms = host.now_ms;
+                    if (was_sign_in_resend and plan.status.?.kind == .need_user) {
+                        try testing.expectEqual(Status.Need.sign_in, plan.status.?.need.?);
+                    } else {
+                        try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
+                        host.transient_failure_ms = host.now_ms;
+                    }
                 },
                 .too_long, .rejected, .sign_in, .quota, .content_filter => {},
             }
