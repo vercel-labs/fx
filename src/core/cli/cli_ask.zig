@@ -2348,18 +2348,7 @@ fn takeSteeringBoundary(
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (kind == .cancelled) return .interrupt;
-    const result = try ctx.worker.takeSteeringBoundary(std.heap.c_allocator, turn_id, kind);
-    return switch (result) {
-        .continue_turn => |owned| blk: {
-            defer worker_runtime.freeSteeringMessages(std.heap.c_allocator, owned);
-            const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-            for (owned, messages) |source, *message| message.* = .{ .text = try arena.dupe(u8, source.text), .author = source.author };
-            break :blk .{ .continue_turn = messages };
-        },
-        .none => .none,
-        .handoff => .handoff,
-        .interrupt => .interrupt,
-    };
+    return ctx.worker.takeSteeringBoundaryInto(std.heap.c_allocator, arena, turn_id, kind);
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {

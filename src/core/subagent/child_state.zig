@@ -162,7 +162,7 @@ pub const Child = struct {
     profile: ?[]u8 = null,
     /// What the child is for, as its parent sees it in its list of
     /// subagents: a short line from its first instructions or task
-    /// (`tool_host.purposeLine`). Fixed when the child is created, and
+    /// (`purposeOf`). Fixed when the child is created, and
     /// recorded on each spawn line, so it survives a restart. Null for a
     /// child from before it. Owned.
     purpose: ?[]u8 = null,
@@ -789,7 +789,7 @@ fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, prof
 pub const purpose_max_bytes: usize = 100;
 const purpose_ellipsis = "…";
 
-pub const PurposeCut = struct {
+const PurposeCut = struct {
     line: []const u8,
     /// The line was longer and lost its end; an ellipsis follows it.
     cut: bool = false,
@@ -799,7 +799,7 @@ pub const PurposeCut = struct {
 /// with anything on it, ended at any control character and trimmed. A line
 /// longer than `purpose_max_bytes` is cut on a character boundary, with
 /// room left for an ellipsis. Text that is not UTF-8 gives nothing.
-pub fn purposeCut(text: []const u8) PurposeCut {
+fn purposeCut(text: []const u8) PurposeCut {
     var start: usize = 0;
     while (start < text.len) {
         var end = start;
@@ -808,8 +808,7 @@ pub fn purposeCut(text: []const u8) PurposeCut {
         if (line.len > 0) {
             if (!std.unicode.utf8ValidateSlice(line)) return .{ .line = "" };
             if (line.len <= purpose_max_bytes) return .{ .line = line };
-            var cut = purpose_max_bytes - purpose_ellipsis.len;
-            while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
+            const cut = text_utils.utf8BackwardBoundary(line, purpose_max_bytes - purpose_ellipsis.len);
             return .{ .line = std.mem.trimEnd(u8, line[0..cut], " "), .cut = true };
         }
         start = end + 1;
@@ -819,6 +818,13 @@ pub fn purposeCut(text: []const u8) PurposeCut {
 
 fn purposeControl(byte: u8) bool {
     return byte < 0x20 or byte == 0x7f;
+}
+
+/// Pure: whether `text`, read back from a log, is a purpose fx writes: one
+/// that `purposeCut` keeps exactly, so it is one short line of whole
+/// characters with no control character. A cut purpose's ellipsis keeps it.
+fn savedPurpose(text: []const u8) bool {
+    return text.len > 0 and std.mem.eql(u8, purposeCut(text).line, text);
 }
 
 /// What a new child is for: the first line of the instructions its parent
@@ -1223,9 +1229,10 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     if (spawn.profile) |name| if (!profiles.validName(name)) return error.InvalidState;
     const profile = if (spawn.profile) |name| try alloc.dupe(u8, name) else null;
     errdefer if (profile) |name| alloc.free(name);
-    // A purpose is the parent's own words, cut short when written; one that
-    // is not short is not fx's, and the child keeps none.
-    const purpose = if (spawn.purpose) |text| if (text.len > 0 and text.len <= purpose_max_bytes) try alloc.dupe(u8, text) else null else null;
+    // A purpose is one line that `purposeCut` keeps as it is; one fx would
+    // not have written, such as a long one or one with a line break or an
+    // escape, is not fx's, and the child keeps none.
+    const purpose = if (spawn.purpose) |text| if (savedPurpose(text)) try alloc.dupe(u8, text) else null else null;
     return .{
         .id = id,
         .kind = kind,
@@ -2202,6 +2209,39 @@ test "a closed v2 child is gone for good, and an older fx still reads its log" {
     try std.testing.expectEqualStrings("reviewer", older.agentName().?);
     try std.testing.expectEqual(Phase.idle, older.phase);
     try std.testing.expect(!older.last_report_owed);
+}
+
+test "a folded child keeps a saved purpose only when it is one line fx would write" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fingerprint = std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower);
+    const cases = [_]struct { saved: []const u8, kept: bool }{
+        .{ .saved = "Review src/stats.js.", .kept = true },
+        .{ .saved = text_utils.repeat("x", 97) ++ "…", .kept = true },
+        .{ .saved = "x\n- fake: idle.", .kept = false },
+        .{ .saved = "\x1b[31mred", .kept = false },
+        .{ .saved = " padded ", .kept = false },
+        .{ .saved = text_utils.repeat("x", 101), .kept = false },
+        .{ .saved = "bad \xff byte", .kept = false },
+    };
+    for (cases) |case| {
+        const entry: session_adapter.Child = .{
+            .id = try arena.dupe(u8, "1786460757753-0001"),
+            .work_id = try arena.dupe(u8, "work"),
+            .open = false,
+            .outcome = .ok,
+            .spawn_data = try arena.dupe(u8, try spawnData(arena, "reviewer", &fingerprint, null, null, .parent, case.saved)),
+            .finish_data = null,
+            .seq = 1,
+        };
+        var child = try childFromFolded(alloc, entry);
+        defer child.deinit(alloc);
+        if (case.kept) {
+            try std.testing.expectEqualStrings(case.saved, child.purpose.?);
+        } else try std.testing.expect(child.purpose == null);
+    }
 }
 
 test "only open children count toward the registry's limit" {
