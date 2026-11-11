@@ -1931,20 +1931,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             null,
     };
-    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job)) |early| return early;
-    // The ask ends once its whole tree is quiet: each report
-    // that arrives runs as the ask's next turn, as one wakes an idle main.
+    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| return early;
+    // The ask ends once its whole tree is quiet: mail that waits when a turn
+    // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
             .quiet, .stopped => break,
             .mail => {},
         }
-        const next = ctx.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
+        // The take marks the turn, so mail posted from then on joins it.
+        const turn_id = debug_trace.nextTurnId();
+        const next = ctx.worker.takeQueuedPromptForTurn(std.heap.c_allocator, turn_id) orelse continue;
         defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
+        var turn_marked = true;
+        defer if (turn_marked) ctx.worker.finishProcessing();
         try ctx.checkCancellation();
         const history = try ctx.session.snapshotHistory(alloc);
         defer types.freeHistoryTurnSlice(alloc, history);
-        ctx.active_turn_id = debug_trace.nextTurnId();
+        ctx.active_turn_id = turn_id;
         var follow = job;
         follow.turn_id = ctx.active_turn_id;
         follow.prompt = next.prompt;
@@ -1955,7 +1959,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         follow.history = history;
         follow.unversioned_history_count = ctx.session.unversionedHistoryEnd();
         debug_trace.eventf("mailbox", "ask_next_turn", .{ .turn_id = ctx.active_turn_id }, "author={s}", .{@tagName(next.author)});
-        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow)) |early| return early;
+        // runAskTurn ends the turn the take marked.
+        turn_marked = false;
+        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow, true)) |early| return early;
     }
     worker_events_drained = true;
     if (ctx.presenter) |value| try value.finish();
@@ -1969,6 +1975,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 /// skipped or unavailable.
 /// Runs one of the ask's turns. Returns the ask's result when the turn ends
 /// it early: a permission it cannot ask for, or a failure in JSON output.
+/// `marked` says the worker already marks the turn, as the take of its mail
+/// did; the turn then ends it.
 fn runAskTurn(
     ctx: *AskContext,
     alloc: Allocator,
@@ -1977,7 +1985,13 @@ fn runAskTurn(
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     config: agent_runtime.Config,
     job: worker_runtime.QueuedPrompt,
+    marked: bool,
 ) !?PromptRunResult {
+    // Mail that arrives while the turn runs joins it at its next boundary, as
+    // in the app; what the turn leaves waits and runs as the ask's next turn
+    // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
+    const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
+    defer if (processing) ctx.worker.finishProcessing();
     options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
@@ -2143,6 +2157,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.context_enabled,
         .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -2322,6 +2337,31 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
+/// Takes the subagent mail that joined the running turn at a model or final
+/// boundary. An ask has no one to steer it, so a cancel always ends the
+/// turn, as it does with no hook.
+fn takeSteeringBoundary(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (kind == .cancelled) return .interrupt;
+    const result = try ctx.worker.takeSteeringBoundary(std.heap.c_allocator, turn_id, kind);
+    return switch (result) {
+        .continue_turn => |owned| blk: {
+            defer worker_runtime.freeSteeringMessages(std.heap.c_allocator, owned);
+            const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
+            for (owned, messages) |source, *message| message.* = .{ .text = try arena.dupe(u8, source.text), .author = source.author };
+            break :blk .{ .continue_turn = messages };
+        },
+        .none => .none,
+        .handoff => .handoff,
+        .interrupt => .interrupt,
+    };
+}
+
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultTransient(.{
@@ -2329,6 +2369,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }
 

@@ -1746,10 +1746,17 @@ function answeredCall(body: string): string | undefined {
   return (last.content ?? []).find((part: any) => part.type === "tool-result")?.toolCallId;
 }
 
-/// The text of a request's newest user message.
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+/// The text of a request's newest user message, without the runtime context
+/// updates fx adds.
 function latestUserText(body: string): string {
   const latest = (JSON.parse(body).prompt ?? []).filter((item: any) => item.role === "user").at(-1)?.content ?? "";
-  return typeof latest === "string" ? latest : JSON.stringify(latest);
+  return withoutContextUpdates(typeof latest === "string" ? latest : JSON.stringify(latest));
 }
 
 function delegate(call: string, agent: string, message: string) {
@@ -3936,7 +3943,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
   writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
   const gateway = startDynamicFakeGateway((raw) => {
     const body = JSON.parse(raw);
-    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
     if (latest.includes("STEERING_CHILD")) {
       childRequests++;
       return held.response;

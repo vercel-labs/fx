@@ -210,12 +210,22 @@ function sendAnswer(text: string): string {
 
 // The idle subagents a message's answer named when it started a new one,
 // and how many more it counted past them.
-function idleNames(text: string): { named: string[]; more: number } {
-  const match = /Idle subagents, each with its own context: (.*?)\. Send related work/.exec(text);
-  if (!match) return { named: [], more: 0 };
-  const more = /,? and (\d+) more$/.exec(match[1]!);
-  const list = more ? match[1]!.slice(0, more.index) : match[1]!;
-  return { named: list.split(", ").filter(Boolean), more: more ? Number(more[1]) : 0 };
+// The answer lists them one to a line, "- <name>" or "- <name>: <purpose>",
+// and "- and N more" last; a name never holds a colon.
+function idleNames(raw: string): { named: string[]; more: number } {
+  // The answer is read from the tool result's JSON text, where each line
+  // break is still escaped.
+  const text = raw.replace(/\\n/g, "\n");
+  const at = text.indexOf("Idle subagents, each with its own context:");
+  if (at < 0) return { named: [], more: 0 };
+  const named: string[] = [];
+  for (const line of text.slice(at).split("\n").slice(1)) {
+    if (!line.startsWith("- ")) break;
+    const more = /^- and (\d+) more$/.exec(line);
+    if (more) return { named, more: Number(more[1]) };
+    named.push(line.slice(2).split(":")[0]!);
+  }
+  return { named, more: 0 };
 }
 
 function dropCount(text: string): number {

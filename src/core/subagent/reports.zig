@@ -232,7 +232,8 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
         .started_by = if (report.end.started_by == .user) @as(?[]const u8, "user") else null,
         .cause = if (report.end.cause) |cause| @as(?[]const u8, @tagName(cause)) else null,
         // A parent tends to start a new subagent for each task and leave
-        // the finished ones idle; this keeps the one it has in view.
+        // the finished ones idle; this keeps the one it has in view, and
+        // asks for its judgment on it.
         .next = if (report.idle) @as(?[]const u8, try idleNote(scratch.allocator(), report.agent)) else null,
     }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
@@ -241,14 +242,14 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
 
 /// A report's `next` when its subagent is idle. Caller owns the result.
 fn idleNote(alloc: Allocator, agent: []const u8) error{OutOfMemory}![]const u8 {
-    return alloc.print("{s} is idle now and keeps this conversation. Send it related work, or close it once you no longer need that context.", .{agent});
+    return alloc.print("{s} is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.", .{agent});
 }
 
 test "a report says its subagent is idle only when it is" {
     const alloc = std.testing.allocator;
     const idle = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .failed, .output = "boom", .idle = true }, 4096);
     defer alloc.free(idle);
-    try std.testing.expect(std.mem.endsWith(u8, idle, ",\"next\":\"reviewer is idle now and keeps this conversation. Send it related work, or close it once you no longer need that context.\"}\n"));
+    try std.testing.expect(std.mem.endsWith(u8, idle, ",\"next\":\"reviewer is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.\"}\n"));
     // Readers that take only the sender still read it.
     const sender = (try agent_frame.reportSender(alloc, idle)).?;
     defer sender.deinit();
