@@ -131,7 +131,9 @@ pub fn startFailure(err: anyerror) StartFailure {
     return switch (err) {
         error.NoSpaceLeft => error.RecordingDiskFull,
         error.FileTooBig => error.RecordingFileTooBig,
-        error.AccessDenied => error.RecordingAccessDenied,
+        // EACCES, and EPERM: an immutable file, or a folder macOS keeps from
+        // the terminal's privacy settings.
+        error.AccessDenied, error.PermissionDenied => error.RecordingAccessDenied,
         error.ReadOnlyFileSystem => error.RecordingReadOnly,
         else => error.RecordingStartFailed,
     };
@@ -989,6 +991,9 @@ test "a recording that cannot start keeps the storage fault behind it, and any o
     try testing.expect(startFailure(error.NoSpaceLeft) == error.RecordingDiskFull);
     try testing.expect(startFailure(error.FileTooBig) == error.RecordingFileTooBig);
     try testing.expect(startFailure(error.AccessDenied) == error.RecordingAccessDenied);
+    // EPERM, which an immutable file or a folder without privacy access gives,
+    // is a separate error from EACCES.
+    try testing.expect(startFailure(error.PermissionDenied) == error.RecordingAccessDenied);
     try testing.expect(startFailure(error.ReadOnlyFileSystem) == error.RecordingReadOnly);
     try testing.expect(startFailure(error.PathAlreadyExists) == error.RecordingStartFailed);
     try testing.expect(startFailure(error.FileNotFound) == error.RecordingStartFailed);

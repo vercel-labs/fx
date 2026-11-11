@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -40,6 +40,22 @@ function ignoresFileModes(): boolean {
     }
   } finally {
     chmodSync(probe, 0o700);
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+/// Whether `chflags` can make a file immutable here, as macOS can and Linux
+/// cannot without root.
+function canMakeImmutable(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-immutable-probe-"));
+  try {
+    const file = join(probe, "probe");
+    writeFileSync(file, "");
+    if (spawnSync("chflags", ["uchg", file]).status !== 0) return false;
+    spawnSync("chflags", ["nouchg", file]);
+    return true;
+  } finally {
+    spawnSync("chflags", ["-R", "nouchg", probe]);
     rmSync(probe, { recursive: true, force: true });
   }
 }
@@ -1035,6 +1051,49 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           session = null;
         }
         chmodSync(locked, 0o700);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!canMakeImmutable())(
+    "a debug recording into an immutable file says permission denied",
+    async () => {
+      // An immutable file fails the open with EPERM, which Zig reports apart
+      // from the EACCES a read-only folder gives.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-immutable-")));
+      const home = join(root, "home");
+      const tape = join(root, "tape.fxtape");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(tape, "");
+      writeFileSync(stderrPath, "");
+      execFileSync("chflags", ["uchg", tape]);
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+            FX_RECORD: tape,
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
+        expect(session.paneStatus().status).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        spawnSync("chflags", ["-R", "nouchg", root]);
         rmSync(root, { recursive: true, force: true });
       }
     },
