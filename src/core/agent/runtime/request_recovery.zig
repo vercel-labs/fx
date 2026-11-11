@@ -250,10 +250,13 @@ pub const RequestRecovery = struct {
         // module keeps that one and resends at once with the new login. It
         // ignores the continue in every other phase.
         if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
-            _ = try self.event(.user_continue);
+            _ = try self.deliverAnswer(.user_continue, "failed_send");
         };
-        // The send that failed was the saved login's try.
-        if (self.sign_in_closed_flag) |flag| flag.store(false, .seq_cst);
+        // The send that failed was the saved login's try, so a sign-in that
+        // closed while it was on the wire leaves nothing more to try.
+        if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=failed_send reason=the_failed_send_tried_the_saved_login", .{});
+        };
         return self.event(.{ .failed = failure });
     }
 
@@ -267,7 +270,7 @@ pub const RequestRecovery = struct {
     /// the continue flag, for example with a picker choice. Returns the
     /// module's send.
     pub fn userContinue(self: *RequestRecovery) !?Send {
-        return self.event(.user_continue);
+        return self.deliverAnswer(.user_continue, "host");
     }
 
     /// Waits for the module's next send, delivering `tick` every
@@ -280,10 +283,10 @@ pub const RequestRecovery = struct {
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
             if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
-                if (try self.event(.user_continue)) |send| return send;
+                if (try self.deliverAnswer(.user_continue, "wait")) |send| return send;
             };
             if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
-                if (try self.event(.sign_in_closed)) |send| return send;
+                if (try self.deliverAnswer(.sign_in_closed, "wait")) |send| return send;
             };
             const now_ms = self.nowMs();
             if (now_ms < next_tick_ms) {
@@ -490,6 +493,20 @@ pub const RequestRecovery = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        return self.stepLocked(value);
+    }
+
+    /// Steps the module with a user's answer, and traces the answer when
+    /// the module has no use for it, since that drops what the user did: an
+    /// Enter while nothing waits for them, or a closed sign-in while no wait
+    /// is for one. `origin` names where the answer was read.
+    fn deliverAnswer(self: *RequestRecovery, value: recovery.Event, origin: []const u8) !?Send {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (!recovery.usesAnswer(&self.state, value)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event={s} origin={s} reason=nothing_waits_for_it", .{ @tagName(value), origin });
+        }
         return self.stepLocked(value);
     }
 

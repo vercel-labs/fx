@@ -2290,6 +2290,51 @@ tmuxTest(
 );
 
 tmuxTest(
+  "a gateway error on the resend after a sign-in code expires keeps the sign-in wait",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-poll-503-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    const unauthorized = () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+    const unavailable = () => new Response(JSON.stringify({ error: { message: "try later" } }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+    gateway = startFakeGateway([unauthorized, unavailable, fakeGatewayFinalText("POLL_503_RECOVERY_RESPONSE")]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      expireDeviceCode: true,
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after the gateway recovers.");
+    await session.waitForText("Press Enter to retry with your current login", TIMEOUT);
+    await session.waitForPane((pane) => gateway!.requests.length === 2, TIMEOUT);
+    // A retry after the 503 would come within a few seconds. The request
+    // keeps waiting for the sign-in instead, and opens no second one.
+    await Bun.sleep(5_000);
+    expect(gateway.requests).toHaveLength(2);
+    const pane = await session.capturePane();
+    expect(pane).toContain("Sign-in expired · waiting");
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+
+    await session.sendKeys("Enter");
+    await session.waitForText("POLL_503_RECOVERY_RESPONSE", TIMEOUT);
+    expect(gateway.requests).toHaveLength(3);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "Esc while a refused login waits ends the request",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-refused-login-esc-"));

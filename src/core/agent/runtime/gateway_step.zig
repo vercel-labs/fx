@@ -88,7 +88,7 @@ pub fn streamModelCompletion(
         .failed => |value| .{ .id = call.id, .error_name = @tagName(value.kind), .cancelled = request.cancel_flag.load(.seq_cst) },
     } });
 
-    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
+    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx, request.credential.secret());
     return switch (result) {
         .completed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
         .failed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
@@ -116,6 +116,7 @@ fn recordProviderResultMetric(
     started_at_ms: i64,
     result: agent_stream_provider.Result,
     trace_ctx: TraceContext,
+    credential: ?[]const u8,
 ) void {
     const completion: types.ModelCompletion = switch (result) {
         .completed => |value| value.completion,
@@ -139,10 +140,8 @@ fn recordProviderResultMetric(
     const input_tokens = clampTokenCount(completion.usage.input_tokens);
     const output_tokens = clampTokenCount(completion.usage.output_tokens);
     const terminal_stop_reason = if (completion.finish_reason) |reason| reason.label() else "";
-    // The gateway's words, masked and clipped the way fx shows them; the
-    // provider already masked the credential it sent.
     const error_message: ?[]u8 = if (failure) |value| if (value.http_status) |status| if (value.detail) |detail|
-        gateway_error_format.formatHttpRecoveryDiagnostic(std.heap.c_allocator, status, detail) catch null
+        traceErrorMessage(std.heap.c_allocator, status, detail, credential) catch null
     else
         null else null else null;
     defer if (error_message) |message| std.heap.c_allocator.free(message);
@@ -242,6 +241,90 @@ test "gateway request scratch is released across success failure cancellation an
     }
     try std.testing.expectEqual(@as(usize, 1000), fake.observed_starts);
     try std.testing.expectEqual(fake.observed_starts, fake.observed_ends);
+}
+
+test "the trace's error message masks the credential a provider quotes back" {
+    const network_metrics = @import("../../workspace/network_metrics.zig");
+    const Fake = struct {
+        fn stream(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !StreamResult {
+            try request.admission.admit();
+            const detail = try alloc.dupe(u8, "{\"error\":{\"message\":\"key fixture-secret-key is not valid\"}}");
+            return .{ .failed = .{ .kind = .unauthorized, .http_status = .unauthorized, .detail = detail, .ownership = .owned } };
+        }
+
+        fn emit(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+    network_metrics.resetForTest();
+    defer network_metrics.resetForTest();
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var delivery = DeliveryCertainty.init();
+    var evidence: AttemptEvidence = .{};
+    var context: u8 = 0;
+    var result = try streamModelCompletion(.{ .context = &context, .stream_fn = Fake.stream }, turn.allocator(), .{
+        .credential = .{ .direct = .{ .secret_bytes = "fixture-secret-key", .source = .chatgpt_subscription } },
+        .model = "fixture-model",
+        .retry_count = 1,
+        .messages = &.{},
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .events = .{ .context = &context, .emit_fn = Fake.emit },
+        .cancel_flag = &cancel,
+        .provider_attempt_owner = .agent,
+    });
+    defer result.deinit(turn.allocator());
+    var calls: [1]network_metrics.NetworkCall = undefined;
+    try std.testing.expectEqual(@as(usize, 1), network_metrics.snapshot(&calls));
+    const message = calls[0].gatewayErrorMessage();
+    try std.testing.expect(std.mem.find(u8, message, "is not valid") != null);
+    try std.testing.expect(std.mem.find(u8, message, "fixture-secret-key") == null);
+}
+
+/// The provider's words for `/trace`, clipped the way fx shows them, with
+/// the credential this call sent masked. Not every provider masks its error
+/// body, a provider can quote the request's key back, and trace output gets
+/// pasted into chats, so this masks it for every provider: in the body, and
+/// again after decoding, which can undo a JSON escape. The caller owns the
+/// result.
+fn traceErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8, credential: ?[]const u8) ![]u8 {
+    const masked = try alloc.dupe(u8, detail);
+    defer alloc.free(masked);
+    if (credential) |secret| maskEvery(masked, secret);
+    const message = try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, status, masked);
+    if (credential) |secret| maskEvery(message, secret);
+    return message;
+}
+
+fn maskEvery(text: []u8, secret: []const u8) void {
+    if (secret.len == 0) return;
+    var rest = text;
+    while (std.mem.find(u8, rest, secret)) |at| {
+        @memset(rest[at..][0..secret.len], '*');
+        rest = rest[at + secret.len ..];
+    }
+}
+
+test "the trace's error message masks the key before clipping and after decoding" {
+    const alloc = std.testing.allocator;
+    const key = "fixture-secret-key";
+    // A JSON escape hides the key from a search until the message is decoded.
+    const escaped = try traceErrorMessage(alloc, .unauthorized, "{\"error\":{\"message\":\"key fixture\\u002dsecret\\u002dkey refused\"}}", key);
+    defer alloc.free(escaped);
+    try std.testing.expect(std.mem.find(u8, escaped, "refused") != null);
+    try std.testing.expect(std.mem.find(u8, escaped, key) == null);
+    // A long body clipped inside the key leaves a piece that no search
+    // after clipping finds.
+    var long: [700]u8 = @splat('x');
+    @memcpy(long[578..][0..key.len], key);
+    const clipped = try traceErrorMessage(alloc, .unauthorized, &long, key);
+    defer alloc.free(clipped);
+    try std.testing.expect(clipped.len < long.len);
+    try std.testing.expect(std.mem.find(u8, clipped, "fixture") == null);
 }
 
 fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {

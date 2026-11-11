@@ -60,6 +60,7 @@ Recovery recovery-mutation-never-ask CrashLoopAsks
 Recovery recovery-mutation-hot-retry NoHotRetry
 Recovery recovery-mutation-send-without-save SaveBeforeSend
 Recovery recovery-mutation-poll-reopens StatusHonest
+Recovery recovery-mutation-poll-drop-reasks PollKeepsSignIn
 RecoveryTimed recovery-timed -
 RecoveryTimed recovery-mutation-unbounded-wait WaitBounded
 RecoveryTimed recovery-mutation-frozen-countdown StatusFresh

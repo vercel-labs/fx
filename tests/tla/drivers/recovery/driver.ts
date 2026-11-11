@@ -333,13 +333,18 @@ if (options.selfCheck) {
   const mutants = [
     {
       name: "resends at once after a failure",
-      target: ".offline, .dropped, .unreadable, .server, .rate_limited, .refused => waitAfter(state, failure, now_ms),",
-      planted: ".offline, .dropped, .unreadable, .server, .rate_limited, .refused => sendNow(state, now_ms, .{}),",
+      target: ".refused => if (!polled)\n            waitAfter(state, failure, now_ms)",
+      planted: ".refused => if (!polled)\n            sendNow(state, now_ms, .{})",
     },
     {
       name: "asks for a sign-in when the gateway refuses a fresh login",
-      target: ".offline, .dropped, .unreadable, .server, .rate_limited, .refused => waitAfter(state, failure, now_ms),",
-      planted: ".offline, .dropped, .unreadable, .server, .rate_limited => waitAfter(state, failure, now_ms),\n        .refused => askUser(state, .sign_in, now_ms),",
+      target: "        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (!polled)",
+      planted: "        .refused => askUser(state, .sign_in, now_ms),\n        .offline, .dropped, .unreadable, .server, .rate_limited => if (!polled)",
+    },
+    {
+      name: "opens a second sign-in when its own resend fails on the way",
+      target: "        else\n            waitForSignInAgain(state, now_ms),\n        .too_long",
+      planted: "        else\n            waitAfter(state, failure, now_ms),\n        .too_long",
     },
     {
       name: "never resends while waiting for a sign-in",

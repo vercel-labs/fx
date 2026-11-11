@@ -745,7 +745,7 @@ fn streamAgentCompletion(
             .http_status = result.status,
             // The body can echo the credential it refused, and it reaches the
             // screen and the trace.
-            .detail = try redactedErrorBody(alloc, result.err_body, request.credential.secret() orelse ""),
+            .detail = if (result.err_body) |body| try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret() orelse "") else null,
             .diagnostics = .{
                 .schema = diagnostics.schema,
                 .request_shape = diagnostics.request_shape,
@@ -758,14 +758,6 @@ fn streamAgentCompletion(
         .completion = result.completion,
         .ownership = .owned,
     } };
-}
-
-/// Takes ownership of `body` and returns the caller-owned copy with
-/// `credential` masked, as the other providers' error paths do.
-fn redactedErrorBody(alloc: Allocator, body: ?[]u8, credential: []const u8) Allocator.Error!?[]u8 {
-    const raw = body orelse return null;
-    defer alloc.free(raw);
-    return try chat_completions_protocol.redact_error_detail(alloc, raw, credential);
 }
 
 /// Gateway reports the last provider it tried, so a provider's size rejection
@@ -3367,26 +3359,4 @@ test "an OAuth request stops at once when cancelled during a lookup that hangs" 
         .cancel_flag = &cancel,
     }));
     try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
-}
-
-test "a gateway error body loses the credential it refused, and stays bounded" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(try redactedErrorBody(alloc, null, "secret-token") == null);
-
-    const echoed = try alloc.dupe(u8, "{\"error\":{\"message\":\"refused secret-token\"}}");
-    const masked = (try redactedErrorBody(alloc, echoed, "secret-token")).?;
-    defer alloc.free(masked);
-    try std.testing.expect(std.mem.find(u8, masked, "secret-token") == null);
-    try std.testing.expect(std.mem.find(u8, masked, "refused") != null);
-
-    // A body past the local limit becomes a fixed message.
-    const huge = try alloc.alloc(u8, 1 << 20);
-    @memset(huge, 'x');
-    const bounded = (try redactedErrorBody(alloc, huge, "secret-token")).?;
-    defer alloc.free(bounded);
-    try std.testing.expect(bounded.len < 128);
-
-    const empty = (try redactedErrorBody(alloc, try alloc.dupe(u8, ""), "")).?;
-    defer alloc.free(empty);
-    try std.testing.expectEqualStrings("", empty);
 }

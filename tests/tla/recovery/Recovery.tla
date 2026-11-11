@@ -39,7 +39,7 @@ CONSTANTS
 
 Bugs == {"none", "stall_stop", "no_wake", "stale_socket", "frozen_status",
          "no_closing", "never_ask", "hot_retry", "send_without_save",
-         "poll_reopens",
+         "poll_reopens", "poll_drop_reasks",
          \* Planted in RecoveryTimed.tla.
          "unbounded_wait", "frozen_countdown", "no_handoff", "poll_hot",
          "never_poll"}
@@ -147,9 +147,14 @@ SendNow(waited) ==
     /\ polling' = FALSE
 
 \* A failure of the given kind. "offline" does not count toward sameFail.
+\* A sign-in wait's own resend that fails on the way, offline, dropped, or
+\* on a broken gateway, waits for the sign-in again with its start kept
+\* (recovery.zig onFailed), so fx opens no second sign-in. Planted defect
+\* poll_drop_reasks: it waits as an ordinary retry instead, and the next
+\* sign-in failure opens a second sign-in.
 OnFail(kind) ==
     /\ polling' = FALSE
-    /\ IF kind = "need_user"
+    /\ IF kind = "need_user" \/ (polling /\ Bug # "poll_drop_reasks")
        THEN /\ phase' = "need_user" /\ status' = "need_user"
             /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
             /\ askedSignIn' = TRUE
@@ -459,6 +464,13 @@ CrashLoopAsks ==
 
 \* A retry after a transient failure always waits first.
 NoHotRetry == lastSendWaited
+
+\* A sign-in wait's own resend that fails, for any reason, waits for the
+\* sign-in again: one request opens one sign-in. A crash, an answer, or Esc
+\* ends the resend another way.
+PollKeepsSignIn ==
+    [][(polling /\ inflight /\ alive' /\ ~inflight' /\ phase' \notin Terminal)
+         => (phase' = "need_user" /\ askedSignIn')]_vars
 
 \* Every send comes with a save, so the record always knows
 \* whether a send is outstanding.

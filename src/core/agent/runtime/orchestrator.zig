@@ -4605,6 +4605,15 @@ fn needsUserFailureKind(
     };
 }
 
+/// Whether a 401 on a login fx has just refreshed retries with that login
+/// instead of asking for a sign-in. Only an fx login on AI Gateway does: the
+/// refresh proved the login good, so the refusal is the gateway's, and the
+/// status says so. A ChatGPT or Grok subscription signs in again as before.
+fn refusedLoginRetries(credential_source: ?types.CredentialSource) bool {
+    const source = credential_source orelse return false;
+    return source == .fx_login;
+}
+
 /// Whether `/login` repairs the source, so fx can open it on its own.
 fn signInRepairs(credential_source: ?types.CredentialSource) bool {
     const source = credential_source orelse return false;
@@ -8967,6 +8976,7 @@ fn processQueuedPromptLoop(
             // reason once; Esc during the wait falls through to the cancel
             // path below. A host that cannot ask ends the turn as before.
             if (response_failure) |failure| if (failure.kind == .unauthorized and auth_retry_used and
+                refusedLoginRetries(job.credential_source) and
                 request_recovery.canAskUser() and !config.cancel_flag.load(.seq_cst))
             {
                 if (!auth_reason_shown) {
@@ -8979,6 +8989,10 @@ fn processQueuedPromptLoop(
                     stream_result_set = false;
                     // Another fx process may have saved a newer login.
                     credential_reload_pending = true;
+                    // The resend's own 401 refreshes the login again, so a
+                    // login whose refresh stops working waits for a sign-in
+                    // instead of retrying here forever.
+                    auth_retry_used = false;
                     // A refused request reached no model.
                     recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
                     recovery_cause = .authentication;
