@@ -1329,29 +1329,36 @@ describe("MCP login", () => {
     expect(message).toContain('stderr: "No MCP server named nosuchserver.');
   }, 20_000);
 
-  test("a login that is killed, lingers with its stdout closed, or stays silent past the deadline, before it prints its address is reported as such", async () => {
-    // Killed by a signal after a line on each stream: the message names the signal and what both streams held.
+  test("a login that is killed before it prints its address is reported with the signal and what both streams held", async () => {
+    // Killed by a signal after a line on each stream.
     const killed = stub("echo starting; echo 'about to die' >&2; kill -9 $$");
-    const killedMessage = await endOf(readLoginAddress(killed, killed.stdout.getReader(), "/nonexistent/trace.log"));
-    expect(killedMessage).toContain("it was killed by SIGKILL");
-    expect(killedMessage).toContain('stdout: "starting\\n"');
-    expect(killedMessage).toContain('stderr: "about to die\\n"');
+    const message = await endOf(readLoginAddress(killed, killed.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain("it was killed by SIGKILL");
+    expect(message).toContain('stdout: "starting\\n"');
+    expect(message).toContain('stderr: "about to die\\n"');
+  }, 20_000);
+
+  test("a login that lingers with its stdout closed before it prints its address is stopped after a moment and reported as such", async () => {
     // Stdout closed, the process still alive: it is given a moment to exit, then stopped.
     const lingering = stub("exec >&-; exec sleep 30");
-    const lingeringMessage = await endOf(readLoginAddress(lingering, lingering.stdout.getReader(), "/nonexistent/trace.log"));
-    expect(lingeringMessage).toContain(`it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`);
+    const message = await endOf(readLoginAddress(lingering, lingering.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain(`it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`);
     expect(await lingering.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login that stays silent past the deadline before it prints its address is stopped at the deadline and reported as such", async () => {
     // Alive and silent: the deadline ends the wait, and the child is stopped.
     const silent = stub("exec sleep 30");
     const started = performance.now();
-    const silentMessage = await endOf(readLoginAddress(silent, silent.stdout.getReader(), "/nonexistent/trace.log", 300));
-    expect(silentMessage).toContain("it was still running after 300 ms, so it was stopped");
+    const message = await endOf(readLoginAddress(silent, silent.stdout.getReader(), "/nonexistent/trace.log", 300));
+    expect(message).toContain("it was still running after 300 ms, so it was stopped");
     expect(performance.now() - started).toBeLessThan(5_000);
     expect(await silent.exited).not.toBe(0);
   }, 20_000);
 
   test("a login address that arrives in pieces is read whole", async () => {
-    const child = stub("printf 'Open this address:\\n  http://127.0.0.1:1/authoriz'; sleep 0.3; printf 'e?state=s\\nThen paste it here\\n'; exec sleep 30");
+    // The first piece ends inside the address, after the `?`, so the line holding it is not complete yet.
+    const child = stub("printf 'Open this address:\\n  http://127.0.0.1:1/authorize?sta'; sleep 0.3; printf 'te=s\\nThen paste it here\\n'; exec sleep 30");
     try {
       const { address, stdout } = await readLoginAddress(child, child.stdout.getReader(), "/nonexistent/trace.log");
       expect(address).toBe("http://127.0.0.1:1/authorize?state=s");
