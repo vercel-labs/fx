@@ -201,14 +201,14 @@ fn checkValueBounds(value: std.json.Value, depth: usize, remaining: *usize) erro
 }
 
 /// The types an argument written as text can be sent as.
-pub const RepairType = enum { number, integer, boolean, array, object };
+const RepairType = enum { number, integer, boolean, array, object };
 
-pub const RepairedField = struct {
+const RepairedField = struct {
     name: []const u8,
     json_type: RepairType,
 };
 
-pub const RepairedArguments = struct {
+const RepairedArguments = struct {
     arguments_json: []const u8,
     /// The top-level fields sent as their schema's type, in argument order.
     fields: []const RepairedField,
