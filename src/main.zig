@@ -6080,7 +6080,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     // From another subagent's screen, main's own request comes first.
     try App.AgentsAppRuntime.show(&app, reviewer);
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
-    try std.testing.expectEqualStrings("main and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "the footer notes a hidden agent whose request waits for the user" {
@@ -6112,7 +6112,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
     // It counts with the agents waiting on an answer.
     try App.AgentsAppRuntime.show(&app, null);
     _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
