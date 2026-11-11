@@ -5349,15 +5349,19 @@ fn renewRejectedCredentialForJob(
     owned_api_key: *?[]u8,
     trace_ctx: TraceContext,
 ) !bool {
+    // A host can free the active key while it loads the stored one, such as
+    // when ACP publishes it to the session, so keep the rejected bytes for the
+    // comparison.
+    const rejected = try alloc.dupe(u8, active_api_key.*);
+    defer secret.zeroAndFree(alloc, rejected);
     const stored = (try loadJobCredential(deps, alloc, job, .reload, trace_ctx)) orelse {
         debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
         return false;
     };
-    if (!std.mem.eql(u8, stored, active_api_key.*)) {
-        adoptJobCredential(alloc, job, .reload, stored, active_api_key, owned_api_key, trace_ctx);
-        return true;
-    }
-    secret.zeroAndFree(alloc, stored);
+    // Adopt it even when it is the rejected token: the job then owns the bytes
+    // it holds if the forced refresh gives nothing.
+    adoptJobCredential(alloc, job, .reload, stored, active_api_key, owned_api_key, trace_ctx);
+    if (!std.mem.eql(u8, stored, rejected)) return true;
     return refreshGatewayCredentialForJob(deps, alloc, job, .force, active_api_key, owned_api_key, trace_ctx);
 }
 
