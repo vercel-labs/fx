@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway, startFakeGateway } from "./tmux-helpers";
-import { manyMcpServerName, startManyMcpHttpServers } from "./fixtures/mcp-many";
+import { manyMcpServerName, startManyMcpHttpServers, writeManyMcpConfig } from "./fixtures/mcp-many";
 
 // The toolbox: fx sends its built-in tools as they are, plus one `toolbox`
 // tool, and lists skills, MCP servers, and custom tools in a short menu
@@ -666,4 +666,39 @@ describe("toolbox", () => {
     expect(childTools).not.toContain("glob_files");
     expect(resultValue(body(childBodies[1]!), "child_glob")).toContain("FINDER_NOTES.md");
   }, 60_000);
+
+  // A toolbox search starts every HTTP server at once. Each connect goes
+  // through std's HostName.connect, which cancels its helper task on every
+  // exit, and on macOS the late SIG.IO that cancel sends can land on another
+  // server's connect: std then calls connect again on the same socket and the
+  // kernel answers ISCONN, which aborts a debug build (exit 134) and fails
+  // that server's connect in a release build (tests/tla/mcp_host/Connect.tla).
+  // Other systems answer the second connect with success, so this passes there.
+  test("a search that starts 50 HTTP MCP servers together never aborts fx, 20 runs in a row", async () => {
+    const root = createRoot();
+    const servers = 50;
+    const many = startManyMcpHttpServers({ servers, toolsPerServer: 4 });
+    try {
+      writeManyMcpConfig(join(root.home, ".fx", "mcp.json"), many, servers);
+      gateway = startDynamicFakeGateway(
+        (raw) =>
+          raw.includes('"toolCallId":"search_all"')
+            ? fakeGatewayFinalText("MANY_CONNECTS_DONE")
+            : fakeGatewayToolCall("search_all", "toolbox", { search: "tool_01" }),
+        { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] },
+      );
+      for (let run = 0; run < 20; run++) {
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", "Search every MCP server."], {
+          cwd: root.workspace,
+          env: env(root, gateway),
+          timeoutMs: 60_000,
+        });
+        expect(result.stderr).not.toContain("programmer bug caused syscall error");
+        expect([run, result.code]).toEqual([run, 0]);
+        expect(result.stdout).toContain("MANY_CONNECTS_DONE");
+      }
+    } finally {
+      many.stop();
+    }
+  }, 240_000);
 });

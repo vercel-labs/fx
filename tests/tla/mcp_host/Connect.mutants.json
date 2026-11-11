@@ -1,0 +1,38 @@
+[
+  {
+    "description": "The retry is back: a stray signal makes the poll loop call connect again, and the second connect answers ISCONN",
+    "old": "          /\\ UNCHANGED vars                 \\* nothing yet, wait again",
+    "new": "          /\\ calls' = calls + 1\n          /\\ th' = \"done\"\n          /\\ res' = \"fail\"\n          /\\ UNCHANGED <<sock, cancel, cancelAt>>",
+    "invariant": "NoFalseFailure"
+  },
+  {
+    "description": "SO_ERROR is not read: a refused connect is reported connected",
+    "old": "          /\\ th' = \"done\"\n          /\\ res' = IF sock = \"connected\" THEN \"ok\" ELSE \"fail\"\n          /\\ UNCHANGED <<sock, calls, cancel, cancelAt>>\n\n\\* The worker is done",
+    "new": "          /\\ th' = \"done\"\n          /\\ res' = \"ok\"\n          /\\ UNCHANGED <<sock, calls, cancel, cancelAt>>\n\n\\* The worker is done",
+    "invariant": "NoFalseSuccess"
+  },
+  {
+    "description": "Cancel is ignored while the connect waits for the socket to be writable: it can still end connected",
+    "old": "       \\/ /\\ ~cancel\n          /\\ sock \\in {\"connected\", \"refused\"}",
+    "new": "       \\/ /\\ sock \\in {\"connected\", \"refused\"}",
+    "invariant": "CancelWins"
+  },
+  {
+    "description": "The first connect is issued twice",
+    "old": "    /\\ calls' = 1\n    /\\ th' = IF Std",
+    "new": "    /\\ calls' = 2\n    /\\ th' = IF Std",
+    "invariant": "NoReissue"
+  },
+  {
+    "description": "A canceled connect is reported failed",
+    "old": "          /\\ res' = \"canceled\"\n          /\\ UNCHANGED <<sock, calls, cancel, cancelAt>>\n       \\/ /\\ ~cancel\n          /\\ sock = \"connecting\"",
+    "new": "          /\\ res' = \"fail\"\n          /\\ UNCHANGED <<sock, calls, cancel, cancelAt>>\n       \\/ /\\ ~cancel\n          /\\ sock = \"connecting\"",
+    "invariant": "NoFalseFailure"
+  },
+  {
+    "description": "A connect is reported canceled when nobody canceled it (a stray signal read as a cancel)",
+    "old": "          /\\ UNCHANGED vars                 \\* nothing yet, wait again",
+    "new": "          /\\ th' = \"done\"\n          /\\ res' = \"canceled\"\n          /\\ UNCHANGED <<sock, calls, cancel, cancelAt>>",
+    "invariant": "CanceledNeedsCancel"
+  }
+]

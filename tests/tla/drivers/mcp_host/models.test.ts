@@ -17,9 +17,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget and
-  // RefreshLease joined the four.
-  expect(count("smoke", "PASS")).toBe(10);
-  expect(count("stress", "PASS")).toBe(10);
+  // RefreshLease and Connect joined the four.
+  expect(count("smoke", "PASS")).toBe(11);
+  expect(count("stress", "PASS")).toBe(11);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -31,7 +31,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
   // configs check it.
-  expect(count("finding", "FINDING")).toBe(2);
+  // Connect's two are std's retry of a connect after a stray signal: a connect the
+  // kernel was completing is reported failed, and a connecting socket gets a second connect.
+  expect(count("finding", "FINDING")).toBe(4);
   expect(count("repair", "PASS")).toBe(1);
 }, 1_800_000);
 
@@ -185,6 +187,19 @@ test("bridge control (refresh lease): going ahead behind a frozen holder on time
   expect(g.verdict).toBe("ACCEPTED");
   expect(b.verdict).toBe("VIOLATES");
   expect(b.broken?.sort()).toEqual(["GoAheadOnTime", "NoGoAheadPastLiveRefresher"]);
+}, 300_000);
+
+test("bridge control (connect): a stray signal that only ends a wait is ACCEPTED, and std's second connect after it VIOLATES", async () => {
+  const dir = join(artifacts, "bridge", "Connect");
+  const ev = (event: string, result?: string): TraceRecord => ({ event, data: result === undefined ? {} : { result } });
+  const good = [ev("start"), ev("intr"), ev("intr"), ev("done", "ok")];
+  // The second connect on the socket that was connecting, which macOS answers with ISCONN.
+  const bad = [ev("start"), ev("intr"), ev("reissue"), ev("done", "unexpected")];
+  const g = await checkTrace({ module: "Connect", records: good, constants: { ObsStd: false }, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "Connect", records: bad, constants: { ObsStd: true }, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["NoFalseFailure", "NoReissue"]);
 }, 300_000);
 
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {

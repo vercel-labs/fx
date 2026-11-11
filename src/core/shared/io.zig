@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const darwin_connect = @import("darwin_connect.zig");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
 const profile_paths = @import("profile_paths.zig");
 
@@ -40,7 +41,7 @@ pub fn restoreIoForTest(previous: ?std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
-    return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
+    return if (os_tag == .macos) darwin_connect.wrap(darwin_process_spawn.wrap(zio)) else zio;
 }
 
 // Thousands of call sites reach `getIo`, so it stays out of line: an inlined
@@ -89,7 +90,7 @@ pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions
     return result;
 }
 
-test "Darwin process I/O replaces only processSpawn with stable storage" {
+test "Darwin process I/O replaces only processSpawn and netConnectIp with stable storage" {
     const original = std.testing.io;
     const selected = process_io_for(.macos, original);
     const selected_again = process_io_for(.macos, original);
@@ -98,6 +99,9 @@ test "Darwin process I/O replaces only processSpawn with stable storage" {
     try std.testing.expect(selected.vtable == selected_again.vtable);
     inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
         if (comptime std.mem.eql(u8, field_name, "processSpawn")) {
+            try std.testing.expect(@field(selected.vtable, field_name) != @field(original.vtable, field_name));
+        } else if (comptime std.mem.eql(u8, field_name, "netConnectIp") and builtin.target.os.tag == .macos) {
+            // `darwin_connect.wrap` leaves the Io alone on other targets.
             try std.testing.expect(@field(selected.vtable, field_name) != @field(original.vtable, field_name));
         } else {
             try std.testing.expectEqual(@field(original.vtable, field_name), @field(selected.vtable, field_name));
@@ -115,6 +119,7 @@ test "getIo applies Darwin process selection to the test fallback" {
     const selected = getIo();
     try std.testing.expect(selected.userdata == std.testing.io.userdata);
     try std.testing.expect(selected.vtable.processSpawn != std.testing.io.vtable.processSpawn);
+    try std.testing.expect(selected.vtable.netConnectIp != std.testing.io.vtable.netConnectIp);
 }
 
 test "getIo Darwin test fallback runs a child through the selected backend" {
@@ -1925,4 +1930,8 @@ pub fn reserveClosedStandardStreams() void {
             _ = std.c.close(held);
         }
     }
+}
+
+test {
+    _ = @import("darwin_connect.zig");
 }
