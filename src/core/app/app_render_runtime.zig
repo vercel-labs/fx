@@ -5727,8 +5727,8 @@ test "core.app_render_runtime compaction row shows its own clock and step in the
         const grid = app.shell.shadow_vt.?;
         // The compaction's own clock replaces the turn row. A narrow row
         // cuts the step and keeps the clock.
-        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting (12s) · 2/3"));
-        try std.testing.expectEqual(cols >= 40, try coordinatorGridContains(grid.*, "• Compacting (12s) · 2/3 summarizing"));
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting (12s) ·"));
+        try std.testing.expectEqual(cols >= 40, try coordinatorGridContains(grid.*, "• Compacting (12s) · summarizing"));
         try std.testing.expect(!(try coordinatorGridContains(grid.*, "Thinking")));
         try std.testing.expect(try coordinatorGridContains(grid.*, "earlier turn output"));
 

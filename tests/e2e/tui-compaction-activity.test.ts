@@ -25,7 +25,7 @@ const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
 // The compaction row's own clock and the step it shows after it.
-const COMPACTION_CLOCK = /Compacting \(((?:\d+h)?(?:\d+m)?\d+s)\)(?: · (\d\/3 \w+))?/;
+const COMPACTION_CLOCK = /Compacting \(((?:\d+h)?(?:\d+m)?\d+s)\)(?: · (\w+))?/;
 const TURN_CLOCK = /Thinking \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
 function clockSeconds(clock: string): number {
   const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?:(\d+)m)?(\d+)s$/.exec(clock)!;
@@ -44,6 +44,15 @@ function turnSummarySeconds(pane: string, prompt: string): number | null {
   return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0);
 }
 const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
+// The line a successful compaction leaves in the transcript, with the time
+// its row showed last.
+const COMPACTED_LINE = /Context compacted \(((?:\d+h)?(?:\d+m)?\d+s)\)/g;
+function compactedSeconds(text: string): number[] {
+  return [...text.matchAll(COMPACTED_LINE)].map((match) => clockSeconds(match[1]!));
+}
+function withoutCompactedLines(text: string): string {
+  return text.replace(COMPACTED_LINE, "");
+}
 // Ctrl+O gives each compaction's model call its own line, as for every call;
 // nothing else there may speak of compaction.
 const COMPACTION_CALL_LINE = /^  (?:[A-Z][a-z]{2} \d{1,2} )?\d{2}:\d{2}:\d{2} · [^\n]* \(compaction\)$/gm;
@@ -262,17 +271,22 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   } catch (error) { await cleanup(false); throw error; }
 }
 
-async function assertSilent(terminal: InstanceType<typeof TmuxSession>, root: string, label: string) {
+/// Compaction leaves nothing in the transcript but one `Context compacted`
+/// line for each compaction that succeeded on this screen.
+async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>, root: string, label: string, compacted = 0) {
   const inline = await terminal.captureFullScrollbackEscapes();
   writeFileSync(join(root, `${label}.scrollback.ansi`), inline);
   expect(inline.length).toBeGreaterThan(0);
-  expect(inline).not.toMatch(COMPACTION_OUTPUT);
+  expect(compactedSeconds(inline)).toHaveLength(compacted);
+  expect(withoutCompactedLines(inline)).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
   await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
   await terminal.sendKeys("End");
   const full = await terminal.waitForPane((pane) => pane.includes("esc close · pgup/pgdn scroll"), 5000);
   writeFileSync(join(root, `${label}.full-transcript.txt`), full);
-  expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
+  // The full transcript shows one page, which may not reach the line.
+  expect(compactedSeconds(full).length).toBeLessThanOrEqual(compacted);
+  expect(withoutCompactedLines(withoutCompactionCallLines(full))).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
   await terminal.waitForComposer(5000);
 }
@@ -318,7 +332,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
         if (trigger === "manual") {
-          await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
+          await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane) && compactedSeconds(pane).length === 1, 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
           // The reply holds only facts, so fx asks once more for the notes
           // of the turn that did work.
@@ -340,7 +354,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 10_000);
         expect(f.counts()).toEqual({ ...before, ordinary: before.ordinary + 1 });
         expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
-        await assertSilent(terminal, f.root, "completed");
+        await assertCompactionQuiet(terminal, f.root, "completed", 1);
         await f.close();
         f.phase("reopen");
         const reopened = await f.launch();
@@ -350,7 +364,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.counts()).toEqual({ ...before, ordinary: before.ordinary + 2 });
         expect(f.durable()).toBe(1);
         expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
-        await assertSilent(reopened, f.root, "reopened");
+        // The line is not saved, so the reopened session does not show it.
+        await assertCompactionQuiet(reopened, f.root, "reopened");
         await f.close();
         for (const tape of f.tapes) {
           const replay = await f.cli(["replay", tape, "--json"]);
@@ -380,9 +395,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(clockSeconds(COMPACTION_CLOCK.exec(started)![1]!)).toBeLessThanOrEqual(1);
       // The summary is held, so the row stays on the summary step while its
       // own clock runs well past what the turn showed.
+      let most = 0;
       await terminal.waitForPane((pane) => {
         const row = COMPACTION_CLOCK.exec(pane);
-        return row !== null && row[2] === "2/3 summarizing" && clockSeconds(row[1]!) >= 6;
+        if (row) most = Math.max(most, clockSeconds(row[1]!));
+        return row !== null && row[2] === "summarizing" && clockSeconds(row[1]!) >= 6;
       }, 15_000);
       f.summaryHold.release(HANDOFF);
       await until(() => f.durable() > 0, "acknowledged checkpoint");
@@ -401,6 +418,13 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const total = turnSummarySeconds(finished, "Continue the current turn.")!;
       expect(total).toBeGreaterThanOrEqual(after - 1);
       expect(total).toBeLessThanOrEqual(after + 2);
+      // The compaction leaves one line with the time its row showed last,
+      // plus at most the moments the release and the save took.
+      expect(finished).toContain("✓ Context compacted (");
+      const lines = compactedSeconds(finished);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toBeGreaterThanOrEqual(most);
+      expect(lines[0]).toBeLessThanOrEqual(most + 2);
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
@@ -498,7 +522,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (outcome === "cancel") f.summaryHold.dispose();
         await terminal.sendKeys("Escape");
         await terminal.waitForPane((pane) => !/compact/i.test(pane) && hasEmptyComposer(pane), 5000);
-        await assertSilent(terminal, f.root, "failed");
+        await assertCompactionQuiet(terminal, f.root, "failed");
         f.phase("followup");
         await terminal.sendText("Recover with another request.");
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 10_000);
@@ -517,7 +541,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.lastRequest()).toContain(TAIL);
         expect(f.lastRequest()).not.toContain("INTERNAL_HANDOFF_4e12");
         expect(f.durable()).toBe(0);
-        await assertSilent(reopened, f.root, "failed-reopen");
+        await assertCompactionQuiet(reopened, f.root, "failed-reopen");
         await f.close();
         passed = true;
       } finally { await f.cleanup(passed); }
@@ -672,7 +696,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       f.ordinaryHold.release("ORDINARY_CONTROL_OK_727a");
       await terminal.waitForPane((pane) => pane.includes("ORDINARY_CONTROL_OK_727a") && hasEmptyComposer(pane), 10_000);
       expect(f.counts().ordinary).toBe(2);
-      await assertSilent(terminal, f.root, "control");
+      await assertCompactionQuiet(terminal, f.root, "control");
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
@@ -918,6 +942,13 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
       console.log(`live turn: clock last ${lastTurn?.seconds}s, summary ${total}s`);
       expect(total).toBeGreaterThanOrEqual(lastTurn!.seconds - 1);
       expect(total).toBeLessThanOrEqual(lastTurn!.seconds + 2);
+      // Each compaction leaves a line; the longest one's shows about the
+      // time its row showed last.
+      const lines = compactedSeconds(await terminal.captureFullScrollback());
+      console.log(`live compacted lines: ${JSON.stringify(lines)}`);
+      expect(lines.length).toBeGreaterThanOrEqual(episodes.length);
+      const longest = Math.max(...episodes.map((episode) => episode.most));
+      expect(lines.some((seconds) => seconds >= longest && seconds <= longest + 2)).toBe(true);
       expect(checkpoints(readFileSync(join(sessionDir(home, sessionId), "log.jsonl")))).toBeGreaterThan(0);
       await terminal.sendText("/quit");
       expect(await terminal.waitForSessionEnd(10_000)).toBe(true);

@@ -48,6 +48,8 @@ pub const Operation = struct {
     /// Manual admission resets it when queued.
     started_at_ms: i64,
     expires_at_ms: ?i64 = null,
+    /// When the operation settled; 0 while it runs.
+    settled_at_ms: i64 = 0,
     dismissed: bool = false,
 
     pub fn visible(self: Operation, now_ms: i64) bool {
@@ -120,6 +122,7 @@ pub const State = struct {
         const op = self.match(id) orelse return;
         if (!op.active()) return;
         op.phase = .{ .terminal = feedback };
+        op.settled_at_ms = now_ms;
         op.expires_at_ms = switch (feedback.outcome) {
             .no_op, .busy => now_ms +| 1500,
             .succeeded, .cancelled, .failed => null,
@@ -172,6 +175,17 @@ test "compaction activity is bounded and rejects stale updates and dismissals" {
     try std.testing.expect(state.snapshot.operation.?.phase == .stopping);
     state.settle(overflow, .{ .outcome = .succeeded, .publication = .committed }, 80);
     try std.testing.expect(!state.snapshot.operation.?.visible(80));
+}
+
+test "compaction activity records when an operation settled, once" {
+    var state: State = .{};
+    const id = state.begin(.manual, null, 1_000);
+    try std.testing.expectEqual(@as(i64, 0), state.snapshot.operation.?.settled_at_ms);
+    state.settle(id, .{ .outcome = .succeeded, .publication = .committed }, 131_000);
+    try std.testing.expectEqual(@as(i64, 131_000), state.snapshot.operation.?.settled_at_ms);
+    // A late settle of the same operation changes nothing.
+    state.settle(id, failure(error.Cancelled, .summary, true), 140_000);
+    try std.testing.expectEqual(@as(i64, 131_000), state.snapshot.operation.?.settled_at_ms);
 }
 
 test "compaction activity transient expiry and persistent feedback are identity scoped" {
