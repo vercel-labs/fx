@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
@@ -1396,20 +1397,10 @@ describe("MCP login", () => {
     const traceDir = join(root.home, "tmp");
     mkdirSync(traceDir, { recursive: true });
     // /trace writes a report to $TMPDIR; read the newest once it is complete.
-    const captureTrace = async (): Promise<string> => {
-      const reports = () => readdirSync(traceDir).filter(name => name.startsWith("fx-trace-") && name.endsWith(".md")).sort();
-      const before = new Set(reports());
+    const captureTrace = async (): Promise<TraceReport> => {
+      const before = new Set(traceReportNames(traceDir));
       await tui!.sendText("/trace");
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline) {
-        const fresh = reports().filter(name => !before.has(name));
-        if (fresh.length > 0) {
-          const content = readFileSync(join(traceDir, fresh[fresh.length - 1]), "utf8");
-          if (content.includes("## Transcript Timeline")) return content;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      throw new Error("trace report was not written");
+      return waitForNewTraceReport(traceDir, before);
     };
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -1431,9 +1422,9 @@ describe("MCP login", () => {
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     const waiting = await captureTrace();
-    expect(waiting).toContain("- mcp server needs login name=fixture");
-    expect(waiting).toMatch(/- fixture state=\w+ transport=http tools=0 signed_in=false needs_login=true/);
-    expect(waiting).not.toContain("mcp_servers: runtime not loaded");
+    expect(waiting.problems("mcp_server").find((problem) => problem.name === "fixture")?.issue).toBe("needs_login");
+    expect(waiting.one("runtime_context").mcp_servers).toBe(1);
+    expect(waiting.one("mcp_server")).toMatchObject({ name: "fixture", transport: "http", tools: 0, signed_in: false, needs_login: true });
 
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  1", 10_000);
@@ -1455,8 +1446,11 @@ describe("MCP login", () => {
     await tui.waitForPane((pane) => !pane.includes("Signed in to fixture."), 10_000);
     expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
     const ready = await captureTrace();
-    expect(ready).toMatch(/- fixture state=ready transport=http tools=\d+ signed_in=true needs_login=false\n(?! {4}error:)/);
-    expect(ready).not.toContain("- mcp server needs login name=fixture");
+    const server = ready.one("mcp_server");
+    expect(server).toMatchObject({ name: "fixture", state: "ready", transport: "http", signed_in: true, needs_login: false });
+    expect(server.tools).toEqual(expect.any(Number));
+    expect(server.error).toBeUndefined();
+    expect(ready.problems("mcp_server")).toEqual([]);
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 

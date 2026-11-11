@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
 import {
@@ -255,28 +256,12 @@ function traceTmpDir(root: FixtureRoot): string {
   return dir;
 }
 
-function traceReports(root: FixtureRoot): string[] {
-  return readdirSync(traceTmpDir(root))
-    .filter(name => name.startsWith("fx-trace-") && name.endsWith(".md"))
-    .sort();
-}
-
-async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<string> {
-  const before = new Set(traceReports(root));
+async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<TraceReport> {
+  const before = new Set(traceReportNames(traceTmpDir(root)));
   await tui.sendText("/trace");
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    const fresh = traceReports(root).filter(name => !before.has(name));
-    if (fresh.length > 0) {
-      // The filename becomes visible between create and the content write, so
-      // wait for the report's closing section before reading.
-      const path = join(traceTmpDir(root), fresh[fresh.length - 1]);
-      const content = readFileSync(path, "utf8");
-      if (content.includes("## Transcript Timeline")) return content;
-    }
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  throw new Error("trace report was not written");
+  // The file name shows before its content is written, so this waits for
+  // the report's end record.
+  return waitForNewTraceReport(traceTmpDir(root), before);
 }
 
 test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", async () => {
@@ -297,11 +282,10 @@ test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", asyn
     await tui.waitForText(GENERATED_TITLE, 15000);
 
     const report = await captureTraceReport(tui, root);
-    expect(report).toContain("## Session Title");
-    expect(report).toContain("setting: true");
-    expect(report).toContain(`title: ${GENERATED_TITLE}`);
-    expect(report).toContain("generation: status=installed");
-    expect(report).toContain(`model=${TITLE_MODEL}`);
+    const title = report.one("session_title");
+    expect(title.setting).toBe(true);
+    expect(title.title).toBe(GENERATED_TITLE);
+    expect(title.generation).toMatchObject({ status: "installed", model: TITLE_MODEL });
   } finally {
     await tui?.kill();
     gateway.stop();
@@ -330,16 +314,14 @@ test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was gener
     // The title task finishes right after the fake gateway responds, but there
     // is no visible signal for a failed title, so retry while it is running.
     const deadline = Date.now() + 20_000;
-    let report = "";
+    let generation: unknown;
     while (Date.now() < deadline) {
-      report = await captureTraceReport(tui, root);
-      if (!report.includes("generation: status=running")) break;
+      const report = await captureTraceReport(tui, root);
+      generation = report.one("session_title").generation;
+      if ((generation as { status?: string }).status !== "running") break;
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    expect(report).toContain("## Session Title");
-    expect(report).toContain("generation: status=failed");
-    expect(report).toContain("model=openai/gpt-5.6-luna");
-    expect(report).toContain("reason=unsanitizable");
+    expect(generation).toMatchObject({ status: "failed", model: "openai/gpt-5.6-luna", reason: "unsanitizable" });
   } finally {
     await tui?.kill();
     gateway.stop();

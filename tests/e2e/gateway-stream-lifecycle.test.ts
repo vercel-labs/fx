@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
@@ -5779,11 +5780,10 @@ describe("gateway stream lifecycle", () => {
       expect((await tui.captureFullScrollback()).match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       await tui.sendText("/trace");
       await tui.waitForText("Trace saved at", 10_000);
-      const traceFile = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
-      expect(traceFile).toBeDefined();
-      const report = readFileSync(join(root.root, traceFile!), "utf8");
-      expect(report).toContain("invalid JSON arguments");
-      expect(report).not.toContain("MUST_NOT_EXECUTE");
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      const transcript = report.all("transcript_entry").map((entry) => String(entry.text)).join("\n");
+      expect(transcript).toContain("invalid JSON arguments");
+      expect(report.text).not.toContain("MUST_NOT_EXECUTE");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;

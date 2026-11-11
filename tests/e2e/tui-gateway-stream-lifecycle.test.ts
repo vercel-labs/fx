@@ -17,6 +17,7 @@ import {
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 import { closePanel, waitForPanel } from "./info-panel";
 import {
@@ -1729,17 +1730,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     );
 
     await session.sendText("/trace");
-    const rootDir = root;
-    await waitForCondition(
-      () => readdirSync(rootDir).some((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md")),
-      "trace report file",
-    );
-    const report = readFileSync(
-      join(rootDir, readdirSync(rootDir).find((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))!),
-      "utf8",
-    );
-    const network = report.split("## Network Calls")[1]?.split("\n## ")[0] ?? "";
-    expect(network).toContain("stop_reason=other provider_stop_reason=UNEXPECTED_TOOL_CALL");
+    const report = await waitForNewTraceReport(root);
+    expect(report.all("network_call").some((call) =>
+      call.stop_reason === "other" && call.provider_stop_reason === "UNEXPECTED_TOOL_CALL")).toBe(true);
 
     await session.sendText("Confirm a later prompt is still usable.");
     await session.waitForText("LATER_PROMPT_OK", TIMEOUT);
@@ -1797,30 +1790,22 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     // The notice text wraps unpredictably across terminal widths, so wait for
     // the report file itself instead of a pane string.
     await session.sendText("/trace");
-    const rootDir = root;
-    await waitForCondition(
-      () => readdirSync(rootDir).some((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md")),
-      "trace report file",
-    );
+    const report = await waitForNewTraceReport(root);
+    expect(traceReportNames(root)).toHaveLength(1);
 
-    const reports = readdirSync(rootDir)
-      .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
-      .sort();
-    expect(reports).toHaveLength(1);
-    const report = readFileSync(join(rootDir, reports[0]!), "utf8");
+    const catalog = report.one("model_catalog");
+    expect(catalog.cache).toMatchObject({ state: "failed" });
+    expect(catalog.selected_model).toMatchObject({ model: MODEL, image_input: "unknown" });
+    const events = report.all("model_catalog_event").map((event) =>
+      `${event.event} ${event.failed ? "failed" : "ok"} ${event.detail ?? ""}`);
+    expect(events.some((event) => event.startsWith("load failed outcome=failed"))).toBe(true);
+    expect(events.some((event) => event.startsWith(`lookup failed outcome=cache_failed model=${MODEL}`))).toBe(true);
+    expect(events.some((event) =>
+      event.startsWith(`image_gate failed model=${MODEL} image_support=unknown err=ModelImageCapabilityUnavailable`))).toBe(true);
 
-    const catalog = report.split("## Model Catalog")[1]?.split("\n## ")[0] ?? "";
-    expect(catalog).toContain("state=failed");
-    expect(catalog).toContain(`selected_model=${MODEL} image_input=unknown`);
-    expect(catalog).toContain("load failed outcome=failed");
-    expect(catalog).toContain(`lookup failed outcome=cache_failed model=${MODEL}`);
-    expect(catalog).toContain(
-      `image_gate failed model=${MODEL} image_support=unknown err=ModelImageCapabilityUnavailable`,
-    );
-
-    const problems = report.split("## Problems")[1]?.split("\n## ")[0] ?? "";
-    expect(problems).toContain(`- model catalog image_gate model=${MODEL}`);
-    expect(problems).not.toContain("no obvious errors");
+    const problems = report.problems("model_catalog");
+    expect(problems.some((problem) => problem.event === "image_gate" && String(problem.detail).startsWith(`model=${MODEL}`))).toBe(true);
+    expect(report.one("problems").count).toBeGreaterThan(0);
 
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session.sendText("/quit");
