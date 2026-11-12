@@ -348,6 +348,12 @@ const TranscriptRecoveryReceipt = struct {
     remaining_semantic_rows: u32 = 0,
     // Only this remaining semantic suffix may advance the current projection.
     remaining_semantic_progress_rows: u32 = 0,
+    // Semantic rows the receipt owed that no frame wrote. The store reconciles
+    // a source rewrite into the receipt before the next frame and zeroes the
+    // rows above, and a frame can accept fewer rows than are owed. The stable
+    // anchor such a receipt commits needs a catch-up flag for them. The count
+    // is in rows at `attempt_cols`, so a resize frame does not carry it.
+    dropped_semantic_rows: u32 = 0,
     remaining_unplanned_scroll_rows: u16 = 0,
     attempt_cols: u16 = 0,
     attempt_resize_history_row_delta: ?i32 = null,
@@ -8347,6 +8353,7 @@ pub const TranscriptRuntime = struct {
                     "action=rebase_recovery reason={s} old_bytes={d} new_bytes={d} view={d} history={d} dropped_rows={d} append_committed={}",
                     .{ reason, receipt.flow.len, rendered_flow.len, receipt.accepted_visual_offset, receipt.accepted_history_visual_offset, receipt.remaining_semantic_rows, receipt.document_append_committed },
                 );
+                receipt.dropped_semantic_rows +|= receipt.remaining_semantic_rows;
                 receipt.remaining_semantic_rows = 0;
                 receipt.remaining_semantic_progress_rows = 0;
                 receipt.projection_rebase_pending = true;
@@ -9457,6 +9464,36 @@ pub const TranscriptRuntime = struct {
                         );
                         target.usePreparedProjection(prepared);
                     }
+                }
+                // A receipt can commit stable with rows it owed still unwritten:
+                // a source rewrite zeroed its debt before this frame
+                // (`dropped_semantic_rows`), or the frame accepts fewer rows than
+                // are owed. The anchor must say so, because a frame that releases
+                // only the rows leaving the screen top never replays them and they
+                // stay missing from native scrollback. A resize owns its own debt,
+                // and its history offsets count rows at another width, so only a
+                // same-geometry receipt without reflow debt counts. A receipt that
+                // never owed rows (an invalid origin) has nothing to flag.
+                if (receipt.remaining_semantic_rows +| receipt.dropped_semantic_rows >
+                    accepted_semantic_rows and
+                    receipt.remaining_resize_reflow_rows == 0 and
+                    receipt.attempt_cols == self.layout.cols and
+                    self.resize_history_row_delta == null and
+                    !target.normal_buffer_recovery_pending and
+                    target.history_visual_offset < target.visual_offset)
+                {
+                    target.history_catchup_pending = true;
+                    debug_trace.logf(
+                        "scroll",
+                        "transcript_history_debt_flagged owed_rows={d} history={d} viewport={d} receipt_remaining_rows={d} receipt_dropped_rows={d}",
+                        .{
+                            target.visual_offset - target.history_visual_offset,
+                            target.history_visual_offset,
+                            target.visual_offset,
+                            receipt.remaining_semantic_rows,
+                            receipt.dropped_semantic_rows,
+                        },
+                    );
                 }
             },
             .invalid => if (semanticProgressNeedsStaging(
@@ -10881,6 +10918,39 @@ pub const TranscriptRuntime = struct {
                 },
                 .invalid, .stable => {},
             }
+            // Rows the previous receipt owed that this frame neither accepted nor
+            // still owes were dropped; the next receipt keeps count of them. The
+            // count is in rows at the receipt's width. A frame at another width,
+            // or one that still measures a resize, belongs to the resize: the
+            // terminal reflowed those rows and the resize recovery owns the
+            // debt, so replaying the old-width rows would write them twice.
+            const dropped_semantic_rows: u32 = switch (previous_state) {
+                .recovering => |receipt| carried: {
+                    const unwritten = receipt.dropped_semantic_rows +|
+                        (receipt.remaining_semantic_rows -|
+                            commit.accepted.semantic_rows -|
+                            commit.remaining_semantic_rows);
+                    if (receipt.attempt_cols == transition.target_layout.terminal_cols and
+                        self.resize_history_row_delta == null)
+                    {
+                        break :carried unwritten;
+                    }
+                    if (unwritten > 0) {
+                        debug_trace.logf(
+                            "scroll",
+                            "transcript_history_debt_dropped rows={d} reason=resize receipt_cols={d} frame_cols={d} resize_delta_pending={s}",
+                            .{
+                                unwritten,
+                                receipt.attempt_cols,
+                                transition.target_layout.terminal_cols,
+                                if (self.resize_history_row_delta != null) "true" else "false",
+                            },
+                        );
+                    }
+                    break :carried 0;
+                },
+                .invalid, .stable => 0,
+            };
             self.transcript_commit_state = .{ .recovering = .{
                 .accepted_visual_offset = recovery.accepted_visual_offset,
                 .accepted_history_visual_offset = recovery.accepted_history_visual_offset,
@@ -10892,6 +10962,7 @@ pub const TranscriptRuntime = struct {
                 .remaining_resize_reflow_rows = commit.remaining_resize_reflow_rows,
                 .remaining_semantic_rows = commit.remaining_semantic_rows,
                 .remaining_semantic_progress_rows = commit.remaining_semantic_progress_rows,
+                .dropped_semantic_rows = dropped_semantic_rows,
                 .remaining_unplanned_scroll_rows = commit.remaining_unplanned_scroll_rows,
                 .attempt_cols = transition.target_layout.terminal_cols,
                 .attempt_resize_history_row_delta = self.resize_history_row_delta,
