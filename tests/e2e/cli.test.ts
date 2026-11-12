@@ -4637,15 +4637,17 @@ describe("cli: credits", () => {
   );
 
   test(
-    "fx credits reports the team's Token Pass credit in text and JSON",
+    "fx credits reports the amount used and the team's Token Pass credit in text and JSON",
     async () => {
       const home = createIsolatedTestHome();
+      // AI Gateway names the amount spent `total_used`, which fx reports as used.
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         fetch: () =>
           Response.json({
             balance: "12.50",
+            total_used: "4.50",
             token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
           }),
       });
@@ -4661,13 +4663,16 @@ describe("cli: credits", () => {
         const json = await runFx(["credits", "--json"], { env });
         expect(json.code).toBe(0);
         expect(json.stderr).toBe("");
-        expect(JSON.parse(json.stdout.trim()).token_pass).toEqual({
+        const credits = JSON.parse(json.stdout.trim());
+        expect(credits.used).toBe("4.50");
+        expect(credits.token_pass).toEqual({
           remaining: "79.92906",
           resets_at: "2026-12-05T08:00:00.000Z",
         });
 
         const text = await runFx(["credits"], { env });
         expect(text.code).toBe(0);
+        expect(text.stdout).toContain("[credits] used=4.50\n");
         expect(text.stdout).toContain("[credits] token_pass_remaining=79.92906\n");
         expect(text.stdout).toContain("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n");
       } finally {
