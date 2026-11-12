@@ -5,6 +5,7 @@
 //! paints.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const composer_stash = @import("../input/composer_stash.zig");
@@ -473,6 +474,14 @@ const wake_check: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50
 /// How long the main loop waits for slot threads to let go of a child agent
 /// before it gives up on freeing it.
 const release_timeout_ms: i64 = 5_000;
+
+/// Test builds only: a test sets it to reach the timeout path at once.
+pub var test_release_timeout_ms: if (builtin.is_test) ?i64 else void = if (builtin.is_test) null else {};
+
+fn releaseTimeoutMs() i64 {
+    if (builtin.is_test) return test_release_timeout_ms orelse release_timeout_ms;
+    return release_timeout_ms;
+}
 
 /// Takes `post` back if the loop has not taken it yet.
 fn withdraw(handoffs: *Handoffs, post: *Post) bool {
@@ -2182,6 +2191,17 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Logs `child`, kept allocated because a slot thread still holds its
+        /// worker after `release_timeout_ms`: its finished turns are saved and
+        /// its session is closed, but its agent and worker are not freed.
+        fn noteKept(child: *const ChildAgent, at: []const u8) void {
+            debug_trace.logf(
+                "host",
+                "child_release_timeout child={s} at={s} kept=agent,worker reason=slot_thread_holds_worker finished_prompts=settled session=closed",
+                .{ child.id, at },
+            );
+        }
+
         /// Stops every child agent's worker and ends each run in flight. Runs
         /// before main's worker is joined, because main's worker can be
         /// waiting on a subagent call, which waits for its run to end. Each
@@ -2666,21 +2686,19 @@ pub fn Runtime(comptime App: type) type {
         /// run's slot thread lets go, and drops it from the list. The slot
         /// thread still reads the agent's worker while it detaches from it, so
         /// the worker is told to stop, the slot lets go, and only then is the
-        /// agent torn down.
+        /// agent freed. Its session closes either way.
         pub fn dropHosted(app: *App, child: *ChildAgent) void {
             child.agent.worker.requestShutdown();
             child.agent.managed_executions.shutdown();
             // A slot thread that never lets go leaves the agent allocated and
-            // whole, so it reads no freed memory, rather than freezing the
-            // screen.
-            const released = child.bound.waitReleased(release_timeout_ms);
-            if (released) {
-                visit(app, child, {}, shutdownInContext) catch |err| {
-                    app_session_runtime.Runtime(App).recordShutdownFailure(firstInstance(app) orelse &app.main_agent, err);
-                };
-            } else {
-                debug_trace.logf("host", "child_release_timeout child={s} at=drop kept_allocated=true", .{child.id});
-            }
+            // its worker whole, so it reads no freed memory, rather than
+            // freezing the screen.
+            const released = child.bound.waitReleased(releaseTimeoutMs());
+            const closed = if (released) visit(app, child, {}, shutdownInContext) else visit(app, child, {}, closeInContext);
+            closed catch |err| {
+                app_session_runtime.Runtime(App).recordShutdownFailure(firstInstance(app) orelse &app.main_agent, err);
+            };
+            if (!released) noteKept(child, "drop");
             {
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
@@ -2936,7 +2954,16 @@ pub fn Runtime(comptime App: type) type {
             Session.finalizePersistence(app, agent);
         }
 
-        fn shutdownInContext(_: void, app: *App, agent: *agents.Agent) anyerror!void {
+        fn shutdownInContext(context: void, app: *App, agent: *agents.Agent) anyerror!void {
+            try closeInContext(context, app, agent);
+            try freeInContext(context, app, agent);
+        }
+
+        /// Stops `agent` and closes its session: its worker stops and is
+        /// joined, its finished turns are saved, and its session closes. It
+        /// frees nothing a slot thread may still read, so it also runs for an
+        /// agent whose slot thread has not let go.
+        fn closeInContext(_: void, app: *App, agent: *agents.Agent) anyerror!void {
             agent.worker.requestShutdown();
             agent.managed_executions.shutdown();
             if (agent.worker_thread) |thread| thread.join();
@@ -2944,8 +2971,13 @@ pub fn Runtime(comptime App: type) type {
             app_worker_runtime.Runtime(App).settleFinishedPromptsForShutdown(app, agent) catch |err| {
                 app_session_runtime.Runtime(App).recordShutdownFailure(agent, err);
             };
-            agent.managed_executions.deinit();
             finalizeInstancePersistence(app, agent);
+        }
+
+        /// Frees `agent`'s state, once `closeInContext` closed it and no slot
+        /// thread holds its worker.
+        fn freeInContext(_: void, app: *App, agent: *agents.Agent) anyerror!void {
+            agent.managed_executions.deinit();
             agent.worker.deinit(std.heap.c_allocator);
             app.clearPendingImages(agent);
             agent.pending_images.deinit(app.alloc);

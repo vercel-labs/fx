@@ -6427,6 +6427,53 @@ test "attaching a subagent's session restores only that agent's conversation" {
     try std.testing.expect(app.main_agent.session_persistence.session_preferences == null);
 }
 
+test "closing a subagent whose slot thread does not let go closes its session but keeps its agent whole" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    const session_adapter = @import("core/session/session_adapter.zig");
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("child task"), .work_id = @constCast("child-work") },
+        .assistant = @constCast("CHILD_ANSWER"),
+    } }};
+    const opened = try parent.openChild("child-1", &history);
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = addTestChildAgent(&app, "child-1") catch |err| {
+        opened.close();
+        return err;
+    };
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    const Attach = struct {
+        fn run(source: *session_adapter.Session, a: *App, agent: *agents.Agent) anyerror!void {
+            try App.SessionAppRuntime.attachChildV2Session(a, agent, source);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, opened, Attach.run);
+    try std.testing.expect(child.agent.session_persistence.v2 != null);
+
+    // The run's slot thread holds the subagent's worker and never lets go.
+    child.bound.hold();
+    app_agents_runtime.test_release_timeout_ms = 20;
+    defer app_agents_runtime.test_release_timeout_ms = null;
+    App.AgentsAppRuntime.dropHosted(&app, child);
+
+    // It left the list and its session is closed, but its agent is not freed,
+    // since the slot thread may still read its worker.
+    try std.testing.expectEqual(@as(usize, 0), app.child_agents.items.len);
+    try std.testing.expect(child.agent.session_persistence.v2 == null);
+    try std.testing.expect(child.agent.role == .subagent);
+
+    // Once the slot lets go, the shutdown frees what the close kept.
+    child.bound.release();
+    try app.child_agents.append(alloc, child);
+}
+
 test "a child agent's worker thread starts for that agent and stops at shutdown" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
