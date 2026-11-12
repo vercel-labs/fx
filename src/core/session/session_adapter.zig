@@ -84,6 +84,13 @@ fn openHome(home: []const u8) !io_mod.VerifiedDir {
 
 /// Pieces larger than this go to a blob; the line keeps a reference.
 const max_inline_piece_bytes: usize = 256 * 1024;
+/// A workspace capture always fits inline: one held for a turn not on disk
+/// yet could not go to a blob, which needs the turn on disk (D44, D98).
+const max_workspace_capture_bytes = max_inline_piece_bytes;
+/// The next capture turn token, shared by every Session of the process so a
+/// token from one never matches another's turn (D98). Starts at 1: 0 means
+/// no turn.
+var capture_turns: std.atomic.Value(u64) = .init(1);
 /// Lines per page when replaying history.
 const replay_page_lines: usize = 256;
 
@@ -1657,6 +1664,27 @@ pub const Session = struct {
     /// The store deletes no blob of a live session, so an entry stays true,
     /// and every copy of a turn the host passes encodes its images alike.
     prompt_blobs: std.array_hash_map.String([]u8) = .empty,
+    /// The workspace captures of the current capture turn and of the ended
+    /// one waiting for its commit, each with its token, in the order saved
+    /// (D98). Each turn's stay until its `commitTurnWithCaptures` lands or
+    /// a later `beginCaptureTurn` drops them; a fresh turn after a
+    /// supersede writes its starts again.
+    captures: std.ArrayList(Capture) = .empty,
+    /// The token of the current capture turn (`CaptureTurn`), drawn from
+    /// `capture_turns`; 0 when no capture turn is open.
+    capture_turn: u64 = 0,
+    /// The token of a turn whose end capture was taken and whose commit
+    /// has not landed when the next turn began (`beginCaptureTurnKeeping`):
+    /// its captures stay held for its own commit. 0 when none waits; at
+    /// most one does.
+    ended_turn: u64 = 0,
+    /// The capture token whose turn is open on disk, set by the write that
+    /// opens it; 0 when that write belonged to no capture turn, such as a
+    /// commit of an earlier turn. Only this turn takes `captures` (D98).
+    turn_token: u64 = 0,
+    /// The open turn is one a failed turn left behind: the next write
+    /// closes it as superseded instead of continuing it (D98).
+    turn_stale: bool = false,
     turn_open: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
     last_turn: u64 = 0,
@@ -1961,10 +1989,18 @@ pub const Session = struct {
     pub fn close(self: *Session) void {
         // Before the close, which forgets whether the log is on disk.
         const was_saved = self.saved();
+        // A failed turn left open is closed as superseded, so readers drop it
+        // with its captures instead of keeping it as an interrupted turn (D98).
+        if (self.turn_open and self.turn_stale) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            self.supersedeOpenTurn("failed_turn") catch |err| debug_trace.logf("session", "event=sessions_v2_stale_turn_kept session={s} err={s}", .{ self.id(), @errorName(err) });
+        }
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
+        self.traceDroppedCaptures("closed");
         // Before `release`: the id lives in the handle.
         if (!was_saved) self.removeUnsavedFiles();
         self.handle.release();
@@ -2002,6 +2038,8 @@ pub const Session = struct {
             alloc.free(path);
         }
         self.prompt_blobs.deinit(alloc);
+        self.clearCaptures();
+        self.captures.deinit(alloc);
         self.turn_numbers.deinit(alloc);
         if (self.language) |value| alloc.free(value);
         if (self.instructions) |value| alloc.free(value);
@@ -2046,11 +2084,18 @@ pub const Session = struct {
     // -- turns ---------------------------------------------------------------
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
-    /// is a blob of a session on disk (D44). Caller holds the mutex.
-    fn openTurnLocked(self: *Session) !void {
-        if (self.turn_open) return;
-        _ = try self.write(&.{.turn_started});
-        self.startedTurn();
+    /// is a blob of a session on disk (D44). `opener` is the capture token
+    /// of the turn being opened, or 0 when it is not the current capture
+    /// turn's. Caller holds the mutex.
+    fn openTurnLocked(self: *Session, opener: u64) !void {
+        if (self.turn_open and !self.turn_stale) return;
+        if (self.turn_open) try self.supersedeOpenTurn("failed_turn");
+        var batch: std.ArrayList(sm.Event) = .empty;
+        defer batch.deinit(self.alloc);
+        try batch.append(self.alloc, .turn_started);
+        try self.appendHeldStarts(self.alloc, &batch, opener);
+        _ = try self.write(batch.items);
+        self.startedTurn(opener);
     }
 
     /// Opens the turn as its work starts. A subagent child streams nothing,
@@ -2060,7 +2105,7 @@ pub const Session = struct {
     pub fn beginTurn(self: *Session) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        try self.openTurnLocked();
+        try self.openTurnLocked(self.capture_turn);
     }
 
     /// Stores the turn's tool results and images as blobs and gives them
@@ -2076,7 +2121,9 @@ pub const Session = struct {
                 .interrupted => |entry| storesBodies(entry.execution),
                 .compacted_summary => false,
             };
-            if (stores) try self.openTurnLocked();
+            // The turn prepared may be an earlier one than the current capture
+            // turn's, so it opens with no captures.
+            if (stores) try self.openTurnLocked(0);
         }
         try session_log.externalizeConversationTurnResults(self.alloc, turn, try self.childCapability());
     }
@@ -2105,10 +2152,45 @@ pub const Session = struct {
     }
 
     /// Appends a finished turn: the pieces not streamed yet, then its end,
-    /// in one durable batch. `turn` must already be prepared.
+    /// in one durable batch. `turn` must already be prepared. Writes no
+    /// workspace capture and leaves the current capture turn as it is, so a
+    /// commit of an earlier turn, such as ACP's interrupted one, never takes
+    /// the next turn's captures: an open turn that holds another capture
+    /// token's written starts, with nothing streamed, is superseded rather
+    /// than continued (`othersOpenTurn`, D98).
     pub fn commitTurn(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        try self.commitTurnLocked(turn, language, 0);
+    }
+
+    /// Commits `turn` as `commitTurn` does, with the workspace captures of
+    /// `capture`, the turn's token: start captures not on disk yet and every
+    /// end capture join the closing batch, before `turn_committed` or
+    /// `turn_interrupted`. Once the batch lands the capture turn ends. A
+    /// failed commit keeps the captures, so a retry of the same turn with
+    /// the same token writes them once; the next `beginCaptureTurn` drops
+    /// them. The token may be the current one or the ended one a later turn
+    /// kept (`beginCaptureTurnKeeping`); each commit takes only its own
+    /// token's captures and never continues a turn another token opened
+    /// (`othersOpenTurn`). Any other token commits the turn without
+    /// captures (D98).
+    pub fn commitTurnWithCaptures(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage, capture: CaptureTurn) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const token = @backingInt(capture);
+        const held = token != 0 and (token == self.capture_turn or token == self.ended_turn);
+        if (!held) debug_trace.logf("session", "event=sessions_v2_workspace_captures_dropped session={s} reason=turn_closed held=0", .{self.id()});
+        try self.commitTurnLocked(turn, language, if (held) token else 0);
+        if (held) {
+            self.clearCapturesOf(token);
+            if (token == self.capture_turn) self.capture_turn = 0 else self.ended_turn = 0;
+        }
+    }
+
+    /// `owner` is the capture token whose captures the turn takes, current
+    /// or ended, or 0.
+    fn commitTurnLocked(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage, owner: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -2123,9 +2205,21 @@ pub const Session = struct {
         const all = events.items;
         const encoded = try a.alloc([]u8, all.len);
         for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
+        if (self.othersOpenTurn(owner)) try self.supersedeOpenTurn("other_turn");
         const start = try self.streamedPrefix(encoded[0..pieces.len], .commit, countResults(pieces));
 
         var tail: std.ArrayList(sm.Event) = .empty;
+        if (owner != 0) {
+            // A turn already open, but not by this token, has not taken its
+            // starts yet; one opened by the batch below takes them first.
+            if (self.turn_open) for (self.captures.items) |capture| {
+                if (capture.turn == owner and capture.place == .start and !capture.written) try tail.append(a, .{ .item = capturePiece(capture.data) });
+            };
+            // End captures close the turn with it, in the order saved (D98).
+            for (self.captures.items) |capture| {
+                if (capture.turn == owner and capture.place == .end) try tail.append(a, .{ .item = capturePiece(capture.data) });
+            }
+        }
         switch (end) {
             .turn_completed => try tail.append(a, .turn_committed),
             .interrupted => |interruption| try tail.append(a, .{ .turn_interrupted = switch (interruption.reason) {
@@ -2149,17 +2243,50 @@ pub const Session = struct {
             null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
-        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn));
-        try self.turn_numbers.append(self.alloc, self.last_turn);
+        // Allocated first: once the batch lands, nothing here can fail and
+        // leave this side thinking the turn is still open.
+        try self.turn_numbers.ensureUnusedCapacity(self.alloc, 1);
+        const owned_language = if (language_changed) try self.alloc.dupe(u8, language_tag) else null;
+        errdefer if (owned_language) |owned| self.alloc.free(owned);
+
+        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn), owner);
+        self.turn_numbers.appendAssumeCapacity(self.last_turn);
         self.turn_open = false;
+        self.turn_token = 0;
         self.clearStreamed();
-        if (language_changed) {
-            const owned = try self.alloc.dupe(u8, language_tag);
+        if (owned_language) |owned| {
             if (self.language) |old| self.alloc.free(old);
             self.language = owned;
         }
         if (derived_title != null) self.titled = true;
         self.fresh = false;
+    }
+
+    /// Whether the open turn belongs to another capture token than `owner`,
+    /// a commit's token or 0, so the commit supersedes it instead of
+    /// continuing it, even when nothing streamed into it lets
+    /// `streamedPrefix` tell the turns apart. The supersede holds that
+    /// token's captures again, so its own turn writes them when it opens
+    /// afresh (D98).
+    ///
+    /// A commit with a token knows its turn: a turn another nonzero token
+    /// opened is never its own, as when a kept ended turn's late commit
+    /// finds the next turn open. A plain commit carries no token, so it may
+    /// be the open turn's own, committed without its captures. With pieces
+    /// streamed, their content decides. With none, continuing harms only a
+    /// turn holding its token's written captures, which the commit would
+    /// take, as when ACP commits an earlier turn after the next one opened
+    /// with its start; only that turn is superseded.
+    fn othersOpenTurn(self: *const Session, owner: u64) bool {
+        if (!self.turn_open or self.turn_stale) return false;
+        const token = self.turn_token;
+        if (token == 0 or token == owner) return false;
+        if (owner != 0) return true;
+        if (self.streamed.items.len != 0) return false;
+        for (self.captures.items) |capture| {
+            if (capture.turn == token and capture.written) return true;
+        }
+        return false;
     }
 
     /// Saves each prompt image of the turn as a blob named by its digest
@@ -2213,7 +2340,7 @@ pub const Session = struct {
     /// image stays inline and the prompt goes on.
     fn savePromptImageLocked(self: *Session, bytes: []const u8, digest: []const u8) ![]const u8 {
         // A blob needs the turn on disk (D44).
-        try self.openTurnLocked();
+        try self.openTurnLocked(self.capture_turn);
         const hash = try BlobHost.put(self.host, bytes);
         // The digest names the blob: bytes that do not match it are not
         // saved under it.
@@ -2287,7 +2414,7 @@ pub const Session = struct {
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
         // A result's blob needs the turn on disk first (D44).
-        if (storesBodies(execution)) try self.openTurnLocked();
+        if (storesBodies(execution)) try self.openTurnLocked(self.capture_turn);
         // On a missing handle the list keeps the pieces before it.
         session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
@@ -2302,7 +2429,7 @@ pub const Session = struct {
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author);
+            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author, self.capture_turn);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
@@ -2317,13 +2444,176 @@ pub const Session = struct {
     pub fn saveRecovery(self: *Session, record: types.RecoveryRecordWrite) !bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (!self.turn_open) return false;
+        // A failed turn left open is not the turn the record belongs to: the
+        // fresh turn's first write takes it (D98).
+        if (!self.turn_open or self.turn_stale) return false;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const piece = (try self.recoveryItem(a, record)) orelse return false;
         _ = try self.write(&.{.{ .item = piece }});
         return true;
+    }
+
+    /// Where a workspace capture goes in its turn (D98).
+    pub const CapturePlace = enum {
+        /// Written in the open turn now, or with the first write of a
+        /// turn not on disk yet.
+        start,
+        /// Held for `commitTurn`, which writes it in the turn's closing
+        /// batch, before `turn_committed` or `turn_interrupted`.
+        end,
+    };
+
+    /// A workspace capture: its payload, owned, the capture token of its
+    /// turn, and whether the open turn holds it on disk.
+    const Capture = struct { data: []u8, place: CapturePlace, turn: u64, written: bool = false };
+
+    /// The turn a workspace capture belongs to (D98), from
+    /// `beginCaptureTurn`. Good only for this Session, and only until that
+    /// turn's `commitTurnWithCaptures` lands or the next `beginCaptureTurn`.
+    pub const CaptureTurn = enum(u64) { _ };
+
+    /// Begins the captures of a new turn and returns its token. A host
+    /// calls it once as each turn starts, saves every capture of that turn
+    /// with the token, and commits the turn with `commitTurnWithCaptures`,
+    /// so one that arrives late is dropped instead of joining a later turn.
+    /// Whatever an earlier token still holds is dropped here, however that
+    /// turn ended, such as a failed commit with no retry or a `prepareTurn`
+    /// that failed (D98).
+    pub fn beginCaptureTurn(self: *Session) CaptureTurn {
+        return self.beginCaptureTurnKeeping(null);
+    }
+
+    /// `beginCaptureTurn`, except that `ended`, when it is the current token
+    /// and its turn's end capture is taken but its commit has not landed,
+    /// keeps its captures for that commit: in the app, a prompt sent while
+    /// the previous answer is still drawn begins its turn before the UI
+    /// commits the previous one. At most one ended turn waits, so one kept
+    /// before is dropped as superseded. A null or other `ended` drops every
+    /// earlier token's captures, as `beginCaptureTurn` does (D98).
+    pub fn beginCaptureTurnKeeping(self: *Session, ended: ?CaptureTurn) CaptureTurn {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const keep = if (ended) |token| self.capture_turn != 0 and @backingInt(token) == self.capture_turn else false;
+        self.dropCapturesOf(self.ended_turn, "superseded_token");
+        if (keep) {
+            debug_trace.logf("session", "event=sessions_v2_workspace_captures_kept session={s} reason=ended_turn", .{self.id()});
+            self.ended_turn = self.capture_turn;
+        } else {
+            self.ended_turn = 0;
+            self.dropCapturesOf(self.capture_turn, "superseded_token");
+        }
+        self.capture_turn = capture_turns.fetchAdd(1, .monotonic);
+        // A turn opened for no capture turn and still live is this turn,
+        // started before its token: an ACP prompt or a prompt image opens it
+        // first. When an ended turn is kept, it is that turn's instead: its
+        // `prepareTurn` opens it with no token just before its late commit,
+        // while this turn's writes before now carried the ended token. A turn
+        // an earlier token opened keeps that token.
+        if (self.turn_open and !self.turn_stale and self.turn_token == 0) self.turn_token = if (keep) self.ended_turn else self.capture_turn;
+        return @fromBackingInt(self.capture_turn);
+    }
+
+    const SaveWorkspaceCaptureError = error{
+        InvalidWorkspaceCapture,
+        WorkspaceCaptureTooLarge,
+        /// `turn` has ended: its `commitTurnWithCaptures` landed or a later
+        /// `beginCaptureTurn` replaced it.
+        WorkspaceCaptureTurnClosed,
+    } || sm.AppendError;
+
+    /// Saves `payload`, one repository's workspace capture for `turn`, as a
+    /// `workspace_capture` item outside the streamed pieces, so it never
+    /// supersedes the turn and never reaches the model's messages (D98).
+    /// `payload` is an encoded JSON object this does not interpret, at most
+    /// `max_workspace_capture_bytes`, without line breaks; the caller keeps
+    /// whatever phase it names in step with `place`. Returns true when it is
+    /// written now and false when it is held: an end until
+    /// `commitTurnWithCaptures`, a start until its turn's first write or that
+    /// commit. A crash or `close` before then loses what is held, and so
+    /// does the next `beginCaptureTurn`. A refused payload, a closed turn or
+    /// a failed write keeps nothing.
+    pub fn saveWorkspaceCapture(self: *Session, turn: CaptureTurn, payload: []const u8, place: CapturePlace) SaveWorkspaceCaptureError!bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const token = @backingInt(turn);
+        if (token == 0 or (token != self.capture_turn and token != self.ended_turn)) {
+            debug_trace.logf("session", "event=sessions_v2_workspace_captures_dropped session={s} reason=turn_closed held=1", .{self.id()});
+            return error.WorkspaceCaptureTurnClosed;
+        }
+        try checkWorkspaceCapture(self.alloc, payload);
+        try self.captures.ensureUnusedCapacity(self.alloc, 1);
+        const data = try self.alloc.dupe(u8, payload);
+        errdefer self.alloc.free(data);
+        // Only the turn this token opened takes it now: a failed turn left
+        // open waits for the fresh turn that replaces it, and a turn opened
+        // for an earlier commit never takes it.
+        const now = place == .start and self.turn_open and !self.turn_stale and self.turn_token == token;
+        if (now) _ = try self.write(&.{.{ .item = capturePiece(data) }});
+        self.captures.appendAssumeCapacity(.{ .data = data, .place = place, .turn = token, .written = now });
+        return now;
+    }
+
+    /// Appends the start captures of `opener`, a capture token, not on
+    /// disk yet to the write that opens its turn; `startedTurn` marks them
+    /// written once that write lands. Only that token's captures go.
+    fn appendHeldStarts(self: *const Session, a: Allocator, batch: *std.ArrayList(sm.Event), opener: u64) !void {
+        if (opener == 0) return;
+        for (self.captures.items) |capture| {
+            if (capture.turn == opener and capture.place == .start and !capture.written) try batch.append(a, .{ .item = capturePiece(capture.data) });
+        }
+    }
+
+    fn clearCaptures(self: *Session) void {
+        for (self.captures.items) |capture| self.alloc.free(capture.data);
+        self.captures.clearRetainingCapacity();
+    }
+
+    /// Forgets the captures of token `turn`, keeping the others in order.
+    fn clearCapturesOf(self: *Session, turn: u64) void {
+        var kept: usize = 0;
+        for (self.captures.items) |capture| {
+            if (capture.turn == turn) {
+                self.alloc.free(capture.data);
+            } else {
+                self.captures.items[kept] = capture;
+                kept += 1;
+            }
+        }
+        self.captures.shrinkRetainingCapacity(kept);
+    }
+
+    /// Forgets the captures of token `turn`, a turn that did not commit.
+    /// When the open turn is that turn's and holds some of them, it is the
+    /// failed turn, left open: the next write closes it as superseded
+    /// rather than adding to it, so readers drop it with its captures
+    /// (D98). Token 0 holds nothing.
+    fn dropCapturesOf(self: *Session, turn: u64, reason: []const u8) void {
+        if (turn == 0) return;
+        self.traceDroppedCapturesOf(turn, reason);
+        for (self.captures.items) |capture| {
+            if (capture.turn == turn and capture.written and self.turn_open and self.turn_token == turn) self.turn_stale = true;
+        }
+        self.clearCapturesOf(turn);
+    }
+
+    /// Names what a drop discards: captures held in memory, and captures
+    /// already in the open turn, which its supersede discards.
+    fn traceDroppedCaptures(self: *const Session, reason: []const u8) void {
+        self.traceDroppedCapturesOf(null, reason);
+    }
+
+    /// `traceDroppedCaptures` for token `turn`'s captures only, or every
+    /// token's when null.
+    fn traceDroppedCapturesOf(self: *const Session, turn: ?u64, reason: []const u8) void {
+        var held: usize = 0;
+        var written: usize = 0;
+        for (self.captures.items) |capture| {
+            if (turn) |token| if (capture.turn != token) continue;
+            if (capture.written) written += 1 else held += 1;
+        }
+        if (held + written > 0) debug_trace.logf("session", "event=sessions_v2_workspace_captures_dropped session={s} reason={s} held={d} written={d}", .{ self.id(), reason, held, written });
     }
 
     fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
@@ -2456,19 +2746,23 @@ pub const Session = struct {
     /// not open. When the user piece is among them and someone other than
     /// the user wrote it, an `author` item follows it, once: a stream writes
     /// each piece once, and a superseded turn is written afresh.
-    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor) !void {
+    /// `opener` is the capture token of the turn written, as for
+    /// `openTurnLocked`.
+    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor, opener: u64) !void {
         const reviews = try a.alloc(?[]u8, events.len);
         for (events, reviews) |event, *review| review.* = try encodeFileReview(a, event);
         var batch: std.ArrayList(sm.Event) = .empty;
         if (!self.turn_open) {
             try batch.append(a, .turn_started);
+            // Held start captures go with the line that starts the turn (D98).
+            try self.appendHeldStarts(a, &batch, opener);
             const needs_blob = for (encoded, reviews) |bytes, review| {
                 if (bytes.len > max_inline_piece_bytes) break true;
                 if (review) |data| if (data.len > max_inline_piece_bytes) break true;
             } else false;
             if (needs_blob) {
                 _ = try self.write(batch.items);
-                self.startedTurn();
+                self.startedTurn(opener);
                 batch.clearRetainingCapacity();
             }
         }
@@ -2485,12 +2779,22 @@ pub const Session = struct {
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
         _ = try self.write(batch.items);
-        if (!self.turn_open) self.startedTurn();
+        if (!self.turn_open) self.startedTurn(opener);
     }
 
-    fn startedTurn(self: *Session) void {
+    /// A turn started on disk for `opener`; it holds that capture token's
+    /// starts (`appendHeldStarts`).
+    fn startedTurn(self: *Session, opener: u64) void {
         self.last_turn += 1;
         self.turn_open = true;
+        self.turn_token = opener;
+        if (opener != 0) self.markStartsWritten(opener);
+    }
+
+    fn markStartsWritten(self: *Session, opener: u64) void {
+        for (self.captures.items) |*capture| {
+            if (capture.turn == opener and capture.place == .start) capture.written = true;
+        }
     }
 
     // -- a conversion's import (D56) -----------------------------------------
@@ -2514,7 +2818,7 @@ pub const Session = struct {
             .interrupted => |entry| storesBodies(entry.execution),
             .compacted_summary => return error.InvalidConversationFrame,
         };
-        if (stores) try self.openTurnLocked();
+        if (stores) try self.openTurnLocked(0);
         try session_log.externalizeConversationTurnResults(a, &copy, try self.capabilityLocked());
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, copy);
@@ -2555,8 +2859,9 @@ pub const Session = struct {
             } },
             else => return error.InvalidConversationFrame,
         };
-        try self.writePieces(a, events, encoded, &.{end}, author);
+        try self.writePieces(a, events, encoded, &.{end}, author, 0);
         self.turn_open = false;
+        self.turn_token = 0;
     }
 
     /// Lets go of an import, published or not. A published one is opened
@@ -2574,6 +2879,8 @@ pub const Session = struct {
     /// the decision in the session trace, which the driver of
     /// `tests/tla/session/TurnStreamTrace.tla` replays.
     fn streamedPrefix(self: *Session, encoded: []const []u8, phase: StreamPhase, results: usize) !usize {
+        // A failed turn left open is never the one to continue (D98).
+        if (self.turn_open and self.turn_stale) try self.supersedeOpenTurn("failed_turn");
         const streamed = self.streamed.items;
         const held = if (self.turn_open) streamed.len else 0;
         const reparsed: ?usize = if (self.turn_open) reparsedPrefix(self.alloc, streamed, encoded) else 0;
@@ -2583,13 +2890,24 @@ pub const Session = struct {
         if (!self.turn_open) return 0;
         if (reparsed != null) return streamed.len;
         debug_trace.logf("session", "event=sessions_v2_stream_mismatch session={s} streamed={d} final={d} dropped=stale_turn", .{ self.id(), streamed.len, encoded.len });
+        try self.supersedeOpenTurn("stream_mismatch");
+        return 0;
+    }
+
+    /// Closes the open turn as superseded, which readers drop whole; the
+    /// next write starts the turn afresh, with its start captures again
+    /// (D98).
+    fn supersedeOpenTurn(self: *Session, reason: []const u8) !void {
+        debug_trace.logf("session", "event=sessions_v2_turn_superseded session={s} reason={s}", .{ self.id(), reason });
         _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
         });
         self.turn_open = false;
+        self.turn_stale = false;
+        self.turn_token = 0;
         self.clearStreamed();
-        return 0;
+        for (self.captures.items) |*capture| capture.written = false;
     }
 
     /// One piece as an item; a large one goes to a blob.
@@ -2636,7 +2954,9 @@ pub const Session = struct {
                 break;
             }
         }
-        if (keep_from == null and active_prefix and self.turn_open) {
+        // A failed turn left open is not the active turn: its fresh turn is
+        // not on disk yet (D98).
+        if (keep_from == null and active_prefix and self.turn_open and !self.turn_stale) {
             keep_from = self.last_turn;
             cut_turn = true;
         }
@@ -5050,6 +5370,8 @@ noinline fn replay(
                     }
                     // The recovery module's record, which only a launch reads.
                     if (std.mem.eql(u8, piece.type, recovery_type)) continue;
+                    // A workspace capture, evidence beside the conversation (D98).
+                    if (std.mem.eql(u8, piece.type, workspace_capture_type)) continue;
                     const ta = turn_arena.allocator();
                     if (std.mem.eql(u8, piece.type, running_type)) {
                         // Kept for the whole turn: copies, not views of the page.
@@ -5522,6 +5844,25 @@ fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
     var record: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&record, rest[0..64]) catch return null;
     return record;
+}
+
+/// One repository's workspace capture at a turn's start or end (D98): fx's
+/// own JSON object, which no reader of the conversation reads. Older
+/// builds drop the piece as an unknown item.
+const workspace_capture_type = "workspace_capture";
+
+fn capturePiece(data: []const u8) sm.Piece {
+    return .{ .type = workspace_capture_type, .data = data };
+}
+
+/// A payload the log can take as one inline item: a JSON object with no
+/// space around it, which the manager refuses, and no line break, which
+/// would split its line.
+fn checkWorkspaceCapture(alloc: Allocator, payload: []const u8) error{ OutOfMemory, InvalidWorkspaceCapture, WorkspaceCaptureTooLarge }!void {
+    if (payload.len > max_workspace_capture_bytes) return error.WorkspaceCaptureTooLarge;
+    if (payload.len < 2 or payload[0] != '{' or payload[payload.len - 1] != '}') return error.InvalidWorkspaceCapture;
+    if (std.mem.findAny(u8, payload, "\r\n") != null) return error.InvalidWorkspaceCapture;
+    if (!try std.json.validate(alloc, payload)) return error.InvalidWorkspaceCapture;
 }
 
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
@@ -6644,6 +6985,1382 @@ test "a cleared record leaves the turn resumable without one" {
     defer r.close();
     const found = (try r.interruptedRequest()).?;
     try testing.expectEqual(@as(?[32]u8, null), found.record);
+}
+
+const capture_start_a = "{\"repo\":\"a\",\"phase\":\"start\"}";
+const capture_start_b = "{\"repo\":\"b\",\"phase\":\"start\"}";
+const capture_end_a = "{\"repo\":\"a\",\"phase\":\"end\"}";
+const capture_end_b = "{\"repo\":\"b\",\"phase\":\"end\"}";
+
+/// Session `id`'s turn lines in order, each as a short name: `capture
+/// <data>` for a workspace capture, `item <type>` for any other item, and
+/// the end lines with their reason. Settings, snapshots and `closed` are
+/// left out. `a` owns the list.
+fn turnLines(a: Allocator, manager: *sm.Manager, id: []const u8) ![]const []const u8 {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        const line: []const u8 = switch (body) {
+            .item => |piece| if (std.mem.eql(u8, piece.type, workspace_capture_type))
+                try a.print("capture {s}", .{piece.data})
+            else
+                try a.print("item {s}", .{piece.type}),
+            .turn_interrupted => |ended| try a.print("turn_interrupted {t}", .{ended.reason}),
+            .turn_started, .turn_committed => @tagName(body),
+            .session_created, .compacted, .set, .child_spawned, .child_finished, .snapshot, .closed => continue,
+        };
+        try lines.append(a, line);
+    }
+    return lines.items;
+}
+
+fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {
+    const same = expected.len == actual.len and for (expected, actual) |want, got| {
+        if (!std.mem.eql(u8, want, got)) break false;
+    } else true;
+    if (same) return;
+    std.debug.print("expected lines:\n", .{});
+    for (expected) |line| std.debug.print("  {s}\n", .{line});
+    std.debug.print("actual lines:\n", .{});
+    for (actual) |line| std.debug.print("  {s}\n", .{line});
+    return error.TestExpectedEqual;
+}
+
+/// Saves a capture for `s`'s current capture turn, beginning one when none
+/// is open, as a host does at a turn's start.
+fn saveCapture(s: *Session, payload: []const u8, place: Session.CapturePlace) !bool {
+    const turn: Session.CaptureTurn = if (s.capture_turn == 0) s.beginCaptureTurn() else @fromBackingInt(s.capture_turn);
+    return s.saveWorkspaceCapture(turn, payload, place);
+}
+
+/// Commits `turn` with the current capture turn's token, as a host does
+/// for the turn it began, or plainly when no capture turn is open.
+fn commitCaptured(s: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage) !void {
+    if (s.capture_turn == 0) return s.commitTurn(turn, language);
+    return s.commitTurnWithCaptures(turn, language, @fromBackingInt(s.capture_turn));
+}
+
+/// A finished turn whose one tool result has no stored body yet, so
+/// `prepareTurn` stores it and allocates for it.
+const TurnWithResult = struct {
+    calls: [1]types.ToolCall = .{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }},
+    results: [1]types.PersistedToolResult = .{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("file body"),
+        .output_bytes = "file body".len,
+        .stored_output_bytes = "file body".len,
+    }},
+    steps: [1]types.ToolExecutionStep = undefined,
+
+    fn turn(self: *TurnWithResult, user: types.UserTurn) types.HistoryTurn {
+        self.steps = .{.{ .tool_calls = &self.calls, .tool_results = &self.results }};
+        return .{ .assistant = .{ .user = user, .assistant = @constCast("read"), .execution = .{ .tool_steps = &self.steps } } };
+    }
+};
+
+/// How many of `lines` are `capture <payload>`.
+fn countCaptureLines(lines: []const []const u8, payload: []const u8) usize {
+    var n: usize = 0;
+    for (lines) |line| {
+        if (std.mem.startsWith(u8, line, "capture ") and std.mem.eql(u8, line["capture ".len..], payload)) n += 1;
+    }
+    return n;
+}
+
+/// The lines of the newest turn: from its `turn_started` on.
+fn newestTurn(lines: []const []const u8) []const []const u8 {
+    var from: usize = 0;
+    for (lines, 0..) |line, i| {
+        if (std.mem.eql(u8, line, "turn_started")) from = i;
+    }
+    return lines[from..];
+}
+
+/// Fails unless `got` and `want` give the model the same messages: the same
+/// summaries, and each turn's pieces encoded alike.
+fn expectSameHistory(a: Allocator, want: []const types.HistoryTurn, got: []const types.HistoryTurn) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |want_turn, got_turn| {
+        if (want_turn == .compacted_summary) {
+            try testing.expectEqualStrings(want_turn.compacted_summary.summary, got_turn.compacted_summary.summary);
+            continue;
+        }
+        var want_events: std.ArrayList(Event) = .empty;
+        var got_events: std.ArrayList(Event) = .empty;
+        try session_event.appendHistoryTurnConversationEvents(a, &want_events, want_turn);
+        try session_event.appendHistoryTurnConversationEvents(a, &got_events, got_turn);
+        try testing.expectEqual(want_events.items.len, got_events.items.len);
+        for (want_events.items, got_events.items) |want_event, got_event| {
+            try testing.expectEqualStrings(try encodePiece(a, want_event), try encodePiece(a, got_event));
+        }
+    }
+}
+
+test "workspace capture: a failed commit with no retry loses its captures to the next turn's token, and the next turn never holds them" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    // Fails each allocation of the commit in turn, until one commits. Every
+    // failure here comes before the batch reaches the log. A write that
+    // lands and still reports an I/O fault (`writeMayHaveLanded`) is not
+    // covered: fx builds the manager without the storage fault hooks its own
+    // tests use, and after such a fault the manager refuses further writes
+    // (D40), so no later turn could hold the failed turn's captures.
+    var extra: usize = 0;
+    var failures: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        try testing.expect(!try saveCapture(s, capture_start_a, .start));
+        try s.appendProgress(one, .{}, .{});
+        try testing.expect(!try saveCapture(s, capture_end_a, .end));
+        failing.fail_index = failing.alloc_index + extra;
+        const result = commitCaptured(s, .{ .assistant = .{ .user = one, .assistant = @constCast("done") } }, language);
+        failing.fail_index = std.math.maxInt(usize);
+        const committed = if (result) |_| true else |err| blk: {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            break :blk false;
+        };
+        // The host goes on with the same session, as `commitV2HistoryTurn`
+        // and ACP's prompt do after a failed save, and begins the next turn.
+        if (!committed) _ = s.beginCaptureTurn();
+        try s.appendProgress(two, .{}, .{});
+        try testing.expect(!try saveCapture(s, capture_end_b, .end));
+        try commitCaptured(s, .{ .assistant = .{ .user = two, .assistant = @constCast("ok") } }, language);
+        const lines = try turnLines(a, t.store.manager, s.id());
+        const newest = newestTurn(lines);
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(newest, capture_start_a));
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(newest, capture_end_a));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_end_b));
+        // The failed turn's captures are written at most once each, and its
+        // end only with a commit that landed.
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, @intFromBool(committed)), countCaptureLines(lines, capture_end_a));
+        if (committed) break;
+    }
+    try testing.expect(failures > 0);
+}
+
+test "workspace capture: a capture for a turn that has closed is dropped, never put in the next turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    try s.appendProgress(.{ .text = @constCast("one") }, .{}, .{});
+    try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    try commitCaptured(s, assistantTurn("one", "1"), language);
+    // Late: its turn has closed.
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_end_a, .end));
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_start_b, .start));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+
+    // The next turn's token, taken before the turn is on disk, stays good
+    // once it is.
+    const second = s.beginCaptureTurn();
+    try testing.expect(second != first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    try s.appendProgress(.{ .text = @constCast("two") }, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try commitCaptured(s, assistantTurn("two", "2"), language);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: an ended turn kept by the next keeps its captures for its own commit, and the next turn its own" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    // The first turn's end is taken; the next begins before its commit.
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(second != first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    // The second may even end before the UI commits the first.
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(assistantTurn("one", "1"), language, first);
+    try s.commitTurnWithCaptures(assistantTurn("two", "2"), language, second);
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
+test "workspace capture: in the app's order, a kept ended turn and the next each commit their own captures across supersedes" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    const first = s.beginCaptureTurn();
+    try s.appendProgress(one, .{}, .{});
+    try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    // The next prompt begins while the UI still draws the first answer: its
+    // start waits, since the open turn is the first one's.
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    // Its stream replaces the first turn's open turn, then the UI's late
+    // commit of the first turn replaces the second's.
+    try s.appendProgress(two, .{}, .{});
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = one, .assistant = @constCast("1") } }, language, first);
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, second);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: at most one ended turn waits, so a third turn drops the oldest's captures" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    _ = try s.saveWorkspaceCapture(first, capture_start_a, .start);
+    _ = try s.saveWorkspaceCapture(first, capture_end_a, .end);
+    const second = s.beginCaptureTurnKeeping(first);
+    _ = try s.saveWorkspaceCapture(second, capture_start_b, .start);
+    _ = try s.saveWorkspaceCapture(second, capture_end_b, .end);
+    const third = s.beginCaptureTurnKeeping(second);
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_end_a, .end));
+    try testing.expectEqual(@as(usize, 2), s.captures.items.len);
+    // The oldest commits without captures; the others keep theirs.
+    try s.commitTurnWithCaptures(assistantTurn("one", "1"), language, first);
+    try s.commitTurnWithCaptures(assistantTurn("two", "2"), language, second);
+    try s.commitTurnWithCaptures(assistantTurn("three", "3"), language, third);
+    const lines = try turnLines(a, t.store.manager, s.id());
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(lines, capture_start_a));
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(lines, capture_end_a));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_b));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_end_b));
+}
+
+test "workspace capture: a turn abandoned before its end is still dropped and superseded by the next" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const first = s.beginCaptureTurn();
+    try s.appendProgress(.{ .text = @constCast("one") }, .{}, .{});
+    try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+    // No end was taken, so the host keeps nothing: the next turn drops the
+    // first's captures and its open turn is superseded.
+    const second = s.beginCaptureTurnKeeping(null);
+    try s.appendProgress(.{ .text = @constCast("two") }, .{}, .{});
+    _ = try s.saveWorkspaceCapture(second, capture_end_b, .end);
+    try s.commitTurnWithCaptures(assistantTurn("two", "2"), language, second);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: a failed commit of a turn opened without a stream never lends its turn to the next" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // As ACP opens a prompt's turn, or a subagent child's, which streams
+    // nothing: each allocation of the commit fails in turn, until one commits.
+    var extra: usize = 0;
+    var failures: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        const first = s.beginCaptureTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(first, capture_start_a, .start));
+        try s.beginTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+        failing.fail_index = failing.alloc_index + extra;
+        const result = commitCaptured(s, assistantTurn("one", "1"), language);
+        failing.fail_index = std.math.maxInt(usize);
+        const committed = if (result) |_| true else |err| blk: {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            break :blk false;
+        };
+        const second = s.beginCaptureTurn();
+        try s.beginTurn();
+        try testing.expect(try s.saveWorkspaceCapture(second, capture_start_b, .start));
+        try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+        try commitCaptured(s, assistantTurn("two", "2"), language);
+        const lines = try turnLines(a, t.store.manager, s.id());
+        try expectLines(&.{
+            "turn_started",
+            "capture " ++ capture_start_b,
+            "item user",
+            "item assistant",
+            "item turn_end",
+            "capture " ++ capture_end_b,
+            "turn_committed",
+        }, newestTurn(lines));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, @intFromBool(committed)), countCaptureLines(lines, capture_end_a));
+        // The failed turn is left superseded, not open for the next one.
+        if (!committed) try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
+        if (committed) break;
+    }
+    try testing.expect(failures > 0);
+}
+
+test "workspace capture: a turn that never reaches commitTurn loses its held captures to the next turn's token" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    for ([_]bool{ true, false }) |streams| {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        const first = s.beginCaptureTurn();
+        const one: types.UserTurn = .{ .text = @constCast("one") };
+        if (streams) try s.appendProgress(one, .{}, .{}) else try s.beginTurn();
+        try testing.expect(try s.saveWorkspaceCapture(first, capture_start_a, .start));
+        try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+        // Storing the turn's tool result fails, so the host never commits it.
+        var with_result: TurnWithResult = .{};
+        var turn = with_result.turn(one);
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(error.OutOfMemory, s.prepareTurn(&turn));
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(with_result.results[0].output_handle == null);
+
+        const second = s.beginCaptureTurn();
+        try testing.expect(second != first);
+        try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(first, capture_end_a, .end));
+        const two: types.UserTurn = .{ .text = @constCast("two") };
+        if (streams) try s.appendProgress(two, .{}, .{}) else try s.beginTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+        try commitCaptured(s, .{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language);
+        const lines = try turnLines(a, t.store.manager, s.id());
+        const newest = newestTurn(lines);
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(newest, capture_start_a));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_end_b));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, 0), countCaptureLines(lines, capture_end_a));
+        try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
+    }
+}
+
+test "workspace capture: a token never matches another Session's turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const other = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer other.close();
+    const mine = s.beginCaptureTurn();
+    const theirs = other.beginCaptureTurn();
+    try testing.expect(mine != theirs);
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, other.saveWorkspaceCapture(mine, capture_start_a, .start));
+    try commitCaptured(s, assistantTurn("one", "1"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    // Nor the turn of the object that reopens the same session.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    try testing.expectError(error.WorkspaceCaptureTurnClosed, r.saveWorkspaceCapture(mine, capture_start_a, .start));
+    const resumed = r.beginCaptureTurn();
+    try testing.expect(resumed != mine and resumed != theirs);
+    try testing.expect(!try r.saveWorkspaceCapture(resumed, capture_start_a, .start));
+}
+
+test "workspace capture: a compacted session gives the model the same messages as one without captures" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    var ids: [2][]const u8 = undefined;
+    for ([_]bool{ true, false }, &ids) |with_captures, *id| {
+        const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+        for ([_][]const u8{ "one", "two", "three" }) |prompt| {
+            if (with_captures) _ = try saveCapture(s, capture_start_a, .start);
+            try s.appendProgress(.{ .text = @constCast(prompt) }, .{}, .{});
+            if (with_captures) _ = try saveCapture(s, capture_end_a, .end);
+            try commitCaptured(s, assistantTurn(prompt, "ok"), language);
+        }
+        var summary = "turns one and two".*;
+        try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, .{ .turns = 2 });
+        // A turn after the compaction, and one a crash leaves open.
+        if (with_captures) _ = try saveCapture(s, capture_start_b, .start);
+        try s.appendProgress(.{ .text = @constCast("four") }, .{}, .{});
+        if (with_captures) _ = try saveCapture(s, capture_end_b, .end);
+        try commitCaptured(s, assistantTurn("four", "4"), language);
+        try s.appendProgress(.{ .text = @constCast("five") }, .{}, .{});
+        if (with_captures) try testing.expect(try saveCapture(s, capture_start_b, .start));
+        id.* = try a.dupe(u8, s.id());
+        crashSession(s);
+    }
+    try testing.expectEqual(@as(usize, 9), try countItems(t.store.manager, ids[0], workspace_capture_type));
+
+    var restored: [2]Restored = undefined;
+    for (ids, &restored) |id, *value| {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+        defer r.close();
+        value.* = try r.restore(testing.allocator);
+    }
+    defer for (&restored) |*value| value.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), restored[0].history.len);
+    try testing.expectEqualStrings("turns one and two", restored[0].history[0].compacted_summary.summary);
+    try testing.expectEqualStrings("five", restored[0].history[3].interrupted.user.text);
+    try expectSameHistory(a, restored[1].history, restored[0].history);
+}
+
+/// `{"x":"xx…x"}`, exactly `len` bytes long. `a` owns it.
+fn objectOfLength(a: Allocator, len: usize) ![]u8 {
+    const bytes = try a.alloc(u8, len);
+    @memset(bytes, 'x');
+    @memcpy(bytes[0..6], "{\"x\":\"");
+    @memcpy(bytes[len - 2 ..], "\"}");
+    return bytes;
+}
+
+/// Ends `s` as a killed process would: its lock and files let go with
+/// nothing more written, and what it held only in memory gone.
+fn crashSession(s: *Session) void {
+    s.host.detach();
+    s.handle.inner.abandon();
+    s.destroyInner();
+}
+
+test "workspace capture: a start in a turn already on disk is written at once and supersedes nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const user: types.UserTurn = .{ .text = @constCast("go") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try expectLines(&.{ "turn_started", "item user", "capture " ++ capture_start_a }, try turnLines(a, t.store.manager, s.id()));
+    // The capture is no streamed piece: the next stream write and the
+    // commit add only their own pieces.
+    try s.appendProgress(user, .{}, .{});
+    try commitCaptured(s, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+}
+
+test "workspace capture: a start before the turn is on disk rides with the turn's first write" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+
+    // The first stream write.
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try testing.expect(!try saveCapture(s, capture_start_a, .start));
+    try testing.expect(!try saveCapture(s, capture_start_b, .start));
+    // Held in memory only: nothing is on disk yet.
+    try testing.expect(!s.saved());
+    try s.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "capture " ++ capture_start_b,
+        "item user",
+    }, try turnLines(a, t.store.manager, s.id()));
+
+    // A turn opened before its first piece, as a subagent child's or an ACP prompt's.
+    const opened = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer opened.close();
+    try testing.expect(!try saveCapture(opened, capture_start_a, .start));
+    try opened.beginTurn();
+    try expectLines(&.{ "turn_started", "capture " ++ capture_start_a }, try turnLines(a, t.store.manager, opened.id()));
+    // Written once: the stream that follows does not write it again.
+    try opened.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+    try expectLines(&.{ "turn_started", "capture " ++ capture_start_a, "item user" }, try turnLines(a, t.store.manager, opened.id()));
+}
+
+test "workspace capture: ends join the closing batch before turn_committed or turn_interrupted, in order" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+
+    // A committed turn with two repositories.
+    const user: types.UserTurn = .{ .text = @constCast("one") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try testing.expect(try saveCapture(s, capture_start_b, .start));
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    try testing.expect(!try saveCapture(s, capture_end_b, .end));
+    // Ends wait for the close.
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, s.id(), workspace_capture_type));
+    try commitCaptured(s, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, language);
+
+    // A cancelled turn.
+    const next: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(next, .{}, .{});
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    try commitCaptured(s, .{ .interrupted = .{ .user = next, .terminal_reason = .cancelled } }, language);
+
+    // A turn never streamed, which its commit writes whole.
+    try testing.expect(!try saveCapture(s, capture_start_b, .start));
+    try testing.expect(!try saveCapture(s, capture_end_b, .end));
+    try commitCaptured(s, assistantTurn("three", "ok"), language);
+
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "capture " ++ capture_start_b,
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "capture " ++ capture_end_b,
+        "turn_committed",
+        "turn_started",
+        "item user",
+        "item interruption",
+        "capture " ++ capture_end_a,
+        "turn_interrupted cancel",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: a turn superseded for its own reasons writes its captures again in the fresh turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("draft") }, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    try commitCaptured(s, assistantTurn("final", "answer"), types.ConversationLanguage.default());
+    const id = try a.dupe(u8, s.id());
+    s.close();
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, id));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("final", restored.history[0].assistant.user.text);
+}
+
+test "workspace capture: a resumed session keeps its captures, and its history never shows them" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("go") };
+    try s.appendProgress(user, .{}, .{});
+    _ = try saveCapture(s, capture_start_a, .start);
+    _ = try saveCapture(s, capture_end_a, .end);
+    try commitCaptured(s, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, language);
+    const id = try a.dupe(u8, s.id());
+    s.close();
+    // The same turn without captures, for the history it should give.
+    const plain = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try plain.appendProgress(user, .{}, .{});
+    try commitCaptured(plain, .{ .assistant = .{ .user = user, .assistant = @constCast("done") } }, language);
+    const plain_id = try a.dupe(u8, plain.id());
+    plain.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const p = try Session.resumeSession(testing.allocator, &t.store, .{ .id = plain_id }, "/w", .app);
+    defer p.close();
+    var expected = try p.restore(testing.allocator);
+    defer expected.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqual(expected.history.len, restored.history.len);
+    // Each turn, as the model's messages are built from it, is the same.
+    var got: std.ArrayList(Event) = .empty;
+    var want: std.ArrayList(Event) = .empty;
+    try session_event.appendHistoryTurnConversationEvents(a, &got, restored.history[0]);
+    try session_event.appendHistoryTurnConversationEvents(a, &want, expected.history[0]);
+    try testing.expectEqual(want.items.len, got.items.len);
+    for (want.items, got.items) |want_event, got_event| {
+        try testing.expectEqualStrings(try encodePiece(a, want_event), try encodePiece(a, got_event));
+    }
+
+    // The resumed session goes on, and every capture stays where it was.
+    const again: types.UserTurn = .{ .text = @constCast("again") };
+    try r.appendProgress(again, .{}, .{});
+    try testing.expect(try saveCapture(r, capture_start_b, .start));
+    try commitCaptured(r, .{ .assistant = .{ .user = again, .assistant = @constCast("ok") } }, language);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_b,
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, id));
+}
+
+test "workspace capture: a fork keeps the captures of the turns it copies, and only those" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    _ = try saveCapture(s, capture_start_a, .start);
+    _ = try saveCapture(s, capture_end_a, .end);
+    try commitCaptured(s, assistantTurn("first", "1"), language);
+    _ = try saveCapture(s, capture_start_b, .start);
+    _ = try saveCapture(s, capture_end_b, .end);
+    try commitCaptured(s, assistantTurn("second", "2"), language);
+    const source = try turnLines(a, t.store.manager, s.id());
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    try testing.expectEqual(@as(usize, 2), points.len);
+
+    const copy = try s.fork(testing.allocator, .{ .before_turn = points[1].turn, .workspace = "/w", .host = .app });
+    defer copy.close();
+    const first_turn: []const []const u8 = &.{
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+    };
+    try expectLines(first_turn, try turnLines(a, t.store.manager, copy.id()));
+    var restored = try copy.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("first", restored.history[0].assistant.user.text);
+
+    // The fork takes captures of its own; the source is untouched.
+    try testing.expect(!try saveCapture(copy, capture_start_b, .start));
+    try commitCaptured(copy, assistantTurn("other second", "2b"), language);
+    try expectLines(source, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 3), try countItems(t.store.manager, copy.id(), workspace_capture_type));
+}
+
+test "workspace capture: a reader that does not know the item type skips it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An older fx maps item types to pieces with `pieceKind` and leaves
+    // out a type it has no piece for (D17); this build has none for it either.
+    try testing.expectEqual(@as(?PieceKind, null), pieceKind(workspace_capture_type));
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitCaptured(s, assistantTurn("first", "1"), types.ConversationLanguage.default());
+    // Items no reader of this build knows, written as a newer fx would,
+    // around the pieces of a turn.
+    const user_piece = try encodePiece(a, .{ .user = .{ .text = "second" } });
+    const end_piece = try encodePiece(a, .{ .turn_completed = .{} });
+    _ = try s.handle.append(&.{
+        .turn_started,
+        .{ .item = .{ .type = "workspace_capture_v9", .data = "{\"phase\":\"start\"}" } },
+        .{ .item = .{ .type = "user", .data = user_piece } },
+        .{ .item = .{ .type = "turn_end", .data = end_piece } },
+        .{ .item = .{ .type = "workspace_capture_v9", .data = "{\"phase\":\"end\"}" } },
+        .turn_committed,
+    });
+    const id = try a.dupe(u8, s.id());
+    s.close();
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("second", restored.history[1].assistant.user.text);
+    try testing.expectEqualStrings("", restored.history[1].assistant.assistant);
+}
+
+test "workspace capture: a commit of an earlier turn never takes the captures of the turn begun after it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // The arena owns the result handle `prepareTurn` gives the turn.
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // ACP commits the interrupted turn of the previous prompt once the next
+    // prompt has started (`src/acp/prompt.zig` `persistAcpHistoryTurn`).
+    const next = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_start_b, .start));
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_end_b, .end));
+    var earlier = TurnWithResult{};
+    var turn = earlier.turn(.{ .text = @constCast("one") });
+    try s.prepareTurn(&turn);
+    try s.commitTurn(turn, language);
+    const first = try turnLines(a, t.store.manager, s.id());
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(first, capture_start_b) + countCaptureLines(first, capture_end_b));
+    // The token is still the next turn's, and its captures go with it.
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, next);
+    const newest = newestTurn(try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_start_b));
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(newest, capture_end_b));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+}
+
+test "workspace capture: a plain commit of an earlier turn supersedes the next turn's open turn instead of taking its start" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // ACP's next prompt opens its turn, with its start, before the previous
+    // prompt's interrupted turn is committed.
+    const next = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_start_b, .start));
+    try s.beginTurn();
+    try s.commitTurn(assistantTurn("earlier", "e"), language);
+    // The next turn writes its start again in its own turn.
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, next);
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+}
+
+test "workspace capture: a late commit of a kept ended turn supersedes the next turn's open turn instead of taking its start" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // The first turn ends with nothing on disk; the next begins, keeping it,
+    // and opens its own turn with its start before the first one commits.
+    const first = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    try s.beginTurn();
+    try s.commitTurnWithCaptures(assistantTurn("one", "1"), language, first);
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, second);
+    try expectLines(&.{
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item superseded",
+        "turn_interrupted failed",
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
+test "workspace capture: a turn prepareTurn opened for a kept ended turn stays that turn's, so the next turn's start waits" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // The arena owns the result handle `prepareTurn` gives the turn.
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // The UI prepares the first turn, which opens it with no token, and the
+    // next prompt begins, keeping it, before the UI's commit.
+    const first = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(first, capture_end_a, .end));
+    var with_result: TurnWithResult = .{};
+    var prepared = with_result.turn(.{ .text = @constCast("one") });
+    try s.prepareTurn(&prepared);
+    const second = s.beginCaptureTurnKeeping(first);
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_start_b, .start));
+    try s.commitTurnWithCaptures(prepared, language, first);
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    try s.appendProgress(two, .{}, .{});
+    try testing.expect(!try s.saveWorkspaceCapture(second, capture_end_b, .end));
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, second);
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "item tool_call",
+        "item tool_result",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_b,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+}
+
+test "workspace capture: a retried commit of the same turn writes its captures once and supersedes nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    var extra: usize = 0;
+    var failures: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        const token = s.beginCaptureTurn();
+        try testing.expect(!try s.saveWorkspaceCapture(token, capture_start_a, .start));
+        try s.appendProgress(one, .{}, .{});
+        try testing.expect(!try s.saveWorkspaceCapture(token, capture_end_a, .end));
+        const final: types.HistoryTurn = .{ .assistant = .{ .user = one, .assistant = @constCast("done") } };
+        failing.fail_index = failing.alloc_index + extra;
+        const result = s.commitTurnWithCaptures(final, language, token);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| {} else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            // The TUI's pacer retries the same turn after a failed save.
+            try s.commitTurnWithCaptures(final, language, token);
+        }
+        const lines = try turnLines(a, t.store.manager, s.id());
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_start_a));
+        try testing.expectEqual(@as(usize, 1), countCaptureLines(lines, capture_end_a));
+        try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+        try testing.expectError(error.WorkspaceCaptureTurnClosed, s.saveWorkspaceCapture(token, capture_end_b, .end));
+        if (result) |_| break else |_| {}
+    }
+    try testing.expect(failures > 0);
+}
+
+/// Leaves `s` with a failed turn open: a start capture on disk, a commit
+/// that failed, and the next turn's token begun, which marks it stale.
+fn leaveStaleTurn(s: *Session, failing: *std.testing.FailingAllocator) !void {
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    var extra: usize = 0;
+    while (true) : (extra += 1) {
+        const token = s.beginCaptureTurn();
+        if (s.turn_open and s.turn_stale) return;
+        try testing.expect(!try s.saveWorkspaceCapture(token, capture_start_a, .start));
+        if (!s.turn_open) try s.appendProgress(one, .{}, .{});
+        failing.fail_index = failing.alloc_index + extra;
+        const result = s.commitTurnWithCaptures(.{ .assistant = .{ .user = one, .assistant = @constCast("done") } }, types.ConversationLanguage.default(), token);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| return error.TestUnexpectedResult else |_| {}
+    }
+}
+
+test "workspace capture: a recovery record is not saved into a failed turn left open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try leaveStaleTurn(s, &failing);
+    // The host takes the record with the fresh turn's first write instead.
+    try testing.expect(!try s.saveRecovery(.{ .save = @splat(7) }));
+    try s.appendProgressWithRecord(.{ .text = @constCast("two") }, .{}, .{}, .{ .save = @splat(7) });
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
+    try testing.expect(s.turn_open and !s.turn_stale);
+}
+
+test "workspace capture: close supersedes a failed turn left open, so readers drop it with its captures" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    const id = try arena.allocator().dupe(u8, s.id());
+    leaveStaleTurn(s, &failing) catch |err| {
+        s.close();
+        return err;
+    };
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+}
+
+test "workspace capture: a start for the next token waits while an earlier token's turn is still open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const two: types.UserTurn = .{ .text = @constCast("two") };
+    _ = s.beginCaptureTurn();
+    try s.appendProgress(one, .{}, .{});
+    // The next prompt begins before the earlier turn is committed.
+    const next = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(next, capture_start_b, .start));
+    try s.commitTurn(.{ .assistant = .{ .user = one, .assistant = @constCast("1") } }, language);
+    try testing.expectEqual(@as(usize, 0), countCaptureLines(try turnLines(a, t.store.manager, s.id()), capture_start_b));
+    try s.appendProgress(two, .{}, .{});
+    try s.commitTurnWithCaptures(.{ .assistant = .{ .user = two, .assistant = @constCast("2") } }, language, next);
+    try testing.expectEqual(@as(usize, 1), countCaptureLines(newestTurn(try turnLines(a, t.store.manager, s.id())), capture_start_b));
+}
+
+test "workspace capture: a start already in a committed turn never marks a later turn stale" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    // The arena owns the result handle `prepareTurn` gives the turn.
+    const s = try Session.create(a, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const one: types.UserTurn = .{ .text = @constCast("one") };
+    const token = s.beginCaptureTurn();
+    try testing.expect(!try s.saveWorkspaceCapture(token, capture_start_a, .start));
+    try s.appendProgress(one, .{}, .{});
+    // Committed without its token, the start stays in this turn.
+    try s.commitTurn(.{ .assistant = .{ .user = one, .assistant = @constCast("1") } }, language);
+    // An earlier turn's commit opens a turn for no capture turn.
+    var earlier = TurnWithResult{};
+    var turn = earlier.turn(.{ .text = @constCast("two") });
+    try s.prepareTurn(&turn);
+    _ = s.beginCaptureTurn();
+    try testing.expect(!s.turn_stale);
+    try s.commitTurn(turn, language);
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), superseded_type));
+}
+
+test "workspace capture: a compaction never keeps from a failed turn left open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try leaveStaleTurn(s, &failing);
+    // The cut falls in the active turn, whose fresh turn is not on disk.
+    var summary = "summary".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 0, .compaction_count = 1 }, true, .{ .turns = s.turn_numbers.items.len, .tool_steps = 1 });
+    try testing.expectEqual(@as(?u64, null), s.trim.turn);
+}
+
+test "workspace capture: a payload that is not one JSON object, or too large for a line, is refused" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    const invalid = [_][]const u8{
+        "",
+        "[1,2]",
+        "\"text\"",
+        "null",
+        "{",
+        "{}{}",
+        " {}",
+        "{} ",
+        // A raw line break would split the log line.
+        "{\n\"a\":1}",
+        "{\"a\":1}\r",
+        "{\"a\":\"\xff\"}",
+    };
+    for ([_]bool{ false, true }) |open| {
+        if (open) try s.appendProgress(.{ .text = @constCast("go") }, .{}, .{});
+        for (invalid) |payload| {
+            try testing.expectError(error.InvalidWorkspaceCapture, saveCapture(s, payload, .start));
+            try testing.expectError(error.InvalidWorkspaceCapture, saveCapture(s, payload, .end));
+        }
+    }
+    // The largest payload stays one inline item; one byte more is refused.
+    const largest = try objectOfLength(a, max_workspace_capture_bytes);
+    const too_large = try objectOfLength(a, max_workspace_capture_bytes + 1);
+    try testing.expectError(error.WorkspaceCaptureTooLarge, saveCapture(s, too_large, .start));
+    try testing.expectError(error.WorkspaceCaptureTooLarge, saveCapture(s, too_large, .end));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), workspace_capture_type));
+    try testing.expect(try saveCapture(s, largest, .start));
+    // Newest first; the manager may have put a snapshot after it.
+    var page = try t.store.manager.read(testing.allocator, s.id(), .end, .backward, 4);
+    defer page.deinit();
+    const piece = for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body == .item) break body.item;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(workspace_capture_type, piece.type);
+    try testing.expectEqualStrings(largest, piece.data);
+    try testing.expectEqual(@as(usize, 0), piece.blobs.len);
+}
+
+test "workspace capture: a crash between start and end leaves the start without an end or a made-up close" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.commitTurn(assistantTurn("first", "1"), types.ConversationLanguage.default());
+    try s.appendProgress(.{ .text = @constCast("second") }, .{}, .{});
+    try testing.expect(try saveCapture(s, capture_start_a, .start));
+    try testing.expect(!try saveCapture(s, capture_end_a, .end));
+    const id = try a.dupe(u8, s.id());
+    crashSession(s);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "item user",
+        "capture " ++ capture_start_a,
+        "turn_interrupted crash",
+    }, try turnLines(a, t.store.manager, id));
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("second", restored.history[1].interrupted.user.text);
+}
+
+test "workspace capture: a start held for a turn not on disk is lost to a crash, and nothing stands in for it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.commitTurn(assistantTurn("first", "1"), types.ConversationLanguage.default());
+    const before = try turnLines(a, t.store.manager, s.id());
+    // The window: held in memory until the turn's first write.
+    try testing.expect(!try saveCapture(s, capture_start_a, .start));
+    const id = try a.dupe(u8, s.id());
+    crashSession(s);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    try expectLines(before, try turnLines(a, t.store.manager, id));
+    // A close drops what it holds the same way.
+    try testing.expect(!try saveCapture(r, capture_start_b, .start));
+    r.close();
+    try expectLines(before, try turnLines(a, t.store.manager, id));
+
+    // A new session that never reached the disk leaves nothing at all.
+    const fresh = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try testing.expect(!try saveCapture(fresh, capture_start_a, .start));
+    const fresh_id = try a.dupe(u8, fresh.id());
+    crashSession(fresh);
+    try testing.expectError(error.NotFound, t.store.manager.read(testing.allocator, fresh_id, .start, .forward, 1));
+}
+
+test "workspace capture: running out of memory saves a capture whole or not at all" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+    const s = try Session.create(failing.allocator(), &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try s.commitTurn(assistantTurn("first", "1"), types.ConversationLanguage.default());
+    const Sweep = struct {
+        fn capture(f: *std.testing.FailingAllocator, session: *Session, payload: []const u8, place: Session.CapturePlace) !bool {
+            var extra: usize = 0;
+            while (true) : (extra += 1) {
+                const held = session.captures.items.len;
+                const on_disk = try countItems(session.store.manager, session.id(), workspace_capture_type);
+                f.fail_index = f.alloc_index + extra;
+                const result = saveCapture(session, payload, place);
+                f.fail_index = std.math.maxInt(usize);
+                if (result) |written| return written else |err| {
+                    try testing.expectEqual(error.OutOfMemory, err);
+                    try testing.expectEqual(held, session.captures.items.len);
+                    try testing.expectEqual(on_disk, try countItems(session.store.manager, session.id(), workspace_capture_type));
+                }
+            }
+        }
+
+        fn begin(f: *std.testing.FailingAllocator, session: *Session) !void {
+            var extra: usize = 0;
+            while (true) : (extra += 1) {
+                const on_disk = try countItems(session.store.manager, session.id(), workspace_capture_type);
+                f.fail_index = f.alloc_index + extra;
+                const result = session.beginTurn();
+                f.fail_index = std.math.maxInt(usize);
+                if (result) |_| return else |err| {
+                    try testing.expectEqual(error.OutOfMemory, err);
+                    try testing.expect(!session.turn_open);
+                    try testing.expectEqual(on_disk, try countItems(session.store.manager, session.id(), workspace_capture_type));
+                }
+            }
+        }
+    };
+    try testing.expect(!try Sweep.capture(&failing, s, capture_start_a, .start));
+    try Sweep.begin(&failing, s);
+    try testing.expect(try Sweep.capture(&failing, s, capture_start_b, .start));
+    try testing.expect(!try Sweep.capture(&failing, s, capture_end_a, .end));
+    try commitCaptured(s, assistantTurn("second", "2"), types.ConversationLanguage.default());
+    try expectLines(&.{
+        "turn_started",
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "turn_committed",
+        "turn_started",
+        "capture " ++ capture_start_a,
+        "capture " ++ capture_start_b,
+        "item user",
+        "item assistant",
+        "item turn_end",
+        "capture " ++ capture_end_a,
+        "turn_committed",
+    }, try turnLines(a, t.store.manager, s.id()));
+    try testing.expectEqual(@as(usize, 0), s.captures.items.len);
 }
 
 test "a session with no interrupted turn has nothing to resume" {

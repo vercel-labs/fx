@@ -309,7 +309,7 @@ manager:
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
   `context_note` (D93), `runtime_context` (D94), `model_call` (D96), `turn_end` (files and
   turn summary), `interruption` (reason detail, partial text, command
-  refs, origin), `recovery` and `continues`.
+  refs, origin), `recovery`, `workspace_capture` (D98) and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
   used to copy are already in the log (D10).
@@ -1843,6 +1843,110 @@ as it was sent):
     the copy may fall on either side. `trace/ForkLog.tla` accepts a
     child's copy that ends inside a turn only when its next line ends the
     turn as cancelled, and checks its lines against the fork point's time.
+- **D98 Decision:** a turn's workspace captures are `workspace_capture`
+  items: one per repository and phase, each fx's own JSON object of at most
+  256 KiB, kept inline and outside the turn's streamed pieces, as `recovery`
+  is. The adapter checks only that the payload is one JSON object without
+  surrounding space or line breaks, and stores its bytes as they are
+  (`Session.saveWorkspaceCapture`). It reads no field of it: the caller
+  keeps the phase the payload names in step with the place it saves it
+  at, start or end.
+  - **Turn:** a host begins each turn's captures (`beginCaptureTurn`)
+    when the turn starts, saves each capture of that turn with the token it
+    returns, and commits the turn with `commitTurnWithCaptures` and that
+    token. The token ends when that commit lands, or at the next
+    `beginCaptureTurn`, which also drops what the old token still holds
+    unless that turn ended and waits for its commit (**Ended turn**), so
+    a turn that never committed with its token, such as one whose
+    `prepareTurn` failed or whose failed commit was never retried, leaves
+    nothing for the next: an ended one stays held only for its own token,
+    until another ended turn replaces it. A capture that arrives with an ended token is
+    refused and dropped with a trace line instead of joining a later turn.
+    Tokens come from one counter for the whole process, so no other
+    Session, nor the object a resume opens, takes them.
+  - **Owner:** the turn open on disk belongs to the token current when the
+    write that opened it ran: a streamed piece, `beginTurn` or a prompt
+    image. A turn opened for an earlier turn, by `prepareTurn`, a plain
+    `commitTurn`, or an import, belongs to no token, and `beginCaptureTurn`
+    adopts such a turn when it is still live, since an ACP prompt and a
+    prompt image open the turn before its token begins; a kept ended turn
+    takes it instead (**Ended turn**). Only the owning token's captures
+    enter the open turn, and a commit never continues a turn another token
+    owns (**Ended turn**), so ACP's commit of the previous prompt's
+    interrupted turn, which runs once the next prompt has begun, never
+    takes the next turn's captures.
+  - **Start:** written in the open turn at once when the turn is the
+    token's. Otherwise it waits in memory for the line that starts the
+    token's turn, or for `commitTurnWithCaptures`, which writes it in the
+    closing batch. A crash or a close before then loses it, and nothing
+    stands in for it. A start written in the open turn, like every streamed
+    piece, survives the death of the fx process, but an OS crash or a power
+    cut before the next sync, which comes with the turn's end, can lose it
+    (D3, D10).
+  - **End:** held until `commitTurnWithCaptures`, which writes it in the
+    closing batch after the turn's pieces and before `turn_committed` or
+    `turn_interrupted`, and the batch's sync covers it and every start
+    before it, with what a sync guarantees (D3). A plain `commitTurn`
+    writes no capture. A crash before the close leaves the start without
+    an end, and a reopen ends the turn `crash` as for any open turn, with
+    no end capture made up.
+  - **Failed commit:** the captures stay with their token, so a retry of
+    the same turn with the same token, as the TUI's pacer makes, writes
+    each once and supersedes nothing. When the host instead begins the next
+    turn, `beginCaptureTurn` drops them with a trace line naming how many
+    were held and how many were already in the turn. A start already
+    written stays in the turn the failure left open, and the adapter marks
+    that turn as failed even when it streamed nothing, as a subagent
+    child's or an ACP prompt's turn may. The next write for the session,
+    whether a streamed piece, an opened turn, a stored body or a commit,
+    closes it as superseded first and starts a fresh turn, and a start
+    saved meanwhile waits for that fresh turn. Until then the failed turn
+    is not the active one: `saveRecovery` leaves the record to the fresh
+    turn's first write, a compaction never keeps from it, and `close`
+    closes it as superseded, so readers drop it with its captures.
+  - **Ended turn:** `beginCaptureTurnKeeping` begins the next token as
+    `beginCaptureTurn` does, except that when the token it is given is the
+    current one, whose turn's end capture is taken but whose commit has
+    not landed, it keeps that ended turn's captures for the turn's late
+    `commitTurnWithCaptures`, beside the new token's. Saves for the ended
+    token are still accepted. Each capture carries its token, a commit
+    takes only its own token's captures, and the write that opens a turn
+    takes only its opener's held starts. At most one ended turn waits:
+    keeping another drops the older one's captures with the
+    `superseded_token` trace, and that turn's commit, which still carries
+    its own token, writes none of them and never another token's. A turn
+    open on disk with no token when an ended turn is kept belongs to the
+    ended turn, whose `prepareTurn` opened it just before the late commit,
+    so the new token's starts wait for the new turn's own write. A commit
+    never continues a turn another token opened, even when nothing
+    streamed into it lets the commit compare pieces: a commit with a token
+    supersedes a turn any other token opened, and a plain commit, which
+    may be the open turn's own, supersedes one that holds its token's
+    written starts, as when ACP commits an earlier turn after the next one
+    opened with its start. The supersede marks those starts unwritten, so
+    that token's own turn writes them again.
+  - **Order:** captures keep the order they were saved in. A turn
+    superseded for its own reasons writes its start captures again in the
+    fresh turn, since readers drop the stale one whole.
+  - **Reading:** the replay that rebuilds fx's history skips them, so the
+    model's messages, the transcript and a compacted history never show
+    one. A resume keeps them where they are, and a fork copies those of the
+    turns it holds. A reader of captures applies the replay's rule for
+    superseded turns: a turn with a `superseded` item, ended by
+    `turn_interrupted`, counts for nothing. In every other turn it takes
+    the newest capture for each repository and phase.
+  - **Older fx:** an fx from before D98 leaves the item out (D17).
+
+  **Why:** a capture belongs to its turn: it must survive a resume and a
+  fork with it and never move the turn's streamed prefix. A start written
+  only at the commit would vanish with a crash, which is when it matters
+  most. An end written after the close could be lost while the turn still
+  reads as finished. Inline items need no blob, which a turn not on disk
+  yet cannot store (D44). **Alternative:** a `set` key per turn, which
+  keeps only the newest value; a separate file next to the log, which a
+  fork would have to copy and join back; the end in a line of its own
+  after the close; or captures kept across a failed commit, which then
+  land in the next turn.
 
 ## Design Risks And Failure Behavior
 
