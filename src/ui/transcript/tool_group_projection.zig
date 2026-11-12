@@ -658,8 +658,9 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
 const JsonField = union(enum) { string: []const u8, integer: i64, other };
 
 /// The value of `key` among the top-level fields of the JSON object `json`,
-/// or among the fields of its "request" object: a call can wrap its fields
-/// in {"request": {...}}, which core unwraps the same way
+/// or, when it has a "request" field, among that object's fields only: a
+/// call can wrap its fields in {"request": {...}}, and core then reads
+/// nothing outside it, and nothing at all when "request" is not an object
 /// (src/core/tooling/tool_presentation.zig). It reads only as far as the key,
 /// skips the strings before it by jumping from quote to quote, and decodes
 /// only the key's own value, so a write_file call that holds a whole file
@@ -680,6 +681,7 @@ fn jsonField(scratch: std.mem.Allocator, json: []const u8, key: []const u8) ?Jso
 /// its "{".
 fn objectField(scratch: std.mem.Allocator, json: []const u8, start: usize, key: []const u8, top: bool) !?JsonField {
     var index = skipJsonSpace(json, start);
+    var top_match: ?JsonField = null;
     while (index < json.len and json[index] != '}') {
         if (json[index] != '"') return error.SyntaxError;
         const name_end = skipJsonString(json, index) orelse return error.SyntaxError;
@@ -692,14 +694,21 @@ fn objectField(scratch: std.mem.Allocator, json: []const u8, start: usize, key: 
         if (index >= json.len or json[index] != ':') return error.SyntaxError;
         index = skipJsonSpace(json, index + 1);
         if (index >= json.len) return error.SyntaxError;
-        if (std.mem.eql(u8, name, key)) return try fieldValue(scratch, json, index);
-        if (top and json[index] == '{' and std.mem.eql(u8, name, "request")) {
-            if (try objectField(scratch, json, index + 1, key, false)) |found| return found;
+        if (top and std.mem.eql(u8, name, "request")) {
+            if (json[index] != '{') return null;
+            return objectField(scratch, json, index + 1, key, false);
+        }
+        if (top_match == null and std.mem.eql(u8, name, key)) {
+            top_match = try fieldValue(scratch, json, index);
+            // A "request" field later in the object would take its place.
+            // When its name appears nowhere after here, there is none, so
+            // the scan stops.
+            if (!top or std.mem.find(u8, json[index..], "\"request\"") == null) return top_match;
         }
         index = skipJsonSpace(json, skipJsonValue(json, index) orelse return error.SyntaxError);
         if (index < json.len and json[index] == ',') index = skipJsonSpace(json, index + 1);
     }
-    return null;
+    return top_match;
 }
 
 fn fieldValue(scratch: std.mem.Allocator, json: []const u8, start: usize) !JsonField {
@@ -5978,6 +5987,11 @@ test "story fields come from a JSON scan that skips values it does not need" {
     const wrapped = "{\"request\":{\"action\":\"message\",\"ag\\u0065nt\":\"reviewer\"}}";
     try std.testing.expectEqualStrings("reviewer", jsonField(arena, wrapped, "agent").?.string);
     try std.testing.expect(jsonField(arena, wrapped, "missing") == null);
+    // With a "request" field, only its fields count, as core reads them.
+    try std.testing.expectEqualStrings("inner", jsonField(arena, "{\"agent\":\"top\",\"request\":{\"agent\":\"inner\"}}", "agent").?.string);
+    try std.testing.expect(jsonField(arena, "{\"request\":{\"action\":\"wait\"},\"agent\":\"top\"}", "agent") == null);
+    try std.testing.expect(jsonField(arena, "{\"agent\":\"top\",\"request\":\"text\"}", "agent") == null);
+    try std.testing.expectEqualStrings("top", jsonField(arena, "{\"agent\":\"top\",\"note\":\"a request\"}", "agent").?.string);
     try std.testing.expect(jsonField(arena, "[1,2]", "path") == null);
     try std.testing.expect(jsonField(arena, "not json", "path") == null);
     try std.testing.expect(jsonField(arena, "{\"line_count\":1.5}", "line_count").? == .other);
