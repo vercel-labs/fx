@@ -2053,6 +2053,102 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a failed network call and catalog load after later calls fill the window",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const failPrompt = "Trigger the kept network failure.";
+      const fillPrompt = "Fill the network call window.";
+      // More successful model calls than the 32-call window holds.
+      const fills = 40;
+      let catalogFetches = 0;
+      const gateway = startDynamicFakeGateway(async (body) => {
+        // The fill turn's history holds the failed prompt too, so it is checked first.
+        if (body.includes(fillPrompt)) {
+          const done = [...body.matchAll(/"toolCallId":"window_ok_(\d+)"/g)].map((match) => Number(match[1]));
+          const next = done.length === 0 ? 0 : Math.max(...done) + 1;
+          if (next < fills) return toolCall("true", {}, `window_ok_${next}`);
+          return finalText("network window filled");
+        }
+        if (body.includes(failPrompt)) {
+          return Response.json({ error: { message: "Synthetic upstream rejection" } }, { status: 400 });
+        }
+        return finalText("unexpected request");
+      }, {
+        // The first catalog load fails; the retry a prompt starts succeeds.
+        models: () => ++catalogFetches === 1
+          ? new Response("catalog unavailable", { status: 500 })
+          : [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateways.push(gateway);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(failPrompt);
+      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.sendText(fillPrompt);
+      await activeSession.waitForText("network window filled", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readTraceReport(latestTraceReportPath(root.root));
+
+      // The window has moved past the failed call, and the kept failures hold it.
+      const network = report.one("network");
+      expect(network.complete).toBe(false);
+      expect(network.retained).toBe(32);
+      expect((network.session as { errors?: number }).errors).toBe(1);
+      const windowCalls = report.all("network_call");
+      expect(windowCalls).toHaveLength(32);
+      expect(windowCalls.filter((call) => call.status === 400)).toEqual([]);
+      const networkFailures = report.all("failed_network_call");
+      expect(networkFailures).toHaveLength(1);
+      expect(network.kept_failures).toBe(1);
+      expect(networkFailures[0]).toMatchObject({
+        source: "parent",
+        status: 400,
+        gateway_error: "HTTP 400 · Synthetic upstream rejection",
+      });
+
+      const catalogFailures = report.all("failed_model_catalog_event");
+      expect(catalogFailures.length).toBeGreaterThan(0);
+      expect(report.one("model_catalog").kept_failures).toBe(catalogFailures.length);
+      const failedLoad = (record: { event?: unknown; detail?: unknown }) =>
+        record.event === "load" && String(record.detail).startsWith("outcome=failed ");
+      expect(catalogFailures.some((event) => event.failed === true && failedLoad(event))).toBe(true);
+
+      expect(report.problems("network_call").map((problem) => (problem.call as { status?: number }).status)).toContain(400);
+      expect(report.problems("model_catalog").some(failedLoad)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI creates a private JSONL trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();

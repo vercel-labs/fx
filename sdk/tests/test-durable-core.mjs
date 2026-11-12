@@ -4,6 +4,8 @@
 // smallest example of one.
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
+//
+// LIBFX_TEST_ONLY=<part of a name> runs only the tests whose names contain it.
 import { strict as assert } from "node:assert";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -632,7 +634,8 @@ test("a started turn whose engine keeps stopping is cancelled, and the prompts b
 });
 
 // An agent whose first `works` engines open and whose later ones cannot,
-// or, given a function, whose engines open when `opens(n)` says so.
+// or, given a function, whose engines open when `opens(n)` says so, after
+// the function's promise settles if it returns one.
 function agentWhoseEnginesFailAfter(works, durability) {
   const scripted = scriptedHarness();
   const counts = { opens: 0 };
@@ -642,7 +645,7 @@ function agentWhoseEnginesFailAfter(works, durability) {
       const base = scripted(options);
       return { open: async (args) => {
         counts.opens += 1;
-        if (!opens(counts.opens)) throw new Error("no engine");
+        if (!(await opens(counts.opens))) throw new Error("no engine");
         return base.open(args);
       } };
     },
@@ -701,26 +704,32 @@ test("a cancel for a turn whose engine cannot open is not retried forever", asyn
   await agent.close();
 });
 
-// Engines that open, except during a 1.5 s outage that starts once engine
-// `after` has opened.
+// Engines that open, except for an outage that starts once engine `after` has
+// opened and lasts until the test calls `end()`. The clock never ends it: the
+// engine the outage must refuse is opened by a retry libfx schedules, and a
+// runner that stalls past any fixed window would open it after the window,
+// so the open turn would be cancelled instead of failed. The first engine the
+// outage refuses opens 2 s late, as it does on such a runner, so that an
+// outage ended by the clock fails these tests every time, not now and then.
 function outageAfter(after) {
-  const outage = { until: Infinity };
-  const opens = (n) => {
-    if (n === after) outage.until = Date.now() + 1500;
-    return n <= after || Date.now() >= outage.until;
+  const outage = { over: false };
+  const opens = async (n) => {
+    if (n === after + 1) await sleep(2000);
+    return n <= after || outage.over;
   };
-  return { opens, over: () => sleep(Math.max(0, outage.until - Date.now()) + 50) };
+  return { opens, end: () => { outage.over = true; } };
 }
 
 test("an outage while a stuck turn is cancelled does not halt the session", async () => {
-  // Three engines stop under the turn; the next ones cannot open for a while.
+  // Three engines stop under the turn; the next ones cannot open until the
+  // test ends the outage.
   const outage = outageAfter(3);
   const { agent } = agentWhoseEnginesFailAfter(outage.opens, await durabilityFor());
   const session = agent.session();
   const stuck = await session.prompt(brittle, { messageId: "turn-outage" }).result;
   assert.equal(stuck.stopReason, "error");
   assert.match(stuck.error?.message ?? "", /no engine/);
-  await outage.over();
+  outage.end();
   // The next prompt's engine cancels the open turn, then runs the prompt.
   assert.equal((await session.prompt("kappa2").result).stopReason, "end_turn");
   assert.equal((await session.prompt("lambda2").result).stopReason, "end_turn");
@@ -728,14 +737,15 @@ test("an outage while a stuck turn is cancelled does not halt the session", asyn
 });
 
 test("an outage while a cancel waits does not halt the session", async () => {
-  // The first engine stops under the turn; the next ones cannot open for a while.
+  // The first engine stops under the turn; the next ones cannot open until
+  // the test ends the outage.
   const outage = outageAfter(1);
   const { agent } = agentWhoseEnginesFailAfter(outage.opens, await durabilityFor());
   const session = agent.session();
   const ended = await session.prompt(brittle, { messageId: "turn-blip" }).result;
   assert.equal(ended.stopReason, "error");
   await session.cancel();
-  await outage.over();
+  outage.end();
   assert.equal((await session.prompt("mu2").result).stopReason, "end_turn");
   assert.equal((await session.prompt("nu2").result).stopReason, "end_turn");
   await agent.close();
@@ -3868,8 +3878,11 @@ if (durabilityKind === "queue") {
   });
 }
 
+// LIBFX_TEST_ONLY runs only the tests whose names contain it.
+const only = process.env.LIBFX_TEST_ONLY;
+const selected = only ? tests.filter(([name]) => name.includes(only)) : tests;
 let failed = 0;
-for (const [name, fn] of tests) {
+for (const [name, fn] of selected) {
   const started = performance.now();
   try {
     let timer;
@@ -3883,5 +3896,5 @@ for (const [name, fn] of tests) {
 await closeAppWorlds?.();
 await closeQueueWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
-console.log(`${tests.length - failed}/${tests.length} core tests passed (${durabilityKind})`);
+console.log(`${selected.length - failed}/${selected.length} core tests passed (${durabilityKind})`);
 process.exit(failed ? 1 : 0);
