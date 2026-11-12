@@ -578,20 +578,35 @@ def emit_bitcode(
     if build.stdout_truncated or build.stderr_truncated:
         raise PgsoError("pgso-ir output was truncated before its compile command")
     compile_argv = unoptimized_bitcode_argv(build.stdout + "\n" + build.stderr, paths.bitcode)
+    # A compile is not byte-identical to the one before it: the path of the
+    # builtin.zig Zig generates, which the debug info records, changes on
+    # every fresh compile. A later emit in the same run must match the first,
+    # so the module is kept under the hash of the optimized one `pgso-ir`
+    # installed, which a `zig build` cache hit installs again unchanged.
+    _require_nonempty_file(paths.bitcode, "pgso-ir bitcode")
+    kept = paths.ir_cache / "pgso-unoptimized" / f"{sha256_file(paths.bitcode)}.bc"
     # `pgso-ir` installed the optimized module here; it must not survive.
-    paths.bitcode.unlink(missing_ok=True)
-    run_checked(
-        compile_argv,
-        cwd=spec.repo_root,
-        env=zig_build_env(paths),
-        timeout_s=ZIG_BUILD_TIMEOUT_S,
-        log_path=paths.logs / "emit-unoptimized-bitcode.json",
-    )
+    paths.bitcode.unlink()
+    if kept.is_file():
+        shutil.copyfile(kept, paths.bitcode)
+    else:
+        run_checked(
+            compile_argv,
+            cwd=spec.repo_root,
+            env=zig_build_env(paths),
+            timeout_s=ZIG_BUILD_TIMEOUT_S,
+            log_path=paths.logs / "emit-unoptimized-bitcode.json",
+        )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
     # Zig's own writer never wraps; LLVM's wraps Darwin bitcode.
     with paths.bitcode.open("rb") as stream:
         if stream.read(4) != BITCODE_MAGICS[0]:
             raise PgsoError(f"ReleaseSafe LLVM bitcode was not written by Zig: {paths.bitcode}")
+    if not kept.is_file():
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        staged = kept.with_name(kept.name + ".staged")
+        shutil.copyfile(paths.bitcode, staged)
+        os.replace(staged, kept)
     # Every job derives instrumentation and profile use from this file, so
     # the helper attributes are part of the recorded bitcode identity.
     staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
