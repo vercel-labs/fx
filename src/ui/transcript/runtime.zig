@@ -5027,7 +5027,8 @@ pub const TranscriptRuntime = struct {
     /// took its place. None of its rows are on screen any more, so a resume
     /// handoff it was waiting to repaint no longer holds its transcript
     /// window's drops; showing it again resets the terminal and repaints it
-    /// from its entries.
+    /// from its entries. A resume flow it has not painted yet still holds
+    /// them, because showing it again paints that flow.
     pub fn slotLeftScreen(slot: *TranscriptSlot) void {
         slot.resume_handoff_repaint_pending = false;
     }
