@@ -5,7 +5,7 @@
 # (src/core/agent/runtime/prompt_context.zig, orchestrator.zig
 # appendStablePromptContext) and how an explicit-caching provider reuses it
 # through AI Gateway with caching "auto". proposed.cfg is fx: the two stable
-# markers and workspace-relative paths in the skill catalog and project rules;
+# markers and workspace-relative paths in the toolbox menu and project rules;
 # it and current-holds.cfg must pass. Each current-*.cfg shows a reuse fx missed
 # before the markers. gap-history.cfg shows reuse the markers cannot give: the
 # turn context sits ahead of the history. Each mutant-*.cfg plants a known-bad
