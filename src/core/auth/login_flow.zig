@@ -338,55 +338,6 @@ pub const SignInRuntime = struct {
     /// Set once when a device code requested on the worker becomes ready, so
     /// the input loop can open the browser for it.
     browser_pending: bool = false,
-    /// The Vercel team the person used before this sign-in, owned. Only
-    /// `keepTeam` writes it, and never while a sign-in is under way, so the
-    /// worker reads it without the lock.
-    kept_team_id: ?[]u8 = null,
-    kept_team_slug: ?[]u8 = null,
-
-    /// Sets the team the next fx login starts on when its team list has it, or
-    /// none. Call it before `start`. While a sign-in is under way it changes
-    /// nothing: that sign-in keeps its team, and `start` refuses a second one.
-    pub fn keepTeam(self: *Self, alloc: Allocator, id: ?[]const u8, slug: ?[]const u8) Allocator.Error!void {
-        const id_copy = if (id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (id_copy) |value| alloc.free(value);
-        const slug_copy = if (slug) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (slug_copy) |value| alloc.free(value);
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        if (self.thread != null or self.state == .polling or self.completion != null) {
-            if (id_copy) |value| alloc.free(value);
-            if (slug_copy) |value| alloc.free(value);
-            return;
-        }
-        self.clearKeptTeam(alloc);
-        self.kept_team_id = id_copy;
-        self.kept_team_slug = slug_copy;
-    }
-
-    fn clearKeptTeam(self: *Self, alloc: Allocator) void {
-        if (self.kept_team_id) |value| alloc.free(value);
-        if (self.kept_team_slug) |value| alloc.free(value);
-        self.kept_team_id = null;
-        self.kept_team_slug = null;
-    }
-
-    /// Starts a new fx login that has no team on the kept team.
-    fn applyKeptTeam(self: *const Self, alloc: Allocator, completion: *SignInCompletion) Allocator.Error!void {
-        const selection = switch (completion.*) {
-            .vercel => |*selection| selection,
-            else => return,
-        };
-        const session = if (selection.session) |*session| session else return;
-        if (session.team_id != null or session.team_slug != null) return;
-        const team = teamIn(selection.teams.items, self.kept_team_id, self.kept_team_slug) orelse return;
-        const slug = try alloc.dupe(u8, team.slug);
-        errdefer alloc.free(slug);
-        session.team_id = try alloc.dupe(u8, team.id);
-        session.team_slug = slug;
-        debug_trace.logf("auth", "sign-in starts on the team fx used", .{});
-    }
-
     /// Starts an fx login sign-in. On native hosts the issuer discovery and
     /// device-code request run on the sign-in worker, so the input loop never
     /// waits on them; `snapshot().preparing` holds until the code arrives.
@@ -494,7 +445,6 @@ pub const SignInRuntime = struct {
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
         _ = self.cancel(alloc);
-        self.clearKeptTeam(alloc);
         if (self.completion) |*selection| selection.deinit(alloc);
         self.completion = null;
         self.failure = null;
@@ -672,10 +622,6 @@ pub const SignInRuntime = struct {
             return;
         };
         defer completion.deinit(alloc);
-        self.applyKeptTeam(alloc, &completion) catch |err| {
-            self.publishFailure(err);
-            return;
-        };
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -859,17 +805,38 @@ pub fn runLogin(
     };
 }
 
-/// The saved fx login's team in `teams`, matched by id, else by slug. A new
-/// sign-in starts on it, so signing in again keeps the person's team instead
-/// of the first team of the list. Null when nothing is saved, the saved login
-/// has no team, or the new account has no such team.
+/// The team a new fx login starts on, so signing in again keeps the person's
+/// team instead of the first team of the list: the saved login's team, else
+/// the team fx kept when it retired the last login (`oauth_session.loadKeptTeam`),
+/// when the new account's list has it. Null means the first team; the trace
+/// says why, without naming the team.
 fn savedLoginTeam(alloc: Allocator, teams: []const Team) ?*const Team {
-    var saved = (oauth_session.load(alloc) catch |err| {
+    if (teams.len == 0) return null;
+    var saved = oauth_session.load(alloc) catch |err| blk: {
         debug_trace.logf("auth", "saved login not read for the team choice err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (saved) |*session| session.deinit(alloc);
+    if (saved) |session| {
+        if (session.team_id != null or session.team_slug != null) {
+            return startingTeam(teams, session.team_id, session.team_slug, "saved_login");
+        }
+    }
+    var kept = oauth_session.loadKeptTeam(alloc) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=no_known_team", .{});
         return null;
-    }) orelse return null;
-    defer saved.deinit(alloc);
-    return teamIn(teams, saved.team_id, saved.team_slug);
+    };
+    defer kept.deinit(alloc);
+    return startingTeam(teams, kept.id, kept.slug, "kept_team");
+}
+
+fn startingTeam(teams: []const Team, id: ?[]const u8, slug: ?[]const u8, comptime source: []const u8) ?*const Team {
+    const team = teamIn(teams, id, slug) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=" ++ source ++ "_not_in_list", .{});
+        return null;
+    };
+    debug_trace.logf("auth", "sign-in starts on a known team source=" ++ source, .{});
+    return team;
 }
 
 /// The team in `teams` with the id `id`, else with the slug `slug`.
@@ -1020,9 +987,14 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
                 break :load null;
             },
         };
-        break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
+        const deleted = mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
         };
+        // Signing out forgets the team fx kept for the next sign-in.
+        mutation.forgetTeam() catch |err| {
+            debug_trace.logf("auth", "kept team not forgotten err={s}", .{@errorName(err)});
+        };
+        break :blk deleted;
     };
     return .{
         .result = .{

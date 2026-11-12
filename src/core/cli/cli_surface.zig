@@ -1211,6 +1211,13 @@ fn activateProviderSelection(
 }
 
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    // `FX_TRACE` and `FX_TRACE_LOG` keep a trace here too, such as why a
+    // sign-in starts on the first team. Without a working directory, the
+    // login goes on without a trace.
+    if (io_mod.realpathAlloc(alloc, ".")) |workspace_root| {
+        defer alloc.free(workspace_root);
+        debug_trace.configureFromEnv(alloc, workspace_root);
+    } else |_| {}
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),

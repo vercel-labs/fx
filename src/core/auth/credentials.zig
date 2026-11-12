@@ -858,12 +858,12 @@ pub fn refreshFxSession(
     ) catch |err| {
         if (err == error.InvalidOAuthResponse) {
             debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
-            try retire_fx_session(alloc, mutation);
+            try retire_fx_session(alloc, mutation, session);
             return error.NoRefreshToken;
         }
         if (refresh_rejection_requires_sign_in(err)) {
             debug_trace.logf("auth", "retiring terminal fx login session reason={s}", .{@errorName(err)});
-            try retire_fx_session(alloc, mutation);
+            try retire_fx_session(alloc, mutation, session);
         }
         return err;
     };
@@ -871,7 +871,7 @@ pub fn refreshFxSession(
 
     const rotated_refresh_token = refreshed.refresh_token orelse {
         debug_trace.logf("auth", "retiring fx login session reason=NoRefreshToken", .{});
-        try retire_fx_session(alloc, mutation);
+        try retire_fx_session(alloc, mutation, session);
         return error.NoRefreshToken;
     };
     const expires_at_ms = oauth.expiryTimestampMs(
@@ -879,7 +879,7 @@ pub fn refreshFxSession(
         refreshed.expires_in,
     ) catch |err| {
         debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
-        try retire_fx_session(alloc, mutation);
+        try retire_fx_session(alloc, mutation, session);
         return error.NoRefreshToken;
     };
 
@@ -896,7 +896,7 @@ pub fn refreshFxSession(
     };
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
-        retire_fx_session(alloc, mutation) catch |cleanup_err| {
+        retire_fx_session(alloc, mutation, session) catch |cleanup_err| {
             debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.OAuthSessionCleanupUncertain;
@@ -935,7 +935,13 @@ fn refresh_rejection_requires_sign_in(err: anyerror) bool {
 fn retire_fx_session(
     alloc: std.mem.Allocator,
     mutation: *oauth_session.Mutation,
+    session: *const oauth_session.Session,
 ) !void {
+    // A later sign-in, in this fx process or another, starts on this login's
+    // team. Not keeping it only changes which team that sign-in starts on.
+    mutation.keepTeam(alloc, session.team_id, session.team_slug) catch |err| {
+        debug_trace.logf("auth", "retired fx login team not kept err={s}", .{@errorName(err)});
+    };
     const result = mutation.delete(alloc) catch return error.OAuthSessionCleanupUncertain;
     if (result.local_cleanup_failed) return error.OAuthSessionCleanupUncertain;
 }

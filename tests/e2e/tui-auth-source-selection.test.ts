@@ -280,6 +280,71 @@ async function waitForSavedLogin(path: string): Promise<Record<string, string | 
   }
 }
 
+const KEEP_TEAM_TEAMS = [
+  { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+  { id: "team_456", slug: "other-team", name: "Other Team" },
+];
+
+function keptTeamPath(testHome: string): string {
+  return join(testHome, ".fx", "vercel-team.json");
+}
+
+/** Runs `fx ask` on the saved login while the gateway refuses it and the
+ * issuer refuses its refresh, so fx removes the login, as another fx process
+ * would. */
+/** The environment of an `fx ask` run on the saved fx login. */
+function askEnv(
+  testHome: string,
+  fakeGateway: ReturnType<typeof startFakeGateway>,
+  issuerUrl: string,
+  tracePath = join(testHome, "ask-trace.log"),
+): Record<string, string | undefined> {
+  return {
+    HOME: testHome,
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${fakeGateway.baseUrl}/coding-agent/v1/models`,
+    FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_SOUND: "0",
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_TEST_OAUTH_ISSUER_URL: issuerUrl,
+    FX_TRACE_LOG: tracePath,
+    FX_TRACE_SCOPES: "auth",
+  };
+}
+
+async function retireLoginWithFxAsk(
+  testHome: string,
+  fakeGateway: ReturnType<typeof startFakeGateway>,
+  issuerUrl: string,
+): Promise<void> {
+  const result = await runFx(["ask", "--no-save", "Answer on my usual team."], {
+    env: askEnv(testHome, fakeGateway, issuerUrl),
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).not.toBe(0);
+  expect(existsSync(join(testHome, ".fx", "auth.json"))).toBe(false);
+}
+
+function refusingGateway(): ReturnType<typeof startDynamicFakeGateway> {
+  return startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+    status: 401,
+    headers: { "content-type": "application/json" },
+  }));
+}
+
+async function startFxLogin(testHome: string, testStderrPath: string, tracePath?: string): Promise<TmuxSession> {
+  return startFx(testHome, testStderrPath, gateway!, oauth!.issuerUrl, tracePath, {
+    AI_GATEWAY_API_KEY: undefined,
+  }, undefined, undefined, ["login"]);
+}
+
 function writeSeededFxLogin(
   testHome: string,
   expiresAtMs = Date.now() + 60 * 60 * 1000,
@@ -2415,7 +2480,8 @@ tmuxTest(
     // The saved login's team is on another account.
     writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_999");
 
-    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+    const tracePath = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
       AI_GATEWAY_API_KEY: undefined,
     });
     await session.waitForComposer(TIMEOUT);
@@ -2434,6 +2500,9 @@ tmuxTest(
     expect(saved.access_token).toBe(ACQUIRED_LOGIN_TOKEN);
     expect(saved.team_id ?? null).toBeNull();
     expect(saved.team_slug ?? null).toBeNull();
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).toContain("sign-in starts on the first team reason=kept_team_not_in_list");
+    expect(trace).not.toContain("team_999");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -2505,6 +2574,259 @@ for (const [label, savedTeam] of [
     60_000,
   );
 }
+
+tmuxTest(
+  "fx login after another fx process removed the login starts on that login's team",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-after-retire-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = refusingGateway();
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { rejectRefreshGrant: true, teams: KEEP_TEAM_TEAMS });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_456");
+    await retireLoginWithFxAsk(home, gateway, oauth.issuerUrl);
+
+    session = await startFxLogin(home, stderrPath);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    const picker = await session.waitForPane((pane) => pane.includes("› 2. Other Team (other-team) (current)"), TIMEOUT);
+    expect(picker).not.toContain("Vercel Labs (vercel-labs) (current)");
+    await session.sendKeys("Enter");
+    const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
+    expect(saved.team_id).toBe("team_456");
+    expect(saved.team_slug).toBe("other-team");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  90_000,
+);
+
+tmuxTest(
+  "fx logout vercel after a removed login forgets its team",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-logout-forgets-team-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = refusingGateway();
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { rejectRefreshGrant: true, teams: KEEP_TEAM_TEAMS });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_456");
+    await retireLoginWithFxAsk(home, gateway, oauth.issuerUrl);
+    expect(existsSync(keptTeamPath(home))).toBe(true);
+
+    const logout = await runFx(["logout", "vercel"], {
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      },
+      timeoutMs: TIMEOUT,
+    });
+    expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
+    expect(existsSync(keptTeamPath(home))).toBe(false);
+
+    session = await startFxLogin(home, stderrPath);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
+    expect(picker).not.toContain("(current)");
+    await session.sendKeys("Enter");
+    const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
+    expect(saved.team_id).toBe("team_123");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  90_000,
+);
+
+for (const [label, contents, mode] of [
+  ["holds a value that is not a team name", JSON.stringify({ team_id: "team 456;", team_slug: "other team" }), 0o600],
+  ["is not JSON", "team_456\n", 0o600],
+  ["is readable by other users", JSON.stringify({ team_id: "team_456", team_slug: "other-team" }), 0o644],
+  ["is larger than a kept team can be", JSON.stringify({ team_id: "team_456", team_slug: "other-team", pad: "x".repeat(8192) }), 0o600],
+] as const) {
+  tmuxTest(
+    `fx login ignores a kept team file that ${label}`,
+    async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-login-bad-kept-team-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const tracePath = join(home, "trace.log");
+      gateway = startFakeGateway([]);
+      oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { teams: KEEP_TEAM_TEAMS });
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      writeFileSync(keptTeamPath(home), contents, { mode });
+      chmodSync(keptTeamPath(home), mode);
+
+      session = await startFxLogin(home, stderrPath, tracePath);
+      await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+      const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
+      expect(picker).not.toContain("(current)");
+      await session.sendKeys("Enter");
+      const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
+      expect(saved.team_id).toBe("team_123");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("kept team ignored reason=");
+      expect(trace).toContain("sign-in starts on the first team reason=no_known_team");
+      expect(trace).not.toContain("team_456");
+      expect(trace).not.toContain("other-team");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+}
+
+tmuxTest(
+  "a removed login whose team cannot be kept is still removed, and the trace says why",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-retire-team-not-kept-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = refusingGateway();
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { rejectRefreshGrant: true, teams: KEEP_TEAM_TEAMS });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_456");
+    // A directory where the kept team goes makes its write fail.
+    mkdirSync(keptTeamPath(home), { mode: 0o700 });
+    const tracePath = join(home, "trace.log");
+    const result = await runFx(["ask", "--no-save", "Answer on my usual team."], {
+      env: askEnv(home, gateway, oauth.issuerUrl, tracePath),
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).not.toBe(0);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).toContain("retired fx login team not kept err=");
+    expect(trace).not.toContain("other-team");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "fx processes that remove the same login at once keep one valid team",
+  async () => {
+    for (let round = 0; round < 5; round++) {
+      const roundHome = mkdtempSync(join(tmpdir(), "fx-retire-at-once-"));
+      const roundGateway = refusingGateway();
+      const roundOauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { rejectRefreshGrant: true, teams: KEEP_TEAM_TEAMS });
+      try {
+        writeSeededFxLogin(roundHome, Date.now() + 60 * 60 * 1000, roundOauth.issuerUrl, "team_456");
+        const env = askEnv(roundHome, roundGateway, roundOauth.issuerUrl);
+        const runs = await Promise.all([0, 1, 2].map(() => runFx(["ask", "--no-save", "Answer on my usual team."], { env, timeoutMs: TIMEOUT })));
+        for (const run of runs) expect(run.code, `round ${round}: ${run.stderr}`).not.toBe(0);
+        expect(existsSync(join(roundHome, ".fx", "auth.json"))).toBe(false);
+        expect(JSON.parse(readFileSync(keptTeamPath(roundHome), "utf8"))).toEqual({
+          team_id: "team_456",
+          team_slug: "example-internal-team",
+        });
+        expect(readdirSync(join(roundHome, ".fx")).filter((name) => name.startsWith(".vercel-team.json"))).toEqual([]);
+      } finally {
+        roundGateway.stop();
+        roundOauth.stop();
+        rmSync(roundHome, { recursive: true, force: true });
+      }
+    }
+  },
+  180_000,
+);
+
+tmuxTest(
+  "fx teams marks no team current when the login's team is not in the list",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-teams-no-current-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { teams: KEEP_TEAM_TEAMS });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_999");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    }, undefined, undefined, ["teams"]);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
+    expect(picker).not.toContain("(current)");
+    await session.sendKeys("Enter");
+    const authPath = join(home, ".fx", "auth.json");
+    const deadline = Date.now() + TIMEOUT;
+    while (JSON.parse(readFileSync(authPath, "utf8")).team_id !== "team_123" && Date.now() < deadline) await Bun.sleep(25);
+    expect(JSON.parse(readFileSync(authPath, "utf8")).team_id).toBe("team_123");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "fx login prefers the saved login's team to a kept team",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-saved-over-kept-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { teams: KEEP_TEAM_TEAMS });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+    writeFileSync(keptTeamPath(home), JSON.stringify({ team_id: "team_456", team_slug: "other-team" }), { mode: 0o600 });
+
+    session = await startFxLogin(home, stderrPath);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs) (current)"), TIMEOUT);
+    expect(picker).not.toContain("Other Team (other-team) (current)");
+    await session.sendKeys("Enter");
+    const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
+    expect(saved.team_id).toBe("team_123");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a removed login without a team removes the kept team",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-retire-no-team-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = refusingGateway();
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { rejectRefreshGrant: true, teams: KEEP_TEAM_TEAMS });
+    // A login without a team sends no request, so it has expired: fx refreshes
+    // it first, and the issuer refuses.
+    writeSeededFxLogin(home, Date.now() - 60 * 1000, oauth.issuerUrl, "team_456");
+    const authPath = join(home, ".fx", "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    delete auth.team_id;
+    delete auth.team_slug;
+    writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
+    writeFileSync(keptTeamPath(home), JSON.stringify({ team_id: "team_456", team_slug: "other-team" }), { mode: 0o600 });
+    await retireLoginWithFxAsk(home, gateway, oauth.issuerUrl);
+    expect(existsSync(keptTeamPath(home))).toBe(false);
+
+    session = await startFxLogin(home, stderrPath);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
+    expect(picker).not.toContain("(current)");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  90_000,
+);
+
+tmuxTest(
+  "fx login starts on a kept team saved by its slug only",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-kept-slug-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { teams: KEEP_TEAM_TEAMS });
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    writeFileSync(keptTeamPath(home), JSON.stringify({ team_slug: "other-team" }), { mode: 0o600 });
+
+    session = await startFxLogin(home, stderrPath);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("› 2. Other Team (other-team) (current)"), TIMEOUT);
+    await session.sendKeys("Enter");
+    const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
+    expect(saved.team_id).toBe("team_456");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
 
 tmuxTest(
   "an expired login during a request opens sign-in and finishes the request",
