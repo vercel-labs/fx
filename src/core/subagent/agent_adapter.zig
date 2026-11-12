@@ -223,6 +223,9 @@ pub fn run(
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
+    // The child has done work in this run, whatever its replies report: the
+    // run's `subagents` result lists it (`usage_ledger.zig`).
+    if (turn.child_id) |child_id| try config.host.noteChildTurnStarted(child_id, turn.child_name);
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -992,6 +995,9 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
 /// own (D92). The parent's total leaves the child's out.
 fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    // The reply was billed whether or not it is saved, so the run's result
+    // counts it first (`usage_ledger.zig`).
+    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, usage);
     // A hosted run has no session here; its own agent saves its usage.
     const child = context.turn.child orelse return;
     try child.recordUsage(usage);

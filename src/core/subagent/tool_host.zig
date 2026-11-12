@@ -32,6 +32,7 @@ const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const toolbox_core = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
+const usage_ledger = @import("usage_ledger.zig");
 
 const Allocator = std.mem.Allocator;
 /// Bounds how long a parent wait takes to observe cancellation or steering,
@@ -230,6 +231,9 @@ pub const Runtime = struct {
     team_note: ?[]u8 = null,
     team_turn: u64 = 0,
     team_mutex: std.Io.Mutex = .init,
+    /// What each child that worked used since `trackUsage`, for a run that
+    /// reports it (`fx ask --json`). Off for every other host. Guards itself.
+    usage_ledger: usage_ledger.Ledger = .{},
 
     /// A host over a parent whose children live in its log (D22), returned
     /// only after abandoned child work has been recovered. Borrows
@@ -302,6 +306,7 @@ pub const Runtime = struct {
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
         self.start_waits.deinit(self.alloc);
+        self.usage_ledger.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
@@ -319,6 +324,32 @@ pub const Runtime = struct {
     pub fn closeTree(self: *Runtime) void {
         self.managed.closeTree();
         debug_trace.eventf("mailbox", "tree_closed", .{}, "owner={s}", .{self.ownerName()});
+    }
+
+    /// Starts keeping what each child that works uses (`usage_ledger.zig`).
+    /// Call before any child runs, from the command that reports it.
+    pub fn trackUsage(self: *Runtime) void {
+        self.usage_ledger.enable();
+    }
+
+    /// Child `child_id` opened a turn, so it did work in this run. Called from
+    /// the thread that runs it.
+    pub fn noteChildTurnStarted(self: *Runtime, child_id: []const u8, name: ?[]const u8) Allocator.Error!void {
+        try self.usage_ledger.begin(self.alloc, child_id, name);
+    }
+
+    /// One reply of child `child_id` used `usage`. Called from the thread that
+    /// runs it, so the count is right whether the turn ends well or is stopped.
+    pub fn noteChildUsage(self: *Runtime, child_id: []const u8, usage: types.Usage) void {
+        self.usage_ledger.add(child_id, usage);
+    }
+
+    /// What each child that worked used since `trackUsage`, in the order each
+    /// first ran: a copy that the caller frees with `usage_ledger.freeEntries`.
+    /// It is safe at any time; a child still at work adds to the ledger, not
+    /// to the copy.
+    pub fn usageSnapshot(self: *Runtime, alloc: Allocator) Allocator.Error![]usage_ledger.Entry {
+        return self.usage_ledger.snapshot(alloc);
     }
 
     pub fn rebindHost(

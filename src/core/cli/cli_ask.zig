@@ -79,6 +79,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
+const subagent_usage = @import("../subagent/usage_ledger.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../../builtins/gateway.zig")
@@ -332,8 +333,13 @@ pub const PromptRunResult = struct {
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     usage: types.Usage = .{},
+    /// Owned. What each subagent that did work in the run used, in the order
+    /// each first ran; empty when none did. Not part of `usage`, which is
+    /// main's alone.
+    subagents: []subagent_usage.Entry = &.{},
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
+        subagent_usage.freeEntries(alloc, self.subagents);
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.final_source.len > 0) alloc.free(self.final_source);
@@ -1068,6 +1074,8 @@ const AskContext = struct {
         self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
+        // The result lists what each subagent that works in this run uses.
+        self.subagent_host.?.trackUsage();
         // What a restart left owed runs as this run's next turns.
         self.subagent_host.?.resumeReports(v2);
     }
@@ -2013,6 +2021,8 @@ fn runAskTurn(
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
+            const subagents = try takeSubagentUsage(ctx, alloc);
+            errdefer subagent_usage.freeEntries(alloc, subagents);
             const tool_calls = try takeToolCallRecords(ctx, alloc);
             return .{
                 .exit_code = 1,
@@ -2021,6 +2031,7 @@ fn runAskTurn(
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
                 .usage = ctx.usage_total,
+                .subagents = subagents,
             };
         },
         else => {
@@ -2137,6 +2148,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         try alloc.dupe(u8, "");
     errdefer if (session_id.len > 0) alloc.free(session_id);
+    const subagents = try takeSubagentUsage(ctx, alloc);
+    errdefer subagent_usage.freeEntries(alloc, subagents);
 
     const tool_calls = try takeToolCallRecords(ctx, alloc);
 
@@ -2157,7 +2170,16 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
         .usage = ctx.usage_total,
+        .subagents = subagents,
     };
+}
+
+/// What each subagent that did work in this run has used so far, a copy for
+/// the result. On a run that ends early a subagent may still be at work; it
+/// shows the replies it has finished.
+fn takeSubagentUsage(ctx: *AskContext, alloc: Allocator) ![]subagent_usage.Entry {
+    const tree = ctx.subagent_host orelse return &.{};
+    return tree.usageSnapshot(alloc);
 }
 
 fn takeToolCallRecords(ctx: *AskContext, alloc: Allocator) ![]ToolCallRecord {
@@ -4134,15 +4156,28 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("],\"usage\":{\"input_tokens\":");
-    try std.json.Stringify.value(result.usage.input_tokens, .{}, &out.writer);
-    try out.writer.writeAll(",\"output_tokens\":");
-    try std.json.Stringify.value(result.usage.output_tokens, .{}, &out.writer);
-    // Present only when the provider reports caching, so a missing count
-    // never reads as zero cached tokens.
-    if (result.usage.cache_read_tokens) |tokens| try out.writer.print(",\"cache_read_tokens\":{d}", .{tokens});
-    if (result.usage.cache_write_tokens) |tokens| try out.writer.print(",\"cache_write_tokens\":{d}", .{tokens});
-    try out.writer.writeAll("}");
+    try out.writer.writeAll("],\"usage\":");
+    try writeUsageJson(&out.writer, result.usage);
+    // Present only when a subagent did work, so a run without one prints the
+    // same JSON as before the field existed. A one-off has a null name.
+    if (result.subagents.len > 0) {
+        try out.writer.writeAll(",\"subagents\":[");
+        for (result.subagents, 0..) |entry, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"name\":");
+            if (entry.name) |name| {
+                try std.json.Stringify.value(name, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"id\":");
+            try std.json.Stringify.value(entry.id, .{}, &out.writer);
+            try out.writer.writeAll(",\"usage\":");
+            try writeUsageJson(&out.writer, entry.usage);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeByte(']');
+    }
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -4158,6 +4193,20 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
+}
+
+/// The `usage` object of the result and of each of its `subagents`: one shape,
+/// so a count reads the same wherever it sits.
+fn writeUsageJson(writer: *std.Io.Writer, usage: types.Usage) !void {
+    try writer.writeAll("{\"input_tokens\":");
+    try std.json.Stringify.value(usage.input_tokens, .{}, writer);
+    try writer.writeAll(",\"output_tokens\":");
+    try std.json.Stringify.value(usage.output_tokens, .{}, writer);
+    // Present only when the provider reports caching, so a missing count
+    // never reads as zero cached tokens.
+    if (usage.cache_read_tokens) |tokens| try writer.print(",\"cache_read_tokens\":{d}", .{tokens});
+    if (usage.cache_write_tokens) |tokens| try writer.print(",\"cache_write_tokens\":{d}", .{tokens});
+    try writer.writeAll("}");
 }
 
 /// `exit_code` is the status the process exits with, so the JSON field and the
@@ -7750,11 +7799,28 @@ const TestRunUsage = struct {
         agent.startTurn();
         agent.observeUsage(turns[turn]);
         try testPushAssistantText(deps, "turn text");
+        try noteSubagentWork(deps, turn);
         if (turn + 1 < turns.len) return postReport(deps);
         switch (ending) {
             .completed => {},
             .read_failed => return error.ReadFailed,
             .permission_required => return error.NonInteractivePermissionRequired,
+        }
+    }
+
+    /// Two subagents work during the run, as the host sees them: `alpha`
+    /// starts in the first turn and works again in the third, and a one-off
+    /// starts in the second and reports no counts.
+    fn noteSubagentWork(deps: *const agent_runtime.AgentRuntimeDeps, turn: usize) !void {
+        const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+        const tree = ctx.subagent_host.?;
+        switch (turn) {
+            0 => {
+                try tree.noteChildTurnStarted("child_a", "alpha");
+                tree.noteChildUsage("child_a", .{ .input_tokens = 7000, .output_tokens = 70, .cache_read_tokens = 700 });
+            },
+            1 => try tree.noteChildTurnStarted("child_b", null),
+            else => tree.noteChildUsage("child_a", .{ .input_tokens = 1, .output_tokens = 1 }),
         }
     }
 
@@ -7778,7 +7844,7 @@ const TestRunUsage = struct {
     }
 };
 
-test "ask JSON usage sums every main turn of the run, however the last turn ends" {
+test "ask JSON usage sums every main turn and subagents lists the work, however the last turn ends" {
     const alloc = std.testing.allocator;
     inline for (std.meta.tags(TestRunUsage.Ending)) |ending| {
         var tmp = std.testing.tmpDir(.{});
@@ -7810,6 +7876,24 @@ test "ask JSON usage sums every main turn of the run, however the last turn ends
         try std.testing.expectEqual(@as(i64, 7), usage.get("output_tokens").?.integer);
         try std.testing.expectEqual(@as(i64, 50), usage.get("cache_read_tokens").?.integer);
         try std.testing.expect(usage.get("cache_write_tokens") == null);
+        // `usage` stays main's alone; each subagent that worked is listed
+        // apart, in the order it first ran.
+        const subagents = parsed.value.object.get("subagents").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), subagents.len);
+        const alpha = subagents[0].object;
+        try std.testing.expectEqualStrings("alpha", alpha.get("name").?.string);
+        try std.testing.expectEqualStrings("child_a", alpha.get("id").?.string);
+        const alpha_usage = alpha.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 7001), alpha_usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 71), alpha_usage.get("output_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 700), alpha_usage.get("cache_read_tokens").?.integer);
+        const one_off = subagents[1].object;
+        try std.testing.expect(one_off.get("name").? == .null);
+        try std.testing.expectEqualStrings("child_b", one_off.get("id").?.string);
+        const one_off_usage = one_off.get("usage").?.object;
+        try std.testing.expect(one_off_usage.get("input_tokens").? == .null);
+        try std.testing.expect(one_off_usage.get("output_tokens").? == .null);
+        try std.testing.expect(one_off_usage.get("cache_read_tokens") == null);
         switch (ending) {
             .completed => try std.testing.expect(parsed.value.object.get("error") == null),
             .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
@@ -7831,6 +7915,46 @@ test "ask usage JSON distinguishes unavailable totals from reported zero" {
     const usage = parsed.value.object.get("usage").?.object;
     try std.testing.expectEqual(@as(i64, 0), usage.get("input_tokens").?.integer);
     try std.testing.expect(usage.get("output_tokens").? == .null);
+}
+
+test "ask JSON lists each subagent with its own usage in the shape of the result's usage" {
+    const alloc = std.testing.allocator;
+    var alpha_id = "child_a".*;
+    var alpha_name = "alpha".*;
+    var other_id = "child_b".*;
+    var entries = [_]subagent_usage.Entry{
+        .{ .id = &alpha_id, .name = &alpha_name, .usage = .{ .input_tokens = 7000, .output_tokens = 70, .cache_read_tokens = 700, .cache_write_tokens = 0 } },
+        .{ .id = &other_id, .name = null },
+    };
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+        .subagents = &entries,
+    });
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]," ++
+            "\"usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
+            "\"subagents\":[{\"name\":\"alpha\",\"id\":\"child_a\",\"usage\":{\"input_tokens\":7000,\"output_tokens\":70,\"cache_read_tokens\":700,\"cache_write_tokens\":0}}," ++
+            "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}]}\n",
+        json,
+    );
+}
+
+test "ask JSON has no subagents field when no subagent worked" {
+    const alloc = std.testing.allocator;
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+    });
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "subagents") == null);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        json,
+    );
 }
 
 test "render final JSON preserves shape escaping order and newline" {
