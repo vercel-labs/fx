@@ -415,6 +415,71 @@ if sys.argv[1] == 'build':
             emit_bitcode(toolchain, self.spec, self.paths)
         self.assertFalse(self.paths.bitcode.exists())
 
+    def write_unreproducible_zig(self, actions: pathlib.Path, *, new_result_each_build: bool = False) -> pathlib.Path:
+        """Like Zig 0.17.1: the printed compile writes different bytes on every
+        run. `pgso-ir` installs the same optimized module each time, as on a
+        cache hit, unless `new_result_each_build` is set."""
+        counter = self.root / "build-counter"
+        return self.write_executable(
+            "unreproducible-zig",
+            f"""import os,pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('zig ' + ' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'build':
+    count = pathlib.Path({str(counter)!r})
+    n = int(count.read_text()) + 1 if count.exists() else 1
+    count.write_text(str(n))
+    prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
+    (prefix / 'pgso').mkdir(parents=True, exist_ok=True)
+    result = str(n) if {new_result_each_build!r} else 'cached'
+    (prefix / 'pgso' / 'fx.bc').write_bytes(b'\\xde\\xc0\\x17\\x0boptimized' + result.encode())
+    sys.stderr.write('info(verbose): ' + sys.argv[0] + ' build-exe -Mroot=src/main.zig -femit-llvm-bc --listen=-\\n')
+else:
+    out = [a for a in sys.argv if a.startswith('--verbose-llvm-bc=')][0].split('=', 1)[1]
+    pathlib.Path(out).write_bytes(b'BC\\xc0\\xde' + os.urandom(16))""",
+        )
+
+    def write_passthrough_ir_size(self) -> pathlib.Path:
+        return self.write_executable(
+            "passthrough-ir-size",
+            """import pathlib,sys
+pathlib.Path(sys.argv[-1]).write_bytes(pathlib.Path(sys.argv[-2]).read_bytes())
+print('{}')""",
+        )
+
+    def test_a_later_emit_of_the_same_pgso_ir_result_matches_the_first(self) -> None:
+        # The distributed and benchmark flows emit twice in one run and
+        # require the same hash; Zig 0.17.1's compile is not reproducible.
+        actions = self.root / "emit-twice"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_unreproducible_zig(actions),
+            ir_size=self.write_passthrough_ir_size(),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+        self.assertEqual(digest, emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest))
+
+        compiles = [line for line in actions.read_text().splitlines() if line.startswith("zig build-exe ")]
+        self.assertEqual(1, len(compiles))
+
+    def test_a_new_pgso_ir_result_compiles_the_module_again(self) -> None:
+        actions = self.root / "emit-new-result"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_unreproducible_zig(actions, new_result_each_build=True),
+            ir_size=self.write_passthrough_ir_size(),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+        with self.assertRaisesRegex(PgsoError, "bitcode identity mismatch"):
+            emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
+
+        compiles = [line for line in actions.read_text().splitlines() if line.startswith("zig build-exe ")]
+        self.assertEqual(2, len(compiles))
+
     def test_unoptimized_bitcode_argv_reruns_the_one_printed_compile(self) -> None:
         bitcode = pathlib.Path("/tmp/out/fx.bc")
         output = (

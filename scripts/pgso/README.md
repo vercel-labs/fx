@@ -161,7 +161,12 @@ them. `zig build` can't pass that flag to one step, so `emit_bitcode` runs
 `pgso-ir` with `--verbose` and then runs the compile it printed again, with the
 flag and `-fno-emit-bin`, which stops before LLVM's passes. The step fails
 unless Zig's own writer wrote the file: LLVM's writer wraps Darwin bitcode, and
-Zig's never does.
+Zig's never does. Two compiles of one commit are not byte-identical, because the
+debug info records the path of the `builtin.zig` Zig generates, and that path
+changes on every fresh compile. A later emit in the same run must match the
+first, so `emit_bitcode` keeps the module under the hash of the optimized one
+`pgso-ir` installed, and reuses it when a `zig build` cache hit installs that
+same file again.
 
 Four size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
