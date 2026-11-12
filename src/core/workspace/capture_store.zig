@@ -4581,3 +4581,1003 @@ test "capture selection: list_refs lines parse only when well formed, and the ne
     try testing.expectEqualStrings(oid, newest[1]);
     try testing.expectEqual(@as(usize, 0), (try newestCaptures(arena_state.allocator(), listing, .sha256)).len);
 }
+
+// ---- Retention (`capture_retention.zig`) against real stores ----
+
+test "capture store: retention's gc and repack keep every copied object and take in no user history" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeShapes("repo");
+    try repos.append("repo/a.txt", "second commit\n");
+    try repos.commitAll("repo", "second");
+    const repo = try repos.repository("repo");
+    try repos.write("repo/staged.txt", "staged\n");
+    _ = try repos.gitIn("repo", &.{ "add", "staged.txt" });
+    const first = try repos.captureRepo(repo, "s");
+    _ = try expectComplete(first);
+    try repos.write("repo/new.txt", "new\n");
+    const second = try repos.captureRepo(repo, "s");
+    const tree = try expectComplete(second);
+
+    const ready = switch (try safe_git.prepareStore(repos.arena, .{})) {
+        .ready => |value| value,
+        .refused => return error.SkipZigTest,
+    };
+    const store = try refStore(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir));
+    for ([_]safe_git.StoreCommand{ .gc, .repack }) |command| {
+        switch (try storeOutput(repos.arena, ready, store, command, .{})) {
+            .ok => {},
+            .failed => |failure| {
+                std.debug.print("{s} failed: {s}\n", .{ @tagName(command), @tagName(failure) });
+                return error.TestUnexpectedFailure;
+            },
+        }
+        try repos.expectSelfSufficient(repo, tree, "staged.txt", "staged\n");
+        try repos.expectSelfSufficient(repo, tree, "new.txt", "new\n");
+    }
+    // The pack holds the captures and their trees, never the user's commits.
+    for ([_][]const u8{ "HEAD", "HEAD~1" }) |rev| {
+        try testing.expect(!try repos.storeAloneHas(repo, try repos.gitIn("repo", &.{ "rev-parse", rev })));
+    }
+    const reachable = try repos.storeGit(repo, &.{ "rev-list", "--objects", "--all" });
+    const packed_count = try repos.storeAlone(repo, &.{ "count-objects", "-v" });
+    const in_pack = std.mem.find(u8, packed_count, "in-pack: ") orelse return error.TestUnexpectedResult;
+    const count_text = packed_count[in_pack + "in-pack: ".len ..];
+    const count = try std.fmt.parseInt(usize, count_text[0 .. std.mem.findScalar(u8, count_text, '\n') orelse count_text.len], 10);
+    try testing.expectEqual(std.mem.count(u8, reachable, "\n") + 1, count);
+    try testing.expectEqualStrings(second.commit.?, (try repos.storeRef(repo, try repos.sessionRef(repo, "s"))).?);
+}
+
+const retention = @import("capture_retention.zig");
+
+/// The profile's sessions as maintenance sees them: every id exists and is
+/// idle unless listed.
+const TestSessions = struct {
+    arena: Allocator,
+    missing: []const []const u8 = &.{},
+    busy_ids: []const []const u8 = &.{},
+    /// Moved when maintenance asks whether its session is open, as a capture
+    /// that starts between the inventory and the deletes would.
+    moved: ?RefMove = null,
+
+    const RefMove = struct { repos: TestRepos, repo: Repository, id: []const u8, to: []const u8 };
+
+    fn listed(self: *TestSessions, ids: []const []const u8, key: []const u8) bool {
+        for (ids) |id| if (std.mem.eql(u8, sessionKey(self.arena, id) catch return true, key)) return true;
+        return false;
+    }
+
+    fn existsFn(ctx: *anyopaque, key: []const u8) bool {
+        const self: *TestSessions = @ptrCast(@alignCast(ctx));
+        return !self.listed(self.missing, key);
+    }
+
+    fn busyFn(ctx: *anyopaque, key: []const u8) bool {
+        const self: *TestSessions = @ptrCast(@alignCast(ctx));
+        if (self.moved) |move| if (self.listed(&.{move.id}, key)) {
+            const ref = move.repos.sessionRef(move.repo, move.id) catch return true;
+            _ = move.repos.storeGit(move.repo, &.{ "update-ref", ref, move.to }) catch return true;
+        };
+        return self.listed(self.busy_ids, key);
+    }
+
+    fn view(self: *TestSessions) retention.Sessions {
+        return .{ .ctx = self, .exists = existsFn, .busy = busyFn };
+    }
+};
+
+fn retentionConfig(repos: TestRepos, current_id: []const u8, sessions: *TestSessions, budget: u64, target: u64) !retention.Config {
+    return .{
+        .profile_root = repos.profile,
+        .current_key = try sessionKey(repos.arena, current_id),
+        .sessions = sessions.view(),
+        .now_ms = io_mod.milliTimestamp(),
+        .deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(test_deadline_ms) }),
+        .budget = budget,
+        .target = target,
+    };
+}
+
+/// A capture of `repo` for `session_id` dated `unix_seconds`.
+fn captureAt(repos: TestRepos, repo: Repository, session_id: []const u8, unix_seconds: i64) ![]const u8 {
+    var request = repos.request(repo, session_id, .{});
+    request.unix_seconds = unix_seconds;
+    _ = try expectStored(try capture(repos.arena, request));
+    return (try repos.storeRef(repo, try repos.sessionRef(repo, session_id))).?;
+}
+
+/// Sets every loose object of `repo`'s store an hour back, as an evicted
+/// session's objects are: retention's prune keeps loose objects written since
+/// it took the store's locks, so one written in that same second would stay.
+fn ageLooseObjects(repos: TestRepos, repo: Repository) !void {
+    const objects = try std.Io.Dir.path.join(repos.arena, &.{ try repos.store(repo), "objects" });
+    var dir = try std.Io.Dir.openDirAbsolute(testing.io, objects, .{ .iterate = true });
+    defer dir.close(testing.io);
+    const past: std.Io.File.SetTimestamp = .{ .new = .{ .nanoseconds = (@as(i96, test_unix_seconds) - 3600) * std.time.ns_per_s } };
+    var fanout = dir.iterate();
+    while (try fanout.next(testing.io)) |entry| {
+        if (entry.kind != .directory or entry.name.len != 2) continue;
+        var sub = try dir.openDir(testing.io, entry.name, .{ .iterate = true });
+        defer sub.close(testing.io);
+        var files = sub.iterate();
+        while (try files.next(testing.io)) |file| {
+            if (file.kind != .file) continue;
+            try sub.setTimestamps(testing.io, file.name, .{ .access_timestamp = past, .modify_timestamp = past });
+        }
+    }
+}
+
+fn storeHasObject(repos: TestRepos, repo: Repository, oid: []const u8) !bool {
+    const result = try repos.run(repos.root, try repos.gitArgv(&.{ "--git-dir", try repos.store(repo), "cat-file", "-e", oid }), &.{});
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn journalLines(repos: TestRepos) ![]const []const u8 {
+    const text = TestRepos.readAbsolute(repos.arena, try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "evictions.jsonl" })) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    while (it.next()) |line| if (line.len > 0) try lines.append(repos.arena, line);
+    return lines.items;
+}
+
+fn usagePath(repos: TestRepos) ![]const u8 {
+    return std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "usage" });
+}
+
+/// The folder name a store has in `usage`.
+fn storeName(repos: TestRepos, repo: Repository) ![]const u8 {
+    return std.Io.Dir.path.basename(try storeDir(repos.arena, repos.profile, repo.common_dir));
+}
+
+/// Field `field` of the `usage` line that starts with `first`: `v2` for the
+/// header, a store name for its line. Null when no line does.
+fn usageField(repos: TestRepos, first: []const u8, field: usize) !?[]const u8 {
+    var lines = std.mem.splitScalar(u8, try TestRepos.readAbsolute(repos.arena, try usagePath(repos)), '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, fields.first(), first)) continue;
+        for (1..field) |_| _ = fields.next() orelse return error.TestUnexpectedResult;
+        return fields.next() orelse error.TestUnexpectedResult;
+    }
+    return null;
+}
+
+/// Rewrites one field of a `usage` line, as `usageField` names it.
+fn setUsageField(repos: TestRepos, first: []const u8, field: usize, value: []const u8) !void {
+    var out: std.ArrayList(u8) = .empty;
+    var found = false;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, try TestRepos.readAbsolute(repos.arena, try usagePath(repos)), "\n"), '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var index: usize = 0;
+        const own = std.mem.eql(u8, fields.first(), first);
+        fields.reset();
+        while (fields.next()) |text| : (index += 1) {
+            if (index > 0) try out.append(repos.arena, ' ');
+            try out.appendSlice(repos.arena, if (own and index == field) value else text);
+        }
+        try out.append(repos.arena, '\n');
+        found = found or own;
+    }
+    if (!found) return error.TestUnexpectedResult;
+    try TestRepos.writeAbsolute(try usagePath(repos), out.items);
+}
+
+/// Moves every store's object folder times that are too recent to
+/// fingerprint back past that window, as waiting would, so the next admit
+/// can keep its measure. Older times stay, so a store settled before keeps
+/// its fingerprint.
+fn settle(repos: TestRepos) !void {
+    const past: i96 = @intCast(io_mod.nanoTimestamp() - 3 * std.time.ns_per_s);
+    const captures = try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures" });
+    for (try listStoreDirs(repos.arena, testing.io, captures)) |store_dir| {
+        try setObjectTimes(try std.Io.Dir.path.join(repos.arena, &.{ try storeGitDir(repos.arena, store_dir), "objects" }), past, true);
+    }
+}
+
+/// Sets the modification time of the `objects` folder and each folder in it
+/// to `ns`; with `only_later`, only of those whose time is later.
+fn setObjectTimes(objects: []const u8, ns: i96, only_later: bool) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(testing.io, objects, .{ .iterate = true });
+    defer dir.close(testing.io);
+    const time: std.Io.File.SetTimestamp = .{ .new = .{ .nanoseconds = ns } };
+    var entries = dir.iterate();
+    while (try entries.next(testing.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (only_later and (try dir.statFile(testing.io, entry.name, .{})).mtime.nanoseconds <= ns) continue;
+        try dir.setTimestamps(testing.io, entry.name, .{ .modify_timestamp = time });
+    }
+    // Last: changing a folder in it leaves the folder's own time alone, but
+    // only the folder's own update is certain not to move it again.
+    if (only_later and (try dir.stat(testing.io)).mtime.nanoseconds <= ns) return;
+    try dir.setTimestamps(testing.io, ".", .{ .modify_timestamp = time });
+}
+
+/// A folder in `store_dir` that no walk can open, so measuring the store
+/// fails; null when this user opens it anyway, such as root. The caller
+/// gives it back its permissions with `unblock`.
+fn blockedFolder(repos: TestRepos, store_dir: []const u8) !?[]const u8 {
+    const path = try std.Io.Dir.path.join(repos.arena, &.{ store_dir, "blocked" });
+    try std.Io.Dir.cwd().createDirPath(testing.io, path);
+    try setFolderMode(path, 0o000);
+    if (std.Io.Dir.openDirAbsolute(testing.io, path, .{ .iterate = true })) |opened| {
+        var dir = opened;
+        dir.close(testing.io);
+        unblock(path);
+        return null;
+    } else |_| {}
+    return path;
+}
+
+fn unblock(path: []const u8) void {
+    setFolderMode(path, 0o700) catch {};
+}
+
+fn setFolderMode(path: []const u8, mode: std.posix.mode_t) !void {
+    var parent = try std.Io.Dir.openDirAbsolute(testing.io, std.Io.Dir.path.dirname(path).?, .{});
+    defer parent.close(testing.io);
+    try parent.setFilePermissions(testing.io, std.Io.Dir.path.basename(path), .fromMode(mode), .{});
+}
+
+fn markerPath(repos: TestRepos, repo: Repository) ![]const u8 {
+    return std.Io.Dir.path.join(repos.arena, &.{ try storeDir(repos.arena, repos.profile, repo.common_dir), retention.prune_marker });
+}
+
+test "capture retention: under the budget a capture is admitted and the measure kept" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    var sessions: TestSessions = .{ .arena = repos.arena };
+
+    // No captures folder yet: nothing to measure.
+    const empty = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, 1, 1));
+    try testing.expect(empty.admit);
+    try testing.expectEqual(@as(?u64, 0), empty.used);
+
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "one", test_unix_seconds);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    try testing.expect(admission.admit);
+    try testing.expect(!admission.maintained);
+    try testing.expect(admission.used.? > 0);
+    const usage = try TestRepos.readAbsolute(repos.arena, try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "usage" }));
+    try testing.expect(std.mem.startsWith(u8, usage, try repos.arena.print("v2 {d} ", .{admission.used.?})));
+}
+
+test "capture retention: a store's kept measure decides, and maintenance waits its interval over the budget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "old", test_unix_seconds);
+    const name = try storeName(repos, repo);
+    try settle(repos);
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    // Once more, with the usage file itself counted beside the store.
+    const real = (try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes))).used.?;
+    const store_bytes = try std.fmt.parseInt(u64, (try usageField(repos, name, 1)).?, 10);
+
+    // The store did not change, so its kept bytes count, not a walk.
+    try setUsageField(repos, name, 1, "100");
+    const kept = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    try testing.expectEqual(real - store_bytes + 100, kept.used.?);
+
+    // Over the budget with maintenance run recently: refused, nothing evicted.
+    try setUsageField(repos, "v2", 2, try repos.arena.print("{d}", .{io_mod.milliTimestamp()}));
+    const over = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, 1, 1));
+    try testing.expect(!over.admit);
+    try testing.expect(!over.maintained);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "old"))) != null);
+
+    // A store measured an interval ago is walked again.
+    try setUsageField(repos, name, 2, try repos.arena.print("{d}", .{io_mod.milliTimestamp() - retention.measure_interval_ms - 1}));
+    try testing.expectEqual(real, (try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes))).used.?);
+    // So is every store when the file is not one.
+    try TestRepos.writeAbsolute(try usagePath(repos), "garbage\n");
+    try testing.expectEqual(real, (try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes))).used.?);
+}
+
+test "capture retention: over the budget evicts orphans, then the longest unused, never the current or an open session" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    try repos.initRepo("other");
+    try repos.write("other/b.txt", "b\n");
+    const other = try repos.repository("other");
+
+    // Oldest first: the open session, then "old" in two repositories, the
+    // orphan last, and the current session in between.
+    _ = try captureAt(repos, repo, "open", test_unix_seconds);
+    _ = try captureAt(repos, repo, "old", test_unix_seconds + 10);
+    _ = try captureAt(repos, other, "old", test_unix_seconds + 20);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds + 30);
+    _ = try captureAt(repos, repo, "newer", test_unix_seconds + 40);
+    _ = try captureAt(repos, repo, "gone", test_unix_seconds + 50);
+
+    var sessions: TestSessions = .{ .arena = repos.arena, .missing = &.{"gone"}, .busy_ids = &.{"open"} };
+    // A one-byte budget: everything that may go, goes.
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expect(!admission.admit);
+    const expected = [_]struct { []const u8, retention.EvictionReason, usize }{
+        .{ "gone", .orphan, 1 },
+        .{ "old", .budget, 2 },
+        .{ "newer", .budget, 1 },
+    };
+    try testing.expectEqual(expected.len, admission.evicted.len);
+    for (expected, admission.evicted) |want, got| {
+        try testing.expectEqualStrings(try sessionKey(repos.arena, want[0]), got.key);
+        try testing.expectEqual(want[1], got.reason);
+        try testing.expectEqual(want[2], got.refs);
+    }
+    for ([_][]const u8{ "gone", "old", "newer" }) |id| {
+        try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, id))) == null);
+    }
+    try testing.expect((try repos.storeRef(other, try repos.sessionRef(other, "old"))) == null);
+    for ([_][]const u8{ "current", "open" }) |id| {
+        try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, id))) != null);
+    }
+    // Every eviction is in the journal, in order: its intent before its refs
+    // went, then what the deletes did.
+    const lines = try journalLines(repos);
+    try testing.expectEqual(expected.len * 2, lines.len);
+    for (expected, 0..) |want, i| {
+        for ([_][]const u8{ "intent", "done" }, lines[i * 2 ..][0..2]) |phase, line| {
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, repos.arena, line, .{});
+            try testing.expectEqualStrings(phase, parsed.object.get("phase").?.string);
+            try testing.expectEqualStrings(try sessionKey(repos.arena, want[0]), parsed.object.get("session_key").?.string);
+            try testing.expectEqualStrings(@tagName(want[1]), parsed.object.get("reason").?.string);
+            try testing.expectEqual(@as(i64, @intCast(want[2])), parsed.object.get("refs").?.integer);
+        }
+    }
+    // The capture index went with the prune; the next capture starts again
+    // from the user's index and still extends the current chain.
+    const parent = (try repos.storeRef(repo, try repos.sessionRef(repo, "current"))).?;
+    try repos.write("repo/a.txt", "changed\n");
+    var request = repos.request(repo, "current", .{});
+    request.unix_seconds = test_unix_seconds + 60;
+    const next = try capture(repos.arena, request);
+    _ = try expectStored(next);
+    try testing.expectEqual(IndexStart.copied, next.index.?);
+    try testing.expectEqualStrings("changed", try repos.storedFile(repo, next.tree.?, "a.txt"));
+    try testing.expectEqualStrings(parent, try repos.storeGit(repo, &.{ "rev-parse", try repos.arena.print("{s}^", .{next.commit.?}) }));
+}
+
+test "capture retention: an evicted session's own objects leave the store and the space drops" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "shared\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+
+    _ = try captureAt(repos, repo, "kept", test_unix_seconds);
+    // Only the old session saw this file: its blob is the old session's own.
+    try repos.write("repo/big.bin", try repos.randomBytes(1024 * 1024, 7));
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    const blob = std.mem.trimEnd(u8, try repos.storeGit(repo, &.{ "rev-parse", try repos.arena.print("{s}:big.bin", .{(try repos.storeRef(repo, try repos.sessionRef(repo, "old"))).?}) }), "\n");
+    try repos.remove("repo/big.bin");
+    var sessions: TestSessions = .{ .arena = repos.arena };
+
+    const before = (try retention.admit(repos.arena, try retentionConfig(repos, "kept", &sessions, retention.budget_bytes, retention.target_bytes))).used.?;
+    try testing.expect(before > 1024 * 1024);
+    // Over a budget just under the space now, with the target half a MiB
+    // below: one eviction is enough, and the kept session is untouched.
+    std.Io.Dir.deleteFileAbsolute(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "usage" })) catch {};
+    try ageLooseObjects(repos, repo);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "kept", &sessions, before - 1, before - 512 * 1024));
+    try testing.expect(admission.maintained);
+    try testing.expectEqual(@as(usize, 1), admission.evicted.len);
+    try testing.expect(admission.admit);
+    try testing.expect(admission.used.? < before - 512 * 1024);
+    try testing.expect(!try storeHasObject(repos, repo, blob));
+    const kept = (try repos.storeRef(repo, try repos.sessionRef(repo, "kept"))).?;
+    try testing.expectEqualStrings("shared", try repos.storedFile(repo, kept, "a.txt"));
+}
+
+test "capture retention: a prune a crash stopped is finished, and a held worktree leaves its store unpruned" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    try repos.write("repo/big.bin", try repos.randomBytes(256 * 1024, 9));
+    const old_commit = try captureAt(repos, repo, "old", test_unix_seconds);
+    const blob = std.mem.trimEnd(u8, try repos.storeGit(repo, &.{ "rev-parse", try repos.arena.print("{s}:big.bin", .{old_commit}) }), "\n");
+    // The marker, the journal line and the ref deletion happened; the prune
+    // did not.
+    try TestRepos.writeAbsolute(try markerPath(repos, repo), "");
+    _ = try repos.storeGit(repo, &.{ "update-ref", "-d", try repos.sessionRef(repo, "old") });
+    var sessions: TestSessions = .{ .arena = repos.arena };
+
+    // A capture holds the worktree past the deadline: the store stays.
+    const worktree_lock = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir), repo.git_dir), "lock" });
+    {
+        const held = try std.Io.Dir.createFileAbsolute(testing.io, worktree_lock, .{ .truncate = false, .read = true });
+        defer held.close(testing.io);
+        try testing.expect(try held.tryLock(testing.io, .exclusive));
+        var config = try retentionConfig(repos, "current", &sessions, 1, 1);
+        config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(300) });
+        const blocked = try retention.admit(repos.arena, config);
+        try testing.expect(blocked.maintained);
+        try testing.expect(try storeHasObject(repos, repo, blob));
+    }
+    // A capture between its worktree lock and its first object holds the
+    // store's init lock: the store stays too.
+    {
+        const init_lock = try std.Io.Dir.path.join(repos.arena, &.{ try storeDir(repos.arena, repos.profile, repo.common_dir), "init.lock" });
+        const held = try std.Io.Dir.createFileAbsolute(testing.io, init_lock, .{ .truncate = false, .read = true });
+        defer held.close(testing.io);
+        try testing.expect(try held.tryLock(testing.io, .exclusive));
+        std.Io.Dir.deleteFileAbsolute(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "usage" })) catch {};
+        var config = try retentionConfig(repos, "current", &sessions, 1, 1);
+        config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(300) });
+        _ = try retention.admit(repos.arena, config);
+        try testing.expect(try storeHasObject(repos, repo, blob));
+    }
+    // Released: the next maintenance prunes what the stopped one left.
+    std.Io.Dir.deleteFileAbsolute(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "usage" })) catch {};
+    try ageLooseObjects(repos, repo);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expectEqual(@as(usize, 0), admission.evicted.len);
+    try testing.expect(!try storeHasObject(repos, repo, blob));
+    try testing.expect(!try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+}
+
+test "capture retention: a store that cannot be pruned stops eviction after the session whose refs left it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "oldest", test_unix_seconds - 200);
+    _ = try captureAt(repos, repo, "older", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+
+    // git cannot write a pack, so every prune of the store fails.
+    const pack = try std.Io.Dir.path.join(repos.arena, &.{ try repos.store(repo), "objects", "pack" });
+    var pack_dir = try std.Io.Dir.openDirAbsolute(testing.io, pack, .{ .iterate = true });
+    defer pack_dir.close(testing.io);
+    try pack_dir.setPermissions(testing.io, .fromMode(0o500));
+    defer pack_dir.setPermissions(testing.io, .fromMode(0o700)) catch {};
+    const probe = try std.Io.Dir.path.join(repos.arena, &.{ pack, "probe" });
+    if (std.Io.Dir.createFileAbsolute(testing.io, probe, .{})) |file| {
+        // A user that ignores permissions, such as root, can still write.
+        file.close(testing.io);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expect(!admission.admit);
+    // The first eviction's space never drops, so the next session stays.
+    try testing.expectEqual(@as(usize, 1), admission.evicted.len);
+    try testing.expectEqualStrings(try sessionKey(repos.arena, "oldest"), admission.evicted[0].key);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "oldest"))) == null);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "older"))) != null);
+    try testing.expectEqual(@as(usize, 2), (try journalLines(repos)).len);
+    try testing.expectEqual(@as(?retention.Refusal, .maintenance_failed), admission.refusal);
+    // The store stays marked, so the next maintenance prunes it first.
+    try testing.expect(try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+    // The usage kept is the last measure taken.
+    const usage = try TestRepos.readAbsolute(repos.arena, try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures", "usage" }));
+    try testing.expect(std.mem.startsWith(u8, usage, try repos.arena.print("v2 {d} ", .{admission.used.?})));
+}
+
+test "capture retention: a session a capture reopens keeps its refs, and the journal and result say so" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "reopened", test_unix_seconds - 200);
+    try repos.write("repo/a.txt", "b\n");
+    const newer = try captureAt(repos, repo, "newer", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+
+    // The oldest session moves its ref after the inventory listed it.
+    var sessions: TestSessions = .{ .arena = repos.arena, .moved = .{ .repos = repos, .repo = repo, .id = "reopened", .to = newer } };
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expectEqual(@as(usize, 1), admission.evicted.len);
+    try testing.expectEqualStrings(try sessionKey(repos.arena, "newer"), admission.evicted[0].key);
+    try testing.expectEqual(@as(usize, 1), admission.evicted[0].refs);
+    try testing.expectEqualStrings(newer, (try repos.storeRef(repo, try repos.sessionRef(repo, "reopened"))).?);
+
+    const expected = [_]struct { []const u8, []const u8, i64, ?i64 }{
+        .{ "reopened", "intent", 1, null },
+        .{ "reopened", "done", 0, 1 },
+        .{ "newer", "intent", 1, null },
+        .{ "newer", "done", 1, 0 },
+    };
+    const lines = try journalLines(repos);
+    try testing.expectEqual(expected.len, lines.len);
+    for (expected, lines) |want, line| {
+        const parsed = (try std.json.parseFromSliceLeaky(std.json.Value, repos.arena, line, .{})).object;
+        try testing.expectEqualStrings(try sessionKey(repos.arena, want[0]), parsed.get("session_key").?.string);
+        try testing.expectEqualStrings(want[1], parsed.get("phase").?.string);
+        try testing.expectEqual(want[2], parsed.get("refs").?.integer);
+        try testing.expectEqual(want[3], if (parsed.get("kept")) |kept| kept.integer else null);
+    }
+}
+
+test "capture retention: only a store that wrote objects since its measure is walked again" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    try repos.initRepo("other");
+    try repos.write("other/b.txt", "b\n");
+    const other = try repos.repository("other");
+    _ = try captureAt(repos, repo, "one", test_unix_seconds);
+    _ = try captureAt(repos, other, "one", test_unix_seconds);
+    try settle(repos);
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    const written = try storeName(repos, repo);
+    const untouched = try storeName(repos, other);
+    const written_before = try std.fmt.parseInt(u64, (try usageField(repos, written, 1)).?, 10);
+    // A walk of the other store would replace this.
+    try setUsageField(repos, untouched, 1, "4096");
+
+    try repos.write("repo/big.bin", try repos.randomBytes(256 * 1024, 11));
+    _ = try captureAt(repos, repo, "one", test_unix_seconds + 1);
+    // Settled, so the fingerprint, not a recent folder time, sends the walk.
+    try settle(repos);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    try testing.expect(admission.admit);
+    try testing.expectEqualStrings("4096", (try usageField(repos, untouched, 1)).?);
+    const written_after = try std.fmt.parseInt(u64, (try usageField(repos, written, 1)).?, 10);
+    try testing.expect(written_after >= written_before + 256 * 1024);
+    try testing.expect(std.mem.startsWith(u8, try TestRepos.readAbsolute(repos.arena, try usagePath(repos)), try repos.arena.print("v2 {d} ", .{admission.used.?})));
+}
+
+test "capture retention: a usage file in the one-line format walks every store again" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "one", test_unix_seconds);
+    try settle(repos);
+    try TestRepos.writeAbsolute(try usagePath(repos), try repos.arena.print("100 {d}\n", .{io_mod.milliTimestamp()}));
+
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    try testing.expect(admission.used.? > 100);
+    try testing.expect(std.mem.startsWith(u8, try TestRepos.readAbsolute(repos.arena, try usagePath(repos)), try repos.arena.print("v2 {d} ", .{admission.used.?})));
+    try testing.expect((try usageField(repos, try storeName(repos, repo), 1)) != null);
+}
+
+test "capture retention: a store that is gone drops out of the space" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    try repos.initRepo("other");
+    try repos.write("other/big.bin", try repos.randomBytes(256 * 1024, 13));
+    const other = try repos.repository("other");
+    _ = try captureAt(repos, repo, "one", test_unix_seconds);
+    _ = try captureAt(repos, other, "one", test_unix_seconds);
+    try settle(repos);
+    const before = (try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes))).used.?;
+    const gone = try storeName(repos, other);
+    const gone_bytes = try std.fmt.parseInt(u64, (try usageField(repos, gone, 1)).?, 10);
+    try testing.expect(gone_bytes > 0);
+
+    try std.Io.Dir.cwd().deleteTree(testing.io, try storeDir(repos.arena, repos.profile, other.common_dir));
+    const after = (try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes))).used.?;
+    try testing.expect(after + gone_bytes <= before + 4096);
+    try testing.expect(after < before);
+    try testing.expect((try usageField(repos, gone, 1)) == null);
+    try testing.expect((try usageField(repos, try storeName(repos, repo), 1)) != null);
+}
+
+test "capture retention: eviction does not wait on stores that lost no refs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    try repos.write("repo/big.bin", try repos.randomBytes(256 * 1024, 17));
+    const old_commit = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    const blob = std.mem.trimEnd(u8, try repos.storeGit(repo, &.{ "rev-parse", try repos.arena.print("{s}:big.bin", .{old_commit}) }), "\n");
+    try repos.remove("repo/big.bin");
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+
+    // Stores of other repositories, each held by a capture past the
+    // deadline: pruning every store first would spend it all on them.
+    var held: std.ArrayList(std.Io.File) = .empty;
+    defer for (held.items) |file| file.close(testing.io);
+    for ([_][]const u8{ "one", "two", "three" }) |name| {
+        try repos.initRepo(name);
+        try repos.write(try repos.arena.print("{s}/b.txt", .{name}), "b\n");
+        const other = try repos.repository(name);
+        _ = try captureAt(repos, other, "current", test_unix_seconds);
+        const lock = try std.Io.Dir.createFileAbsolute(testing.io, try initLockPath(repos.arena, try storeDir(repos.arena, repos.profile, other.common_dir)), .{ .truncate = false, .read = true });
+        try held.append(repos.arena, lock);
+        try testing.expect(try lock.tryLock(testing.io, .exclusive));
+    }
+
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    var config = try retentionConfig(repos, "current", &sessions, 1, 1);
+    config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(5000) });
+    try ageLooseObjects(repos, repo);
+    const admission = try retention.admit(repos.arena, config);
+    try testing.expect(admission.maintained);
+    try testing.expectEqual(@as(usize, 1), admission.evicted.len);
+    try testing.expectEqualStrings(try sessionKey(repos.arena, "old"), admission.evicted[0].key);
+    // Only the store the refs left was pruned, and its space dropped.
+    try testing.expect(!try storeHasObject(repos, repo, blob));
+    try testing.expect(!try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "current"))) != null);
+}
+
+test "capture retention: a measure that fails after finishing a stopped prune evicts nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    // The store's measure is kept, so the admit before maintenance does not
+    // walk it.
+    try settle(repos);
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, retention.budget_bytes, retention.target_bytes));
+
+    // A stopped maintenance left the store marked, and the walk after its
+    // prune fails.
+    try TestRepos.writeAbsolute(try markerPath(repos, repo), "");
+    const blocked = (try blockedFolder(repos, try storeDir(repos.arena, repos.profile, repo.common_dir))) orelse return error.SkipZigTest;
+    defer unblock(blocked);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expect(!admission.admit);
+    try testing.expectEqual(@as(?retention.Refusal, .measure_failed), admission.refusal);
+    try testing.expectEqual(@as(usize, 0), admission.evicted.len);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "old"))) != null);
+    try testing.expectEqual(@as(usize, 0), (try journalLines(repos)).len);
+    // The prune itself went through.
+    try testing.expect(!try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+}
+
+test "capture retention: a measure that fails after an eviction stops the next one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "oldest", test_unix_seconds - 200);
+    _ = try captureAt(repos, repo, "older", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    try settle(repos);
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, retention.budget_bytes, retention.target_bytes));
+
+    // The kept measure lets maintenance start; the walk after the first
+    // eviction's prune fails.
+    const blocked = (try blockedFolder(repos, try storeDir(repos.arena, repos.profile, repo.common_dir))) orelse return error.SkipZigTest;
+    defer unblock(blocked);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expectEqual(@as(?retention.Refusal, .measure_failed), admission.refusal);
+    try testing.expectEqual(@as(usize, 1), admission.evicted.len);
+    try testing.expectEqualStrings(try sessionKey(repos.arena, "oldest"), admission.evicted[0].key);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "older"))) != null);
+    try testing.expectEqual(@as(usize, 2), (try journalLines(repos)).len);
+}
+
+test "capture retention: a held maintenance lock refuses as busy, and a journal that cannot be written stops eviction before any ref goes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    const captures = try std.Io.Dir.path.join(repos.arena, &.{ repos.profile, "captures" });
+
+    // Another process runs maintenance.
+    {
+        const held = try std.Io.Dir.createFileAbsolute(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ captures, "maintenance.lock" }), .{ .truncate = false, .read = true });
+        defer held.close(testing.io);
+        try testing.expect(try held.tryLock(testing.io, .exclusive));
+        const busy = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+        try testing.expect(!busy.admit);
+        try testing.expect(!busy.maintained);
+        try testing.expectEqual(@as(?retention.Refusal, .busy), busy.refusal);
+    }
+
+    // The journal's place is taken by a folder.
+    try std.Io.Dir.cwd().createDirPath(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ captures, "evictions.jsonl" }));
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expect(!admission.admit);
+    try testing.expectEqual(@as(?retention.Refusal, .maintenance_failed), admission.refusal);
+    try testing.expectEqual(@as(usize, 0), admission.evicted.len);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "old"))) != null);
+}
+
+test "capture retention: a write in the same tick of a coarse file clock is not missed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "one", test_unix_seconds);
+    const name = try storeName(repos, repo);
+    const objects = try std.Io.Dir.path.join(repos.arena, &.{ try repos.store(repo), "objects" });
+
+    // A 2 s file clock shows this tick's writes at the tick's start, up to
+    // 2 s before now.
+    const tick: i96 = @intCast(io_mod.nanoTimestamp() - std.time.ns_per_s);
+    try setObjectTimes(objects, tick, false);
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    try testing.expectEqualStrings("0000000000000000", (try usageField(repos, name, 3)).?);
+    const before = try std.fmt.parseInt(u64, (try usageField(repos, name, 1)).?, 10);
+
+    // A pack written later in the same tick leaves every folder time as it
+    // was.
+    try TestRepos.writeAbsolute(try std.Io.Dir.path.join(repos.arena, &.{ objects, "pack", "late.pack" }), try repos.randomBytes(256 * 1024, 19));
+    try setObjectTimes(objects, tick, false);
+    _ = try retention.admit(repos.arena, try retentionConfig(repos, "one", &sessions, retention.budget_bytes, retention.target_bytes));
+    try testing.expect(try std.fmt.parseInt(u64, (try usageField(repos, name, 1)).?, 10) >= before + 256 * 1024);
+}
+
+test "capture retention: a kept ref leaves a prune a stopped maintenance owes, and the next maintenance finishes it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    const current_commit = try captureAt(repos, repo, "current", test_unix_seconds);
+    _ = try captureAt(repos, repo, "y", test_unix_seconds - 100);
+    try repos.write("repo/big.bin", try repos.randomBytes(256 * 1024, 23));
+    const old_commit = try captureAt(repos, repo, "old", test_unix_seconds);
+    const blob = std.mem.trimEnd(u8, try repos.storeGit(repo, &.{ "rev-parse", try repos.arena.print("{s}:big.bin", .{old_commit}) }), "\n");
+    // A stopped maintenance marked the store and deleted "old"'s ref, then
+    // stopped before its prune.
+    try TestRepos.writeAbsolute(try markerPath(repos, repo), "");
+    _ = try repos.storeGit(repo, &.{ "update-ref", "-d", try repos.sessionRef(repo, "old") });
+
+    // A capture holds the worktree past the share of the deadline finishing
+    // that prune may take, so it fails again; the candidate "y" keeps its
+    // only ref there because a capture moves it meanwhile.
+    var sessions: TestSessions = .{ .arena = repos.arena, .moved = .{ .repos = repos, .repo = repo, .id = "y", .to = current_commit } };
+    const worktree_lock = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, try storeDir(repos.arena, repos.profile, repo.common_dir), repo.git_dir), "lock" });
+    {
+        const held = try std.Io.Dir.createFileAbsolute(testing.io, worktree_lock, .{ .truncate = false, .read = true });
+        defer held.close(testing.io);
+        try testing.expect(try held.tryLock(testing.io, .exclusive));
+        var config = try retentionConfig(repos, "current", &sessions, 1, 1);
+        config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(2000) });
+        const blocked = try retention.admit(repos.arena, config);
+        try testing.expect(blocked.maintained);
+        try testing.expectEqual(@as(usize, 0), blocked.evicted.len);
+        try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "y"))) != null);
+    }
+    // The store still owes "old"'s prune, so it stays marked.
+    try testing.expect(try storeHasObject(repos, repo, blob));
+    try testing.expect(try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+
+    // Released: the next maintenance prunes what the stopped one left.
+    sessions.moved = null;
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    try ageLooseObjects(repos, repo);
+    const admission = try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, 1, 1));
+    try testing.expect(admission.maintained);
+    try testing.expect(!try storeHasObject(repos, repo, blob));
+    try testing.expect(!try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "current"))) != null);
+}
+
+/// `count` captures of `repo` for `session_id`, one second apart from
+/// `first_seconds`, each a small edit of one 64 KiB file of random bytes:
+/// loose, each version takes the whole file; packed, a version is a delta.
+fn editingCaptures(repos: TestRepos, repo: Repository, session_id: []const u8, count: usize, first_seconds: i64, seed: u64) ![]const u8 {
+    const path = try repos.arena.print("{s}/edited.bin", .{std.Io.Dir.path.basename(repo.work_tree)});
+    const bytes = try repos.arena.dupe(u8, try repos.randomBytes(64 * 1024, seed));
+    var last: []const u8 = "";
+    for (0..count) |i| {
+        bytes[(i * 4099) % bytes.len] +%= 1;
+        try repos.write(path, bytes);
+        last = try captureAt(repos, repo, session_id, first_seconds + @as(i64, @intCast(i)));
+    }
+    return last;
+}
+
+/// Whether the store still holds loose objects. A capture packs only the
+/// objects it copies from the user's repository; those it writes stay loose.
+fn storeUnpacked(repos: TestRepos, repo: Repository) !bool {
+    return !std.mem.startsWith(u8, try repos.storeGit(repo, &.{ "count-objects", "-v" }), "count: 0\n");
+}
+
+test "capture retention: a store of loose objects is packed before eviction, and nothing is evicted when the pack is enough" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    const old_last = try editingCaptures(repos, repo, "old", 24, test_unix_seconds - 100, 29);
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    try testing.expect(try storeUnpacked(repos, repo));
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    const before = (try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, retention.budget_bytes, retention.target_bytes))).used.?;
+    try testing.expect(before > 24 * 64 * 1024);
+
+    // Over the budget with the target at half the space: evicting "old"
+    // would get there, but packing its loose versions does too.
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    var config = try retentionConfig(repos, "current", &sessions, before - 1, before / 2);
+    config.repack_loose = 16;
+    const admission = try retention.admit(repos.arena, config);
+    try testing.expect(admission.maintained);
+    try testing.expect(admission.admit);
+    try testing.expectEqual(@as(usize, 0), admission.evicted.len);
+    try testing.expect(admission.used.? < before / 2);
+    try testing.expectEqual(@as(usize, 0), (try journalLines(repos)).len);
+    try testing.expect(!try storeUnpacked(repos, repo));
+    // Every capture of "old" is still there, the first version included.
+    try testing.expectEqualStrings(old_last, (try repos.storeRef(repo, try repos.sessionRef(repo, "old"))).?);
+    _ = try repos.storeGit(repo, &.{ "cat-file", "-e", try repos.arena.print("{s}~23:edited.bin", .{old_last}) });
+    try testing.expect(!try TestRepos.existsAbsolute(try markerPath(repos, repo)));
+}
+
+test "capture retention: a loose store that cannot be packed evicts only what the measured space needs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    // A store of loose objects that only the current session has captured.
+    try repos.initRepo("loose");
+    try repos.write("loose/a.txt", "a\n");
+    const loose = try repos.repository("loose");
+    _ = try editingCaptures(repos, loose, "current", 12, test_unix_seconds, 31);
+    // A store with two old sessions, each with half a MiB of its own.
+    try repos.initRepo("repo");
+    try repos.write("repo/a.txt", "a\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commitAll("repo", "first");
+    const repo = try repos.repository("repo");
+    _ = try captureAt(repos, repo, "current", test_unix_seconds);
+    try repos.write("repo/older.bin", try repos.randomBytes(512 * 1024, 37));
+    _ = try captureAt(repos, repo, "older", test_unix_seconds - 200);
+    try repos.remove("repo/older.bin");
+    try repos.write("repo/old.bin", try repos.randomBytes(512 * 1024, 41));
+    _ = try captureAt(repos, repo, "old", test_unix_seconds - 100);
+    try repos.remove("repo/old.bin");
+    var sessions: TestSessions = .{ .arena = repos.arena };
+    const before = (try retention.admit(repos.arena, try retentionConfig(repos, "current", &sessions, retention.budget_bytes, retention.target_bytes))).used.?;
+
+    // A capture holds the loose store past the share of the deadline
+    // packing may take; one eviction gets under the target.
+    const held = try std.Io.Dir.createFileAbsolute(testing.io, try initLockPath(repos.arena, try storeDir(repos.arena, repos.profile, loose.common_dir)), .{ .truncate = false, .read = true });
+    defer held.close(testing.io);
+    try testing.expect(try held.tryLock(testing.io, .exclusive));
+    std.Io.Dir.deleteFileAbsolute(testing.io, try usagePath(repos)) catch {};
+    var config = try retentionConfig(repos, "current", &sessions, before - 1, before - 300 * 1024);
+    config.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(5000) });
+    config.repack_loose = 16;
+    const admission = try retention.admit(repos.arena, config);
+    try testing.expect(admission.maintained);
+    try testing.expect(admission.admit);
+    try testing.expectEqual(@as(usize, 1), admission.evicted.len);
+    try testing.expectEqualStrings(try sessionKey(repos.arena, "older"), admission.evicted[0].key);
+    try testing.expect((try repos.storeRef(repo, try repos.sessionRef(repo, "old"))) != null);
+    try testing.expect(try storeUnpacked(repos, loose));
+    try testing.expect((try repos.storeRef(loose, try repos.sessionRef(loose, "current"))) != null);
+}
