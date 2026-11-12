@@ -8788,8 +8788,9 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
-    // The refresh token is rejected, so only a new sign-in helps.
+    // The store still holds the rejected token, and the refresh token is
+    // rejected, so only a new sign-in helps.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after" };
     hooks.credential_refresh_fail_force = true;
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
@@ -8804,7 +8805,7 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload }, modes);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, modes);
     try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
     // The gateway's reason shows once while fx waits for the sign-in.
@@ -8836,7 +8837,9 @@ test "processQueuedPrompt resends a login the gateway refuses after a refresh th
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after", "token-after", "token-after" };
+    // Each 401's reload finds the refused token still stored, so fx forces
+    // a refresh, and the refresh works.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after", "token-after", "token-after", "token-after", "token-after" };
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
     var config = fixture.config();
@@ -8852,9 +8855,10 @@ test "processQueuedPrompt resends a login the gateway refuses after a refresh th
     // No sign-in: the login just refreshed is good.
     try std.testing.expect(needUserText(&hooks) == null);
     try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
-    // Each resend reads the stored login again, and its 401 gets a forced
-    // refresh of its own, so the login is checked again on every resend.
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
+    // Each resend reads the stored login again, and its 401 reads it once
+    // more and forces a refresh of its own while the store still holds the
+    // refused token, so the login is checked again on every resend.
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
     // The reason shows once, not once per resend.
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "refused for now") != null);
@@ -8876,8 +8880,10 @@ test "processQueuedPrompt sends a refused request again with the team a reload r
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-team-b" };
-    hooks.credential_refresh_teams = &.{ null, "team_a", "team_b" };
+    // The 401's reload finds the refused token still stored, so fx forces a
+    // refresh, which keeps the team.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after", "token-team-b" };
+    hooks.credential_refresh_teams = &.{ null, null, "team_a", "team_b" };
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
     var config = fixture.config();
@@ -8891,7 +8897,7 @@ test "processQueuedPrompt sends a refused request again with the team a reload r
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload }, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_teams.items.len);
     // A refresh that keeps the team, or returns none, changes nothing.
     try std.testing.expectEqualStrings("team_a", gateway.request_teams.items[0].?);
@@ -9030,25 +9036,27 @@ test "processQueuedPrompt sends each of many refused resends with the team its r
     const alloc = std.testing.allocator;
     const rounds = 100;
     const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
-    // Each round is a send and its replay, both refused. Every reload before
-    // a resend returns one of three teams, or none, so the team changes on
-    // most resends and stays on some.
+    // Each round is a send and its replay, both refused. The 401's reload
+    // finds the refused token still stored, so fx forces a refresh, which
+    // keeps the team. Every reload before a resend returns one of three
+    // teams, or none, so the team changes on most resends and stays on some.
     var completions: [2 * rounds + 1]FakeCompletion = undefined;
     for (completions[0 .. 2 * rounds]) |*completion| completion.* = .{ .status = .unauthorized, .err_body = refused };
     completions[2 * rounds] = .{ .content = "accepted answer" };
     const team_names = [_][]const u8{ "team_0", "team_1", "team_2" };
-    var tokens: [2 * rounds + 1][]const u8 = undefined;
-    var teams: [2 * rounds + 1]?[]const u8 = undefined;
+    var tokens: [3 * rounds + 1][]const u8 = undefined;
+    var teams: [3 * rounds + 1]?[]const u8 = undefined;
     // What each round's two requests must send.
     var expected: [rounds + 1][]const u8 = undefined;
     expected[0] = "team_start";
     for (&tokens) |*token| token.* = "token";
     teams[0] = null;
     for (0..rounds) |round| {
-        // The forced refresh after the first 401 keeps the team.
-        teams[1 + 2 * round] = null;
+        // The reload and the forced refresh after the first 401 keep the team.
+        teams[1 + 3 * round] = null;
+        teams[2 + 3 * round] = null;
         const next: ?[]const u8 = if (round % 4 == 3) null else team_names[round % 3];
-        teams[2 + 2 * round] = next;
+        teams[3 + 3 * round] = next;
         expected[round + 1] = next orelse expected[round];
     }
     var gateway = FakeGateway.init(alloc, &completions);
@@ -9089,8 +9097,10 @@ test "processQueuedPrompt replays a 401 with the team its forced refresh returns
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-team-b" };
-    hooks.credential_refresh_teams = &.{ null, "team_b" };
+    // The 401's reload finds the refused token still stored, so fx forces a
+    // refresh, which returns the login on another team.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-team-b" };
+    hooks.credential_refresh_teams = &.{ null, null, "team_b" };
     var fixture = PromptFixture{};
     const config = fixture.config();
     var job = fixture.job();
@@ -9100,7 +9110,7 @@ test "processQueuedPrompt replays a 401 with the team its forced refresh returns
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force }, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_teams.items.len);
     try std.testing.expectEqualStrings("team_a", gateway.request_teams.items[0].?);
     // The replay sends the refreshed key and the refreshed login's team together.
@@ -9122,9 +9132,10 @@ test "processQueuedPrompt waits for a sign-in when a refused login's refresh sto
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
-    // The first forced refresh works; the refresh token is revoked before
-    // the resend, so the second finds nothing.
+    // Each 401's reload finds the refused token still stored. The first
+    // forced refresh works; the refresh token is revoked before the resend,
+    // so the second finds nothing.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after", "token-after", "token-after", "token-after" };
     hooks.credential_refresh_force_successes = 1;
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
@@ -9969,7 +9980,8 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.credential_refresh_tokens = &.{ "still-stale", "fresh-after-401" };
+    // The store still holds the rejected token, so only a forced refresh helps.
+    hooks.credential_refresh_tokens = &.{ "still-stale", "still-stale", "fresh-after-401" };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -9982,9 +9994,36 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt replays a fx login 401 with the token another process stored, without a forced refresh" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{
+            .status = .unauthorized,
+            .err_body = "{\"error\":{\"message\":\"expired\"}}",
+        },
+        .{ .content = "Done." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    // Another fx process refreshed the shared login after this one read it.
+    hooks.credential_refresh_tokens = &.{ "read-before-401", "stored-by-other-fx", "must-not-use" };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_api_keys.items.len);
+    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+    try std.testing.expectEqualStrings("read-before-401", gateway.request_api_keys.items[0]);
+    try std.testing.expectEqualStrings("stored-by-other-fx", gateway.request_api_keys.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -10153,7 +10192,8 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.credential_refresh_tokens = &.{"selected-login-token"};
+    // The store still holds the rejected token, and the forced refresh gives nothing.
+    hooks.credential_refresh_tokens = &.{ "selected-login-token", "selected-login-token" };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -10163,8 +10203,7 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("selected-login-token", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
@@ -10192,9 +10231,9 @@ test "processQueuedPrompt reports the selected login after refresh failure witho
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("key", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    // A refused reload, such as for a stored sign-in of another team, is never
+    // followed by a forced refresh, which would rotate that sign-in.
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
