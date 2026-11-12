@@ -2,10 +2,9 @@
 
 const std = @import("std");
 const io_mod = @import("io.zig");
-const net_connect = @import("net_connect.zig");
+const net_accept = @import("net_accept.zig");
 
 const posix = std.posix;
-const Threaded = std.Io.Threaded;
 
 /// How long one wait for a connection lasts before the stop flag is read
 /// again.
@@ -22,7 +21,8 @@ pub const AcceptError = posix.PollError || std.Io.net.Server.AcceptError;
 /// owns the returned stream.
 ///
 /// A connection that is gone by the time `accept` runs sends the loop back
-/// to waiting, through `acceptIfWaiting`, so the stop is still read.
+/// to waiting, through `net_accept.acceptIfWaiting`, so the stop is still
+/// read.
 pub fn acceptUnlessStopping(
     server: *std.Io.net.Server,
     io: std.Io,
@@ -36,52 +36,9 @@ pub fn acceptUnlessStopping(
     while (!stopping.load(.seq_cst)) {
         fds[0].revents = 0;
         if (try posix.poll(&fds, stop_check_ms) == 0) continue;
-        if (try acceptIfWaiting(server, io)) |stream| return stream;
+        if (try net_accept.acceptIfWaiting(server, io)) |stream| return stream;
     }
     return null;
-}
-
-/// Accepts the connection that `poll` found waiting on `server`, or returns
-/// null when it is gone, as when another thread took it first. A blocking
-/// `accept` would wait for the next connection instead, and a thread waiting
-/// there never reads its stop flag. This leaves the listener non-blocking,
-/// so accept on it only through this function from then on:
-/// the standard `accept` treats a listener with nothing to accept as a bug.
-/// Like a stream the standard `accept` returns, the stream blocks and is
-/// closed on exec from the moment it exists, through `accept4` where std
-/// uses it. macOS has no `accept4` and gives the stream the listener's
-/// non-blocking flag, so there both are set after the accept, as std does.
-/// The caller owns the returned stream.
-pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.Io.net.Stream {
-    const listener = server.socket.handle;
-    try net_connect.setNonblocking(listener);
-    var storage: Threaded.PosixAddress = undefined;
-    var length: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
-    const fd: posix.fd_t = while (true) {
-        const rc = if (Threaded.socket_flags_unsupported)
-            posix.system.accept(listener, &storage.any, &length)
-        else
-            posix.system.accept4(listener, &storage.any, &length, posix.SOCK.CLOEXEC);
-        switch (posix.errno(rc)) {
-            .SUCCESS => break @intCast(rc),
-            .INTR => continue,
-            .AGAIN, .CONNABORTED => return null,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    };
-    const stream: std.Io.net.Stream = .{ .socket = .{
-        .handle = fd,
-        .address = Threaded.addressFromPosix(&storage),
-    } };
-    if (Threaded.socket_flags_unsupported) {
-        errdefer stream.close(io);
-        try net_connect.setCloexec(fd);
-        try net_connect.setBlocking(fd);
-    }
-    return stream;
 }
 
 /// Waits up to `limit_ms` for `flag` to be set and returns whether it was.
@@ -180,6 +137,66 @@ pub const ServerThread = struct {
         if (self.connection) |stream| stream.shutdown(io, .both) catch {};
     }
 };
+
+/// A thread that polls a listener it shares with a server under test and
+/// takes one connection with its own accept. Both can see the connection
+/// ready, and only one accept gets it, so the server's own accept can find
+/// it gone. The rival's accept blocks when the server took the connection
+/// first and the listener still blocks.
+pub const Rival = struct {
+    listener: posix.fd_t,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    taken: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *Rival) !void {
+        std.debug.assert(self.thread == null);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *Rival) void {
+        defer self.done.store(true, .seq_cst);
+        var fds = [_]posix.pollfd{.{ .fd = self.listener, .events = posix.POLL.IN, .revents = 0 }};
+        while (!self.stopping.load(.seq_cst)) {
+            fds[0].revents = 0;
+            const ready = posix.poll(&fds, stop_check_ms) catch return;
+            if (ready == 0) continue;
+            const rc = posix.system.accept(self.listener, null, null);
+            if (posix.errno(rc) != .SUCCESS) continue;
+            _ = posix.system.close(@intCast(rc));
+            self.taken.store(true, .seq_cst);
+            return;
+        }
+    }
+
+    /// Stops the thread and joins it. While it still waits in `accept`, as
+    /// when the server took the connection, `wake` opens one connection to
+    /// the listener, which ends that wait.
+    pub fn finish(self: *Rival, context: *const anyopaque, wake: *const fn (*const anyopaque) void) void {
+        const thread = self.thread orelse return;
+        self.thread = null;
+        self.stopping.store(true, .seq_cst);
+        while (!waitFor(&self.done, 100)) wake(context);
+        thread.join();
+    }
+};
+
+/// `Rival.finish`'s wake for a loopback listener: `context` is its `u16` port.
+pub fn wakeLoopback(context: *const anyopaque) void {
+    const port: *const u16 = @ptrCast(@alignCast(context));
+    connectToLoopback(port.*);
+}
+
+/// Opens and closes one connection to the loopback `port`, ignoring a
+/// failure, for a `Rival.finish` or a test's own wake.
+pub fn connectToLoopback(port: u16) void {
+    var backend: std.Io.Threaded = .init_single_threaded;
+    const zio = backend.io();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = address.connect(zio, .{ .mode = .stream }) catch return;
+    stream.close(zio);
+}
 
 /// A loopback listener with a thread waiting on it, for the tests below.
 const Waiter = struct {
@@ -360,27 +377,6 @@ test "a waiting accept ends at the stop when another thread takes the connection
         try std.testing.expectEqual(@as(usize, 1), rivals.accepted.load(.seq_cst));
         try std.testing.expect(!rivals.failed.load(.seq_cst));
     }
-}
-
-test "a stream the waiting accept returns blocks and is closed on exec" {
-    // The listener does not block, and macOS gives an accepted socket the
-    // listener's file status flags.
-    var backend: std.Io.Threaded = .init_single_threaded;
-    const zio = backend.io();
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try address.listen(zio, .{ .reuse_address = true });
-    defer server.deinit(zio);
-    try connectOnce(&server);
-    var stopping = std.atomic.Value(bool).init(false);
-    const stream = (try acceptUnlessStopping(&server, zio, &stopping)).?;
-    defer stream.close(zio);
-    const flags = std.posix.system.fcntl(stream.socket.handle, std.posix.F.GETFL, @as(usize, 0));
-    try std.testing.expect(flags >= 0);
-    const nonblock: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    try std.testing.expectEqual(@as(usize, 0), @as(usize, @intCast(flags)) & nonblock);
-    const fd_flags = std.posix.system.fcntl(stream.socket.handle, std.posix.F.GETFD, @as(usize, 0));
-    try std.testing.expect(fd_flags >= 0);
-    try std.testing.expect(@as(usize, @intCast(fd_flags)) & std.posix.FD_CLOEXEC != 0);
 }
 
 test "a stop that the thread ignores fails within its limit" {
