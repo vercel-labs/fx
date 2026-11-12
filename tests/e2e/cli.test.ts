@@ -1308,9 +1308,8 @@ describe("cli: status", () => {
   }
 
   test("FX_HOME under a symlinked folder reads its own skills folder", async () => {
-    // macOS's $TMPDIR and /tmp are such folders. Before, fx read the profile's
-    // skills folder through the link but checked it against the resolved path,
-    // so doctor called it unreadable and its skills did not load.
+    // fx resolves a symlinked folder above FX_HOME, such as macOS's $TMPDIR,
+    // and reads the profile's skills folder at its real path.
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-link-")));
     try {
       const home = join(root, "home");
