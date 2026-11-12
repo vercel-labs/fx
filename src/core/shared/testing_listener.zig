@@ -48,15 +48,20 @@ pub fn acceptUnlessStopping(
 /// so accept on it only through this function from then on:
 /// the standard `accept` treats a listener with nothing to accept as a bug.
 /// Like a stream the standard `accept` returns, the stream blocks and is
-/// closed on exec; macOS gives it the listener's non-blocking flag. The
-/// caller owns the returned stream.
+/// closed on exec from the moment it exists, through `accept4` where std
+/// uses it. macOS has no `accept4` and gives the stream the listener's
+/// non-blocking flag, so there both are set after the accept, as std does.
+/// The caller owns the returned stream.
 pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.Io.net.Stream {
     const listener = server.socket.handle;
     try net_connect.setNonblocking(listener);
     var storage: Threaded.PosixAddress = undefined;
     var length: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
     const fd: posix.fd_t = while (true) {
-        const rc = posix.system.accept(listener, &storage.any, &length);
+        const rc = if (Threaded.socket_flags_unsupported)
+            posix.system.accept(listener, &storage.any, &length)
+        else
+            posix.system.accept4(listener, &storage.any, &length, posix.SOCK.CLOEXEC);
         switch (posix.errno(rc)) {
             .SUCCESS => break @intCast(rc),
             .INTR => continue,
@@ -71,9 +76,11 @@ pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.
         .handle = fd,
         .address = Threaded.addressFromPosix(&storage),
     } };
-    errdefer stream.close(io);
-    try net_connect.setCloexec(fd);
-    try net_connect.setBlocking(fd);
+    if (Threaded.socket_flags_unsupported) {
+        errdefer stream.close(io);
+        try net_connect.setCloexec(fd);
+        try net_connect.setBlocking(fd);
+    }
     return stream;
 }
 
@@ -355,7 +362,7 @@ test "a waiting accept ends at the stop when another thread takes the connection
     }
 }
 
-test "a stream the waiting accept returns blocks on its reads" {
+test "a stream the waiting accept returns blocks and is closed on exec" {
     // The listener does not block, and macOS gives an accepted socket the
     // listener's file status flags.
     var backend: std.Io.Threaded = .init_single_threaded;
@@ -371,6 +378,9 @@ test "a stream the waiting accept returns blocks on its reads" {
     try std.testing.expect(flags >= 0);
     const nonblock: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     try std.testing.expectEqual(@as(usize, 0), @as(usize, @intCast(flags)) & nonblock);
+    const fd_flags = std.posix.system.fcntl(stream.socket.handle, std.posix.F.GETFD, @as(usize, 0));
+    try std.testing.expect(fd_flags >= 0);
+    try std.testing.expect(@as(usize, @intCast(fd_flags)) & std.posix.FD_CLOEXEC != 0);
 }
 
 test "a stop that the thread ignores fails within its limit" {
