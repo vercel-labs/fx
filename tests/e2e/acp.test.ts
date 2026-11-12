@@ -9808,6 +9808,60 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP's wait says a report starts the next turn, since an ACP report never joins a running turn",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-wait-");
+      const childPrompt = "Reply exactly ACP_WAIT_CHILD_DONE without using tools.";
+      const heldChild = deferred<void>();
+      let waitText: string | null = null;
+      const route = async (body: string) => {
+        if (!body.includes('"name":"subagent"')) {
+          await heldChild.promise;
+          return finalText("ACP_WAIT_CHILD_DONE");
+        }
+        if (acpLatestUserIsReport(body)) return finalText("ACP_WAIT_REPORT_TURN");
+        if (body.includes("acp_wait_call")) {
+          // ACP reads its list of subagents at each step, so the step whose
+          // subagent finished also carries a runtime context update.
+          const text = acpToolResultText(body, "acp_wait_call");
+          const result = /"result":("(?:[^"\\]|\\.)*")/.exec(text);
+          waitText = result ? JSON.parse(result[1]!) : text;
+          expect(text).toContain("- waiter: idle, last work completed. For: Reply exactly ACP_WAIT_CHILD_DONE without using tools.");
+          return finalText("ACP_WAIT_TURN_DONE");
+        }
+        if (body.includes("acp_wait_send")) {
+          // The child ends while main waits for it.
+          setTimeout(() => heldChild.resolve(), 300);
+          return fakeGatewayToolCall("acp_wait_call", "subagent", { request: { action: "wait" } });
+        }
+        return fakeGatewayToolCall("acp_wait_send", "subagent", {
+          request: { action: "message", agent: "waiter", message: childPrompt },
+        });
+      };
+      const gateway = startFakeGateway([route, route, route, route, route, route]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client, true);
+        const result = await runPrompt(client, "Delegate and wait for the report.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(waitText).toBe("A report or message arrived. It starts your next turn once this one ends, so end your turn to read it.");
+        // The report then starts the next turn, as before.
+        expect(gateway.requests.some((request) => acpLatestUserIsReport(request.body))).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
+        heldChild.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP cancellation ends the wait for subagent reports, and a late report follows the next prompt",
     async () => {
       const root = createIsolatedRoot("fx-acp-subagent-cancel-");

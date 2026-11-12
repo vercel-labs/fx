@@ -1138,6 +1138,27 @@ pub const WorkerRuntime = struct {
         queued.delivery = if (joins) .{ .active_turn = self.active_turn_id } else .continuation;
         queued.agent_settings = self.agent_turn_settings;
         try self.enqueuePromptLocked(alloc, queued);
+        // Under the lock, so the trace orders it against the turn's takes
+        // (`tests/tla/drivers/subagent/main-mail.test.ts`).
+        debug_trace.eventf("worker", "mail_posted", .{ .turn_id = self.active_turn_id }, "worker={x} mail={s} delivery={s}", .{ @intFromPtr(self), @tagName(queued.mail), if (joins) "joined" else "waits" });
+    }
+
+    /// Whether mail waiting in this queue joins the running turn at its next
+    /// boundary. False between turns and in a turn the worker was not told
+    /// of, as ACP's, whose mail starts the next turn
+    /// (`tests/tla/subagent/MainMail.tla` WaitHonest).
+    pub fn queuedMailJoinsTurn(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const joins = joins: {
+            if (!self.worker_processing or self.active_turn_id == 0) break :joins false;
+            for (self.queued_prompts.items) |prompt| {
+                if (prompt.delivery.activeTurnId() == self.active_turn_id) break :joins true;
+            }
+            break :joins false;
+        };
+        debug_trace.eventf("worker", "mail_joins_checked", .{ .turn_id = self.active_turn_id }, "worker={x} joins={}", .{ @intFromPtr(self), joins });
+        return joins;
     }
 
     /// Holds a place in this queue for another agent's message that is on
@@ -1191,6 +1212,31 @@ pub const WorkerRuntime = struct {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
             self.queued_history = &.{};
         }
+        debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
+        return prompt;
+    }
+
+    /// As `takeQueuedPrompt`, and marks turn `turn_id`, which runs the
+    /// prompt, in the same step, as `beginDirectProcessing` does: mail posted
+    /// from the take on joins that turn (`tests/tla/subagent/MainMail.tla`
+    /// NextTurn). Null, and nothing marked, when no prompt waits or the
+    /// worker is busy or stopped. The caller pairs a prompt with
+    /// `finishProcessing`.
+    pub fn takeQueuedPromptForTurn(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ?QueuedPrompt {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.queued_prompts.items.len == 0 or self.worker_processing or self.worker_stop_requested) return null;
+        const prompt = self.queued_prompts.orderedRemove(0);
+        if (self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        self.direct_steering_closed = false;
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_processing = true;
+        self.active_turn_id = turn_id;
+        self.tool_phase_step_id = null;
+        debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = turn_id }, "worker={x} mail={s} remaining={d} marked=true", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
         return prompt;
     }
 
@@ -1500,6 +1546,7 @@ pub const WorkerRuntime = struct {
                 }
                 const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
                 if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
+                debug_trace.eventf("worker", "steering_taken", .{ .turn_id = turn_id }, "worker={x} kind={s} count={d} closed={}", .{ @intFromPtr(self), @tagName(kind), messages.len, self.direct_steering_closed });
                 return if (messages.len == 0)
                     .none
                 else
@@ -2062,12 +2109,15 @@ pub const WorkerRuntime = struct {
         // order in which steering and ordinary prompts were submitted.
         const finished_turn_id = self.active_turn_id;
         self.finishCompactionActivityLocked(finished_turn_id);
+        var deferred: usize = 0;
         for (self.queued_prompts.items) |*prompt| {
             if (prompt.delivery.activeTurnId() == finished_turn_id) {
                 prompt.delivery = .continuation;
+                deferred += 1;
                 debug_trace.eventf("worker", "steering_deferred_to_next_turn", .{ .turn_id = finished_turn_id }, "queued_turn_id={d} prompt_bytes={d}", .{ prompt.turn_id, prompt.prompt.len });
             }
         }
+        debug_trace.eventf("worker", "processing_finished", .{ .turn_id = finished_turn_id }, "worker={x} deferred={d}", .{ @intFromPtr(self), deferred });
         self.worker_processing = false;
         self.active_turn_id = 0;
         self.steering_cancel_turn_id = null;
@@ -2090,6 +2140,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
+        debug_trace.eventf("worker", "processing_begun", .{ .turn_id = turn_id }, "worker={x} queued={d}", .{ @intFromPtr(self), self.queued_prompts.items.len });
         return true;
     }
 

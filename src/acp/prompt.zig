@@ -2328,6 +2328,9 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
+        // ACP's turns have no id here, so its list is read afresh at each
+        // step; its reports never join a turn, so a change shows at once.
+        .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
     }, arena, messages);
 }
 
