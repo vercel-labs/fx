@@ -8425,14 +8425,14 @@ test.skipIf(!tmuxAvailable())(
       const historyPath = logOf(home, sessionId);
       const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
-      // Success is silent; publication, not a transcript notice, gates resume.
+      // Publication, not the transcript line, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
-      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
       expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
-      expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
+      expect(await active.captureFullScrollback()).toMatch(/Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/);
       // Plain turns have nothing to summarize, but the earlier message may set
       // a rule, so the one model call files it; the checkpoint keeps the
       // earlier message and reply word for word.

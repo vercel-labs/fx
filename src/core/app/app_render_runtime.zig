@@ -3798,6 +3798,11 @@ const CoordinatorTestWorker = struct {
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
     steering_messages: []const []const u8 = &.{},
+    compaction: @import("../output/compaction_activity.zig").State = .{},
+
+    pub fn compactionActivitySnapshot(self: *const @This()) @import("../output/compaction_activity.zig").Snapshot {
+        return self.compaction.snapshot;
+    }
 
     pub fn snapshotSteeringPresentation(
         self: *const @This(),
@@ -5675,6 +5680,68 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Responsive session title")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
+}
+
+test "core.app_render_runtime compaction row shows its count and its own clock in the VT, then the turn row goes on" {
+    const activity_status = @import("../output/activity_status.zig");
+    const turn_clock = @import("../output/turn_clock.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]u16{ 120, 28 }) |cols| {
+        var file = try tmp.dir.createFile(std.testing.io, "compaction-row-vt.log", .{ .read = true });
+        defer file.close(io_mod.getIo());
+        var app = CoordinatorTestApp{
+            .alloc = alloc,
+            .shell = .{
+                .stdout_file = file,
+                .layout = .{
+                    .rows = 24,
+                    .cols = cols,
+                    .content_bottom = 20,
+                    .divider_top_row = 21,
+                    .input_row = 22,
+                    .divider_bottom_row = 23,
+                    .hint_row = 24,
+                },
+                .owned_top_row = 1,
+                .viewport_top_row = 1,
+            },
+        };
+        defer app.deinit();
+        try app.selected_model.appendSlice(alloc, "test-model");
+        try app.shell.initBacking(alloc);
+        try app.shell.enableShadowVt(alloc);
+        try app.shell.writeTranscript(alloc, &app.metrics, "earlier turn output\n", true);
+
+        // 10m15s into the turn a compaction began 12 s ago. Each mark sits
+        // 50 ms past a whole second, so the shown second holds for 950 ms.
+        var now = io_mod.milliTimestamp();
+        const began = now - 12_050;
+        app.agent().stream = .{ .active = true, .phase = .thinking, .turn_started_ms = began - 615_000 };
+        const id = app.agent().worker.compaction.begin(.automatic, 1, began);
+        app.agent().worker.compaction.running(id, .summary);
+        app.agent().worker.compaction.written(id, 66);
+        activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), began);
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        const grid = app.shell.shadow_vt.?;
+        // The compaction's count and its own clock replace the turn row,
+        // whole even on a narrow row.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting 66% (12s)"));
+        try std.testing.expect(!(try coordinatorGridContains(grid.*, "Thinking")));
+        try std.testing.expect(try coordinatorGridContains(grid.*, "earlier turn output"));
+
+        // The compaction ends; syncState resumes the turn clock.
+        now = io_mod.milliTimestamp();
+        app.agent().worker.compaction.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, now);
+        activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), now);
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        // The turn goes on from the 10m15s it showed when compaction began.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Thinking (10m15s)"));
+        try std.testing.expect(!(try coordinatorGridContains(grid.*, "Compacting")));
+    }
 }
 
 test "core.app_render_runtime inline menus survive the VT size and resize matrix" {

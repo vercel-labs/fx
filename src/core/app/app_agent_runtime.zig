@@ -3105,9 +3105,15 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
     try std.testing.expect(gateway.saw_no_tools);
     try std.testing.expectEqualStrings("test-model", gateway.observed_model.?);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    // The commit, then the line that tells the user the context was compacted.
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
     try std.testing.expect(events.items[0] == .context_compaction);
     try std.testing.expect(events.items[0].context_compaction.active_prefix == null);
+    const done = events.items[1].semantic_notice;
+    try std.testing.expectEqualStrings("", done.topic);
+    try std.testing.expectEqual(types.NoticeTone.success, done.tone);
+    try std.testing.expect(std.mem.startsWith(u8, done.body, "Context compacted ("));
+    try std.testing.expect(std.mem.endsWith(u8, done.body, "s)"));
 
     const completed_activity = app.agent().worker.compactionActivitySnapshot();
     try std.testing.expectEqual(pending_activity.operation.?.id, completed_activity.operation.?.id);

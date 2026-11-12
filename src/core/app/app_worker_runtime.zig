@@ -3,6 +3,8 @@ const session_notices = @import("../session/session.zig");
 const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
+const compaction_activity = @import("../output/compaction_activity.zig");
+const turn_clock = @import("../output/turn_clock.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
@@ -848,13 +850,18 @@ pub fn Runtime(comptime App: type) type {
                 agent.stream.turn_started_ms = io_mod.milliTimestamp();
                 app.shell.render_requests.request(.footer);
             }
-            // Waiting on an approval or question is not thinking: freeze the
-            // elapsed clock for the duration of the wait.
-            activity_status.syncWaitingClock(&agent.stream, modal_active, io_mod.milliTimestamp());
+            // Waiting on an approval, a question, or a compaction is not the
+            // turn's work: freeze the elapsed clock for the duration of the
+            // wait. A compaction shows a clock of its own meanwhile.
+            const compaction: compaction_activity.Snapshot = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot"))
+                agent.worker.compactionActivitySnapshot()
+            else
+                .{};
+            activity_status.syncWaitingClock(&agent.stream, turn_clock.waits(modal_active, compaction), io_mod.milliTimestamp());
 
             if (comptime @hasField(App, "program_status")) {
                 reportProgramStatus(app, agent, !cancellation_stops_turn and
-                    (agent.stream.active or snapshot.processing or snapshot.queued_count > 0));
+                    (agent.stream.active or snapshot.processing or snapshot.queued_count > 0), compaction);
             }
         }
 
@@ -880,11 +887,9 @@ pub fn Runtime(comptime App: type) type {
 
         /// Tells the terminal what the user would see: a decision prompt,
         /// running work, or the result of the last turn.
-        fn reportProgramStatus(app: *App, agent: *AppAgent, busy: bool) void {
+        fn reportProgramStatus(app: *App, agent: *AppAgent, busy: bool, compaction: compaction_activity.Snapshot) void {
             if (offScreen(app, agent)) return;
-            if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) {
-                app.program_status.noteCompaction(agent.worker.compactionActivitySnapshot());
-            }
+            app.program_status.noteCompaction(compaction);
             const activity: program_status.Activity = if (agent.approval_prompt.isActive())
                 .{ .blocked = .{
                     .kind = .permission,
@@ -1027,7 +1032,7 @@ pub fn Runtime(comptime App: type) type {
                 .turn_thinking => |thinking| if (thinking.tone != .thinking) return null,
                 .none, .tool_slot => {},
             }
-            switch (activity_status.compactionProjection(buf, compaction, agent.stream, now_ms)) {
+            switch (activity_status.compactionProjection(buf, compaction, now_ms)) {
                 .turn_thinking => |thinking| return if (thinking.tone == .thinking) thinking.label else null,
                 .none, .tool_slot => {},
             }
@@ -3775,6 +3780,25 @@ test "core.app_worker_runtime syncState freezes the turn clock while an approval
     app.agent().worker.pending_permission_request = null;
     Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(!app.agent().approval_prompt.isActive());
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(@as(i64, 0), app.agent().stream.waiting_since_ms);
+}
+
+test "core.app_worker_runtime syncState holds the turn clock while a compaction runs" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.agent().worker.processing = true;
+    app.agent().stream.active = true;
+    app.agent().stream.turn_started_ms = io_mod.milliTimestamp() - 615_000;
+    const id = app.agent().worker.compaction.begin(.automatic, 1, io_mod.milliTimestamp());
+    app.agent().worker.compaction.running(id, .summary);
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expect(app.agent().stream.waiting_since_ms > 0);
+
+    // A failed compaction's feedback stays on screen but holds nothing.
+    app.agent().worker.compaction.settle(id, compaction_activity.failure(error.ConnectionTimedOut, .summary, false), io_mod.milliTimestamp());
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(app.agent().stream.active);
     try std.testing.expectEqual(@as(i64, 0), app.agent().stream.waiting_since_ms);
 }

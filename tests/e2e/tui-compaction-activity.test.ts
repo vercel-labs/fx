@@ -13,6 +13,7 @@ const {
   fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway,
   hasEmptyComposer, tmuxAvailable,
 } = await import("./tmux-helpers");
+const { HAS_API_KEY } = await import("../evals/eval-helpers");
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
@@ -22,8 +23,36 @@ const TAIL = "HISTORY_TAIL_16d3";
 const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
-const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+const ACTIVITY = /Compacting \d+% \((?:\d+h)?(?:\d+m)?\d+s\)/;
+// The share of the summary written, then the compaction row's own clock.
+const COMPACTION_CLOCK = /Compacting (\d+)% \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
+const TURN_CLOCK = /Thinking \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
+function clockSeconds(clock: string): number {
+  const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?:(\d+)m)?(\d+)s$/.exec(clock)!;
+  return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds);
+}
+// The summary line a finished turn leaves after it, such as `  12s (↑34 ↓433)`.
+const TURN_SUMMARY_LINE = /^  (\d+s|\d+m \d+s|\d+h \d{2}m)(?: \(↑[^\n]*\))?$/m;
+/// The seconds on the summary line of the turn whose prompt holds `prompt`,
+/// or null before that turn has finished.
+function turnSummarySeconds(pane: string, prompt: string): number | null {
+  const at = pane.lastIndexOf(prompt);
+  if (at < 0) return null;
+  const line = TURN_SUMMARY_LINE.exec(pane.slice(at));
+  if (!line) return null;
+  const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?: ?(\d+)m)?(?: ?(\d+)s)?$/.exec(line[1]!)!;
+  return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0);
+}
 const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
+// The line a successful compaction leaves in the transcript, with the time
+// its row showed last.
+const COMPACTED_LINE = /Context compacted \(((?:\d+h)?(?:\d+m)?\d+s)\)/g;
+function compactedSeconds(text: string): number[] {
+  return [...text.matchAll(COMPACTED_LINE)].map((match) => clockSeconds(match[1]!));
+}
+function withoutCompactedLines(text: string): string {
+  return text.replace(COMPACTED_LINE, "");
+}
 // Ctrl+O gives each compaction's model call its own line, as for every call;
 // nothing else there may speak of compaction.
 const COMPACTION_CALL_LINE = /^  (?:[A-Z][a-z]{2} \d{1,2} )?\d{2}:\d{2}:\d{2} · [^\n]* \(compaction\)$/gm;
@@ -58,7 +87,7 @@ async function until(predicate: () => boolean, label: string, timeout = 20_000) 
   }
 }
 
-async function fixture(trigger: Trigger, outcome: Outcome = "success", longResume = false) {
+async function fixture(trigger: Trigger, outcome: Outcome = "success", longResume = false, overflowDelayMs = 0) {
   // Ctrl+O includes the recording path; keep it free of forbidden notice words.
   const root = mkdtempSync(join(tmpdir(), "fx-activity-"));
   const home = join(root, "home");
@@ -108,10 +137,11 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     if (phase === "attempt") {
       if (trigger === "overflow" && !overflowSent) {
         overflowSent = true;
-        return Response.json({ error: {
+        const overflow = Response.json({ error: {
           type: "invalid_request_error", code: "context_length_exceeded",
           message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
         } }, { status: 400 });
+        return overflowDelayMs > 0 ? Bun.sleep(overflowDelayMs).then(() => overflow) : overflow;
       }
       return ordinaryHold.response;
     }
@@ -241,17 +271,22 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   } catch (error) { await cleanup(false); throw error; }
 }
 
-async function assertSilent(terminal: InstanceType<typeof TmuxSession>, root: string, label: string) {
+/// Compaction leaves nothing in the transcript but one `Context compacted`
+/// line for each compaction that succeeded on this screen.
+async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>, root: string, label: string, compacted = 0) {
   const inline = await terminal.captureFullScrollbackEscapes();
   writeFileSync(join(root, `${label}.scrollback.ansi`), inline);
   expect(inline.length).toBeGreaterThan(0);
-  expect(inline).not.toMatch(COMPACTION_OUTPUT);
+  expect(compactedSeconds(inline)).toHaveLength(compacted);
+  expect(withoutCompactedLines(inline)).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
   await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
   await terminal.sendKeys("End");
   const full = await terminal.waitForPane((pane) => pane.includes("esc close · pgup/pgdn scroll"), 5000);
   writeFileSync(join(root, `${label}.full-transcript.txt`), full);
-  expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
+  // The full transcript shows one page, which may not reach the line.
+  expect(compactedSeconds(full).length).toBeLessThanOrEqual(compacted);
+  expect(withoutCompactedLines(withoutCompactionCallLines(full))).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
   await terminal.waitForComposer(5000);
 }
@@ -264,7 +299,7 @@ async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
     const rows = pane.split("\n").filter((line) => ACTIVITY.test(line));
     if (rows.length === 0) return false;
     expect(rows).toHaveLength(1);
-    expect(rows[0]).not.toMatch(/[↑↓]|tokens|chunk|%/i);
+    expect(rows[0]).not.toMatch(/[↑↓]|tokens|chunk/i);
     markers.add(rows[0].includes("•"));
     return markers.size === 2 && !rows[0].includes(clock);
   }, 5000);
@@ -297,7 +332,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
         if (trigger === "manual") {
-          await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
+          await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane) && compactedSeconds(pane).length === 1, 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
           // The reply holds only facts, so fx asks once more for the notes
           // of the turn that did work.
@@ -319,7 +354,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 10_000);
         expect(f.counts()).toEqual({ ...before, ordinary: before.ordinary + 1 });
         expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
-        await assertSilent(terminal, f.root, "completed");
+        await assertCompactionQuiet(terminal, f.root, "completed", 1);
         await f.close();
         f.phase("reopen");
         const reopened = await f.launch();
@@ -329,7 +364,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.counts()).toEqual({ ...before, ordinary: before.ordinary + 2 });
         expect(f.durable()).toBe(1);
         expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
-        await assertSilent(reopened, f.root, "reopened");
+        // The line is not saved, so the reopened session does not show it.
+        await assertCompactionQuiet(reopened, f.root, "reopened");
         await f.close();
         for (const tape of f.tapes) {
           const replay = await f.cli(["replay", tape, "--json"]);
@@ -340,6 +376,130 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       } finally { await f.cleanup(passed); }
     }, 120_000);
   }
+
+  test("manual: the row shows the percentage of the summary written so far", async () => {
+    const f = await fixture("manual", "success");
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("/compact");
+      await until(() => f.counts().summaries === 1, "first summary request");
+      const seen: number[] = [];
+      const record = (pane: string) => {
+        const rows = pane.split("\n").filter((line) => COMPACTION_CLOCK.test(line));
+        if (rows.length === 0) return null;
+        expect(rows).toHaveLength(1);
+        const value = Number(COMPACTION_CLOCK.exec(rows[0]!)![1]);
+        seen.push(value);
+        return value;
+      };
+      // Nothing of the summary has arrived while the model reads.
+      await terminal.waitForPane((pane) => record(pane) === 0, 10_000);
+      // Two of the sections the model must write arrive; the rest is held.
+      f.summaryHold.send("Rules:\nnone\n\nDecisions:\nnone\n\n");
+      await terminal.waitForPane((pane) => {
+        const value = record(pane);
+        return value !== null && value > 0;
+      }, 10_000);
+      expect(seen.at(-1)!).toBeLessThan(100);
+      f.summaryHold.release(HANDOFF);
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      await terminal.waitForPane((pane) => {
+        record(pane);
+        return !ACTIVITY.test(pane) && hasEmptyComposer(pane) && compactedSeconds(pane).length === 1;
+      }, 10_000);
+      // The percentage only goes up.
+      for (let i = 1; i < seen.length; i++) expect(seen[i]!).toBeGreaterThanOrEqual(seen[i - 1]!);
+      expect(seen.some((value) => value > 0 && value < 100)).toBe(true);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 120_000);
+
+  test("manual: a summary stream that breaks midway keeps its count while another model finishes", async () => {
+    const f = await fixture("manual", "success");
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("/compact");
+      await until(() => f.counts().summaries === 1, "first summary request");
+      const seen: number[] = [];
+      const record = (pane: string) => {
+        const row = COMPACTION_CLOCK.exec(pane);
+        if (row) seen.push(Number(row[1]));
+        return row ? Number(row[1]) : null;
+      };
+      await terminal.waitForPane((pane) => record(pane) === 0, 10_000);
+      f.summaryHold.send("Rules:\nnone\n\nDecisions:\nnone\n\n");
+      await terminal.waitForPane((pane) => (record(pane) ?? 0) > 0, 10_000);
+      const before = seen.at(-1)!;
+      // The stream ends before the reply is finished; fx asks another model.
+      f.summaryHold.dispose();
+      await until(() => f.counts().summaries >= 2, "a second summary request");
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      await terminal.waitForPane((pane) => {
+        record(pane);
+        return !ACTIVITY.test(pane) && hasEmptyComposer(pane) && compactedSeconds(pane).length === 1;
+      }, 10_000);
+      for (let i = 1; i < seen.length; i++) expect(seen[i]!).toBeGreaterThanOrEqual(seen[i - 1]!);
+      expect(Math.min(...seen.slice(seen.indexOf(before)))).toBeGreaterThanOrEqual(before);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 120_000);
+
+  test("overflow: compaction counts its own time from zero with its count, and the turn clock goes on from where it stopped", async () => {
+    // The turn's first request answers with the overflow only after 3 s, so
+    // the turn clock is past zero when compaction starts.
+    const f = await fixture("overflow", "success", false, 3000);
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("Continue the current turn.");
+      let before = -1;
+      const started = await terminal.waitForPane((pane) => {
+        const turn = TURN_CLOCK.exec(pane);
+        if (turn) before = Math.max(before, clockSeconds(turn[1]!));
+        return COMPACTION_CLOCK.test(pane);
+      }, 15_000);
+      expect(before).toBeGreaterThanOrEqual(2);
+      expect(clockSeconds(COMPACTION_CLOCK.exec(started)![2]!)).toBeLessThanOrEqual(1);
+      // The summary is held, so the row's count stays below 100% while its
+      // own clock runs well past what the turn showed.
+      let most = 0;
+      await terminal.waitForPane((pane) => {
+        const row = COMPACTION_CLOCK.exec(pane);
+        if (row) most = Math.max(most, clockSeconds(row[2]!));
+        return row !== null && Number(row[1]) < 100 && clockSeconds(row[2]!) >= 6;
+      }, 15_000);
+      f.summaryHold.release(HANDOFF);
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      const resumed = await terminal.waitForText(TURN_CLOCK, 10_000);
+      expect(resumed).not.toMatch(COMPACTION_CLOCK);
+      // The turn goes on from the second compaction started in, plus at most
+      // the second the release took; the 6 s or more of compaction are not in it.
+      const after = clockSeconds(TURN_CLOCK.exec(resumed)![1]!);
+      expect(after).toBeGreaterThanOrEqual(before);
+      expect(after).toBeLessThanOrEqual(before + 2);
+      f.ordinaryHold.release("CURRENT_TURN_OK_f713");
+      const finished = await terminal.waitForPane((pane) =>
+        pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane) && turnSummarySeconds(pane, "Continue the current turn.") !== null, 10_000);
+      // The finished turn's duration leaves out the compaction too: about
+      // what its clock showed, not that plus the 6 s of compaction.
+      const total = turnSummarySeconds(finished, "Continue the current turn.")!;
+      expect(total).toBeGreaterThanOrEqual(after - 1);
+      expect(total).toBeLessThanOrEqual(after + 2);
+      // The compaction leaves one line with the time its row showed last,
+      // plus at most the moments the release and the save took.
+      expect(finished).toContain("✓ Context compacted (");
+      const lines = compactedSeconds(finished);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toBeGreaterThanOrEqual(most);
+      expect(lines[0]).toBeLessThanOrEqual(most + 2);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 90_000);
 
   for (const trigger of ["manual", "auto"] as const) {
     test(`${trigger}: a message submitted during a held compaction waits and runs after with compacted context`, async () => {
@@ -433,7 +593,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (outcome === "cancel") f.summaryHold.dispose();
         await terminal.sendKeys("Escape");
         await terminal.waitForPane((pane) => !/compact/i.test(pane) && hasEmptyComposer(pane), 5000);
-        await assertSilent(terminal, f.root, "failed");
+        await assertCompactionQuiet(terminal, f.root, "failed");
         f.phase("followup");
         await terminal.sendText("Recover with another request.");
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 10_000);
@@ -452,7 +612,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.lastRequest()).toContain(TAIL);
         expect(f.lastRequest()).not.toContain("INTERNAL_HANDOFF_4e12");
         expect(f.durable()).toBe(0);
-        await assertSilent(reopened, f.root, "failed-reopen");
+        await assertCompactionQuiet(reopened, f.root, "failed-reopen");
         await f.close();
         passed = true;
       } finally { await f.cleanup(passed); }
@@ -607,7 +767,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       f.ordinaryHold.release("ORDINARY_CONTROL_OK_727a");
       await terminal.waitForPane((pane) => pane.includes("ORDINARY_CONTROL_OK_727a") && hasEmptyComposer(pane), 10_000);
       expect(f.counts().ordinary).toBe(2);
-      await assertSilent(terminal, f.root, "control");
+      await assertCompactionQuiet(terminal, f.root, "control");
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
@@ -716,4 +876,166 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       if (passed) rmSync(root, { recursive: true, force: true });
     }
   }, 90_000);
+});
+
+// A real model writes the summary of an automatic compaction that starts in
+// the middle of a turn. Opt in with FX_E2E_REAL_API=1 and an AI Gateway
+// credential; FX_COMPACTION_LIVE_MODEL picks another model.
+const LIVE_MODEL = process.env.FX_COMPACTION_LIVE_MODEL ?? "anthropic/claude-haiku-4.5";
+const LIVE = process.env.FX_E2E_REAL_API === "1" && HAS_API_KEY;
+// The turn row names its phase: thinking, running a tool, or generating.
+const LIVE_TURN_CLOCK = /(?:Thinking|Running|Generating) \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
+const LIVE_PROMPT = "Use read_file to read part1.txt, then part2.txt, then part3.txt, one file per step. Then reply with the single word DONE.";
+
+describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live model", () => {
+  test("live: compaction in the middle of a turn counts from zero with its count, and the turn clock goes on from where it stopped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-live-compaction-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    // The earlier turn holds about 5k tokens and each part about 6k, so the
+    // turn's first request stays under 10% of the model's usable input and a
+    // later request in the same turn crosses it.
+    const body = (tag: string, lines: number) => Array.from({ length: lines }, (_, line) =>
+      `${tag} ${line}: notes on the river survey, gauge readings, and weather by the bank`).join("\n");
+    writeFileSync(join(workspace, "seed.txt"), body("seed", 200));
+    for (const part of [1, 2, 3]) {
+      writeFileSync(join(workspace, `part${part}.txt`), `${body(`part${part}`, 300)}\n`);
+    }
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: LIVE_MODEL, auto_compact_percent: 10, auto_upgrade: false, startup_scrollback: false,
+    }));
+    // A local gateway plays the earlier turn, so only this turn and its
+    // compaction reach the live model.
+    const seedGateway = startDynamicFakeGateway((raw) => raw.includes('"seed-read"')
+      ? fakeGatewayFinalText("SEED_OK")
+      : fakeGatewayToolCall("seed-read", "read_file", { path: "seed.txt" }),
+    { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 200000, max_tokens: 64000 }] });
+    const stderrPath = join(root, "terminal.stderr");
+    const tracePath = join(root, "terminal.trace");
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    const samples: { at: number; turn?: number; compaction?: number; percent?: number }[] = [];
+    let passed = false;
+    try {
+      const seed = Bun.spawn([binary, "ask", "--json", "--auto", "Read seed.txt."], {
+        cwd: workspace, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root, AI_GATEWAY_API_KEY: "synthetic-seed-key",
+          FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: seedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: seedGateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: seedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${seedGateway.baseUrl}/coding-agent/v1/models`,
+        },
+      });
+      const [seedCode, seedOut] = await Promise.all([seed.exited, new Response(seed.stdout).text()]);
+      expect(seedCode).toBe(0);
+      const sessionId = JSON.parse(seedOut).session_id as string;
+
+      terminal = await TmuxSession.create({
+        cmd: `${shellQuote(binary)} --resume ${shellQuote(sessionId)}`,
+        cwd: workspace,
+        env: {
+          HOME: home, TMPDIR: root,
+          AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
+          VERCEL_OIDC_TOKEN: process.env.VERCEL_OIDC_TOKEN,
+          FX_E2E_DISABLE_DOTENV: "1", FX_AUTO_UPGRADE: "0", FX_MODEL: LIVE_MODEL,
+          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "compaction,worker",
+        },
+        isolated: true, width: 100, height: 32, stderrPath, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(30_000);
+      const sent = Date.now();
+      await terminal.sendText(LIVE_PROMPT);
+      let pane = "";
+      // The model may take more or fewer steps; the test waits for the turn
+      // to end, which leaves its summary line after the prompt.
+      const finished = (text: string) => turnSummarySeconds(text, "one file per step") !== null && hasEmptyComposer(text);
+      while (Date.now() - sent < 240_000) {
+        pane = await terminal.capturePane();
+        const turn = LIVE_TURN_CLOCK.exec(pane);
+        const compaction = COMPACTION_CLOCK.exec(pane);
+        samples.push({
+          at: Date.now() - sent,
+          turn: turn ? clockSeconds(turn[1]!) : undefined,
+          compaction: compaction ? clockSeconds(compaction[2]!) : undefined,
+          percent: compaction ? Number(compaction[1]) : undefined,
+        });
+        if (finished(pane)) break;
+        await Bun.sleep(100);
+      }
+      expect(finished(pane)).toBe(true);
+
+      // Each stretch of compaction rows, with the turn clock's last reading
+      // before it, how long before the stretch that was, and the turn
+      // clock's first reading after it.
+      type Episode = { before?: number; gap: number; first: number; most: number; percents: number[]; after?: number };
+      const episodes: Episode[] = [];
+      let lastTurn: { seconds: number; at: number } | undefined;
+      let compacting = false;
+      for (const sample of samples) {
+        if (sample.compaction !== undefined) {
+          if (!compacting) {
+            episodes.push({
+              before: lastTurn?.seconds, gap: lastTurn ? sample.at - lastTurn.at : 0,
+              first: sample.compaction, most: sample.compaction, percents: [],
+            });
+          }
+          compacting = true;
+          const episode = episodes.at(-1)!;
+          episode.most = Math.max(episode.most, sample.compaction);
+          if (sample.percent !== undefined && episode.percents.at(-1) !== sample.percent) episode.percents.push(sample.percent);
+          continue;
+        }
+        compacting = false;
+        if (sample.turn === undefined) continue;
+        const open = episodes.at(-1);
+        if (open && open.after === undefined) open.after = sample.turn;
+        lastTurn = { seconds: sample.turn, at: sample.at };
+      }
+      console.log(`live compaction with ${LIVE_MODEL}: ${JSON.stringify(episodes)}`);
+      expect(episodes.length).toBeGreaterThan(0);
+      // At least one compaction came after the turn had shown its clock.
+      expect(episodes.some((episode) => episode.before !== undefined && episode.after !== undefined)).toBe(true);
+      for (const episode of episodes) {
+        expect(episode.first).toBeLessThanOrEqual(1);
+        // The count only goes up, and it moves while the summary streams in.
+        for (let i = 1; i < episode.percents.length; i++) expect(episode.percents[i]!).toBeGreaterThan(episode.percents[i - 1]!);
+        expect(episode.percents.some((value) => value > 0)).toBe(true);
+        if (episode.before === undefined || episode.after === undefined) continue;
+        // The turn goes on from where it stopped: at most the seconds from
+        // its last reading to the compaction, plus one for each sampling
+        // edge. The compaction's own seconds are not in it.
+        expect(episode.after).toBeGreaterThanOrEqual(episode.before);
+        expect(episode.after).toBeLessThanOrEqual(episode.before + Math.ceil(episode.gap / 1000) + 2);
+      }
+      // The finished turn's duration leaves out the compaction too: about
+      // what the turn clock last showed.
+      const total = turnSummarySeconds(pane, "one file per step")!;
+      console.log(`live turn: clock last ${lastTurn?.seconds}s, summary ${total}s`);
+      expect(total).toBeGreaterThanOrEqual(lastTurn!.seconds - 1);
+      expect(total).toBeLessThanOrEqual(lastTurn!.seconds + 2);
+      // Each compaction leaves a line; the longest one's shows about the
+      // time its row showed last.
+      const lines = compactedSeconds(await terminal.captureFullScrollback());
+      console.log(`live compacted lines: ${JSON.stringify(lines)}`);
+      expect(lines.length).toBeGreaterThanOrEqual(episodes.length);
+      const longest = Math.max(...episodes.map((episode) => episode.most));
+      expect(lines.some((seconds) => seconds >= longest && seconds <= longest + 2)).toBe(true);
+      expect(checkpoints(readFileSync(join(sessionDir(home, sessionId), "log.jsonl")))).toBeGreaterThan(0);
+      await terminal.sendText("/quit");
+      expect(await terminal.waitForSessionEnd(10_000)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "samples.json"), JSON.stringify(samples, null, 2));
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`live compaction evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      seedGateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 300_000);
 });

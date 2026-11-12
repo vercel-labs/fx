@@ -64,6 +64,8 @@ pub const CompactionActivityEffect = struct {
     begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
     running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
+    /// How much of the summary the model has written, from 1 to 99.
+    written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {

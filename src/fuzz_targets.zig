@@ -19,6 +19,7 @@ test {
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/cli/doctor_child_status.zig");
     _ = @import("core/app/trace_report.zig");
+    _ = @import("core/compactor/compactor.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
     _ = @import("core/images/image_attachments.zig");
@@ -30,6 +31,7 @@ test {
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
+    _ = @import("core/output/turn_clock.zig");
     _ = @import("core/mcp_host/credentials.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");

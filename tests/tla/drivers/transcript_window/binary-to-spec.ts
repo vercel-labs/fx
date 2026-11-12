@@ -178,7 +178,7 @@ async function runScenario(bin: string, dir: string) {
       await session.sendText("/compact");
       compactions += 1;
       await waitFor(() => existsSync(log) && (readFileSync(log, "utf8").match(/"kind":"compacted"/g) ?? []).length === compactions, `compaction ${compactions}`);
-      await session.waitForPane((pane) => !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      await session.waitForPane((pane) => !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
     }
     // A resize clears the screen and scrollback and replays what the window

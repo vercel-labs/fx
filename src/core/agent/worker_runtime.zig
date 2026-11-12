@@ -701,6 +701,12 @@ pub const WorkerRuntime = struct {
         self.compaction_presentation.running(id, stage);
     }
 
+    pub fn writtenCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, percent: u8) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.written(id, percent);
+    }
+
     pub fn settleCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -3515,6 +3521,36 @@ test "session transfer preserves active and finished prompt snapshots" {
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
+}
+
+test "a reader never sees the summary's count fall while the worker writes it" {
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    const id = runtime.beginCompactionActivity(.manual, null);
+    runtime.runCompactionActivity(id, .summary);
+    const Writer = struct {
+        fn run(target: *WorkerRuntime, operation: compaction_activity.OperationId) void {
+            for (0..20_000) |round| {
+                const percent: u8 = @intCast(round * 99 / 20_000);
+                target.writtenCompactionActivity(operation, percent);
+                // A lower count, as a fallback model's reply sends, in between.
+                target.writtenCompactionActivity(operation, percent / 2);
+            }
+            target.writtenCompactionActivity(operation, 100);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ &runtime, id });
+    var last: u8 = 0;
+    var reads: usize = 0;
+    while (last < 99) : (reads += 1) {
+        const now = runtime.compactionActivitySnapshot().operation.?.written_percent;
+        try std.testing.expect(now >= last);
+        try std.testing.expect(now <= 99);
+        last = now;
+    }
+    thread.join();
+    try std.testing.expectEqual(@as(u8, 99), runtime.compactionActivitySnapshot().operation.?.written_percent);
+    try std.testing.expect(reads > 0);
 }
 
 test "compaction activity survives worker finish without allocating a permission snapshot" {

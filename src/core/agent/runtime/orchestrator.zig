@@ -7110,7 +7110,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report };
+        return .{ .context = self, .report_fn = report, .written_fn = written };
+    }
+
+    fn written(context: *anyopaque, percent: u8) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.written) |write| write(self.deps.ctx, id, percent);
     }
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {
@@ -8437,7 +8444,8 @@ fn processQueuedPromptLoop(
                         .conversation = if (overflow_pending) null else request_data,
                     };
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
-                    const compacted = compactContext(arena, deps, .{
+                    const compaction_started_ms = io_mod.milliTimestamp();
+                    const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
                         .before_summary = source.hook(),
@@ -8451,7 +8459,11 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
-                    }) catch |err| {
+                    });
+                    // The turn's duration leaves out the compaction, as its
+                    // live clock does.
+                    summary_accumulator.addCompaction(compaction_started_ms, io_mod.milliTimestamp());
+                    const compacted = compaction_result catch |err| {
                         if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(

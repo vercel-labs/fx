@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const summarize = @import("summarize.zig");
+const progress = @import("progress.zig");
 const trace = @import("trace.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -59,6 +60,9 @@ pub const Call = struct {
     max_bytes: usize,
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
+    /// Receives the reply's text as it arrives, so the notes can be
+    /// counted while the model writes them.
+    on_text: ?progress.TextSink = null,
 };
 
 pub const CallError = error{ Cancelled, OutOfMemory };
@@ -99,6 +103,8 @@ pub const Summarizer = struct {
     trace_ctx: debug_trace.TraceContext,
     summaries: usize = 0,
     fallback_used: ?[]const u8 = null,
+    /// Receives each reply as it streams in.
+    on_text: ?progress.TextSink = null,
 
     pub fn model(self: *Summarizer) summarize.Model {
         return .{ .context = self, .summarize_fn = summarizeWith };
@@ -137,6 +143,9 @@ pub const Summarizer = struct {
     /// One summary request to `model_name`, at its lowest reasoning.
     fn ask(self: *Summarizer, alloc: Allocator, prompt: summarize.Prompt, model_name: []const u8) summarize.ModelError![]u8 {
         const caller = self.caller;
+        // Each reply starts on a line of its own, whatever the one before
+        // it left.
+        if (self.on_text) |sink| sink.write("\n");
         const reply = try caller.vtable.send(caller.context, alloc, .{
             .model = model_name,
             .reasoning = if (prompt.after_conversation) null else lowestReasoningEffort(caller.vtable.capabilities(caller.context, model_name)),
@@ -146,6 +155,7 @@ pub const Summarizer = struct {
             .max_bytes = max_summary_bytes,
             .cancel_flag = self.cancel_flag,
             .trace_ctx = self.trace_ctx,
+            .on_text = self.on_text,
         });
         const failure = switch (reply) {
             .text => |text| return text,

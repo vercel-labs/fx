@@ -43,6 +43,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
+const activity_status = @import("../output/activity_status.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const ui_render = @import("../../ui/render.zig");
 const render_request = @import("../../ui/render_request.zig");
@@ -338,6 +339,7 @@ pub fn Bindings(comptime App: type) type {
                     .begin = beginCompactionActivity,
                     .running = runCompactionActivity,
                     .settle = settleCompactionActivity,
+                    .written = if (comptime @hasDecl(@TypeOf(agent.worker), "writtenCompactionActivity")) writtenCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
@@ -1161,9 +1163,40 @@ pub fn Bindings(comptime App: type) type {
             agent.worker.runCompactionActivity(id, stage);
         }
 
+        fn writtenCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            agent.worker.writtenCompactionActivity(id, percent);
+        }
+
         fn settleCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             agent.worker.settleCompactionActivity(id, feedback);
+            if (feedback.outcome == .succeeded) pushCompactionDoneNotice(agent, id);
+        }
+
+        /// Leaves `Context compacted (2m10s)` in the transcript once the
+        /// compaction `id` has succeeded, with the time its row showed last.
+        fn pushCompactionDoneNotice(agent: *AppAgent, id: compaction_activity.OperationId) void {
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) return;
+            const op = agent.worker.compactionActivitySnapshot().operation orelse {
+                debug_trace.logf("compaction", "event=compaction_notice_dropped reason=no_operation", .{});
+                return;
+            };
+            if (op.id != id) {
+                debug_trace.logf("compaction", "event=compaction_notice_dropped reason=superseded", .{});
+                return;
+            }
+            var buf: [64]u8 = undefined;
+            const body = activity_status.compactionDoneNotice(&buf, op) orelse {
+                debug_trace.logf("compaction", "event=compaction_notice_dropped reason=no_line", .{});
+                return;
+            };
+            // No topic, so the line reads `✓ Context compacted (2m10s)`.
+            app_worker_runtime.Runtime(App).pushSemanticNotice(appOf(agent), agent, .{
+                .topic = "",
+                .tone = .success,
+                .body = body,
+            }) catch |err| debug_trace.logf("compaction", "event=compaction_notice_dropped reason={t}", .{err});
         }
 
         fn agentCommitContextCompaction(
