@@ -15154,6 +15154,153 @@ test "recovery growth does not release rows past the finality floor" {
     try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
 }
 
+const rebase_retained_attempt_flow =
+    "row-00\nrow-01\nrow-02\nrow-03\n" ++
+    "row-04\nrow-05\nrow-06\nrow-07\n";
+const rebase_retained_grown_flow = rebase_retained_attempt_flow ++
+    "row-08\nrow-09\nrow-10\nrow-11\n";
+
+/// Leaves the runtime holding the receipt of a partial frame that still owes
+/// four semantic rows.
+fn installRetainedRowsReceiptForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    rebase_pending: bool,
+) !void {
+    runtime.transcript_commit_state = .{
+        .recovering = .{
+            .accepted_visual_offset = 4,
+            .accepted_history_visual_offset = 4,
+            .attempt_visual_offset = 4,
+            .attempt_total_visual_rows = 8,
+            .materialized_visual_offset = 4,
+            .materialized_visual_rows = 4,
+            .materialized_flow_len = if (rebase_pending) null else rebase_retained_attempt_flow.len,
+            .remaining_semantic_rows = 4,
+            .remaining_semantic_progress_rows = if (rebase_pending) 0 else 4,
+            .attempt_cols = 20,
+            .projection_rebase_pending = rebase_pending,
+            .tracks_semantic_progress = !rebase_pending,
+            .flow = try alloc.dupe(u8, rebase_retained_attempt_flow),
+            .cursor_row = 4,
+            .cursor_col = 1,
+            // A rebase frame defers history it could not write.
+            .normal_buffer_recovery_pending = rebase_pending,
+        },
+    };
+}
+
+test "rebase receipt without publication entries plans no retained scroll rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, true);
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    // A rebase receipt can append only through its publication replay. With
+    // none, the retained rows cannot be written, so scrolling them would push
+    // blank rows into native scrollback while history stays behind.
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(facts.recovery_rebase);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+}
+
+test "frame from a rebase receipt without publication entries scrolls only rows it writes" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, true);
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+
+    // No append base exists for this receipt, so history stays where it was.
+    // Scrolling the terminal anyway would push blank rows into native
+    // scrollback, and the next frame would write the same rows again.
+    try std.testing.expect(transition.document_append.isEmpty());
+    try std.testing.expectEqual(@as(u32, 4), transition.history_visual_offset);
+    try std.testing.expectEqual(@as(u16, 0), scroll_plan.terminal_scroll_rows);
+}
+
+test "progress receipt keeps planning its retained scroll rows on growth" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, false);
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(!facts.recovery_rebase);
+    try std.testing.expect(facts.semantic_rows >= 4);
+    try std.testing.expect(facts.planned_rows > 0);
+}
+
+test "rebase receipt with publication entries also releases no retained scroll rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installRetainedRowsReceiptForTest(&runtime, alloc, true);
+    runtime.transcript_commit_state.recovering.retention_identity.publication_entries =
+        try alloc.dupe(u32, &.{1});
+    runtime.committed_frame_layout.terminal_cols = 20;
+    runtime.committed_frame_layout.terminal_rows = 8;
+
+    var source = try testSource(alloc, rebase_retained_grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    // The publication hold already releases nothing for a rebase receipt.
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expectEqual(true, facts.recovery_rebase);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+}
+
 test "pending replacement notice holds release until the finished replacement settles" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
