@@ -900,11 +900,13 @@ fn sameCredentialState(left: oauth_session.Session, right: oauth_session.Session
 pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
 ) !LogoutResult {
     var local = try logoutLocally(alloc);
     defer if (local.session) |*session| session.deinit(alloc);
     var result = local.result;
     if (local.session) |session| {
+        if (before_revocation) |notice| notice.run(notice.context);
         revokeLoggedOutSession(alloc, transport, session) catch {
             result.remote_revocation_failed = true;
         };

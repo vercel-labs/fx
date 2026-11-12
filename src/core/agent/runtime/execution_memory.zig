@@ -617,6 +617,28 @@ fn isSteering(message: ChatMessage) bool {
     return steeringText(content) != null;
 }
 
+/// Where the notes that join `messages` at the next step boundary go. A saved
+/// turn restores a boundary's notes before its steering (D93), so a note joins
+/// before the steering the last step ended with, such as a continuation prompt,
+/// the empty-reply nudge, review mode's message, or steering taken after a
+/// reply, and never after it. That steering is the longest tail of steering
+/// messages, each with the plain assistant message before it that the save keeps
+/// as its prefix. With none, the notes join at the end.
+///
+/// A message fx appends without a steering marker is not steering, and the save
+/// drops it: a Stop hook's message and the Vision outage notice are such
+/// messages here, so a note joins after them. Marking them is a separate change.
+pub fn boundaryNotesStart(messages: []const ChatMessage) usize {
+    var start = messages.len;
+    while (start > 0) {
+        const message = messages[start - 1];
+        if (message.role != .user or message.content == null or !isSteering(message)) break;
+        start -= 1;
+        if (start > 0 and messages[start - 1].role == .assistant and !startsPersistedToolStep(messages, start - 1)) start -= 1;
+    }
+    return start;
+}
+
 fn steeringText(content: []const u8) ?[]const u8 {
     // A subagent's report or message a boundary took keeps its frame, which
     // names it as untrusted agent output wherever it is replayed.
@@ -2685,6 +2707,194 @@ test "a context note between steps keeps every tool result and its feedback (D93
         try std.testing.expectEqualStrings("between steps", execution.context_notes[0].text);
         try std.testing.expectEqual(@as(usize, 1), execution.context_notes[0].after_tool_step_count);
         try std.testing.expectEqual(@as(usize, 0), execution.steering.len);
+    }
+}
+
+test "boundary notes join before the steering the last step ended with, and after everything else" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls = [_]ToolCall{toolCall("call_a", "read_file", "{\"path\":\"a\"}")};
+    const step = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "call_a", .tool_name = "read_file", .tool_result_status = .success },
+    };
+    const nudge: ChatMessage = .{ .role = .user, .content = "Your last reply had no text and no tool call.", .recovery_prompt = true };
+    const typed: ChatMessage = .{ .role = .user, .content = try steeringMessage(arena, "use the staging key") };
+    const prefix: ChatMessage = .{ .role = .assistant, .content = "Reading the file." };
+    const standalone: ChatMessage = .{ .role = .assistant, .content = "A reply that stays.", .standalone_response = true };
+    const frame: ChatMessage = .{ .role = .user, .content = agent_frame.report_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n" };
+    const feedback: ChatMessage = .{ .role = .user, .content = "allowed once", .tool_call_id = "call_a", .permission_feedback = true };
+
+    try std.testing.expectEqual(@as(usize, 0), boundaryNotesStart(&.{}));
+    // No steering: the notes join at the end.
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&step));
+    // Feedback belongs to its step, and a plain assistant message with no
+    // steering after it ends nothing.
+    try std.testing.expectEqual(@as(usize, 3), boundaryNotesStart(&(step ++ [_]ChatMessage{feedback})));
+    try std.testing.expectEqual(@as(usize, 3), boundaryNotesStart(&(step ++ [_]ChatMessage{prefix})));
+    // Steering at the end: the notes join before it, before every message of a
+    // run of it, and before the plain assistant message that precedes it.
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&(step ++ [_]ChatMessage{nudge})));
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&(step ++ [_]ChatMessage{ nudge, nudge })));
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&(step ++ [_]ChatMessage{ prefix, typed })));
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&(step ++ [_]ChatMessage{ prefix, typed, nudge, frame })));
+    // A reply that stays in the turn is a step of its own, so it stays before
+    // the notes, and so does a note that already joined.
+    try std.testing.expectEqual(@as(usize, 3), boundaryNotesStart(&(step ++ [_]ChatMessage{ standalone, nudge })));
+    try std.testing.expectEqual(@as(usize, 3), boundaryNotesStart(&(step ++ [_]ChatMessage{ contextNote("rules"), nudge })));
+    // The plain assistant message belongs to the steering after it, wherever in
+    // the run that is.
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&(step ++ [_]ChatMessage{ prefix, nudge, nudge })));
+    try std.testing.expectEqual(@as(usize, 2), boundaryNotesStart(&(step ++ [_]ChatMessage{ nudge, prefix, typed })));
+}
+
+// A turn's messages built the way the step loop builds them, with the boundary's
+// notes where `boundaryNotesStart` puts them, come back from a save as the turn
+// sent them: the next turn's request starts with the last request. Each seed
+// plays a turn of up to six requests, with steps of one or two results and
+// feedback, empty replies with and without a reply that stays, steering after a
+// reply, a failed request's recovery prompt, and notes from the gate and from a
+// changed runtime context. A Stop hook's message and Vision's outage notice are
+// built as the step loop builds them, with no marker, and the save drops them;
+// the restored turn is the sent one without them, until they are marked.
+test "a turn's messages come back from a save in the order the step loop sent them (seeded)" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    const Check = struct {
+        /// A user message fx sends with no steering marker, no feedback flag,
+        /// and no note flag: the save has no place for it.
+        fn unmarked(message: ChatMessage) bool {
+            return message.role == .user and message.content != null and !isSteering(message) and
+                !message.permission_feedback and !isContextNote(message);
+        }
+
+        fn roundTrip(a: Allocator, seed: u64, sent_all: []const ChatMessage) !void {
+            var arena_state = std.heap.ArenaAllocator.init(a);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var kept: std.ArrayList(ChatMessage) = .empty;
+            for (sent_all) |message| {
+                if (!unmarked(message)) try kept.append(arena, message);
+            }
+            const live = kept.items;
+            const saved = try buildExecutionMemory(a, sent_all);
+            defer types.freeExecutionMemory(a, saved);
+            var restored: std.ArrayList(ChatMessage) = .empty;
+            try session.appendExecutionMemoryChatMessages(arena, &restored, saved);
+            const back = try rewrapRestoredSteering(arena, restored.items);
+            std.testing.expectEqual(live.len, back.len) catch |err| {
+                std.debug.print("seed {d}: {d} messages kept, {d} restored\n", .{ seed, live.len, back.len });
+                for (sent_all) |message| std.debug.print("  sent {s} {s} {s}\n", .{ @tagName(message.role), if (message.tool_calls.len > 0) "(calls)" else "", message.content orelse "" });
+                for (back) |message| std.debug.print("  back {s} {s} {s}\n", .{ @tagName(message.role), if (message.tool_calls.len > 0) "(calls)" else "", message.content orelse "" });
+                return err;
+            };
+            for (live, back, 0..) |sent, got, index| {
+                const same = sent.role == got.role and
+                    std.mem.eql(u8, sent.content orelse "", got.content orelse "") and
+                    sent.recovery_prompt == got.recovery_prompt and
+                    sent.context_note == got.context_note and
+                    sent.permission_feedback == got.permission_feedback and
+                    sent.tool_calls.len == got.tool_calls.len;
+                if (!same) {
+                    std.debug.print("seed {d}: message {d} sent as {s} {s}, restored as {s} {s}\n", .{
+                        seed, index, @tagName(sent.role), sent.content orelse "", @tagName(got.role), got.content orelse "",
+                    });
+                    return error.TestExpectedEqual;
+                }
+            }
+        }
+    };
+    var seed: u64 = 0;
+    while (seed < 300) : (seed += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+        var live: std.ArrayList(ChatMessage) = .empty;
+        var gate_notes: usize = 0;
+        var calls_made: usize = 0;
+        var requests: usize = 0;
+        while (requests < 6) {
+            // The top of a step: the gate's notes and a changed runtime context
+            // join before the steering the last step ended with, then steering
+            // the user typed.
+            var notes: std.ArrayList(ChatMessage) = .empty;
+            while (gate_notes > 0) : (gate_notes -= 1) {
+                try notes.append(arena, contextNote(try arena.print("gate note {d}", .{live.items.len})));
+            }
+            if (random.uintLessThan(u8, 4) == 0) try notes.append(arena, contextNote(try arena.print("runtime update {d}", .{live.items.len})));
+            try live.insertSlice(arena, boundaryNotesStart(live.items), notes.items);
+            if (random.uintLessThan(u8, 5) == 0) try live.append(arena, .{ .role = .user, .content = try steeringMessage(arena, try arena.print("typed {d}", .{live.items.len})) });
+            requests += 1;
+            try Check.roundTrip(alloc, seed, live.items);
+            // The reply.
+            switch (random.uintLessThan(u8, 7)) {
+                0, 1, 2 => {
+                    const results = 1 + random.uintLessThan(usize, 2);
+                    const calls = try arena.alloc(ToolCall, results);
+                    for (calls) |*call| {
+                        calls_made += 1;
+                        call.* = toolCall(try arena.print("call_{d}", .{calls_made}), "read_file", "{\"path\":\"a\"}");
+                    }
+                    try live.append(arena, .{ .role = .assistant, .tool_calls = calls });
+                    for (calls, 0..) |call, index| {
+                        try live.append(arena, .{ .role = .tool, .content = "ok", .tool_call_id = call.id, .tool_name = call.name, .tool_result_status = .success });
+                        // Vision's outage notice follows its own result, here the
+                        // step's last. Between two results it would also cut off
+                        // the later results, which the save does not keep.
+                        if (index == calls.len - 1 and random.uintLessThan(u8, 5) == 0) try live.append(arena, .{ .role = .user, .content = "None of the requested images were read by Vision." });
+                    }
+                    if (random.boolean()) try live.append(arena, .{ .role = .user, .content = "allowed once", .tool_call_id = calls[0].id, .permission_feedback = true });
+                    if (random.boolean()) gate_notes += 1;
+                    if (random.uintLessThan(u8, 4) == 0) try live.append(arena, .{ .role = .user, .content = "Review the changes you just made.", .recovery_prompt = true });
+                },
+                3 => {
+                    if (random.boolean()) try live.append(arena, .{ .role = .assistant, .content = "A reply that stays.", .standalone_response = true });
+                    try live.append(arena, .{ .role = .user, .content = "Your last reply had no text and no tool call.", .recovery_prompt = true });
+                },
+                4 => {
+                    try live.append(arena, .{ .role = .assistant, .content = "A reply the hook continues.", .standalone_response = true });
+                    try live.append(arena, .{ .role = .user, .content = "Continue the turn. fx hook context:\nkeep going" });
+                },
+                5 => {
+                    if (random.boolean())
+                        try live.append(arena, .{ .role = .assistant, .content = "A reply that stays.", .standalone_response = true })
+                    else
+                        try live.append(arena, .{ .role = .assistant, .content = "Reading the file." });
+                    try live.append(arena, .{ .role = .user, .content = try steeringMessage(arena, "typed after the reply") });
+                },
+                else => try live.append(arena, .{ .role = .user, .content = "Continue from the preceding tool result.", .recovery_prompt = true }),
+            }
+            // A turn may end here: nothing more is sent, and what the reply added
+            // is saved too.
+            try Check.roundTrip(alloc, seed, live.items);
+            if (random.uintLessThan(u8, 6) == 0) break;
+        }
+    }
+}
+
+test "a turn cancelled after review mode's message keeps it as fx's own steering" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{toolCall("call_a", "write_file", "{\"path\":\"a\"}")};
+    const review = "Review the changes you just made.";
+    const live = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "wrote a", .tool_call_id = "call_a", .tool_name = "write_file", .tool_result_status = .success },
+        .{ .role = .user, .content = review, .recovery_prompt = true },
+    };
+    for ([_]bool{ false, true }) |interrupted| {
+        const execution = if (interrupted)
+            try buildInterruptedExecutionMemory(alloc, &live, null)
+        else
+            try buildExecutionMemory(alloc, &live);
+        defer types.freeExecutionMemory(alloc, execution);
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+        try std.testing.expectEqualStrings(review, recovery_prompt.fromSaved(execution.steering[0].text).?);
     }
 }
 

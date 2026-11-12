@@ -274,6 +274,27 @@ fn append_steering_guidance(
     }
 }
 
+/// Adds the notes that join the turn at a step boundary: the notes the last
+/// step's gate queued, and a changed runtime context. The saved turn restores a
+/// boundary's notes before its steering (D93), so they join before the steering
+/// the last step ended with, such as a continuation prompt or the nudge, not
+/// after it (`boundaryNotesStart`). The turn's messages a compaction already
+/// took out of the request stay where they are.
+fn insertBoundaryNotes(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    compacted_suffix_len: usize,
+    notes: []const ChatMessage,
+) Allocator.Error!void {
+    if (notes.len == 0) return;
+    const start = runtime_execution_memory.boundaryNotesStart(within_turn_suffix.items);
+    const at = @max(start, @min(compacted_suffix_len, within_turn_suffix.items.len));
+    if (at < within_turn_suffix.items.len) {
+        debug_trace.logf("context", "boundary notes join before steering notes={d} index={d} messages={d}", .{ notes.len, at, within_turn_suffix.items.len });
+    }
+    try within_turn_suffix.insertSlice(arena, at, notes);
+}
+
 fn append_pending_steering_after_assistant(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2572,6 +2593,7 @@ fn toolboxRunSubject(
     if (!std.mem.eql(u8, call.name, toolbox.tool_name) or call.argument_integrity != .valid) return null;
     const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return null;
     if (std.mem.eql(u8, run.name, toolbox.tool_name)) return null;
+    if (run.arguments_from_text) debug_trace.logf("toolbox", "run arguments read from JSON text call={s} tool={s}", .{ call.id, run.name });
     var subject = call;
     subject.name = run.name;
     subject.arguments_json = run.arguments_json;
@@ -3715,6 +3737,27 @@ noinline fn effectiveRecoveryToolEvidence(
 ) resend_strategy.ToolEvidence {
     const observed = recoveryToolEvidence(completion, stream_ctx);
     return if (observed == .none) preserved else observed;
+}
+
+/// The tool evidence a settled attempt leaves. fx runs a completion's local
+/// calls only when it settles as completed, so an attempt that broke off or
+/// ended in a provider error never ran them. A completed attempt keeps
+/// `effectiveRecoveryToolEvidence`: its calls run next, and one may start
+/// before fx saves its intent. A call the provider runs itself may have run
+/// either way.
+fn settledAttemptToolEvidence(
+    preserved: resend_strategy.ToolEvidence,
+    completion: types.ModelCompletion,
+    disposition: types.ProviderCompletionDisposition,
+    stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
+) resend_strategy.ToolEvidence {
+    const evidence = effectiveRecoveryToolEvidence(preserved, completion, stream_ctx);
+    if (disposition != .interrupted and disposition != .provider_failure) return evidence;
+    if (evidence != .uncertain or completion.tool_calls.len == 0) return evidence;
+    if (stream_ctx.saw_provider_tool_start or hasProviderExecutedCall(completion.tool_calls)) {
+        return .uncertain;
+    }
+    return .proven_unexecuted;
 }
 
 fn restoredRecoveryToolEvidence(
@@ -5317,18 +5360,22 @@ fn optionalBytesEqual(current: ?[]const u8, next: []const u8) bool {
 }
 
 /// Refreshes the job's login in `mode` and takes it, with its team, through
-/// `adoptJobCredential`.
+/// `adoptJobCredential`. `rejected_token`, with `.force`, is the access token
+/// the provider just answered 401 for: the saved login then rotates only while
+/// it still holds that token (`tests/tla/auth/SharedLoginRefresh.tla`
+/// NoRedundantRotation).
 fn refreshGatewayCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
     job: *QueuedPrompt,
     job_arena: Allocator,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
     active_api_key: *[]const u8,
     owned_api_key: *?[]u8,
     trace_ctx: TraceContext,
 ) !bool {
-    const refreshed = (try loadJobCredential(deps, alloc, job.*, mode, trace_ctx)) orelse return false;
+    const refreshed = (try loadJobCredential(deps, alloc, job.*, mode, rejected_token, trace_ctx)) orelse return false;
     try adoptJobCredential(alloc, job, job_arena, mode, refreshed, active_api_key, owned_api_key, trace_ctx);
     return true;
 }
@@ -5341,12 +5388,13 @@ fn loadJobCredential(
     alloc: Allocator,
     job: QueuedPrompt,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
     trace_ctx: TraceContext,
 ) !?RefreshedGatewayCredential {
     const source = job.credential_source orelse return null;
     if (!credentials.sourceRefreshable(source)) return null;
     const refresh = deps.refresh_gateway_credential orelse return null;
-    return refresh(deps.ctx, alloc, source, mode, job.account_id) catch |err| {
+    return refresh(deps.ctx, alloc, source, mode, job.account_id, rejected_token) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.eventf(
             "gateway",
@@ -5426,7 +5474,7 @@ fn renewRejectedCredentialForJob(
     // comparison.
     const rejected = try alloc.dupe(u8, active_api_key.*);
     defer secret.zeroAndFree(alloc, rejected);
-    const stored = (try loadJobCredential(deps, alloc, job.*, .reload, trace_ctx)) orelse {
+    const stored = (try loadJobCredential(deps, alloc, job.*, .reload, null, trace_ctx)) orelse {
         debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
         return false;
     };
@@ -5435,7 +5483,7 @@ fn renewRejectedCredentialForJob(
     // it holds if the forced refresh gives nothing.
     try adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx);
     if (renewed) return true;
-    return refreshGatewayCredentialForJob(deps, alloc, job, job_arena, .force, active_api_key, owned_api_key, trace_ctx);
+    return refreshGatewayCredentialForJob(deps, alloc, job, job_arena, .force, rejected, active_api_key, owned_api_key, trace_ctx);
 }
 
 const ProviderAdmission = struct {
@@ -7727,9 +7775,10 @@ fn processQueuedPromptLoop(
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         // The notes the last step's gate queued follow that step's results and
-        // come before any steering at this boundary (D93).
+        // come before any steering at this boundary (D93), including the
+        // steering the last step ended with.
         if (pending_context_notes.items.len > 0) {
-            try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
+            try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, pending_context_notes.items);
             pending_context_notes.clearRetainingCapacity();
         }
         current_step_index = step + 1;
@@ -7771,7 +7820,8 @@ fn processQueuedPromptLoop(
             debug_trace.logf("context", "runtime context captured step={d} messages={d}", .{ current_step_index, runtime_context.messages().len });
         }
         if (runtime_update) |note| {
-            try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
+            const update = [_]ChatMessage{.{ .role = .system, .content = note, .context_note = true }};
+            try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, &update);
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
         const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
@@ -7983,6 +8033,7 @@ fn processQueuedPromptLoop(
                     &job,
                     arena,
                     if (credential_reload_pending) .reload else .if_needed,
+                    null,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
@@ -9031,9 +9082,10 @@ fn processQueuedPromptLoop(
                     false,
                     recovery_cause,
                     recovery_strategy,
-                    effectiveRecoveryToolEvidence(
+                    settledAttemptToolEvidence(
                         preserved_tool_evidence,
                         response_completion,
+                        settled_disposition,
                         &stream_ctx,
                     ),
                     step_ctx,
@@ -9108,12 +9160,13 @@ fn processQueuedPromptLoop(
                 }
             };
 
-            // fx refreshed the login after a 401 and the gateway refused the
-            // new one too, so the login itself is good and signing in again
-            // cannot help. On a host that can ask, the request waits and
-            // resends with the same login as for a 5xx, showing the gateway's
-            // reason once; Esc during the wait falls through to the cancel
-            // path below. A host that cannot ask ends the turn as before.
+            // fx refreshed the login after a 401, or took the one another fx
+            // had saved, and the gateway refused that one too. A sign-in
+            // would not help, so on a host that can ask, the request waits
+            // and resends as for a 5xx, showing the gateway's reason once.
+            // The resend reloads the saved login, and its own 401 rotates
+            // it. Esc during the wait falls through to the cancel path
+            // below. A host that cannot ask ends the turn as before.
             if (response_failure) |failure| if (failure.kind == .unauthorized and auth_retry_used and
                 gatewayLogin(job.credential_source) and
                 request_recovery.canAskUser() and !config.cancel_flag.load(.seq_cst))
@@ -9369,9 +9422,10 @@ fn processQueuedPromptLoop(
                     );
                 }
                 if (retries) {
-                    const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                    const failure_tool_evidence = settledAttemptToolEvidence(
                         preserved_tool_evidence,
                         attempt_completion,
+                        attempt_disposition,
                         &stream_ctx,
                     );
                     _ = try request_recovery.failed(.{ .kind = failure_kind.? });

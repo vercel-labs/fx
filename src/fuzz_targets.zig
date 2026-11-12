@@ -8,6 +8,7 @@ test {
     _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("core/agent/assistant_presentation.zig");
+    _ = @import("core/auth/credentials.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/parallel_execution.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
@@ -17,6 +18,7 @@ test {
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/cli/doctor_child_status.zig");
+    _ = @import("core/app/trace_report.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
     _ = @import("core/images/image_attachments.zig");

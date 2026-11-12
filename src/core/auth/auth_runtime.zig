@@ -225,16 +225,21 @@ fn resetRequestPathCredentialVerification() void {
 
 /// Returns one complete owned credential after a provider-specific refresh.
 /// The caller owns every field and must call `Credential.deinit`.
+/// `rejected_token` is the access token the provider just answered 401 for.
+/// With `.force` an fx login then rotates only while the saved login still
+/// holds it, so the login another fx already refreshed is used as it is;
+/// Codex and Grok refresh whatever they hold.
 pub fn refreshCredentialForAccount(
     transport: oauth_transport.Provider,
     alloc: Allocator,
     source: credentials.Source,
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
-    var credential = (loadCredentialForRefresh(alloc, transport, source, mode) catch |err| {
+    var credential = (loadCredentialForRefresh(alloc, transport, source, mode, rejected_token) catch |err| {
         debug_trace.logf(
             "auth",
             "credential refresh provider failed source={t} mode={t} err={s}",
@@ -334,11 +339,12 @@ fn loadCredentialForRefresh(
     transport: oauth_transport.Provider,
     source: credentials.Source,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
 ) !?credentials.Credential {
     return switch (source) {
         .fx_login => switch (mode) {
             .if_needed, .reload => credentials.loadFxLoginCredential(alloc, transport),
-            .force => credentials.refreshFxLoginCredential(alloc, transport),
+            .force => credentials.refreshFxLoginCredential(alloc, transport, rejected_token),
         },
         .chatgpt_subscription => switch (mode) {
             .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
@@ -890,6 +896,7 @@ const PromptCredentialRefreshTask = struct {
             self.source,
             .if_needed,
             self.expected_account_id,
+            null,
         ) catch |err| {
             self.failure = err;
             self.done.store(true, .release);
@@ -3787,6 +3794,7 @@ test "auth runtime complete credential refresher ignores non-refreshable sources
             std.testing.allocator,
             source,
             .force,
+            null,
             null,
         )) == null);
     }

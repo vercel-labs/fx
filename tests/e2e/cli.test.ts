@@ -1307,6 +1307,63 @@ describe("cli: status", () => {
     );
   }
 
+  test("FX_HOME under a symlinked folder reads its own skills folder", async () => {
+    // fx resolves a symlinked folder above FX_HOME, such as macOS's $TMPDIR,
+    // and reads the profile's skills folder at its real path.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-link-")));
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const real = join(root, "real");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      mkdirSync(real);
+      symlinkSync(real, join(root, "link"));
+      const options = {
+        cwd: workspace,
+        env: {
+          HOME: home,
+          FX_HOME: join(root, "link", "profile"),
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+        },
+      };
+      const skillChecks = async () => {
+        const doctor = await runFx(["doctor", "--json"], options);
+        expect(doctor.stderr).toBe("");
+        return JSON.parse(doctor.stdout).checks.filter((check: { name: string }) => check.name === "skills");
+      };
+      const skills = join(real, "profile", "skills");
+
+      // A new profile has no skills folder yet, and that is not a problem.
+      expect(await skillChecks()).toEqual([]);
+
+      // A skill in the profile's own folder loads without a warning.
+      mkdirSync(join(skills, "linked-home"), { recursive: true });
+      writeFileSync(
+        join(skills, "linked-home", "SKILL.md"),
+        "---\nname: linked-home\ndescription: skill under a linked FX_HOME\n---\n\nBody\n",
+      );
+      expect(await skillChecks()).toEqual([]);
+
+      // A skills path fx cannot read still warns, and names the resolved path.
+      rmSync(skills, { recursive: true });
+      writeFileSync(skills, "not a folder\n");
+      expect(await skillChecks()).toEqual([
+        {
+          name: "skills",
+          status: "warn",
+          detail: `${skills} could not be read, so some skills may be missing`,
+          fix: "fix access to that folder",
+        },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test("FX_HOME holds settings and sessions in place of ~/.fx", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-")));
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_UNDER_FX_HOME")]);
@@ -4579,15 +4636,17 @@ describe("cli: credits", () => {
   );
 
   test(
-    "fx credits reports the team's Token Pass credit in text and JSON",
+    "fx credits reports the amount used and the team's Token Pass credit in text and JSON",
     async () => {
       const home = createIsolatedTestHome();
+      // AI Gateway names the amount spent `total_used`, which fx reports as used.
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         fetch: () =>
           Response.json({
             balance: "12.50",
+            total_used: "4.50",
             token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
           }),
       });
@@ -4603,13 +4662,16 @@ describe("cli: credits", () => {
         const json = await runFx(["credits", "--json"], { env });
         expect(json.code).toBe(0);
         expect(json.stderr).toBe("");
-        expect(JSON.parse(json.stdout.trim()).token_pass).toEqual({
+        const credits = JSON.parse(json.stdout.trim());
+        expect(credits.used).toBe("4.50");
+        expect(credits.token_pass).toEqual({
           remaining: "79.92906",
           resets_at: "2026-12-05T08:00:00.000Z",
         });
 
         const text = await runFx(["credits"], { env });
         expect(text.code).toBe(0);
+        expect(text.stdout).toContain("[credits] used=4.50\n");
         expect(text.stdout).toContain("[credits] token_pass_remaining=79.92906\n");
         expect(text.stdout).toContain("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n");
       } finally {

@@ -34,7 +34,21 @@ pub fn resolveSkillsHome(alloc: Allocator) Allocator.Error!?[]u8 {
 pub fn resolveManagedSkillsDir(alloc: Allocator) Allocator.Error!?[]u8 {
     const home = (try resolveSkillsHome(alloc)) orelse return null;
     defer alloc.free(home);
-    return try profile_paths.managedSkillsDir(alloc, home);
+    return try managedSkillsDirFor(alloc, home, profile_paths.fxHomeParent());
+}
+
+/// The managed skills directory. With `FX_HOME`, the folder that holds it is
+/// resolved as `resolveSkillsHome` resolves HOME, so a symlinked parent such
+/// as macOS's /tmp does not make a missing skills folder read as a symlinked
+/// root. The caller owns the returned path.
+fn managedSkillsDirFor(alloc: Allocator, home: []const u8, fx_home_parent: ?[]const u8) Allocator.Error![]u8 {
+    const parent = fx_home_parent orelse return try profile_paths.managedSkillsDir(alloc, home);
+    const real_parent = io_mod.realpathAlloc(alloc, parent) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try profile_paths.managedSkillsDir(alloc, home),
+    };
+    defer alloc.free(real_parent);
+    return try profile_paths.managedSkillsDirIn(alloc, real_parent);
 }
 
 pub fn loadSkills(
@@ -44,7 +58,7 @@ pub fn loadSkills(
 ) LoadSkillsError!LoadedSkills {
     const home = (try resolveSkillsHome(alloc)) orelse return .{};
     defer alloc.free(home);
-    const dir = try profile_paths.managedSkillsDir(alloc, home);
+    const dir = try managedSkillsDirFor(alloc, home, profile_paths.fxHomeParent());
     errdefer alloc.free(dir);
     const discovery = try skill_runtime.loadVisibleSkills(alloc, workspace_root, home, dir, root_policy);
 
@@ -148,6 +162,40 @@ test "loadSkills loads managed skills under HOME" {
     try std.testing.expectEqualStrings("Demo skill", loaded.skills[0].description);
     try std.testing.expectEqual(skill_runtime.SkillSource.global_fx, loaded.skills[0].source);
     try std.testing.expectEqual(@as(usize, 0), loaded.diagnostics.len);
+}
+
+test "the managed skills directory under FX_HOME resolves a symlinked parent" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "real-parent");
+    tmp.dir.symLink(std.testing.io, "real-parent", "linked-parent", .{ .is_directory = true }) catch |err| {
+        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
+        return err;
+    };
+    const tmp_root = try tmpPath(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+    const linked_parent = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "linked-parent" });
+    defer alloc.free(linked_parent);
+    const real_parent = try tmpPath(alloc, tmp.dir, "real-parent");
+    defer alloc.free(real_parent);
+
+    const dir = try managedSkillsDirFor(alloc, "/Users/example", linked_parent);
+    defer alloc.free(dir);
+    const expected = try profile_paths.managedSkillsDirIn(alloc, real_parent);
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, dir);
+    try std.testing.expect(std.mem.find(u8, dir, "linked-parent") == null);
+
+    // A parent that cannot be resolved keeps the configured path.
+    const fallback = try managedSkillsDirFor(alloc, "/Users/example", "/nonexistent-fx-parent");
+    defer alloc.free(fallback);
+    const configured = try profile_paths.managedSkillsDir(alloc, "/Users/example");
+    defer alloc.free(configured);
+    try std.testing.expectEqualStrings(configured, fallback);
 }
 
 test "loadSkills canonicalizes a symlinked HOME before discovering optional roots" {
