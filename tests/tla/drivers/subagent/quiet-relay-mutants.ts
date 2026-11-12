@@ -93,7 +93,6 @@ const unitFilters = [
   "masks secrets",
   "a call's label stays one line",
   "a call ends only itself",
-  "durations read",
   "the quiet note names",
   "a quiet note for a child",
   "only a running result that ended",
