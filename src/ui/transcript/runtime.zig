@@ -351,7 +351,8 @@ const TranscriptRecoveryReceipt = struct {
     // Semantic rows the receipt owed that no frame wrote. The store reconciles
     // a source rewrite into the receipt before the next frame and zeroes the
     // rows above, and a frame can accept fewer rows than are owed. The stable
-    // anchor such a receipt commits needs a catch-up flag for them.
+    // anchor such a receipt commits needs a catch-up flag for them. The count
+    // is in rows at `attempt_cols`, so a resize frame does not carry it.
     dropped_semantic_rows: u32 = 0,
     remaining_unplanned_scroll_rows: u16 = 0,
     attempt_cols: u16 = 0,
@@ -10842,12 +10843,36 @@ pub const TranscriptRuntime = struct {
                 .invalid, .stable => {},
             }
             // Rows the previous receipt owed that this frame neither accepted nor
-            // still owes were dropped; the next receipt keeps count of them.
+            // still owes were dropped; the next receipt keeps count of them. The
+            // count is in rows at the receipt's width. A frame at another width,
+            // or one that still measures a resize, belongs to the resize: the
+            // terminal reflowed those rows and the resize recovery owns the
+            // debt, so replaying the old-width rows would write them twice.
             const dropped_semantic_rows: u32 = switch (previous_state) {
-                .recovering => |receipt| receipt.dropped_semantic_rows +|
-                    (receipt.remaining_semantic_rows -|
-                        commit.accepted.semantic_rows -|
-                        commit.remaining_semantic_rows),
+                .recovering => |receipt| carried: {
+                    const unwritten = receipt.dropped_semantic_rows +|
+                        (receipt.remaining_semantic_rows -|
+                            commit.accepted.semantic_rows -|
+                            commit.remaining_semantic_rows);
+                    if (receipt.attempt_cols == transition.target_layout.terminal_cols and
+                        self.resize_history_row_delta == null)
+                    {
+                        break :carried unwritten;
+                    }
+                    if (unwritten > 0) {
+                        debug_trace.logf(
+                            "scroll",
+                            "transcript_history_debt_dropped rows={d} reason=resize receipt_cols={d} frame_cols={d} resize_delta_pending={s}",
+                            .{
+                                unwritten,
+                                receipt.attempt_cols,
+                                transition.target_layout.terminal_cols,
+                                if (self.resize_history_row_delta != null) "true" else "false",
+                            },
+                        );
+                    }
+                    break :carried 0;
+                },
                 .invalid, .stable => 0,
             };
             self.transcript_commit_state = .{ .recovering = .{
