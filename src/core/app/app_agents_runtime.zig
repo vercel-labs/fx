@@ -127,10 +127,6 @@ pub const ChildAgent = struct {
 /// above a closed agent: a subagent, or an instance with null for the first.
 const ListedAgent = struct { agent: ?*ChildAgent };
 
-/// The open list's search, carried across a preview switch: its text, which
-/// the caller frees, and where the cursor and selection were in it.
-const CarriedSearch = struct { text: []u8, cursor: usize, selection_anchor: ?usize };
-
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
 /// is doing now. It opens on the agent on screen, and its highlight is a
@@ -1510,37 +1506,6 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Copies the open list's search out of the composer, with its cursor
-        /// and selection, and empties it, so a switch can carry it on to the
-        /// arriving agent's composer. Null with no search, or when the copy
-        /// can't be made, which drops it. The caller frees the text.
-        fn takeSearch(app: *App) ?CarriedSearch {
-            const edit = &app.input_runtime.edit_state;
-            const text = edit.input.items;
-            if (text.len == 0) return null;
-            const copy = app.alloc.dupe(u8, text) catch {
-                debug_trace.logf("host", "agent list search dropped bytes={d} reason=out_of_memory", .{text.len});
-                return null;
-            };
-            const search: CarriedSearch = .{ .text = copy, .cursor = edit.cursor, .selection_anchor = edit.selection_anchor };
-            app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            return search;
-        }
-
-        /// Types `search`, which `takeSearch` carried, into the composer, the
-        /// open list's search box, with the cursor and selection where they
-        /// were, so the next key edits where the user left off.
-        fn putSearchBack(app: *App, search: CarriedSearch) void {
-            app.input_runtime.textReplacementState().replace(app.alloc, search.text) catch {
-                debug_trace.logf("host", "agent list search dropped bytes={d} reason=out_of_memory", .{search.text.len});
-                return;
-            };
-            const edit = &app.input_runtime.edit_state;
-            const len = edit.input.items.len;
-            edit.cursor = @min(search.cursor, len);
-            edit.selection_anchor = if (search.selection_anchor) |anchor| @min(anchor, len) else null;
-        }
-
         /// The composer's search changed, so rows came or went: the list
         /// scrolls back to its top, a close the first Delete armed lapses,
         /// and when the highlight moved to another row the list shows its
@@ -2130,11 +2095,11 @@ pub fn Runtime(comptime App: type) type {
             if (leaving == arriving) return;
             // The open list's search box lends the composer: each agent keeps
             // its own draft, and the arriving one's is set aside in turn. The
-            // search typed in the box goes on with the list, which shows each
-            // agent it highlights by switching to it.
+            // search typed in the box, with its cursor and selection, goes on
+            // with the list, which shows each agent it highlights by switching
+            // to it.
             const searching = menuActive(app);
-            const search = if (searching) takeSearch(app) else null;
-            defer if (search) |carried| app.alloc.free(carried.text);
+            var search: composer_stash.State = if (searching) composer_stash.State.capture(app.input_runtime.composerStashView()) else .{};
             if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
@@ -2146,7 +2111,7 @@ pub fn Runtime(comptime App: type) type {
             arriving.draft.restore(app.alloc, app.input_runtime.composerStashView());
             if (searching) {
                 setDraftAside(app);
-                if (search) |carried| putSearchBack(app, carried);
+                search.restore(app.alloc, app.input_runtime.composerStashView());
             }
             app.agent_on_screen = target;
             app.screen_owner = if (target) |child| &child.agent else null;
