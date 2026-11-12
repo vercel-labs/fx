@@ -835,15 +835,25 @@ pub const PromptCredentialRefreshPoll = union(enum) {
     }
 };
 
+/// Refreshes the prompt's credential on its own thread. A refresh is never
+/// cut off once it starts: an issuer that rotates the refresh token has
+/// already retired the stored one, so a dropped answer would sign out every
+/// fx process that shares the login. When the prompt no longer wants the
+/// result, the thread still saves the new login and then frees the task.
 const PromptCredentialRefreshTask = struct {
+    const State = enum(u8) { running, done, abandoned };
+
+    /// Its context must outlive the thread, which can outlive the task's owner.
     transport: oauth_transport.Provider,
     source: credentials.Source,
     expected_account_id: ?[]u8,
     thread: ?std.Thread = null,
-    cancel_requested: std.atomic.Value(bool) = .init(false),
-    done: std.atomic.Value(bool) = .init(false),
+    state: std.atomic.Value(State) = .init(.running),
     credential: ?credentials.Credential = null,
     failure: ?anyerror = null,
+
+    /// Abandoned refreshes that have finished, for tests that wait for them.
+    var abandoned_finished: std.atomic.Value(usize) = .init(0);
 
     fn start(
         transport: oauth_transport.Provider,
@@ -868,24 +878,29 @@ const PromptCredentialRefreshTask = struct {
     }
 
     fn workerMain(self: *PromptCredentialRefreshTask) void {
-        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel_requested };
         self.credential = refreshCredentialForAccount(
-            transport.provider(),
+            self.transport,
             std.heap.c_allocator,
             self.source,
             .if_needed,
             self.expected_account_id,
-        ) catch |err| {
+        ) catch |err| blk: {
             self.failure = err;
-            self.done.store(true, .release);
-            return;
+            break :blk null;
         };
-        if (self.credential == null) self.failure = error.CredentialRefreshUnavailable;
-        self.done.store(true, .release);
+        if (self.credential == null and self.failure == null) self.failure = error.CredentialRefreshUnavailable;
+        if (self.state.cmpxchgStrong(.running, .done, .acq_rel, .acquire) == null) return;
+        // The prompt left before the refresh finished; the store already
+        // holds whatever the refresh saved.
+        debug_trace.logf("auth", "prompt credential refresh finished after its prompt left source={t} renewed={}", .{ self.source, self.credential != null });
+        if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
+        self.credential = null;
+        self.destroy();
+        _ = abandoned_finished.fetchAdd(1, .seq_cst);
     }
 
     fn poll(self: *const PromptCredentialRefreshTask) bool {
-        return self.done.load(.acquire);
+        return self.state.load(.acquire) == .done;
     }
 
     fn takeResult(self: *PromptCredentialRefreshTask) PromptCredentialRefreshPoll {
@@ -903,10 +918,18 @@ const PromptCredentialRefreshTask = struct {
         return result;
     }
 
+    /// Drops the task without waiting: a running refresh finishes on its
+    /// thread, which then frees the task.
     fn deinit(self: *PromptCredentialRefreshTask) void {
-        self.cancel_requested.store(true, .seq_cst);
-        if (self.thread) |thread| thread.join();
+        const thread = self.thread;
         self.thread = null;
+        if (self.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) {
+            // The worker owns `self` from here; only the local handle is used.
+            debug_trace.logf("auth", "prompt credential refresh left running reason=prompt_cancelled", .{});
+            if (thread) |handle| handle.detach();
+            return;
+        }
+        if (thread) |handle| handle.join();
         if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
         self.credential = null;
         self.destroy();
@@ -5640,4 +5663,59 @@ test "auth runtime shutdown waits for a remote revocation in flight" {
     runtime.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
+}
+
+/// Answers discovery, then holds the token request until the test releases
+/// it, as a slow issuer would. It gives up early only when the request
+/// carries a cancel flag that is set.
+const HeldRefreshTransport = struct {
+    token_request_seen: std.atomic.Value(bool) = .init(false),
+    token_request_cancellable: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn provider(self: *HeldRefreshTransport) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *HeldRefreshTransport = @ptrCast(@alignCast(raw.?));
+        if (request.method == .get) return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}"),
+        };
+        self.token_request_cancellable.store(request.cancel_flag != null, .seq_cst);
+        self.token_request_seen.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) {
+            if (request.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+            std.Thread.yield() catch {};
+        }
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"access_token\":\"renewed-token\",\"refresh_token\":\"renewed-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}"),
+        };
+    }
+};
+
+test "a prompt that leaves during its credential refresh lets the refresh finish and save the new login" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    const finished_before = PromptCredentialRefreshTask.abandoned_finished.load(.seq_cst);
+
+    const task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
+    while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+    // The prompt leaves while the token request is on the wire. Nothing waits
+    // for the issuer, and nothing cuts the request off.
+    task.deinit();
+    try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+
+    transport.release.store(true, .seq_cst);
+    while (PromptCredentialRefreshTask.abandoned_finished.load(.seq_cst) == finished_before) std.Thread.yield() catch {};
+    var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-token", stored.token);
 }
