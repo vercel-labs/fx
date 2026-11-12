@@ -337,3 +337,64 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
     TIMEOUT,
   );
 });
+
+describe.skipIf(TMUX_SKIP)("tui: loop", () => {
+  /// Starts fx on the fake gateway in auto mode, wide enough that a loop's
+  /// notices and list rows stay on one line each.
+  async function launchLoopTerminal(name: string, env: Record<string, string> = {}): Promise<{ stderrPath: string }> {
+    const root = mkdtempSync(join(tmpdir(), `fx-loop-${name}-`));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    tempDirs.push(root);
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      isolated: true,
+      width: 160,
+      height: 40,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "loop-key",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway!.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway!.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway!.baseUrl}/coding-agent/v1/models`,
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_PERMISSION_MODE: "auto",
+        VERCEL_OIDC_TOKEN: undefined,
+        NO_COLOR: "1",
+        ...env,
+      },
+    });
+    await session.waitForComposer(10_000);
+    return { stderrPath };
+  }
+
+  test(
+    "loop arms, lists, and stops",
+    async () => {
+      gateway = startFakeGateway([]);
+      const { stderrPath } = await launchLoopTerminal("arm");
+
+      await session!.sendText("/loop");
+      await session!.waitForText("No active loops. Start one with /loop <interval> <prompt>.", 5_000);
+      await session!.sendText("/loop 1h say LOOP_OK");
+      await session!.waitForText("Loop 1 runs every 1h until you stop it or fx exits: say LOOP_OK", 5_000);
+      await session!.sendText("/loop");
+      await session!.waitForText(/1 +every 1h +next in \d+m +runs 0 +failures 0\/3 +say LOOP_OK/, 5_000);
+      await session!.sendText("/loop stop 1");
+      await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.sendText("/loop stop 1");
+      await session!.waitForText("No loop 1. /loop lists active loops.", 5_000);
+      await session!.sendText("/loop 30s ping");
+      await session!.waitForText("30s is shorter than the 1m minimum.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+});

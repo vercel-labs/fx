@@ -16,6 +16,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const child_run_mod = @import("child_run.zig");
 const profiles = @import("../profiles/profiles.zig");
 const tool_set = @import("../tooling/tool_set.zig");
+const loops = @import("../loops/loops.zig");
 
 /// How many history turns an agent's session keeps in memory.
 pub const max_history_turns: usize = 8;
@@ -89,4 +90,7 @@ pub const Agent = struct {
     profile: profiles.Held = .{},
     /// fx's tools narrowed to `profile`, in its arena, or null for all of them.
     profile_tools: ?tool_set.ToolSet = null,
+    /// The prompts `/loop` reruns in this conversation. In memory only: they
+    /// end with the conversation or when fx exits. Main loop only.
+    loops: loops.Loops = .{},
 };

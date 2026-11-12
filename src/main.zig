@@ -1103,6 +1103,7 @@ const App = struct {
         self.instances.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         main_agent.session_title.deinit(self.alloc);
+        main_agent.loops.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self, main_agent);
         self.provider_selection.deinit();
         if (self.requested_resume) |*target| {

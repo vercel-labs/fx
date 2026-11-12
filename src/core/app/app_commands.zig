@@ -4,6 +4,7 @@ const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_loop_runtime = @import("app_loop_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -318,6 +319,7 @@ pub fn Handlers(comptime App: type) type {
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .handle_loop = commandHandleLoop,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
@@ -1475,6 +1477,15 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try handleWorkspaceCommand(app, rest);
+        }
+
+        fn commandHandleLoop(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !agents.hasAgentField(App, "loops")) {
+                try app.writeDomainNotice(.{ .topic = "loop", .tone = .@"error", .body = "/loop is unavailable in this runtime." }, true);
+                return;
+            }
+            try app_loop_runtime.Runtime(App).handleCommand(app, agents.screenAgentOf(app), rest);
         }
 
         fn commandShowVersion(ctx: *anyopaque) !void {
