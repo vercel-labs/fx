@@ -3,6 +3,7 @@ const client = @import("client.zig");
 const contracts = @import("contracts.zig");
 const operation = @import("operation.zig");
 const io_mod = @import("../shared/io.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -72,18 +73,17 @@ pub fn execute(
                 }
             }
         }
-        if (!cancellation_sent and yieldDue(ctx, started_ms, io_mod.milliTimestamp())) {
+        if (!cancellation_sent and managed_execution.steerYieldDue(
+            ctx.yield_flag,
+            started_ms,
+            io_mod.milliTimestamp(),
+            ctx.yield_grace_ms,
+        )) {
             _ = ctx.runtime.cancel(correlation_id);
             cancellation_sent = true;
         }
         io_mod.sleep(2 * std.time.ns_per_ms);
     }
-}
-
-fn yieldDue(ctx: Context, started_ms: i64, now_ms: i64) bool {
-    const flag = ctx.yield_flag orelse return false;
-    if (!flag.load(.acquire)) return false;
-    return now_ms - started_ms >= ctx.yield_grace_ms;
 }
 
 fn disconnectedActionIsRetryable(action: contracts.Action) bool {
@@ -115,23 +115,6 @@ fn mapAdmissionError(err: client.AdmissionError) contracts.StructuredErrorCode {
         error.RuntimeStopping => .cancelled,
         else => .invalid_request,
     };
-}
-
-test "a yield is due only once its flag is set and the grace time has passed" {
-    var flag = std.atomic.Value(bool).init(false);
-    var ctx = Context{
-        .alloc = std.testing.allocator,
-        .lifecycle_allocator = std.testing.allocator,
-        .runtime = undefined,
-        .yield_flag = &flag,
-        .yield_grace_ms = 250,
-    };
-    try std.testing.expect(!yieldDue(ctx, 1_000, 2_000));
-    flag.store(true, .release);
-    try std.testing.expect(!yieldDue(ctx, 1_000, 1_249));
-    try std.testing.expect(yieldDue(ctx, 1_000, 1_250));
-    ctx.yield_flag = null;
-    try std.testing.expect(!yieldDue(ctx, 1_000, 2_000));
 }
 
 test "disconnect retryability excludes actions that may already have effects" {

@@ -935,6 +935,8 @@ pub const Runtime = struct {
         wait_ceiling_ms: u32,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !PreparedSnapshot {
+        // `waitOrYield` without steering, for callers no steering reaches,
+        // such as tests.
         return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null);
     }
 
@@ -2046,6 +2048,35 @@ test "steering yield returns a captured command running and keeps it running" {
     }
     try std.testing.expect(std.mem.find(u8, completed.snapshot.output_delta, "done") != null);
     try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "a command that ends inside the steering grace returns its result" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var input = StartCapturedInput{
+        .execution_id = "managed-steer-grace",
+        .command = "printf quick",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .tool_yield_flag = &yield_flag,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    switch (started.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 }
 
 test "steering yield waits out its grace time" {

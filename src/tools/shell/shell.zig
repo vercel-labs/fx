@@ -804,19 +804,32 @@ fn attachSnapshotNotice(
     if (body.len == 0 or body[body.len - 1] != '}') return result;
     const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
     defer alloc.free(notice);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"notice\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeByte('}') catch return error.OutOfMemory;
-    const updated = try out.toOwnedSlice();
+    const updated = (try withJsonStringField(alloc, body, "notice", notice)).?;
     alloc.free(body);
     return switch (result) {
         .success => .{ .success = updated },
         .failure => .{ .failure = updated },
         .rich => unreachable,
     };
+}
+
+/// Returns a copy of the JSON object `body` with the string field `name`,
+/// a plain key, set to `value` at its end, or null when `body` does not end
+/// in `}`. The caller owns the copy; `body` is left as it is.
+fn withJsonStringField(
+    alloc: Allocator,
+    body: []const u8,
+    comptime name: []const u8,
+    value: []const u8,
+) Allocator.Error!?[]u8 {
+    if (body.len == 0 or body[body.len - 1] != '}') return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"" ++ name ++ "\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
 }
 
 const steering_notice = "New steering arrived, so this call returned while the command keeps running. " ++
@@ -830,16 +843,28 @@ fn steerYieldRequested(ctx: tool_dispatch.DispatchContext) bool {
 /// Adds `steering_notice` to a JSON result of a command that returned
 /// running for steering. Frees `body` only when it returns the new one.
 fn attachSteeringNotice(alloc: Allocator, body: []u8) Allocator.Error![]u8 {
-    if (body.len == 0 or body[body.len - 1] != '}') return body;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"steering_notice\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(steering_notice, .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeByte('}') catch return error.OutOfMemory;
-    const updated = try out.toOwnedSlice();
+    const updated = (try withJsonStringField(alloc, body, "steering_notice", steering_notice)) orelse return body;
     alloc.free(body);
     return updated;
+}
+
+/// `attachSteeringNotice` for a result of `prepared` when its command still
+/// runs and steering asked it to yield. On failure it gives up the result's
+/// delivery, and the caller still owns `body`.
+fn noteSteeringYield(
+    ctx: tool_dispatch.DispatchContext,
+    runtime: *managed_execution.Runtime,
+    prepared: *managed_execution.PreparedSnapshot,
+    body: []u8,
+) Allocator.Error![]u8 {
+    if (prepared.snapshot.state != .running or !steerYieldRequested(ctx)) return body;
+    return attachSteeringNotice(ctx.allocator, body) catch |err| {
+        runtime.cancelDelivery(
+            prepared.snapshot.execution_id,
+            prepared.reservation_id,
+        ) catch {};
+        return err;
+    };
 }
 
 fn callInteract(
@@ -1528,15 +1553,7 @@ fn finishPreparedWithAccepted(
         return runtimeFailure(ctx, err);
     };
     errdefer ctx.allocator.free(body);
-    if (prepared.snapshot.state == .running and steerYieldRequested(ctx)) {
-        body = attachSteeringNotice(ctx.allocator, body) catch |err| {
-            runtime.cancelDelivery(
-                prepared.snapshot.execution_id,
-                prepared.reservation_id,
-            ) catch {};
-            return err;
-        };
-    }
+    body = try noteSteeringYield(ctx, runtime, prepared, body);
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1649,15 +1666,7 @@ fn finishPrepared(
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result is unavailable") };
     };
     errdefer ctx.allocator.free(body);
-    if (action == .command and prepared.snapshot.state == .running and steerYieldRequested(ctx)) {
-        body = attachSteeringNotice(ctx.allocator, body) catch |err| {
-            runtime.cancelDelivery(
-                prepared.snapshot.execution_id,
-                prepared.reservation_id,
-            ) catch {};
-            return err;
-        };
-    }
+    if (action == .command) body = try noteSteeringYield(ctx, runtime, prepared, body);
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
