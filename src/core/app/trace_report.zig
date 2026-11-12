@@ -95,8 +95,9 @@
 //!   before its first work ends, or `unknown`), `last_reason` (masked), why
 //!   that work failed, `model`, `effort`, `title` (masked), `status`
 //!   (masked), its status row, such as a failed request that waits for the
-//!   user, `task` (masked), the start of its newest retained turn's prompt,
-//!   and `task_bytes`, that prompt's whole length, `turns_retained`,
+//!   user, `task` (masked), the start of its newest retained turn's prompt:
+//!   at most 240 bytes, without a word that cut would split, and
+//!   `task_bytes`, that prompt's whole length, `turns_retained`,
 //!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
 //!   calls in the tool-call window. A subagent that is not open has only
 //!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
@@ -1105,8 +1106,10 @@ fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) 
 }
 
 /// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
-/// boundary. Masking comes first, so a cut never splits a secret the mask
-/// would have found.
+/// boundary. Masking comes first, so this cut never splits a secret the mask
+/// would have found. A task comes already cut from the turn ring, which
+/// leaves out the word its own cut splits (`subagent_turn_metrics.keptPrompt`),
+/// so no part of a secret that cut shortened reaches the mask.
 fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
     return text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(r.arena, value), subagent_text_max_bytes);
 }
@@ -2497,10 +2500,10 @@ fn testSubagentTurn(subagent_id: u64, session_id: []const u8, outcome: []const u
     turn.model_len = "openai/gpt-5".len;
     @memcpy(turn.effort_buf[0.."high".len], "high");
     turn.effort_len = "high".len;
-    // The ring keeps the start of a prompt, cut on a UTF-8 boundary.
-    const kept = text_utils.utf8PrefixByBytes(prompt, turn.prompt_buf.len);
-    @memcpy(turn.prompt_buf[0..kept.len], kept);
-    turn.prompt_len = @intCast(kept.len);
+    // A longer prompt goes through the ring's own cut (`testRingTurn`).
+    std.debug.assert(prompt.len <= turn.prompt_buf.len);
+    @memcpy(turn.prompt_buf[0..prompt.len], prompt);
+    turn.prompt_len = @intCast(prompt.len);
     turn.prompt_total_bytes = @intCast(prompt.len);
     if (outcome.len > 0) {
         @memcpy(turn.outcome_buf[0..outcome.len], outcome);
@@ -2508,6 +2511,25 @@ fn testSubagentTurn(subagent_id: u64, session_id: []const u8, outcome: []const u
         turn.ended_at_ms = turn.started_at_ms + 25;
     }
     return turn;
+}
+
+/// Subagent turn 1 of `session_id` with `prompt`, as the turn ring keeps
+/// it. Resets the trace's rings.
+fn testRingTurn(session_id: []const u8, prompt: []const u8) diagnostics.SubagentTurn {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = 1,
+        .session_id = session_id,
+        .model = "openai/gpt-5",
+        .effort = "high",
+        .prompt = prompt,
+        .started_at_ms = 1_000,
+    });
+    var turns: [1]diagnostics.SubagentTurn = undefined;
+    const kept = diagnostics.snapshotSubagentTurns(&turns);
+    std.debug.assert(kept == 1);
+    return turns[0];
 }
 
 fn testSubagentRow(id: []const u8, name: []const u8) app_agents_runtime.TraceRow {
@@ -2688,11 +2710,11 @@ test "trace subagent records list closed sessions and numbers with no retained t
 
 test "trace subagent text is cut on a character boundary and keeps control characters inside its line" {
     const long_title = "x" ++ text_utils.repeat("\xc3\xa9", 300);
-    const long_task = text_utils.repeat("\xc3\xa9", 300);
+    const long_task = "first words " ++ text_utils.repeat("\xc3\xa9", 200);
     var row = testSubagentRow("child-long", "long");
     row.title = long_title;
     row.status = "a\x1b[31m red\r\n\ttabbed";
-    const turn = testSubagentTurn(5, "child-long", "completed", long_task);
+    const turn = testRingTurn("child-long", long_task);
     const w = try TestWriter.create();
     defer w.destroy();
     try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .turns = &.{turn}, .turns_total = 1 });
@@ -2706,8 +2728,9 @@ test "trace subagent text is cut on a character boundary and keeps control chara
     try std.testing.expectEqual(@as(i64, long_title.len), try testInt(record, "title_bytes"));
     try std.testing.expectEqualStrings(row.status, try testString(record, "status"));
     try expectAbsent(record, "status_bytes");
-    // The ring kept the first 240 bytes of the prompt.
-    try std.testing.expectEqualStrings(long_task[0..240], try testString(record, "task"));
+    // The ring's cut at 240 bytes falls inside the run of "é", so it kept
+    // only the words before it.
+    try std.testing.expectEqualStrings("first words ", try testString(record, "task"));
     try std.testing.expectEqual(@as(i64, long_task.len), try testInt(record, "task_bytes"));
 }
 
@@ -2747,58 +2770,166 @@ test "trace subagent records read the turn ring and the tool-call window" {
     try std.testing.expectEqual(@as(i64, 1_700_000_000_000), try testInt(turn, "started_at_ms"));
 }
 
-/// Writes one subagent whose every text is `text` and checks what a reader
-/// gets back: names and models as they are, the rest masked and cut.
-fn checkSubagentText(text: []const u8) !void {
+/// Bytes of a prompt the turn ring keeps.
+const ring_prompt_bytes = @typeInfo(@FieldType(diagnostics.SubagentTurn, "prompt_buf")).array.len;
+
+/// A secret the leak checks plant, and the length of its fixed start: a
+/// record that shows that start and the next byte shows part of the secret.
+/// Each body is capitals and digits, which `subagentFiller` never writes.
+const PlantedSecret = struct { text: []const u8, fixed: usize };
+
+const planted_secrets = [_]PlantedSecret{
+    .{ .text = "ghp_" ++ text_utils.repeat("Q7Z3", 9), .fixed = "ghp_".len },
+    .{ .text = "sk-" ++ text_utils.repeat("Q7Z3", 4), .fixed = "sk-".len },
+    .{ .text = "AKIA" ++ text_utils.repeat("Q7Z3", 4), .fixed = "AKIA".len },
+    .{ .text = "https://Q7Z3W9X2:V5T8R1N4Q7Z3@example.com", .fixed = "https://".len },
+};
+
+/// Fails, naming the secret, when a string anywhere in `trace` shows the
+/// fixed start of a planted secret and the byte after it.
+fn expectNoPlantedSecret(trace: *const TestTrace) !void {
+    for (trace.records) |record| try expectNoPlantedSecretIn(.{ .object = record });
+}
+
+fn expectNoPlantedSecretIn(value: std.json.Value) anyerror!void {
+    switch (value) {
+        .string => |text| for (planted_secrets) |secret| try expectNotIn(text, secret.text[0 .. secret.fixed + 1]),
+        .array => |items| for (items.items) |item| try expectNoPlantedSecretIn(item),
+        .object => |fields| {
+            var entries = fields.iterator();
+            while (entries.next()) |entry| try expectNoPlantedSecretIn(entry.value_ptr.*);
+        },
+        else => {},
+    }
+}
+
+/// `len` bytes of filler made from `fuzzed`, repeated as needed: each byte
+/// below 0x80 becomes a lowercase letter, a space, or a symbol, so the filler
+/// never holds a capital or a digit, and the other bytes stay as they are.
+fn subagentFiller(arena: std.mem.Allocator, fuzzed: []const u8, len: usize) ![]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz -_.=:/@\"'\\\n\r\t\x00\x1b\x7f";
+    const out = try arena.alloc(u8, len);
+    for (out, 0..) |*byte, index| {
+        const source: u8 = if (fuzzed.len == 0) 'a' else fuzzed[index % fuzzed.len];
+        byte.* = if (source < 0x80) alphabet[source % alphabet.len] else source;
+    }
+    return out;
+}
+
+/// `filler` cut to put `secret` across byte `cut`, `inside` bytes of it
+/// before the cut, with a space on each side.
+fn plantAcross(arena: std.mem.Allocator, filler: []const u8, secret: []const u8, cut: usize, inside: usize) ![]u8 {
+    return std.mem.concat(arena, u8, &.{ filler[0 .. cut - inside - 1], " ", secret, " ", filler[0..20] });
+}
+
+/// The `task` a trace shows for one subagent turn whose prompt holds
+/// `secret` across the turn ring's cut, `inside` bytes of it before the cut.
+/// Fails when any record shows part of a planted secret.
+fn taskWithSecretAcrossCut(arena: std.mem.Allocator, secret: []const u8, inside: usize) ![]const u8 {
+    const filler = text_utils.repeat("plan the work ", 20);
     const w = try TestWriter.create();
     defer w.destroy();
-    const a = w.arena.allocator();
-    const registry = [_]subagent_tool_host.Runtime.TraceChild{
-        .{ .id = try a.dupe(u8, "child-fuzz"), .phase = .running, .last_outcome = .failed, .last_failure = try a.dupe(u8, text), .closing = false },
-    };
-    var row = testSubagentRow("child-fuzz", text);
-    row.title = text;
-    row.status = text;
-    row.model = text;
-    row.effort = text;
-    const turns = [_]diagnostics.SubagentTurn{testSubagentTurn(1, "child-fuzz", "completed", text)};
-    try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .registry = &registry, .turns = &turns, .turns_total = 1 });
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, w.out.written(), "\n"));
-
+    const prompt = try plantAcross(w.records.arena, filler, secret, ring_prompt_bytes, inside);
+    const turn = testRingTurn("child-secret", prompt);
+    try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
     var trace = try w.trace();
     defer trace.deinit();
-    const ta = trace.arena.allocator();
-    const record = try trace.one("subagent");
-    inline for (.{ "name", "model", "effort" }) |name| {
-        if (text.len == 0) {
-            try expectAbsent(record, name);
-        } else {
-            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, text), try testString(record, name));
+    try expectNoPlantedSecret(&trace);
+    return arena.dupe(u8, try testString(try trace.one("subagent"), "task"));
+}
+
+test "trace subagent task never shows part of a secret the ring's cut split" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var leaks: usize = 0;
+    for (planted_secrets) |secret| {
+        for (1..secret.text.len + 1) |inside| {
+            _ = taskWithSecretAcrossCut(arena, secret.text, inside) catch {
+                std.debug.print("trace test: {s} leaks with {d} of its bytes before the cut\n", .{ secret.text, inside });
+                leaks += 1;
+                break;
+            };
         }
     }
-    const masked = try text_utils.maskSecrets(ta, text);
-    const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
-    try std.testing.expect(kept.len <= subagent_text_max_bytes);
-    if (std.unicode.utf8ValidateSlice(masked)) try std.testing.expect(std.unicode.utf8ValidateSlice(kept));
-    inline for (.{ "last_reason", "title", "status" }) |name| {
-        if (text.len == 0) {
-            try expectAbsent(record, name);
-        } else {
-            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, kept), try testString(record, name));
+    try std.testing.expectEqual(@as(usize, 0), leaks);
+
+    // The words before the secret stay; a secret that ends at the cut is
+    // kept whole and masked.
+    const words = text_utils.repeat("plan the work ", 20);
+    for (planted_secrets) |secret| {
+        for (1..secret.text.len + 1) |inside| {
+            const task = try taskWithSecretAcrossCut(arena, secret.text, inside);
+            const before = try std.mem.concat(arena, u8, &.{ words[0 .. ring_prompt_bytes - inside - 1], " " });
+            if (inside == secret.text.len) {
+                try expectStartsWith(task, before);
+                try std.testing.expect(task.len > before.len);
+            } else {
+                try std.testing.expectEqualStrings(before, task);
+            }
+        }
+    }
+}
+
+/// Writes a subagent whose name, model, and effort are fuzzed filler, and
+/// whose task, title, status row, and failure reason hold each planted secret
+/// across the cut of the turn ring or of the trace. Checks that every record
+/// is one JSON line, that no record shows part of a secret, and what a reader
+/// gets back.
+fn checkSubagentText(fuzzed: []const u8) !void {
+    const choice = std.hash.Wyhash.hash(0, fuzzed);
+    for (planted_secrets, 0..) |secret, secret_index| {
+        const w = try TestWriter.create();
+        defer w.destroy();
+        const a = w.records.arena;
+        const inside = 1 + @as(usize, @intCast((choice >> @intCast(secret_index * 16)) % secret.text.len));
+        const words = try subagentFiller(a, fuzzed, subagent_text_max_bytes);
+        const prompt = try plantAcross(a, words, secret.text, ring_prompt_bytes, inside);
+        const text = try plantAcross(a, words, secret.text, subagent_text_max_bytes, inside);
+        const name = try subagentFiller(a, fuzzed, fuzzed.len);
+        const registry = [_]subagent_tool_host.Runtime.TraceChild{
+            .{ .id = try a.dupe(u8, "child-fuzz"), .phase = .running, .last_outcome = .failed, .last_failure = text, .closing = false },
+        };
+        var row = testSubagentRow("child-fuzz", name);
+        row.title = text;
+        row.status = text;
+        row.model = name;
+        row.effort = name;
+        const turn = testRingTurn("child-fuzz", prompt);
+        // The ring keeps a start of the prompt that fits.
+        try std.testing.expect(std.mem.startsWith(u8, prompt, turn.prompt()));
+        try std.testing.expect(turn.prompt().len <= ring_prompt_bytes);
+        try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .registry = &registry, .turns = &.{turn}, .turns_total = 1 });
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, w.out.written(), "\n"));
+
+        var trace = try w.trace();
+        defer trace.deinit();
+        expectNoPlantedSecret(&trace) catch |err| {
+            std.debug.print("secret {s} with {d} bytes before the cut\n", .{ secret.text, inside });
+            return err;
+        };
+        const ta = trace.arena.allocator();
+        const record = try trace.one("subagent");
+        inline for (.{ "name", "model", "effort" }) |field| {
+            if (name.len == 0) {
+                try expectAbsent(record, field);
+            } else {
+                try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, name), try testString(record, field));
+            }
+        }
+        const masked = try text_utils.maskSecrets(ta, text);
+        const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
+        inline for (.{ "last_reason", "title", "status" }) |field| {
+            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, kept), try testString(record, field));
             if (kept.len < masked.len) {
-                try std.testing.expectEqual(@as(i64, @intCast(masked.len)), try testInt(record, name ++ "_bytes"));
-            } else try expectAbsent(record, name ++ "_bytes");
+                try std.testing.expectEqual(@as(i64, @intCast(masked.len)), try testInt(record, field ++ "_bytes"));
+            } else try expectAbsent(record, field ++ "_bytes");
         }
-    }
-    if (text.len == 0) {
-        try expectAbsent(record, "task");
-    } else {
-        const prompt = text_utils.utf8PrefixByBytes(text, turns[0].prompt_buf.len);
-        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, prompt), subagent_text_max_bytes);
+        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, turn.prompt()), subagent_text_max_bytes);
         try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, task), try testString(record, "task"));
-        try std.testing.expectEqual(@as(i64, @intCast(text.len)), try testInt(record, "task_bytes"));
+        try std.testing.expectEqual(@as(i64, @intCast(prompt.len)), try testInt(record, "task_bytes"));
+        try std.testing.expectEqual(@as(i64, 1), try testInt(try trace.one("subagent_turn"), "subagent_id"));
     }
-    try std.testing.expectEqual(@as(i64, 1), try testInt(try trace.one("subagent_turn"), "subagent_id"));
 }
 
 fn fuzzSubagentText(_: void, smith: *std.testing.Smith) !void {
@@ -2807,7 +2938,7 @@ fn fuzzSubagentText(_: void, smith: *std.testing.Smith) !void {
     try checkSubagentText(buffer[0..len]);
 }
 
-test "trace subagent records stay valid JSON lines for fuzzed text" {
+test "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text" {
     try std.testing.fuzz({}, fuzzSubagentText, .{
         .corpus = &(@import("fuzz_seed").slices(.{
             "",
@@ -2815,7 +2946,7 @@ test "trace subagent records stay valid JSON lines for fuzzed text" {
             "two\nlines\r\n\ttabbed",
             "\x1b[31mred\x1b[0m\x7f\xc2\x85",
             "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
-            "token=sk-live-0123456789abcdef0123456789 " ++ text_utils.repeat("\xc3\xa9", 210),
+            "token=\"open quote and spaces " ++ text_utils.repeat("\xc3\xa9", 210),
         }) ++ @import("fuzz_corpus").subagent_task_line.*),
     });
 }

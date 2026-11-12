@@ -57,7 +57,8 @@ pub const Turn = struct {
         return self.outcome_buf[0..self.outcome_len];
     }
 
-    /// The first bytes of the turn's prompt, cut on a UTF-8 boundary.
+    /// The first bytes of the turn's prompt, without a word the cut split
+    /// (`keptPrompt`).
     pub fn prompt(self: *const Turn) []const u8 {
         return self.prompt_buf[0..self.prompt_len];
     }
@@ -86,6 +87,21 @@ fn copyInto(buf: []u8, len: *u8, value: []const u8) void {
     len.* = @intCast(kept.len);
 }
 
+/// The part of `prompt` the ring keeps: its first `max_prompt_len` bytes,
+/// cut on a UTF-8 boundary, without the word the cut falls inside. `/trace`
+/// masks the prompt with `text_utils.maskSecrets`, which finds a secret only
+/// whole, so a secret the cut shortened would show unmasked. Each secret it
+/// finds ends at whitespace or at the end of the text, except a quoted value,
+/// which it masks to the end of a text that lost the closing quote. So the
+/// word that crosses the cut holds every part of a secret the cut split.
+fn keptPrompt(prompt: []const u8) []const u8 {
+    const kept = text_utils.utf8PrefixByBytes(prompt, max_prompt_len);
+    if (kept.len == prompt.len or std.ascii.isWhitespace(prompt[kept.len])) return kept;
+    var end = kept.len;
+    while (end > 0 and !std.ascii.isWhitespace(kept[end - 1])) end -= 1;
+    return kept[0..end];
+}
+
 /// Records a subagent turn as it starts. A turn with no number is not a
 /// subagent turn and is not recorded.
 pub fn recordStart(start: Start) void {
@@ -104,7 +120,7 @@ pub fn recordStart(start: Start) void {
     copyInto(&slot.session_id_buf, &slot.session_id_len, start.session_id);
     copyInto(&slot.model_buf, &slot.model_len, start.model);
     copyInto(&slot.effort_buf, &slot.effort_len, start.effort);
-    copyInto(&slot.prompt_buf, &slot.prompt_len, start.prompt);
+    copyInto(&slot.prompt_buf, &slot.prompt_len, keptPrompt(start.prompt));
     slot.prompt_total_bytes = @intCast(@min(start.prompt.len, std.math.maxInt(u32)));
 }
 
@@ -236,19 +252,42 @@ test "long values are cut on a UTF-8 boundary" {
     reset();
     defer reset();
 
-    var prompt: [max_prompt_len + 1]u8 = undefined;
-    @memset(prompt[0 .. max_prompt_len - 1], 'a');
+    var model_name: [max_model_len + 1]u8 = undefined;
+    @memset(model_name[0 .. max_model_len - 1], 'a');
     // "é" is two bytes; the cut falls between them.
-    prompt[max_prompt_len - 1] = 0xc3;
-    prompt[max_prompt_len] = 0xa9;
+    model_name[max_model_len - 1] = 0xc3;
+    model_name[max_model_len] = 0xa9;
+    // A prompt cut inside "é" loses the word around it too.
+    const prompt = text_utils.repeat("a", max_prompt_len - 3) ++ " b\xc3\xa9c";
     var start = startForTest(3, "child");
-    start.prompt = &prompt;
+    start.model = &model_name;
+    start.prompt = prompt;
     recordStart(start);
     const turns = try snapshotForTest();
     defer freeForTest(turns);
-    try testing.expectEqual(@as(usize, max_prompt_len - 1), turns[0].prompt().len);
-    try testing.expectEqual(@as(u32, max_prompt_len + 1), turns[0].prompt_total_bytes);
+    try testing.expectEqual(@as(usize, max_model_len - 1), turns[0].model().len);
+    try testing.expectEqualStrings(prompt[0 .. max_prompt_len - 2], turns[0].prompt());
+    try testing.expectEqual(@as(u32, prompt.len), turns[0].prompt_total_bytes);
     try testing.expect(std.unicode.utf8ValidateSlice(turns[0].prompt()));
+}
+
+test "a prompt cut inside a word leaves that word out, so no cut secret is kept" {
+    const filler = text_utils.repeat("word ", 46); // 230 bytes, ends in a space
+    const token = "ghp_" ++ text_utils.repeat("Q7Z3", 9);
+    const Case = struct { prompt: []const u8, kept: []const u8 };
+    const cases = [_]Case{
+        // The cut splits the token, so none of it is kept.
+        .{ .prompt = filler ++ "next " ++ token ++ " done", .kept = filler ++ "next " },
+        // The cut falls just before a space: the last word is whole.
+        .{ .prompt = filler ++ "abcdefghij more", .kept = filler ++ "abcdefghij" },
+        // The cut falls just after a space.
+        .{ .prompt = filler ++ "abcdefghi more", .kept = filler ++ "abcdefghi " },
+        // One word longer than the cut: nothing is kept.
+        .{ .prompt = text_utils.repeat("x", max_prompt_len + 5), .kept = "" },
+        // A prompt that fits is kept whole, its last word too.
+        .{ .prompt = filler ++ token[0..10], .kept = filler ++ token[0..10] },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case.kept, keptPrompt(case.prompt));
 }
 
 test "a reset clears the turns" {
