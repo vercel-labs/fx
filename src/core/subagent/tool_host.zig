@@ -3280,7 +3280,9 @@ test "the parent's close ends a working subagent's turn without a report and rem
     const listing = try runtime.listChildren(alloc);
     defer Runtime.freeChildListing(alloc, listing);
     try std.testing.expectEqual(@as(usize, 0), listing.len);
-    try waitUntilQuiet(runtime);
+    // The close is written as the slot ends, after the host stops counting
+    // the child as working.
+    try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
     {
@@ -3321,7 +3323,9 @@ test "the user's close of a working subagent reports that the user closed it" {
     const child_id = try reviewerId(runtime, arena);
     const closed = (try runtime.closeChild(child_id, .user)).?;
     try std.testing.expect(closed.stopped);
-    try waitUntilQuiet(runtime);
+    // The close is written as the slot ends, after the host stops counting
+    // the child as working.
+    try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
     try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, fixture.ends.items[0]);
     try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user closed it before it finished.") != null);
