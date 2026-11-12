@@ -62,8 +62,8 @@ fn parentRow(rows: []const AgentsMenuRow, index: usize) usize {
 }
 const column_gap: usize = 2;
 const branch_width: usize = 2;
-/// The state column: as wide as the longest state, "needs approval".
-const state_width: usize = 14;
+/// The widest state, "needs approval".
+const max_state_width: usize = 14;
 const max_name_width: usize = 22;
 const max_profile_width: usize = 16;
 const max_model_width: usize = 24;
@@ -117,6 +117,7 @@ const Columns = struct {
     /// A subagent's branch included.
     name: usize,
     title: usize,
+    state: usize,
     profile: usize,
     model: usize,
 
@@ -127,22 +128,25 @@ const Columns = struct {
     fn of(projection: AgentsMenuProjection, width: usize, indent: usize) Columns {
         var name: usize = 0;
         var title: usize = 0;
+        var state: usize = 0;
         var profile: usize = 0;
         var model: usize = 0;
         for (projection.rows) |row| {
             const branch = branchWidth(row);
             name = @max(name, branch + text_utils.terminalSafeVisibleWidth(row.name));
             title = @max(title, text_utils.terminalSafeVisibleWidth(titleOf(row)));
+            state = @max(state, text_utils.terminalSafeVisibleWidth(row.state));
             profile = @max(profile, text_utils.terminalSafeVisibleWidth(row.profile));
             var model_buf: [model_label_bytes]u8 = undefined;
             model = @max(model, text_utils.terminalSafeVisibleWidth(modelLabel(row, &model_buf)));
         }
         name = @min(name, max_name_width);
+        state = @min(state, max_state_width);
         profile = @min(profile, max_profile_width);
         model = @min(model, max_model_width);
 
         // One column stays free at the right edge, as in the session list.
-        const fixed = indent + name + column_gap + column_gap + state_width;
+        const fixed = indent + name + column_gap + column_gap + state;
         const room = (width -| 1) -| fixed;
         const title_floor = @min(title, min_title_width);
         if (room < title_floor + columnRoom(profile) + columnRoom(model)) profile = 0;
@@ -150,6 +154,7 @@ const Columns = struct {
         return .{
             .name = name,
             .title = @min(title, room -| (columnRoom(profile) + columnRoom(model))),
+            .state = state,
             .profile = profile,
             .model = model,
         };
@@ -169,7 +174,7 @@ const Columns = struct {
     }
 
     fn modelStart(self: Columns, indent: usize) usize {
-        return self.stateStart(indent) + state_width + column_gap;
+        return self.stateStart(indent) + self.state + column_gap;
     }
 
     fn profileStart(self: Columns, indent: usize) usize {
@@ -237,7 +242,7 @@ fn composeAgentRow(alloc: Allocator, projection: AgentsMenuProjection, index: us
     }
     try appendCell(alloc, &line, name_start, row.name, name_width, plain);
     try appendCell(alloc, &line, columns.titleStart(indent), titleOf(row), columns.title, dim);
-    try appendCell(alloc, &line, columns.stateStart(indent), row.state, state_width, state_style);
+    try appendCell(alloc, &line, columns.stateStart(indent), row.state, columns.state, state_style);
     var model_buf: [model_label_bytes]u8 = undefined;
     try appendCell(alloc, &line, columns.modelStart(indent), modelLabel(row, &model_buf), columns.model, dim);
     try appendCell(alloc, &line, columns.profileStart(indent), row.profile, columns.profile, dim);
@@ -470,8 +475,21 @@ test "a subagent's own subagents hang off its branch, which goes on past them to
         "  ├ lead       Plan the fix        idle",
         "  │ ├ helper   Check one fix       working",
         "  │ └ checker  Run the tests       idle",
-        "  └ tester     Run the auth tests  idle            tester",
+        "  └ tester     Run the auth tests  idle     tester",
         "    └ scout    Map the store       idle",
+    });
+}
+
+test "the state column is as wide as the widest state shown, so the model follows an idle one closely" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "idle", .model = "anthropic/claude-opus-4-7", .effort = "high" },
+        .{ .name = "scout", .subagent = true, .title = "List the open items", .state = "idle", .model = "anthropic/claude-opus-4-7" },
+    };
+    try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
+        "  Agents 2",
+        "",
+        "  main     Fix the login bug    idle  opus 4-7 high",
+        "  └ scout  List the open items  idle  opus 4-7",
     });
 }
 

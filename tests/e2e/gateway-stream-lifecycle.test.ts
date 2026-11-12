@@ -915,6 +915,9 @@ type ShellResult = {
   signal?: string;
   termination_indeterminate?: true;
   error?: string;
+  running_ms?: number;
+  quiet_ms?: number;
+  quiet_notice?: string;
 };
 
 function shellResult(body: string, callId: string): ShellResult {
@@ -6453,6 +6456,322 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
     }
   }, 30_000);
+
+  // The quiet limit the tests set with FX_TEST_SHELL_QUIET_NOTICE_MS in
+  // place of the 2 minute default.
+  const QUIET_LIMIT_MS = 1_500;
+
+  function quietEnv(root: FixtureRoot, gateway: GatewayFixture, limitMs: number): Record<string, string | undefined> {
+    return {
+      ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      FX_TEST_SHELL_QUIET_NOTICE_MS: String(limitMs),
+    };
+  }
+
+  // Plays one model step per request and records when each request came. A
+  // failed check ends the run with a final reply, so the test reports that
+  // check instead of the retries a failed request would start.
+  function scriptedGateway(steps: Array<(body: string) => Response>) {
+    const arrivals: number[] = [];
+    const failures: string[] = [];
+    const gateway = startGateway((body: string) => {
+      arrivals.push(Date.now());
+      const index = arrivals.length - 1;
+      const step = steps[index];
+      if (failures.length > 0) return fakeGatewayFinalText("Fixture failed.");
+      if (!step) {
+        failures.push(`step ${index}: unexpected request`);
+        return fakeGatewayFinalText("Fixture failed.");
+      }
+      try {
+        return step(body);
+      } catch (error) {
+        failures.push(`step ${index}: ${error instanceof Error ? error.message : String(error)}`);
+        return fakeGatewayFinalText("Fixture failed.");
+      }
+    });
+    return { gateway, arrivals, failures };
+  }
+
+  async function runQuietFixture(
+    label: string,
+    args: string[],
+    steps: Array<(body: string) => Response>,
+    finalText: string,
+    limitMs = QUIET_LIMIT_MS,
+  ): Promise<void> {
+    const root = createFixtureRoot(label);
+    const { gateway, failures } = scriptedGateway(steps);
+    try {
+      const result = await runFx(args, { cwd: root.workspace, env: quietEnv(root, gateway, limitMs), timeoutMs: 40_000 });
+      expect(failures).toEqual([]);
+      expect(result.code, result.stderr).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(finalText);
+      expect(gateway.requestCount()).toBe(steps.length);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  function shellInteract(callId: string, sessionId: string, yieldTimeMs: number): Response {
+    return fakeGatewayToolCall(callId, "shell", {
+      request: { action: "interact", session_id: sessionId, yield_time_ms: yieldTimeMs },
+    });
+  }
+
+  function shellStop(callId: string, sessionId: string): Response {
+    return fakeGatewayToolCall(callId, "shell", { request: { action: "stop", session_id: sessionId } });
+  }
+
+  function expectNoQuietFields(result: ShellResult): void {
+    expect(result.running_ms).toBeUndefined();
+    expect(result.quiet_ms).toBeUndefined();
+    expect(result.quiet_notice).toBeUndefined();
+  }
+
+  test("a quiet shell command ends an interact at the quiet limit and asks the model to check it", async () => {
+    const arrivals: number[] = [];
+    let sessionId = "";
+    const at = (body: string, index: number) => {
+      arrivals[index] = Date.now();
+      return body;
+    };
+    await runQuietFixture(
+      "shell-quiet-notice",
+      ["ask", "--json", "--yolo", "--no-save", "Run the quiet command fixture."],
+      [
+        (body) => {
+          at(body, 0);
+          return fakeShellRun("shell_quiet_run", "printf 'QUIET-READY\\n'; sleep 30", { profile: "clean", yield_time_ms: 300 });
+        },
+        (body) => {
+          at(body, 1);
+          const started = shellResult(body, "shell_quiet_run");
+          expect(started.state).toBe("running");
+          expect(started.output_delta).toContain("QUIET-READY");
+          expect(typeof started.running_ms).toBe("number");
+          expect(typeof started.quiet_ms).toBe("number");
+          expect(started.quiet_ms!).toBeLessThan(QUIET_LIMIT_MS);
+          expect(started.quiet_notice).toBeUndefined();
+          sessionId = started.session_id ?? "";
+          return shellInteract("shell_quiet_first_wait", sessionId, 20_000);
+        },
+        (body) => {
+          at(body, 2);
+          // The wait started before the limit, so it ends when the quiet
+          // time crosses it, long before its 20 second yield.
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThan(10_000);
+          const crossed = shellResult(body, "shell_quiet_first_wait");
+          expect(crossed.state).toBe("running");
+          expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(crossed.running_ms!).toBeGreaterThanOrEqual(crossed.quiet_ms!);
+          expect(crossed.quiet_notice).toContain("still working or has hung");
+          return shellInteract("shell_quiet_later_wait", sessionId, 5_000);
+        },
+        (body) => {
+          at(body, 3);
+          // Already past the limit, the wait runs its whole yield, so a
+          // model that waits again is not woken at once.
+          expect(arrivals[3]! - arrivals[2]!).toBeGreaterThanOrEqual(4_900);
+          const later = shellResult(body, "shell_quiet_later_wait");
+          expect(later.state).toBe("running");
+          expect(later.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS + 4_900);
+          expect(later.quiet_notice).toContain("still working or has hung");
+          return shellStop("shell_quiet_stop", sessionId);
+        },
+        (body) => {
+          const stopped = shellResult(body, "shell_quiet_stop");
+          expect(stopped.state).toBe("stopped");
+          expectNoQuietFields(stopped);
+          return fakeGatewayFinalText("Quiet command checked.");
+        },
+      ],
+      "Quiet command checked.",
+    );
+  }, 60_000);
+
+  test("a quiet shell command's limit restarts at new output", async () => {
+    let resetSession = "";
+    await runQuietFixture(
+      "shell-quiet-reset",
+      ["ask", "--json", "--yolo", "--no-save", "Run the quiet reset fixture."],
+      [
+        () =>
+          fakeShellRun(
+            "shell_quiet_reset_run",
+            "printf 'QUIET-A\\n'; sleep 1; printf 'QUIET-B\\n'; sleep 30",
+            { profile: "clean", yield_time_ms: 200 },
+          ),
+        (body) => {
+          const started = shellResult(body, "shell_quiet_reset_run");
+          expect(started.state).toBe("running");
+          expect(started.quiet_notice).toBeUndefined();
+          resetSession = started.session_id ?? "";
+          return shellInteract("shell_quiet_reset_wait", resetSession, 20_000);
+        },
+        (body) => {
+          // QUIET-B came about 1 second in, before the limit, so the wait
+          // ended at the limit after it, not 1.5 seconds in.
+          const crossed = shellResult(body, "shell_quiet_reset_wait");
+          expect(crossed.output_delta).toContain("QUIET-B");
+          expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(crossed.running_ms!).toBeGreaterThanOrEqual(2_300);
+          expect(crossed.quiet_notice).toContain("still working or has hung");
+          return shellStop("shell_quiet_reset_stop", resetSession);
+        },
+        (body) => {
+          expect(shellResult(body, "shell_quiet_reset_stop").state).toBe("stopped");
+          return fakeGatewayFinalText("Quiet reset checked.");
+        },
+      ],
+      "Quiet reset checked.",
+    );
+  }, 60_000);
+
+  test("a quiet shell command that never printed counts from its start, and a short yield ends at the yield", async () => {
+    // A longer limit than the other quiet tests, so the shortest wait an
+    // interact takes, 5 seconds, ends well before it.
+    const limitMs = 8_000;
+    const arrivals: number[] = [];
+    let silentSession = "";
+    await runQuietFixture(
+      "shell-quiet-silent",
+      ["ask", "--json", "--yolo", "--no-save", "Run the silent command fixture."],
+      [
+        () => fakeShellRun("shell_quiet_silent_run", "sleep 30", { profile: "clean", yield_time_ms: 200 }),
+        (body) => {
+          arrivals[1] = Date.now();
+          // A command that never printed has been quiet since it started.
+          const started = shellResult(body, "shell_quiet_silent_run");
+          expect(started.state).toBe("running");
+          expect(started.quiet_ms).toBe(started.running_ms);
+          silentSession = started.session_id ?? "";
+          return shellInteract("shell_quiet_short_wait", silentSession, 5_000);
+        },
+        (body) => {
+          arrivals[2] = Date.now();
+          // A yield shorter than the time left ends at the yield.
+          expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(4_900);
+          const short = shellResult(body, "shell_quiet_short_wait");
+          expect(short.state).toBe("running");
+          expect(short.quiet_ms!).toBeLessThan(limitMs);
+          expect(short.quiet_notice).toBeUndefined();
+          return shellInteract("shell_quiet_silent_wait", silentSession, 20_000);
+        },
+        (body) => {
+          arrivals[3] = Date.now();
+          expect(arrivals[3]! - arrivals[2]!).toBeLessThan(10_000);
+          const crossed = shellResult(body, "shell_quiet_silent_wait");
+          expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(limitMs);
+          expect(crossed.quiet_ms).toBe(crossed.running_ms);
+          expect(crossed.quiet_notice).toContain("still working or has hung");
+          return shellStop("shell_quiet_silent_stop", silentSession);
+        },
+        (body) => {
+          expect(shellResult(body, "shell_quiet_silent_stop").state).toBe("stopped");
+          return fakeGatewayFinalText("Silent command checked.");
+        },
+      ],
+      "Silent command checked.",
+      limitMs,
+    );
+  }, 60_000);
+
+  test("a shell command that keeps printing, finishes, or exits during a wait carries no quiet notice", async () => {
+    const arrivals: number[] = [];
+    let sessionId = "";
+    await runQuietFixture(
+      "shell-quiet-chatty",
+      ["ask", "--json", "--yolo", "--no-save", "Run the chatty command fixture."],
+      [
+        () => fakeShellRun("shell_quiet_done", "printf 'QUIET-DONE\\n'", { profile: "clean" }),
+        (body) => {
+          // A finished command keeps the result it has always had.
+          const done = shellResult(body, "shell_quiet_done") as ShellResult & { duration_ms?: number };
+          expect(done.state).toBe("completed");
+          expect(done.exit_code).toBe(0);
+          expect(typeof done.duration_ms).toBe("number");
+          expectNoQuietFields(done);
+          return fakeShellRun("shell_quiet_exit_run", "sleep 1; printf 'QUIET-EXIT\\n'", { profile: "clean", yield_time_ms: 0 });
+        },
+        (body) => {
+          arrivals[2] = Date.now();
+          const started = shellResult(body, "shell_quiet_exit_run");
+          expect(started.state).toBe("running");
+          return shellInteract("shell_quiet_exit_wait", started.session_id ?? "", 20_000);
+        },
+        (body) => {
+          // A command that exits during the wait ends it at once, and its
+          // result has no time fields.
+          expect(Date.now() - arrivals[2]!).toBeLessThan(10_000);
+          const exited = shellResult(body, "shell_quiet_exit_wait");
+          expect(exited.state).toBe("completed");
+          expect(exited.output_delta).toContain("QUIET-EXIT");
+          expectNoQuietFields(exited);
+          return fakeShellRun(
+            "shell_quiet_chatty_run",
+            "while :; do printf 'tick\\n'; sleep 0.2; done",
+            { profile: "clean", yield_time_ms: 300 },
+          );
+        },
+        (body) => {
+          arrivals[4] = Date.now();
+          const started = shellResult(body, "shell_quiet_chatty_run");
+          expect(started.state).toBe("running");
+          sessionId = started.session_id ?? "";
+          return shellInteract("shell_quiet_chatty_wait", sessionId, 5_000);
+        },
+        (body) => {
+          arrivals[5] = Date.now();
+          // Output keeps the quiet time under the limit, so the wait runs
+          // its whole yield and carries no notice.
+          expect(arrivals[5]! - arrivals[4]!).toBeGreaterThanOrEqual(4_900);
+          const chatty = shellResult(body, "shell_quiet_chatty_wait");
+          expect(chatty.state).toBe("running");
+          expect(chatty.quiet_ms!).toBeLessThan(QUIET_LIMIT_MS);
+          expect(chatty.running_ms!).toBeGreaterThanOrEqual(5_000);
+          expect(chatty.quiet_notice).toBeUndefined();
+          return shellStop("shell_quiet_chatty_stop", sessionId);
+        },
+        (body) => {
+          const stopped = shellResult(body, "shell_quiet_chatty_stop");
+          expect(stopped.state).toBe("stopped");
+          expectNoQuietFields(stopped);
+          return fakeGatewayFinalText("Chatty command checked.");
+        },
+      ],
+      "Chatty command checked.",
+    );
+  }, 60_000);
+
+  test("a quiet terminal session carries no quiet notice", async () => {
+    let sessionId = "";
+    await runQuietFixture(
+      "shell-quiet-tty",
+      ["ask", "--json", "--yolo", "Run the quiet terminal fixture."],
+      [
+        () => fakeShellRun("shell_quiet_tty_run", "sleep 30", { profile: "clean", tty: true, yield_time_ms: 300 }),
+        (body) => {
+          const started = shellResult(body, "shell_quiet_tty_run");
+          expect(started.state).toBe("running");
+          expect(started.backend).toBe("tty");
+          expectNoQuietFields(started);
+          sessionId = started.session_id ?? "";
+          return shellInteract("shell_quiet_tty_wait", sessionId, 5_000);
+        },
+        (body) => {
+          // A program that waits for input is quiet by design.
+          const waited = shellResult(body, "shell_quiet_tty_wait");
+          expect(waited.state).toBe("running");
+          expectNoQuietFields(waited);
+          return shellStop("shell_quiet_tty_stop", sessionId);
+        },
+        () => fakeGatewayFinalText("Terminal session checked."),
+      ],
+      "Terminal session checked.",
+    );
+  }, 60_000);
 
   test("shell keeps a detached daemon across calls and stops same-session jobs", async () => {
     const root = createFixtureRoot("shell-detached-daemon");
