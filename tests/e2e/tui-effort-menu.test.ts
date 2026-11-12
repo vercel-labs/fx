@@ -46,6 +46,7 @@ type Shell = {
   root: string;
   home: string;
   tape: string;
+  trace: string;
   stderrPath: string;
 };
 
@@ -84,6 +85,7 @@ async function launch(options: {
     },
   });
   const tape = join(root, "session.fxtape");
+  const trace = join(root, "trace.log");
   const stderrPath = join(root, "stderr.log");
   const session = await TmuxSession.create({
     cwd: workspace,
@@ -105,9 +107,11 @@ async function launch(options: {
       FX_PERMISSION_MODE: "auto",
       FX_RECORD: tape,
       FX_RECORD_INPUT: "1",
+      FX_TRACE_LOG: trace,
+      FX_TRACE_SCOPES: "input",
     },
   });
-  shell = { session, gateway, root, home, tape, stderrPath };
+  shell = { session, gateway, root, home, tape, trace, stderrPath };
   await session.waitForComposer(10_000);
   await session.waitForPane(() => catalogServed > 0, 10_000);
   // The shell adopts the served catalog on its next loop turn.
@@ -189,6 +193,43 @@ function highlightsAfter(current: Shell, key: RegExp): string[] {
   });
 }
 
+/// Waits for the `/effort` menu after `/effort` and Enter. CI keeps no tape
+/// or trace, so when the menu does not open this prints what fx read and what
+/// its input code did, then fails as the wait failed.
+async function waitForEffortMenu(current: Shell): Promise<void> {
+  try {
+    await current.session.waitForText("Effort 5", 5_000);
+  } catch (error) {
+    console.error(effortMenuDiagnostics(current));
+    throw error;
+  }
+}
+
+/// Each read fx made from the terminal, with its time in milliseconds since
+/// the epoch, and fx's last input trace lines, which carry the same clock and
+/// say whether Enter reached the submit step.
+function effortMenuDiagnostics(current: Shell): string {
+  const lines = ["The /effort menu did not open. Input fx read, oldest first:"];
+  try {
+    // The tape header holds its start time after the magic, columns, and rows.
+    let atMs = Number(readFileSync(current.tape).readBigInt64LE(9));
+    for (const frame of readTapeFrames(current.tape, { ignoreTruncatedTail: true })) {
+      atMs += frame.deltaMs;
+      if (frame.kind === STDIN) lines.push(`  ${atMs} ${JSON.stringify(frame.payload.toString("latin1"))}`);
+    }
+  } catch (error) {
+    lines.push(`  tape unreadable: ${error}`);
+  }
+  lines.push("Last input trace lines:");
+  try {
+    const trace = readFileSync(current.trace, "utf8").split("\n").filter((line) => line.length > 0);
+    for (const line of trace.slice(-60)) lines.push(`  ${line}`);
+  } catch (error) {
+    lines.push(`  trace unreadable: ${error}`);
+  }
+  return lines.join("\n");
+}
+
 const ARROW = /^\x1b(?:\[|O)[AB]$/;
 const TAB = /^\t$/;
 
@@ -229,7 +270,7 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   const current = await launch();
   const { session } = current;
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   // ↑ from the first level wraps to the last, as the /model menu does.
   for (const key of ["Up", "Down", "Down", "Down", "Down"]) await press(session, key);
   await session.sendKeys("Enter");
@@ -244,7 +285,7 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
   // A typed character closes the menu and lands in the composer.
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   await session.sendLiteral("x");
   await session.waitForPane((pane) => !pane.includes("Effort 5") && /^┃ x$/m.test(pane), 5_000);
   await session.sendKeys("C-u");
@@ -333,7 +374,7 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   await session.sendText("first question");
   await session.waitForText("Thinking", 10_000);
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   await press(session, "Up");
   await session.sendKeys("Enter");
   await session.waitForText("Next turn will use reasoning effort xhigh for acme/thinker", 5_000);
@@ -361,7 +402,7 @@ test.skipIf(!tmuxAvailable())("a short terminal shows one level at a time, ↓ s
   const { session } = current;
   const kept = lastTranscriptRow((await session.capturePane()).split("\n"));
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   for (let step = 1; step < LEVELS.length; step++) await press(session, "Down");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
