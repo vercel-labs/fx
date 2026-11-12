@@ -106,10 +106,12 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         if (chosen != .open) return failure(ctx.allocator, "toolbox offset goes with open");
         if (value != .integer or value.integer < 0) return failure(ctx.allocator, "toolbox offset must be a non-negative integer");
     }
-    const arguments_value = args.get("arguments");
+    var arguments_value = args.get("arguments");
     if (arguments_value) |value| {
         if (chosen != .run) return failure(ctx.allocator, "toolbox arguments go with run");
-        if (value != .object) return failure(ctx.allocator, "toolbox arguments must be an object");
+        // The same reading as toolbox_core.carriedCall, which carries the run.
+        arguments_value = (try toolbox_core.runArguments(parsed.arena.allocator(), value)) orelse
+            return failure(ctx.allocator, "toolbox arguments must be an object");
     }
     var kind: ?toolbox_core.Kind = null;
     if (args.get("kind")) |value| {
@@ -601,6 +603,10 @@ test "toolbox takes exactly one of open, run, or search" {
         .{ .args = "{\"run\":3}", .reason = "toolbox open, run, and search take a string" },
         .{ .args = "{\"open\":\"a\",\"arguments\":{}}", .reason = "toolbox arguments go with run" },
         .{ .args = "{\"run\":\"a\",\"arguments\":[]}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"run\":\"a\",\"arguments\":\"text\"}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"run\":\"a\",\"arguments\":\"[1]\"}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"run\":\"a\",\"arguments\":\"\\\"{}\\\"\"}", .reason = "toolbox arguments must be an object" },
+        .{ .args = "{\"open\":\"a\",\"arguments\":\"{}\"}", .reason = "toolbox arguments go with run" },
         .{ .args = "{\"run\":\"a\",\"resource\":\"x.md\"}", .reason = "toolbox resource goes with open" },
         .{ .args = "[1]", .reason = "toolbox arguments must be an object" },
         .{ .args = "{", .reason = "toolbox arguments must be valid JSON" },
@@ -635,6 +641,18 @@ test "toolbox keeps a run's arguments as JSON and defaults them to an empty obje
     try std.testing.expectEqualStrings("mcp_fixture_echo", typed.target);
     try std.testing.expectEqualStrings("{\"text\":\"hello\"}", typed.arguments_json);
 
+    // Some models write the arguments as JSON text; the run gets the object.
+    const text = try decodeForTest("{\"run\":\"mcp_fixture_echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\"}");
+    const text_input = switch (text) {
+        .input => |value| value,
+        .failure => |reason| {
+            std.testing.allocator.free(reason);
+            return error.TestUnexpectedFailure;
+        },
+    };
+    defer text_input.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"text\":\"hello\"}", text_input.as(Input).arguments_json);
+
     const bare = try decodeForTest("{\"open\":\"fixture\"}");
     const open_input = switch (bare) {
         .input => |value| value,
@@ -648,7 +666,7 @@ test "toolbox keeps a run's arguments as JSON and defaults them to an empty obje
 }
 
 const fuzz_keys = [_][]const u8{ "open", "run", "search", "resource", "server", "offset", "kind", "limit", "cursor", "arguments", "note" };
-const fuzz_values = [_][]const u8{ "\"mcp_fixture_echo\"", "\"\"", "\"  \"", "3", "-1", "{}", "{\"text\":\"hi\"}", "[1]", "null", "true", "\"tool\"", "\"a\\u0000b\"" };
+const fuzz_values = [_][]const u8{ "\"mcp_fixture_echo\"", "\"\"", "\"  \"", "3", "-1", "{}", "{\"text\":\"hi\"}", "[1]", "null", "true", "\"tool\"", "\"a\\u0000b\"", "\"{\\\"text\\\":\\\"hi\\\"}\"", "\"{}\"", "\"[1]\"" };
 
 /// Byte pairs pick an arguments object's keys and values; a first byte of
 /// 0xff takes the rest as the arguments' text.
@@ -693,6 +711,7 @@ test "a toolbox call is carried as a run exactly when its decode reads a run" {
             "\x00\x00\x01\x00",
             "\x01\x00\x09\x06\x0a\x03",
             "\xff{\"run\":\"mcp_fixture_echo\",\"arguments\":\"text\"}",
+            "\xff{\"run\":\"mcp_fixture_echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}",
         }) ++ @import("fuzz_corpus").toolbox_run_shape.*),
     });
 }

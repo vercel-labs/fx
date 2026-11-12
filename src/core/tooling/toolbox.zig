@@ -15,6 +15,7 @@ const mcp_call_capability = @import("mcp_call_capability.zig");
 const core_types = @import("../shared/types.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const tool_args = @import("tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -105,7 +106,27 @@ pub fn runs(tool: tool_dispatch.Tool) bool {
     return tool.executor_kind != .host;
 }
 
-pub const Carried = struct { name: []const u8, arguments_json: []const u8 };
+pub const Carried = struct {
+    name: []const u8,
+    arguments_json: []const u8,
+    /// The model wrote the arguments as JSON text, which `runArguments` read.
+    arguments_from_text: bool = false,
+};
+
+/// A run's `arguments` as the object the tool takes: the object itself, or
+/// the object that JSON text holds, since some models write the arguments as
+/// text. Only one level of text is read. Null for any other value, which the
+/// tool's decode refuses; a decoded object is allocated in `arena`. Decode
+/// and `carriedCall` both read arguments through this, so a call is carried
+/// exactly when decode reads it as a run.
+pub fn runArguments(arena: Allocator, value: std.json.Value) Allocator.Error!?std.json.Value {
+    var decoded = value;
+    tool_args.normalizeCompositeObjectValue(arena, &decoded) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return if (decoded == .object) decoded else null;
+}
 
 /// The keys toolbox reads for open and search. The tool's decode
 /// (`src/tools/capabilities/toolbox.zig`) refuses a run that has any of them.
@@ -126,11 +147,47 @@ pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u
     const target = parsed.object.get("run") orelse return null;
     if (target != .string or std.mem.trim(u8, target.string, " \t\r\n").len == 0) return null;
     var arguments: std.Io.Writer.Allocating = .init(arena);
+    var from_text = false;
     if (parsed.object.get("arguments")) |value| {
-        if (value != .object) return null;
-        std.json.Stringify.value(value, .{}, &arguments.writer) catch return error.OutOfMemory;
+        const object = (try runArguments(arena, value)) orelse return null;
+        from_text = value == .string;
+        std.json.Stringify.value(object, .{}, &arguments.writer) catch return error.OutOfMemory;
     } else arguments.writer.writeAll("{}") catch return error.OutOfMemory;
-    return .{ .name = target.string, .arguments_json = arguments.written() };
+    return .{ .name = target.string, .arguments_json = arguments.written(), .arguments_from_text = from_text };
+}
+
+test "a run's arguments written as JSON text are carried as their object, and other text is not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const carried = (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\",\\\"n\\\":[1,{\\\"a\\\":null}]}\"}")).?;
+    try std.testing.expectEqualStrings("mcp_fixture_echo", carried.name);
+    try std.testing.expectEqualStrings("{\"text\":\"hi\",\"n\":[1,{\"a\":null}]}", carried.arguments_json);
+    try std.testing.expect(carried.arguments_from_text);
+    const empty = (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\",\"arguments\":\"{}\"}")).?;
+    try std.testing.expectEqualStrings("{}", empty.arguments_json);
+    try std.testing.expect(empty.arguments_from_text);
+    const object = (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"text\":\"hi\"}}")).?;
+    try std.testing.expect(!object.arguments_from_text);
+
+    const refused = [_][]const u8{
+        "\"text\"",
+        "\"[1]\"",
+        "\"40\"",
+        "\"true\"",
+        "\"null\"",
+        "\"\"",
+        "\"  \"",
+        "\"{\\\"a\\\":1} x\"",
+        // Text of text of an object: only one level is read.
+        "\"\\\"{\\\\\\\"a\\\\\\\":1}\\\"\"",
+        "null",
+        "40",
+    };
+    for (refused) |arguments| {
+        const call = try std.mem.concat(arena, u8, &.{ "{\"run\":\"mcp_fixture_echo\",\"arguments\":", arguments, "}" });
+        try std.testing.expect(try carriedCall(arena, tool_name, call) == null);
+    }
 }
 
 test "only a call that is just a run is carried, so any other reaches the tool's decode" {
