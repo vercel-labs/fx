@@ -285,6 +285,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_NEXT_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_NEXT_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_START_HELD": {
       "job": "test",
       "stability": "internal"
