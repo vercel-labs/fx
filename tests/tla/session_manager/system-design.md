@@ -888,9 +888,10 @@ Settled while wiring side files, `fx sessions` and doctor (2026-09-28):
   process (D26), and the converter is its own step. **Alternative:** build
   the converter now, or run v1's migration from a v2 process.
 - **D36 Decision:** with v2 on, `fx doctor` verifies up to 64 sessions,
-  v1's bound, says when it stopped early, and reports damage, and removes
-  only side folders whose session is gone (D27), as v1's doctor removes
-  stray temporary files. A folder changed in the last 24 hours stays: a new session keeps side files
+  v1's bound, says when it stopped early, and reports damage. It finds
+  only side folders whose session is gone (D27) and removes them only
+  with `fx doctor --fix`; without it, doctor says how many `--fix` would
+  remove. A folder changed in the last 24 hours stays: a new session keeps side files
   (an attached image) before its first turn creates its log, so a young
   folder may still have an owner. It rebuilds nothing
   and forks nothing; `fx session recover` stays the way to salvage a

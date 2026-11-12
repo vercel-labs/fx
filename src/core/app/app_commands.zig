@@ -13,6 +13,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -25,6 +26,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const feedback_runtime = @import("../feedback/runtime.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const mcp_tool_result = @import("../mcp/tool_result.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
@@ -1389,6 +1391,23 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
+            if (comptime @hasField(App, "model_cache")) {
+                if (snapshot.err_message == null) {
+                    if (snapshot.token_pass != null) {
+                        app.model_cache.observeTokenPassCredit();
+                    } else if (snapshot.no_token_pass) {
+                        app.model_cache.observeNoTokenPass("credits");
+                    } else if (app.model_cache.tokenPassStatus() == .active) {
+                        // The team uses Token Pass, but this reply does not
+                        // mention Token Pass: point at the tab that has it.
+                        try app.writeDomainNotice(.{
+                            .topic = "credits",
+                            .tone = .neutral,
+                            .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
+                        }, true);
+                    }
+                }
+            }
         }
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {
@@ -1950,7 +1969,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         count += 1;
         tool_reported += 1;
         try writer.writeAll("- tool ");
-        try writeToolCallCompact(writer, call);
+        try writeToolCallCompact(writer, alloc, call);
     }
 
     var compaction_buf: [diagnostics.compaction_ring_capacity]diagnostics.CompactionEvent = undefined;
@@ -2451,10 +2470,20 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
     }
 }
 
-fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
+fn writeToolCallCompact(writer: *std.Io.Writer, alloc: std.mem.Allocator, call: diagnostics.ToolCallMetric) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
     try writer.print(" name={s} outcome={s} duration={d}ms", .{ traceToolDisplayName(call.name()), @tagName(call.outcome), call.duration_ms });
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
+    if (call.outcome != .succeeded) {
+        // Why an MCP server refused the call, so the line doesn't read as a
+        // limit or a crash.
+        var scratch: std.heap.ArenaAllocator = .init(alloc);
+        defer scratch.deinit();
+        if (try mcp_tool_result.invalidParamsCause(scratch.allocator(), call.result())) |cause| {
+            try writer.writeAll(" cause=");
+            try std.json.Stringify.value(cause, .{}, writer);
+        }
+    }
     try writer.writeByte('\n');
 }
 
@@ -2586,7 +2615,7 @@ noinline fn writeToolCallsSummary(
             try writer.writeAll("non-successes first:\n");
             for (buf[0..n]) |call| {
                 if (call.outcome == .succeeded) continue;
-                try writeToolCallCompact(writer, call);
+                try writeToolCallCompact(writer, alloc, call);
                 try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
                 try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
             }
@@ -2596,7 +2625,7 @@ noinline fn writeToolCallsSummary(
         }
         for (buf[0..n]) |call| {
             if (call.outcome != .succeeded) continue;
-            try writeToolCallCompact(writer, call);
+            try writeToolCallCompact(writer, alloc, call);
             try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
             try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
         }

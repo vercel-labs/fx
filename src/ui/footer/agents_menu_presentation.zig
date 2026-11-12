@@ -1,14 +1,15 @@
 //! The agent list ↓, Ctrl+X, and `/agents` open: a count, then one row per
 //! open agent, in columns. Each fx comes first, named "main", or "fx 2"
 //! while several are open, with its subagents under it on a branch, and a
-//! subagent's own subagents under that one:
+//! subagent's own subagents under that one. A profile other than main
+//! comes last:
 //!
 //!   Agents 4
 //!
-//!   main          Fix the login bug   working         main    opus 4-7 high
-//!   ├ reviewer    Review the parser   needs approval  main    opus 4-7
-//!   │ └ checker   Check one fix       working         main    opus 4-7
-//!   └ tester      Run the auth tests  idle            tester  gpt-5.4-mini
+//!   main          Fix the login bug   working         opus 4-7 high
+//!   ├ reviewer    Review the parser   needs approval  opus 4-7
+//!   │ └ checker   Check one fix       working         opus 4-7
+//!   └ tester      Run the auth tests  idle            gpt-5.4-mini  tester
 
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -17,6 +18,7 @@ const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const AgentsMenuProjection = render_input.AgentsMenuProjection;
@@ -60,8 +62,8 @@ fn parentRow(rows: []const AgentsMenuRow, index: usize) usize {
 }
 const column_gap: usize = 2;
 const branch_width: usize = 2;
-/// The state column: as wide as the longest state, "needs approval".
-const state_width: usize = 14;
+/// The widest state, "needs approval".
+const max_state_width: usize = 14;
 const max_name_width: usize = 22;
 const max_profile_width: usize = 16;
 const max_model_width: usize = 24;
@@ -115,6 +117,7 @@ const Columns = struct {
     /// A subagent's branch included.
     name: usize,
     title: usize,
+    state: usize,
     profile: usize,
     model: usize,
 
@@ -125,22 +128,25 @@ const Columns = struct {
     fn of(projection: AgentsMenuProjection, width: usize, indent: usize) Columns {
         var name: usize = 0;
         var title: usize = 0;
+        var state: usize = 0;
         var profile: usize = 0;
         var model: usize = 0;
         for (projection.rows) |row| {
             const branch = branchWidth(row);
             name = @max(name, branch + text_utils.terminalSafeVisibleWidth(row.name));
             title = @max(title, text_utils.terminalSafeVisibleWidth(titleOf(row)));
+            state = @max(state, text_utils.terminalSafeVisibleWidth(row.state));
             profile = @max(profile, text_utils.terminalSafeVisibleWidth(row.profile));
             var model_buf: [model_label_bytes]u8 = undefined;
             model = @max(model, text_utils.terminalSafeVisibleWidth(modelLabel(row, &model_buf)));
         }
         name = @min(name, max_name_width);
+        state = @min(state, max_state_width);
         profile = @min(profile, max_profile_width);
         model = @min(model, max_model_width);
 
         // One column stays free at the right edge, as in the session list.
-        const fixed = indent + name + column_gap + column_gap + state_width;
+        const fixed = indent + name + column_gap + column_gap + state;
         const room = (width -| 1) -| fixed;
         const title_floor = @min(title, min_title_width);
         if (room < title_floor + columnRoom(profile) + columnRoom(model)) profile = 0;
@@ -148,6 +154,7 @@ const Columns = struct {
         return .{
             .name = name,
             .title = @min(title, room -| (columnRoom(profile) + columnRoom(model))),
+            .state = state,
             .profile = profile,
             .model = model,
         };
@@ -166,12 +173,12 @@ const Columns = struct {
         return self.titleStart(indent) + columnRoom(self.title);
     }
 
-    fn profileStart(self: Columns, indent: usize) usize {
-        return self.stateStart(indent) + state_width + column_gap;
+    fn modelStart(self: Columns, indent: usize) usize {
+        return self.stateStart(indent) + self.state + column_gap;
     }
 
-    fn modelStart(self: Columns, indent: usize) usize {
-        return self.profileStart(indent) + columnRoom(self.profile);
+    fn profileStart(self: Columns, indent: usize) usize {
+        return self.modelStart(indent) + columnRoom(self.model);
     }
 };
 
@@ -235,10 +242,10 @@ fn composeAgentRow(alloc: Allocator, projection: AgentsMenuProjection, index: us
     }
     try appendCell(alloc, &line, name_start, row.name, name_width, plain);
     try appendCell(alloc, &line, columns.titleStart(indent), titleOf(row), columns.title, dim);
-    try appendCell(alloc, &line, columns.stateStart(indent), row.state, state_width, state_style);
-    try appendCell(alloc, &line, columns.profileStart(indent), row.profile, columns.profile, dim);
+    try appendCell(alloc, &line, columns.stateStart(indent), row.state, columns.state, state_style);
     var model_buf: [model_label_bytes]u8 = undefined;
     try appendCell(alloc, &line, columns.modelStart(indent), modelLabel(row, &model_buf), columns.model, dim);
+    try appendCell(alloc, &line, columns.profileStart(indent), row.profile, columns.profile, dim);
     if (display_width.visibleWidthIgnoringAnsi(line.items) <= width) return line;
 
     // Too narrow for even the name and state: cut the row at the edge.
@@ -312,17 +319,13 @@ fn testRow(projection: AgentsMenuProjection, row_index: u16, width: u16, row_bud
     var row = try composeAgentsMenuRow(alloc, projection, row_index, width, row_budget);
     defer row.deinit(alloc);
     const selected = std.mem.find(u8, row.items, ui_render.selected_completion_style) != null;
+    // The row as a terminal shows it.
+    var grid = try vt_emulator.Grid.init(alloc, width, 1);
+    defer grid.deinit();
+    try grid.feed(row.items);
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(alloc);
-    var index: usize = 0;
-    while (index < row.items.len) {
-        if (row.items[index] == 0x1b) {
-            index = std.mem.findScalarPos(u8, row.items, index, 'm').? + 1;
-            continue;
-        }
-        try text.append(alloc, row.items[index]);
-        index += 1;
-    }
+    try grid.rowTextTrimmed(1, &text);
     return .{ .text = try text.toOwnedSlice(alloc), .selected = selected };
 }
 
@@ -336,19 +339,19 @@ fn expectRows(projection: AgentsMenuProjection, width: u16, row_budget: u16, exp
 }
 
 const test_team = [_]AgentsMenuRow{
-    .{ .name = "main", .title = "Fix the login bug", .profile = "main", .state = "working", .state_tone = .active, .model = "anthropic/claude-opus-4-7", .effort = "high" },
+    .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active, .model = "anthropic/claude-opus-4-7", .effort = "high" },
     .{ .name = "tester", .subagent = true, .title = "Run the auth tests", .profile = "tester", .state = "needs approval", .state_tone = .needs_user, .model = "openai/gpt-5.4-mini" },
-    .{ .name = "docs", .subagent = true, .title = "", .profile = "main", .state = "idle" },
+    .{ .name = "docs", .subagent = true, .title = "", .state = "idle" },
 };
 
-test "the agent list counts the agents, then shows each one's name, title, state, profile, and model in columns" {
+test "the agent list counts the agents, then shows each one's name, title, state, model, and a profile other than main in columns" {
     const projection: AgentsMenuProjection = .{ .rows = &test_team, .selected = 1 };
     try expectRows(projection, 80, max_inline_rows, &.{
         "  Agents 3",
         "",
-        "  main      Fix the login bug   working         main    opus 4-7 high",
-        "  ├ tester  Run the auth tests  needs approval  tester  gpt-5.4-mini",
-        "  └ docs    new session         idle            main",
+        "  main      Fix the login bug   working         opus 4-7 high",
+        "  ├ tester  Run the auth tests  needs approval  gpt-5.4-mini   tester",
+        "  └ docs    new session         idle",
     });
     for ([_]u16{ 2, 3, 4 }) |row_index| {
         const row = try testRow(projection, row_index, 80, max_inline_rows);
@@ -378,7 +381,7 @@ test "the agent list draws an unselected row dim, with its name plain and a stat
     const reset = ui_render.reset_style;
     const expected_waiting = try alloc.print(
         "  {[dim]s}├ {[reset]s}tester{[reset]s}  {[dim]s}Run the auth tests{[reset]s}" ++
-            "  {[bright]s}needs approval{[reset]s}  {[dim]s}tester{[reset]s}  {[dim]s}gpt-5.4-mini{[reset]s}",
+            "  {[bright]s}needs approval{[reset]s}  {[dim]s}gpt-5.4-mini{[reset]s}   {[dim]s}tester{[reset]s}",
         .{ .dim = dim, .reset = reset, .bright = ui_render.hint_style },
     );
     defer alloc.free(expected_waiting);
@@ -390,52 +393,103 @@ test "the agent list draws an unselected row dim, with its name plain and a stat
     defer last.deinit(alloc);
     const expected_last = try alloc.print(
         "  {[dim]s}└ {[reset]s}{[bold]s}docs{[reset]s}    {[bold]s}new session{[reset]s}" ++
-            "         {[bold]s}idle{[reset]s}            {[bold]s}main{[reset]s}",
+            "         {[bold]s}idle{[reset]s}",
         .{ .dim = dim, .reset = reset, .bold = ui_render.selected_completion_style },
     );
     defer alloc.free(expected_last);
     try std.testing.expectEqualStrings(expected_last, last.items);
 }
 
+test "the agent list draws the model after the state, and a profile other than main last, as a terminal shows it" {
+    const alloc = std.testing.allocator;
+    const width: u16 = 80;
+    const projection: AgentsMenuProjection = .{ .rows = &test_team };
+    const rows = menuRowCount(projection, max_inline_rows);
+    var grid = try vt_emulator.Grid.init(alloc, width, rows);
+    defer grid.deinit();
+    var row_index: u16 = 0;
+    while (row_index < rows) : (row_index += 1) {
+        var row = try composeAgentsMenuRow(alloc, projection, row_index, width, max_inline_rows);
+        defer row.deinit(alloc);
+        var cursor_buf: [32]u8 = undefined;
+        try grid.feed(try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1}));
+        try grid.feed(row.items);
+    }
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    // Main runs in the main profile, so nothing follows its model.
+    try grid.rowTextTrimmed(3, &text);
+    try std.testing.expectEqualStrings("  main      Fix the login bug   working         opus 4-7 high", text.items);
+    text.clearRetainingCapacity();
+    try grid.rowTextTrimmed(4, &text);
+    try std.testing.expectEqualStrings("  ├ tester  Run the auth tests  needs approval  gpt-5.4-mini   tester", text.items);
+    // The model and the profile after it are dim, as the title is; the
+    // state waiting for the user is not.
+    const title = grid.cellAt(4, 13).?;
+    const state = grid.cellAt(4, 33).?;
+    const model = grid.cellAt(4, 49).?;
+    const profile = grid.cellAt(4, 64).?;
+    try std.testing.expectEqual(@as(u21, 'R'), title.codepoint);
+    try std.testing.expectEqual(@as(u21, 'n'), state.codepoint);
+    try std.testing.expectEqual(@as(u21, 'g'), model.codepoint);
+    try std.testing.expectEqual(@as(u21, 't'), profile.codepoint);
+    try std.testing.expect(model.style.eql(title.style));
+    try std.testing.expect(profile.style.eql(title.style));
+    try std.testing.expect(!state.style.eql(title.style));
+}
+
 test "the agent list puts each fx's subagents under it on a branch that ends at the last one" {
     const rows = [_]AgentsMenuRow{
-        .{ .name = "fx 1", .title = "Plan the parser work", .profile = "main", .state = "idle" },
-        .{ .name = "reviewer", .subagent = true, .title = "Review the parser", .profile = "main", .state = "working", .state_tone = .active },
+        .{ .name = "fx 1", .title = "Plan the parser work", .state = "idle" },
+        .{ .name = "reviewer", .subagent = true, .title = "Review the parser", .state = "working", .state_tone = .active },
         .{ .name = "tester", .subagent = true, .title = "Run the auth tests", .profile = "tester", .state = "idle" },
-        .{ .name = "fx 2", .title = "Trace the resize flake", .profile = "main", .state = "has a question", .state_tone = .needs_user },
-        .{ .name = "scout", .subagent = true, .title = "Map the session store", .profile = "main", .state = "working", .state_tone = .active },
-        .{ .name = "fx 3", .title = "", .profile = "main", .state = "idle" },
+        .{ .name = "fx 2", .title = "Trace the resize flake", .state = "has a question", .state_tone = .needs_user },
+        .{ .name = "scout", .subagent = true, .title = "Map the session store", .state = "working", .state_tone = .active },
+        .{ .name = "fx 3", .title = "", .state = "idle" },
     };
     try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
         "  Agents 6",
         "",
-        "  fx 1        Plan the parser work    idle            main",
-        "  ├ reviewer  Review the parser       working         main",
+        "  fx 1        Plan the parser work    idle",
+        "  ├ reviewer  Review the parser       working",
         "  └ tester    Run the auth tests      idle            tester",
-        "  fx 2        Trace the resize flake  has a question  main",
-        "  └ scout     Map the session store   working         main",
-        "  fx 3        new session             idle            main",
+        "  fx 2        Trace the resize flake  has a question",
+        "  └ scout     Map the session store   working",
+        "  fx 3        new session             idle",
     });
 }
 
 test "a subagent's own subagents hang off its branch, which goes on past them to its next sibling" {
     const rows = [_]AgentsMenuRow{
-        .{ .name = "main", .title = "Fix the login bug", .profile = "main", .state = "working", .state_tone = .active },
-        .{ .name = "lead", .subagent = true, .title = "Plan the fix", .profile = "main", .state = "idle" },
-        .{ .name = "helper", .subagent = true, .nested = true, .title = "Check one fix", .profile = "main", .state = "working", .state_tone = .active },
-        .{ .name = "checker", .subagent = true, .nested = true, .title = "Run the tests", .profile = "main", .state = "idle" },
+        .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active },
+        .{ .name = "lead", .subagent = true, .title = "Plan the fix", .state = "idle" },
+        .{ .name = "helper", .subagent = true, .nested = true, .title = "Check one fix", .state = "working", .state_tone = .active },
+        .{ .name = "checker", .subagent = true, .nested = true, .title = "Run the tests", .state = "idle" },
         .{ .name = "tester", .subagent = true, .title = "Run the auth tests", .profile = "tester", .state = "idle" },
-        .{ .name = "scout", .subagent = true, .nested = true, .title = "Map the store", .profile = "main", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .nested = true, .title = "Map the store", .state = "idle" },
     };
     try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
         "  Agents 6",
         "",
-        "  main         Fix the login bug   working         main",
-        "  ├ lead       Plan the fix        idle            main",
-        "  │ ├ helper   Check one fix       working         main",
-        "  │ └ checker  Run the tests       idle            main",
-        "  └ tester     Run the auth tests  idle            tester",
-        "    └ scout    Map the store       idle            main",
+        "  main         Fix the login bug   working",
+        "  ├ lead       Plan the fix        idle",
+        "  │ ├ helper   Check one fix       working",
+        "  │ └ checker  Run the tests       idle",
+        "  └ tester     Run the auth tests  idle     tester",
+        "    └ scout    Map the store       idle",
+    });
+}
+
+test "the state column is as wide as the widest state shown, so the model follows an idle one closely" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "idle", .model = "anthropic/claude-opus-4-7", .effort = "high" },
+        .{ .name = "scout", .subagent = true, .title = "List the open items", .state = "idle", .model = "anthropic/claude-opus-4-7" },
+    };
+    try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
+        "  Agents 2",
+        "",
+        "  main     Fix the login bug    idle  opus 4-7 high",
+        "  └ scout  List the open items  idle  opus 4-7",
     });
 }
 
@@ -469,31 +523,30 @@ test "an agent's row shows its name's and title's control bytes as escapes" {
         .name = "re\x1b[2Jview",
         .subagent = true,
         .title = "task \x1b]2;pwned\x07 \xc2\x9b2J",
-        .profile = "main",
         .state = "idle",
     }};
     const row = try testRow(.{ .rows = &rows }, 0, 120, 1);
     defer std.testing.allocator.free(row.text);
-    try std.testing.expectEqualStrings("  └ re\\x1b[2Jview  task \\x1b]2;pwned\\x07 \\u{009b}2J  idle            main", row.text);
+    try std.testing.expectEqualStrings("  └ re\\x1b[2Jview  task \\x1b]2;pwned\\x07 \\u{009b}2J  idle", row.text);
     try std.testing.expect(text_utils.isTerminalSafe(row.text));
 }
 
 test "the agent list scrolls to keep the selected agent in view, and a branch that goes on below the last row stays open" {
     const names = "abcdef";
     var rows: [names.len]AgentsMenuRow = undefined;
-    rows[0] = .{ .name = "main", .title = "t", .profile = "main", .state = "idle" };
-    for (rows[1..], 1..) |*row, at| row.* = .{ .name = names[at..][0..1], .subagent = true, .title = "t", .profile = "main", .state = "idle" };
+    rows[0] = .{ .name = "main", .title = "t", .state = "idle" };
+    for (rows[1..], 1..) |*row, at| row.* = .{ .name = names[at..][0..1], .subagent = true, .title = "t", .state = "idle" };
     var projection: AgentsMenuProjection = .{ .rows = &rows, .selected = 0 };
     // Two rows hold no heading: both go to agents.
     try expectRows(projection, 80, 2, &.{
-        "  main  t  idle            main",
-        "  ├ b   t  idle            main",
+        "  main  t  idle",
+        "  ├ b   t  idle",
     });
     projection.selected = 3;
     projection.window_start = windowStart(projection, 2);
     try expectRows(projection, 80, 2, &.{
-        "  ├ c   t  idle            main",
-        "  ├ d   t  idle            main",
+        "  ├ c   t  idle",
+        "  ├ d   t  idle",
     });
     const bottom = try testRow(projection, 1, 80, 2);
     defer std.testing.allocator.free(bottom.text);
@@ -505,8 +558,8 @@ test "the agent list scrolls to keep the selected agent in view, and a branch th
     try expectRows(projection, 80, 5, &.{
         "  Agents 6",
         "",
-        "  ├ d   t  idle            main",
-        "  ├ e   t  idle            main",
-        "  └ f   t  idle            main",
+        "  ├ d   t  idle",
+        "  ├ e   t  idle",
+        "  └ f   t  idle",
     });
 }

@@ -306,29 +306,39 @@ pub fn Runtime(comptime App: type) type {
             }
             defer if (hold_turn_start) agent.worker.releaseTurnStartHold();
             if (logout_provider == .grok) return logoutGrok(app, agent);
-            if (logout_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not durably sign out of Codex. The current source is unchanged.",
-                    });
-                    return;
-                };
-                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
-                    try app.auth.reconcileAfterChatGptLogout(app.alloc)
-                else
-                    false;
-                applyCredentialChange(app, changed);
-                try writeAuthNotice(app, switch (outcome) {
-                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
-                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
-                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
-                });
-                try reconcileSubscriptionLogout(app, agent, .codex);
-                return;
-            }
+            if (logout_provider == .codex) return logoutCodex(app, agent);
             return logoutFxLogin(app);
+        }
+
+        /// Signs out of Codex locally, then revokes its refresh token at
+        /// OpenAI in the background.
+        fn logoutCodex(app: *App, agent: *AppAgent) !void {
+            const local = chatgpt_oauth.logoutLocally(std.heap.c_allocator) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably sign out of Codex. The current source is unchanged.",
+                });
+                return;
+            };
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .codex = token } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            const outcome = local.result;
+            const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
+                try app.auth.reconcileAfterChatGptLogout(app.alloc)
+            else
+                false;
+            applyCredentialChange(app, changed);
+            try writeAuthNotice(app, switch (outcome.deletion) {
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
+            });
+            if (outcome.revocation_failed) {
+                try writeRemoteRevocationWarning(app, .chatgpt_subscription);
+            }
+            try reconcileSubscriptionLogout(app, agent, .codex);
+            try startRemoteRevocation(app, &revocation);
         }
 
         /// Signs out of Grok locally, then revokes its refresh token at the
@@ -413,10 +423,11 @@ pub fn Runtime(comptime App: type) type {
             try writeAuthNotice(app, .{
                 .topic = "auth",
                 .tone = .warning,
-                .body = if (source == .grok_subscription)
-                    "The local Grok session was removed, but remote revocation could not be confirmed."
-                else
-                    login_flow.remote_revocation_warning,
+                .body = switch (source) {
+                    .grok_subscription => "The local Grok session was removed, but remote revocation could not be confirmed.",
+                    .chatgpt_subscription => "The local Codex session was removed, but remote revocation could not be confirmed.",
+                    else => login_flow.remote_revocation_warning,
+                },
             });
         }
 

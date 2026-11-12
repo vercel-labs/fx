@@ -21,6 +21,7 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  envWithoutFxHome,
   FX_BIN,
   HAS_API_KEY,
   REPO_ROOT,
@@ -814,6 +815,7 @@ describe("cli: status", () => {
           FX_AUTO_UPGRADE: "0",
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
         const cwd = realpathSync(workspace);
         const before = snapshotTree(home);
@@ -828,7 +830,7 @@ describe("cli: status", () => {
         );
 
         for (const result of [statusText, statusJsonResult, doctorText, doctorJsonResult]) {
-          expect(result.code).toBe(0);
+          expect(result.code).toBe(result === doctorText || result === doctorJsonResult ? 1 : 0);
           expect(result.stderr).toBe("");
         }
         expect(statusText.stdout).toContain(
@@ -852,6 +854,7 @@ describe("cli: status", () => {
             name: "mcp_config",
             status: "fail",
             detail: "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+            fix: "fix or remove ~/.fx/mcp.json, then run fx doctor again",
           },
         ]);
         expect(ask.code).toBe(1);
@@ -932,7 +935,7 @@ describe("cli: status", () => {
         const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
 
         const doctor = await runFx(["doctor", "--json"], { cwd, env });
-        expect(doctor.code).toBe(0);
+        expect(doctor.code).toBe(1);
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
@@ -1213,7 +1216,7 @@ describe("cli: status", () => {
         const doctor = await runFx(["doctor", "--json"], { env });
 
         expect(status.code).toBe(0);
-        expect(doctor.code).toBe(0);
+        expect(doctor.code).toBe(1);
         const statusJson = JSON.parse(status.stdout.trim());
         const doctorJson = JSON.parse(doctor.stdout.trim());
         expect(statusJson).toMatchObject({
@@ -1230,6 +1233,7 @@ describe("cli: status", () => {
           name: "auth",
           status: "fail",
           detail: MISSING_AUTH_MESSAGE,
+          fix: "fx login",
         });
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -1246,9 +1250,9 @@ describe("cli: status", () => {
     { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
     { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
     { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
-    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
-    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
-  ]) {
+    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex.", fix: "fx login codex" },
+    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok.", fix: "fx login grok" },
+  ] as Array<{ name: string; provider: string; source: string | undefined; help: string; fix?: string }>) {
     test(
       `status and doctor respect ${scenario.name} when credentials are missing`,
       async () => {
@@ -1273,8 +1277,8 @@ describe("cli: status", () => {
           for (const command of ["status", "doctor"]) {
             const text = await runFx([command], options);
             const json = await runFx([command, "--json"], options);
-            expect(text.code).toBe(0);
-            expect(json.code).toBe(0);
+            expect(text.code).toBe(command === "doctor" ? 1 : 0);
+            expect(json.code).toBe(command === "doctor" ? 1 : 0);
             expect(text.stderr).toBe("");
             expect(json.stderr).toBe("");
             expect(text.stdout).toContain(scenario.help);
@@ -1285,7 +1289,7 @@ describe("cli: status", () => {
               expect(value.auth_help).toBe(scenario.help);
             } else {
               expect(value.checks).toContainEqual({
-                name: "auth", status: "fail", detail: scenario.help,
+                name: "auth", status: "fail", detail: scenario.help, fix: scenario.fix ?? "fx login",
               });
             }
           }
@@ -1453,6 +1457,8 @@ describe("cli: status", () => {
           ...NO_GATEWAY_AUTH,
           HOME: realpathSync(home),
           FX_DISABLE_KEYCHAIN: "1",
+          // Doctor asks the provider; a refused local port keeps it offline.
+          FX_TEST_GATEWAY_MODELS_URL: "http://127.0.0.1:9/coding-agent/v1/models",
         };
         const cwd = realpathSync(workspace);
 
@@ -1463,8 +1469,8 @@ describe("cli: status", () => {
 
         expect(statusText.code).toBe(0);
         expect(statusJsonResult.code).toBe(0);
-        expect(doctorText.code).toBe(0);
-        expect(doctorJsonResult.code).toBe(0);
+        expect(doctorText.code).toBe(1);
+        expect(doctorJsonResult.code).toBe(1);
         const expectedAuth = {
           auth: "fx login",
           auth_refreshable: true,
@@ -1550,6 +1556,8 @@ describe("cli: status", () => {
           VERCEL_OIDC_TOKEN: undefined,
           AI_GATEWAY_API_KEY: envToken,
           FX_DISABLE_KEYCHAIN: "1",
+          // Doctor asks the provider; a refused local port keeps it offline.
+          FX_TEST_GATEWAY_MODELS_URL: "http://127.0.0.1:9/coding-agent/v1/models",
         };
 
         const status = await runFx(["status", "--json"], { env });
@@ -1573,11 +1581,10 @@ describe("cli: status", () => {
   test(
     "fx status --json returns valid status JSON",
     async () => {
-      // A fresh profile, so a developer's own settings can't leak in,
-      // including through FX_HOME.
+      // A fresh profile, so a developer's own settings can't leak in.
       const home = createIsolatedTestHome();
       try {
-        const r = await runFx(["status", "--json"], { env: { HOME: home, FX_HOME: undefined } });
+        const r = await runFx(["status", "--json"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("status");
@@ -1769,6 +1776,7 @@ describe("cli: status", () => {
         mkdirSync(workspace);
         const env = {
           ...NO_GATEWAY_AUTH,
+          FX_DISABLE_KEYCHAIN: "1",
           HOME: realpathSync(home),
           FX_MAX_AGENT_STEPS: "3",
         };
@@ -1786,7 +1794,7 @@ describe("cli: status", () => {
           env,
           timeoutMs: TIMEOUT,
         });
-        expect(doctor.code).toBe(0);
+        expect(doctor.code).toBe(1);
         const startup = JSON.parse(doctor.stdout.trim()).checks.find(
           (check: { name: string }) => check.name === "startup",
         );
@@ -2244,17 +2252,22 @@ describe("cli: permissions", () => {
   test(
     "fx permissions --json returns valid permissions JSON",
     async () => {
-      const r = await runFx(["permissions", "--json"]);
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(json.kind).toBe("permissions");
-      expect(json).toHaveProperty("mode");
-      expect(json).toHaveProperty("grant_count");
-      expect(json.grant_scope).toBe("session");
-      expect(json.runtime_grants_available).toBe(false);
-      expect(json.rules_scope).toBe("persistent_config");
-      expect(Array.isArray(json.rules)).toBe(true);
-      expect(Array.isArray(json.grants)).toBe(true);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["permissions", "--json"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(json.kind).toBe("permissions");
+        expect(json).toHaveProperty("mode");
+        expect(json).toHaveProperty("grant_count");
+        expect(json.grant_scope).toBe("session");
+        expect(json.runtime_grants_available).toBe(false);
+        expect(json.rules_scope).toBe("persistent_config");
+        expect(Array.isArray(json.rules)).toBe(true);
+        expect(Array.isArray(json.grants)).toBe(true);
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
@@ -2275,11 +2288,12 @@ describe("cli: doctor", () => {
           cwd: realpathSync(workspace),
           env: {
             ...NO_GATEWAY_AUTH,
+            FX_DISABLE_KEYCHAIN: "1",
             HOME: realpathSync(home),
           },
           timeoutMs: TIMEOUT,
         });
-        expect(r.code).toBe(0);
+        expect(r.code).toBe(1);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("doctor");
         expect(Array.isArray(json.checks)).toBe(true);
@@ -2290,6 +2304,7 @@ describe("cli: doctor", () => {
           name: "auth",
           status: "fail",
           detail: MISSING_AUTH_MESSAGE,
+          fix: "fx login",
         });
         for (const check of json.checks) {
           expect(check).toHaveProperty("name");
@@ -2318,12 +2333,13 @@ describe("cli: doctor", () => {
           cwd: realpathSync(workspace),
           env: {
             ...NO_GATEWAY_AUTH,
+            FX_DISABLE_KEYCHAIN: "1",
             HOME: realpathSync(home),
           },
           timeoutMs: TIMEOUT,
         });
 
-        expect(r.code).toBe(0);
+        expect(r.code).toBe(1);
         expect(JSON.parse(r.stdout.trim()).kind).toBe("doctor");
         expect(existsSync(join(home, ".fx"))).toBe(false);
       } finally {
@@ -2360,12 +2376,13 @@ describe("cli: doctor", () => {
           cwd: workspaceRoot,
           env: {
             ...NO_GATEWAY_AUTH,
+            FX_DISABLE_KEYCHAIN: "1",
             HOME: home,
           },
           timeoutMs: TIMEOUT,
         });
 
-        expect(r.code).toBe(0);
+        expect(r.code).toBe(1);
         expect(r.stderr).toBe("");
         expect(r.stdout.length).toBeLessThan(64 * 1024);
         const json = JSON.parse(r.stdout.trim());
@@ -2647,7 +2664,10 @@ describe("cli: logout", () => {
         const oidcStatus = await runFx(["status", "--json"], { env });
         const apiEnv = { ...env, VERCEL_OIDC_TOKEN: undefined };
         const apiStatus = await runFx(["status", "--json"], { env: apiEnv });
-        const doctor = await runFx(["doctor", "--json"], { env: apiEnv });
+        // Doctor asks the provider; a refused local port keeps it offline.
+        const doctor = await runFx(["doctor", "--json"], {
+          env: { ...apiEnv, FX_TEST_GATEWAY_MODELS_URL: "http://127.0.0.1:9/coding-agent/v1/models" },
+        });
         expect(JSON.parse(oidcStatus.stdout)).toMatchObject({
           auth: "VERCEL_OIDC_TOKEN",
           auth_refreshable: false,
@@ -3029,7 +3049,7 @@ describe("cli: read-only no-create matrix", () => {
     { args: ["sessions", "--json"], code: 0, kind: "sessions", count: 0 },
     { args: ["session", "last", "--json"], code: 1, error: "no saved sessions" },
     { args: ["session", "--id", "missing.valid-id", "--json"], code: 1, error: "record not found" },
-    { args: ["doctor", "--json"], code: 0, kind: "doctor" },
+    { args: ["doctor", "--json"], code: 1, kind: "doctor" },
   ] as const;
 
   for (const probe of probes) {
@@ -3049,6 +3069,7 @@ describe("cli: read-only no-create matrix", () => {
             env: {
               ...NO_GATEWAY_AUTH,
               HOME: realpathSync(home),
+              FX_DISABLE_KEYCHAIN: "1",
               FX_TEST_FAIL_ON_DURABLE_MUTATION: "1",
             },
             timeoutMs: TIMEOUT,
@@ -3156,6 +3177,7 @@ describe("cli: missing durable home", () => {
         const cwd = realpathSync(workspace);
         const env = {
           ...NO_GATEWAY_AUTH,
+          FX_DISABLE_KEYCHAIN: "1",
           HOME: undefined,
         };
 
@@ -3179,7 +3201,8 @@ describe("cli: missing durable home", () => {
           env,
           timeoutMs: TIMEOUT,
         });
-        expect(doctor.code).toBe(0);
+        // No credential here, so the auth check fails.
+        expect(doctor.code).toBe(1);
         expect(JSON.parse(doctor.stdout).checks).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
@@ -3846,15 +3869,21 @@ describe("cli: removed task and background commands", () => {
   test(
     "fx task, fx tasks, and fx background are not commands",
     async () => {
-      for (const command of ["task", "tasks"]) {
-        const result = await runFx([command], { env: NO_GATEWAY_AUTH });
-        expect(result.code).toBe(2);
-        expect(result.stderr).toContain(`fx: unknown command ${command} (did you mean ask?)`);
+      const home = createIsolatedTestHome();
+      try {
+        const env = { ...NO_GATEWAY_AUTH, HOME: home };
+        for (const command of ["task", "tasks"]) {
+          const result = await runFx([command], { env });
+          expect(result.code).toBe(2);
+          expect(result.stderr).toContain(`fx: unknown command ${command} (did you mean ask?)`);
+        }
+        // A word that isn't close to a command is a first prompt for a session.
+        const background = await runFx(["background"], { env });
+        expect(background.code).toBe(1);
+        expect(background.stderr).toContain("fx requires an interactive terminal (TTY).");
+      } finally {
+        cleanupIsolatedTestHome(home);
       }
-      // A word that isn't close to a command is a first prompt for a session.
-      const background = await runFx(["background"], { env: NO_GATEWAY_AUTH });
-      expect(background.code).toBe(1);
-      expect(background.stderr).toContain("fx requires an interactive terminal (TTY).");
     },
     TIMEOUT,
   );
@@ -4204,7 +4233,7 @@ describe("cli: models", () => {
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
         env: {
-          ...process.env,
+          ...envWithoutFxHome(),
           ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
         },
         stdout: "pipe",
@@ -4472,13 +4501,18 @@ describe("cli: models", () => {
   test.skipIf(!HAS_API_KEY)(
     "fx models --json returns valid models JSON",
     async () => {
-      const r = await runFx(["models", "--json"], { timeoutMs: 30_000 });
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(json.kind).toBe("models");
-      expect(json).toHaveProperty("count");
-      expect(Array.isArray(json.ids)).toBe(true);
-      expect(json.ids.length).toBeGreaterThan(0);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["models", "--json"], { env: { HOME: home }, timeoutMs: 30_000 });
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(json.kind).toBe("models");
+        expect(json).toHaveProperty("count");
+        expect(Array.isArray(json.ids)).toBe(true);
+        expect(json.ids.length).toBeGreaterThan(0);
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     30_000,
   );
@@ -4544,15 +4578,62 @@ describe("cli: credits", () => {
     TIMEOUT,
   );
 
+  test(
+    "fx credits reports the team's Token Pass credit in text and JSON",
+    async () => {
+      const home = createIsolatedTestHome();
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () =>
+          Response.json({
+            balance: "12.50",
+            token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+          }),
+      });
+
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "credits-fake-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_GATEWAY_CREDITS_URL: `http://127.0.0.1:${server.port}/v1/credits`,
+        };
+        const json = await runFx(["credits", "--json"], { env });
+        expect(json.code).toBe(0);
+        expect(json.stderr).toBe("");
+        expect(JSON.parse(json.stdout.trim()).token_pass).toEqual({
+          remaining: "79.92906",
+          resets_at: "2026-12-05T08:00:00.000Z",
+        });
+
+        const text = await runFx(["credits"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stdout).toContain("[credits] token_pass_remaining=79.92906\n");
+        expect(text.stdout).toContain("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n");
+      } finally {
+        server.stop(true);
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "fx credits --json returns credits JSON or exits non-zero",
     async () => {
-      const r = await runFx(["credits", "--json"], { timeoutMs: 30_000 });
-      if (r.code === 0 && r.stdout.trim()) {
-        const json = JSON.parse(r.stdout.trim());
-        expect(json.kind).toBe("credits");
-      } else {
-        expect(r.code).not.toBe(0);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["credits", "--json"], { env: { HOME: home }, timeoutMs: 30_000 });
+        if (r.code === 0 && r.stdout.trim()) {
+          const json = JSON.parse(r.stdout.trim());
+          expect(json.kind).toBe("credits");
+        } else {
+          expect(r.code).not.toBe(0);
+        }
+      } finally {
+        cleanupIsolatedTestHome(home);
       }
     },
     30_000,
@@ -5005,28 +5086,33 @@ describe("cli: ask success", () => {
     "fx ask stdin resource overflow has distinct text and JSON errors",
     async () => {
       const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x78);
+      const home = createIsolatedTestHome();
+      try {
+        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const textResult = await runFx(["ask", "--auto", "--no-save"], {
+          env,
+          stdin: oversized,
+          timeoutMs: 60_000,
+        });
+        expect(textResult.code).toBe(1);
+        expect(textResult.stdout).toBe("");
+        expect(textResult.stderr).toBe(
+          "fx ask: prompt exceeds the local input safety limit\n",
+        );
 
-      const textResult = await runFx(["ask", "--auto", "--no-save"], {
-        env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
-        stdin: oversized,
-        timeoutMs: 60_000,
-      });
-      expect(textResult.code).toBe(1);
-      expect(textResult.stdout).toBe("");
-      expect(textResult.stderr).toBe(
-        "fx ask: prompt exceeds the local input safety limit\n",
-      );
-
-      const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
-        env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
-        stdin: oversized,
-        timeoutMs: 60_000,
-      });
-      expect(jsonResult.code).toBe(1);
-      expect(jsonResult.stderr).toBe("");
-      expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
-      );
+        const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
+          env,
+          stdin: oversized,
+          timeoutMs: 60_000,
+        });
+        expect(jsonResult.code).toBe(1);
+        expect(jsonResult.stderr).toBe("");
+        expect(jsonResult.stdout).toBe(
+          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+        );
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     120_000,
   );
@@ -5709,19 +5795,24 @@ describe("cli: ask success", () => {
   test.skipIf(!HAS_API_KEY)(
     "fx ask --json --no-save --auto returns valid JSON with output",
     async () => {
-      const r = await runFx(
-        ["ask", "--json", "--no-save", "--auto", "Say exactly: hello world"],
-        { timeoutMs: 60_000 },
-      );
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(typeof json.output).toBe("string");
-      expect(json.output.length).toBeGreaterThan(0);
-      expect(typeof json.final_output).toBe("string");
-      expect(json.final_output.length).toBeGreaterThan(0);
-      expect(typeof json.model).toBe("string");
-      expect(Array.isArray(json.tool_calls)).toBe(true);
-      expect(typeof json.steps).toBe("number");
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(
+          ["ask", "--json", "--no-save", "--auto", "Say exactly: hello world"],
+          { env: { HOME: home }, timeoutMs: 60_000 },
+        );
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(typeof json.output).toBe("string");
+        expect(json.output.length).toBeGreaterThan(0);
+        expect(typeof json.final_output).toBe("string");
+        expect(json.final_output.length).toBeGreaterThan(0);
+        expect(typeof json.model).toBe("string");
+        expect(Array.isArray(json.tool_calls)).toBe(true);
+        expect(typeof json.steps).toBe("number");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     60_000,
   );
@@ -5793,9 +5884,14 @@ describe("cli: error handling", () => {
   test(
     "fx ask with no prompt exits 2",
     async () => {
-      const r = await runFx(["ask"]);
-      expect(r.code).toBe(2);
-      expect(r.stderr).toContain("missing prompt");
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["ask"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
+        expect(r.code).toBe(2);
+        expect(r.stderr).toContain("missing prompt");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
@@ -5863,39 +5959,45 @@ describe("cli: workspace access", () => {
   test(
     "workspace launch modifiers preserve ask help and report friendly option errors",
     async () => {
-      const enabled = {
-        ...NO_GATEWAY_AUTH,
-      };
+      const home = createIsolatedTestHome();
+      try {
+        const enabled = {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+        };
 
-      const help = await runFx(
-        ["--add-dir", "/tmp/shared", "ask", "--help"],
-        { env: enabled },
-      );
-      expect(help.code).toBe(0);
-      expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
-      expect(help.stderr).toBe("");
+        const help = await runFx(
+          ["--add-dir", "/tmp/shared", "ask", "--help"],
+          { env: enabled },
+        );
+        expect(help.code).toBe(0);
+        expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
+        expect(help.stderr).toBe("");
 
-      const missing = await runFx(["--add-dir"], { env: enabled });
-      expect(missing.code).toBe(2);
-      expect(missing.stderr).toContain("fx: --add-dir needs a value\n");
-      expect(missing.stderr).not.toContain("InvalidFlag");
+        const missing = await runFx(["--add-dir"], { env: enabled });
+        expect(missing.code).toBe(2);
+        expect(missing.stderr).toContain("fx: --add-dir needs a value\n");
+        expect(missing.stderr).not.toContain("InvalidFlag");
 
-      // A repeated flag is not an error: the launch gets past parsing and
-      // stops only because this run has no terminal.
-      const duplicate = await runFx(
-        ["--no-additional-dirs", "--no-additional-dirs"],
-        { env: enabled },
-      );
-      expect(duplicate.code).toBe(1);
-      expect(duplicate.stderr).toBe("fx requires an interactive terminal (TTY).\n");
+        // A repeated flag is not an error: the launch gets past parsing and
+        // stops only because this run has no terminal.
+        const duplicate = await runFx(
+          ["--no-additional-dirs", "--no-additional-dirs"],
+          { env: enabled },
+        );
+        expect(duplicate.code).toBe(1);
+        expect(duplicate.stderr).toBe("fx requires an interactive terminal (TTY).\n");
 
-      const badMode = await runFx(["--permission-mode", "never"], { env: enabled });
-      expect(badMode.code).toBe(2);
-      expect(badMode.stderr).toContain("fx: --permission-mode accepts ask, auto, or full-access\n");
+        const badMode = await runFx(["--permission-mode", "never"], { env: enabled });
+        expect(badMode.code).toBe(2);
+        expect(badMode.stderr).toContain("fx: --permission-mode accepts ask, auto, or full-access\n");
 
-      const beforeCommand = await runFx(["--auto", "status"], { env: enabled });
-      expect(beforeCommand.code).toBe(2);
-      expect(beforeCommand.stderr).toBe("fx: agent-run flags such as --permission-mode apply to a session and to fx ask, fx pr, fx issue, and fx acp\n");
+        const beforeCommand = await runFx(["--auto", "status"], { env: enabled });
+        expect(beforeCommand.code).toBe(2);
+        expect(beforeCommand.stderr).toBe("fx: agent-run flags such as --permission-mode apply to a session and to fx ask, fx pr, fx issue, and fx acp\n");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
@@ -6190,7 +6292,7 @@ describe("cli: workspace access", () => {
 });
 
 describe("cli: MCP profile", () => {
-  test("status, doctor, and list start no MCP server, and show connects one", async () => {
+  test("status and list start no MCP server, and doctor and show connect it", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -6211,7 +6313,7 @@ describe("cli: MCP profile", () => {
       }),
       { mode: 0o600 },
     );
-    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    const env = { HOME: home, ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" };
     try {
       const status = await runFx(["status", "--json"], { cwd: workspace, env });
       expect(status.code).toBe(0);
@@ -6226,17 +6328,18 @@ describe("cli: MCP profile", () => {
       });
       expect(existsSync(pidPath)).toBe(false);
 
-      const doctor = await runFx(["doctor", "--json"], { cwd: workspace, env });
-      expect(doctor.code).toBe(0);
-      expect(JSON.parse(doctor.stdout.trim()).mcp.connection_check).toBe(
-        "not_checked",
-      );
-      expect(existsSync(pidPath)).toBe(false);
-
       const listed = await runFx(["mcp", "list"], { cwd: workspace, env });
       expect(listed.code).toBe(0);
       expect(listed.stdout).toMatch(/fixture +~\/\.fx\/mcp\.json +stdio +not started/);
       expect(existsSync(pidPath)).toBe(false);
+
+      // Doctor checks each server in its own `fx mcp show` child.
+      const doctor = await runFx(["doctor", "--json"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+      expect(doctor.code).toBe(1);
+      const doctorJson = JSON.parse(doctor.stdout.trim());
+      expect(doctorJson.mcp.connection_check).toBe("checked");
+      expect(doctorJson.checks).toContainEqual({ name: "mcp", status: "ok", detail: "fixture ready, 1 tool" });
+      expect(existsSync(pidPath)).toBe(true);
 
       const shown = await runFx(
         ["mcp", "show", "fixture"],

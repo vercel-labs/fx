@@ -777,27 +777,51 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (!wrote_provider) try writer.writeAll("none");
 }
 
+/// What `fx doctor` found when it checked one configured MCP server.
+pub const McpServerResult = struct {
+    /// The server's name, as the runtime knows it.
+    name: []const u8,
+    connection: Connection,
+    authentication: Authentication,
+
+    pub const Connection = enum { not_checked, ready, failed, timed_out };
+    pub const Authentication = enum { not_checked, ok, needs_login };
+};
+
 pub const McpLocalSnapshot = struct {
     servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
     configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
     inspection_error: ?[]const u8 = null,
+    /// `checked` once doctor has asked each server for its tools.
+    connection_check: enum { not_checked, checked } = .not_checked,
+    /// What doctor found for each server it checked. A server with no entry
+    /// reads `not_checked`, as every server does for `fx status`.
+    results: []const McpServerResult = &.{},
+
+    fn resultFor(self: McpLocalSnapshot, name: []const u8) McpServerResult {
+        for (self.results) |result| if (std.mem.eql(u8, result.name, name)) return result;
+        return .{ .name = name, .connection = .not_checked, .authentication = .not_checked };
+    }
 
     fn writeText(self: McpLocalSnapshot, writer: *std.Io.Writer, alloc: Allocator, prefix: []const u8) !void {
-        try writer.print("[{s}] mcp_connection_check=not_checked\n", .{prefix});
+        try writer.print("[{s}] mcp_connection_check={s}\n", .{ prefix, @tagName(self.connection_check) });
         try writer.print(
             "[{s}] mcp_servers={d} mcp_configuration_issues={d}\n",
             .{ prefix, self.servers.len, self.configuration_issues.len },
         );
         for (self.servers) |server| {
+            const result = self.resultFor(server.configured_name);
             try writer.print("[{s}] mcp_server=", .{prefix});
             try writeTerminalSafe(writer, alloc, server.configured_name);
             try writer.print(
-                " source={s} scope={s} admission={s} transport={s} connection=not_checked authentication=not_checked\n",
+                " source={s} scope={s} admission={s} transport={s} connection={s} authentication={s}\n",
                 .{
                     @tagName(server.source),
                     @tagName(server.scope),
                     if (server.workspace_admission) |admission| @tagName(admission) else "not_applicable",
                     @tagName(server.transport),
+                    @tagName(result.connection),
+                    @tagName(result.authentication),
                 },
             );
         }
@@ -812,9 +836,10 @@ pub const McpLocalSnapshot = struct {
     }
 
     fn writeJson(self: McpLocalSnapshot, writer: *std.Io.Writer) !void {
-        try writer.writeAll("{\"connection_check\":\"not_checked\",\"servers\":[");
+        try writer.print("{{\"connection_check\":\"{s}\",\"servers\":[", .{@tagName(self.connection_check)});
         for (self.servers, 0..) |server, index| {
             if (index > 0) try writer.writeByte(',');
+            const result = self.resultFor(server.configured_name);
             try std.json.Stringify.value(.{
                 .name = server.configured_name,
                 .source = server.source,
@@ -822,8 +847,8 @@ pub const McpLocalSnapshot = struct {
                 .admission = server.workspace_admission,
                 .required = server.required,
                 .transport = server.transport,
-                .connection = "not_checked",
-                .authentication = "not_checked",
+                .connection = result.connection,
+                .authentication = result.authentication,
             }, .{}, writer);
         }
         try writer.writeAll("],\"configuration_issues\":[");
@@ -2163,6 +2188,8 @@ test "fx sessions convert names each subagent it keeps as it is, in text and JSO
 }
 
 pub const DoctorSnapshot = struct {
+    /// The fx version that ran the checks.
+    version: []const u8 = "",
     workspace_root: []const u8,
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
@@ -2188,6 +2215,7 @@ pub const DoctorSnapshot = struct {
             "[doctor] ok={d} warn={d} fail={d}\n",
             .{ counts.ok, counts.warn, counts.fail },
         );
+        if (self.version.len > 0) try out.writer.print("[doctor] version={s}\n", .{self.version});
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
@@ -2209,6 +2237,11 @@ pub const DoctorSnapshot = struct {
             try out.writer.writeAll(": ");
             try writeTerminalSafe(&out.writer, alloc, entry.detail);
             try out.writer.writeByte('\n');
+            if (entry.fix) |fix| {
+                try out.writer.writeAll("  fix: ");
+                try writeTerminalSafe(&out.writer, alloc, fix);
+                try out.writer.writeByte('\n');
+            }
         }
 
         return try out.toOwnedSlice();
@@ -2228,6 +2261,10 @@ pub const DoctorSnapshot = struct {
             "{{\"kind\":\"doctor\",\"ok_count\":{d},\"warn_count\":{d},\"fail_count\":{d}",
             .{ counts.ok, counts.warn, counts.fail },
         );
+        if (self.version.len > 0) {
+            try writer.writeAll(",\"version\":");
+            try std.json.Stringify.value(self.version, .{}, writer);
+        }
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.writeAll(",\"model\":");
@@ -2256,6 +2293,10 @@ pub const DoctorSnapshot = struct {
             try std.json.Stringify.value(checkStatusLabel(entry.status), .{}, writer);
             try writer.writeAll(",\"detail\":");
             try std.json.Stringify.value(entry.detail, .{}, writer);
+            if (entry.fix) |fix| {
+                try writer.writeAll(",\"fix\":");
+                try std.json.Stringify.value(fix, .{}, writer);
+            }
             try writer.writeByte('}');
         }
 
@@ -2272,8 +2313,20 @@ pub const CreditsSnapshot = struct {
     balance: ?[]const u8 = null,
     used: ?[]const u8 = null,
     plan: ?[]const u8 = null,
+    /// The team's Token Pass credit, a separate balance, while it has an
+    /// active Token Pass.
+    token_pass: ?TokenPassCredit = null,
+    /// The Gateway said the team has no active Token Pass (`token_pass: null`),
+    /// as opposed to a reply that does not mention Token Pass.
+    no_token_pass: bool = false,
     raw_json: ?[]const u8 = null,
     err_message: ?[]const u8 = null,
+
+    pub const TokenPassCredit = struct {
+        remaining: []const u8,
+        /// When the credit resets, as the Gateway writes it.
+        resets_at: ?[]const u8 = null,
+    };
 
     /// Frees provider-owned fields. `raw_json` remains borrowed presentation
     /// input and is not released here.
@@ -2281,8 +2334,16 @@ pub const CreditsSnapshot = struct {
         if (self.balance) |value| alloc.free(value);
         if (self.used) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
+        if (self.token_pass) |credit| {
+            alloc.free(credit.remaining);
+            if (credit.resets_at) |value| alloc.free(value);
+        }
         if (self.err_message) |value| alloc.free(value);
         self.* = undefined;
+    }
+
+    fn hasFields(self: CreditsSnapshot) bool {
+        return self.balance != null or self.used != null or self.plan != null or self.token_pass != null;
     }
 
     pub fn render(self: CreditsSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
@@ -2297,23 +2358,27 @@ pub const CreditsSnapshot = struct {
         defer out.deinit();
 
         if (self.err_message) |msg| {
-            try out.writer.print("[credits] error: {s}\n", .{msg});
+            try out.writer.print("[credits] error: {f}\n", .{text_utils.terminalSafe(msg)});
             return try out.toOwnedSlice();
         }
 
         if (self.balance) |b| {
-            try out.writer.print("[credits] balance={s}\n", .{b});
+            try out.writer.print("[credits] balance={f}\n", .{text_utils.terminalSafe(b)});
         }
         if (self.used) |u| {
-            try out.writer.print("[credits] used={s}\n", .{u});
+            try out.writer.print("[credits] used={f}\n", .{text_utils.terminalSafe(u)});
         }
         if (self.plan) |p| {
-            try out.writer.print("[credits] plan={s}\n", .{p});
+            try out.writer.print("[credits] plan={f}\n", .{text_utils.terminalSafe(p)});
+        }
+        if (self.token_pass) |credit| {
+            try out.writer.print("[credits] token_pass_remaining={f}\n", .{text_utils.terminalSafe(credit.remaining)});
+            if (credit.resets_at) |resets_at| try out.writer.print("[credits] token_pass_resets_at={f}\n", .{text_utils.terminalSafe(resets_at)});
         }
 
-        if (self.balance == null and self.used == null and self.plan == null) {
+        if (!self.hasFields()) {
             if (self.raw_json) |raw| {
-                try out.writer.print("[credits] {s}\n", .{raw});
+                try out.writer.print("[credits] {f}\n", .{text_utils.terminalSafe(raw)});
             } else {
                 try out.writer.writeAll("[credits] no data returned by gateway\n");
             }
@@ -2326,25 +2391,31 @@ pub const CreditsSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        if (self.err_message) |msg| return alloc.dupe(u8, msg);
+        if (self.err_message) |msg| return alloc.print("{f}", .{text_utils.terminalSafe(msg)});
         var wrote_field = false;
         if (self.balance) |balance| {
-            try out.writer.print("balance={s}", .{balance});
+            try out.writer.print("balance={f}", .{text_utils.terminalSafe(balance)});
             wrote_field = true;
         }
         if (self.used) |used| {
             if (wrote_field) try out.writer.writeByte('\n');
-            try out.writer.print("used={s}", .{used});
+            try out.writer.print("used={f}", .{text_utils.terminalSafe(used)});
             wrote_field = true;
         }
         if (self.plan) |plan| {
             if (wrote_field) try out.writer.writeByte('\n');
-            try out.writer.print("plan={s}", .{plan});
+            try out.writer.print("plan={f}", .{text_utils.terminalSafe(plan)});
             wrote_field = true;
         }
-        if (self.balance == null and self.used == null and self.plan == null) {
+        if (self.token_pass) |credit| {
+            if (wrote_field) try out.writer.writeByte('\n');
+            try out.writer.print("token_pass_remaining={f}", .{text_utils.terminalSafe(credit.remaining)});
+            if (credit.resets_at) |resets_at| try out.writer.print("\ntoken_pass_resets_at={f}", .{text_utils.terminalSafe(resets_at)});
+            wrote_field = true;
+        }
+        if (!self.hasFields()) {
             if (self.raw_json) |raw| {
-                try out.writer.writeAll(raw);
+                try out.writer.print("{f}", .{text_utils.terminalSafe(raw)});
             } else {
                 try out.writer.writeAll("no data returned by gateway");
             }
@@ -2374,6 +2445,12 @@ pub const CreditsSnapshot = struct {
             } else {
                 try out.writer.writeAll("null");
             }
+        }
+        try out.writer.writeAll(",\"token_pass\":");
+        if (self.token_pass) |credit| {
+            try std.json.Stringify.value(credit, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll("null");
         }
 
         try out.writer.writeByte('}');
@@ -3050,6 +3127,42 @@ test "status and doctor share a side-effect-free MCP inspection contract" {
     ) != null);
 }
 
+test "doctor's MCP rows say what doctor found for each server it checked" {
+    const servers = [_]mcp_health.ConfiguredServerSnapshot{
+        .{ .configured_name = @constCast("docs"), .source = .profile, .scope = .profile, .required = false, .transport = .stdio },
+        .{ .configured_name = @constCast("slow"), .source = .profile, .scope = .profile, .required = false, .transport = .http },
+        .{ .configured_name = @constCast("unapproved"), .source = .workspace, .scope = .profile, .workspace_admission = .pending, .required = false, .transport = .stdio },
+    };
+    const results = [_]McpServerResult{
+        .{ .name = "docs", .connection = .ready, .authentication = .ok },
+        .{ .name = "slow", .connection = .timed_out, .authentication = .not_checked },
+    };
+    const doctor = DoctorSnapshot{
+        .workspace_root = "/tmp/fx",
+        .model = "alpha",
+        .permission_mode = .auto,
+        .agent_step_limit = 24,
+        .checks = &.{},
+        .mcp = .{ .servers = &servers, .connection_check = .checked, .results = &results },
+    };
+    const text = try doctor.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    for ([_][]const u8{
+        "[doctor] mcp_connection_check=checked\n",
+        "[doctor] mcp_server=docs source=profile scope=profile admission=not_applicable transport=stdio connection=ready authentication=ok\n",
+        "[doctor] mcp_server=slow source=profile scope=profile admission=not_applicable transport=http connection=timed_out authentication=not_checked\n",
+        "[doctor] mcp_server=unapproved source=workspace scope=profile admission=pending transport=stdio connection=not_checked authentication=not_checked\n",
+    }) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);
+    const json = try doctor.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    for ([_][]const u8{
+        "\"connection_check\":\"checked\"",
+        "\"name\":\"docs\",\"source\":\"profile\",\"scope\":\"profile\",\"admission\":null,\"required\":false,\"transport\":\"stdio\",\"connection\":\"ready\",\"authentication\":\"ok\"",
+        "\"name\":\"slow\",\"source\":\"profile\",\"scope\":\"profile\",\"admission\":null,\"required\":false,\"transport\":\"http\",\"connection\":\"timed_out\",\"authentication\":\"not_checked\"",
+        "\"name\":\"unapproved\",\"source\":\"workspace\",\"scope\":\"profile\",\"admission\":\"pending\",\"required\":false,\"transport\":\"stdio\",\"connection\":\"not_checked\",\"authentication\":\"not_checked\"",
+    }) |part| try std.testing.expect(std.mem.find(u8, json, part) != null);
+}
+
 test "core permissions snapshot text and json stay stable" {
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("write_file"), .target_path = @constCast("/tmp/workspace/src/app.zig") },
@@ -3702,9 +3815,10 @@ test "core session recovery snapshot text and json stay stable" {
 test "core doctor snapshot text and json stay stable" {
     const checks = [_]doctor_runtime.Check{
         .{ .name = @constCast("auth"), .status = .ok, .detail = @constCast("AI_GATEWAY_API_KEY is configured") },
-        .{ .name = @constCast("gh"), .status = .warn, .detail = @constCast("GitHub CLI not found in PATH") },
+        .{ .name = @constCast("gh"), .status = .warn, .detail = @constCast("GitHub CLI not found in PATH"), .fix = "install gh from https://cli.github.com" },
     };
     const snapshot = DoctorSnapshot{
+        .version = "0.0.16",
         .workspace_root = "/tmp/fx",
         .model = "alpha",
         .auth = .{ .active_source = .ai_gateway_api_key },
@@ -3716,14 +3830,14 @@ test "core doctor snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[doctor] ok=1 warn=1 fail=0\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n",
+        "[doctor] ok=1 warn=1 fail=0\n[doctor] version=0.0.16\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n  fix: install gh from https://cli.github.com\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"version\":\"0.0.16\",\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\",\"fix\":\"install gh from https://cli.github.com\"}]}",
         json,
     );
 }
@@ -3788,7 +3902,7 @@ test "core credits snapshot renders parsed, raw, and empty fallbacks" {
     const parsed_json = try parsed.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(parsed_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\"}",
+        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\",\"token_pass\":null}",
         parsed_json,
     );
 
@@ -3801,13 +3915,63 @@ test "core credits snapshot renders parsed, raw, and empty fallbacks" {
     const raw_json = try raw.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(raw_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"balance\":null,\"used\":null,\"plan\":null}",
+        "{\"kind\":\"credits\",\"balance\":null,\"used\":null,\"plan\":null,\"token_pass\":null}",
         raw_json,
     );
 
     const empty_text = try (CreditsSnapshot{}).renderText(std.testing.allocator);
     defer std.testing.allocator.free(empty_text);
     try std.testing.expectEqualStrings("[credits] no data returned by gateway\n", empty_text);
+}
+
+test "core credits snapshot never lets Gateway text add lines or reach the terminal raw" {
+    const snapshot = CreditsSnapshot{
+        .balance = "1\n[credits] balance=999999",
+        .plan = "pro\x1b]52;c;aGk=\x07\x1b[2K",
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x07) == null);
+
+    const body = try snapshot.renderInteractiveBody(std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\n"));
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+
+    const failed = CreditsSnapshot{ .err_message = "denied\x1b[2J" };
+    const failed_text = try failed.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(failed_text);
+    try std.testing.expect(std.mem.findScalar(u8, failed_text, 0x1b) == null);
+}
+
+test "core credits snapshot renders the Token Pass balance on every surface" {
+    const snapshot = CreditsSnapshot{
+        .balance = "10",
+        .token_pass = .{ .remaining = "79.92906", .resets_at = "2026-12-05T08:00:00.000Z" },
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[credits] balance=10\n[credits] token_pass_remaining=79.92906\n[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n",
+        text,
+    );
+
+    const body = try snapshot.renderInteractiveBody(std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "balance=10\ntoken_pass_remaining=79.92906\ntoken_pass_resets_at=2026-12-05T08:00:00.000Z",
+        body,
+    );
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":null,\"plan\":null,\"token_pass\":{\"remaining\":\"79.92906\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}",
+        json,
+    );
 }
 
 test "core upgrade snapshot renders errors and statuses" {

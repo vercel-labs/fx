@@ -4079,23 +4079,31 @@ test("doctor reports a damaged session and removes only old terminal and side fo
     // An old folder whose session exists is never an orphan.
     utimesSync(keptTerminal, twoDaysAgo, twoDaysAgo);
 
-    const result = await command(fixture, gateway, ["doctor", "--json"]);
-    expect(result.code).toBe(0);
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+    // Without --fix, doctor names the old folders and removes nothing.
+    const looked = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    expect(named(looked, "session")).toEqual([
+      `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
+      "warn: 2 old terminal or side folder(s) whose session is gone can be removed",
+    ]);
+    expect(existsSync(old)).toBe(true);
+    expect(existsSync(oldTerminal)).toBe(true);
+
+    const result = await command(fixture, gateway, ["doctor", "--json", "--fix"]);
     const checks: any[] = JSON.parse(result.stdout).checks;
-    const named = (name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
-    expect(named("state")).toEqual(["ok: sessions ready"]);
-    expect(named("session")).toEqual([
+    expect(named(checks, "state")).toEqual(["ok: sessions ready"]);
+    expect(named(checks, "session")).toEqual([
       `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
       "ok: removed 2 terminal or side folder(s) whose session is gone",
     ]);
-    expect(named("sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
+    expect(named(checks, "sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
     expect(existsSync(old)).toBe(false);
     expect(existsSync(oldTerminal)).toBe(false);
     expect(existsSync(young)).toBe(true);
     expect(existsSync(keptTerminal)).toBe(true);
     // Doctor reports damage and repairs nothing.
     expect(readFileSync(path)).toEqual(before);
-    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json", "--fix"])).stdout).checks;
     expect(again.filter((check: any) => check.detail.includes("removed"))).toEqual([]);
 
   } finally {

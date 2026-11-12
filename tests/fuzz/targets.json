@@ -2,6 +2,7 @@
   "targets": [
     {"name": "acp_mcp_servers", "module": "fx", "test": "ACP MCP parser handles fuzzed request bytes", "iterations": 1500000},
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
+    {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
@@ -15,6 +16,8 @@
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},
     {"name": "earlier_image_notes", "module": "fx", "test": "earlier images withheld from a request always leave a note", "iterations": 100000},
     {"name": "mcp_elicitation", "module": "fx", "test": "elicitation request and response parsers stay bounded under fuzzed bytes", "iterations": 1500000},
+    {"name": "mcp_argument_repair", "module": "fx", "test": "MCP argument repair keeps its laws on fuzzed schemas and arguments", "iterations": 200000},
+    {"name": "mcp_invalid_params_cause", "module": "fx", "test": "an invalid-params cause keeps its laws on fuzzed messages", "iterations": 200000},
     {"name": "mcp_search_page", "module": "fx", "test": "MCP search pages agree with the schemas they load under fuzzed tools and limits", "iterations": 50000},
     {"name": "session_optional_fields", "module": "fx", "test": "durable session optional fields handle fuzzed ownership paths", "iterations": 3000000},
     {"name": "session_work_provenance", "module": "fx", "test": "per-turn work provenance parser handles fuzzed ownership paths", "iterations": 2100000},
@@ -60,6 +63,7 @@
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
     {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000},
     {"name": "network_error_message", "module": "fx", "test": "fuzzed gateway error messages stay one bounded line of UTF-8", "iterations": 2000000},
-    {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000}
+    {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000},
+    {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000}
   ]
 }

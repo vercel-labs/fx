@@ -1161,6 +1161,9 @@ const App = struct {
         // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
+        // The suspend restore turned theme notifications off, and the theme
+        // may have changed while fx was stopped.
+        self.terminal_input_runtime.terminal_theme_monitor.requestRearm();
     }
 
     pub fn ensurePromptCredential(self: *App, agent: *agents.Agent) !bool {
@@ -1696,6 +1699,7 @@ const App = struct {
                 .api_key = credential.token,
                 .gateway_team = credential.gatewayTeam(),
                 .source = credential.source,
+                .team_slug = credential.team_slug,
             };
         } else self.auth.queuedPromptCredential() orelse return error.MissingApiKey;
         const api_key_copy = if (gateway_credential.api_key) |api_key|
@@ -1709,6 +1713,11 @@ const App = struct {
         else
             null;
         errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
+        const gateway_team_label_copy = if (gateway_credential.team_slug) |slug|
+            try std.heap.c_allocator.dupe(u8, slug)
+        else
+            null;
+        errdefer if (gateway_team_label_copy) |label| std.heap.c_allocator.free(label);
         const account_id_value = if (child_run) |active_run|
             if (active_run.credential) |credential| credential.accountId() else self.auth.accountId()
         else
@@ -1786,6 +1795,7 @@ const App = struct {
             .provider = if (child_run) |active_run| active_run.admission.provider else provider_runtime.providerOf(self, agent),
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
+            .gateway_team_label = gateway_team_label_copy,
             .credential_source = gateway_credential.source,
             .account_id = account_id_copy,
             .permission_mode = if (child_run) |active_run| active_run.admission.permission_mode else app_permission_runtime.Runtime(App).viewOf(self, agent).mode,
@@ -2367,10 +2377,11 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
-            self.model_cache.startWarmup(
+            self.model_cache.startWarmupWithSharedSignIn(
                 self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
                 trigger,
+                self.auth.backgroundSignIn(),
             );
         }
     }
@@ -3206,6 +3217,22 @@ const App = struct {
                 });
             };
         }
+        if (self.terminal_input_runtime.terminal_theme_monitor.takeRearmRequest(now_ms)) {
+            debug_trace.logf("theme", "theme_notifications_rearmed", .{});
+            self.terminal.enableThemeNotifications() catch |err| {
+                debug_trace.logf("theme", "theme_notification_enable_failed err={s}", .{@errorName(err)});
+            };
+            self.terminal.requestThemeColorScheme() catch |err| {
+                debug_trace.logf("theme", "theme_color_scheme_query_failed err={s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn collectBracketedPasteFacts(self: *App) void {
+        if (!self.terminal_input_runtime.bracketed_paste_rearm.take(io_mod.milliTimestamp())) return;
+        self.terminal.enableBracketedPaste() catch |err| {
+            debug_trace.logf("input", "bracketed_paste_rearm_failed err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
@@ -3233,6 +3260,7 @@ const App = struct {
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
 
         try self.collectThemeFacts();
+        self.collectBracketedPasteFacts();
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -5359,6 +5387,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = @import("core/app/usage_host.zig");
     _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
@@ -5408,6 +5437,7 @@ test {
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
+    _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
@@ -5415,6 +5445,8 @@ test {
     _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/shared/history_range.zig");
     _ = @import("core/cli/doctor_runtime.zig");
+    _ = @import("core/cli/doctor_probes.zig");
+    _ = @import("core/cli/doctor_child_status.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");
@@ -5520,6 +5552,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
@@ -6076,7 +6109,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     // From another subagent's screen, main's own request comes first.
     try App.AgentsAppRuntime.show(&app, reviewer);
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
-    try std.testing.expectEqualStrings("main and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "the footer notes a hidden agent whose request waits for the user" {
@@ -6108,7 +6141,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
     // It counts with the agents waiting on an answer.
     try App.AgentsAppRuntime.show(&app, null);
     _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {

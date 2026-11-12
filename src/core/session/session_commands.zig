@@ -15,6 +15,7 @@ const model_cache_runtime = @import("../app/model_cache_runtime.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -918,6 +919,10 @@ pub fn Commands(comptime App: type) type {
             if (announce) {
                 const label = if (app.fast_mode) "on" else "off";
                 try app.writeDomainNotice(.{ .topic = "fast", .tone = .neutral, .body = label }, true);
+                const model = provider_runtime.modelOf(app, agent);
+                if (app.fast_mode and isGatewayTokenPassModel(app, agent, model) and tokenPassModelRunsFast(app, agent, model)) {
+                    try warnTokenPassFast(app);
+                }
                 if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
             }
             app.shell.render_requests.request(.footer);
@@ -1472,7 +1477,52 @@ pub fn Commands(comptime App: type) type {
             const line = try app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, agent.effort.displayLabel(), speed });
             defer app.alloc.free(line);
             try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
+            try announceTokenPass(app, agent, selected);
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+        }
+
+        /// After a switch to a Token Pass model: a warning when Fast mode
+        /// would bill AI Gateway credits instead, or else one line that
+        /// Token Pass covers the model, until fx sees this team use it.
+        fn announceTokenPass(app: *App, agent: *AppAgent, selected: []const u8) !void {
+            if (!isGatewayTokenPassModel(app, agent, selected)) return;
+            if (tokenPassModelRunsFast(app, agent, selected)) {
+                try warnTokenPassFast(app);
+                return;
+            }
+            const status: token_pass.Status = if (comptime @hasField(App, "model_cache"))
+                app.model_cache.tokenPassStatus()
+            else
+                .unknown;
+            if (status == .active) return;
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .neutral,
+                .body = "Token Pass covers this model: " ++ token_pass.docs_url,
+            }, true);
+        }
+
+        /// Whether Token Pass credit can pay for `model` on the agent's
+        /// provider. Only AI Gateway serves Token Pass.
+        fn isGatewayTokenPassModel(app: *App, agent: *AppAgent, model: []const u8) bool {
+            if (comptime !provider_runtime.supported(App)) return false;
+            if (provider_runtime.providerOf(app, agent) != .gateway) return false;
+            return token_pass.isFeaturedModel(model);
+        }
+
+        /// Whether the agent's speed setting sends `model` at a speed Token
+        /// Pass credit does not pay for.
+        fn tokenPassModelRunsFast(app: *App, agent: *AppAgent, model: []const u8) bool {
+            return agent.worker.agent_turn_settings.ultrafast_mode or
+                (app.fast_mode and model_capabilities.resolveForApp(App, app, model).supports_fast_mode);
+        }
+
+        fn warnTokenPassFast(app: *App) !void {
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .warning,
+                .body = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.",
+            }, true);
         }
 
         /// The model `/model <query>` switches to: the one the Models menu

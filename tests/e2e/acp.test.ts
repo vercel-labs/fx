@@ -30,6 +30,7 @@ import {
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
+import { bearer, rotateFxLogin, startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -1579,6 +1580,87 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP titles a Token Pass session with a Token Pass model",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-token-pass-title-");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
+        titleResponses: [finalText("ACP Token Pass Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: "zai/glm-5.3" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Name this conversation for me.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP Token Pass Title");
+        // The turn runs on the Token Pass model, and so does the title.
+        expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["zai/glm-5.3"]);
+        expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
+          .toEqual(["zai/glm-5.3-flash"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP titles a session with the login another fx refreshed after session/new",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-title-rotated-login-");
+      const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      let accepted = "launch-token";
+      const title = (_body: string, headers: Headers) =>
+        bearer(headers) === accepted ? finalText("ACP Generated Title") : unauthorized();
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
+        titleResponses: [title, title, title],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        // Another fx refreshes the shared login, and the old token stops working.
+        rotateFxLogin(root.home, "other-fx-token");
+        accepted = "other-fx-token";
+        const result = await runPrompt(client, "Name this conversation for me.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP Generated Title");
+        expect(gateway.titleRequests.map((request) => bearer(request.headers))).toEqual(["other-fx-token"]);
+        expect(issuer.refreshes).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
