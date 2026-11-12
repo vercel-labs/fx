@@ -1222,13 +1222,16 @@ describe("Vision route fake Gateway", () => {
         expect(second.output).toContain("second answer");
         expect(gateway.chatRequests).toHaveLength(6);
         expectNextRequestExtends(gateway.chatRequests[2].body, gateway.chatRequests[3].body);
-        // The second turn lists both images, each on the message it came with.
-        const secondTurn = promptMessages(gateway.chatRequests[5].body)
-          .filter((message) => message.role === "user")
-          .map((message) => textFromContent(message.content));
+        // Each image is listed once, on the message of the turn that attached it.
+        const userTexts = (body: string) =>
+          promptMessages(body)
+            .filter((message) => message.role === "user")
+            .map((message) => textFromContent(message.content));
+        const secondTurn = userTexts(gateway.chatRequests[5].body);
         expect(secondTurn[0]).toContain("[Image #1]");
         expect(secondTurn[0]).not.toContain("[Image #2]");
         expect(secondTurn.at(-1)).toContain("[Image #2]");
+        expect(secondTurn.at(-1)).not.toContain("[Image #1]");
 
         const third = parseFxJson(await runFx(
           ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "And the last word?"],
@@ -1237,6 +1240,13 @@ describe("Vision route fake Gateway", () => {
         expect(third.output).toContain("third answer");
         expect(gateway.chatRequests).toHaveLength(7);
         expectNextRequestExtends(gateway.chatRequests[5].body, gateway.chatRequests[6].body);
+        // A turn with no image adds no list, and both earlier images stay named
+        // on the messages they came with, so the model can still read them.
+        const thirdTurn = userTexts(gateway.chatRequests[6].body);
+        expect(thirdTurn.at(-1)).toContain("And the last word?");
+        expect(thirdTurn.at(-1)).not.toContain("<available_images>");
+        expect(thirdTurn.join("\n").split("[Image #1]")).toHaveLength(2);
+        expect(thirdTurn.join("\n").split("[Image #2]")).toHaveLength(2);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

@@ -363,6 +363,7 @@ async function runTrace(observation: Observation, bug: string, parent: string): 
       "  MaxRequests = 30",
       '  Notices = "none"',
       "  Review = FALSE",
+      "  Hook = TRUE",
       "  DoubleTrail = TRUE",
       `  Bug = ${str(bug)}`,
       "CONSTRAINT TraceBounded",

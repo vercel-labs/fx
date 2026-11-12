@@ -620,11 +620,14 @@ fn isSteering(message: ChatMessage) bool {
 /// Where the notes that join `messages` at the next step boundary go. A saved
 /// turn restores a boundary's notes before its steering (D93), so a note joins
 /// before the steering the last step ended with, such as a continuation prompt,
-/// the empty-reply nudge, a Stop hook's message, review mode's message, or
-/// steering taken after a reply, and never after it. That steering is the
-/// longest tail of steering messages, each with the plain assistant message
-/// before it that the save keeps as its prefix. With none, the notes join at the
-/// end.
+/// the empty-reply nudge, review mode's message, or steering taken after a
+/// reply, and never after it. That steering is the longest tail of steering
+/// messages, each with the plain assistant message before it that the save keeps
+/// as its prefix. With none, the notes join at the end.
+///
+/// A message fx appends without a steering marker is not steering, and the save
+/// drops it: a Stop hook's message and the Vision outage notice are such
+/// messages here, so a note joins after them. Marking them is a separate change.
 pub fn boundaryNotesStart(messages: []const ChatMessage) usize {
     var start = messages.len;
     while (start > 0) {
@@ -2750,24 +2753,40 @@ test "boundary notes join before the steering the last step ended with, and afte
 // notes where `boundaryNotesStart` puts them, come back from a save as the turn
 // sent them: the next turn's request starts with the last request. Each seed
 // plays a turn of up to six requests, with steps of one or two results and
-// feedback, empty replies with and without a reply that stays, hook messages,
-// steering after a reply, a failed request's recovery prompt, and notes from
-// the gate and from a changed runtime context.
+// feedback, empty replies with and without a reply that stays, steering after a
+// reply, a failed request's recovery prompt, and notes from the gate and from a
+// changed runtime context. A Stop hook's message and Vision's outage notice are
+// built as the step loop builds them, with no marker, and the save drops them;
+// the restored turn is the sent one without them, until they are marked.
 test "a turn's messages come back from a save in the order the step loop sent them (seeded)" {
     const alloc = std.testing.allocator;
     const session = @import("../../session/session.zig");
     const Check = struct {
-        fn roundTrip(a: Allocator, seed: u64, live: []const ChatMessage) !void {
+        /// A user message fx sends with no steering marker, no feedback flag,
+        /// and no note flag: the save has no place for it.
+        fn unmarked(message: ChatMessage) bool {
+            return message.role == .user and message.content != null and !isSteering(message) and
+                !message.permission_feedback and !isContextNote(message);
+        }
+
+        fn roundTrip(a: Allocator, seed: u64, sent_all: []const ChatMessage) !void {
             var arena_state = std.heap.ArenaAllocator.init(a);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            const saved = try buildExecutionMemory(a, live);
+            var kept: std.ArrayList(ChatMessage) = .empty;
+            for (sent_all) |message| {
+                if (!unmarked(message)) try kept.append(arena, message);
+            }
+            const live = kept.items;
+            const saved = try buildExecutionMemory(a, sent_all);
             defer types.freeExecutionMemory(a, saved);
             var restored: std.ArrayList(ChatMessage) = .empty;
             try session.appendExecutionMemoryChatMessages(arena, &restored, saved);
             const back = try rewrapRestoredSteering(arena, restored.items);
             std.testing.expectEqual(live.len, back.len) catch |err| {
-                std.debug.print("seed {d}: {d} messages sent, {d} restored\n", .{ seed, live.len, back.len });
+                std.debug.print("seed {d}: {d} messages kept, {d} restored\n", .{ seed, live.len, back.len });
+                for (sent_all) |message| std.debug.print("  sent {s} {s} {s}\n", .{ @tagName(message.role), if (message.tool_calls.len > 0) "(calls)" else "", message.content orelse "" });
+                for (back) |message| std.debug.print("  back {s} {s} {s}\n", .{ @tagName(message.role), if (message.tool_calls.len > 0) "(calls)" else "", message.content orelse "" });
                 return err;
             };
             for (live, back, 0..) |sent, got, index| {
@@ -2820,7 +2839,13 @@ test "a turn's messages come back from a save in the order the step loop sent th
                         call.* = toolCall(try arena.print("call_{d}", .{calls_made}), "read_file", "{\"path\":\"a\"}");
                     }
                     try live.append(arena, .{ .role = .assistant, .tool_calls = calls });
-                    for (calls) |call| try live.append(arena, .{ .role = .tool, .content = "ok", .tool_call_id = call.id, .tool_name = call.name, .tool_result_status = .success });
+                    for (calls, 0..) |call, index| {
+                        try live.append(arena, .{ .role = .tool, .content = "ok", .tool_call_id = call.id, .tool_name = call.name, .tool_result_status = .success });
+                        // Vision's outage notice follows its own result, here the
+                        // step's last. Between two results it would also cut off
+                        // the later results, which the save does not keep.
+                        if (index == calls.len - 1 and random.uintLessThan(u8, 5) == 0) try live.append(arena, .{ .role = .user, .content = "None of the requested images were read by Vision." });
+                    }
                     if (random.boolean()) try live.append(arena, .{ .role = .user, .content = "allowed once", .tool_call_id = calls[0].id, .permission_feedback = true });
                     if (random.boolean()) gate_notes += 1;
                     if (random.uintLessThan(u8, 4) == 0) try live.append(arena, .{ .role = .user, .content = "Review the changes you just made.", .recovery_prompt = true });
@@ -2831,7 +2856,7 @@ test "a turn's messages come back from a save in the order the step loop sent th
                 },
                 4 => {
                     try live.append(arena, .{ .role = .assistant, .content = "A reply the hook continues.", .standalone_response = true });
-                    try live.append(arena, .{ .role = .user, .content = "Continue the turn. fx hook context:\nkeep going", .recovery_prompt = true });
+                    try live.append(arena, .{ .role = .user, .content = "Continue the turn. fx hook context:\nkeep going" });
                 },
                 5 => {
                     if (random.boolean())

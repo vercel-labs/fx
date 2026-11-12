@@ -277,9 +277,9 @@ fn append_steering_guidance(
 /// Adds the notes that join the turn at a step boundary: the notes the last
 /// step's gate queued, and a changed runtime context. The saved turn restores a
 /// boundary's notes before its steering (D93), so they join before the steering
-/// the last step ended with, such as a continuation prompt, the nudge, or a
-/// message from a Stop hook, not after it (`boundaryNotesStart`). The turn's
-/// messages a compaction already took out of the request stay where they are.
+/// the last step ended with, such as a continuation prompt or the nudge, not
+/// after it (`boundaryNotesStart`). The turn's messages a compaction already
+/// took out of the request stay where they are.
 fn insertBoundaryNotes(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),

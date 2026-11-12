@@ -6,6 +6,7 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const sort_utils = @import("../../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -490,26 +491,48 @@ fn isTurnUserMessage(message: types.ChatMessage) bool {
         !message.restored_steering and !message.permission_feedback and !message.recovery_prompt;
 }
 
-/// `content` followed by the reference list of `catalog`, as every projected
-/// message carries it. Returned storage belongs to `alloc`.
-fn withImageReferences(
+fn imageIdLessThan(_: void, lhs: types.ImageAttachment, rhs: types.ImageAttachment) bool {
+    return lhs.id < rhs.id;
+}
+
+/// `message`'s content followed by the reference list of the images it carries,
+/// or null when it carries none. The list names the catalog's entries for those
+/// images, in ID order, and leaves out an image the catalog does not authorize.
+/// `catalog` must be sorted by ID. Returned storage belongs to `alloc`.
+fn withOwnImageReferences(
     alloc: Allocator,
-    content: []const u8,
+    message: types.ChatMessage,
     catalog: []const types.ImageAttachment,
-) ![]u8 {
-    const references = try project_image_references(alloc, catalog);
+) !?[]u8 {
+    var carried: std.ArrayList(types.ImageAttachment) = .empty;
+    defer carried.deinit(alloc);
+    for (message.images) |image| {
+        const index = image_attachments.findImageIndexByIdSorted(catalog, image.id) orelse continue;
+        try carried.append(alloc, catalog[index]);
+    }
+    if (carried.items.len == 0) return null;
+    sort_utils.sort(types.ImageAttachment, carried.items, {}, imageIdLessThan);
+    var unique: usize = 0;
+    for (carried.items) |image| {
+        if (unique > 0 and carried.items[unique - 1].id == image.id) continue;
+        carried.items[unique] = image;
+        unique += 1;
+    }
+    const references = try project_image_references(alloc, carried.items[0..unique]);
     defer alloc.free(references);
-    if (content.len == 0) return alloc.dupe(u8, references);
-    return alloc.print("{s}\n\n{s}", .{ content, references });
+    const content = message.content orelse "";
+    if (content.len == 0) return try alloc.dupe(u8, references);
+    return try alloc.print("{s}\n\n{s}", .{ content, references });
 }
 
 /// Projects an eligible text-only request without carrying filesystem-backed
-/// image parts. Every authorized stable ID is attached to the current root user
-/// message as a compact reference list. Each earlier turn's user message lists
-/// the images the conversation held at its own turn, which are the ones with an
-/// ID up to the newest image of that turn or before it, so it reads in every
-/// later request as it did in the request of its own turn, and the provider's
-/// prompt cache still covers it. Returned storage belongs to `alloc`.
+/// image parts. Each image is listed once, as a compact reference list on the
+/// user message of the turn that attached it, so a later request repeats the
+/// message as the request of its own turn sent it: the provider's prompt cache
+/// still covers it, and the request grows by one line per image, not by every
+/// image on every turn. The catalog holds the images of the turns the request
+/// carries, since a compacted turn's images leave it, so the lists together name
+/// every authorized ID. Returned storage belongs to `alloc`.
 pub noinline fn project_text_only_messages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
@@ -527,18 +550,14 @@ pub noinline fn project_text_only_messages(
     {
         return error.MissingUserMessage;
     }
-    // The catalog is sorted by ID, so the images known at a turn are its start.
-    var newest_known: usize = 0;
+    if (!image_attachments.imageAttachmentsSortedById(catalog)) return error.InvalidImageCatalog;
     for (messages[0..current_user_message_index], 0..) |message, index| {
-        for (message.images) |image| newest_known = @max(newest_known, image.id);
-        if (newest_known == 0 or !isTurnUserMessage(message)) continue;
-        var known: usize = 0;
-        while (known < catalog.len and catalog[known].id <= newest_known) known += 1;
-        if (known == 0) continue;
-        projected[index].content = try withImageReferences(alloc, message.content orelse "", catalog[0..known]);
+        if (!isTurnUserMessage(message)) continue;
+        if (try withOwnImageReferences(alloc, message, catalog)) |content| projected[index].content = content;
     }
-    const current = &projected[current_user_message_index];
-    current.content = try withImageReferences(alloc, current.content orelse "", catalog);
+    if (try withOwnImageReferences(alloc, messages[current_user_message_index], catalog)) |content| {
+        projected[current_user_message_index].content = content;
+    }
     return projected;
 }
 
@@ -1582,7 +1601,7 @@ test "text-only projection preserves typed permission feedback byte-exact" {
     try std.testing.expectEqualStrings("Make the requested changes.", messages[0].content.?);
 }
 
-test "text-only projection lists each earlier turn's images on its own message, as that turn's request did" {
+test "text-only projection lists each image once, on the message of the turn that attached it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1604,21 +1623,28 @@ test "text-only projection lists each earlier turn's images on its own message, 
     const messages = history ++ [_]types.ChatMessage{current};
 
     const projected = try project_text_only_messages(arena, &messages, 7, &catalog);
-    // Before any image, a turn lists none; later turns list every image the
-    // conversation held at their turn, and steering is the user's own words.
+    // A turn with no image of its own lists none, and steering is the user's
+    // own words. The earlier images stay named on the messages that came with them.
     try std.testing.expectEqualStrings("zero", projected[0].content.?);
     try std.testing.expectEqualStrings("first\n\n<available_images>\n[Image #1]\n</available_images>", projected[2].content.?);
     try std.testing.expectEqualStrings(
-        "second\n\n<available_images>\n[Image #1]\n[Image #2]\n[Image #3]\n</available_images>",
+        "second\n\n<available_images>\n[Image #2]\n[Image #3]\n</available_images>",
         projected[4].content.?,
     );
     try std.testing.expectEqualStrings("typed update", projected[5].content.?);
-    try std.testing.expectEqualStrings(
-        "third\n\n<available_images>\n[Image #1]\n[Image #2]\n[Image #3]\n</available_images>",
-        projected[7].content.?,
-    );
+    try std.testing.expectEqualStrings("third", projected[7].content.?);
     for (projected) |chat_message| try std.testing.expectEqual(@as(usize, 0), chat_message.images.len);
     try std.testing.expectEqualStrings("first", messages[2].content.?);
+
+    // Every authorized ID is named in the request, once.
+    var listed: usize = 0;
+    for (projected) |chat_message| listed += std.mem.count(u8, chat_message.content orelse "", "[Image #");
+    try std.testing.expectEqual(catalog.len, listed);
+    for ([_][]const u8{ "[Image #1]", "[Image #2]", "[Image #3]" }) |name| {
+        var found: usize = 0;
+        for (projected) |chat_message| found += std.mem.count(u8, chat_message.content orelse "", name);
+        try std.testing.expectEqual(@as(usize, 1), found);
+    }
 
     // The request each earlier turn sent, built when that turn was the current
     // one over the images it knew, carries the message as a later request does.
@@ -1627,6 +1653,52 @@ test "text-only projection lists each earlier turn's images on its own message, 
     const then_second = try project_text_only_messages(arena, messages[0..5], 4, &catalog);
     try std.testing.expectEqualStrings(then_second[4].content.?, projected[4].content.?);
     try std.testing.expectEqualStrings(then_second[2].content.?, projected[2].content.?);
+}
+
+test "text-only projection grows by the lines of the images, not by the turns after them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const image_count = 30;
+    const later_turns = 100;
+    var catalog: [image_count]types.ImageAttachment = undefined;
+    for (&catalog, 0..) |*image, index| {
+        image.* = .{ .id = index + 1, .path = @constCast("/tmp/image.png"), .media_type = @constCast("image/png") };
+    }
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try messages.append(arena, .{ .role = .user, .content = "look at these", .images = &catalog, .context_origin = .user_turn });
+    for (0..later_turns) |_| {
+        try messages.append(arena, .{ .role = .assistant, .content = "ok" });
+        try messages.append(arena, .{ .role = .user, .content = "and then?", .context_origin = .user_turn });
+    }
+
+    const projected = try project_text_only_messages(arena, messages.items, messages.items.len - 1, &catalog);
+    const references = try project_image_references(arena, &catalog);
+    // One list on the first message, and nothing on the hundred turns after it.
+    var added: usize = 0;
+    var lists: usize = 0;
+    for (projected, messages.items) |after, before| {
+        const after_content: []const u8 = after.content orelse "";
+        const before_content: []const u8 = before.content orelse "";
+        added += after_content.len - before_content.len;
+        lists += std.mem.count(u8, after_content, "<available_images>");
+    }
+    try std.testing.expectEqual("\n\n".len + references.len, added);
+    try std.testing.expectEqual(@as(usize, 1), lists);
+
+    // A turn that follows adds only its own message to the request.
+    const shorter = try project_text_only_messages(arena, messages.items[0 .. messages.items.len - 2], messages.items.len - 3, &catalog);
+    var shorter_bytes: usize = 0;
+    var longer_bytes: usize = 0;
+    for (shorter) |message| {
+        const content: []const u8 = message.content orelse "";
+        shorter_bytes += content.len;
+    }
+    for (projected) |message| {
+        const content: []const u8 = message.content orelse "";
+        longer_bytes += content.len;
+    }
+    try std.testing.expectEqual(shorter_bytes + "ok".len + "and then?".len, longer_bytes);
 }
 
 test "native message projection retains only the current turn structured rejection" {

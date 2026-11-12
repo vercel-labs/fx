@@ -32,7 +32,10 @@
 (*        `boundary_notices` until the next step's top)                    *)
 (*   "X"  a user message fx sent with no marker, which the save drops     *)
 (* The steering kinds are T, K, H, V and Q: the save keeps each in the     *)
-(* turn's steering list, anchored at the number of steps before it.        *)
+(* turn's steering list, anchored at the number of steps before it, when   *)
+(* fx marks the message. fx marks T, K and V. It sends the Stop hook's     *)
+(* message (H) and a tool's notice (Q) with no marker, as X, so the save   *)
+(* drops them, until open PR 1829 marks them.                              *)
 (*                                                                         *)
 (* Save keeps steps with their results and feedback, notes anchored the    *)
 (* same way, and steering with its assistant prefix. Restore puts back, at *)
@@ -44,8 +47,10 @@
 (*   Notices      how a tool's notice joins the turn: "none"; "held", the *)
 (*                notice waits and joins at the next step's top (PR 1829);  *)
 (*                "inline", right after its own result; "plain", inline   *)
-(*                with no marker (fx before PR 1829)                       *)
+(*                with no marker (fx on main)                              *)
 (*   Review       review mode's message after a step that wrote            *)
+(*   Hook         a Stop hook may continue the turn (no production code    *)
+(*                registers a Stop hook today)                             *)
 (*   DoubleTrail  a second steering message may follow one the last        *)
 (*                request already carried, with no reply between them      *)
 (*   Bug          "none" is the design: a boundary's notes join before the *)
@@ -54,13 +59,13 @@
 (*                catch it:                                                *)
 (*     append_notes     notes join after that steering, as fx did before   *)
 (*     review_plain     review mode's message has no marker                *)
-(*     hook_plain       a Stop hook's message has no marker                *)
+(*     hook_plain       a Stop hook's message has no marker, as on main    *)
 (*     steering_first   Restore puts a boundary's steering before its notes *)
 (*     prefix_dropped   Save forgets the assistant message before steering *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS MaxAtoms, MaxRequests, Notices, Review, DoubleTrail, Bug
+CONSTANTS MaxAtoms, MaxRequests, Notices, Review, Hook, DoubleTrail, Bug
 
 Steer == {"T", "K", "H", "V", "Q"}
 Atoms == {"C", "R", "F", "A", "P", "N", "X"} \cup Steer
@@ -198,7 +203,7 @@ EmptyReply ==
     /\ UNCHANGED <<sent, held, pend, ctx, wrote, requests, how>>
 
 HookReply ==
-    /\ phase = "reply" /\ MaySteer
+    /\ phase = "reply" /\ Hook /\ MaySteer
     /\ live' = live \o <<"A", IF Bug = "hook_plain" THEN "X" ELSE "H">>
     /\ phase' = "top"
     /\ UNCHANGED <<sent, held, pend, ctx, wrote, requests, how>>
