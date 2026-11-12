@@ -742,21 +742,21 @@ fn accepts(arena: std.mem.Allocator, properties: []const u8, content: []const u8
     return true;
 }
 
-/// Every case the engine refuses, named, so a failure lists them all.
+/// Every case the engine refuses, named, so a failure lists them all. The test fails when the text is not empty,
+/// and `expectEqualStrings` prints it.
 fn expectAllAccepted(comptime what: []const u8, comptime shape: fn (std.mem.Allocator, EscapeCase, []const u8) anyerror!bool) !void {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var refused: usize = 0;
+    var refused: std.ArrayList(u8) = .empty;
     for (escape_cases) |c| {
         const sent = try hostWrites(arena, c.written);
         try testing.expectEqualStrings(c.sent, sent); // the table says what the host writes
         if (!try shape(arena, c, sent)) {
-            std.debug.print("refused a valid {s}: written {s}, sent {s}, escape {s}\n", .{ what, c.written, sent, c.name });
-            refused += 1;
+            try refused.print(arena, "refused a valid {s}: written {s}, sent {s}, escape {s}\n", .{ what, c.written, sent, c.name });
         }
     }
-    try testing.expectEqual(@as(usize, 0), refused);
+    try testing.expectEqualStrings("", refused.items);
 }
 
 fn keyIsAccepted(arena: std.mem.Allocator, c: EscapeCase, sent: []const u8) anyerror!bool {
