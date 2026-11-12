@@ -1,6 +1,9 @@
 //! Rewrites text that fx already drew in one theme into another theme's
-//! colors, by escape bytes. Loaded themes give each slot its own escape
-//! (`theme.parse`), so each slot's color maps to its own new color.
+//! colors, by escape bytes. A loaded theme gives each slot that its file sets
+//! its own escape, within the padding limits of `theme.parse`, so each of those
+//! slots maps to its own new color. Slots left to the builtin variant, and
+//! repeats past the limits, share an escape: the first slot that has it
+//! decides its new color.
 
 const std = @import("std");
 const shared_theme = @import("theme.zig");
@@ -44,8 +47,8 @@ fn isBuiltin(theme: Theme) bool {
 /// The escape rewrite map from `from` to `to`, built in `buf` or pinned for a
 /// builtin-to-builtin flip. Empty when both themes have the same variant. Any
 /// custom theme involved gets a map pairing each slot's old escape with its
-/// new one, longest first so combined forms match before their fg-only
-/// equivalents.
+/// new one, the first slot winning when slots share an escape, longest first
+/// so combined forms match before their fg-only equivalents.
 pub fn tokens(from: Theme, to: Theme, buf: *[max_tokens]Token) []const Token {
     if (from.light == to.light) return &.{};
     if (isBuiltin(from) and isBuiltin(to)) {

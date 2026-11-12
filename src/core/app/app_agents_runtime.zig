@@ -789,8 +789,13 @@ pub fn Runtime(comptime App: type) type {
         /// theme `from` to `to`, as the theme change does for the agent on
         /// screen, so a hidden agent shows the new colors when it comes on
         /// screen. An agent that fails keeps its old colors, and the others
-        /// still change.
+        /// still change. While a scrollback handoff is pending no transcript
+        /// may be swapped, so every hidden agent keeps its old colors.
         pub fn retintHiddenScreens(app: *App, from: shared_theme.Theme, to: shared_theme.Theme) void {
+            if (app.shell.sessionScrollbackHandoffPending()) {
+                debug_trace.logf("theme", "hidden_retint_skipped reason=scrollback_handoff_pending kept=old_colors", .{});
+                return;
+            }
             const Themes = struct {
                 from: shared_theme.Theme,
                 to: shared_theme.Theme,

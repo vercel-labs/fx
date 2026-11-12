@@ -6889,3 +6889,35 @@ test "a theme change rewrites hidden agents' transcripts and paced text" {
     // The agent on screen is the theme change's own work, not this one's.
     try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "\x1b[38;2;136;192;208mmain") != null);
 }
+
+test "a theme change leaves hidden agents alone while a scrollback handoff is pending" {
+    const alloc = std.testing.allocator;
+    const shared_theme = @import("core/shared/theme.zig");
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.shell.layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 };
+    const child = try addTestChildAgent(&app, "child-1");
+
+    var dark = shared_theme.fx_dark;
+    dark.name = "probe-dark";
+    dark.inline_code_open = "\x1b[38;2;136;192;208m";
+    var light = shared_theme.fx_light;
+    light.name = "probe-light";
+    light.inline_code_open = "\x1b[38;2;23;108;116m";
+
+    const Fill = struct {
+        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
+            _ = try a.shell.appendRawTranscriptEntryClassified(a.alloc, "\x1b[38;2;136;192;208mshown\x1b[39m\n", .tool_status);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, {}, Fill.run);
+
+    // Swapping a transcript in now would trip swapSlot's handoff assertion.
+    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
+    defer app.shell.pending_session_scrollback_handoff = null;
+    App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
+
+    try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;136;192;208mshown") != null);
+}

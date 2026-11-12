@@ -55,7 +55,7 @@ pub const SgrState = struct {
     underline: bool = false,
     strike: bool = false,
     fg: Foreground = .none,
-    fg_buf: [24]u8 = undefined,
+    fg_buf: [shared_theme.max_restorable_open_bytes]u8 = undefined,
     fg_len: u8 = 0,
 
     pub fn isActive(self: SgrState) bool {

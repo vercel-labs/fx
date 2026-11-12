@@ -206,6 +206,14 @@ noinline fn styleSlotPtr(theme: *Theme, index: usize) *[]const u8 {
     unreachable;
 }
 
+/// The longest foreground open the transcript can restore after a wrap or a
+/// paced block boundary (`SgrState` in `src/ui/assistant/pacer.zig`).
+pub const max_restorable_open_bytes: usize = 24;
+
+/// Most leading zeros one padded escape adds: nine distinct forms for a
+/// three-value color, two for a palette color.
+const max_added_zeros: usize = 2;
+
 /// Gives every escape slot a loaded theme sets its own bytes. Theme files
 /// often use one color for several slots, and the transcript keeps text as
 /// drawn bytes, so a light/dark flip could not tell which slot drew a color
@@ -214,7 +222,8 @@ noinline fn styleSlotPtr(theme: *Theme, index: usize) *[]const u8 {
 /// becomes `;23;068m`), which terminals read as the same numbers, so it draws
 /// the same color. Slots the file leaves to the builtin variant keep its
 /// bytes, and an escape whose last parameter is not a color value stays as
-/// it is.
+/// it is. A repeat past the padding limits keeps the shared escape, so its
+/// slot takes the first sharing slot's new color, as before.
 fn giveSlotsDistinctEscapes(alloc: std.mem.Allocator, theme: *Theme) ParseError!void {
     const base = builtin(theme.light);
     var originals: [style_slot_count][]const u8 = undefined;
@@ -240,20 +249,32 @@ fn giveSlotsDistinctEscapes(alloc: std.mem.Allocator, theme: *Theme) ParseError!
         }
         const repeats = @intFromBool(shares_inherited) + earlier_set;
         if (repeats == 0) continue;
-        if (try zeroPaddedEscape(alloc, original, repeats)) |padded| styleSlotPtr(theme, index).* = padded;
+        if (try zeroPaddedEscape(alloc, original, repeats)) |padded| {
+            styleSlotPtr(theme, index).* = padded;
+        } else {
+            var starts: [3]usize = undefined;
+            if (lastColorValueStarts(original, &starts) != null) {
+                debug_trace.logf("theme", "theme_slot_escape_shared slot={d} repeat={d} reason=padding_limit", .{ index, repeats });
+            }
+        }
     }
 }
 
 /// `escape` with leading zeros on the values of its last color, as the
-/// `repeat`th distinct form, or null when the escape is not one SGR sequence
-/// that ends with a color. Forms are ordered by how many zeros they add, so
-/// the first nine repeats of a three-value color add at most two bytes.
+/// `repeat`th distinct form. Null when the escape is not one SGR sequence
+/// that ends with a color, when the form needs more than `max_added_zeros`
+/// zeros, or when it would grow a restorable open past
+/// `max_restorable_open_bytes`. Forms are ordered by how many zeros they add.
 /// Caller owns the returned slice.
 fn zeroPaddedEscape(alloc: std.mem.Allocator, escape: []const u8, repeat: usize) ParseError!?[]u8 {
     var starts: [3]usize = undefined;
     const values = lastColorValueStarts(escape, &starts) orelse return null;
     var zeros: [3]usize = .{ 0, 0, 0 };
     distinctZeroCounts(repeat, zeros[0..values]);
+    var added: usize = 0;
+    for (zeros[0..values]) |count| added += count;
+    if (added > max_added_zeros) return null;
+    if (escape.len <= max_restorable_open_bytes and escape.len + added > max_restorable_open_bytes) return null;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -267,32 +288,21 @@ fn zeroPaddedEscape(alloc: std.mem.Allocator, escape: []const u8, repeat: usize)
     return try out.toOwnedSlice(alloc);
 }
 
-/// Writes into `zeros` the `repeat`th (from 1) way to spread leading zeros
-/// over its values, counting ways with fewer zeros first.
+/// Writes into `zeros`, one count per color value (one or three), the
+/// `repeat`th (from 1) way to spread leading zeros over them, counting ways
+/// with fewer zeros first.
 fn distinctZeroCounts(repeat: usize, zeros: []usize) void {
+    std.debug.assert(zeros.len == 1 or zeros.len == 3);
+    if (zeros.len == 1) {
+        zeros[0] = repeat;
+        return;
+    }
     var seen: usize = 0;
     var total: usize = 1;
     while (true) : (total += 1) {
-        if (zeros.len == 1) {
-            seen += 1;
-            if (seen == repeat) {
-                zeros[0] = total;
-                return;
-            }
-            continue;
-        }
-        // Two or three values: walk the splits of `total` in a fixed order.
+        // Walk the splits of `total` over the three values in a fixed order.
         var first: usize = 0;
         while (first <= total) : (first += 1) {
-            if (zeros.len == 2) {
-                seen += 1;
-                if (seen == repeat) {
-                    zeros[0] = first;
-                    zeros[1] = total - first;
-                    return;
-                }
-                continue;
-            }
             var second: usize = 0;
             while (second <= total - first) : (second += 1) {
                 seen += 1;
@@ -1411,10 +1421,18 @@ test "repeated escapes get zero padded forms of the same color" {
         .{ .escape = "\x1b[38;2;20;20;20m", .repeat = 4, .want = "\x1b[38;2;20;20;0020m" },
         .{ .escape = "\x1b[1;38;5;23m", .repeat = 2, .want = "\x1b[1;38;5;0023m" },
         // The last color is the background.
-        .{ .escape = "\x1b[38;2;1;2;3;48;2;4;5;6m", .repeat = 1, .want = "\x1b[38;2;1;2;3;48;2;4;5;06m" },
+        .{ .escape = "\x1b[38;5;1;48;5;4m", .repeat = 1, .want = "\x1b[38;5;1;48;5;04m" },
+        // Already at the restore limit: one more byte would lose its restore.
+        .{ .escape = "\x1b[38;2;1;2;3;48;2;4;5;6m", .repeat = 1, .want = null },
         // Ends with an attribute, or holds several escapes: left alone.
         .{ .escape = "\x1b[38;5;235;1m", .repeat = 1, .want = null },
         .{ .escape = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m", .repeat = 1, .want = null },
+        // Past two added zeros: the slot keeps the shared escape.
+        .{ .escape = "\x1b[1;38;5;23m", .repeat = 3, .want = null },
+        .{ .escape = "\x1b[38;2;20;20;20m", .repeat = 10, .want = null },
+        // A 23-byte open has room for one zero before the restore limit.
+        .{ .escape = "\x1b[1;3;38;2;255;255;255m", .repeat = 1, .want = "\x1b[1;3;38;2;255;255;0255m" },
+        .{ .escape = "\x1b[1;3;38;2;255;255;255m", .repeat = 4, .want = null },
     };
     for (cases) |case| {
         const got = try zeroPaddedEscape(alloc, case.escape, case.repeat);
@@ -1430,7 +1448,7 @@ test "repeated escapes get zero padded forms of the same color" {
     }
 }
 
-test "the first nine repeats of a truecolor escape stay distinct within two extra bytes" {
+test "a truecolor escape has nine distinct padded forms within two extra bytes" {
     const alloc = std.testing.allocator;
     var seen: [10][]u8 = undefined;
     var count: usize = 0;
@@ -1441,6 +1459,32 @@ test "the first nine repeats of a truecolor escape stay distinct within two extr
         count += 1;
         try std.testing.expect(padded.len <= "\x1b[38;2;240;240;240m".len + 2);
         for (seen[0 .. count - 1]) |earlier| try std.testing.expect(!std.mem.eql(u8, earlier, padded));
+    }
+    try std.testing.expect(try zeroPaddedEscape(alloc, "\x1b[38;2;240;240;240m", 10) == null);
+}
+
+test "every foreground slot of a loaded theme stays restorable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // One color for every slot an editor theme maps, and one for every slot a
+    // native file names, in a terminal without truecolor.
+    const docs = [_][]const u8{
+        "{ \"type\": \"dark\", \"colors\": { \"editor.foreground\": \"#D0D0D0\" } }",
+        "{ \"name\": \"probe-mono\", \"colors\": { \"hint\": \"#D0D0D0\", \"statusline\": \"#D0D0D0\", \"system_notice_text\": \"#D0D0D0\", " ++
+            "\"dim\": \"#D0D0D0\", \"warning\": \"#D0D0D0\", \"green\": \"#D0D0D0\", \"red\": \"#D0D0D0\", \"permission_auto\": \"#D0D0D0\", " ++
+            "\"user_card_marker\": \"#D0D0D0\", \"user_card_accent\": \"#D0D0D0\", \"inline_code\": \"#D0D0D0\", \"task_completed\": \"#D0D0D0\", " ++
+            "\"tool_stdout\": \"#D0D0D0\", \"tool_stderr\": \"#D0D0D0\", \"link\": \"#D0D0D0\" } }",
+    };
+    for (docs) |doc| {
+        for ([_]bool{ false, true }) |truecolor| {
+            const theme = try parse(alloc, doc, .{ .truecolor = truecolor });
+            for (0..style_slot_count) |index| {
+                const slot = styleSlot(theme, index);
+                if (sgrHasParam(slot, "48")) continue;
+                try std.testing.expect(slot.len <= max_restorable_open_bytes);
+            }
+        }
     }
 }
 
