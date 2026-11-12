@@ -1448,7 +1448,7 @@ test "a loaded theme gives every slot it sets its own escape" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    // Like cursor-light: red text and removed diff lines share one color, as
+    // As in many editor themes: red text and removed diff lines share one color, as
     // do body text and shell variables.
     const theme = try parse(alloc,
         \\{ "type": "light", "name": "probe-light",

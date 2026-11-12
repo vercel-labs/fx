@@ -151,7 +151,7 @@ test "slots that share a color in one loaded theme still map to their own colors
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    // As in cursor-light and cursor-dark: light shares colors the dark keeps apart.
+    // As in many editor theme pairs: the light one shares colors the dark one keeps apart.
     const light = try shared_theme.parse(alloc,
         \\{ "type": "light", "name": "probe-light",
         \\  "colors": { "hint": "#141414", "red": "#BE1744", "diff_removed": "#BE1744" },
