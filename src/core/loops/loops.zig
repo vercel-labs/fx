@@ -101,6 +101,9 @@ pub const Loops = struct {
     /// Test hook: the wait between runs for every loop, in place of each
     /// loop's interval. Lists and notices still show the interval.
     wait_override_ms: ?u64 = null,
+    /// The ids `endForConversation` ended, kept until the new conversation
+    /// can say so, because a switch redraws the screen in between.
+    ended_ids: std.ArrayList(u32) = .empty,
 
     /// Copies `prompt`. The first run is due one interval from `now_ms`.
     pub fn arm(self: *Loops, alloc: Allocator, interval_ms: u64, prompt: []const u8, now_ms: i64) error{ TooManyLoops, OutOfMemory }!u32 {
@@ -192,6 +195,13 @@ pub const Loops = struct {
         return ended;
     }
 
+    /// Ends every loop because its conversation changed, and records their
+    /// ids in `ended_ids` for the notice the next conversation writes.
+    pub fn endForConversation(self: *Loops, alloc: Allocator) error{OutOfMemory}!void {
+        for (self.items.items) |loop| try self.ended_ids.append(alloc, loop.id);
+        _ = self.endAll(alloc);
+    }
+
     /// Every loop, paused ones included, as `/loop` lists them.
     pub fn count(self: *const Loops) usize {
         return self.items.items.len;
@@ -200,6 +210,7 @@ pub const Loops = struct {
     pub fn deinit(self: *Loops, alloc: Allocator) void {
         _ = self.endAll(alloc);
         self.items.deinit(alloc);
+        self.ended_ids.deinit(alloc);
         self.* = .{};
     }
 
@@ -457,4 +468,14 @@ test "wait override schedules runs without changing the interval" {
     loops.markStarted(loops.nextDue(500).?, 1);
     _ = loops.noteTurnFinished(1, .completed, 600).?;
     try testing.expectEqual(@as(i64, 1_100), loops.items.items[0].next_due_ms);
+}
+
+test "endForConversation records the ids it ended" {
+    var loops: Loops = .{};
+    defer loops.deinit(testing.allocator);
+    _ = try loops.arm(testing.allocator, minute_ms, "a", 0);
+    _ = try loops.arm(testing.allocator, minute_ms, "b", 0);
+    try loops.endForConversation(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), loops.count());
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, loops.ended_ids.items);
 }

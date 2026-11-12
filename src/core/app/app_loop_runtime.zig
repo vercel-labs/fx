@@ -198,6 +198,33 @@ pub fn Runtime(comptime App: type) type {
             try writeNotice(app, .neutral, "Resumed loop {d}. Next run in {s}.", .{ id, formatInterval(&interval_buf, loop.interval_ms) });
         }
 
+        /// Ends every loop `agent` holds, because its conversation changes
+        /// (`/clear`, `/new`, `/reset`, `/resume`, `/fork`). Runs before the
+        /// switch, so no run starts in between; `noteEndedLoops` says which
+        /// loops ended once the new conversation is on screen.
+        pub fn endForConversationChange(app: *App, agent: anytype) !void {
+            if (agent.loops.count() == 0) return;
+            try agent.loops.endForConversation(app.alloc);
+            debug_trace.logf("loop", "event=ended reason=conversation_changed count={d}", .{agent.loops.ended_ids.items.len});
+        }
+
+        /// Writes, in the conversation a switch opened, which loops the
+        /// switch ended, as `noteStoppedSubagentTasks` does for subagents.
+        pub fn noteEndedLoops(app: *App, agent: anytype) !void {
+            const ended = agent.loops.ended_ids.items.len;
+            if (ended == 0) return;
+            defer agent.loops.ended_ids.clearRetainingCapacity();
+            if (agents.screenAgentOf(app) != agent) return;
+            var ids: std.ArrayList(u8) = .empty;
+            defer ids.deinit(app.alloc);
+            for (agent.loops.ended_ids.items, 0..) |id, index| {
+                if (index > 0) try ids.appendSlice(app.alloc, ", ");
+                var buf: [16]u8 = undefined;
+                try ids.appendSlice(app.alloc, try std.mem.print(&buf, "{d}", .{id}));
+            }
+            try writeNotice(app, .neutral, "Ended {s} {s} because the conversation changed.", .{ loopWord(ended), ids.items });
+        }
+
         fn writeUnknownLoop(app: *App, id: u32) !void {
             try writeNotice(app, .warning, "No loop {d}. /loop lists active loops.", .{id});
         }

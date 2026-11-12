@@ -496,4 +496,24 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "clear ends active loops with a notice",
+    async () => {
+      gateway = startFakeGateway([]);
+      const { stderrPath } = await launchLoopTerminal("clear");
+
+      await session!.sendText("/loop 1h first");
+      await session!.waitForText("Loop 1 runs every 1h", 5_000);
+      await session!.sendText("/loop 2h second");
+      await session!.waitForText("Loop 2 runs every 2h", 5_000);
+      await session!.sendText("/clear");
+      await session!.waitForText("Ended loops 1, 2 because the conversation changed.", 5_000);
+      await session!.waitForComposer(5_000);
+      await session!.sendText("/loop");
+      await session!.waitForText("No active loops.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
 });
