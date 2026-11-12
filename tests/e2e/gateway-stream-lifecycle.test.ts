@@ -13886,6 +13886,13 @@ test("a stop that drops an unread message says so", async () => {
   expect(result.code).toBe(0);
 }, 90_000);
 
+// A message to subagent `worker`. With `emptyOptionalFields` it is a flat call
+// that carries every optional field set to an empty string.
+function startGapMessage(message: string, emptyOptionalFields: boolean) {
+  if (!emptyOptionalFields) return { request: { action: "message", agent: "worker", message } };
+  return { action: "message", agent: "worker", message, instructions: "", report: "", model: "", effort: "", profile: "" };
+}
+
 // Main starts subagent `worker` with STARTGAP_TASK, and the start hold
 // (src/core/subagent/start_test_controls.zig) stops its first turn before the
 // worker attaches. Main then messages it STARTGAP_NOTE. `releaseWhenWaiting`
@@ -13894,11 +13901,12 @@ test("a stop that drops an unread message says so", async () => {
 // task takes one shell step, so a joined note reaches that task, and a note
 // fx held for the next turn arrives after the task's final answer,
 // STARTGAP_CHILD_DONE.
-async function runStartGap(label: string, options: { releaseWhenWaiting: boolean; waitLimitMs?: number; quitWhenWaiting?: boolean }) {
+async function runStartGap(label: string, options: { releaseWhenWaiting: boolean; waitLimitMs?: number; quitWhenWaiting?: boolean; emptyOptionalFields?: boolean }) {
   const root = createFixtureRoot(label);
   const startHeld = join(root.root, "start-held"), startRelease = join(root.root, "start-release");
   const tracePath = join(root.root, "trace.log");
-  const state = { noteJoined: 0, noteTurns: 0, noteAnswer: "", trace: "" };
+  const emptyOptionalFields = options.emptyOptionalFields ?? false;
+  const state = { noteJoined: 0, noteTurns: 0, noteAnswer: "", startAnswer: "", trace: "" };
   const release = () => { if (!existsSync(startRelease)) writeFileSync(startRelease, ""); };
   const gateway = startDynamicFakeGateway(async raw => {
     const body = JSON.parse(raw);
@@ -13915,6 +13923,7 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
       return fakeGatewayToolCall("startgap-shell", "shell", { request: { action: "run", command: "true" } });
     }
     if (raw.includes("startgap-note")) {
+      state.startAnswer = toolResultText(raw, "startgap-start");
       state.noteAnswer = toolResultText(raw, "startgap-note");
       release();
       return fakeGatewayFinalText("STARTGAP_MAIN_DONE");
@@ -13926,9 +13935,9 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
         await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=message_waits_start"), 20_000);
         release();
       })();
-      return fakeGatewayToolCall("startgap-note", "subagent", { request: { action: "message", agent: "worker", message: "STARTGAP_NOTE" } });
+      return fakeGatewayToolCall("startgap-note", "subagent", startGapMessage("STARTGAP_NOTE", emptyOptionalFields));
     }
-    return fakeGatewayToolCall("startgap-start", "subagent", { request: { action: "message", agent: "worker", message: "STARTGAP_TASK" } });
+    return fakeGatewayToolCall("startgap-start", "subagent", startGapMessage("STARTGAP_TASK", emptyOptionalFields));
   }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
   const env = {
     ...fixtureEnv(root, gateway, tracePath),
@@ -13957,7 +13966,7 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
       cwd: root.workspace, env, timeoutMs: 60_000,
     });
     state.trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
-    return { result, state, heldMarker: readFileSync(`${startHeld}.1`, "utf8") };
+    return { result, state, heldMarker: existsSync(`${startHeld}.1`) ? readFileSync(`${startHeld}.1`, "utf8") : "" };
   } finally {
     release();
     gateway.stop();
@@ -13969,6 +13978,24 @@ test("a message right after starting a subagent joins its first task", async () 
   expect(heldMarker).toContain("start child=");
   expect(state.noteAnswer).toContain("Sent into the subagent's running turn");
   expect(state.noteAnswer).not.toContain("waits and starts its next turn");
+  expect(result.code).toBe(0);
+  expect(state.noteJoined).toBe(1);
+  expect(state.noteTurns).toBe(0);
+}, 90_000);
+
+test("a message whose optional fields are all empty starts a subagent, and a second one joins its work", async () => {
+  // Both calls set instructions, report, model, effort, and profile to empty
+  // strings. Each means the field is absent: the first message starts
+  // `worker`, and the second reaches it while it works, without
+  // `child_busy` for the instructions or `override_after_create` for the model.
+  const { result, state, heldMarker } = await runStartGap("start-then-message-empty-fields", { releaseWhenWaiting: true, emptyOptionalFields: true });
+  expect(state.startAnswer).toContain("\"ok\":true");
+  expect(state.startAnswer).toContain("Sent to worker, which works on it now");
+  expect(heldMarker).toContain("start child=");
+  expect(state.noteAnswer).toContain("\"ok\":true");
+  expect(state.noteAnswer).toContain("Sent into the subagent's running turn");
+  expect(state.noteAnswer).not.toContain("child_busy");
+  expect(state.noteAnswer).not.toContain("override_after_create");
   expect(result.code).toBe(0);
   expect(state.noteJoined).toBe(1);
   expect(state.noteTurns).toBe(0);
