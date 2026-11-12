@@ -3,8 +3,8 @@
 // answers with scripted tool calls and replies.
 //
 // Fixtures: repository r1 with a second worktree, and repository r2. Each has
-// its own AGENTS.md and a repository skill, so the skill catalog and project
-// rules blocks are present. Sessions, in order:
+// its own AGENTS.md and a repository skill, so the toolbox menu lists a skill
+// and the project rules block is present. Sessions, in order:
 //   1. w1 (r1)               a tool step, then a reply
 //   2. w2 (r1, worktree)     the same, in another worktree of r1
 //   3. w3 (r2)               the same, in another repository

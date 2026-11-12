@@ -50,17 +50,20 @@ pub fn free(alloc: Allocator, credential: RefreshedGatewayCredential) void {
 /// The sign-in's credential from the host in `mode`, owned by the caller.
 /// Null when its source is not refreshable, the host holds none, or the host
 /// refused it, such as a stored sign-in for another account or team.
+/// `rejected_token` is the token the provider refused, for a forced refresh:
+/// the host refreshes only while the store still holds it.
 pub fn load(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
     sign_in: SignIn,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
     trace_ctx: TraceContext,
 ) Allocator.Error!?RefreshedGatewayCredential {
     const source = sign_in.source orelse return null;
     if (!credentials.sourceRefreshable(source)) return null;
     const refresh = deps.refresh_gateway_credential orelse return null;
-    return refresh(deps.ctx, alloc, source, mode, sign_in.account_id) catch |err| {
+    return refresh(deps.ctx, alloc, source, mode, sign_in.account_id, rejected_token) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.eventf(
             "gateway",
@@ -89,12 +92,12 @@ pub fn renewRejected(
     rejected: []const u8,
     trace_ctx: TraceContext,
 ) Allocator.Error!Renewal {
-    const stored = (try load(deps, alloc, sign_in, .reload, trace_ctx)) orelse {
+    const stored = (try load(deps, alloc, sign_in, .reload, null, trace_ctx)) orelse {
         debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
         return .{};
     };
     errdefer free(alloc, stored);
     if (!std.mem.eql(u8, stored.token, rejected)) return .{ .stored = stored, .resend = true };
-    const forced = (try load(deps, alloc, sign_in, .force, trace_ctx)) orelse return .{ .stored = stored };
+    const forced = (try load(deps, alloc, sign_in, .force, rejected, trace_ctx)) orelse return .{ .stored = stored };
     return .{ .stored = stored, .forced = forced, .resend = true };
 }

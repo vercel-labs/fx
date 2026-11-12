@@ -432,11 +432,16 @@ pub const LogoutResult = struct {
     revocation_failed: bool,
 };
 
-pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
+pub fn logout(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) !LogoutResult {
     const local = try logoutLocally(alloc);
     defer if (local.refresh_token) |token| secret.zeroAndFree(alloc, token);
     var result = local.result;
     if (local.refresh_token) |token| {
+        if (before_revocation) |notice| notice.run(notice.context);
         revokeToken(alloc, transport, token) catch {
             result.revocation_failed = true;
         };
