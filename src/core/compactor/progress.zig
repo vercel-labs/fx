@@ -3,10 +3,12 @@
 //! its ID (`T12:`, or `T3–T7:` for calls that share a line), then the
 //! sections Rules, Facts, Decisions, Status and Open, and Earlier when a
 //! compaction folds the one before it (`ledger.writeRequest`). Each call
-//! noted and each section begun is one step of the count. Only the start of
-//! each line is read, so a chunk can end anywhere, even inside an ID.
+//! noted and each section begun is one step of the count, read with the
+//! notes reader's own line rules (`ledger.lineStart`). Only the start of each
+//! line is read, so a chunk can end anywhere, even inside an ID.
 
 const std = @import("std");
+const ledger = @import("ledger.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,13 +29,12 @@ pub const Sink = struct {
     written_fn: *const fn (context: *anyopaque, percent: u8) void,
 };
 
-/// The sections every request asks for, in order, and Earlier, which only a
-/// request that folds the compaction before it asks for.
-const sections = [_][]const u8{ "rules", "facts", "decisions", "status", "open", "earlier" };
+/// The sections every request asks for, and Earlier.
+const section_count = @typeInfo(ledger.Section).@"enum".field_names.len;
 
-/// The start of a line kept to read it. A tool ID range and a section name,
-/// with Markdown around them, fit.
-const line_start_bytes = 48;
+/// The start of a line kept to read it. A tool ID range with its tool's name,
+/// or a section heading, with Markdown around them, fits.
+const line_start_bytes = 64;
 
 /// The highest count before the notes are saved.
 const most_before_saved = 99;
@@ -43,7 +44,7 @@ pub const Counter = struct {
     /// Tool calls the whole compaction notes, in every part.
     total_tools: usize = 0,
     /// Sections the last part writes.
-    total_sections: usize = sections.len - 1,
+    total_sections: usize = section_count - 1,
     /// Calls noted in the parts before this one.
     tools_before: usize = 0,
     /// This part's calls are numbered from here, one after another.
@@ -53,7 +54,7 @@ pub const Counter = struct {
     covered_count: usize = 0,
     /// Only the last part's sections count: each part writes them.
     sections_count: bool = false,
-    seen: [sections.len]bool = @splat(false),
+    seen: [section_count]bool = @splat(false),
     seen_count: usize = 0,
     line: [line_start_bytes]u8 = undefined,
     line_len: usize = 0,
@@ -65,7 +66,7 @@ pub const Counter = struct {
     /// and Earlier too when it folds the compaction before it.
     pub fn begin(self: *Counter, tools: usize, folds: bool) void {
         self.total_tools = tools;
-        self.total_sections = if (folds) sections.len else sections.len - 1;
+        self.total_sections = if (folds) section_count else section_count - 1;
     }
 
     /// Starts a part whose `count` calls are numbered from `first_tool`.
@@ -111,7 +112,11 @@ pub const Counter = struct {
             if (self.line_read) continue;
             self.line[self.line_len] = byte;
             self.line_len += 1;
-            if (byte == ':' or self.line_len == self.line.len) self.readLine();
+            if (self.line_len == self.line.len) {
+                self.readLine(true);
+            } else if (byte == ':') {
+                self.readLine(false);
+            }
         }
         const now = self.percent();
         if (now <= self.reported) return;
@@ -128,21 +133,34 @@ pub const Counter = struct {
     }
 
     fn endLine(self: *Counter) void {
-        if (!self.line_read and self.line_len > 0) self.readLine();
+        if (!self.line_read and self.line_len > 0) self.readLine(true);
         self.line_len = 0;
         self.line_read = false;
     }
 
-    fn readLine(self: *Counter) void {
+    /// Reads the line's start when it names calls or begins a section. A `:`
+    /// can end an ID or a heading, so the line is tried there too; a line
+    /// that names nothing is given up once it ends or fills the buffer.
+    fn readLine(self: *Counter, last_try: bool) void {
+        var buffer: [line_start_bytes]u8 = undefined;
+        var arena: std.heap.FixedBufferAllocator = .init(&buffer);
+        const start = ledger.lineStart(arena.allocator(), self.line[0..self.line_len]) catch null;
+        if (start == null and !last_try) return;
         self.line_read = true;
-        const text = trimDecoration(self.line[0..self.line_len]);
-        if (toolRange(text)) |range| return self.cover(range.first, range.last);
-        if (!self.sections_count) return;
-        if (sectionIndex(text)) |index| {
-            if (self.seen[index]) return;
-            self.seen[index] = true;
-            self.seen_count += 1;
+        switch (start orelse return) {
+            .tools => |tools| self.cover(tools.first, tools.last),
+            .section => |section| self.see(section),
         }
+    }
+
+    fn see(self: *Counter, section: ledger.Section) void {
+        // Only the last part's sections count, and Earlier only in a fold.
+        if (!self.sections_count) return;
+        if (section == .earlier and self.total_sections < section_count) return;
+        const index = @backingInt(section);
+        if (self.seen[index]) return;
+        self.seen[index] = true;
+        self.seen_count += 1;
     }
 
     fn cover(self: *Counter, first: usize, last: usize) void {
@@ -158,78 +176,6 @@ pub const Counter = struct {
         }
     }
 };
-
-fn isDecoration(byte: u8) bool {
-    return switch (byte) {
-        ' ', '\t', '\r', '-', '*', '#', '>', '`', '_', '+' => true,
-        else => false,
-    };
-}
-
-/// Drops the Markdown a model may put around a line's start: bullets,
-/// headings, bold, quotes, and code marks.
-fn trimDecoration(text: []const u8) []const u8 {
-    var start: usize = 0;
-    while (start < text.len and isDecoration(text[start])) start += 1;
-    return text[start..];
-}
-
-const Range = struct { first: usize, last: usize };
-
-/// `T12:` or a range of calls on one line, `T3–T7:` (an en dash, an em
-/// dash, or a hyphen, the second `T` optional).
-fn toolRange(text: []const u8) ?Range {
-    if (text.len == 0 or text[0] != 'T') return null;
-    var rest = text[1..];
-    const first = leadingNumber(&rest) orelse return null;
-    var last = first;
-    rest = trimDecorationExceptDash(rest);
-    if (dashLength(rest)) |dash| {
-        rest = std.mem.trimStart(u8, rest[dash..], " ");
-        if (rest.len > 0 and rest[0] == 'T') rest = rest[1..];
-        last = leadingNumber(&rest) orelse return null;
-        rest = trimDecorationExceptDash(rest);
-    }
-    if (rest.len == 0 or rest[0] != ':' or last < first) return null;
-    return .{ .first = first, .last = last };
-}
-
-fn trimDecorationExceptDash(text: []const u8) []const u8 {
-    var start: usize = 0;
-    while (start < text.len and text[start] != '-' and isDecoration(text[start])) start += 1;
-    return text[start..];
-}
-
-fn dashLength(text: []const u8) ?usize {
-    for ([_][]const u8{ "\u{2013}", "\u{2014}", "-" }) |dash| {
-        if (std.mem.startsWith(u8, text, dash)) return dash.len;
-    }
-    return null;
-}
-
-/// Reads the digits at the start of `rest` and moves past them. Null for
-/// none, for 0, and for a number too long to be a tool ID.
-fn leadingNumber(rest: *[]const u8) ?usize {
-    var end: usize = 0;
-    while (end < rest.len and std.ascii.isDigit(rest.*[end])) end += 1;
-    if (end == 0 or end > 9) return null;
-    const value = std.fmt.parseUnsigned(usize, rest.*[0..end], 10) catch return null;
-    rest.* = rest.*[end..];
-    return if (value == 0) null else value;
-}
-
-/// A line that begins a section: its name, with or without a colon after it.
-fn sectionIndex(text: []const u8) ?usize {
-    var end: usize = 0;
-    while (end < text.len and std.ascii.isAlphabetic(text[end])) end += 1;
-    if (end == 0) return null;
-    const rest = trimDecoration(text[end..]);
-    if (rest.len > 0 and rest[0] != ':') return null;
-    for (sections, 0..) |name, index| {
-        if (std.ascii.eqlIgnoreCase(text[0..end], name)) return index;
-    }
-    return null;
-}
 
 // Tests
 
@@ -337,6 +283,21 @@ test "without tool calls only the sections count" {
     var folds = onePart(&.{}, 1, true);
     folds.feed("Earlier:\nThe user asked for a fix.\n\nRules:\n");
     try testing.expectEqual(@as(u8, 33), folds.percent());
+}
+
+test "a line counts as the notes reader reads it" {
+    var covered: [3]bool = undefined;
+    var counter = onePart(&covered, 40, false);
+    // A tool's name before the separator, a colon inside it, a dash for the
+    // separator, and a long heading.
+    counter.feed("T40 (shell) - ran the tests\nT41 (a:b): read it\n");
+    try testing.expectEqual(@as(usize, 2), counter.covered_count);
+    counter.feed("T42 \u{2013} wrote it\nFacts of the session:\n");
+    try testing.expectEqual(@as(usize, 3), counter.covered_count);
+    try testing.expectEqual(@as(usize, 1), counter.seen_count);
+    // Earlier counts only when the compaction folds the one before it.
+    counter.feed("Earlier:\n");
+    try testing.expectEqual(@as(usize, 1), counter.seen_count);
 }
 
 test "a reply that ignores the format stays at zero" {
