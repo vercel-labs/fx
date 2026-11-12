@@ -152,35 +152,6 @@ fn appendContinuationPrompt(
 const ignored_effort_notice =
     "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
 
-/// Adds the notices the last step's tools raised to the turn, after the
-/// step's results. They join at the next boundary, after its notes, or here
-/// when the turn ends or is cancelled before another request carries them,
-/// so the saved turn keeps them where the request would have (D93).
-fn flushBoundaryNotices(
-    arena: Allocator,
-    within_turn_suffix: *std.ArrayList(ChatMessage),
-    boundary_notices: *std.ArrayList(ChatMessage),
-) !void {
-    try within_turn_suffix.appendSlice(arena, boundary_notices.items);
-    boundary_notices.clearRetainingCapacity();
-}
-
-/// Adds what a step held for its boundary to the turn: the notes its calls'
-/// gate queued, then its tools' notices. A step that takes steering before
-/// its next request does this first, since the saved turn restores a
-/// boundary's notes before its steering (D93); the top of the next step does
-/// the same for a step that goes on without it.
-fn flushStepBoundary(
-    arena: Allocator,
-    within_turn_suffix: *std.ArrayList(ChatMessage),
-    pending_context_notes: *std.ArrayList(ChatMessage),
-    boundary_notices: *std.ArrayList(ChatMessage),
-) !void {
-    try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
-    pending_context_notes.clearRetainingCapacity();
-    try flushBoundaryNotices(arena, within_turn_suffix, boundary_notices);
-}
-
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
     if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
@@ -7630,12 +7601,6 @@ fn processQueuedPromptLoop(
     // Notes the gate queued during a step; they join the turn at the next
     // step boundary.
     var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
-    // The notices the last step's tools handed the model. They join the turn
-    // at the next boundary, after the notes above and the runtime context
-    // update and before any steering, the order a saved turn restores a
-    // boundary in (D93). A turn that ends or is cancelled first keeps them
-    // through `flushBoundaryNotices`.
-    var boundary_notices: std.ArrayList(ChatMessage) = .empty;
     // The rules of the folders the turn's images come from join the turn's
     // own message at its first boundary.
     if (deps.context_enabled and deps.image_folder_rules) if (deps.context_registry) |registry| try queueImageFolderRules(
@@ -7809,7 +7774,6 @@ fn processQueuedPromptLoop(
         );
         last_step_ctx = step_ctx;
         if (config.cancel_flag.load(.seq_cst)) {
-            try flushBoundaryNotices(arena, &within_turn_suffix, &boundary_notices);
             if (try append_immediate_steering_after_cancel(
                 deps,
                 arena,
@@ -7839,9 +7803,6 @@ fn processQueuedPromptLoop(
             try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, &update);
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
-        // The last step's notices follow every note at this boundary, as the
-        // saved turn restores them, and come before its steering.
-        try flushBoundaryNotices(arena, &within_turn_suffix, &boundary_notices);
         const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
         if (steering_action == .handoff) {
             try finish_steering_handoff(
@@ -12641,9 +12602,10 @@ fn processQueuedPromptLoop(
                 result_commit_pending = false;
             }
             replay_handed_off = true;
-            // The notice joins the turn at the next boundary, after the step's
-            // results and notes, so the saved turn, which restores it there,
-            // matches the request.
+            // The notice joins the turn when the step's results are in, as
+            // steering the saved turn restores there, and the step's notes
+            // join before it at the next step (`insertBoundaryNotes`), so the
+            // saved turn matches the request.
             if (execution.system_notice) |notice| {
                 try runtime_tool_batch.appendToolNotice(arena, &step_batch, notice);
             }
@@ -12665,10 +12627,6 @@ fn processQueuedPromptLoop(
             }
         }
 
-        // The step's notices wait for the next boundary, where the step's
-        // notes, which join there, come first.
-        try boundary_notices.appendSlice(arena, step_batch.pending_notices.items);
-        step_batch.pending_notices.clearRetainingCapacity();
         try runtime_tool_batch.drainPendingUserSuffix(
             arena,
             &step_batch,
@@ -12690,7 +12648,6 @@ fn processQueuedPromptLoop(
             &step_batch,
         );
         if (malformed_arguments_retry.finishBatch()) {
-            try flushStepBoundary(arena, &within_turn_suffix, &pending_context_notes, &boundary_notices);
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
@@ -12722,7 +12679,6 @@ fn processQueuedPromptLoop(
             return;
         }
         if (terminal_validation_retry.finishBatch()) {
-            try flushStepBoundary(arena, &within_turn_suffix, &pending_context_notes, &boundary_notices);
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
@@ -12747,7 +12703,6 @@ fn processQueuedPromptLoop(
             return;
         }
         if (shell_execution_failure_retry.finishBatch(step_batch.step_changed_files)) {
-            try flushStepBoundary(arena, &within_turn_suffix, &pending_context_notes, &boundary_notices);
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
@@ -12925,7 +12880,6 @@ fn processQueuedPromptLoop(
         }
     }
 
-    try flushBoundaryNotices(arena, &within_turn_suffix, &boundary_notices);
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
         .step_index = current_step_index,

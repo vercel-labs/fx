@@ -2561,6 +2561,50 @@ fn expectReminderOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, ru
     try std.testing.expect(std.mem.endsWith(u8, output, line));
 }
 
+test "a tool's notice raised by the first of two results keeps the second result in the saved turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Done" } };
+    const notice = "notice from the first call";
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output", .system_notice = notice } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    hooks.permission_feedback = &.{ "", "typed feedback" };
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The request carries both results and the feedback before the notice.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "typed feedback", notice });
+
+    // The save keeps both results and the feedback, and the notice after them.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps[0].tool_results.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+
+    // The next turn's request opens with that whole request.
+    var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_job = fixture.job();
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+    try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+    try test_support.expectPromptExtends(gateway.request_bodies.items[1], next_gateway.request_bodies.items[0]);
+}
+
 test "a tool's notice follows the rules its step delivered, and the next turn extends the request (D93)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -34,9 +34,7 @@ pub const StepBatchState = struct {
     step_changed_files: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
     /// What the step's tools told the model on their own, held until the step's
-    /// results are in (`appendToolNotice`). A step that goes on hands them to
-    /// the next boundary, after the step's notes; a drain after
-    /// `pending_user_suffix` takes them when the step ends otherwise.
+    /// results are in (`appendToolNotice`). Drained after `pending_user_suffix`.
     pending_notices: std.ArrayList(ChatMessage) = .empty,
     /// Turn-scoped identical-failure tracker owned by the orchestrator step
     /// loop. Null disables escalation (tests and non-turn callers).
@@ -139,11 +137,13 @@ pub fn appendPermissionFeedback(
 /// Holds a notice a tool handed the model, such as Vision's when it could not
 /// read an image, until every result of the step is in. It joins the turn as
 /// fx's own message, `recovery_prompt`, so the saved turn keeps it. A saved turn
-/// counts steering only at a step's boundary, after the step's results, their
-/// permission feedback and the notes the step's calls queued, so the notice
-/// waits for that boundary. Appended right after its own result it would sit
-/// between two results, and the next request would put it after both, changing
-/// the request at that point. An empty notice says nothing, so none is held.
+/// counts steering only at a step's boundary, after the step's results and
+/// their permission feedback, so the notice waits for that boundary. Appended
+/// right after its own result it would sit between two results, the save would
+/// end the step there and drop the later results, and the next request would
+/// put the notice after both. The notes the step's calls queue join before it
+/// at the next step (`insertBoundaryNotes` in the orchestrator), as they do
+/// before any steering. An empty notice says nothing, so none is held.
 pub fn appendToolNotice(
     arena: Allocator,
     batch: *StepBatchState,
@@ -159,10 +159,7 @@ pub fn appendToolNotice(
 }
 
 /// Adds what the step held to the turn: the permission feedback of its calls,
-/// then its tools' notices, the order a saved turn restores them in when no
-/// note comes between. A step that goes on hands its notices to the next
-/// boundary first, so they follow that step's notes (`boundary_notices` in the
-/// orchestrator).
+/// then its tools' notices, the order a saved turn restores them in.
 pub fn drainPendingUserSuffix(
     arena: Allocator,
     batch: *StepBatchState,
