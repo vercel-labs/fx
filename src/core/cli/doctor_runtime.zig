@@ -389,6 +389,10 @@ fn appendConfigLoadFailureCheck(checks: *std.ArrayList(Check), alloc: Allocator,
 }
 
 fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) ![]u8 {
+    if (try config_runtime.configuredProviderMessage(alloc, err)) |message| {
+        defer alloc.free(message);
+        return alloc.print("{s}: {s}", .{ prefix, message });
+    }
     return alloc.print("{s}: {s}", .{ prefix, @errorName(err) });
 }
 

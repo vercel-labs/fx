@@ -13,6 +13,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -1390,6 +1391,23 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
+            if (comptime @hasField(App, "model_cache")) {
+                if (snapshot.err_message == null) {
+                    if (snapshot.token_pass != null) {
+                        app.model_cache.observeTokenPassCredit();
+                    } else if (snapshot.no_token_pass) {
+                        app.model_cache.observeNoTokenPass("credits");
+                    } else if (app.model_cache.tokenPassStatus() == .active) {
+                        // The team uses Token Pass, but this reply does not
+                        // mention Token Pass: point at the tab that has it.
+                        try app.writeDomainNotice(.{
+                            .topic = "credits",
+                            .tone = .neutral,
+                            .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
+                        }, true);
+                    }
+                }
+            }
         }
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {

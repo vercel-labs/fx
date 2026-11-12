@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
-import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import * as messagesFake from "./fixtures/anthropic-messages";
+import * as responsesFake from "./fixtures/responses";
+import { logLines, rootSessionIds } from "./saved-sessions";
 import { reviewedActionEvidence } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
@@ -796,4 +799,739 @@ describe("configured providers", () => {
       expect(f.requests).toHaveLength(0);
     } finally { f.close(); }
   }, 25000);
+});
+
+/// The model metadata of a fixture connection, to add fields to.
+function metadata(f: ReturnType<typeof fixture>, connection: "local" | "remote" = "local"): Record<string, any> {
+  const models = f.settings.providers[connection].model_metadata as Record<string, any>;
+  return models[`${connection}-model`];
+}
+
+/// The settings of a fixture connection, to add fields to.
+function connection(f: ReturnType<typeof fixture>, name: "local" | "remote" = "local"): Record<string, any> {
+  return f.settings.providers[name];
+}
+
+function occurrences(text: string, part: string): number {
+  return text.split(part).length - 1;
+}
+
+describe("custom connection options", () => {
+  test("effort: a declared level sends its fields, over the model's own, and no level sends none", async () => {
+    const f = fixture();
+    try {
+      Object.assign(metadata(f), {
+        request: { temperature: 0.2, top_p: 0.9 },
+        reasoning_efforts: { low: { reasoning_effort: "low" }, high: { reasoning_effort: "high", temperature: 0.7 } },
+      });
+      f.save();
+      const high = await runFx(["ask", "--json", "--no-save", "--effort", "high", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (high.code !== 0) throw new Error(high.stdout + high.stderr);
+      expect(high.stderr).toBe("");
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.reasoning_effort).toBe("high");
+      expect(f.requests[0].body.temperature).toBe(0.7);
+      expect(f.requests[0].body.top_p).toBe(0.9);
+      expect(f.requests[0].body.model).toBe("local-model");
+
+      const none = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (none.code !== 0) throw new Error(none.stdout + none.stderr);
+      expect(none.stderr).toBe("");
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].body.reasoning_effort).toBeUndefined();
+      expect(f.requests[1].body.temperature).toBe(0.2);
+      expect(f.requests[1].body.top_p).toBe(0.9);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("effort: a configured level the model does not declare is not sent, and one line says so", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? toolCompletion(body.model, "read_file", { path: "note.txt" }) : completion(body.model, "read complete"));
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      (f.settings as any).effort = "high";
+      f.save();
+      const undeclared = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (undeclared.code !== 0) throw new Error(undeclared.stdout + undeclared.stderr);
+      // Two requests in one session, one notice.
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests.every(request => request.body.reasoning_effort === undefined)).toBe(true);
+      expect(occurrences(undeclared.stderr, "high is not available for local-model")).toBe(1);
+
+      metadata(f).reasoning_efforts = { low: { reasoning_effort: "low" } };
+      f.save();
+      calls = 1;
+      const other = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (other.code !== 0) throw new Error(other.stdout + other.stderr);
+      expect(f.requests[2].body.reasoning_effort).toBeUndefined();
+      expect(occurrences(other.stderr, "high is not available for local-model")).toBe(1);
+
+      (f.settings as any).effort = "low";
+      f.save();
+      const declared = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (declared.code !== 0) throw new Error(declared.stdout + declared.stderr);
+      expect(f.requests[3].body.reasoning_effort).toBe("low");
+      expect(declared.stderr).toBe("");
+    } finally { f.close(); }
+  }, 60000);
+
+  test("request: the output limit travels in the field the model names, and extra headers come from the environment", async () => {
+    const f = fixture();
+    try {
+      metadata(f, "remote").output_limit_field = "max_completion_tokens";
+      connection(f, "remote").headers = { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } };
+      f.save();
+      const env = { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_ORG: "org-fixture-123" };
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.max_completion_tokens).toBe(8192);
+      expect(f.requests[0].body.max_tokens).toBeUndefined();
+      expect(f.requests[0].headers["x-org"]).toBe("org-fixture-123");
+      expect(f.requests[0].authorization).toBe("Bearer own-provider-token");
+
+      // A header whose variable is unset fails before anything is sent.
+      const unset = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...env, FX_TEST_PROVIDER_ORG: undefined }, timeoutMs: 20000 });
+      expect(unset.code).not.toBe(0);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("request: a header value the server quotes back is masked like the key", async () => {
+    // A 400, because fx shows a server's own words for it; a 401 gets fx's fixed text.
+    const f = fixture(() => Response.json({ error: { message: "rejected org-fixture-123 for own-provider-token" } }, { status: 400 }));
+    try {
+      connection(f, "remote").headers = { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } };
+      f.save();
+      const env = { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_ORG: "org-fixture-123" };
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(f.requests).toHaveLength(1);
+      expect(result.stdout + result.stderr).toContain("rejected");
+      expect(result.stdout + result.stderr).not.toContain("org-fixture-123");
+      expect(result.stdout + result.stderr).not.toContain("own-provider-token");
+    } finally { f.close(); }
+  }, 15000);
+
+  test.each([
+    ["a model's request fields", (f: ReturnType<typeof fixture>) => { metadata(f).request = { messages: [] }; }, "ReservedRequestField"],
+    ["an effort level's fields", (f: ReturnType<typeof fixture>) => { metadata(f).reasoning_efforts = { high: { model: "other" } }; }, "ReservedRequestField"],
+    ["the output limit, through a model's request fields", (f: ReturnType<typeof fixture>) => { metadata(f).request = { max_tokens: 1 }; }, "ReservedRequestField"],
+    ["the Authorization header", (f: ReturnType<typeof fixture>) => { connection(f).headers = { authorization: { env: "FX_TEST_PROVIDER_ORG" } }; }, "ReservedHeader"],
+  ])("request: settings that would replace %s are refused before any request", async (_what, change, code) => {
+    const f = fixture();
+    try {
+      change(f);
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_ORG: "org-fixture-123" }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toBe(code);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("models: a connection that asks for it lists the server's models beside its own, with its defaults", async () => {
+    const served = { object: "list", data: [{ id: "served-a", object: "model" }, { id: "local-model", object: "model" }, { id: "served-b", object: "model" }] };
+    const f = fixture(undefined, { "/v1/models": () => Response.json(served) });
+    try {
+      Object.assign(connection(f), { fetch_models: true, model_defaults: { context_window: 65536, max_output_tokens: 777, supports_tool_use: true } });
+      f.save();
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      const ids: string[] = JSON.parse(listed.stdout).ids;
+      expect([...ids].sort()).toEqual(["local-model", "served-a", "served-b"]);
+      expect(listed.stderr).toBe("");
+      expect(f.requests.map(request => `${request.method} ${request.path}`)).toEqual(["GET /v1/models"]);
+      expect(f.requests[0].authorization).toBeNull();
+
+      // A model only the server lists takes the connection's defaults; one the
+      // settings declare keeps its own.
+      const defaulted = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "served-a" }, timeoutMs: 20000 });
+      if (defaulted.code !== 0) throw new Error(defaulted.stdout + defaulted.stderr);
+      const chat = f.requests.filter(request => request.path === "/v1/chat/completions");
+      expect(chat).toHaveLength(1);
+      expect(chat[0].body.model).toBe("served-a");
+      expect(chat[0].body.max_tokens).toBe(777);
+      const declared = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (declared.code !== 0) throw new Error(declared.stdout + declared.stderr);
+      expect(f.requests.filter(request => request.path === "/v1/chat/completions")[1].body.max_tokens).toBe(8192);
+    } finally { f.close(); }
+  }, 60000);
+
+  test("models: the model list request carries the connection's own key and headers", async () => {
+    const f = fixture(undefined, { "/v1/models": () => Response.json({ object: "list", data: [{ id: "served-a" }] }) });
+    try {
+      Object.assign(connection(f, "remote"), { fetch_models: true, headers: { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } } });
+      f.save();
+      const env = { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_ORG: "org-fixture-123" };
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env, timeoutMs: 15000 });
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      expect([...JSON.parse(listed.stdout).ids].sort()).toEqual(["remote-model", "served-a"]);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].authorization).toBe("Bearer own-provider-token");
+      expect(f.requests[0].headers["x-org"]).toBe("org-fixture-123");
+    } finally { f.close(); }
+  }, 20000);
+
+  test.each([
+    ["answers 401", () => Response.json({ error: { message: "no" } }, { status: 401 })],
+    ["answers 500", () => new Response("down", { status: 500 })],
+    ["sends something that is not a model list", () => new Response("{\"object\":\"list\",\"data\":", { headers: { "content-type": "application/json" } })],
+    ["lists nothing usable", () => Response.json({ object: "list", data: [{ id: "" }, { name: "no id" }, 7] })],
+    ["never answers", () => neverAnswers()],
+  ])("models: a server that %s leaves the models in settings, with one line", async (_what, reply) => {
+    const f = fixture(undefined, { "/v1/models": reply });
+    try {
+      Object.assign(connection(f), { fetch_models: true, timeouts: { first_response_ms: 300 } });
+      f.save();
+      const started = performance.now();
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(performance.now() - started).toBeLessThan(8000);
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      expect(JSON.parse(listed.stdout).ids).toEqual(["local-model"]);
+      expect(occurrences(listed.stderr, "showing the models in settings")).toBe(_what === "lists nothing usable" ? 0 : 1);
+      expect(f.requests.filter(request => request.path === "/v1/models")).toHaveLength(1);
+    } finally { f.close(); }
+  }, 20000);
+
+  test.each([
+    ["first_response_ms", (model: string) => neverAnswers()],
+    ["stall_ms", (model: string) => stallsAfterFirstChunk(model)],
+  ])("timeouts: %s ends an attempt at the connection's bound, and fx sends again", async (key, silent) => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? silent(body.model) : completion(body.model, "answered the second attempt"));
+    try {
+      connection(f).timeouts = { [key]: 300 };
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (result.code !== 0) throw new Error(`fx did not finish: ${result.stdout} ${result.stderr}`);
+      expect(JSON.parse(result.stdout).final_output).toBe("answered the second attempt");
+      expect(f.requests).toHaveLength(2);
+      // The bound, then request recovery's first wait of about a second. The
+      // built-in bounds are 120 s and 600 s.
+      const gap = f.requests[1].at - f.requests[0].at;
+      expect(gap).toBeGreaterThanOrEqual(300);
+      expect(gap).toBeLessThan(6000);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("title: a connection's title model names a saved session, with no key", async () => {
+    const f = fixture(body => body.model === "title-model" ? completion(body.model, "Renderer Loop Refactor") : completion(body.model));
+    try {
+      connection(f).title_model = "title-model";
+      f.save();
+      const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const titleCalls = f.requests.filter(request => request.body.model === "title-model");
+      expect(titleCalls).toHaveLength(1);
+      expect(titleCalls[0].path).toBe("/v1/chat/completions");
+      expect(titleCalls[0].authorization).toBeNull();
+      expect(JSON.stringify(titleCalls[0].body.messages)).toContain("refactor the renderer loop");
+      const titles = rootSessionIds(f.home).map(id => (logLines(f.home, id) as any[]).filter(line => line.kind === "set" && line.key === "title").at(-1)?.value);
+      expect(titles).toEqual(["Renderer Loop Refactor"]);
+    } finally { f.close(); }
+  }, 40000);
+
+  test("vision: the connection's vision model reads an image for a model that cannot, and without one fx offers no fallback", async () => {
+    const visionResult = JSON.stringify({ images: [{ image_id: 1, status: "ok", summary: "a square logo", visible_text: ["FX LOGO"], details: ["square layout"] }] });
+    let turns = 0;
+    const f = fixture(body => {
+      if (body.model === "vision-model") return completion(body.model, visionResult);
+      return ++turns === 1 ? toolCompletion(body.model, "vision", { image_ids: [1], focus: "describe the image" }, "call-vision") : completion(body.model, "it is a logo");
+    });
+    try {
+      const image = join(f.workspace, "logo.png");
+      copyFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png"), image);
+      connection(f).vision_model = "vision-model";
+      // A model that says it cannot see images, so fx must use the fallback.
+      metadata(f).supports_vision = false;
+      f.save();
+      // Vision asks before it sends an image anywhere; auto mode allows it.
+      const result = await runFx(["ask", "--json", "--no-save", "--image", image, "Describe the attached image."], { cwd: f.workspace, env: { ...f.env, FX_PERMISSION_MODE: "auto" }, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("it is a logo");
+      const vision = f.requests.filter(request => request.body?.model === "vision-model");
+      expect(vision).toHaveLength(1);
+      expect(vision[0].body.response_format.type).toBe("json_schema");
+      expect(vision[0].body.response_format.json_schema.schema.type).toBe("object");
+      const parts = vision[0].body.messages.at(-1).content;
+      expect(parts.some((part: any) => part.type === "image_url" && part.image_url.url.startsWith("data:image/png;base64,"))).toBe(true);
+      const turn = f.requests.filter(request => request.body?.model === "local-model");
+      expect(turn).toHaveLength(2);
+      expect(turn[0].body.tools.some((tool: any) => tool.function.name === "vision")).toBe(true);
+      expect(JSON.stringify(turn[0].body)).not.toContain("image_url");
+      expect(JSON.stringify(turn[1].body)).toContain("FX LOGO");
+
+      // Without a vision model the connection has no image fallback.
+      delete connection(f).vision_model;
+      f.save();
+      turns = 1;
+      const before = f.requests.length;
+      const plain = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (plain.code !== 0) throw new Error(plain.stdout + plain.stderr);
+      const offered = f.requests.slice(before).map(request => request.body.tools?.map((tool: any) => tool.function.name) ?? []);
+      expect(offered).toHaveLength(1);
+      expect(offered[0]).not.toContain("vision");
+    } finally { f.close(); }
+  }, 45000);
+
+  test("usage: the cached token count a server reports reaches the JSON result", async () => {
+    const f = fixture(body => completion(body.model, "local reply", 12, 9));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).usage).toEqual({ input_tokens: 12, output_tokens: 3, cache_read_tokens: 9 });
+    } finally { f.close(); }
+  });
+});
+
+// The same options on the two other protocols a connection can speak, each
+// against a fake built from a real server's replies
+// (`fixtures/custom-endpoint-captures/`).
+const OTHER_PROTOCOLS = [
+  { protocol: "openai-responses", fake: responsesFake, owned: "input", limitField: "max_output_tokens", effort: { reasoning: { effort: "high" } }, effortKey: "reasoning" },
+  { protocol: "anthropic-messages", fake: messagesFake, owned: "system", limitField: "max_tokens", effort: { thinking: { type: "enabled", budget_tokens: 2048 } }, effortKey: "thinking" },
+] as const;
+
+describe.each(OTHER_PROTOCOLS)("custom connection on $protocol", ({ protocol, fake, owned, limitField, effort, effortKey }) => {
+  function protocolFixture(respond?: (body: any) => Response | Promise<Response>, routes: Record<string, (body: any) => Response | Promise<Response>> = {}) {
+    const f = fixture(undefined, { [fake.path]: body => respond ? respond(body) : fake.completion(body.model), ...routes });
+    for (const name of ["local", "remote"] as const) connection(f, name).protocol = protocol;
+    f.save();
+    return f;
+  }
+  const sent = (f: ReturnType<typeof fixture>) => f.requests.filter(request => request.path === fake.path);
+
+  test("a tool call and its result go to the connection, and the reply's usage reaches the JSON result", async () => {
+    let calls = 0;
+    const f = protocolFixture(body => ++calls === 1 ? fake.toolCompletion(body.model, "read_file", { path: "note.txt" }) : fake.completion(body.model, "read complete", { input: 12, output: 3, cached: 9 }));
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const json = JSON.parse(result.stdout);
+      expect(json.final_output).toBe("read complete");
+      // Both requests of the turn: 12 + 12 in, 3 + 3 out, and the second's cached 9.
+      expect(json.usage).toEqual({ input_tokens: 24, output_tokens: 6, cache_read_tokens: 9 });
+      expect(f.requests.map(request => request.path)).toEqual([fake.path, fake.path]);
+      expect(fake.requestView(f.requests[0].body).toolNames).toContain("read_file");
+      expect(fake.requestView(f.requests[0].body).limit).toBe(8192);
+      expect(JSON.stringify(f.requests[1].body)).toContain("fixture contents");
+      expect(f.requests.every(request => request.authorization === null)).toBe(true);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("effort: a declared level sends its fields over the model's own, and one the model does not declare is left out with one line", async () => {
+    const f = protocolFixture();
+    try {
+      Object.assign(metadata(f), { request: { temperature: 0.2 }, reasoning_efforts: { high: { ...effort, temperature: 0.7 } } });
+      f.save();
+      const high = await runFx(["ask", "--json", "--no-save", "--effort", "high", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (high.code !== 0) throw new Error(high.stdout + high.stderr);
+      expect(high.stderr).toBe("");
+      expect(sent(f)[0].body[effortKey]).toEqual((effort as any)[effortKey]);
+      expect(sent(f)[0].body.temperature).toBe(0.7);
+
+      const none = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (none.code !== 0) throw new Error(none.stdout + none.stderr);
+      expect(sent(f)[1].body[effortKey]).toBeUndefined();
+      expect(sent(f)[1].body.temperature).toBe(0.2);
+
+      (f.settings as any).effort = "low";
+      f.save();
+      const undeclared = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (undeclared.code !== 0) throw new Error(undeclared.stdout + undeclared.stderr);
+      expect(sent(f)[2].body[effortKey]).toBeUndefined();
+      expect(occurrences(undeclared.stderr, "low is not available for local-model")).toBe(1);
+    } finally { f.close(); }
+  }, 60000);
+
+  test("request: the model's fields, the output limit and a header from the environment reach the server, and a field fx owns is refused", async () => {
+    const f = protocolFixture();
+    try {
+      metadata(f, "remote").request = { top_p: 0.9 };
+      connection(f, "remote").headers = { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } };
+      f.save();
+      const env = { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_ORG: "org-fixture-123" };
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const request = sent(f)[0];
+      expect(request.body.top_p).toBe(0.9);
+      expect(request.body[limitField]).toBe(8192);
+      expect(request.headers["x-org"]).toBe("org-fixture-123");
+      expect(request.authorization).toBe("Bearer own-provider-token");
+      if (protocol === "anthropic-messages") expect(request.headers["anthropic-version"]).toBe("2023-06-01");
+
+      metadata(f).request = { [owned]: "replaced" };
+      f.save();
+      const refused = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(refused.code).toBe(1);
+      expect(JSON.parse(refused.stdout).error).toBe("ReservedRequestField");
+      expect(sent(f)).toHaveLength(1);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("timeouts: first_response_ms ends an attempt at the connection's bound, and fx sends again", async () => {
+    let calls = 0;
+    const f = protocolFixture(body => ++calls === 1 ? neverAnswers() : fake.completion(body.model, "answered the second attempt"));
+    try {
+      connection(f).timeouts = { first_response_ms: 300 };
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (result.code !== 0) throw new Error(`fx did not finish: ${result.stdout} ${result.stderr}`);
+      expect(JSON.parse(result.stdout).final_output).toBe("answered the second attempt");
+      expect(sent(f)).toHaveLength(2);
+      const gap = sent(f)[1].at - sent(f)[0].at;
+      expect(gap).toBeGreaterThanOrEqual(300);
+      expect(gap).toBeLessThan(6000);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("title and models: the title model names a saved session, and the server's model list joins the declared models", async () => {
+    const f = protocolFixture(
+      body => body.model === "title-model" ? fake.completion(body.model, "Renderer Loop Refactor") : fake.completion(body.model),
+      { "/v1/models": () => Response.json({ object: "list", data: [{ id: "served-a" }, { id: "local-model" }] }) },
+    );
+    try {
+      Object.assign(connection(f), { title_model: "title-model", fetch_models: true, model_defaults: { max_output_tokens: 777 } });
+      f.save();
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      expect([...JSON.parse(listed.stdout).ids].sort()).toEqual(["local-model", "served-a"]);
+
+      const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(sent(f).filter(request => request.body.model === "title-model")).toHaveLength(1);
+      const titles = rootSessionIds(f.home).map(id => (logLines(f.home, id) as any[]).filter(line => line.kind === "set" && line.key === "title").at(-1)?.value);
+      expect(titles).toEqual(["Renderer Loop Refactor"]);
+    } finally { f.close(); }
+  }, 45000);
+});
+
+// The bytes a real server sent, unedited (`fixtures/custom-endpoint-captures/`):
+// a tool call, then text, for each protocol.
+describe("replay: fx reads the replies a real local server sent", () => {
+  const capture = (name: string) => new Response(readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/custom-endpoint-captures", name)), { headers: { "content-type": "text/event-stream" } });
+  test.each([
+    ["openai-chat-completions", "/v1/chat/completions", "chat", "ok", "call_wbzs0x5v"],
+    ["openai-responses", "/v1/responses", "responses", "ok", "call_jwjijtgk"],
+    ["anthropic-messages", "/v1/messages", "messages", "Ok.", "call_xtq9b61r"],
+  ])("%s", async (protocol, path, prefix, text, callId) => {
+    let calls = 0;
+    const f = fixture(undefined, { [path]: () => capture(++calls === 1 ? `${prefix}-tool-call.sse` : `${prefix}-text.sse`) });
+    try {
+      connection(f).protocol = protocol;
+      f.save();
+      // The recorded call reads a path outside the workspace, which fails;
+      // full access lets it run without a prompt.
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: { ...f.env, FX_PERMISSION_MODE: "full-access" }, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const json = JSON.parse(result.stdout);
+      expect(json.final_output).toBe(text);
+      expect(json.tool_calls.map((call: any) => call.name)).toEqual(["read_file"]);
+      const sent = f.requests.filter(request => request.path === path);
+      expect(sent).toHaveLength(2);
+      expect(JSON.stringify(sent[1].body)).toContain(callId);
+    } finally { f.close(); }
+  }, 30000);
+});
+
+describe("custom connection limits", () => {
+  test("stress: 256 declared models, 16 levels for each through model_defaults, and a server list of 10,000 models", async () => {
+    // Settings files stop at 64 KiB, so a connection with many models
+    // declares them briefly and gives their shared fields in model_defaults.
+    const levels = Object.fromEntries(Array.from({ length: 16 }, (_, index) => [`level${index}`, { reasoning_effort: `l${index}` }]));
+    const declared = Object.fromEntries(Array.from({ length: 256 }, (_, index) => [`model-${index}`, { context_window: 131072 }]));
+    const served = { object: "list", data: Array.from({ length: 10_000 }, (_, index) => ({ id: `model-${index}`, object: "model" })) };
+    const f = fixture(undefined, { "/v1/models": () => Response.json(served) });
+    try {
+      Object.assign(connection(f), { fetch_models: true, model_metadata: declared, model_defaults: { max_output_tokens: 4096, supports_tool_use: true, reasoning_efforts: levels } });
+      (f.settings.models as any).local = "model-255";
+      f.save();
+      expect(readFileSync(f.settingsPath).length).toBeLessThan(64 * 1024);
+      const started = performance.now();
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      const listSeconds = (performance.now() - started) / 1000;
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      const ids: string[] = JSON.parse(listed.stdout).ids;
+      expect(ids).toHaveLength(10_000);
+      expect(new Set(ids).size).toBe(10_000);
+      expect(listSeconds).toBeLessThan(10);
+
+      // A model only the server lists gets every level from the defaults.
+      const ask = await runFx(["ask", "--json", "--no-save", "--effort", "level15", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "model-9999" }, timeoutMs: 30000 });
+      if (ask.code !== 0) throw new Error(ask.stdout + ask.stderr);
+      const chat = f.requests.filter(request => request.path === "/v1/chat/completions");
+      expect(chat).toHaveLength(1);
+      expect(chat[0].body.model).toBe("model-9999");
+      expect(chat[0].body.reasoning_effort).toBe("l15");
+      expect(chat[0].body.max_tokens).toBe(4096);
+    } finally { f.close(); }
+  }, 60000);
+
+  test("one past the limits is refused before any request: 257 models, or 17 levels", async () => {
+    const f = fixture();
+    try {
+      connection(f).model_metadata = Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`model-${index}`, {}]));
+      f.save();
+      const models = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "model-1" }, timeoutMs: 10000 });
+      expect(models.code).toBe(1);
+      expect(JSON.parse(models.stdout).error).toBe("LimitExceeded");
+      connection(f).model_metadata = { "local-model": { reasoning_efforts: Object.fromEntries(Array.from({ length: 17 }, (_, index) => [`l${index}`, {}])) } };
+      f.save();
+      const levels = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(levels.code).toBe(1);
+      expect(JSON.parse(levels.stdout).error).toBe("LimitExceeded");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("crash: a session killed mid-reply resumes on its own connection, with the effort level the settings give", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls += 1;
+      if (calls === 2) return stallsAfterFirstChunk(body.model);
+      return completion(body.model, calls === 1 ? "first reply" : "resumed reply");
+    });
+    try {
+      metadata(f).reasoning_efforts = { high: { reasoning_effort: "high" } };
+      (f.settings as any).effort = "high";
+      f.save();
+      const first = await runFx(["ask", "--json", "start the long task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      const env = Object.fromEntries(Object.entries({ ...process.env, ...f.env }).filter(([, value]) => value !== undefined)) as Record<string, string>;
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--resume", session, "second step"], { cwd: f.workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      const deadline = Date.now() + 15_000;
+      while (f.requests.length < 2 && Date.now() < deadline) await Bun.sleep(20);
+      expect(f.requests).toHaveLength(2);
+      // Killed while the reply streams: no chance to save anything on the way out.
+      child.kill(9);
+      await child.exited;
+      expect(child.signalCode).toBe("SIGKILL");
+      const resumed = await runFx(["ask", "--json", "--resume", session, "continue the task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(JSON.parse(resumed.stdout).final_output).toBe("resumed reply");
+      expect(f.requests).toHaveLength(3);
+      for (const request of f.requests) {
+        expect(request.path).toBe("/v1/chat/completions");
+        expect(request.authorization).toBeNull();
+        expect(request.body.reasoning_effort).toBe("high");
+      }
+      expect(JSON.stringify(f.requests[2].body.messages)).toContain("start the long task");
+      expect(JSON.stringify(f.requests[2].body.messages)).toContain("first reply");
+    } finally { f.close(); }
+  }, 45000);
+});
+
+// OpenAI's Responses API answers 400 when a request asks for encrypted
+// reasoning from a model that does not reason, and `include` is a field fx
+// owns, so settings cannot take it out.
+describe("custom connection on openai-responses: encrypted reasoning", () => {
+  const high = { high: { reasoning: { effort: "high" } } };
+  test.each([
+    { name: "a model without effort levels", levels: undefined, defaults: undefined, include: false },
+    { name: "a model whose effort levels are an empty list", levels: {}, defaults: undefined, include: false },
+    { name: "a model with effort levels", levels: high, defaults: undefined, include: true },
+    { name: "a model that takes its effort levels from model_defaults", levels: undefined, defaults: { reasoning_efforts: high }, include: true },
+  ])("a Responses request asks for encrypted reasoning only when the model declares effort levels: $name", async ({ levels, defaults, include }) => {
+    const f = fixture(undefined, {
+      [responsesFake.path]: body => body.include !== undefined && !include
+        ? new Response(JSON.stringify({ error: { message: "Encrypted content is not supported with this model.", type: "invalid_request_error", param: "include", code: null } }), { status: 400, headers: { "content-type": "application/json" } })
+        : responsesFake.completion(body.model),
+    });
+    try {
+      connection(f).protocol = "openai-responses";
+      if (levels !== undefined) metadata(f).reasoning_efforts = levels;
+      if (defaults !== undefined) connection(f).model_defaults = defaults;
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const sent = f.requests.filter(request => request.path === responsesFake.path);
+      expect(sent.length).toBe(1);
+      expect(sent[0].body.include).toEqual(include ? ["reasoning.encrypted_content"] : undefined);
+    } finally { f.close(); }
+  }, 25000);
+});
+
+describe("automatic permission review on a custom connection", () => {
+  test.each([
+    { name: "a review model the settings do not declare", declared: undefined, defaults: { max_output_tokens: 300 }, limit: 300 },
+    { name: "a declared review model without its own limit", declared: { context_window: 262144 }, defaults: { max_output_tokens: 300 }, limit: 300 },
+    { name: "a default above the review's own cap", declared: undefined, defaults: { max_output_tokens: 4096 }, limit: 2048 },
+  ])("the review takes its output limit from the model defaults: $name", async ({ declared, defaults, limit }) => {
+    const f = fixture(body => {
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", { decision: "clear", rationale: "fixture review" });
+      if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "done");
+      return toolCompletion(body.model, "shell", { request: { action: "run", command: "python3 -c 'print(42)'" } });
+    });
+    try {
+      f.settings.permission_mode = "auto";
+      connection(f).reviewer_model = "review-model";
+      connection(f).model_defaults = defaults;
+      if (declared !== undefined) (connection(f).model_metadata as any)["review-model"] = declared;
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const review = f.requests.find(request => request.body?.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
+      expect(review?.body.model).toBe("review-model");
+      expect(review?.body.max_tokens).toBe(limit);
+    } finally { f.close(); }
+  }, 35000);
+});
+
+// What a person reads when a custom connection's settings are wrong: the file,
+// the setting's path, and what to do, on every surface that reports it.
+describe("custom connection errors name the setting", () => {
+  const settingsFile = "~/.fx/settings.json";
+  const owned = "fx writes this field itself; remove it";
+  test.each([
+    ["a model's request field fx writes", (f: ReturnType<typeof fixture>) => { metadata(f).request = { messages: [] }; },
+      "providers.local.model_metadata.local-model.request.messages", owned],
+    ["an effort level's field fx writes", (f: ReturnType<typeof fixture>) => { metadata(f).reasoning_efforts = { high: { model: "other" } }; },
+      "providers.local.model_metadata.local-model.reasoning_efforts.high.model", owned],
+    ["a header fx sets", (f: ReturnType<typeof fixture>) => { connection(f).headers = { authorization: { env: "FX_TEST_PROVIDER_ORG" } }; },
+      "providers.local.headers.authorization", "fx sets this header itself; remove it"],
+    ["a header given its value", (f: ReturnType<typeof fixture>) => { connection(f).headers = { "X-Org": "acme" }; },
+      "providers.local.headers.X-Org", "a header's value is {\"env\": \"VARIABLE\"}, the environment variable that holds it"],
+    ["an effort level fx can't name", (f: ReturnType<typeof fixture>) => { metadata(f).reasoning_efforts = { "High Effort!": {} }; },
+      "providers.local.model_metadata.local-model.reasoning_efforts.\"High Effort!\"", "an effort level's name uses letters, digits, -, _, and ., and is not auto, adaptive, or default"],
+    ["a timeout of 0", (f: ReturnType<typeof fixture>) => { connection(f).timeouts = { stall_ms: 0 }; },
+      "providers.local.timeouts.stall_ms", "a timeout is a whole number of milliseconds from 1 to 86400000"],
+    ["a field fx does not know", (f: ReturnType<typeof fixture>) => { metadata(f).bogus = 1; },
+      "providers.local.model_metadata.local-model.bogus", "fx doesn't know this field; check its spelling or remove it"],
+    ["a protocol fx does not speak", (f: ReturnType<typeof fixture>) => { connection(f).protocol = "openai"; },
+      "providers.local.protocol", "the protocol is openai-chat-completions, openai-responses, or anthropic-messages"],
+    ["a model id with a dot", (f: ReturnType<typeof fixture>) => { connection(f).model_metadata["gpt-4.1"] = { request: { model: "x" } }; },
+      "providers.local.model_metadata.\"gpt-4.1\".request.model", owned],
+  ])("settings: fx refuses %s with the setting's path and what to do", async (_what, change, path, fix) => {
+    const f = fixture();
+    try {
+      change(f);
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_ORG: "org-fixture-123" }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(`fx: ${settingsFile}: ${path}: ${fix}\n`);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("settings: a key thousands of bytes long is cut in the path, so the message stays one line", async () => {
+    const f = fixture();
+    try {
+      metadata(f).request = { ["k".repeat(5000)]: 1 };
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr.startsWith(`fx: ${settingsFile}: providers.local.model_metadata.local-model.request.kkkk`)).toBe(true);
+      expect(result.stderr.split("\n")).toHaveLength(2);
+      expect(result.stderr.length).toBeLessThan(400);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("settings: fx provider names the same setting", async () => {
+    const f = fixture();
+    try {
+      const models = f.settings.providers.local.model_metadata as Record<string, any>;
+      models["local-model"].request = { messages: [] };
+      f.save();
+      const result = await runFx(["provider", "local"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe("fx provider: ~/.fx/settings.json: providers.local.model_metadata.local-model.request.messages: fx writes this field itself; remove it\n");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("settings: fx doctor names the same setting", async () => {
+    const f = fixture();
+    try {
+      metadata(f).request = { messages: [] };
+      f.save();
+      const doctor = await runFx(["doctor"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(doctor.stdout).toContain(`[fail] config: failed to load config: ${settingsFile}: providers.local.model_metadata.local-model.request.messages: ${owned}`);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test.each([
+    ["not set", undefined, "which is not set; set it, or remove the header from ~/.fx/settings.json"],
+    ["empty", "", "which is empty; set it, or remove the header from ~/.fx/settings.json"],
+    ["holding a control character", "acme\u0001", "whose value has a character a header can't carry; fix the variable"],
+  ])("headers: a header variable %s is named with its header and connection, before any request", async (_what, value, rest) => {
+    const f = fixture();
+    try {
+      connection(f).headers = { "X-Org": { env: "FX_PROBE_ORG" } };
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROBE_ORG: value }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(`fx: the header X-Org of connection local reads FX_PROBE_ORG, ${rest}\n`);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("headers: when headers on more than one connection can't be sent, each is named with its connection", async () => {
+    const f = fixture();
+    try {
+      connection(f).headers = { "X-Org": { env: "FX_PROBE_ORG" } };
+      (f.settings.providers as Record<string, any>).remote.headers = { "X-Team": { env: "FX_PROBE_TEAM" } };
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROBE_ORG: undefined, FX_PROBE_TEAM: "" }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe("fx: 2 headers can't be sent: X-Org of connection local reads FX_PROBE_ORG, which is not set; X-Team of connection remote reads FX_PROBE_TEAM, which is empty. Set or fix each variable, or remove its header from ~/.fx/settings.json\n");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  const changed = "fx ask: This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session.\n";
+  test.each([
+    ["its protocol", (f: ReturnType<typeof fixture>) => { connection(f).protocol = "anthropic-messages"; }],
+    ["its base_url", (f: ReturnType<typeof fixture>) => { connection(f).base_url = connection(f).base_url.replace("127.0.0.1", "localhost"); }],
+    ["its auth", (f: ReturnType<typeof fixture>) => { connection(f).auth = { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }; }],
+  ])("resume: a session whose connection changed %s says so and sends nothing", async (_what, change) => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      change(f);
+      f.save();
+      const resumed = await runFx(["ask", "--resume", session, "second turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(resumed.code).toBe(1);
+      expect(resumed.stderr).toBe(changed);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("resume: a session whose connection was removed says so and sends nothing", async () => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      delete (f.settings.providers as Record<string, unknown>).local;
+      (f.settings as Record<string, unknown>).provider = "remote";
+      f.save();
+      const resumed = await runFx(["ask", "--resume", session, "second turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(resumed.code).toBe(1);
+      expect(resumed.stderr).toBe("fx ask: This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session.\n");
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("resume: a change outside the connection's binding still resumes", async () => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      connection(f).timeouts = { stall_ms: 60000 };
+      metadata(f).reasoning_efforts = { high: { reasoning_effort: "high" } };
+      connection(f).headers = { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } };
+      f.save();
+      const resumed = await runFx(["ask", "--json", "--resume", session, "second turn"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_ORG: "org-fixture-123" }, timeoutMs: 15000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].headers["x-org"]).toBe("org-fixture-123");
+    } finally { f.close(); }
+  }, 30000);
 });

@@ -1699,6 +1699,7 @@ const App = struct {
                 .api_key = credential.token,
                 .gateway_team = credential.gatewayTeam(),
                 .source = credential.source,
+                .team_slug = credential.team_slug,
             };
         } else self.auth.queuedPromptCredential() orelse return error.MissingApiKey;
         const api_key_copy = if (gateway_credential.api_key) |api_key|
@@ -1712,6 +1713,11 @@ const App = struct {
         else
             null;
         errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
+        const gateway_team_label_copy = if (gateway_credential.team_slug) |slug|
+            try std.heap.c_allocator.dupe(u8, slug)
+        else
+            null;
+        errdefer if (gateway_team_label_copy) |label| std.heap.c_allocator.free(label);
         const account_id_value = if (child_run) |active_run|
             if (active_run.credential) |credential| credential.accountId() else self.auth.accountId()
         else
@@ -1789,6 +1795,7 @@ const App = struct {
             .provider = if (child_run) |active_run| active_run.admission.provider else provider_runtime.providerOf(self, agent),
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
+            .gateway_team_label = gateway_team_label_copy,
             .credential_source = gateway_credential.source,
             .account_id = account_id_copy,
             .permission_mode = if (child_run) |active_run| active_run.admission.permission_mode else app_permission_runtime.Runtime(App).viewOf(self, agent).mode,
@@ -5353,6 +5360,7 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/function_tools.zig");
     _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
@@ -5380,6 +5388,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = @import("core/app/usage_host.zig");
     _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");

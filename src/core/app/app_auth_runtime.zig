@@ -2209,6 +2209,15 @@ pub fn Runtime(comptime App: type) type {
 
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
+            if (config_runtime.sessionConnectionNotice(err)) |notice| {
+                // The session's custom connection changed or was removed in
+                // settings: a retry meets the same settings, so say what to
+                // do instead of recording a credential failure.
+                if (compactionOwnsCredentialFeedback(app, agent)) return false;
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = notice }, true);
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
             const failure = auth_runtime.classifyCredentialFailure(source, err);
             debug_trace.logf(
                 "auth",
@@ -3739,6 +3748,17 @@ test "manual compaction missing credentials preserves onboarding when it is enab
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "a session whose custom connection changed says what to do instead of offering a retry" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .configured;
+    try std.testing.expect(!try Runtime(TestApp).recoverCredentialFailure(&app, (&app).agent(), .configured, error.ConfiguredProviderChanged));
+    try std.testing.expect(app.auth.credential_failure == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "custom connection changed") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "retry") == null);
 }
 
 test "manual compaction credential failure leaves feedback to its lifecycle owner" {

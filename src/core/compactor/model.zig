@@ -32,6 +32,10 @@ pub const ModelCaller = struct {
     /// as the agent was about to send it, so the provider can reuse what it
     /// cached of it.
     sends_after_conversation: bool = false,
+    /// The model to retry the summary with when the conversation's model
+    /// cannot write it, chosen by the caller, such as a model the same plan
+    /// pays for. Null lets the compactor choose another model family.
+    fallback_model: ?[]const u8 = null,
 
     pub const VTable = struct {
         /// What `model` accepts.
@@ -121,7 +125,7 @@ pub const Summarizer = struct {
             if (primary_error) |err| return err;
             return alloc.dupe(u8, "");
         }
-        const fallback = fallbackModel(prompt.model);
+        const fallback = self.caller.fallback_model orelse fallbackModel(prompt.model);
         trace.info(self.trace_ctx, .log, "fallback model={s} after={s}", .{
             fallback,
             if (primary_error) |err| @errorName(err) else "empty_summary",
@@ -231,6 +235,22 @@ test "a failed or empty summary falls back to another family at its lowest reaso
     const summary_model = summarizer.model();
     try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
     try std.testing.expectEqual(@as(usize, 1), direct.calls.items.len);
+}
+
+test "a fallback the caller names replaces the compactor's choice" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
+    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
+    defer scripted.calls.deinit(std.testing.allocator);
+    var caller = scripted.caller(.gateway);
+    caller.fallback_model = "zai/glm-5.3";
+    var summarizer: Summarizer = .{ .caller = caller, .cancel_flag = &cancel, .trace_ctx = .{} };
+    const summary_model = summarizer.model();
+    const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("summary", text);
+    try std.testing.expectEqualStrings("zai/glm-5.3", summarizer.fallback_used.?);
+    try std.testing.expectEqualStrings("zai/glm-5.3", scripted.calls.items[1].model);
 }
 
 test "a request after the conversation goes to its own model only, with the agent's settings" {

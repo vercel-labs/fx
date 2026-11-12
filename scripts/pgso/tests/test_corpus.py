@@ -90,6 +90,7 @@ VERIFICATION_E2E_TESTS = (
     "web-search-permission-progress.test.ts",
     "yolo-permission-mode.test.ts",
     "doctor.test.ts",
+    "tui-custom-connection-errors.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (
@@ -423,7 +424,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(72, len(corpus.candidate_scenarios))
+        self.assertEqual(73, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

@@ -7088,7 +7088,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const joinedGateway = startDynamicFakeGateway(async (body) => {
         const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
         const messages = request.prompt ?? [];
-        const userText = contentText(messages.findLast((message) => message.role === "user")?.content);
+        // Main's list of subagents, which fx adds to a user message when it
+        // changes, quotes the child's task, so it is left out.
+        const userText = contentText(messages.findLast((message) => message.role === "user")?.content)
+          .replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
         if (userText === "AFTER_RESUME_PROMPT") {
           afterResume = messages;
           return fakeGatewayFinalText("AFTER_RESUME_DONE");

@@ -79,12 +79,19 @@ function text(id: string, delta: string): Response {
   ]);
 }
 
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+// Each user message's text, without the runtime context updates fx adds.
 function userTexts(body: string): string[] {
   const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
   return (request.prompt ?? []).filter((message) => message.role === "user").map((message) => {
-    if (typeof message.content === "string") return message.content;
+    if (typeof message.content === "string") return withoutContextUpdates(message.content);
     if (!Array.isArray(message.content)) return "";
-    return message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("");
+    return withoutContextUpdates(message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join(""));
   });
 }
 
