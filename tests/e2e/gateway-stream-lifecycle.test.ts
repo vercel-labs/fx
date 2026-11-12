@@ -712,6 +712,18 @@ function parseAskJson(stdout: string): {
   return JSON.parse(stdout.trim());
 }
 
+/** How many turns main has ended so far, from fx's trace (scope `worker`).
+ * Each subagent's turn runs on a worker of its own, so main's is the worker
+ * whose turn begins first. */
+function mainTurnsEnded(tracePath: string): number {
+  if (!existsSync(tracePath)) return 0;
+  const lines = readFileSync(tracePath, "utf8").split("\n");
+  const first = lines.find((line) => line.includes("[worker] event=processing_begun"));
+  const worker = first ? / worker=([0-9a-f]+)/.exec(first)?.[1] : undefined;
+  if (!worker) return 0;
+  return lines.filter((line) => line.includes("[worker] event=processing_finished ") && line.includes(` worker=${worker} `)).length;
+}
+
 function contentText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map(contentText).join("");
@@ -7335,6 +7347,128 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 45_000);
+
+  // `usage` in fx ask's JSON is the run's, not its last turn's: the turn that
+  // sends work and the turn its report starts both count. The gateway holds
+  // the subagent's reply until main's first turn has ended, so the report
+  // cannot join that turn and must start a turn of its own. Subagent usage
+  // stays out of it.
+  test("fx ask --json usage sums the turn that sends work and the turn its report starts", async () => {
+    const root = createFixtureRoot("ask-usage-report-turn");
+    const tracePath = join(root.root, "trace.log");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    const text = (id: string, delta: string, ...rest: object[]) => fakeGatewaySse([{ type: "text-delta", id, delta }, ...rest]);
+    let releaseChild: () => void = () => {};
+    const childHeld = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        await childHeld;
+        return text("child_answer", "USAGE_CHILD_DONE", finish("stop", 7000, 700, 70));
+      }
+      if (latestUserIsReport(body)) return text("report_answer", "USAGE_REPORT_READ", finish("stop", 400, 40, 4));
+      if (hasCurrentToolResult(body, "usage_send")) return text("send_answer", "USAGE_DISPATCHED", finish("stop", 200, 20, 2));
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_send", toolName: "subagent", input: { request: { action: "message", agent: "worker", message: "Reply exactly USAGE_CHILD_DONE without using tools." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const released = (async () => {
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 1, 20_000)) releaseChild();
+    })();
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "worker" },
+        timeoutMs: 30_000,
+      });
+      await released;
+      expect(result.code).toBe(0);
+      const json = parseAskJson(result.stdout);
+      expect(json.final_output).toBe("USAGE_REPORT_READ");
+      expect(mainTurnsEnded(tracePath)).toBe(2);
+      expect(json.usage).toEqual({ input_tokens: 700, output_tokens: 7, cache_read_tokens: 70 });
+    } finally {
+      releaseChild();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  // The same with three main turns: main sends work, one report starts a
+  // turn in which main sends more, and that work's report starts the third.
+  test("fx ask --json usage sums three main turns", async () => {
+    const root = createFixtureRoot("ask-usage-three-turns");
+    const tracePath = join(root.root, "trace.log");
+    const first = "Reply exactly USAGE_CHILD_ONE without using tools.";
+    const second = "Reply exactly USAGE_CHILD_TWO without using tools.";
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    const text = (id: string, delta: string, ...rest: object[]) => fakeGatewaySse([{ type: "text-delta", id, delta }, ...rest]);
+    const send = (id: string, message: string, end: object) =>
+      fakeGatewaySse([{ type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "message", agent: "worker", message } } }, end]);
+    let releaseFirst: () => void = () => {};
+    let releaseSecond: () => void = () => {};
+    const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondHeld = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // The worker's second request holds its first task too.
+        if (body.includes(second)) {
+          await secondHeld;
+          return text("child_two", "USAGE_CHILD_TWO", finish("stop", 7000, 700, 70));
+        }
+        await firstHeld;
+        return text("child_one", "USAGE_CHILD_ONE", finish("stop", 7000, 700, 70));
+      }
+      if (hasCurrentToolResult(body, "usage_send_two")) return text("second_sent", "USAGE_SECOND_SENT", finish("stop", 800, 80, 8));
+      if (latestUserIsReport(body)) {
+        const output = String(latestReport(body)?.output);
+        if (output.includes("USAGE_CHILD_ONE")) return send("usage_send_two", second, finish("tool-calls", 400, 40, 4));
+        return text("all_done", "USAGE_ALL_DONE", finish("stop", 1600, 160, 16));
+      }
+      if (hasCurrentToolResult(body, "usage_send_one")) return text("first_sent", "USAGE_FIRST_SENT", finish("stop", 200, 20, 2));
+      return send("usage_send_one", first, finish("tool-calls", 100, 10, 1));
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    // Each reply is held until the turn before it has ended, so its report
+    // starts a turn of its own.
+    const released = (async () => {
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 1, 20_000)) releaseFirst();
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 2, 20_000)) releaseSecond();
+    })();
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task twice."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "worker" },
+        timeoutMs: 40_000,
+      });
+      await released;
+      expect(result.code).toBe(0);
+      const json = parseAskJson(result.stdout);
+      expect(json.final_output).toBe("USAGE_ALL_DONE");
+      expect(mainTurnsEnded(tracePath)).toBe(3);
+      expect(json.usage).toEqual({ input_tokens: 3100, output_tokens: 31, cache_read_tokens: 310 });
+    } finally {
+      releaseFirst();
+      releaseSecond();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test.skipIf(process.platform !== "linux")(
     "a second headless shell run survives replacing the running fx binary",

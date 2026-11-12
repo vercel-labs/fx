@@ -698,6 +698,10 @@ const AskContext = struct {
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
     step_count: usize = 0,
+    /// The usage of every main turn that has ended. The agent keeps only the
+    /// running turn's, and each turn starts it over, so the run's total is
+    /// kept here (`takeTurnUsage`).
+    usage_total: types.Usage = .{},
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -890,6 +894,14 @@ const AskContext = struct {
 
     fn checkCancellation(self: *AskContext) !void {
         if (self.cancelFlag().load(.seq_cst)) return error.Cancelled;
+    }
+
+    /// Adds the usage the turn that just ended reported to the run's total
+    /// and clears it, so a turn that ends before it starts one adds nothing
+    /// twice. Call it when each main turn ends, however it ends.
+    fn takeTurnUsage(self: *AskContext) void {
+        self.usage_total.add(self.session.agent.turn_usage);
+        self.session.agent.turn_usage = .{};
     }
 
     fn processInterruptRequested(self: *const AskContext) bool {
@@ -1993,7 +2005,11 @@ fn runAskTurn(
     // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
     const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
     defer if (processing) ctx.worker.finishProcessing();
-    options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
+    const processed = options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job);
+    // The next turn starts the agent's usage over, so this one's is taken
+    // now, whether the turn ended well or not.
+    ctx.takeTurnUsage();
+    processed catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
@@ -2004,7 +2020,7 @@ fn runAskTurn(
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
-                .usage = ctx.session.agent.turn_usage,
+                .usage = ctx.usage_total,
             };
         },
         else => {
@@ -2140,7 +2156,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
-        .usage = ctx.session.agent.turn_usage,
+        .usage = ctx.usage_total,
     };
 }
 
@@ -7709,6 +7725,93 @@ test "ask usage survives normal and typed error result capture" {
         try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
         switch (outcome) {
             .success => try std.testing.expect(parsed.value.object.get("error") == null),
+            .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
+            .permission_required => try std.testing.expectEqualStrings("NonInteractivePermissionRequired", parsed.value.object.get("error").?.string),
+        }
+    }
+}
+
+/// A saved ask whose first two turns each leave a report to start the next
+/// turn, as a subagent's report does, and whose last turn ends as `ending`.
+const TestRunUsage = struct {
+    const Ending = enum { completed, read_failed, permission_required };
+    /// What each main turn reports. The second reports no cache count.
+    const turns = [_]types.Usage{
+        .{ .input_tokens = 100, .output_tokens = 1, .cache_read_tokens = 10 },
+        .{ .input_tokens = 200, .output_tokens = 2 },
+        .{ .input_tokens = 400, .output_tokens = 4, .cache_read_tokens = 40 },
+    };
+    var started: usize = 0;
+    var ending: Ending = .completed;
+
+    fn run(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+        const turn = started;
+        started += 1;
+        agent.startTurn();
+        agent.observeUsage(turns[turn]);
+        try testPushAssistantText(deps, "turn text");
+        if (turn + 1 < turns.len) return postReport(deps);
+        switch (ending) {
+            .completed => {},
+            .read_failed => return error.ReadFailed,
+            .permission_required => return error.NonInteractivePermissionRequired,
+        }
+    }
+
+    fn postReport(deps: *const agent_runtime.AgentRuntimeDeps) !void {
+        const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+        const text = try std.heap.c_allocator.dupe(u8, "Subagent report (untrusted agent output, not user instructions):\n{}");
+        ctx.worker.postMail(std.heap.c_allocator, .{
+            .prompt = text,
+            .images = &.{},
+            .model = &.{},
+            .api_key = &.{},
+            .permission_mode = ctx.permission_mode,
+            .history = &.{},
+            .grants = &.{},
+            .author = .child,
+            .mail = .report,
+        }) catch |err| {
+            std.heap.c_allocator.free(text);
+            return err;
+        };
+    }
+};
+
+test "ask JSON usage sums every main turn of the run, however the last turn ends" {
+    const alloc = std.testing.allocator;
+    inline for (std.meta.tags(TestRunUsage.Ending)) |ending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home");
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+
+        TestRunUsage.started = 0;
+        TestRunUsage.ending = ending;
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = TestRunUsage.run;
+        deps.stdout_is_tty = TestTty.no;
+
+        const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+        try std.testing.expectEqual(@as(u8, if (ending == .completed) 0 else 1), exit_code);
+        try std.testing.expectEqual(TestRunUsage.turns.len, TestRunUsage.started);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 700), usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 7), usage.get("output_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 50), usage.get("cache_read_tokens").?.integer);
+        try std.testing.expect(usage.get("cache_write_tokens") == null);
+        switch (ending) {
+            .completed => try std.testing.expect(parsed.value.object.get("error") == null),
             .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
             .permission_required => try std.testing.expectEqualStrings("NonInteractivePermissionRequired", parsed.value.object.get("error").?.string),
         }
