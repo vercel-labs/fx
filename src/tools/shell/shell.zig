@@ -1919,7 +1919,10 @@ fn hasUsageBannerOutput(output: []const u8) bool {
 /// model can still use, and otherwise only when they are not the default
 /// `captured` and `process`, such as a command that ran on a terminal.
 /// `output_terminal_safe` marks output whose unsafe bytes were written as
-/// escapes (`escaped`).
+/// escapes (`escaped`). A running captured command also says how long it has
+/// run (`running_ms`) and printed nothing (`quiet_ms`), and once that quiet
+/// time reaches the limit, `quiet_notice` asks the model to check it
+/// (`src/core/execution/quiet_notice.zig`).
 fn formatSnapshotRaw(
     alloc: Allocator,
     snapshot: managed_execution.Snapshot,
@@ -1953,6 +1956,11 @@ fn formatSnapshotRaw(
         ),
         .running, .stopped => null,
     };
+    var notice_buffer: [quiet_notice_max_bytes]u8 = undefined;
+    const notice: ?[]const u8 = if (snapshot.quiet_notice)
+        quietNoticeText(&notice_buffer, snapshot.quiet_ms orelse 0)
+    else
+        null;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const retained = snapshot.retained;
@@ -1969,6 +1977,9 @@ fn formatSnapshotRaw(
         .signal = projection.signal,
         .termination_indeterminate = presentFlag(projection.termination_indeterminate),
         .duration_ms = snapshot.duration_ms,
+        .running_ms = snapshot.running_ms,
+        .quiet_ms = snapshot.quiet_ms,
+        .quiet_notice = notice,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
         .retry_guidance = retry_guidance,
@@ -1976,6 +1987,29 @@ fn formatSnapshotRaw(
     }, .{ .emit_null_optional_fields = false }, &out.writer);
     return try out.toOwnedSlice();
 }
+
+const quiet_notice_max_bytes = 192;
+
+comptime {
+    // The longest notice, for the largest quiet time, fits the buffer.
+    std.debug.assert(quiet_notice_max_bytes >= "No output for 18446744073709551615 min. ".len + quiet_notice_check.len);
+}
+
+/// The check a running command's result asks for once it has printed nothing
+/// for the quiet limit. fx never stops the command: it may have hung, or it
+/// may be a server or watcher at rest.
+fn quietNoticeText(buffer: *[quiet_notice_max_bytes]u8, quiet_ms: u64) []const u8 {
+    const minutes = quiet_ms / std.time.ms_per_min;
+    const text = if (minutes > 0)
+        std.mem.print(buffer, "No output for {d} min. " ++ quiet_notice_check, .{minutes})
+    else
+        std.mem.print(buffer, "No output for {d} s. " ++ quiet_notice_check, .{quiet_ms / std.time.ms_per_s});
+    // The buffer fits every notice (see the comptime check above); the check
+    // alone stands in if it ever does not.
+    return text catch quiet_notice_check;
+}
+
+const quiet_notice_check = "Check whether this command is still working or has hung; a server or watcher can stay quiet while it works.";
 
 /// A flag the result writes only when it is set.
 fn presentFlag(value: bool) ?bool {
@@ -2768,6 +2802,51 @@ test "a command still running names its session with the backend and persistence
         "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"output_delta\":\"partial\\n\"}",
         body,
     );
+}
+
+test "a running command says how long it has run and been quiet, and asks for a check at the limit" {
+    const alloc = std.testing.allocator;
+    const under = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-live"),
+        .command = @constCast("sleep 30"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .running_ms = 4_000,
+        .quiet_ms = 3_000,
+    }, null);
+    defer alloc.free(under);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"running_ms\":4000,\"quiet_ms\":3000,\"output_delta\":\"\"}",
+        under,
+    );
+    const quiet = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-live"),
+        .command = @constCast("sleep 300"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .running_ms = 185_000,
+        .quiet_ms = 150_000,
+        .quiet_notice = true,
+    }, null);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"running_ms\":185000,\"quiet_ms\":150000,\"quiet_notice\":\"No output for 2 min. Check whether this command is still working or has hung; a server or watcher can stay quiet while it works.\",\"output_delta\":\"\"}",
+        quiet,
+    );
+}
+
+test "the quiet notice names seconds under a minute and fits its buffer for any quiet time" {
+    var buffer: [quiet_notice_max_bytes]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 1_500), "No output for 1 s. "));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 59_999), "No output for 59 s. "));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 60_000), "No output for 1 min. "));
+    try std.testing.expect(std.mem.endsWith(u8, quietNoticeText(&buffer, std.math.maxInt(u64)), quiet_notice_check));
 }
 
 test "completed shell snapshot reports incomplete output without losing status" {

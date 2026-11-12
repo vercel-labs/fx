@@ -499,13 +499,26 @@ pub fn Runtime(comptime App: type) type {
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(agent);
             // An instance whose profile names its MCP servers uses only those.
             // A subagent's run replaces this with its own view below.
-            if (comptime agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role")) {
-                if (agent.role == .instance and profiles.setsMcpServers(&agent.profile.profile)) {
-                    ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(&agent.profile.profile), .allows_fn = profileAllowsMcpServer } };
-                }
+            if (instanceMcpProfile(agent)) |profile| {
+                ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(profile), .allows_fn = profileAllowsMcpServer } };
             }
             if (childRun(agent)) |run| applyChildToolContext(app, &ctx, run);
             return ctx;
+        }
+
+        /// The profile of an instance that names its MCP servers; null otherwise.
+        fn instanceMcpProfile(agent: *const AppAgent) ?*const profiles.Profile {
+            if (comptime !(agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role"))) return null;
+            if (agent.role != .instance or !profiles.setsMcpServers(&agent.profile.profile)) return null;
+            return &agent.profile.profile;
+        }
+
+        /// The servers in `names` that `profile` allows; all of them without one.
+        fn allowedMcpServers(arena: Allocator, names: []const []const u8, profile: ?*const profiles.Profile) ![]const []const u8 {
+            const value = profile orelse return names;
+            var kept: std.ArrayList([]const u8) = .empty;
+            for (names) |name| if (profiles.allowsMcpServer(value, name)) try kept.append(arena, name);
+            return kept.items;
         }
 
         /// Whether the instance profile at `raw` allows MCP server `server`.
@@ -673,6 +686,19 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !?[]const u8 {
             const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            // A wait, or a status that names no agent, concerns every
+            // subagent this agent runs, so its row names them as its host
+            // lists them now: `waiting for reviewer, builder`.
+            if (try tool_presentation.subagentRoster(arena, call)) |roster| {
+                const subagent_host = ctx.subagent_host orelse return null;
+                return subagent_host.rosterNames(arena, roster == .working) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => blk: {
+                        debug_trace.logf("subagent", "roster unavailable for row call_id={s} err={s}", .{ call.id, @errorName(err) });
+                        break :blk null;
+                    },
+                };
+            }
             return tool_presentation.resolveTerminalDisplayTarget(
                 arena,
                 ctx.tool_registry,
@@ -1047,6 +1073,11 @@ pub fn Runtime(comptime App: type) type {
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent);
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
+            // The agent's own subagents, as its turn started with them.
+            const subagents: ?[]const u8 = if (comptime agents.hasAgentField(App, "session_persistence"))
+                if (app_session_runtime.Runtime(App).ownSubagentHost(agent)) |team_host| try team_host.teamNote(arena, agent.worker.activeTurnId()) else null
+            else
+                null;
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
@@ -1057,6 +1088,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .subagents = subagents,
             }, arena, messages);
         }
 
@@ -1180,11 +1212,12 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
-            // The toolbox menu lists the configured MCP servers, by name.
+            // The toolbox menu lists the MCP servers the agent may call, by name.
             var toolbox_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer toolbox_arena_state.deinit();
             if (comptime @hasDecl(App, "mcpServerNames")) {
-                config.toolbox_mcp_servers = try app.mcpServerNames(toolbox_arena_state.allocator());
+                const toolbox_arena = toolbox_arena_state.allocator();
+                config.toolbox_mcp_servers = try allowedMcpServers(toolbox_arena, try app.mcpServerNames(toolbox_arena), instanceMcpProfile(agent));
             }
             if (comptime @hasField(App, "toolbox_behind")) config.toolbox_behind = app.toolbox_behind.slice();
             // A subagent is shown only the built-in tools its run was admitted
@@ -1616,6 +1649,7 @@ pub fn Runtime(comptime App: type) type {
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
+                .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -1682,7 +1716,11 @@ fn formatToolAction(
             display_target orelse spec.label_arg_default,
         );
     }
-    if (try tool_presentation.subagentAction(arena, call, switch (state) {
+    // The subagents a call that concerns them all names reach its row as
+    // the call's resolved target.
+    var subagent_call = call;
+    if (display_target) |target| subagent_call.resolved_display_target = target;
+    if (try tool_presentation.subagentAction(arena, subagent_call, switch (state) {
         .active => .active,
         .completed => .completed,
         .denied => .{ .stopped = denied_label.? },

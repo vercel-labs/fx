@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import { keystrokeFrames, lastTranscriptRow, replayGrids } from "./info-panel";
 import { readTapeFrames } from "./render-lab/tape";
+import { createConfiguredProviderFixture as configuredProvider } from "./fixtures/chat-completions";
 import {
   fakeGatewayFinalText,
   heldFakeGatewayFinalText,
@@ -157,7 +158,7 @@ function effortMenu(grid: string[]): EffortMenuView | null {
 }
 
 /// Each grid of the tape that shows the menu, in order, with its frame.
-function menuViews(current: Shell, label: string): { frame: number; grid: string[]; menu: EffortMenuView }[] {
+function menuViews(current: Pick<Shell, "tape" | "root">, label: string): { frame: number; grid: string[]; menu: EffortMenuView }[] {
   const grids = replayGrids(FX_BIN, current.tape, join(current.root, `${label}.frames`));
   const views: { frame: number; grid: string[]; menu: EffortMenuView }[] = [];
   for (const [frame, grid] of [...grids.entries()].sort((a, b) => a[0] - b[0])) {
@@ -444,4 +445,75 @@ test.skipIf(!tmuxAvailable())("a model without levels opens no /effort column, a
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);
   expect(columnViews(current, "plain-column")).toEqual([]);
+}, TIMEOUT);
+
+/// A shell on a custom model connection (`fixtures/chat-completions.ts`)
+/// whose model declares `levels`, recording every byte to a tape.
+async function launchCustom(levels: Record<string, Record<string, unknown>>, settings: Record<string, unknown> = {}) {
+  const f = configuredProvider();
+  Object.assign((f.settings.providers.local.model_metadata as any)["local-model"], { reasoning_efforts: levels });
+  Object.assign(f.settings, settings);
+  f.save();
+  const tape = join(f.home, "session.fxtape");
+  const stderrPath = join(f.home, "stderr.log");
+  const session = await TmuxSession.create({
+    cwd: f.workspace,
+    stderrPath,
+    isolated: true,
+    width: 80,
+    height: 24,
+    env: { ...f.env, FX_DISABLE_KEYCHAIN: "1", FX_PERMISSION_MODE: "auto", FX_RECORD: tape, FX_RECORD_INPUT: "1" },
+  });
+  await session.waitForComposer(10_000);
+  return { f, session, tape, stderrPath, root: f.home };
+}
+
+test.skipIf(!tmuxAvailable())("on a custom connection, /effort lists the levels the model's settings declare, in their order, and the request carries the chosen one's fields", async () => {
+  const current = await launchCustom({ high: { reasoning_effort: "high" }, low: { reasoning_effort: "low" } });
+  const { session, f } = current;
+  try {
+    await session.sendText("/effort");
+    await session.waitForText("Effort 3", 5_000);
+    // default, high, low: Down twice reaches low.
+    await press(session, "Down");
+    await press(session, "Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Reasoning effort set to low for local-model", 5_000);
+    await session.sendText("say hello");
+    await session.waitForText("local reply", 10_000);
+    await session.waitForComposer(10_000);
+    expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(10_000)).toBe(true);
+    const chat = f.requests.filter((request) => request.path === "/v1/chat/completions");
+    expect(chat.map((request) => request.body.reasoning_effort)).toEqual(["low"]);
+    const views = menuViews(current, "custom");
+    expect(views[0]?.menu).toEqual({ count: 3, model: "local-model", levels: ["default", "high", "low"], current: "default" });
+  } finally {
+    await session.kill();
+    f.close();
+  }
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("on a custom connection, an effort the model does not declare is not sent, and the screen says so once", async () => {
+  const notice = "Effort xhigh is not available for local-model, so it is not sent.";
+  const current = await launchCustom({ low: { reasoning_effort: "low" } }, { effort: "xhigh" });
+  const { session, f } = current;
+  try {
+    for (const prompt of ["first question", "second question"]) {
+      await session.sendText(prompt);
+      await session.waitForPane(() => f.requests.some((request) => JSON.stringify(request.body ?? {}).includes(prompt)), 10_000);
+      await session.waitForComposer(10_000);
+    }
+    await session.waitForText(notice, 5_000);
+    const scrollback = await session.captureFullScrollback();
+    expect(count(scrollback, notice)).toBe(1);
+    expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+    const chat = f.requests.filter((request) => request.path === "/v1/chat/completions");
+    expect(chat).toHaveLength(2);
+    expect(chat.every((request) => request.body.reasoning_effort === undefined)).toBe(true);
+  } finally {
+    await session.kill();
+    f.close();
+  }
 }, TIMEOUT);

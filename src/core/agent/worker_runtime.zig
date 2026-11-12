@@ -141,6 +141,9 @@ pub const QueuedPrompt = struct {
     provider: model_provider.ProviderId = .gateway,
     api_key: []u8,
     gateway_team: ?[]u8 = null,
+    /// The team's slug, which fx shows the user. Null when the login has no
+    /// slug; fx then names the team by `gateway_team`.
+    gateway_team_label: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
@@ -617,6 +620,13 @@ pub const WorkerRuntime = struct {
     /// Set when the user answers a request that waits for them; the request's
     /// recovery reads and clears it (`RequestRecovery.continue_flag`).
     recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the sign-in fx opened for a waiting request closes without
+    /// a new login; the request's recovery reads and clears it
+    /// (`RequestRecovery.sign_in_closed_flag`).
+    recovery_sign_in_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set while the request waits for a follow-up the parent may give
+    /// (`noteChildWaiting`); the parent's next message takes it.
+    parent_may_continue: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
@@ -905,6 +915,14 @@ pub const WorkerRuntime = struct {
         self.recovery_continue_requested.store(true, .seq_cst);
     }
 
+    /// The sign-in fx opened for a request that waits for one closed without
+    /// a new login, for example because its code expired. The request tries
+    /// its saved login once more; a request that does not wait for a sign-in
+    /// ignores it.
+    pub fn requestRecoverySignInClosed(self: *WorkerRuntime) void {
+        self.recovery_sign_in_closed.store(true, .seq_cst);
+    }
+
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -1120,6 +1138,27 @@ pub const WorkerRuntime = struct {
         queued.delivery = if (joins) .{ .active_turn = self.active_turn_id } else .continuation;
         queued.agent_settings = self.agent_turn_settings;
         try self.enqueuePromptLocked(alloc, queued);
+        // Under the lock, so the trace orders it against the turn's takes
+        // (`tests/tla/drivers/subagent/main-mail.test.ts`).
+        debug_trace.eventf("worker", "mail_posted", .{ .turn_id = self.active_turn_id }, "worker={x} mail={s} delivery={s}", .{ @intFromPtr(self), @tagName(queued.mail), if (joins) "joined" else "waits" });
+    }
+
+    /// Whether mail waiting in this queue joins the running turn at its next
+    /// boundary. False between turns and in a turn the worker was not told
+    /// of, as ACP's, whose mail starts the next turn
+    /// (`tests/tla/subagent/MainMail.tla` WaitHonest).
+    pub fn queuedMailJoinsTurn(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const joins = joins: {
+            if (!self.worker_processing or self.active_turn_id == 0) break :joins false;
+            for (self.queued_prompts.items) |prompt| {
+                if (prompt.delivery.activeTurnId() == self.active_turn_id) break :joins true;
+            }
+            break :joins false;
+        };
+        debug_trace.eventf("worker", "mail_joins_checked", .{ .turn_id = self.active_turn_id }, "worker={x} joins={}", .{ @intFromPtr(self), joins });
+        return joins;
     }
 
     /// Holds a place in this queue for another agent's message that is on
@@ -1173,6 +1212,31 @@ pub const WorkerRuntime = struct {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
             self.queued_history = &.{};
         }
+        debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
+        return prompt;
+    }
+
+    /// As `takeQueuedPrompt`, and marks turn `turn_id`, which runs the
+    /// prompt, in the same step, as `beginDirectProcessing` does: mail posted
+    /// from the take on joins that turn (`tests/tla/subagent/MainMail.tla`
+    /// NextTurn). Null, and nothing marked, when no prompt waits or the
+    /// worker is busy or stopped. The caller pairs a prompt with
+    /// `finishProcessing`.
+    pub fn takeQueuedPromptForTurn(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ?QueuedPrompt {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.queued_prompts.items.len == 0 or self.worker_processing or self.worker_stop_requested) return null;
+        const prompt = self.queued_prompts.orderedRemove(0);
+        if (self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        self.direct_steering_closed = false;
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_processing = true;
+        self.active_turn_id = turn_id;
+        self.tool_phase_step_id = null;
+        debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = turn_id }, "worker={x} mail={s} remaining={d} marked=true", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
         return prompt;
     }
 
@@ -1482,6 +1546,7 @@ pub const WorkerRuntime = struct {
                 }
                 const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
                 if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
+                debug_trace.eventf("worker", "steering_taken", .{ .turn_id = turn_id }, "worker={x} kind={s} count={d} closed={}", .{ @intFromPtr(self), @tagName(kind), messages.len, self.direct_steering_closed });
                 return if (messages.len == 0)
                     .none
                 else
@@ -2044,12 +2109,15 @@ pub const WorkerRuntime = struct {
         // order in which steering and ordinary prompts were submitted.
         const finished_turn_id = self.active_turn_id;
         self.finishCompactionActivityLocked(finished_turn_id);
+        var deferred: usize = 0;
         for (self.queued_prompts.items) |*prompt| {
             if (prompt.delivery.activeTurnId() == finished_turn_id) {
                 prompt.delivery = .continuation;
+                deferred += 1;
                 debug_trace.eventf("worker", "steering_deferred_to_next_turn", .{ .turn_id = finished_turn_id }, "queued_turn_id={d} prompt_bytes={d}", .{ prompt.turn_id, prompt.prompt.len });
             }
         }
+        debug_trace.eventf("worker", "processing_finished", .{ .turn_id = finished_turn_id }, "worker={x} deferred={d}", .{ @intFromPtr(self), deferred });
         self.worker_processing = false;
         self.active_turn_id = 0;
         self.steering_cancel_turn_id = null;
@@ -2072,6 +2140,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
+        debug_trace.eventf("worker", "processing_begun", .{ .turn_id = turn_id }, "worker={x} queued={d}", .{ @intFromPtr(self), self.queued_prompts.items.len });
         return true;
     }
 
@@ -3299,6 +3368,7 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     alloc.free(prompt.model);
     secret.zeroAndFree(alloc, prompt.api_key);
     if (prompt.gateway_team) |team| alloc.free(team);
+    if (prompt.gateway_team_label) |label| alloc.free(label);
     if (prompt.account_id) |account_id| alloc.free(account_id);
     types.freeHistoryTurnSlice(alloc, prompt.history);
     if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);

@@ -151,6 +151,8 @@ pub const State = struct {
     startup_count: usize = 1,
     /// Backs the footer's agent indicator, which can hold a subagent's label.
     label_buf: [192]u8 = undefined,
+    /// Backs the "waiting on N subagents" activity row.
+    subagent_wait_buf: [96]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
     /// closes like any other and stays closed.
     first_open: bool = true,
@@ -544,9 +546,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// `/close`: closes the instance on screen and every subagent in its
-        /// tree. The next instance takes over and the host keeps running, the
-        /// first instance included. Closing the only open instance ends the
-        /// host, as `/exit` does.
+        /// tree. The agent on the row above it in the agent list takes over,
+        /// or the next instance when it is the first row, and the host keeps
+        /// running, the first instance included. Closing the only open
+        /// instance ends the host, as `/exit` does.
         pub fn closeOnScreen(app: *App) !void {
             if (app.agent_on_screen) |child| if (child.agent.role == .subagent) {
                 try app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = "/close closes an fx instance. This screen is a subagent's." }, true);

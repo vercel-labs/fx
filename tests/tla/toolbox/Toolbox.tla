@@ -21,6 +21,10 @@
 (*   "append_tool"        an opened or called tool is added to the tools   *)
 (*   "live_menu"          the menu follows the catalog's availability      *)
 (*   "menu_from_live"     a resume rebuilds the menu from what is up now   *)
+(*   "compact_resets_menu"  compaction rebuilds the menu from what is up   *)
+(*                        now, as a new conversation does                  *)
+(*   "compact_forgets_notes"  after a compaction, fx counts the notes the  *)
+(*                        summary replaced as still told                   *)
 (*   "skip_admission"     a run goes ahead when permission was denied      *)
 (*   "rerun_after_crash"  a resume runs an interrupted call again          *)
 (*   "run_needs_open"     a run fails unless its entry was opened in the   *)
@@ -92,7 +96,7 @@ OpenedIn(e, c) == \E i \in DOMAIN c : c[i].k = "opened" /\ c[i].e = e
 \* fx sends a request built from what it has now.
 Send ==
     /\ Step /\ Idle
-    /\ reqs' = Append(reqs, [tools |-> tools, menu |-> menu, conv |-> conv, epoch |-> epoch])
+    /\ reqs' = Append(reqs, [tools |-> tools, menu |-> menu, conv |-> conv, epoch |-> epoch, avail |-> avail])
     /\ UNCHANGED <<tools, menu, conv, epoch, avail, executed, admitted, pending, pendingTool, nextId>>
 
 \* toolbox {open: e}: the entry's text, or why it can't be opened, goes at
@@ -165,12 +169,19 @@ CatalogChange(e) ==
                    ELSE menu
     /\ UNCHANGED <<tools, reqs, epoch, executed, admitted, pending, pendingTool, nextId>>
 
-\* Compaction replaces the conversation with a summary.
+\* Compaction replaces the conversation with a summary. The conversation
+\* keeps its menu: compaction is not a new conversation. The notes went with
+\* the turns, so when the catalog differs from the menu, the next request
+\* notes what the toolbox holds now.
 Compact ==
     /\ Step /\ Idle
-    /\ conv' = << [k |-> "summary"] >>
+    /\ menu' = IF Bug = "compact_resets_menu" THEN {e \in Entries : avail[e]} ELSE menu
+    /\ conv' = << [k |-> "summary"] >> \o
+                IF Bug = "compact_forgets_notes" \/ \A e \in Entries : avail[e] = (e \in menu')
+                THEN << >>
+                ELSE << [k |-> "state", up |-> avail] >>
     /\ epoch' = epoch + 1
-    /\ UNCHANGED <<tools, menu, reqs, avail, executed, admitted, pending, pendingTool, nextId>>
+    /\ UNCHANGED <<tools, reqs, avail, executed, admitted, pending, pendingTool, nextId>>
 
 \* The run's bound is spent and nothing is in flight: the behavior ends.
 Done ==
@@ -198,6 +209,19 @@ ToolsFixed == \A i \in DOMAIN reqs : reqs[i].tools = BaseTools
 
 \* Every request sends the same menu, whatever the catalog does.
 MenuFixed == \A i \in DOMAIN reqs : reqs[i].menu = InitMenu
+
+\* What request r tells the model about entry e: the newest note about it,
+\* else whether the menu lists it.
+Says(r, i, e) == (r.conv[i].k = "note" /\ r.conv[i].e = e) \/ r.conv[i].k = "state"
+Believed(r, e) ==
+    LET says == {i \in DOMAIN r.conv : Says(r, i, e)}
+    IN IF says = {} THEN e \in r.menu
+       ELSE LET last == CHOOSE i \in says : \A j \in says : j <= i
+            IN IF r.conv[last].k = "note" THEN r.conv[last].up ELSE r.conv[last].up[e]
+
+\* Every request tells the model what the catalog can serve when it is sent,
+\* across compactions too.
+Informed == \A i \in DOMAIN reqs : \A e \in Entries : Believed(reqs[i], e) = reqs[i].avail[e]
 
 \* Between compactions, every request is the one before it plus new items at
 \* the end, so the provider reads all of the earlier request from its cache.

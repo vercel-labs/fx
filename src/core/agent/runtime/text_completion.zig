@@ -11,6 +11,7 @@ const runtime_gateway_step = @import("gateway_step.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
+const token_pass = @import("../../gateway/token_pass.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const types = @import("../../shared/types.zig");
@@ -205,7 +206,7 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
             capture.failed = true;
         },
         .tool_started => capture.saw_tool_call = true,
-        .reasoning_delta, .tool_input_delta => {},
+        .reasoning_delta, .tool_input_delta, .tool_input_progress => {},
     }
 }
 
@@ -247,6 +248,8 @@ pub const CompactorCaller = struct {
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,
+            // A Token Pass conversation retries its summary on Token Pass.
+            .fallback_model = if (self.provider == .gateway) token_pass.compactionFallback(self.model) else null,
         };
     }
 

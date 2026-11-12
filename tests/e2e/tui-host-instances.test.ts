@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
   startDynamicFakeGateway,
@@ -42,6 +43,18 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
   return rows;
 }
 
+// Waits until the agent list draws `name`'s row selected, then returns the
+// pane as text.
+async function waitForSelected(session: TmuxSession, name: string, ms = 10_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const escapes = await session.capturePaneEscapes();
+    if (agentRows(escapes).find((row) => row.selected)?.name === name) return await session.capturePane();
+    if (Date.now() > deadline) throw new Error(`the agent list never selected ${name}:\n${escapes}`);
+    await Bun.sleep(25);
+  }
+}
+
 // Directions follow the list's order: the instances as they started, each
 // followed by its own subagents. A number selects that fx instance.
 async function switchAgent(session: TmuxSession, target: "next" | "previous" | number) {
@@ -67,12 +80,19 @@ function text(id: string, delta: string): Response {
   ]);
 }
 
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+// Each user message's text, without the runtime context updates fx adds.
 function userTexts(body: string): string[] {
   const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
   return (request.prompt ?? []).filter((message) => message.role === "user").map((message) => {
-    if (typeof message.content === "string") return message.content;
+    if (typeof message.content === "string") return withoutContextUpdates(message.content);
     if (!Array.isArray(message.content)) return "";
-    return message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("");
+    return withoutContextUpdates(message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join(""));
   });
 }
 
@@ -325,6 +345,13 @@ async function approve(session: TmuxSession, turn: number, choice: "1" | "2") {
 }
 const shownAnswers = (pane: string) => ANSWERS.filter((answer) => pane.includes(answer));
 
+// Waits until the pane shows exactly `answers` of the instances' answers. Each
+// instance answers with its own letter, so this names the instance on screen
+// while the agent list takes the footer's place.
+async function waitForAnswers(session: TmuxSession, answers: readonly string[], ms = 10_000): Promise<string> {
+  return await session.waitForPane((pane) => JSON.stringify(shownAnswers(pane)) === JSON.stringify(answers), ms);
+}
+
 describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   test(
     "three instances started together each keep their own conversation",
@@ -383,13 +410,16 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText("HOST_D launched");
         await session.waitForText("HOST_ANSWER_D", 30_000);
 
-        // Closing it leaves the others running; the first comes back.
+        // Closing it leaves the others running; the row above it, fx 2,
+        // comes on screen, not the first.
         await session.sendText("/close");
-        const after = await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
-        expect(shownAnswers(after)).toEqual(["HOST_ANSWER_A"]);
+        const after = await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        expect(shownAnswers(after)).toEqual([]);
+        await switchAgent(session, "previous");
+        const first = await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        expect(shownAnswers(first)).toEqual(["HOST_ANSWER_A"]);
         await switchAgent(session, "next");
-        const second = await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
-        expect(shownAnswers(second)).toEqual([]);
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
 
         // A profile that won't load says why and opens nothing.
         await session.sendText("/launch nosuch");
@@ -440,18 +470,20 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText("HOST_A first");
         await session.waitForText("HOST_ANSWER_A", 30_000);
 
-        // The list previews the highlighted row, so fx 2 is on screen.
+        // Down shows fx 2, which has no conversation yet.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendKeys("Down");
-        await session.waitForText("delete close", 10_000);
+        await waitForSelected(session, "fx 2");
+        expect(await waitForAnswers(session, [])).toContain("delete close");
         await session.sendKeys("BSpace");
         await session.waitForText("press delete again to close this instance", 10_000);
         await session.sendKeys("BSpace");
-        // The list stays open on the instance left, the first, which Delete
-        // no longer offers to close: that would end fx.
+        // fx 2 closes, and the row above it, the first, comes back on screen.
+        // The list stays open on it, and Delete no longer offers to close it:
+        // that would end fx.
         const closed = await session.waitForPane((pane) => !/\bfx 2\b/.test(pane) && pane.includes("esc back"), 15_000);
-        expect(shownAnswers(closed)).toEqual(["HOST_ANSWER_A"]);
+        expect(shownAnswers(await waitForAnswers(session, ["HOST_ANSWER_A"]))).toEqual(["HOST_ANSWER_A"]);
         expect(closed).not.toContain("delete close");
         await session.sendKeys("BSpace");
         await session.sendKeys("BSpace");
@@ -1016,6 +1048,67 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/new in a launched instance stops its working subagent first, and the instance goes on (D97)",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-tree-")));
+      const releases: Array<() => void> = [];
+      const respond = (body: string): Response | Promise<Response> => {
+        const texts = userTexts(body);
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return text("switch_reported", "SWITCH_MAIN_REPORTED");
+        }
+        // The subagent's request waits until the test ends.
+        if (texts.join("\n").includes("SLOW_TASK")) {
+          return new Promise((resolve) => releases.push(() => resolve(text("slow_done", "SLOW_DONE"))));
+        }
+        if (texts.at(-1)?.includes("SWITCH_USER")) {
+          if (answered(body)) return text("switch_final", "SWITCH_MAIN_FINAL");
+          return call("switch_sub", "subagent", { request: { action: "message", agent: "slowpoke", message: "SLOW_TASK take your time" } });
+        }
+        if (texts.at(-1)?.includes("AFTER_NEW")) return text("after_new", "AFTER_NEW_ANSWER");
+        return answerByLetter(body);
+      };
+      try {
+        let oldId = "";
+        await withHost(respond, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_A saved");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_USER start a slow helper");
+          await session.waitForText("SWITCH_MAIN_FINAL", 45_000);
+          await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
+          oldId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
+          // A new session in fx 2 while slowpoke still works.
+          await session.sendText("/new");
+          await session.waitForText("stopped 1 running subagent task", 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("AFTER_NEW go on");
+          await session.waitForText("AFTER_NEW_ANSWER", 30_000);
+          // fx 2 moved to its new session, and fx 1 kept its own.
+          await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && ids[1] !== oldId), 15_000);
+          await session.sendText("/exit");
+          await session.waitForSessionEnd(15_000);
+        });
+        // slowpoke's work ended cancelled, and slowpoke stays in the old session.
+        const log = readFileSync(join(home, ".fx", "sessions", "v2", oldId, "log.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const finishes = log.filter((line) => line.kind === "child_finished");
+        expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
+        expect(JSON.stringify(finishes[0].data ?? "")).not.toContain('\\"closed\\":true');
+      } finally {
+        for (const release of releases) release();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "a restored later instance lists its subagents under it again, with their conversations",
     async () => {
       const home = createIsolatedTestHome();
@@ -1241,8 +1334,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
             await session.waitForText("TREE_MCP_DONE", 45_000);
           });
           // The fixture's answer reaches the model only when the profile
-          // names its server, whether or not the model selected the tool.
+          // names its server, whether or not the model selected the tool,
+          // and its toolbox menu lists the server only then.
           expect((bodies.at(-1) ?? "").includes("MODERN_MCP_TOOL_RESULT")).toBe(reaches);
+          expect((bodies[0] ?? "").includes("MCP servers\\n- fixture")).toBe(reaches);
         } finally {
           cleanupIsolatedTestHome(home);
           rmSync(workspace, { recursive: true, force: true });
@@ -1524,6 +1619,68 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/effort in a launched instance under FX_MODEL saves the effort but not the run's model",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-effort-env-model-")));
+      try {
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: "other/model" }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("/effort low");
+          await session.waitForText("Reasoning effort set to", 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "SAVED_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "SAVED_TURN")).toMatchObject({ model: "other/model", reasoning: "low" });
+        const id = sessionHolding(home, "DONE_SAVED_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_SAVED_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        // FX_MODEL shaped only the run that set it.
+        expect(preferencesOf(after, "RESUMED_TURN")?.model).not.toBe("other/model");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/fast under FX_MODEL changes the run without saving the run's model to settings",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-fast-env-model-")));
+      try {
+        const requests: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: "other/model" }, models: PREFERENCE_MODELS, requests, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/fast on");
+          await session.waitForText("fast: on", 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "FAST_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(requests, "FAST_TURN")).toMatchObject({ model: "other/model", speed: "fast" });
+        // fast mode is saved with its model, so neither outlives this run.
+        const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        expect(settings).not.toHaveProperty("models");
+        expect(settings).not.toHaveProperty("fast_mode");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/new in a launched instance keeps FX_MODEL for the run without saving it",
     async () => {
       const home = createIsolatedTestHome();
@@ -1734,10 +1891,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("NOTE_ONE go");
         await session.waitForPane((pane) => pane.includes("rm -rf"), 15_000);
-        // From fx 2, fx 1 comes first.
+        // From fx 2, the note counts the two waiting instances.
         await switchAgent(session, "next");
-        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("need you"), 15_000);
-        expect(pane).toContain("fx 1 and 1 more need you · fx 2/3 \u2193");
+        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("require attention"), 15_000);
+        expect(pane).toContain("2 agents require attention · fx 2/3 \u2193");
         expect(pane).not.toContain("main");
       });
     },
@@ -1759,8 +1916,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(list).not.toContain("Step limit");
         expect(list).toContain("Agents 3");
         expect(list).toMatch(instanceRow(1));
-        expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}main {2,}\S/m);
-        expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}\S+\s*$/m);
+        expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain(LIST_HINT);
         // The list opens on the agent on screen.
         expect(agentRows(await session.capturePaneEscapes())).toEqual([
@@ -1771,7 +1928,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // Esc closes it.
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !instanceRow(3).test(pane), 15_000);
-        // ↓↓ previews fx 3, and Enter keeps it.
+        // ↓↓ shows fx 3, and Enter keeps it.
         await session.sendText("/agents");
         await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         await session.sendKeys("Down");
@@ -1779,6 +1936,191 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Enter");
         await session.waitForPane((pane) => pane.includes("fx 3/3") && !instanceRow(3).test(pane), 15_000);
         await session.waitForComposer(15_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "moving through the agent list shows each agent at once, Esc goes back to the agent it opened on, and Enter keeps the one shown for typing",
+    async () => {
+      const bodies = await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await switchAgent(session, 2);
+        await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("HOST_B second");
+        await session.waitForText("HOST_ANSWER_B", 30_000);
+        await switchAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.waitForComposer(15_000);
+        await waitForAnswers(session, ["HOST_ANSWER_A"]);
+
+        // Down opens the list on fx 1. Each move shows the agent it lands on
+        // at once, with no Enter, and the list stays open; Down on the last
+        // row stays there.
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 1");
+        for (const [key, name, answers] of [
+          ["Down", "fx 2", ["HOST_ANSWER_B"]],
+          ["Down", "fx 3", []],
+          ["Up", "fx 2", ["HOST_ANSWER_B"]],
+          ["Down", "fx 3", []],
+          ["Down", "fx 3", []],
+        ] as const) {
+          await session.sendKeys(key);
+          await waitForSelected(session, name);
+          expect(await waitForAnswers(session, answers)).toContain(LIST_HINT);
+        }
+
+        // Esc goes back to fx 1, the agent the list opened on.
+        await session.sendKeys("Escape");
+        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("fx 1/3"), 10_000);
+        expect(shownAnswers(back)).toEqual(["HOST_ANSWER_A"]);
+
+        // Enter keeps the agent shown, and its composer takes what is typed next.
+        await session.sendKeys("C-x");
+        await waitForSelected(session, "fx 1");
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 2");
+        await waitForAnswers(session, ["HOST_ANSWER_B"]);
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => pane.includes("fx 2/3") && !pane.includes(LIST_HINT), 10_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("HOST_C typed on fx 2");
+        const typed = await session.waitForText("HOST_ANSWER_C", 30_000);
+        expect(shownAnswers(typed)).toEqual(["HOST_ANSWER_B", "HOST_ANSWER_C"]);
+      });
+      // fx 2 sent it, with its own conversation and not fx 1's.
+      const sent = bodies.find((body) => letterOf(body) === "C")!;
+      expect(userTexts(sent).join("\n")).toContain("HOST_B second");
+      expect(userTexts(sent).join("\n")).not.toContain("HOST_A first");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Up on the agent list's first row closes it and keeps the agent shown, and Down on the last row stays there",
+    async () => {
+      await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForComposer(15_000);
+
+        // Down opens the list on fx 1, its first row. Nothing is above it, so
+        // Up closes the list, and fx 1 stays on screen.
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 1");
+        await session.sendKeys("Up");
+        const closed = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("fx 1/3 \u2193"), 10_000);
+        expect(shownAnswers(closed)).toEqual(["HOST_ANSWER_A"]);
+
+        // Down and then Up come back to fx 1's row with the list still open;
+        // one more Up closes it.
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 1");
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 2");
+        await session.sendKeys("Up");
+        await waitForSelected(session, "fx 1");
+        expect(await waitForAnswers(session, ["HOST_ANSWER_A"])).toContain(LIST_HINT);
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("fx 1/3 \u2193"), 10_000);
+
+        // Down on the last row stays there: the Up after it lands on fx 2,
+        // where a wrap to the top would have closed the list.
+        await session.sendKeys("C-x");
+        await waitForSelected(session, "fx 1");
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 2");
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 3");
+        await session.sendKeys("Down");
+        await session.sendKeys("Up");
+        expect(await waitForSelected(session, "fx 2")).toContain(LIST_HINT);
+        await session.sendKeys("Escape");
+        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("fx 1/3"), 10_000);
+        expect(shownAnswers(back)).toEqual(["HOST_ANSWER_A"]);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a search edit in the middle of the search keeps the cursor there when the list shows the new match",
+    async () => {
+      await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForComposer(15_000);
+
+        // "f 3" matches no row, so fx 1 stays shown.
+        await session.sendKeys("C-x");
+        await waitForSelected(session, "fx 1");
+        await session.sendLiteral("f 3");
+        await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "f 3"), 10_000);
+
+        // Left twice puts the cursor after the f, and an x there makes "fx 3",
+        // whose one match the list shows at once. The cursor stays after the
+        // x, so the Z typed next lands there and not at the end.
+        await session.sendKeys("Left");
+        await session.sendKeys("Left");
+        await session.sendLiteral("x");
+        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "fx 3") && shownAnswers(pane).length === 0, 10_000);
+        await session.sendLiteral("Z");
+        const typed = await session.waitForPane((pane) => composerContains(pane, "fxZ 3") || composerContains(pane, "fx 3Z"), 10_000);
+        expect(composerContains(typed, "fxZ 3")).toBe(true);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "closing the shown instance from the agent list shows the row above it, one row at a time",
+    async () => {
+      await withHost(answerByLetter, { instances: 4 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/4"), 15_000);
+        // fx 1, fx 2, and fx 3 each answer once, so each shows its own answer.
+        for (const [number, letter] of [[1, "A"], [2, "B"], [3, "C"]] as const) {
+          if (number > 1) {
+            await switchAgent(session, number);
+            await session.waitForPane((pane) => pane.includes(`fx ${number}/4`), 15_000);
+          }
+          await session.waitForComposer(15_000);
+          await session.sendText(`HOST_${letter} hello`);
+          await session.waitForText(`HOST_ANSWER_${letter}`, 30_000);
+        }
+        await switchAgent(session, 4);
+        await session.waitForPane((pane) => pane.includes("fx 4/4"), 15_000);
+        await session.waitForComposer(15_000);
+
+        // The list opens on fx 4, its last row. Closing it shows the row
+        // above it, fx 3, and not the first instance.
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 4");
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForPane((pane) => !instanceRow(4).test(pane) && pane.includes(LIST_HINT), 15_000);
+        await waitForSelected(session, "fx 3");
+        await waitForAnswers(session, ["HOST_ANSWER_C"]);
+
+        // Closing fx 3 then shows fx 2.
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForPane((pane) => !instanceRow(3).test(pane) && pane.includes(LIST_HINT), 15_000);
+        await waitForSelected(session, "fx 2");
+        await waitForAnswers(session, ["HOST_ANSWER_B"]);
+
+        // The list opened on fx 4, which is gone, so Esc keeps fx 2.
+        await session.sendKeys("Escape");
+        const kept = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("fx 2/2"), 10_000);
+        expect(shownAnswers(kept)).toEqual(["HOST_ANSWER_B"]);
       });
     },
     TIMEOUT,
@@ -1871,7 +2213,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2 finished · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
         const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
-        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}finished {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}finished {2,}\S+\s*$/m);
         await session.sendKeys("Escape");
         // Showing it clears the note.
         await switchAgent(session, "next");
@@ -1903,7 +2245,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
         const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
-        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}needs you {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}needs you {2,}\S+\s*$/m);
         await session.sendKeys("Escape");
         // Esc on its own screen ends the request, and the note goes.
         await switchAgent(session, "next");

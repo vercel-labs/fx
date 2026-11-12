@@ -12,6 +12,7 @@ const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const session_commands = @import("../session/session_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -521,8 +522,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        /// Moves the agent list's selection, keeping it in view, and shows
-        /// the agent it lands on.
+        /// Moves the agent list's highlight, keeping it in view, and shows
+        /// the agent it lands on; ↑ on the first row closes the list.
         pub fn routeAgentsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             const runtime = app_agents_runtime.Runtime(App);
@@ -780,6 +781,9 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn catalogMenuOwnsSurface(app: *App, agent: *AppAgent) bool {
             if (app.input_runtime.help_menu.active or app.input_runtime.settings_menu.active) return true;
+            if (comptime @hasField(App, "instances")) {
+                if (app.instances.agents_menu.open) return true;
+            }
             if (comptime @hasField(App, "skills")) {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
                     if (app.skills.menuVisible()) return true;
@@ -1216,7 +1220,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         app.alloc,
                         model,
                         model_capabilities.reasoningEffortIndex(capabilities, effort),
-                        capabilities.supports_fast_mode,
+                        preselectsFast(model, capabilities),
                         false,
                         .effort,
                     );
@@ -1255,7 +1259,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     if (!capabilities.supports_fast_mode and !capabilities.supports_ultrafast_mode) return false;
 
                     try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), capabilities.supports_fast_mode, false, .fast);
+                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), preselectsFast(model, capabilities), false, .fast);
                     return true;
                 },
                 .fast => return false,
@@ -1301,7 +1305,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const capabilities = model_capabilities.resolveForApp(App, app, model);
                     if (capabilities.supports_fast_mode) {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
+                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), preselectsFast(model, capabilities), false, .fast);
                     } else {
                         try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, app.fast_mode, false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -1394,16 +1398,23 @@ pub fn CompletionRuntime(comptime App: type) type {
             } else {
                 try setModelComposerText(app, "/model {s} auto ", .{model});
             }
-            // Preselect the product effort default and Fast mode when supported.
+            // Preselect the product effort default, and Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
                 model,
                 model_capabilities.reasoningEffortIndex(capabilities, .auto),
-                supports_fast,
+                preselectsFast(model, capabilities),
                 false,
                 stage,
             );
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Whether the speed stage starts on Fast for `model`. A Token Pass
+        /// model starts on normal speed, since Token Pass credit does not
+        /// pay for Fast mode and those requests bill AI Gateway credits.
+        fn preselectsFast(model: []const u8, capabilities: model_capabilities.Capabilities) bool {
+            return capabilities.supports_fast_mode and !token_pass.isFeaturedModel(model);
         }
 
         pub fn beginExactModelSelection(app: *App, agent: *AppAgent, model: []const u8) !void {

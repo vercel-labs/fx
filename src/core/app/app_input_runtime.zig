@@ -29,6 +29,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
@@ -96,6 +97,8 @@ fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
         else => .unavailable,
     };
 }
@@ -957,6 +960,9 @@ pub fn Runtime(comptime App: type) type {
                     if (app.shell.fullTranscriptActive()) return .done;
                     if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    // The list sets the draft aside itself, so the model
+                    // picker's goes back to the composer first.
+                    restoreModelPickerDraft(app);
                     try app.openAgentsMenu();
                 }
                 return .done;
@@ -985,7 +991,9 @@ pub fn Runtime(comptime App: type) type {
                 else => {},
             }
 
-            if (agents.screenAgentOf(app).question_prompt.isActive()) {
+            // The open agent list covers the prompt, and its search box
+            // takes the keys it passes on.
+            if (agents.screenAgentOf(app).question_prompt.isActive() and !agentsMenuActive(app)) {
                 try question_rt.routeQuestionEscapeAction(
                     app,
                     agents.screenAgentOf(app),
@@ -995,7 +1003,7 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
-            if (agents.screenAgentOf(app).approval_prompt.isActive()) {
+            if (agents.screenAgentOf(app).approval_prompt.isActive() and !agentsMenuActive(app)) {
                 try approval_rt.routeApprovalEscapeAction(
                     app,
                     agents.screenAgentOf(app),
@@ -1167,6 +1175,9 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !bool {
             const byte = raw.byte;
+            // The open agent list covers the prompt; its search box takes the
+            // bytes it passes on.
+            if (agentsMenuActive(app)) return false;
             if ((agent.question_prompt.isActive() or approvalOwnsCurrentSurface(app, agent)) and byte == ctrl_g_upgrade_byte) {
                 _ = try routeUpgradeShortcut(app, agent, byte);
                 return true;
@@ -1224,6 +1235,7 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
+            if (try routeForkQuestionByte(app, agent, byte)) return true;
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1441,7 +1453,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSlashPickerSelection(app, agent)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app, agent)) return;
-                        if (try submitForkMenuSelection(app, agent, max_input_len)) return;
+                        if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, agent, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -1709,7 +1721,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "session",
                         .tone = .@"error",
-                        .body = "Unable to resume selected session.",
+                        .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -1735,7 +1747,7 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).closeMenu(app);
         }
 
-        /// Closes the agent list and puts back the agent it opened on.
+        /// Closes the agent list and shows again the agent it opened on.
         fn backAgentsMenu(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             return app_agents_runtime.Runtime(App).backMenu(app);
@@ -1747,19 +1759,40 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).pressCloseKey(app);
         }
 
+        /// The composer, the open agent list's search box, holds a search.
+        fn agentsMenuSearching(app: *App) bool {
+            return app.input_runtime.edit_state.input.items.len > 0;
+        }
+
+        fn clearAgentsMenuSearch(app: *App) void {
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            syncAgentsMenu(app);
+        }
+
+        fn syncAgentsMenu(app: *App) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).searchChanged(app);
+        }
+
         fn disarmAgentsMenuClose(app: *App) void {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return;
             app_agents_runtime.Runtime(App).disarmClose(app);
         }
 
         /// While the agent list is open it takes every key, ahead of the
-        /// prompts and composer of the agent it shows, which is a preview:
-        /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
-        /// Ctrl+X, and Ctrl+C go back to the one it opened on. A paste keeps
-        /// the agent shown and lands in its composer, and mouse input passes
-        /// through. Any other key does nothing, so none edits the previewed
-        /// agent's draft or answers its prompt. Returns whether the list
-        /// took `event`.
+        /// prompts and composer of the agent it shows, which is a preview: ↑
+        /// and ↓ move and show the agent they land on, ↑ on the first row
+        /// closes the list, Enter keeps the agent shown, Backspace or Delete
+        /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C go back to
+        /// the agent the list opened on. The composer is its search box, with
+        /// the agent's draft set aside: typing, Left, and Right edit it, and
+        /// the list shows the match the highlight moves to; while it holds a
+        /// search, Backspace and Delete edit it too and Esc clears it. A paste
+        /// closes the list, keeping the agent shown, and lands in its draft;
+        /// mouse input passes through. Any other key does nothing, so none
+        /// answers the prompt behind the list. Returns whether the list took
+        /// `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1767,6 +1800,7 @@ pub fn Runtime(comptime App: type) type {
                 .raw => |raw| raw.byte == 127 or raw.byte == 8,
                 .action => |decoded| switch (decoded.action) {
                     .remapped_byte => |byte| byte == 127 or byte == 8,
+                    .delete_next => true,
                     else => false,
                 },
                 else => false,
@@ -1777,24 +1811,34 @@ pub fn Runtime(comptime App: type) type {
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
-                    127, 8 => _ = try pressAgentsMenuClose(app),
+                    127, 8 => if (agentsMenuSearching(app)) return false else {
+                        _ = try pressAgentsMenuClose(app);
+                    },
                     3, 24 => _ = try backAgentsMenu(app),
+                    ' '...'~' => return false,
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
-                    else => if (raw.byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(
-                        &app.input_runtime.text_scalar,
-                        "agents_menu_active",
-                    ),
+                    else => if (raw.byte >= 0x80) return false,
                 },
                 .action => |decoded| switch (decoded.action) {
                     .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
-                    .escape, .open_agent_list => {
+                    .delete_next => if (agentsMenuSearching(app)) return false else {
+                        _ = try pressAgentsMenuClose(app);
+                    },
+                    .cursor_left, .cursor_right => return false,
+                    .escape => {
+                        if (agentsMenuSearching(app)) clearAgentsMenuSearch(app) else _ = try backAgentsMenu(app);
+                        _ = disarmEscapeClear(app);
+                    },
+                    .open_agent_list => {
                         _ = try backAgentsMenu(app);
                         _ = disarmEscapeClear(app);
                     },
+                    // A paste closes the list on the agent shown and lands in
+                    // its draft.
                     .paste_start => {
-                        _ = try submitAgentsMenuSelection(app);
+                        _ = cancelAgentsMenu(app);
                         return false;
                     },
                     // Replayed as the byte it stands for, which comes back here.
@@ -1806,16 +1850,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Forks before the selected prompt and puts its text in the composer.
-        fn submitForkMenuSelection(app: *App, agent: *AppAgent, max_input_len: usize) !bool {
-            if (comptime !@hasDecl(App, "forkBeforeSelectedPrompt")) return false;
+        /// Enter on `/fork`'s prompts (`bring` null), or the answer to its
+        /// question whether the fork takes copies of the subagents (D97).
+        fn submitForkMenuSelection(app: *App, agent: *AppAgent, bring: ?bool, max_input_len: usize) !bool {
+            if (comptime !@hasDecl(App, "submitForkMenu")) return false;
             if (!forkMenuActive(agent)) return false;
-            const prompt = app.forkBeforeSelectedPrompt(agent) catch |err| {
+            const forked = app.submitForkMenu(agent, bring) catch |err| {
                 debug_trace.logf("session", "fork failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .@"error",
                     .body = "Unable to fork the session.",
                 }, true);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            // The menu asks its question first.
+            const prompt = forked orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
@@ -1870,6 +1921,45 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.session_picker.active;
+        }
+
+        /// While `/fork` asks whether the fork takes copies of the session's
+        /// subagents (D97), Enter or y answers yes and n answers no; Esc
+        /// also answers no (`answerForkQuestionOnEscape`). Other printable
+        /// bytes are dropped with a trace line, so a stray key never forks;
+        /// control bytes pass, so Ctrl+C still works.
+        fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            const bring: ?bool = switch (byte) {
+                '\r', 'y', 'Y' => true,
+                'n', 'N' => false,
+                else => null,
+            };
+            if (bring) |yes| {
+                _ = try submitForkMenuSelection(app, agent, yes, forkPromptLimit());
+                return true;
+            }
+            if (byte < 0x20) return false;
+            if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "fork_question");
+            debug_trace.logf("input", "fork question ignored byte=0x{x} reason=not_an_answer", .{byte});
+            return true;
+        }
+
+        fn answerForkQuestionOnEscape(app: *App, agent: *AppAgent) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            return submitForkMenuSelection(app, agent, false, forkPromptLimit());
+        }
+
+        /// The composer's limit, which the fork's restored prompt keeps.
+        fn forkPromptLimit() usize {
+            return if (comptime @hasDecl(App, "input_limits"))
+                App.input_limits.composer_bytes
+            else
+                std.math.maxInt(usize);
         }
 
         fn forkMenuActive(agent: *AppAgent) bool {
@@ -2125,12 +2215,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
-            // The fork and effort menus and the instance list read no query
-            // from the composer, so an edit closes them.
+            // The fork and effort menus read no query from the composer, so an
+            // edit closes them. The agent list searches with it instead.
             const fork_menu_closed = cancelForkMenu(app, agent);
             const effort_menu_closed = cancelEffortMenu(app);
-            const agents_menu_closed = cancelAgentsMenu(app);
-            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed or agents_menu_closed;
+            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App, agent: *AppAgent) void {
@@ -2658,6 +2747,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn syncCatalogMenus(app: *App, agent: *AppAgent) void {
+            syncAgentsMenu(app);
             syncSettingsMenu(app);
             syncHelpMenu(app);
             syncSkillsMenu(app);
@@ -2873,6 +2963,12 @@ pub fn Runtime(comptime App: type) type {
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
+                return;
+            }
+            // Esc answers `/fork`'s question: fork without the subagents (D97).
+            if (try answerForkQuestionOnEscape(app, agent)) {
+                _ = disarmEscapeClear(app);
+                _ = disarmEscapeInterrupt(app, "fork_question");
                 return;
             }
             if (was_cancel_pending) {
@@ -6115,6 +6211,12 @@ test "app_input_runtime Enter consumes an active session picker on target failur
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, picker.selection_failure.?);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "unable to resume") == null);
+}
+
+test "a resume refused for a changed or removed custom connection says which" {
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_changed, classifyResumeFailure(error.ConfiguredProviderChanged));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_removed, classifyResumeFailure(error.ConfiguredProviderRemoved));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, classifyResumeFailure(error.UnknownConfiguredProvider));
 }
 
 test "app_input_runtime reports resume failure after picker transition" {

@@ -20,6 +20,7 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
+import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
   canonicalSubagentIdForStore,
   confirmationReplay,
@@ -204,19 +205,6 @@ function twoEffectfulCommandBatch(first: string, second: string) {
 
 function sessionIdFromHome(root: IsolatedRoot): string {
   return onlySessionId(root.home);
-}
-
-function latestTraceReportPath(root: IsolatedRoot): string {
-  const reports = readdirSync(root.root)
-    .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
-    .map((entry) => {
-      const path = join(root.root, entry);
-      return { path, mtimeMs: statSync(path).mtimeMs };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  expect(reports.length).toBeGreaterThan(0);
-  return reports[0]!.path;
 }
 
 function expectGroupedContinuationRequest(
@@ -1761,34 +1749,47 @@ describe("effect-aware command permissions", () => {
           : "Trace saved at",
         TIMEOUT,
       );
-      const report = readFileSync(latestTraceReportPath(root), "utf8");
+      const report = readTraceReport(latestTraceReportPath(root.root));
 
       // Main's four steps, the child's two, and the report's turn.
       expect(gateway.requests).toHaveLength(7);
-      expect(report).toContain(
-        "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
+      expect(report.one("tool_calls")).toMatchObject({
+        retained: 4,
+        outcomes: { succeeded: 2, rejected: 0, command_failed: 1, tool_failed: 1, runtime_failed: 0 },
+      });
+      const calls = report.all("tool_call");
+      const described = calls.map((call) =>
+        `${call.name} ${call.outcome} ${call.source}${call.subagent_id === undefined ? "" : `#${call.subagent_id}`}`);
+      expect(described).toEqual(expect.arrayContaining([
+        "shell succeeded subagent#1",
+        "subagent succeeded parent",
+        "shell command_failed parent",
+        "edit_file tool_failed parent",
+      ]));
+      for (const call of calls) expect(call.duration_ms).toEqual(expect.any(Number));
+      const failedCalls = report.problems("tool_call").map((problem) => problem.call as { name: string; outcome: string });
+      expect(failedCalls.map((call) => `${call.name} ${call.outcome}`)).toEqual(
+        expect.arrayContaining(["edit_file tool_failed", "shell command_failed"]),
       );
-      const localCalls = report.split("### Local\n")[1]?.split("### Web Search")[0];
-      expect(localCalls).toBeDefined();
-      expect(localCalls).toMatch(
-        /name=shell outcome=succeeded duration=\d+ms source=subagent#1 call_id=trace_child_command\n/,
+      expect(calls.filter((call) => call.outcome === "runtime_failed")).toEqual([]);
+      // Every call carries the provider's call ID.
+      const ids = calls.map((call) => `${call.name} ${call.outcome} ${String(call.call_id)}`);
+      expect(ids).toEqual(expect.arrayContaining([
+        "shell succeeded trace_child_command",
+        "subagent succeeded trace_child",
+        "shell command_failed trace_command_failed",
+        "edit_file tool_failed trace_edit_failed",
+      ]));
+      for (const call of calls.filter((call) => call.outcome !== "succeeded")) expect(call.failure_kept).toBe(true);
+      expect(failedCalls.map((call) => (call as { call_id?: string }).call_id)).toEqual(
+        expect.arrayContaining(["trace_command_failed", "trace_edit_failed"]),
       );
-      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent call_id=trace_child\n/);
-      expect(localCalls).toMatch(
-        /name=shell outcome=command_failed duration=\d+ms source=parent call_id=trace_command_failed\n/,
-      );
-      expect(localCalls).toMatch(
-        /name=edit_file outcome=tool_failed duration=\d+ms source=parent call_id=trace_edit_failed\n/,
-      );
-      // Both failures are kept whole under Failures, ahead of the window.
-      const failures = report.split("### Failures\n")[1]?.split("### Local\n")[0];
-      expect(failures).toContain("kept=2 of 2 session failures");
-      expect(failures).toContain("call_id=trace_command_failed");
-      expect(failures).toContain("call_id=trace_edit_failed");
-      expect(report).toContain("name=edit_file outcome=tool_failed");
-      expect(report).toContain("name=shell outcome=command_failed");
-      expect(report).not.toContain("name=edit_file outcome=runtime_failed");
-      expect(report).not.toContain("name=shell outcome=runtime_failed");
+      // Both failures are also kept whole in their own records.
+      expect(report.one("tool_calls")).toMatchObject({ failed_retained: 2, failed_complete: true });
+      expect(report.all("failed_tool_call").map((call) => `${call.name} ${call.outcome} ${String(call.call_id)}`)).toEqual([
+        "edit_file tool_failed trace_edit_failed",
+        "shell command_failed trace_command_failed",
+      ]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -1854,30 +1855,44 @@ describe("effect-aware command permissions", () => {
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
         TIMEOUT,
       );
-      const report = readFileSync(latestTraceReportPath(root), "utf8");
-      const section = (start: string, end: string) => report.split(start)[1]?.split(end)[0];
+      const report = readTraceReport(latestTraceReportPath(root.root));
 
       // The window has moved past the failed call.
-      expect(report).toContain(`coverage: window holds only the last 64 of ${successes + 1} tool calls`);
-      const local = section("### Local\n", "### Web Search");
-      expect(local).toBeDefined();
-      expect(local).not.toContain("trace_failed_first");
-      expect(local).toMatch(/name=shell outcome=succeeded duration=\d+ms source=parent call_id=trace_ok_69\n/);
+      expect(report.one("tool_calls")).toMatchObject({
+        retained: 64,
+        session: { calls: successes + 1 },
+        complete: false,
+        failed_retained: 1,
+        failed_complete: true,
+      });
+      const window = report.all("tool_call");
+      expect(window.map((call) => call.call_id)).not.toContain("trace_failed_first");
+      expect(window[window.length - 1]).toMatchObject({
+        name: "shell",
+        outcome: "succeeded",
+        source: "parent",
+        call_id: "trace_ok_69",
+      });
 
       // The failed call is kept whole: its call ID, folder, whole command,
-      // and the end of its output.
-      const failures = section("### Failures\n", "### Local\n");
-      expect(failures).toBeDefined();
-      expect(failures).toMatch(
-        /name=shell outcome=command_failed duration=\d+ms source=parent call_id=trace_failed_first\n/,
-      );
-      expect(failures).toContain(`  dir: ${root.workspace}\n`);
-      expect(failures).toContain("COMMAND_TAIL_MARKER");
-      expect(failures).toContain("OUTPUT_TAIL_MARKER");
-      expect(failures).toContain("  redefined: ls (alias of fx-eza-fixture)\n");
+      // and the end of its output, past the window's 1200 and 2000 bytes.
+      const failed = report.one("failed_tool_call");
+      expect(failed).toMatchObject({
+        name: "shell",
+        outcome: "command_failed",
+        source: "parent",
+        call_id: "trace_failed_first",
+        dir: root.workspace,
+        redefined: [{ name: "ls", kind: "alias", alias_of: "fx-eza-fixture" }],
+      });
+      expect(failed.duration_ms).toEqual(expect.any(Number));
+      expect(failed.args_bytes as number).toBeGreaterThan(1200);
+      expect(String(failed.args)).toContain("COMMAND_TAIL_MARKER");
+      expect(failed.result_bytes as number).toBeGreaterThan(2000);
+      expect(`${String(failed.result)}${String(failed.result_tail ?? "")}`).toContain("OUTPUT_TAIL_MARKER");
 
-      const problems = section("## Problems\n", "\n## ");
-      expect(problems).toContain("call_id=trace_failed_first");
+      const problems = report.problems("tool_call").map((problem) => problem.call as { call_id?: string });
+      expect(problems.map((call) => call.call_id)).toContain("trace_failed_first");
 
       // The call ID finds the call in the session log.
       const log = readFileSync(join(storeRoot(root.home), onlySessionId(root.home), "log.jsonl"), "utf8");
@@ -1885,11 +1900,9 @@ describe("effect-aware command permissions", () => {
       expect(records.some((record) => record.type === "tool_call" && record.data?.call_id === "trace_failed_first"))
         .toBe(true);
 
-      const shell = section("## Shell\n", "\n## ");
-      expect(shell).toBeDefined();
-      expect(shell).toContain(`login_shell: ${configuredShell}\n`);
-      expect(shell).toMatch(/snapshot: state=ready /);
-      expect(shell).toContain("ls (alias of fx-eza-fixture)");
+      const shell = report.one("shell");
+      expect(shell).toMatchObject({ login_shell: configuredShell, start: "snapshot_replay", snapshot: { state: "ready" } });
+      expect(shell.redefined).toContainEqual({ name: "ls", kind: "alias", alias_of: "fx-eza-fixture" });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -1943,13 +1956,15 @@ describe("effect-aware command permissions", () => {
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
         TIMEOUT,
       );
-      const report = readFileSync(latestTraceReportPath(root), "utf8");
-      const shell = report.split("## Shell\n")[1]?.split("\n## ")[0];
-      expect(shell).toBeDefined();
-      expect(shell).toContain(
-        "snapshot: state=failed reason=the login shell exited before reporting its state",
-      );
-      expect(shell).toContain("user commands start: full startup");
+      const shell = readTraceReport(latestTraceReportPath(root.root)).one("shell");
+      expect(shell).toMatchObject({
+        login_shell: configuredShell,
+        start: "full_startup",
+        snapshot: { state: "failed", failure: "the login shell exited before reporting its state" },
+      });
+      expect(String(shell.start_command).startsWith(configuredShell)).toBe(true);
+      // Without a snapshot, which commands are redefined is unknown.
+      expect(shell.redefined).toBeUndefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -2001,18 +2016,31 @@ describe("effect-aware command permissions", () => {
           : "Trace saved at",
         TIMEOUT,
       );
-      const reportPath = latestTraceReportPath(root);
-      const report = readFileSync(reportPath, "utf8");
+      const reportPath = latestTraceReportPath(root.root);
+      const report = readTraceReport(reportPath);
 
       expect(gateway.requests).toHaveLength(1);
-      expect(report).toContain("## Problems");
-      expect(report).toContain("## Network Calls");
-      expect(report).toContain("status=400");
-      expect(report).toContain('gateway_schema="path=prompt.0.content expected=string received=array"');
-      expect(report).toContain("request_shape=");
-      expect(report).toContain("prompt.0 role=system content=string");
-      expect(report).toContain("role=user content=array");
-      expect(report).not.toContain('"text":"Trigger the gateway schema diagnostic."');
+      const refused = report.all("network_call").filter((call) => call.status === 400);
+      expect(refused).toHaveLength(1);
+      expect(refused[0]!.gateway_schema).toBe("path=prompt.0.content expected=string received=array");
+      const shape = String(refused[0]!.request_shape);
+      expect(shape).toContain("prompt.0 role=system content=string");
+      expect(shape).toContain("role=user content=array");
+      // The request shape names roles and types, never the prompt's text.
+      expect(shape).not.toContain("Trigger the gateway schema diagnostic.");
+      // No record holds the raw request body. The prompt itself is only in
+      // the transcript and in the screen rows of the renderer state, so a
+      // gateway error, schema diagnostic, or any other record that leaks it
+      // fails. The test does not set FX_TRACE_LOG, so the trace has no debug
+      // log lines to check.
+      const strings = (value: unknown): string[] =>
+        typeof value === "string" ? [value] : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+      expect(report.records.flatMap(strings).filter((text) => text.includes('"text":"Trigger the gateway schema diagnostic."'))).toEqual([]);
+      const elsewhere = report.records.filter((record) => record.type !== "transcript_entry" && record.type !== "renderer_state");
+      expect(elsewhere.flatMap(strings).filter((text) => text.includes("Trigger the gateway schema diagnostic."))).toEqual([]);
+      expect(report.all("transcript_entry").some((entry) => String(entry.text).includes("Trigger the gateway schema diagnostic."))).toBe(true);
+      expect(report.problems("network_call").map((problem) => (problem.call as { status?: number }).status)).toContain(400);
+      expect(report.one("problems").count).toBeGreaterThan(0);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -2025,7 +2053,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI creates a private Markdown trace without a feedback CTA",
+    "TUI creates a private JSONL trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([finalText(
@@ -2074,20 +2102,35 @@ describe("effect-aware command permissions", () => {
       expect(escapes).not.toContain("Report issue");
       expect(escapes).not.toContain("fx.sh/feedback");
       expect(escapes).not.toContain("github.com");
-      const reportPath = latestTraceReportPath(root);
-      const report = readFileSync(reportPath, "utf8");
-      expect(report).toContain("# fx trace");
-      expect(report).toContain("## Summary");
-      expect(report).toContain(root.workspace);
-      expect(report).toContain("terminal_hosts: tmux=true");
-      expect(report).toContain("projection: view=");
-      const rendererEvents = report.split("## Recent Renderer Events\n")[1]?.split("## Transcript Timeline")[0];
-      expect(rendererEvents).toBeDefined();
-      expect(rendererEvents).toContain("kind=transition");
-      expect(rendererEvents).toContain("kind=commit");
-      expect(rendererEvents).toContain("kind=resize");
-      expect(rendererEvents).not.toContain("TRACE_RENDER_ROW_");
-      expect(rendererEvents).not.toContain("[truncated]");
+      const reportPath = latestTraceReportPath(root.root);
+      const report = readTraceReport(reportPath);
+      // The Markdown report is gone.
+      expect(readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))).toEqual([]);
+      const header = report.records[0]!;
+      expect(header).toMatchObject({ type: "fx_trace", format_version: 1 });
+      expect(header.fx_version).toEqual(expect.any(String));
+      expect(header.written_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(String(report.one("summary").workspace)).toContain(root.workspace);
+      expect(report.one("runtime_context").tmux).toBe(true);
+      expect(report.one("renderer_state").projection).toMatchObject({ view: expect.any(Number) });
+      const rendererEvents = report.all("renderer_event");
+      expect(report.one("renderer_events").retained).toBe(rendererEvents.length);
+      const rendererKinds = rendererEvents.map((event) => event.kind);
+      expect(rendererKinds).toContain("transition");
+      expect(rendererKinds).toContain("commit");
+      expect(rendererKinds).toContain("resize");
+      for (const event of rendererEvents) {
+        expect(String(event.detail)).not.toContain("TRACE_RENDER_ROW_");
+        expect(event.truncated).toBe(false);
+      }
+      const entries = report.all("transcript_entry");
+      expect(report.one("transcript").emitted).toBe(entries.length);
+      expect(entries.some((entry) => entry.kind === "assistant" && String(entry.text).includes("TRACE_RENDER_DONE"))).toBe(true);
+      if (process.platform !== "darwin") {
+        // The notice names the file, however the pane wraps it.
+        const screen = (await activeSession.captureFullScrollback()).replace(/\s+/g, "");
+        expect(screen).toContain(`Tracesavedat${reportPath}.`);
+      }
       expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       if (process.platform === "darwin") {
@@ -2095,6 +2138,68 @@ describe("effect-aware command permissions", () => {
       } else {
         expect(existsSync(clipboardPath)).toBe(false);
       }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace reports a temp folder it cannot write and a last-shutdown report it cannot read",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([finalText("TRACE_FAULT_READY")]);
+      const stderrPath = join(root.root, "trace-fault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // Valid JSON that is not the object fx saves when it shuts down.
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(join(root.home, ".fx", "diagnostics", "last-shutdown.json"), "[1, 2]");
+      const tmpDir = join(root.root, "tmp-not-yet");
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say ready.");
+      await activeSession.waitForText("TRACE_FAULT_READY", TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText("Could not create trace.", TIMEOUT);
+      expect(existsSync(tmpDir)).toBe(false);
+
+      // With the folder there, the same session writes a whole trace, and the
+      // damaged report reads as unreadable.
+      mkdirSync(tmpDir);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_shutdown").status).toBe("unreadable");
+      expect(report.all("transcript_entry").some((entry) => String(entry.text).includes("TRACE_FAULT_READY"))).toBe(true);
+
+      // A report time past year 9999 is left out instead of stopping fx.
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-shutdown.json"),
+        '{"total_ms":42,"recorded_at_ms":9000000000000000000}',
+      );
+      const before = new Set(traceReportNames(tmpDir));
+      await activeSession.sendText("/trace");
+      const farReport = await waitForNewTraceReport(tmpDir, before);
+      const farShutdown = farReport.one("last_shutdown");
+      expect(farShutdown).toMatchObject({ status: "recorded", total_ms: 42 });
+      expect(farShutdown.recorded_at).toBeUndefined();
+      expect(farShutdown.recorded_at_ms).toBeUndefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
