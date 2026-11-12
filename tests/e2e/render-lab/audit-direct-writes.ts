@@ -74,7 +74,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/slack/install.zig", "run", /stdio_acquisition_write/, "noninteractive_output", "Slack CLI installation authorization prompt"),
   rule("src/core/shared/debug_trace.zig", "(?:writeLine|writeNoninteractiveStderr)", /debug_print/, "noninteractive_output", "opt-in tracing"),
   rule("src/main.zig", "(?:writeStdoutFast|writeStderrFast)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write)/, "noninteractive_output", "top-level help and CLI validation output"),
-  rule("src/main.zig", "(?:stdoutIsTerminal|stdoutTerminalColumns)", /fixed_descriptor/, "terminal_probe", "top-level help terminal capability probe"),
+  rule("src/core/shared/terminal_env.zig", "(?:stdoutIsTerminal|stdoutColumns)", /fixed_descriptor/, "terminal_probe", "stdout terminal probe for top-level help and session lists"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_render_runtime.zig", "checkRewritePublicationRetry", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/indexer/scan.zig", "expectEntries", /debug_print/, "tests", "test diagnostics"),
