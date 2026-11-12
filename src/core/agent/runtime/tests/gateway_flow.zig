@@ -8807,6 +8807,10 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try std.testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
     try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, modes);
+    // Only the forced refresh names a rejected token: the one the 401 refused.
+    const rejected = hooks.credential_refresh_rejected.items;
+    try std.testing.expect(rejected[0] == null and rejected[1] == null and rejected[3] == null);
+    try std.testing.expectEqualStrings("token-before", rejected[2].?);
     try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
     // The gateway's reason shows once while fx waits for the sign-in.
