@@ -324,6 +324,19 @@ pub fn choose(
     }
 }
 
+/// Compacts everything: no turn stays unchanged after the checkpoint, only
+/// the first user message of a turn in progress. Null when nothing is older.
+pub fn chooseEverything(
+    arena: Allocator,
+    history: []const HistoryTurn,
+    active: ?types.AssistantHistoryTurn,
+    size: Size,
+    route: model_provider.ProviderSelection,
+) !?Window {
+    const window = try split(arena, history, active, 0, size.usable_tokens, route);
+    return if (window.older.len > 0) window else null;
+}
+
 /// Splits the context: the newest turns stay unchanged, at most
 /// `max_kept_turns` of them within `kept_tokens`; everything older is
 /// compacted. `kept_tokens == 0` keeps nothing.
@@ -353,18 +366,57 @@ fn split(
             .steering = turn.execution.steering.len,
         };
     }
+    return fromCut(arena, history, combined.items, cut, kept_tokens, recent.tokens);
+}
+
+/// `chosen` with its cut moved to where a turn starts, for a compaction the
+/// provider writes. The provider reads the older part as the conversation up
+/// to the cut, so what stays after its block starts with a user message, or
+/// is only the first message of the turn in progress: a step kept after the
+/// block would follow a block that covers it too
+/// (`tests/tla/compaction/ProviderCompaction.tla` KeepCompaction and
+/// WholeCompaction). A cut inside a finished turn compacts that whole turn;
+/// one inside the turn in progress compacts all of its finished steps.
+pub fn atTurnStart(
+    arena: Allocator,
+    history: []const HistoryTurn,
+    active: ?types.AssistantHistoryTurn,
+    chosen: Window,
+) !Window {
+    if (chosen.cut.tool_steps == 0 and chosen.cut.steering == 0) return chosen;
+    var combined: std.ArrayList(HistoryTurn) = .empty;
+    try combined.appendSlice(arena, history);
+    if (active) |turn| try combined.append(arena, .{ .assistant = turn });
+    const active_index = history_range.rawHistoryTurnCount(history);
+    const cut: types.ContextHistoryCut = if (active != null and chosen.cut.turns == active_index) .{
+        .turns = active_index,
+        .tool_steps = active.?.execution.tool_steps.len,
+        .steering = active.?.execution.steering.len,
+    } else .{ .turns = chosen.cut.turns + 1 };
+    return fromCut(arena, history, combined.items, cut, chosen.kept_tokens, chosen.kept_used);
+}
+
+/// The window that keeps everything from `cut` on.
+fn fromCut(
+    arena: Allocator,
+    history: []const HistoryTurn,
+    combined: []const HistoryTurn,
+    cut: types.ContextHistoryCut,
+    kept_tokens: usize,
+    kept_used: usize,
+) !Window {
     var earlier: ?[]const u8 = null;
     for (history) |turn| {
         if (turn == .compacted_summary) earlier = turn.compacted_summary.summary;
     }
     return .{
         .earlier = earlier,
-        .older = try history_range.contextHistoryRange(arena, combined.items, .{}, cut),
+        .older = try history_range.contextHistoryRange(arena, combined, .{}, cut),
         .retained_history = try history_range.contextHistoryRange(arena, history, cut, null),
-        .kept = try history_range.contextHistoryRange(arena, combined.items, cut, null),
+        .kept = try history_range.contextHistoryRange(arena, combined, cut, null),
         .cut = cut,
         .kept_tokens = kept_tokens,
-        .kept_used = recent.tokens,
+        .kept_used = kept_used,
     };
 }
 

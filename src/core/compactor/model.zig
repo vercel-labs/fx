@@ -36,13 +36,56 @@ pub const ModelCaller = struct {
     /// cannot write it, chosen by the caller, such as a model the same plan
     /// pays for. Null lets the compactor choose another model family.
     fallback_model: ?[]const u8 = null,
+    /// The conversation's model writes its own compaction block over the
+    /// conversation, and `compact_with_provider` asks for it. Null when it
+    /// cannot (`vercel_model_policy.providerCompaction`).
+    provider_compaction: ?model_capabilities.ProviderCompaction = null,
 
     pub const VTable = struct {
         /// What `model` accepts.
         capabilities: *const fn (context: *anyopaque, model: []const u8) model_capabilities.Capabilities,
         /// Sends one request and waits for the whole reply.
         send: *const fn (context: *anyopaque, alloc: Allocator, call: Call) CallError!Reply,
+        /// Sends the conversation, as the agent sent it, to its own model
+        /// with the provider's compaction option, and waits for the block.
+        compact_with_provider: ?*const fn (context: *anyopaque, alloc: Allocator, call: ProviderCall) CallError!ProviderReply = null,
     };
+
+    /// The model's replies keep their reasoning only after the exact prefix
+    /// they were written after, and its provider writes compaction blocks.
+    /// fx's own summary keeps no turn after it for such a model.
+    pub fn bindsReasoning(self: ModelCaller) bool {
+        return self.provider_compaction != null;
+    }
+
+    /// The provider can write this conversation's compaction block.
+    pub fn compactsWithProvider(self: ModelCaller) bool {
+        return self.provider_compaction != null and self.sends_after_conversation and self.vtable.compact_with_provider != null;
+    }
+};
+
+/// A request for the provider's own compaction block.
+pub const ProviderCall = struct {
+    /// The compacted part as the session projects it, which must be where
+    /// the request the agent was about to send starts; the provider gets
+    /// exactly that start. Null sends that whole request: the turn in
+    /// progress is compacted too.
+    older: ?[]const types.ChatMessage,
+    cancel_flag: *std.atomic.Value(bool),
+    trace_ctx: debug_trace.TraceContext,
+};
+
+pub const ProviderReply = union(enum) {
+    /// The block, allocated with the `alloc` given to `compact_with_provider`.
+    block: struct {
+        /// The provider authority, as `model_provider.ProviderId` names it.
+        provider: []const u8,
+        text: []u8,
+        parts_json: []u8,
+    },
+    /// No block. `detail` names the cause in `key=value` form for the
+    /// trace; allocated with the `alloc` given to `compact_with_provider`.
+    failed: struct { reason: FailureReason, detail: []u8 },
 };
 
 /// One request: a system message and one user message, no tools. Or, with

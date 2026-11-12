@@ -45,6 +45,9 @@ pub const ModelCaller = model.ModelCaller;
 pub const Call = model.Call;
 pub const CallError = model.CallError;
 pub const Reply = model.Reply;
+pub const FailureReason = model.FailureReason;
+pub const ProviderCall = model.ProviderCall;
+pub const ProviderReply = model.ProviderReply;
 
 // Compaction notes: the `context_compaction` trace scope and the bounded
 // events `/trace` shows.
@@ -69,6 +72,8 @@ pub const parsePercent = settings.parsePercent;
 // Saved checkpoints, read back when a session is loaded or shown.
 pub const modelText = checkpoint.modelText;
 pub const replacesPriorContext = checkpoint.replacesPriorContext;
+pub const ProviderBlock = checkpoint.ProviderBlock;
+pub const providerBlock = checkpoint.providerBlock;
 
 // Saved turns (M1, M2, ...), tool calls (T1, T2, ...) and earlier
 // compactions (L1, L2, ...).
@@ -136,6 +141,10 @@ pub const Request = struct {
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
     progress: ?Progress = null,
+    /// The runtime context the conversation was sent with, one system
+    /// message text each. A provider block keeps it, so the turns after the
+    /// block go on after the same instructions.
+    runtime_context: []const []const u8 = &.{},
 };
 
 /// Owns everything it points to except the turns it shares with
@@ -199,22 +208,42 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     try Progress.report(request.progress, .summarizing);
     trace.log(false, "room after compaction after_tokens={d} fixed_tokens={any} kept_tokens={d} kept_used={d} compacted_tokens={d}", .{ request.size.afterTokens(), request.size.fixed_tokens, chosen.kept_tokens, chosen.kept_used, request.size.compactedTokens(chosen.kept_used) });
 
-    const earlier = try earlierFrom(out, request.records, chosen.earlier);
-    const turns = try turnsFrom(out, chosen.older, request.append_messages);
+    var chosen_window = chosen;
+    var earlier = try earlierFrom(out, request.records, chosen.earlier);
+    var turns = try turnsFrom(out, chosen.older, request.append_messages);
     if (turns.len == 0) return error.NothingToCompact;
+    if (caller.bindsReasoning()) {
+        if (caller.compactsWithProvider()) {
+            const provider_window = try window.atTurnStart(out, request.history, request.active, chosen);
+            const provider_turns = try turnsFrom(out, provider_window.older, request.append_messages);
+            if (try compactWithProvider(alloc, request, arena, provider_window, earlier, provider_turns)) |result| return result;
+            if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        } else {
+            // Overflow recovery has no request the provider could compact.
+            trace.failure(trace_ctx, .provider_block_failed, "model={s} reason=no_request; fx writes its own summary and keeps no turns", .{caller.model});
+        }
+        // fx's own summary keeps no turn after it: the newest turns' reasoning
+        // would follow a summary the provider never read before it
+        // (`tests/tla/compaction/ProviderCompaction.tla` Commit).
+        chosen_window = try window.chooseEverything(out, request.history, request.active, request.size, .{ .provider = caller.provider, .model = caller.model }) orelse return error.NothingToCompact;
+        earlier = try earlierFrom(out, request.records, chosen_window.earlier);
+        turns = try turnsFrom(out, chosen_window.older, request.append_messages);
+        if (turns.len == 0) return error.NothingToCompact;
+    }
+    const chosen_fx = chosen_window;
     var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
-    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
+    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen_fx.earlier != null, request.records != null });
     // The caller's allocator, so the summary gives its working memory back
     // when it is done instead of keeping it in this result.
     var summary = try summarize.compact(alloc, .{
         .model = caller.model,
         .earlier = earlier,
         .turns = turns,
-        .last_turn_open = chosen.splitsLastTurn(),
-        .kept = try turnsFrom(out, chosen.kept, request.append_messages),
+        .last_turn_open = chosen_fx.splitsLastTurn(),
+        .kept = try turnsFrom(out, chosen_fx.kept, request.append_messages),
         .max_prompt_tokens = request.size.summaryRequestTokens(),
         .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
-        .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
+        .max_text_tokens = request.size.compactedTokens(chosen_fx.kept_used),
     }, summarizer.model(), request.records);
     defer summary.deinit();
     trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
@@ -223,14 +252,97 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .arena = arena,
         .checkpoint = .{
             .summary = try checkpoint.encode(out, summary.compacted),
-            .removed_turn_count = chosen.cut.turns,
+            .removed_turn_count = chosen_fx.cut.turns,
             .compaction_count = latestCompactionCount(request.history) + 1,
         },
         .model_text = try out.dupe(u8, summary.text),
-        .retained_history = chosen.retained_history,
-        .cut = chosen.cut,
+        .retained_history = chosen_fx.retained_history,
+        .cut = chosen_fx.cut,
         .tool_count = summary.compacted.tool_count,
     };
+}
+
+/// Asks the conversation's own model for its compaction block over the older
+/// part, sent exactly as before, or over everything the agent was about to
+/// send when the turn in progress is compacted too. The block replaces the
+/// older part and the kept turns follow it unchanged
+/// (`tests/tla/compaction/ProviderCompaction.tla` KeepCompaction and
+/// WholeCompaction). The checkpoint also holds fx's exact text of the same
+/// turns, written without asking any model, which every other model reads.
+/// Null when the provider writes no block; nothing is saved but the turn and
+/// tool call records.
+fn compactWithProvider(
+    alloc: Allocator,
+    request: Request,
+    arena: *std.heap.ArenaAllocator,
+    chosen: window.Window,
+    earlier: ?summarize.Compacted,
+    turns: []const summarize.Turn,
+) !?Result {
+    const out = arena.allocator();
+    const caller = request.caller;
+    const trace_ctx = request.trace_ctx;
+    var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
+    var exact = try summarize.compact(alloc, .{
+        .model = caller.model,
+        .earlier = earlier,
+        .turns = turns,
+        .last_turn_open = chosen.splitsLastTurn(),
+        .kept = try turnsFrom(out, chosen.kept, request.append_messages),
+        .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
+        .notes = false,
+    }, summarizer.model(), request.records);
+    defer exact.deinit();
+    const older: ?[]const types.ChatMessage = if (chosen.splitsLastTurn()) null else older: {
+        // What the agent's request sends before the kept turns: the newest
+        // checkpoint, where its context starts, then the older raw turns.
+        var sent_turns: std.ArrayList(types.HistoryTurn) = .empty;
+        if (newestCheckpoint(request.history)) |turn| try sent_turns.append(out, turn);
+        try sent_turns.appendSlice(out, chosen.older);
+        var messages: std.ArrayList(types.ChatMessage) = .empty;
+        try request.append_messages(out, &messages, sent_turns.items);
+        break :older messages.items;
+    };
+    trace.info(trace_ctx, .provider_start, "model={s} path=provider_block whole={} older_messages={any}", .{ caller.model, older == null, if (older) |messages| messages.len else null });
+    const reply = try caller.vtable.compact_with_provider.?(caller.context, out, .{ .older = older, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx });
+    const block = switch (reply) {
+        .block => |block| block,
+        .failed => |failure| {
+            trace.failure(trace_ctx, .provider_block_failed, "model={s} reason={s} {s}; fx writes its own summary and keeps no turns", .{ caller.model, @tagName(failure.reason), failure.detail });
+            return null;
+        },
+    };
+    var payload = exact.compacted;
+    payload.provider = .{
+        .provider = block.provider,
+        .model = caller.model,
+        .text = block.text,
+        .parts_json = block.parts_json,
+        .kept_turns = chosen.retained_history.len,
+        .runtime_context = request.runtime_context,
+    };
+    trace.info(trace_ctx, .provider_completed, "model={s} path=provider_block text_bytes={d} parts_bytes={d} turns={d} tools={d}", .{ caller.model, block.text.len, block.parts_json.len, exact.compacted.turn_count, exact.compacted.tool_count });
+    return .{
+        .arena = arena,
+        .checkpoint = .{
+            .summary = try checkpoint.encode(out, payload),
+            .removed_turn_count = chosen.cut.turns,
+            .compaction_count = latestCompactionCount(request.history) + 1,
+        },
+        .model_text = try out.dupe(u8, exact.text),
+        .retained_history = chosen.retained_history,
+        .cut = chosen.cut,
+        .tool_count = exact.compacted.tool_count,
+    };
+}
+
+fn newestCheckpoint(history: []const types.HistoryTurn) ?types.HistoryTurn {
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        if (history[index] == .compacted_summary) return history[index];
+    }
+    return null;
 }
 
 fn latestCompactionCount(history: []const types.HistoryTurn) usize {

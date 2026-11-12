@@ -42,6 +42,7 @@ pub fn compactionProjection(
 }
 
 fn compactionFeedbackLabel(feedback: compaction_activity.Feedback) []const u8 {
+    if (feedback.scheduled) return "Context will be compacted before your next message.";
     if (feedback.publication == .uncertain)
         return "Compaction could not confirm saved context. Reopen the session before retrying.";
     if (feedback.publication == .committed)

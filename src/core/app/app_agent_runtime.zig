@@ -1295,6 +1295,14 @@ pub fn Runtime(comptime App: type) type {
                 deps.agent_stream_provider = bundle.agent_stream_or_unavailable();
                 break :blk bundle.capabilities;
             } else .{};
+            // A model whose provider writes the compaction block compacts
+            // right before the next message is sent: only that request can
+            // go to the provider exactly as the conversation went before.
+            if (job.provider == .gateway and deps.agent_stream_provider.providerCompaction(job.model) != null) {
+                agent.session.agent.compaction_requested = true;
+                agent.worker.settleCompactionActivity(operation_id, .{ .outcome = .no_op, .scheduled = true });
+                return;
+            }
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const settings = agent.worker.effectiveAgentTurnSettings();
             var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, settings.effort, settings.fast_mode);
