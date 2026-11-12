@@ -106,7 +106,7 @@ async function runScenario(name) {
   const seedTurns = automatic ? 1 : 3;
   const seedRule = "Always keep the history markers.";
   const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 1_800)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
-  const activity = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+  const activity = /Compacting \d+% \((?:\d+h)?(?:\d+m)?\d+s\)/;
   const forbidden = /Compacting|compaction|Context compacted|No context to compact|HOST_INTERNAL_HANDOFF_268a/i;
   // Ctrl+O gives each compaction's model call its own line, as for every call;
   // nothing else there may speak of compaction.
@@ -221,7 +221,7 @@ async function runScenario(name) {
     await waitFor(() => {
       const rows = grid(active.terminal).split("\n").filter((line) => activity.test(line));
       assert.equal(rows.length, 1, "exactly one live activity row");
-      assert(!/[↑↓]|tokens|chunk|%/i.test(rows[0]), "compaction must not show a token suffix");
+      assert(!/[↑↓]|tokens|chunk/i.test(rows[0]), "compaction must not show a token suffix");
       markerStates.add(rows[0].includes("•"));
       return markerStates.size === 2 && !rows[0].includes(first) && active.writes >= writes + 2;
     }, `${label} marker blink and elapsed time`, 5000);

@@ -19,6 +19,7 @@ const Op = struct {
     stage: []const u8 = "",
     ok: bool = true,
     open: bool = false,
+    percent: u8 = 0,
 };
 
 const Result = struct {
@@ -29,12 +30,16 @@ const Result = struct {
     turn_seconds: ?i64,
     phase: []const u8,
     compaction_seconds: ?i64,
+    /// Operation.written_percent of the operation on screen, 0 without one.
+    written: u8 = 0,
     @"error": ?[]const u8 = null,
 };
 
 const Lab = struct {
     activity: compaction_activity.State = .{},
     id: ?compaction_activity.OperationId = null,
+    /// The operation before `id`, whose late counts must change nothing.
+    previous: ?compaction_activity.OperationId = null,
     marks: turn_clock.Marks = .{},
     turn: bool = false,
     prompt: bool = false,
@@ -79,6 +84,7 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         };
         const id = lab.activity.begin(origin, 1, lab.now);
         lab.activity.running(id, .preparation);
+        lab.previous = lab.id;
         lab.id = id;
     } else if (is(op.op, "advance")) {
         const stage = std.meta.stringToEnum(compaction_activity.Stage, op.stage) orelse {
@@ -86,6 +92,11 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
             return;
         };
         lab.activity.running(lab.id orelse return, stage);
+    } else if (is(op.op, "write")) {
+        lab.activity.written(lab.id orelse return, op.percent);
+    } else if (is(op.op, "stale_write")) {
+        // Before a second compaction there is no older one to arrive late.
+        lab.activity.written(lab.previous orelse return, op.percent);
     } else if (is(op.op, "stop")) {
         lab.activity.stopping(lab.id orelse return);
     } else if (is(op.op, "settle")) {
@@ -110,6 +121,7 @@ fn report(lab: *const Lab, result: *Result) void {
     result.waiting_since_ms = lab.marks.waiting_since_ms;
     result.turn_seconds = turn_clock.seconds(lab.marks, lab.now);
     result.phase = phaseName(lab);
+    result.written = if (lab.activity.snapshot.operation) |op| op.written_percent else 0;
     result.compaction_seconds = if (lab.activity.snapshot.operation) |op|
         if (op.active()) turn_clock.seconds(turn_clock.compactionMarks(op), lab.now) else null
     else

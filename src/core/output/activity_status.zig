@@ -13,13 +13,15 @@ pub fn compactionClock(operation: compaction_activity.Operation) StreamState {
     return .{ .turn_started_ms = turn_clock.compactionMarks(operation).started_ms };
 }
 
-/// The step a running compaction is on. Only the summary takes long, so the
-/// row names the step and does not count the steps.
-fn compactionStepLabel(stage: compaction_activity.Stage) []const u8 {
+/// How far a running compaction has come: nothing of the summary while it
+/// prepares, the share of its notes the model has written while it
+/// summarizes, and all of it while fx saves them
+/// (`tests/tla/turn_clock/TurnClock.tla` FullOnlyWhenSaving).
+fn compactionPercent(op: compaction_activity.Operation, stage: compaction_activity.Stage) u8 {
     return switch (stage) {
-        .preparation => "preparing",
-        .summary => "summarizing",
-        .publication => "saving",
+        .preparation => 0,
+        .summary => op.written_percent,
+        .publication => 100,
     };
 }
 
@@ -31,9 +33,9 @@ pub fn compactionProjection(
 ) ActivityProjection {
     const op = snapshot.operation orelse return .none;
     if (!op.visible(now_ms)) return .none;
-    const label: []const u8, const step: ?[]const u8 = switch (op.phase) {
-        .preparing => .{ "• Compacting", compactionStepLabel(.preparation) },
-        .running => |stage| .{ "• Compacting", compactionStepLabel(stage) },
+    const label: []const u8, const percent: ?u8 = switch (op.phase) {
+        .preparing => .{ "• Compacting", compactionPercent(op, .preparation) },
+        .running => |stage| .{ "• Compacting", compactionPercent(op, stage) },
         .stopping => .{ "• Stopping compaction", null },
         .terminal => |feedback| return .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
@@ -46,9 +48,8 @@ pub fn compactionProjection(
     };
     var out: std.Io.Writer = .fixed(buf);
     out.writeAll(label) catch return .{ .turn_thinking = .{ .label = label } };
+    if (percent) |value| out.print(" {d}%", .{value}) catch return .{ .turn_thinking = .{ .label = label } };
     appendTurnElapsedSuffix(&out, compactionClock(op), now_ms) catch return .{ .turn_thinking = .{ .label = out.buffered() } };
-    // The step goes after the clock, so a narrow row loses the step first.
-    if (step) |text| out.print(" · {s}", .{text}) catch {};
     return .{ .turn_thinking = .{ .label = out.buffered() } };
 }
 
@@ -306,20 +307,24 @@ pub fn appendTurnTokenSuffix(writer: *std.Io.Writer, stream: StreamState) !void 
     try appendTokenProgressSuffix(writer, stream.token_progress);
 }
 
-test "every compaction counts its own time from zero and shows its step" {
+test "every compaction counts its own time from zero and shows how much of the summary is written" {
     var state: compaction_activity.State = .{};
     var buf: [256]u8 = undefined;
     for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
         const id = state.begin(origin, 1, 3_500);
-        try std.testing.expectEqualStrings("• Compacting (0s) · preparing", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 3_500).turn_thinking.label);
+        // A count that arrives before the summary starts is kept for it.
         state.running(id, .summary);
-        try std.testing.expectEqualStrings("• Compacting (0s) · summarizing", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
-        try std.testing.expectEqualStrings("• Compacting (1m2s) · summarizing", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
-        try std.testing.expectEqualStrings("• Compacting (1h0m0s) · summarizing", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 4_000).turn_thinking.label);
+        state.written(id, 66);
+        try std.testing.expectEqualStrings("• Compacting 66% (1m2s)", compactionProjection(&buf, state.snapshot, 65_500).turn_thinking.label);
+        // A lower count, from a fallback model or a follow-up, changes nothing.
+        state.written(id, 40);
+        try std.testing.expectEqualStrings("• Compacting 66% (1h0m0s)", compactionProjection(&buf, state.snapshot, 3_603_500).turn_thinking.label);
         try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_000));
         try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(compactionClock(state.snapshot.operation.?), 4_500));
         state.running(id, .publication);
-        try std.testing.expectEqualStrings("• Compacting (2s) · saving", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
+        try std.testing.expectEqualStrings("• Compacting 100% (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
         state.stopping(id);
         try std.testing.expectEqualStrings("• Stopping compaction (2s)", compactionProjection(&buf, state.snapshot, 5_500).turn_thinking.label);
         state.settle(id, .{ .outcome = .succeeded }, 5_500);
@@ -341,7 +346,7 @@ test "the turn row goes on after a compaction from the time it showed before" {
     const id = state.begin(.automatic, 1, began);
     syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began);
     state.running(id, .summary);
-    try std.testing.expectEqualStrings("• Compacting (40s) · summarizing", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (40s)", compactionProjection(&buf, state.snapshot, began + 40_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .succeeded, .publication = .committed }, began + 40_000);
     syncWaitingClock(&stream, turn_clock.waits(false, state.snapshot), began + 40_000);
     try std.testing.expectEqualStrings("• Running (10m15s) (↑100 ↓20)", buildTurnLabel(&buf, stream, began + 40_000).?);
@@ -383,7 +388,7 @@ test "compaction terminal feedback is static scoped and publication honest" {
     var state: compaction_activity.State = .{};
     var buf: [256]u8 = undefined;
     const id = state.begin(.manual, null, 1_000);
-    try std.testing.expectEqualStrings("• Compacting (0s) · preparing", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (0s)", compactionProjection(&buf, state.snapshot, 1_000).turn_thinking.label);
     state.settle(id, .{ .outcome = .failed, .stage = .publication, .publication = .uncertain }, 1_500);
     const failed = compactionProjection(&buf, state.snapshot, 9_000).turn_thinking;
     try std.testing.expectEqual(ActivityProjection.Tone.danger, failed.tone);
