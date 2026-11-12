@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
@@ -1208,9 +1209,9 @@ describe("fx ask shell startup files", () => {
       }
 
       expect(gateway.requests[1]!.body).toContain("FX_SECRET_VISIBLE");
-      const report = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
-      expect(report).toBeDefined();
-      expect(readFileSync(join(root.root, report!), "utf8")).not.toContain(secret);
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      expect(report.all("tool_call").map((call) => call.name)).toContain("shell");
+      expect(report.text).not.toContain(secret);
       expect(readFileSync(tracePath, "utf8")).toContain("shell snapshot ready");
       expect(readFileSync(tracePath, "utf8")).not.toContain(secret);
       expect(filesContaining(join(root.home, ".fx"), secret)).toEqual([]);

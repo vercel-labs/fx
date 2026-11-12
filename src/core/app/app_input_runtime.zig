@@ -29,6 +29,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
@@ -96,6 +97,8 @@ fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
         else => .unavailable,
     };
 }
@@ -627,8 +630,8 @@ pub fn Runtime(comptime App: type) type {
                 );
             }
 
-            // The open agent list takes every key first, ahead of the agent
-            // on screen.
+            // The open agent list takes every key first: the agent it shows
+            // is a preview.
             if (ingress.event) |event| {
                 if (try routeAgentsMenuInput(app, event)) return ingress.replay_byte_after_routing;
             }
@@ -1718,7 +1721,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "session",
                         .tone = .@"error",
-                        .body = "Unable to resume selected session.",
+                        .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -1738,7 +1741,13 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).menuActive(app);
         }
 
-        /// Closes the agent list and puts back the agent it opened on.
+        /// Closes the agent list, keeping the agent it shows.
+        fn cancelAgentsMenu(app: *App) bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).closeMenu(app);
+        }
+
+        /// Closes the agent list and shows again the agent it opened on.
         fn backAgentsMenu(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             return app_agents_runtime.Runtime(App).backMenu(app);
@@ -1772,16 +1781,18 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// While the agent list is open it takes every key, ahead of the
-        /// prompts and composer of the agent on screen: ↑ and ↓ move the
-        /// highlight, Enter shows the highlighted agent, Backspace or Delete
-        /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C close the
-        /// list. The composer is its search box, with the agent's draft set
-        /// aside: typing, Left, and Right edit it, and while it holds a
+        /// prompts and composer of the agent it shows, which is a preview: ↑
+        /// and ↓ move and show the agent they land on, ↑ on the first row
+        /// closes the list, Enter keeps the agent shown, Backspace or Delete
+        /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C go back to
+        /// the agent the list opened on. The composer is its search box, with
+        /// the agent's draft set aside: typing, Left, and Right edit it, and
+        /// the list shows the match the highlight moves to; while it holds a
         /// search, Backspace and Delete edit it too and Esc clears it. A paste
-        /// closes the list, keeping the agent on screen, and lands in its
-        /// draft; mouse input passes through. Any other key does nothing, so
-        /// none answers the prompt behind the list. Returns whether the list
-        /// took `event`.
+        /// closes the list, keeping the agent shown, and lands in its draft;
+        /// mouse input passes through. Any other key does nothing, so none
+        /// answers the prompt behind the list. Returns whether the list took
+        /// `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1824,8 +1835,10 @@ pub fn Runtime(comptime App: type) type {
                         _ = try backAgentsMenu(app);
                         _ = disarmEscapeClear(app);
                     },
+                    // A paste closes the list on the agent shown and lands in
+                    // its draft.
                     .paste_start => {
-                        _ = try backAgentsMenu(app);
+                        _ = cancelAgentsMenu(app);
                         return false;
                     },
                     // Replayed as the byte it stands for, which comes back here.
@@ -2945,7 +2958,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, agent: *AppAgent, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, agent, .escape)) return;
-            // Ahead of the prompts: Esc closes the open agent list first.
+            // Ahead of the prompts: the open agent list shows `agent` only as
+            // a preview, and Esc goes back from it.
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
@@ -6197,6 +6211,12 @@ test "app_input_runtime Enter consumes an active session picker on target failur
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, picker.selection_failure.?);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "unable to resume") == null);
+}
+
+test "a resume refused for a changed or removed custom connection says which" {
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_changed, classifyResumeFailure(error.ConfiguredProviderChanged));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_removed, classifyResumeFailure(error.ConfiguredProviderRemoved));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, classifyResumeFailure(error.UnknownConfiguredProvider));
 }
 
 test "app_input_runtime reports resume failure after picker transition" {

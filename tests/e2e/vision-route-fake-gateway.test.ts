@@ -620,7 +620,7 @@ const VISION_OUTAGE_NOTICE =
 /** A provider's prompt cache covers a request only up to the first message
  * that differs from the request before it, so the next request must open with
  * every message the last one carried, byte for byte. */
-function expectPromptExtends(previousBody: string, nextBody: string) {
+function expectNextRequestExtends(previousBody: string, nextBody: string) {
   const previous = promptMessages(previousBody);
   const next = promptMessages(nextBody);
   expect(next.length).toBeGreaterThanOrEqual(previous.length);
@@ -1151,6 +1151,144 @@ describe("Vision route fake Gateway", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "a resumed session's next request starts with the request that carried the image references",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "logo.png");
+      copyFileSync(IMAGE_PATH, imagePath);
+      const gateway = startImageGateway([
+        sseToolCall("vision", { image_ids: [1], focus: "describe the image" }, "vision_1"),
+        sseText(VISION_RESULT),
+        sseText("first answer"),
+        sseText("second answer"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("first answer");
+        // The text-only route lists the image on the user's message; the
+        // second request is Vision's own.
+        expect(gateway.chatRequests).toHaveLength(3);
+        expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
+        const lastLive = gateway.chatRequests[2].body;
+        expect(lastUserText(gateway.chatRequests[0].body)).toContain("<available_images>");
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second answer");
+        expect(gateway.chatRequests).toHaveLength(4);
+        expectNextRequestExtends(lastLive, gateway.chatRequests[3].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "each turn's next request starts with the last request of the turn before when later turns attach images too",
+    async () => {
+      const root = createIsolatedRoot();
+      const firstImage = join(root.workspace, "logo.png");
+      const secondImage = join(root.workspace, "second.png");
+      copyFileSync(IMAGE_PATH, firstImage);
+      writeFileSync(secondImage, solidPng(48, 32));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { image_ids: [1], focus: "describe the image" }, "vision_1"),
+        sseText(VISION_RESULT),
+        sseText("first answer"),
+        sseToolCall("vision", { image_ids: [2], focus: "describe the second image" }, "vision_2"),
+        sseText(visionResult(2, "a gray rectangle")),
+        sseText("second answer"),
+        sseText("third answer"),
+      ]);
+      try {
+        const env = fakeGatewayEnv(root, gateway, GLM_MODEL);
+        const first = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", firstImage, "Describe the attached image."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        ));
+        expect(first.output).toContain("first answer");
+        expect(gateway.chatRequests).toHaveLength(3);
+
+        const second = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "--image", secondImage, "And this one?"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        ));
+        expect(second.output).toContain("second answer");
+        expect(gateway.chatRequests).toHaveLength(6);
+        expectNextRequestExtends(gateway.chatRequests[2].body, gateway.chatRequests[3].body);
+        // Each image is listed once, on the message of the turn that attached it.
+        const userTexts = (body: string) =>
+          promptMessages(body)
+            .filter((message) => message.role === "user")
+            .map((message) => textFromContent(message.content));
+        const secondTurn = userTexts(gateway.chatRequests[5].body);
+        expect(secondTurn[0]).toContain("[Image #1]");
+        expect(secondTurn[0]).not.toContain("[Image #2]");
+        expect(secondTurn.at(-1)).toContain("[Image #2]");
+        expect(secondTurn.at(-1)).not.toContain("[Image #1]");
+
+        const third = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "And the last word?"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        ));
+        expect(third.output).toContain("third answer");
+        expect(gateway.chatRequests).toHaveLength(7);
+        expectNextRequestExtends(gateway.chatRequests[5].body, gateway.chatRequests[6].body);
+        // A turn with no image adds no list, and both earlier images stay named
+        // on the messages they came with, so the model can still read them.
+        const thirdTurn = userTexts(gateway.chatRequests[6].body);
+        expect(thirdTurn.at(-1)).toContain("And the last word?");
+        expect(thirdTurn.at(-1)).not.toContain("<available_images>");
+        expect(thirdTurn.join("\n").split("[Image #1]")).toHaveLength(2);
+        expect(thirdTurn.join("\n").split("[Image #2]")).toHaveLength(2);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  test(
+    "a resumed session's next request starts with the request that carried a native image",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "logo.png");
+      copyFileSync(IMAGE_PATH, imagePath);
+      const gateway = startImageGateway([sseText("first native answer"), sseText("second native answer")]);
+      try {
+        const first = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        ));
+        expect(first.output).toContain("first native answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(gateway.chatRequests[0].body).not.toContain("<available_images>");
+
+        const resumed = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        ));
+        expect(resumed.output).toContain("second native answer");
+        expect(gateway.chatRequests).toHaveLength(2);
+        expectNextRequestExtends(gateway.chatRequests[0].body, gateway.chatRequests[1].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(
@@ -2186,7 +2324,7 @@ describe("Vision route fake Gateway", () => {
         );
         expect(parseFxJson(resumed).output).toContain("second turn answered");
         expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
-        expectPromptExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+        expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -2219,7 +2357,7 @@ describe("Vision route fake Gateway", () => {
         expect(firstJson.output).toContain("Vision unavailable final answer");
         const sent = gateway.chatRequests.length - 2;
         expect(gateway.chatRequests[sent].body).toContain(VISION_OUTAGE_NOTICE);
-        expectPromptExtends(gateway.chatRequests[sent].body, gateway.chatRequests[sent + 1].body);
+        expectNextRequestExtends(gateway.chatRequests[sent].body, gateway.chatRequests[sent + 1].body);
 
         const resumed = await runFx(
           ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
@@ -2227,7 +2365,7 @@ describe("Vision route fake Gateway", () => {
         );
         expect(parseFxJson(resumed).output).toContain("second turn answered");
         expect(gateway.chatRequests).toHaveLength(sent + 3);
-        expectPromptExtends(gateway.chatRequests[sent + 1].body, gateway.chatRequests[sent + 2].body);
+        expectNextRequestExtends(gateway.chatRequests[sent + 1].body, gateway.chatRequests[sent + 2].body);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -2277,7 +2415,7 @@ describe("Vision route fake Gateway", () => {
         );
         expect(parseFxJson(resumed).output).toContain("second turn answered");
         expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
-        expectPromptExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+        expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -3678,7 +3816,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendText("And once more.");
         await session.waitForText("answered in the resumed terminal", TIMEOUT);
         expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
-        expectPromptExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+        expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain("None of the requested images were read");
         expect(scrollback).not.toContain("fx_recovery_prompt");

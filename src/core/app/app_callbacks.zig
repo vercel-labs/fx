@@ -363,6 +363,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_system_notice = agentPushSystemNotice,
                 .push_interactive_notice = agentPushInteractiveNotice,
                 .push_context_notice = agentPushContextNotice,
+                .push_session_notice = agentPushSessionNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
                 .push_command_output_complete = agentPushCommandOutputComplete,
@@ -406,7 +407,8 @@ pub fn Bindings(comptime App: type) type {
             source: credentials.Source,
             mode: auth_runtime.CredentialRefreshMode,
             expected_account_id: ?[]const u8,
-        ) !?[]u8 {
+            rejected_token: ?[]const u8,
+        ) !?agent_runtime.RefreshedGatewayCredential {
             const agent: *AppAgent = @ptrCast(@alignCast(raw_ctx));
             const app = appOf(agent);
             if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -419,6 +421,7 @@ pub fn Bindings(comptime App: type) type {
                 source,
                 mode,
                 expected_account_id,
+                rejected_token,
             )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
@@ -428,11 +431,22 @@ pub fn Bindings(comptime App: type) type {
 
             const worker_token = try alloc.dupe(u8, refreshed.token);
             errdefer secret.zeroAndFree(alloc, worker_token);
+            // The login matches the app's current choice, which can be a team
+            // the user picked after the request started, so the request sends
+            // this team from now on.
+            const worker_team = if (refreshed.gatewayTeam()) |team| try alloc.dupe(u8, team) else null;
+            errdefer if (worker_team) |team| alloc.free(team);
+            const worker_team_label = if (refreshed.team_slug) |slug| try alloc.dupe(u8, slug) else null;
+            errdefer if (worker_team_label) |label| alloc.free(label);
             try app_worker_runtime.Runtime(App).pushOwnedEvent(app, agent, .{
                 .credential_refreshed = refreshed,
             });
             owns_refreshed = false;
-            return worker_token;
+            return .{
+                .token = worker_token,
+                .gateway_team = worker_team,
+                .gateway_team_label = worker_team_label,
+            };
         }
 
         /// Resolves models for `agent`, under its own turn settings.
@@ -1305,6 +1319,19 @@ pub fn Bindings(comptime App: type) type {
                 .tone = .warning,
                 .body = body,
                 .visibility = .full_only,
+            });
+        }
+
+        fn agentPushSessionNotice(ctx: *anyopaque, text: []const u8) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
+                if (!try agent.session.claimContextNotice(std.heap.c_allocator, text)) return;
+            }
+            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
+                .topic = "effort",
+                .tone = .neutral,
+                .body = text,
             });
         }
 

@@ -7,8 +7,10 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
-const json_depth = @import("json_depth.zig");
+const function_tools = @import("function_tools.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
+const request_fragment = @import("../core/config/request_fragment.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -20,6 +22,16 @@ pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
+    /// The field that carries the output limit; servers differ on which they read.
+    output_limit_field: configured_provider.OutputLimitField = .max_tokens,
+    /// The model's own request fields, from the connection's settings.
+    request_fields: request_fragment.Fragment = .{},
+    /// The fields of the effort level the request carries, from the
+    /// connection's settings. Null when the model does not declare that
+    /// level: a request that names one anyway is refused, never sent without
+    /// it (`tests/tla/configured_provider/ConfiguredRequest.tla`
+    /// EffortOnlyWhenDeclared).
+    effort_fields: ?request_fragment.Fragment = null,
 };
 
 pub const Error = error{
@@ -65,118 +77,27 @@ pub const Error = error{
     ReadFailed,
 };
 
-const max_selected_tools = 256;
-const max_name_bytes = 128;
+const max_selected_tools = function_tools.max_selected_tools;
+const max_name_bytes = function_tools.max_name_bytes;
 const max_history_arguments_bytes = 1024 * 1024;
 const max_json_depth = json_depth.max_depth;
 
-const Function = struct {
-    name: []const u8,
-    description: []const u8,
-    schema: union(enum) {
-        builtin: model_tool_schema.ObjectSchema,
-        dynamic: std.json.Value,
-    },
-};
-
-fn contains_name(names: []const []const u8, name: []const u8) bool {
-    for (names) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
-    return false;
-}
-
-fn validate_name(name: []const u8) Error!void {
-    if (name.len == 0 or name.len > max_name_bytes) return error.InvalidToolName;
-    // fx advertises dotted built-in names as well as MCP names. Keep those
-    // literal identities; do not invent aliases that core cannot resolve.
-    for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return error.InvalidToolName;
-}
-
-fn append_function(alloc: Allocator, functions: *std.ArrayList(Function), function: Function) Error!void {
-    try validate_name(function.name);
-    if (functions.items.len == max_selected_tools) return error.TooManyTools;
-    for (functions.items) |prior| if (std.mem.eql(u8, prior.name, function.name)) return error.InvalidToolSelection;
-    try functions.append(alloc, function);
-}
-
-// Provider-native advertisements are not Chat Completions function tools.
-// Omit only registered provider-executed tools; missing ordinary schemas fail.
-fn select_functions(alloc: Allocator, tools: stream_provider.ToolSelection, choice: types.ToolChoice) Error!std.ArrayList(Function) {
-    var functions: std.ArrayList(Function) = .empty;
-    errdefer functions.deinit(alloc);
-    if (choice == .none) return functions;
-    if (tools.advertised_names.len > max_selected_tools or tools.advertised_functions.len > max_selected_tools or tools.additional_functions.len > max_selected_tools or tools.selected_dynamic.len > max_selected_tools) return error.TooManyTools;
-    for (tools.advertised_names) |name| {
-        const function = tools.advertisedFunction(name) orelse {
-            const registered = tools.registry.lookup(name) orelse return error.InvalidToolSelection;
-            if (registered.provider_executed) continue;
-            return error.InvalidToolSelection;
-        };
-        // A repeated definition must not be selected by accidental first match.
-        var matches: usize = 0;
-        for (tools.advertised_functions) |candidate| if (std.mem.eql(u8, candidate.name, name)) {
-            matches += 1;
-        };
-        if (matches != 1) return error.InvalidToolSelection;
-        try append_function(alloc, &functions, .{ .name = name, .description = function.description, .schema = .{ .builtin = function.input_schema } });
-    }
-    for (tools.additional_functions) |function| {
-        if (contains_name(tools.advertised_names, function.name)) continue;
-        try append_function(alloc, &functions, .{ .name = function.name, .description = function.description, .schema = .{ .builtin = function.input_schema } });
-    }
-    var schema_budget: SchemaBudget = .{};
-    for (tools.selected_dynamic) |function| {
-        if (contains_name(tools.advertised_names, function.name)) continue;
-        if (function.input_schema != .object) return error.InvalidToolSchema;
-        try validate_dynamic_schema(function.input_schema, 0, &schema_budget);
-        try append_function(alloc, &functions, .{ .name = function.name, .description = function.description, .schema = .{ .dynamic = function.input_schema } });
-    }
-    if (choice == .required and functions.items.len == 0) return error.RequiredToolMissing;
-    return functions;
-}
-
-const SchemaBudget = struct {
-    nodes: usize = 16 * 1024,
-    string_bytes: usize = 1024 * 1024,
-
-    fn consume_string(self: *SchemaBudget, text: []const u8) Error!void {
-        if (text.len > self.string_bytes or !std.unicode.utf8ValidateSlice(text)) return error.InvalidToolSchema;
-        self.string_bytes -= text.len;
-    }
-};
-
-fn validate_dynamic_schema(value: std.json.Value, depth: usize, budget: *SchemaBudget) Error!void {
-    if (depth > max_json_depth) return error.JsonTooDeep;
-    if (budget.nodes == 0) return error.InvalidToolSchema;
-    budget.nodes -= 1;
-    switch (value) {
-        .object => |fields| {
-            var iterator = fields.iterator();
-            while (iterator.next()) |entry| {
-                try budget.consume_string(entry.key_ptr.*);
-                try validate_dynamic_schema(entry.value_ptr.*, depth + 1, budget);
-            }
-        },
-        .array => |items| for (items.items) |item| try validate_dynamic_schema(item, depth + 1, budget),
-        .string => |text| try budget.consume_string(text),
-        .number_string => return error.InvalidToolSchema,
-        .float => |number| if (!std.math.isFinite(number)) return error.InvalidToolSchema,
-        .integer, .bool, .null => {},
-    }
-}
-
-fn validate_request(request: stream_provider.RequestData) Error!void {
+fn validate_request(request: stream_provider.RequestData, effort_declared: bool) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.reasoning != null and !effort_declared) return error.UnsupportedProviderOption;
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
-    if (request.response_format != null) return error.UnsupportedResponseFormat;
+    // A structured reply travels as a JSON schema, which needs an object.
+    if (request.response_format) |format| if (format.schema != .object) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
     // content on user and tool-result messages serializes natively below.
-    if (request.vision_mode != .unavailable) return error.UnsupportedVision;
-    // Verified snapshots only flow through the vision executor's structured
-    // request, which this protocol rejects above via response_format.
-    if (request.verified_images != null and request.verified_images.?.len != 0) return error.UnsupportedVision;
+    // Verified snapshots come from the vision executor's structured request
+    // and travel on its last user message.
+    if (request.verified_images) |images| if (images.len != 0) {
+        if (request.response_format == null or function_tools.last_user_index(request.messages) == null) return error.UnsupportedVision;
+    };
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     for (request.messages) |message| {
         if (message.images.len != 0 and message.role != .user) return error.InvalidProviderPrompt;
@@ -190,6 +111,42 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
 
 fn check_json_depth(text: []const u8) Error!void {
     if (json_depth.exceeds(text)) return error.JsonTooDeep;
+}
+
+/// Takes ownership of `body` and returns the caller-owned copy with
+/// `credential` masked, as `redact_error_detail` masks it: the detail reaches
+/// the turn, its events, and the saved session, so a server that quotes the
+/// request's own key back must not put it there. With no credential, returns
+/// `body` itself.
+pub fn redactOwnedErrorBody(alloc: Allocator, body: []u8, credential: ?[]const u8) Allocator.Error![]u8 {
+    const secret = credential orelse return body;
+    defer alloc.free(body);
+    return redact_error_detail(alloc, body, secret);
+}
+
+test "an owned error body loses the credential it quotes, and stays bounded" {
+    const alloc = std.testing.allocator;
+    const raw = try alloc.dupe(u8, "refused secret-token");
+    const kept = try redactOwnedErrorBody(alloc, raw, null);
+    defer alloc.free(kept);
+    try std.testing.expectEqual(raw.ptr, kept.ptr);
+
+    const echoed = try alloc.dupe(u8, "{\"error\":{\"message\":\"refused secret-token\"}}");
+    const masked = try redactOwnedErrorBody(alloc, echoed, "secret-token");
+    defer alloc.free(masked);
+    try std.testing.expect(std.mem.find(u8, masked, "secret-token") == null);
+    try std.testing.expect(std.mem.find(u8, masked, "refused") != null);
+
+    // A body past the local limit becomes a fixed message.
+    const huge = try alloc.alloc(u8, 1 << 20);
+    @memset(huge, 'x');
+    const bounded = try redactOwnedErrorBody(alloc, huge, "secret-token");
+    defer alloc.free(bounded);
+    try std.testing.expect(bounded.len < 128);
+
+    const empty = try redactOwnedErrorBody(alloc, try alloc.dupe(u8, ""), "");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("", empty);
 }
 
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later
@@ -212,18 +169,9 @@ pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []cons
     errdefer alloc.free(detail);
     const encoded = try std.json.Stringify.valueAlloc(alloc, credential, .{});
     defer alloc.free(encoded);
-    mask_error_bytes(detail, encoded[1 .. encoded.len - 1]);
-    mask_error_bytes(detail, credential);
+    text_utils.maskLiteral(detail, encoded[1 .. encoded.len - 1]);
+    text_utils.maskLiteral(detail, credential);
     return detail;
-}
-
-fn mask_error_bytes(detail: []u8, value: []const u8) void {
-    if (value.len == 0) return;
-    var remaining = detail;
-    while (std.mem.find(u8, remaining, value)) |index| {
-        @memset(remaining[index..][0..value.len], '*');
-        remaining = remaining[index + value.len ..];
-    }
 }
 
 test "chat completions error masking survives JSON and recovery decoding" {
@@ -286,7 +234,7 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
         for (message.tool_calls) |call| {
             if (call.provenance != .fx_local or call.provider_result != null) return error.UnsupportedToolProvenance;
             if (call.id.len == 0 or call.final_identity != .valid) return error.InvalidToolCallId;
-            try validate_name(call.name);
+            try function_tools.validate_name(call.name);
             if (call.arguments_json.len > max_history_arguments_bytes) return error.ArgumentsTooLarge;
             try validate_arguments(alloc, call.arguments_json);
             const entry = try pending.getOrPut(alloc, call.id);
@@ -317,7 +265,7 @@ fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.jso
     while (iterator.next()) |entry| {
         const key = entry.key_ptr.*;
         const value = entry.value_ptr.*;
-        if (contains_name(&reasoning_fields, key)) {
+        if (function_tools.contains_name(&reasoning_fields, key)) {
             if (value != .string and value != .null) return error.InvalidProviderState;
             metadata_seen = true;
         } else if (std.mem.eql(u8, key, "reasoning_details")) {
@@ -371,10 +319,11 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 
 /// Pure Chat Completions serialization. Caller owns the returned bytes. Model
 /// IDs are opaque: no catalog lookup, prefix inference, or provider defaults.
-/// max_output_tokens deliberately maps to max_tokens, not max_completion_tokens.
+/// max_output_tokens maps to max_tokens unless `options.output_limit_field`
+/// names max_completion_tokens.
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
-    try validate_request(input);
+    try validate_request(input, options.effort_fields != null);
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -385,7 +334,7 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
     var request = input;
     request.messages = projected orelse input.messages;
     try validate_history(alloc, request.messages);
-    var functions = try select_functions(alloc, request.tools, request.tool_choice);
+    var functions = try function_tools.select_functions(alloc, request.tools, request.tool_choice, request.vision_mode);
     defer functions.deinit(alloc);
     var projection = tool_call_ids.Projection.init(alloc, request.messages) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -400,14 +349,6 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
         else => return error.InvalidToolSchema,
     };
     return out.toOwnedSlice();
-}
-
-fn toolResultDenied(message: types.ChatMessage) bool {
-    const failed = if (message.tool_result_status) |status|
-        status == .failure
-    else
-        false;
-    return failed and tool_result_errors.toolPermissionDenialReason(message.content orelse "") != null;
 }
 
 /// Writes one OpenAI-style image_url part. `base64_data` is already encoded.
@@ -435,10 +376,12 @@ fn write_image_url_part_raw(writer: *std.Io.Writer, media_type: []const u8, byte
 
 /// User messages carry image attachments as content parts instead of a plain
 /// string so vision-capable chat-completions models receive the pixels.
+/// `verified` are snapshots already read and checked, sent after them.
 fn write_user_content_parts(
     writer: *std.Io.Writer,
     alloc: Allocator,
     message: types.ChatMessage,
+    verified: []const image_attachments.VerifiedSnapshot,
 ) !void {
     try writer.writeByte('[');
     var wrote_part = false;
@@ -454,6 +397,11 @@ fn write_user_content_parts(
         if (wrote_part) try writer.writeByte(',');
         var snapshot = image_attachments.loadVerifiedSnapshot(alloc, image, .{}) catch return error.ImageUnavailable;
         defer snapshot.deinit(alloc);
+        try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
+        wrote_part = true;
+    }
+    for (verified) |snapshot| {
+        if (wrote_part) try writer.writeByte(',');
         try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
         wrote_part = true;
     }
@@ -495,7 +443,7 @@ fn flush_tool_image_follow_up(
     pending_images.clearRetainingCapacity();
 }
 
-fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
+fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const function_tools.Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
@@ -507,9 +455,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     defer pending_names.deinit(alloc);
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
     defer pending_images.deinit(alloc);
+    const verified = request.verified_images orelse &.{};
+    const verified_at = if (verified.len != 0) function_tools.last_user_index(request.messages) else null;
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
-    for (lanes) |lane| {
-        for (lane) |message| {
+    for (lanes, 0..) |lane, lane_index| {
+        for (lane, 0..) |message, message_index| {
+            const carries_verified = lane_index == 1 and verified_at == message_index;
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
@@ -518,8 +469,8 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeAll("{\"role\":");
             try std.json.Stringify.value(@tagName(message.role), .{}, writer);
             try writer.writeAll(",\"content\":");
-            if (message.role == .user and message.images.len != 0) {
-                try write_user_content_parts(writer, alloc, message);
+            if (message.role == .user and (message.images.len != 0 or carries_verified)) {
+                try write_user_content_parts(writer, alloc, message, if (carries_verified) verified else &.{});
             } else {
                 try std.json.Stringify.value(message.content, .{}, writer);
             }
@@ -545,7 +496,7 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeByte('}');
             if (message.role == .tool) {
                 const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
-                if (tool_images.len != 0 and !toolResultDenied(message)) {
+                if (tool_images.len != 0 and !function_tools.toolResultDenied(message)) {
                     try pending_names.append(alloc, message.tool_name orelse "unknown");
                     try pending_images.appendSlice(alloc, tool_images);
                 }
@@ -574,15 +525,30 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     }
     if (functions.len != 0) {
         if (options.tool_choice_mode == .send) {
+            const choice: types.ToolChoice = if (request.vision_mode == .required) .required else request.tool_choice;
             try writer.writeAll(",\"tool_choice\":");
-            try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
+            try std.json.Stringify.value(@tagName(choice), .{}, writer);
         }
         if (request.provider_options.parallel_tool_calls) |parallel| {
             try writer.writeAll(",\"parallel_tool_calls\":");
             try std.json.Stringify.value(parallel, .{}, writer);
         }
     }
-    if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (request.max_output_tokens) |limit| try writer.print(",\"{s}\":{d}", .{ @tagName(options.output_limit_field), limit });
+    if (request.response_format) |format| {
+        try writer.writeAll(",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":");
+        try std.json.Stringify.value(format.name, .{}, writer);
+        if (format.description.len != 0) {
+            try writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(format.description, .{}, writer);
+        }
+        try writer.writeAll(",\"schema\":");
+        try std.json.Stringify.value(format.schema, .{}, writer);
+        try writer.writeAll("}}");
+    }
+    // Last, so every field above is fx's own: the settings cannot name one.
+    const effort_fields = if (request.provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
+    try request_fragment.write(writer, options.request_fields, effort_fields);
     try writer.writeByte('}');
 }
 
@@ -648,7 +614,9 @@ pub const Reducer = struct {
     json_bytes: usize = 0,
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
-        try validate_request(request);
+        // The reply answers a request `build_request` already let through, so
+        // an effort it carries was declared.
+        try validate_request(request, true);
         return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
     }
 
@@ -865,10 +833,15 @@ pub const Reducer = struct {
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
-        const usage = types.Usage{
+        var usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
         };
+        // Details a server may add. They are part of the counts above, not
+        // more tokens, so one that is malformed or larger than its count is
+        // left out and the reply stands.
+        usage.cache_read_tokens = detail_count(fields, "prompt_tokens_details", "cached_tokens", usage.input_tokens) orelse self.usage.cache_read_tokens;
+        usage.reasoning_tokens = detail_count(fields, "completion_tokens_details", "reasoning_tokens", usage.output_tokens) orelse self.usage.reasoning_tokens;
         const total = incoming_total orelse self.usage_total;
         var final_fields = self.usage_final_fields;
         if (final) {
@@ -926,7 +899,7 @@ pub const Reducer = struct {
         // permission reviewer retries a malformed decision.
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
-            try validate_name(tool.name.items);
+            try function_tools.validate_name(tool.name.items);
             try check_json_depth(tool.arguments.items);
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
@@ -999,6 +972,17 @@ fn index_value(value: std.json.Value) Error!usize {
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
     const value = non_null(fields, key) orelse return null;
     return std.math.cast(u64, try integer(value)) orelse error.InvalidChunk;
+}
+
+/// `fields[details][key]` when it is a count no larger than `whole`, the
+/// count it is a part of.
+fn detail_count(fields: std.json.ObjectMap, details: []const u8, key: []const u8, whole: ?u64) ?u64 {
+    const group = non_null(fields, details) orelse return null;
+    if (group != .object) return null;
+    const value = non_null(group.object, key) orelse return null;
+    const count = std.math.cast(u64, integer(value) catch return null) orelse return null;
+    if (count > (whole orelse return null)) return null;
+    return count;
 }
 
 fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []const u8, limit: usize, failure: Error) Error!void {
@@ -1540,6 +1524,43 @@ fn test_usage_snapshot(reducer: *Reducer, usage: []const u8) Error!void {
     try test_accept(reducer, chunk);
 }
 
+test "chat completions usage details report cached and reasoning tokens, and a bad detail is left out" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { usage: []const u8, cached: ?u64, reasoning: ?u64 }{
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":{\"cached_tokens\":24},\"completion_tokens\":9,\"completion_tokens_details\":{\"reasoning_tokens\":7},\"total_tokens\":45}", .cached = 24, .reasoning = 7 },
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens\":2,\"total_tokens\":38}", .cached = 0, .reasoning = null },
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":{\"cached_tokens\":36},\"completion_tokens\":2,\"completion_tokens_details\":{\"reasoning_tokens\":2}}", .cached = 36, .reasoning = 2 },
+        .{ .usage = "{\"prompt_tokens\":36,\"completion_tokens\":2}", .cached = null, .reasoning = null },
+        // More cached than sent, negative, not a whole number, or the wrong shape.
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":{\"cached_tokens\":37},\"completion_tokens\":2,\"completion_tokens_details\":{\"reasoning_tokens\":3}}", .cached = null, .reasoning = null },
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":{\"cached_tokens\":-1},\"completion_tokens\":2,\"completion_tokens_details\":{\"reasoning_tokens\":1.5}}", .cached = null, .reasoning = null },
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":null,\"completion_tokens\":2,\"completion_tokens_details\":[]}", .cached = null, .reasoning = null },
+        .{ .usage = "{\"prompt_tokens\":36,\"prompt_tokens_details\":{\"cached_tokens\":null},\"completion_tokens\":2,\"completion_tokens_details\":{\"reasoning_tokens\":\"3\"}}", .cached = null, .reasoning = null },
+        .{ .usage = "{\"prompt_tokens_details\":{\"cached_tokens\":1},\"completion_tokens\":2}", .cached = null, .reasoning = null },
+    };
+    for (cases) |case| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        const terminal = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{case.usage});
+        defer alloc.free(terminal);
+        var result = try test_finish(&reducer, terminal);
+        defer result.deinit(alloc);
+        const usage = result.completed.completion.usage;
+        try std.testing.expectEqual(case.cached, usage.cache_read_tokens);
+        try std.testing.expectEqual(case.reasoning, usage.reasoning_tokens);
+        try std.testing.expect(usage.cache_write_tokens == null);
+    }
+
+    // A count from an earlier chunk stays when a later chunk leaves it out.
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens\":1}");
+    try test_usage_snapshot(&reducer, "{\"completion_tokens\":2}");
+    try std.testing.expectEqual(@as(?u64, 4), reducer.usage.cache_read_tokens);
+}
+
 test "chat completions final usage allows optional total metadata in either order" {
     const alloc = std.testing.allocator;
     const counts = "{\"prompt_tokens\":10,\"completion_tokens\":3}";
@@ -1794,13 +1815,6 @@ test "chat completions bounds dynamic schema traversal before serialization" {
     var request = test_request();
     request.tools.selected_dynamic = &.{.{ .name = "deep", .description = "Deep schema.", .input_schema = parsed.value }};
     try std.testing.expectError(error.JsonTooDeep, build_request(alloc, request, .{}));
-
-    var exhausted_nodes = SchemaBudget{ .nodes = 0 };
-    try std.testing.expectError(error.InvalidToolSchema, validate_dynamic_schema(.null, 0, &exhausted_nodes));
-    var exhausted_strings = SchemaBudget{ .string_bytes = 2 };
-    try std.testing.expectError(error.InvalidToolSchema, validate_dynamic_schema(.{ .string = "abc" }, 0, &exhausted_strings));
-    var budget: SchemaBudget = .{};
-    try std.testing.expectError(error.InvalidToolSchema, validate_dynamic_schema(.{ .float = std.math.inf(f64) }, 0, &budget));
 }
 
 test "chat completions history correlation preserves canonical IDs and JSON strings" {
@@ -1991,21 +2005,59 @@ test "chat completions serializes user message images as content parts" {
     try std.testing.expect(std.mem.startsWith(u8, image_part.get("image_url").?.object.get("url").?.string, "data:image/png;base64,"));
 }
 
+test "chat completions sends a structured reply's schema and the checked images on the last user message" {
+    const alloc = std.testing.allocator;
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"object\",\"properties\":{\"records\":{\"type\":\"array\"}}}", .{});
+    defer schema.deinit();
+    var pixels = [_]u8{ 1, 2, 3 };
+    const snapshots = [_]image_attachments.VerifiedSnapshot{.{ .bytes = &pixels, .media_type = "image/png" }};
+    var request = test_request();
+    request.messages = &.{ .{ .role = .user, .content = "earlier" }, .{ .role = .assistant, .content = "ok" }, .{ .role = .user, .content = "describe image 1" } };
+    request.response_format = .{ .name = "vision_result", .description = "One record per image", .schema = schema.value };
+    request.verified_images = &snapshots;
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const format = parsed.value.object.get("response_format").?.object;
+    try std.testing.expectEqualStrings("json_schema", format.get("type").?.string);
+    const json_schema = format.get("json_schema").?.object;
+    try std.testing.expectEqualStrings("vision_result", json_schema.get("name").?.string);
+    try std.testing.expectEqualStrings("One record per image", json_schema.get("description").?.string);
+    try std.testing.expectEqualStrings("object", json_schema.get("schema").?.object.get("type").?.string);
+    const messages = parsed.value.object.get("messages").?.array.items;
+    // The two instructions, then the three messages; only the last user one has parts.
+    try std.testing.expectEqual(@as(usize, 5), messages.len);
+    try std.testing.expectEqualStrings("earlier", messages[2].object.get("content").?.string);
+    const parts = messages[4].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("describe image 1", parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,AQID", parts[1].object.get("image_url").?.object.get("url").?.string);
+}
+
 test "chat completions rejects unsupported requests and ambiguous selection" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.provider_options.reasoning = .auto;
+    // A level the model's settings do not declare is refused, not dropped.
+    request.provider_options.reasoning = types.ReasoningEffort.literal("high");
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .fast = true };
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .prompt_caching = true };
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request = test_request();
+    // The image fallback needs its tool registered.
     request.vision_mode = .optional;
-    try std.testing.expectError(error.UnsupportedVision, build_request(alloc, request, .{}));
+    try std.testing.expectError(error.InvalidToolSelection, build_request(alloc, request, .{}));
     request = test_request();
     request.response_format = .{ .name = "answer", .description = "", .schema = .null };
     try std.testing.expectError(error.UnsupportedResponseFormat, build_request(alloc, request, .{}));
+    // Checked images belong to a structured request with a user message.
+    var pixels = [_]u8{ 1, 2, 3 };
+    const snapshots = [_]image_attachments.VerifiedSnapshot{.{ .bytes = &pixels, .media_type = "image/png" }};
+    request = test_request();
+    request.verified_images = &snapshots;
+    try std.testing.expectError(error.UnsupportedVision, build_request(alloc, request, .{}));
     request = test_request();
     request.max_output_tokens = 0;
     try std.testing.expectError(error.InvalidOutputLimit, build_request(alloc, request, .{}));

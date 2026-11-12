@@ -30,6 +30,7 @@ import {
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
+import { bearer, rotateFxLogin, startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -887,6 +888,42 @@ test("ACP load and resume negotiate hooks and clear them when omitted", async ()
   } finally { await client.close(); fixture.close(); }
 }, 30000);
 
+test("configured provider ACP names a refused setting and what to do", async () => {
+  const fixture = createConfiguredProviderFixture();
+  (fixture.settings.providers.local.model_metadata as Record<string, any>)["local-model"].request = { messages: [] };
+  fixture.save();
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    const initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} }) as any;
+    expect(initialized.error).toEqual({
+      code: -32600,
+      message: "~/.fx/settings.json: providers.local.model_metadata.local-model.request.messages: fx writes this field itself; remove it",
+    });
+    expect(fixture.requests).toHaveLength(0);
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
+test("configured provider ACP loads no session whose connection changed, and says what to do", async () => {
+  const fixture = createConfiguredProviderFixture();
+  try {
+    const first = await runFx(["ask", "--json", "first turn"], { cwd: fixture.workspace, env: fixture.env, timeoutMs: 15000 });
+    if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    fixture.settings.providers.local.protocol = "anthropic-messages";
+    fixture.save();
+    const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    try {
+      await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const loaded = await client.request("session/load", { sessionId, cwd: fixture.workspace, mcpServers: [] }) as any;
+      expect(loaded.error).toEqual({
+        code: -32600,
+        message: "This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session.",
+      });
+      expect(fixture.requests).toHaveLength(1);
+    } finally { await client.close(); }
+  } finally { fixture.close(); }
+}, 40000);
+
 test("configured provider ACP preserves reasoning between prompts", async () => {
   const fixture = createConfiguredProviderFixture(async body => {
     const response = configuredCompletion(body.model, "reasoned answer");
@@ -1591,6 +1628,87 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP titles a Token Pass session with a Token Pass model",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-token-pass-title-");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
+        titleResponses: [finalText("ACP Token Pass Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: "zai/glm-5.3" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Name this conversation for me.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP Token Pass Title");
+        // The turn runs on the Token Pass model, and so does the title.
+        expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["zai/glm-5.3"]);
+        expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
+          .toEqual(["zai/glm-5.3-flash"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP titles a session with the login another fx refreshed after session/new",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-title-rotated-login-");
+      const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      let accepted = "launch-token";
+      const title = (_body: string, headers: Headers) =>
+        bearer(headers) === accepted ? finalText("ACP Generated Title") : unauthorized();
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
+        titleResponses: [title, title, title],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        // Another fx refreshes the shared login, and the old token stops working.
+        rotateFxLogin(root.home, "other-fx-token");
+        accepted = "other-fx-token";
+        const result = await runPrompt(client, "Name this conversation for me.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP Generated Title");
+        expect(gateway.titleRequests.map((request) => bearer(request.headers))).toEqual(["other-fx-token"]);
+        expect(issuer.refreshes).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
@@ -9168,6 +9286,46 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP's second prompt after an image prompt starts with the last request of the first",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-second-prompt-");
+      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
+      // The default fake model has no image input, so the first request lists
+      // the image on the user's message and the model reads it through Vision.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("vision_1", "vision", { image_ids: [1], focus: "describe" }),
+        finalText(JSON.stringify({ images: [{ image_id: 1, status: "ok", summary: "small fixture", visible_text: [], details: [] }] })),
+        finalText("ACP_FIRST_IMAGE_ANSWER"),
+        finalText("ACP_SECOND_ANSWER"),
+      ]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const first = await runPromptBlocks(client, [
+          { type: "text", text: "Describe the image." },
+          { type: "image", data: imageData, mimeType: "image/png" },
+        ], TIMEOUT);
+        expect(first.promptResult.error).toBeUndefined();
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[0]!.body).toContain("available_images");
+
+        const second = await runPrompt(client, "And once more.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+        expectPromptExtends(gateway.requests[2]!.body, gateway.requests[3]!.body);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "ACP delivers complete explicit skill and required reference content",
     async () => {
       const root = createIsolatedRoot("fx-acp-explicit-skill-");
@@ -9826,6 +9984,60 @@ describe("acp: model-independent", () => {
         expect(client.hookEvents.some(event => event.type === "delegation" && event.data.phase === "completed")).toBe(true);
         expect(client.stderr).toBe("");
       } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP's wait says a report starts the next turn, since an ACP report never joins a running turn",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-wait-");
+      const childPrompt = "Reply exactly ACP_WAIT_CHILD_DONE without using tools.";
+      const heldChild = deferred<void>();
+      let waitText: string | null = null;
+      const route = async (body: string) => {
+        if (!body.includes('"name":"subagent"')) {
+          await heldChild.promise;
+          return finalText("ACP_WAIT_CHILD_DONE");
+        }
+        if (acpLatestUserIsReport(body)) return finalText("ACP_WAIT_REPORT_TURN");
+        if (body.includes("acp_wait_call")) {
+          // ACP reads its list of subagents at each step, so the step whose
+          // subagent finished also carries a runtime context update.
+          const text = acpToolResultText(body, "acp_wait_call");
+          const result = /"result":("(?:[^"\\]|\\.)*")/.exec(text);
+          waitText = result ? JSON.parse(result[1]!) : text;
+          expect(text).toContain("- waiter: idle, last work completed. For: Reply exactly ACP_WAIT_CHILD_DONE without using tools.");
+          return finalText("ACP_WAIT_TURN_DONE");
+        }
+        if (body.includes("acp_wait_send")) {
+          // The child ends while main waits for it.
+          setTimeout(() => heldChild.resolve(), 300);
+          return fakeGatewayToolCall("acp_wait_call", "subagent", { request: { action: "wait" } });
+        }
+        return fakeGatewayToolCall("acp_wait_send", "subagent", {
+          request: { action: "message", agent: "waiter", message: childPrompt },
+        });
+      };
+      const gateway = startFakeGateway([route, route, route, route, route, route]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client, true);
+        const result = await runPrompt(client, "Delegate and wait for the report.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(waitText).toBe("A report or message arrived. It starts your next turn once this one ends, so end your turn to read it.");
+        // The report then starts the next turn, as before.
+        expect(gateway.requests.some((request) => acpLatestUserIsReport(request.body))).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
+        heldChild.resolve();
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
