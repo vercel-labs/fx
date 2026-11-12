@@ -1950,6 +1950,10 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, MCP, or model catalog state\n");
 }
 
+/// Problems names at most this many of the newest kept failures of each kind:
+/// network calls, compaction events, and model catalog events.
+const trace_problems_per_kind: usize = 3;
+
 /// Surfaces failed model-catalog loads, capability lookup misses, and image
 /// gate rejections under Problems so an unverifiable-capability failure is
 /// never reported as "no obvious errors". They come from the kept failures,
@@ -1959,7 +1963,7 @@ fn writeModelCatalogProblems(writer: *std.Io.Writer) !usize {
     const total = diagnostics.snapshotFailedModelCatalogEvents(&buf);
     var count: usize = 0;
     var index = total;
-    while (index > 0 and count < 3) {
+    while (index > 0 and count < trace_problems_per_kind) {
         index -= 1;
         const event = &buf[index];
         count += 1;
@@ -1973,14 +1977,14 @@ fn writeModelCatalogProblems(writer: *std.Io.Writer) !usize {
     return count;
 }
 
-/// Lists the newest three kept failed network calls. They come from the kept
+/// Lists the newest kept failed network calls. They come from the kept
 /// failures, not the window, so later successful calls never remove them.
 fn writeNetworkProblems(writer: *std.Io.Writer) !usize {
     var buf: [diagnostics.failed_network_call_capacity]diagnostics.NetworkCall = undefined;
     const total = diagnostics.snapshotFailedNetworkCalls(&buf);
     var count: usize = 0;
     var index = total;
-    while (index > 0 and count < 3) {
+    while (index > 0 and count < trace_problems_per_kind) {
         index -= 1;
         count += 1;
         try writer.writeAll("- network ");
@@ -1989,14 +1993,14 @@ fn writeNetworkProblems(writer: *std.Io.Writer) !usize {
     return count;
 }
 
-/// Lists the newest three kept failed compaction events, from the kept
-/// failures rather than the window, with each detail cut on a UTF-8 boundary.
+/// Lists the newest kept failed compaction events, from the kept failures
+/// rather than the window, with each detail cut on a UTF-8 boundary.
 fn writeCompactionProblems(writer: *std.Io.Writer) !usize {
     var buf: [diagnostics.failed_compaction_event_capacity]diagnostics.CompactionEvent = undefined;
     const total = diagnostics.snapshotFailedCompactionEvents(&buf);
     var count: usize = 0;
     var index = total;
-    while (index > 0 and count < 3) {
+    while (index > 0 and count < trace_problems_per_kind) {
         index -= 1;
         count += 1;
         const event = &buf[index];
@@ -2046,13 +2050,17 @@ fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !voi
     }
 }
 
+/// The failures line of a section that kept no failure: network calls,
+/// compaction events, or model catalog events.
+const trace_no_failures_line = "failures: none\n";
+
 /// The kept failed compaction events, newest last. Unlike the window, later
 /// events never push these out.
 fn writeCompactionFailures(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
     var failed: [diagnostics.failed_compaction_event_capacity]diagnostics.CompactionEvent = undefined;
     const n = diagnostics.snapshotFailedCompactionEvents(&failed);
     if (n == 0) {
-        try writer.writeAll("failures: none\n");
+        try writer.writeAll(trace_no_failures_line);
         return;
     }
     try writer.print(
@@ -2316,10 +2324,6 @@ fn lastInterruptedTurn(items: []const types.HistoryTurn) ?types.InterruptedHisto
 
 const trace_tool_args_max_bytes: usize = 1200;
 
-fn networkCallIsError(call: diagnostics.NetworkCall) bool {
-    return call.isError();
-}
-
 fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
     try writer.print(" model={s}", .{call.model()});
@@ -2358,7 +2362,7 @@ fn writeNetworkCallsSummary(writer: *std.Io.Writer) !void {
     var max_ms: u32 = 0;
     var min_ms: u32 = std.math.maxInt(u32);
     for (buf[0..n]) |call| {
-        if (networkCallIsError(call)) error_count += 1 else ok_count += 1;
+        if (call.isError()) error_count += 1 else ok_count += 1;
         total_ms += call.duration_ms;
         if (call.duration_ms > max_ms) max_ms = call.duration_ms;
         if (call.duration_ms < min_ms) min_ms = call.duration_ms;
@@ -2421,7 +2425,7 @@ fn writeNetworkFailures(writer: *std.Io.Writer) !void {
     var failed: [diagnostics.failed_network_call_capacity]diagnostics.NetworkCall = undefined;
     const n = diagnostics.snapshotFailedNetworkCalls(&failed);
     if (n == 0) {
-        try writer.writeAll("failures: none\n");
+        try writer.writeAll(trace_no_failures_line);
         return;
     }
     try writer.print(
@@ -2485,7 +2489,7 @@ fn writeModelCatalogFailures(writer: *std.Io.Writer) !void {
     var failed: [diagnostics.failed_model_catalog_event_capacity]diagnostics.ModelCatalogEvent = undefined;
     const n = diagnostics.snapshotFailedModelCatalogEvents(&failed);
     if (n == 0) {
-        try writer.writeAll("failures: none\n");
+        try writer.writeAll(trace_no_failures_line);
         return;
     }
     try writer.print(
