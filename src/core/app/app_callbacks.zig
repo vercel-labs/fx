@@ -19,6 +19,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -349,6 +350,14 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .save_prompt_images = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentSavePromptImages else null
+                else
+                    null,
+                .start_workspace_capture = if (comptime agents.hasAgentField(App, "session_persistence") and turn_capture.supported)
+                    if (agent.session_persistence.v2 != null and agent.session_persistence.workspace_capture) agentStartWorkspaceCapture else null
+                else
+                    null,
+                .reach_workspace = if (comptime agents.hasAgentField(App, "session_persistence") and turn_capture.supported)
+                    if (agent.session_persistence.v2 != null and agent.session_persistence.workspace_capture) agentReachWorkspace else null
                 else
                     null,
                 .save_recovery_record = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -1211,6 +1220,16 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).savePromptImages(agent, alloc, images);
         }
 
+        fn agentStartWorkspaceCapture(ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).startWorkspaceCapture(appOf(agent), agent, fresh, step);
+        }
+
+        fn agentReachWorkspace(ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).reachWorkspace(appOf(agent), agent, dir, tool_name);
+        }
+
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1221,12 +1240,19 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             var owned_event = event;
-            if (event == .finish_prompt and
-                comptime @hasDecl(@TypeOf(agent.worker), "handoffActivePromptSnapshots"))
-            {
+            if (event == .finish_prompt) {
                 var finished = event.finish_prompt;
-                finished.snapshot_file_ownership =
-                    try agent.worker.handoffActivePromptSnapshots(std.heap.c_allocator);
+                // The turn's end capture runs here, on the agent's worker,
+                // before the finished prompt reaches the UI that commits it,
+                // and the prompt carries the turn's token so that commit
+                // writes only this turn's captures, however late (D98).
+                if (comptime agents.hasAgentField(App, "session_persistence") and turn_capture.supported) {
+                    if (app_session_runtime.Runtime(App).endWorkspaceCapture(app, agent)) |token| finished.capture_turn = @backingInt(token);
+                }
+                if (comptime @hasDecl(@TypeOf(agent.worker), "handoffActivePromptSnapshots")) {
+                    finished.snapshot_file_ownership =
+                        try agent.worker.handoffActivePromptSnapshots(std.heap.c_allocator);
+                }
                 owned_event = .{ .finish_prompt = finished };
             }
             defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, owned_event);

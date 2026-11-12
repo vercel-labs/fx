@@ -1816,6 +1816,120 @@ fn pathKey(arena: Allocator, path: []const u8) Allocator.Error![]const u8 {
     return arena.print("{x}", .{digest[0..16]});
 }
 
+pub const CopyRequest = struct {
+    /// The fx profile root, such as `~/.fx`.
+    profile_root: []const u8,
+    /// The session whose captures are copied. Its refs are only read.
+    from_session_id: []const u8,
+    /// The session that receives them, such as a fork of `from_session_id`.
+    to_session_id: []const u8,
+    /// One budget for every store.
+    deadline: std.Io.Clock.Timestamp,
+};
+
+/// What `copySessionRefs` did, counted in refs and stores.
+pub const CopyResult = struct {
+    /// Refs created for the receiving session.
+    copied: usize = 0,
+    /// Refs the receiving session already had at the same commit, such as
+    /// from an earlier copy.
+    existing: usize = 0,
+    /// Refs the receiving session already had at another commit, which stay
+    /// as they are.
+    conflicting: usize = 0,
+    /// Refs that could not be created, such as one a stale lock blocks; the
+    /// store's other refs are still copied.
+    failed_refs: usize = 0,
+    /// Stores that could not be locked or listed, or stayed locked past the
+    /// deadline; refs not copied from them are not counted.
+    failed_stores: usize = 0,
+};
+
+pub const CopyError = Allocator.Error || error{InvalidRequest};
+
+/// Gives `to_session_id` every capture `from_session_id` has, for a fork:
+/// each of the first session's refs, in every repository's store, gets a
+/// twin under the second session's key that names the same commit, so the
+/// fork's captures stay when the original's are evicted. It only creates
+/// refs, never moves or deletes one, so the first session's refs are never
+/// touched and a second run changes nothing. Each store is handled under its
+/// `init.lock`, which pruning holds, so no commit is pruned between listing
+/// it and naming it. Memory belongs to `arena`.
+pub fn copySessionRefs(arena: Allocator, request: CopyRequest) CopyError!CopyResult {
+    if (!validSessionId(request.from_session_id) or !validSessionId(request.to_session_id) or
+        std.mem.eql(u8, request.from_session_id, request.to_session_id) or
+        !std.Io.Dir.path.isAbsolute(request.profile_root)) return error.InvalidRequest;
+    const io = io_mod.getIo();
+    var result: CopyResult = .{};
+    const stores = try listStoreDirs(arena, io, try std.Io.Dir.path.join(arena, &.{ request.profile_root, "captures" }));
+    if (stores.len == 0) return result;
+    const limits: safe_git.Limits = .{ .deadline = request.deadline };
+    const ready = switch (try safe_git.prepareStore(arena, limits)) {
+        .ready => |value| value,
+        .refused => {
+            result.failed_stores = stores.len;
+            return result;
+        },
+    };
+    const from_prefix = try arena.print("refs/fx/sessions/{s}/", .{try sessionKey(arena, request.from_session_id)});
+    const to_key = try sessionKey(arena, request.to_session_id);
+    for (stores) |store_dir| {
+        if (!try copyStoreRefs(arena, io, ready, store_dir, from_prefix, to_key, request.deadline, &result)) result.failed_stores += 1;
+    }
+    return result;
+}
+
+/// Copies the refs under `from_prefix` in one store to `to_key`. A ref that
+/// cannot be created is counted in `failed_refs` and the rest are still
+/// tried. False when the store could not be locked or listed.
+fn copyStoreRefs(
+    arena: Allocator,
+    io: std.Io,
+    ready: safe_git.StoreReady,
+    store_dir: []const u8,
+    from_prefix: []const u8,
+    to_key: []const u8,
+    deadline: std.Io.Clock.Timestamp,
+    result: *CopyResult,
+) Allocator.Error!bool {
+    const lock = lockUntil(io, try initLockPath(arena, store_dir), deadline, null) catch return false;
+    defer lock.close(io);
+    const limits: safe_git.Limits = .{ .deadline = deadline };
+    const store = try refStore(arena, store_dir);
+    const listing = switch (try storeOutput(arena, ready, store, .list_refs, limits)) {
+        .ok => |stdout| stdout,
+        .failed => return false,
+    };
+    const Source = struct { worktree: []const u8, oid: []const u8 };
+    var sources: std.ArrayList(Source) = .empty;
+    var existing: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        const parsed = parseRefLine(line) orelse continue;
+        if (std.mem.startsWith(u8, parsed.name, from_prefix)) {
+            try sources.append(arena, .{ .worktree = parsed.worktree, .oid = parsed.oid });
+        } else {
+            try existing.put(arena, parsed.name, parsed.oid);
+        }
+    }
+    for (sources.items) |source| {
+        const target = try arena.print("refs/fx/sessions/{s}/{s}", .{ to_key, source.worktree });
+        if (existing.get(target)) |oid| {
+            if (std.mem.eql(u8, oid, source.oid)) result.existing += 1 else result.conflicting += 1;
+            continue;
+        }
+        // A null `old` creates the ref only if it does not exist yet.
+        switch (try storeOutput(arena, ready, store, .{ .update_ref = .{ .ref = target, .new = source.oid, .old = null } }, limits)) {
+            .ok => result.copied += 1,
+            .failed => |failure| {
+                result.failed_refs += 1;
+                debug_trace.logf("workspace", "event=workspace_capture_ref_copy_failed store={s} ref={s} failure={s}", .{ store_dir, target, @tagName(failure) });
+            },
+        }
+    }
+    return true;
+}
+
 /// A store's git directory for ref commands, which touch neither an index
 /// nor a worktree; git still needs both names, so they point inside the
 /// store's folder.
@@ -4580,6 +4694,94 @@ test "capture selection: list_refs lines parse only when well formed, and the ne
     try testing.expectEqualStrings(other, newest[0]);
     try testing.expectEqualStrings(oid, newest[1]);
     try testing.expectEqual(@as(usize, 0), (try newestCaptures(arena_state.allocator(), listing, .sha256)).len);
+}
+
+test "capture store: copying a session's refs keeps its captures for the copy after the original's are gone" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeTwoWorktrees();
+    const main_repo = try repos.repository("wt-main");
+    const side_repo = try repos.repository("wt-side");
+    try repos.makeShapes("solo");
+    const solo = try repos.repository("solo");
+    const captured = [_]struct { Repository, Outcome }{
+        .{ main_repo, try repos.captureRepo(main_repo, "A") },
+        .{ side_repo, try repos.captureRepo(side_repo, "A") },
+        .{ solo, try repos.captureRepo(solo, "A") },
+    };
+    for (captured) |entry| _ = try expectStored(entry[1]);
+    // A session with captures of its own is never touched.
+    _ = try expectStored(try repos.captureRepo(solo, "other"));
+    const other_before = (try repos.storeRef(solo, try repos.sessionRef(solo, "other"))).?;
+
+    const copy_request: CopyRequest = .{
+        .profile_root = repos.profile,
+        .from_session_id = "A",
+        .to_session_id = "B",
+        .deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(test_deadline_ms) }),
+    };
+    const first = try copySessionRefs(repos.arena, copy_request);
+    try testing.expectEqual(CopyResult{ .copied = 3 }, first);
+    for (captured) |entry| {
+        try testing.expectEqualStrings(entry[1].commit.?, (try repos.storeRef(entry[0], try repos.sessionRef(entry[0], "A"))).?);
+        try testing.expectEqualStrings(entry[1].commit.?, (try repos.storeRef(entry[0], try repos.sessionRef(entry[0], "B"))).?);
+    }
+    // A second run changes nothing.
+    try testing.expectEqual(CopyResult{ .existing = 3 }, try copySessionRefs(repos.arena, copy_request));
+    try testing.expectError(error.InvalidRequest, copySessionRefs(repos.arena, .{ .profile_root = repos.profile, .from_session_id = "A", .to_session_id = "A", .deadline = copy_request.deadline }));
+    try testing.expectError(error.InvalidRequest, copySessionRefs(repos.arena, .{ .profile_root = repos.profile, .from_session_id = "../A", .to_session_id = "B", .deadline = copy_request.deadline }));
+
+    // The original's refs go and the stores are pruned: the copy still
+    // names commits whose trees restore.
+    for (captured) |entry| {
+        _ = try repos.storeGit(entry[0], &.{ "update-ref", "-d", try repos.sessionRef(entry[0], "A") });
+    }
+    _ = try repos.storeGit(main_repo, &.{ "gc", "--quiet", "--prune=now" });
+    _ = try repos.storeGit(solo, &.{ "gc", "--quiet", "--prune=now" });
+    for (captured) |entry| {
+        try testing.expect(try repos.storeRef(entry[0], try repos.sessionRef(entry[0], "A")) == null);
+        try testing.expectEqualStrings("commit", try repos.storeGit(entry[0], &.{ "cat-file", "-t", try repos.sessionRef(entry[0], "B") }));
+        try testing.expectEqualStrings(entry[1].tree.?, try repos.storeGit(entry[0], &.{ "rev-parse", try repos.arena.print("{s}^{{tree}}", .{try repos.sessionRef(entry[0], "B")}) }));
+    }
+    try testing.expectEqualStrings("one", try repos.storedFile(solo, captured[2][1].tree.?, "a.txt"));
+    try testing.expectEqualStrings(other_before, (try repos.storeRef(solo, try repos.sessionRef(solo, "other"))).?);
+}
+
+test "capture store: a ref the copy cannot create is counted and the store's other refs are still copied" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeTwoWorktrees();
+    const main_repo = try repos.repository("wt-main");
+    const side_repo = try repos.repository("wt-side");
+    const main_a = try repos.captureRepo(main_repo, "A");
+    const side_a = try repos.captureRepo(side_repo, "A");
+    _ = try expectStored(main_a);
+    _ = try expectStored(side_a);
+    // A lock left on the fork's ref for each worktree in turn, so the
+    // blocked one is listed first once and last once.
+    const pairs = [_]struct { Repository, Repository, Outcome }{ .{ main_repo, side_repo, side_a }, .{ side_repo, main_repo, main_a } };
+    for (pairs, [_][]const u8{ "B", "C" }) |pair, fork| {
+        const blocked_ref = try repos.sessionRef(pair[0], fork);
+        const lock_path = try repos.arena.print("{s}/{s}.lock", .{ try repos.store(main_repo), blocked_ref });
+        try TestRepos.writeAbsolute(lock_path, "");
+        const result = try copySessionRefs(repos.arena, .{
+            .profile_root = repos.profile,
+            .from_session_id = "A",
+            .to_session_id = fork,
+            .deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(test_deadline_ms) }),
+        });
+        try testing.expectEqual(CopyResult{ .copied = 1, .failed_refs = 1 }, result);
+        try testing.expect(try repos.storeRef(main_repo, blocked_ref) == null);
+        try testing.expectEqualStrings(pair[2].commit.?, (try repos.storeRef(main_repo, try repos.sessionRef(pair[1], fork))).?);
+    }
 }
 
 // ---- Retention (`capture_retention.zig`) against real stores ----

@@ -92,7 +92,7 @@ pub fn InterruptRuntime(comptime App: type) type {
             if (!agent.stream.active) return;
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
-            if (agent.worker.isCancelRequested()) return;
+            if (turnCancelled(agent)) return;
             const compacting = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) blk: {
                 const observed = agent.worker.compactionActivitySnapshot();
                 break :blk if (observed.operation) |op| op.active() else false;
@@ -167,6 +167,14 @@ pub fn InterruptRuntime(comptime App: type) type {
             return shell_runtime.activeToolActivityCount(&app.shell);
         }
 
+        /// Whether the agent's turn is already cancelled. A steer's
+        /// interrupt of the model is not a cancel, so the user's cancel
+        /// still stops the turn and its workspace captures.
+        fn turnCancelled(agent: *AppAgent) bool {
+            if (comptime @hasDecl(@TypeOf(agent.worker), "isTurnCancelRequested")) return agent.worker.isTurnCancelRequested();
+            return agent.worker.isCancelRequested();
+        }
+
         fn activeCancellationTarget(agent: *AppAgent) CancellationTarget {
             const status = if (comptime @hasDecl(
                 @TypeOf(agent.worker),
@@ -200,4 +208,35 @@ test "idle compaction feedback dismissal is scoped and never cancels active work
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(!app.agent().worker.isCancelRequested());
     try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
+}
+
+test "a steer's interrupt of the model leaves the user's cancel to stop the turn" {
+    const alloc = std.testing.allocator;
+    const FakeApp = struct {
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    var app: FakeApp = .{};
+    const worker = &app.agent().worker;
+    defer worker.deinit(alloc);
+    try std.testing.expect(worker.beginDirectProcessing(41));
+    defer worker.finishProcessing();
+    try worker.admitInteractivePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "follow-up"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(@import("../shared/types.zig").HistoryTurn, 0),
+        .grants = try alloc.alloc(@import("../shared/types.zig").PermissionGrant, 0),
+    });
+    try std.testing.expect(worker.isCancelRequested());
+    try std.testing.expect(!InterruptRuntime(FakeApp).turnCancelled((&app).agent()));
+    worker.requestInteractiveCancel();
+    try std.testing.expect(InterruptRuntime(FakeApp).turnCancelled((&app).agent()));
 }

@@ -31,6 +31,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
+const turn_capture = @import("../core/workspace/turn_capture.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
@@ -228,6 +229,11 @@ pub const ActiveSessionState = struct {
     session_id: []u8,
     /// The saved session; null on the wasm host, which keeps `wasm_state`.
     v2: ?*session_adapter.Session = null,
+    /// The home of the session store while workspace captures are on, set
+    /// as each prompt starts; null when they are off (D98).
+    capture_home: ?[]const u8 = null,
+    /// The current turn's workspace captures.
+    turn_capture: turn_capture.TurnCapture = .{},
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -264,6 +270,12 @@ pub const ActiveSessionState = struct {
     /// MCP identities shown for earlier tool calls, for session/load replay.
     tool_identities: tool_call_identities.Record = .{},
     cancel_flag: std.atomic.Value(bool),
+    /// Set with `cancel_flag` only by a cancel that stops the turn: the
+    /// client's `session/cancel`, its closed steering, or a host tool it
+    /// cancelled. A steer that cuts the reply short sets `cancel_flag` alone,
+    /// so the turn's workspace captures, which watch this, keep running (D98).
+    /// Cleared as each prompt starts.
+    turn_cancel: std.atomic.Value(bool) = .init(false),
     pending_prompt_id: ?jsonrpc.RequestId,
     steering: libfx_steering.Runtime = .{},
     /// Set when the host passed a journal; every state change is sent to it.
@@ -353,6 +365,8 @@ pub const ServerState = struct {
     context_enabled: bool = true,
     session_titles: bool = true,
     cache_warming: bool = true,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -405,6 +419,8 @@ pub const ServerState = struct {
         // A host `session/load` replaced may still be stopping its servers;
         // they end before this process does.
         if (comptime !host_target.is_wasm) mcp_host.waitRetired();
+        // Retention's maintenance, if one runs, ends with the server.
+        if (comptime turn_capture.supported) turn_capture.finishMaintenance();
         if (self.sessions_v2) |*store| store.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
@@ -769,6 +785,7 @@ fn destroyActiveSession(state: *ServerState) void {
     }
     active.session_rt.deinit(state.alloc);
     if (active.v2) |v2| v2.close();
+    active.turn_capture.deinit();
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
@@ -2414,6 +2431,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
+    session.turn_cancel.store(false, .seq_cst);
     session.cancel_flag.store(false, .seq_cst);
     session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
@@ -3019,6 +3037,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
+    state.workspace_capture = startup.workspace_capture;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -3489,6 +3508,7 @@ test "ACP keeps its model catalog when a due refresh cannot connect" {
 fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
+        session.turn_cancel.store(true, .seq_cst);
         session.cancel_flag.store(true, .seq_cst);
         // A prompt waiting for its subagents' reports stops waiting.
         state.worker.nudgeWaiter();
@@ -4536,6 +4556,48 @@ test "ACP permission responses map canonical option ids" {
         defer parsed.deinit();
         try std.testing.expect(parsePermissionDecision(parsed.value) == null);
     }
+}
+
+test "an ACP steer that cuts the reply short is no turn cancel, and the client's cancel is" {
+    const alloc = std.testing.allocator;
+    const Discard = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(null, Discard.write),
+    };
+    state.cfg.minimal_kernel = true;
+    defer state.pending_outbound.deinit(alloc);
+    state.active_session = .{
+        .session_id = @constCast("session"),
+        .model = @constCast("model"),
+        .mode = "default",
+        .workspace_root = "/tmp/workspace",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    const session = &state.active_session.?;
+    session.steering.open(alloc);
+    defer session.steering.deinit(alloc);
+    _ = session.steering.notePhase(1, .reply, &session.cancel_flag);
+    try session.steering.enqueue(alloc, "use tabs");
+    try std.testing.expect(session.steering.claimInterrupt(&session.cancel_flag));
+    try std.testing.expect(session.cancel_flag.load(.seq_cst));
+    // The turn's workspace captures keep running (D98).
+    try std.testing.expect(!session.turn_cancel.load(.seq_cst));
+    handleCancel(&state, false);
+    try std.testing.expect(session.turn_cancel.load(.seq_cst));
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {

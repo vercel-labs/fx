@@ -136,6 +136,8 @@ async function withHost(
     remainOnExit?: boolean;
     // Reuse a profile and workspace across runs; the caller removes them.
     reuse?: { home: string; workspace: string };
+    // Settings beside `sandbox`, written to the profile before fx starts.
+    settings?: Record<string, unknown>;
   },
   run: (host: Host) => Promise<void>,
 ): Promise<string[]> {
@@ -143,7 +145,7 @@ async function withHost(
   const home = options.reuse?.home ?? createIsolatedTestHome();
   const workspace = options.reuse?.workspace ?? realpathSync(mkdtempSync(join(tmpdir(), "fx-host-instances-")));
   mkdirSync(join(home, ".fx"), { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", ...options.settings }));
   let session: TmuxSession | null = null;
   try {
     session = await TmuxSession.create({
@@ -427,6 +429,62 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(refused).toContain("Couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
         expect(refused).not.toContain("ProfileNotFound");
         expect(refused).toContain("fx 2/2");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an instance /launch adds records the repository at its turn's start and end with experimental.workspace_capture",
+    async () => {
+      await withHost(answerByLetter, { settings: { experimental: { workspace_capture: true } } }, async ({ home, workspace, session }) => {
+        const git = (...args: string[]) => {
+          // The test's own home and no system config, so the developer's
+          // git config, such as commit signing, never reaches the fixture.
+          const result = Bun.spawnSync(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+            cwd: workspace,
+            env: { HOME: home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+          });
+          if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+          return result.stdout.toString().trim();
+        };
+        git("init", "-q", "-b", "main");
+        writeFileSync(join(workspace, "a.txt"), "one\n");
+        git("add", "a.txt");
+        git("commit", "-q", "-m", "first");
+        writeFileSync(join(workspace, "a.txt"), "two\n");
+        const head = git("rev-parse", "HEAD");
+
+        await session.sendText("/launch");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("HOST_D launched");
+        await session.waitForText("HOST_ANSWER_D", 30_000);
+
+        // Only the launched instance was prompted, so its session is the
+        // one saved; its turn commits after the answer shows.
+        const sessions = join(home, ".fx", "sessions", "v2");
+        const captures = async () => {
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            const ids = existsSync(sessions) ? readdirSync(sessions).filter((name) => existsSync(join(sessions, name, "log.jsonl"))) : [];
+            if (ids.length === 1) {
+              const records = readFileSync(join(sessions, ids[0]!, "log.jsonl"), "utf8")
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => JSON.parse(line))
+                .filter((line) => line.kind === "item" && line.type === "workspace_capture")
+                .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
+              if (records.length === 2) return records;
+            }
+            await Bun.sleep(100);
+          }
+          throw new Error("the launched instance's captures never landed");
+        };
+        const records = await captures();
+        expect(records.map((record) => [record.phase, record.status, record.head])).toEqual([
+          ["start", "complete", head],
+          ["end", "complete", head],
+        ]);
       });
     },
     TIMEOUT,
