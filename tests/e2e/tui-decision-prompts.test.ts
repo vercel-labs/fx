@@ -305,6 +305,60 @@ function outerTallQuestionCall() {
   ]);
 }
 
+const MARKDOWN_QUESTION = [
+  "Two ways to migrate:",
+  "",
+  "- **online**: no downtime",
+  "- `offline`: ten minutes of downtime",
+  "",
+  "```sh",
+  "fx migrate --mode online",
+  "```",
+  "",
+  "Which one do you want?",
+].join("\n");
+
+function outerMarkdownQuestionCall(question = MARKDOWN_QUESTION) {
+  return outerToolCalls([
+    {
+      id: "markdown_question_outer_1",
+      name: "ask_user_question",
+      input: {
+        questions: [
+          {
+            question,
+            options: [
+              {
+                label: "Online",
+                description: "No downtime.\nWrites are **slow** for `two` hours.",
+              },
+              { label: "Offline", description: "Ten minutes of downtime.\n- run `fx migrate`" },
+            ],
+          },
+        ],
+      },
+    },
+  ]);
+}
+
+// Asserts the rows a Markdown question draws, starting at `first`, with
+// `indent` columns before its text.
+function expectMarkdownQuestionRows(rows: string[], first: number, indent: string) {
+  expect(rows.slice(first + 1, first + 5)).toEqual([
+    "",
+    `${indent}• online: no downtime`,
+    `${indent}• offline: ten minutes of downtime`,
+    "",
+  ]);
+  expect(rows[first + 5]).toMatch(new RegExp(`^${indent}─ sh ─+$`));
+  expect(rows[first + 6]).toBe(`${indent}fx migrate --mode online`);
+  expect(rows[first + 7]).toMatch(new RegExp(`^${indent}─+$`));
+  expect(rows.slice(first + 8, first + 10)).toEqual([
+    "",
+    `${indent}Which one do you want?`,
+  ]);
+}
+
 const FILL_LINE_COUNT = 40;
 
 function fillLine(index: number) {
@@ -3101,14 +3155,15 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "long question content wrapped rows",
         (value) =>
-          value.includes("remain fully visible even when it wraps.") &&
+          value.includes("fully visible even when it wraps.") &&
           value.includes("verification suite before") &&
           value.includes("pushing this branch") &&
           value.includes("when it wraps across several terminal rows"),
       );
+      // The question wraps as transcript text does, to the last column.
       const questionContinuation = pane
         .split("\n")
-        .find((line) => line.includes("remain fully visible even when it wraps."));
+        .find((line) => line.startsWith("  fully visible even when it wraps."));
       const questionLead = pane
         .split("\n")
         .find((line) => line.includes("When you ask fx to ask a question"));
@@ -3124,8 +3179,11 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const descriptionLead = pane
         .split("\n")
         .find((line) => line.includes("Keep the entire explanation"));
-      expect(questionContinuation?.indexOf("remain fully visible even when it wraps.")).toBe(
+      expect(questionContinuation?.indexOf("fully visible even when it wraps.")).toBe(
         questionLead?.indexOf("When you ask fx to ask a question"),
+      );
+      expect(questionLead?.trimEnd()).toBe(
+        "  When you ask fx to ask a question interactively, the question text must remain",
       );
       expect(labelContinuation?.indexOf("verification suite before")).toBe(
         labelLead?.indexOf("Run the complete"),
@@ -3209,13 +3267,145 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "question freeform narrow hint",
         (value) => value.includes("shift+↑↓ options"),
       );
-      expect(pane).toContain(
-        "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
-      );
+      expect(pane).toContain("↑↓ cursor · shift+↑↓ options · enter answer · esc cancel");
+      expect(pane).not.toContain("tab questions");
       expect(ctx.gateway.requests).toHaveLength(1);
 
       await ctx.session.sendKeys("Enter");
       await ctx.session.waitForText("question freeform narrow hint handled", TIMEOUT);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "markdown question keeps its lines in the prompt, the answered card, and the tool result",
+    async () => {
+      const ctx = await launchScenario([
+        outerMarkdownQuestionCall(),
+        outerText("markdown question handled"),
+      ]);
+      await ctx.session.sendText("Ask me how to migrate.");
+      const grid = await waitForGridState(
+        ctx.session,
+        "markdown question prompt",
+        (rows) =>
+          rows.some((row) => row.includes("Which one do you want?")) &&
+          rows.some((row) => row.includes("esc cancel")),
+      );
+      const rows = grid.map((row) => row.trimEnd());
+      const first = rows.indexOf("  Two ways to migrate:");
+      expect(first).toBeGreaterThanOrEqual(0);
+      expectMarkdownQuestionRows(rows, first, "  ");
+      expect(rows[first + 10]).toBe("");
+
+      // A description keeps its line break and renders its Markdown, and
+      // each of its lines starts under its first.
+      const option = first + 11;
+      expect(rows[option]).toMatch(/^    1\) Online\s+No downtime\.$/);
+      const column = rows[option]!.indexOf("No downtime.");
+      expect(rows[option + 1]).toBe(`${" ".repeat(column)}Writes are slow for two hours.`);
+      expect(rows[option + 2]).toMatch(/^    2\) Offline\s+Ten minutes of downtime\.$/);
+      expect(rows[option + 3]).toBe(`${" ".repeat(column)}• run fx migrate`);
+      expect(rows[option + 4]).toBe("    3) Other");
+      const panel = rows.slice(first, option + 5).join("\n");
+      for (const syntax of ["**", "`", "- "]) expect(panel).not.toContain(syntax);
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("markdown question handled", TIMEOUT);
+      const answered = (await ctx.session.capturePaneGrid()).map((row) => row.trimEnd());
+      const card = answered.indexOf("  1) Two ways to migrate:");
+      expect(card).toBeGreaterThanOrEqual(0);
+      expectMarkdownQuestionRows(answered, card, "     ");
+      expect(answered[card + 10]).toBe("     Online");
+      const cardText = answered.slice(card, card + 11).join("\n");
+      for (const syntax of ["**", "`", "- "]) expect(cardText).not.toContain(syntax);
+
+      const result = JSON.parse(
+        toolResultText(ctx.gateway.requests[1]!.body, "markdown_question_outer_1"),
+      );
+      expect(result).toEqual([{ question: MARKDOWN_QUESTION, answer: "Online" }]);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "markdown question shows control bytes as text on every line",
+    async () => {
+      const ctx = await launchScenario([
+        outerMarkdownQuestionCall(
+          "First \u001b[2Jline\r\nSecond \u001b]0;MARKDOWN_TITLE\u0007line\rThird \u202eline\u200b",
+        ),
+        outerText("markdown control question handled"),
+      ]);
+      await ctx.session.sendText("Ask me the control question.");
+      const grid = await waitForGridState(
+        ctx.session,
+        "markdown control question",
+        (rows) => rows.some((row) => row.includes("Third ")),
+      );
+      const rows = grid.map((row) => row.trimEnd());
+      const first = rows.indexOf("  First \\x1b[2Jline");
+      expect(first).toBeGreaterThanOrEqual(0);
+      expect(rows.slice(first, first + 3)).toEqual([
+        "  First \\x1b[2Jline",
+        "  Second \\x1b]0;MARKDOWN_TITLE\\x07line",
+        // A bidi override and a zero-width space show as text, so the
+        // prompt cannot draw a question other than the one it holds.
+        "  Third \\u{202e}line\\u{200b}",
+      ]);
+      // The screen was not cleared and the title was not set.
+      expect(rows.some((row) => row.includes("Ask me the control question."))).toBe(true);
+      expect(await ctx.session.paneTitle()).not.toContain("MARKDOWN_TITLE");
+
+      await ctx.session.sendKeys("Escape");
+      await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "tall question in a short terminal keeps its selection and hint row on screen",
+    async () => {
+      const ctx = await launchScenario([
+        outerTallQuestionCall(),
+        outerText("short terminal question handled"),
+      ]);
+      await ctx.session.sendText("Ask me who should relay the events.");
+      await ctx.session.waitForText(TALL_QUESTION_PROMPT, TIMEOUT);
+      await ctx.session.resizeWindow(90, 12);
+
+      const first = await waitForGridState(
+        ctx.session,
+        "short terminal question",
+        (grid) =>
+          grid.some((row) => row.includes("↓ 3 more")) &&
+          grid.some((row) => row.includes("esc cancel")),
+      );
+      expect(first.some((row) => row.includes(TALL_QUESTION_PROMPT))).toBe(true);
+      expect(first.some((row) => row.includes("1) A relay process"))).toBe(true);
+      expect(first.some((row) => row.includes("3) Both, per pane"))).toBe(false);
+
+      await ctx.session.sendKeys("Down");
+      await ctx.session.sendKeys("Down");
+      const third = await waitForGridState(
+        ctx.session,
+        "third option in view",
+        (grid) => grid.some((row) => row.includes("3) Both, per pane")),
+      );
+      expect(third.some((row) => row.includes("↑ 2 more"))).toBe(true);
+      expect(third.some((row) => row.includes("↓ 1 more"))).toBe(true);
+      expect(third.some((row) => row.includes("esc cancel"))).toBe(true);
+      expect(third.some((row) => row.includes(TALL_QUESTION_PROMPT))).toBe(true);
+
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("short terminal question handled", TIMEOUT);
+      expect(
+        toolResultText(ctx.gateway.requests[1]!.body, "tall_question_outer_1"),
+      ).toContain("Both, per pane");
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

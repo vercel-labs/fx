@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
+import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
   canonicalSubagentIdForStore,
   confirmationReplay,
@@ -204,19 +205,6 @@ function twoEffectfulCommandBatch(first: string, second: string) {
 
 function sessionIdFromHome(root: IsolatedRoot): string {
   return onlySessionId(root.home);
-}
-
-function latestTraceReportPath(root: IsolatedRoot): string {
-  const reports = readdirSync(root.root)
-    .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
-    .map((entry) => {
-      const path = join(root.root, entry);
-      return { path, mtimeMs: statSync(path).mtimeMs };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  expect(reports.length).toBeGreaterThan(0);
-  return reports[0]!.path;
 }
 
 function expectGroupedContinuationRequest(
@@ -1759,23 +1747,29 @@ describe("effect-aware command permissions", () => {
           : "Trace saved at",
         TIMEOUT,
       );
-      const report = readFileSync(latestTraceReportPath(root), "utf8");
+      const report = readTraceReport(latestTraceReportPath(root.root));
 
       // Main's four steps, the child's two, and the report's turn.
       expect(gateway.requests).toHaveLength(7);
-      expect(report).toContain(
-        "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
+      expect(report.one("tool_calls")).toMatchObject({
+        retained: 4,
+        outcomes: { succeeded: 2, rejected: 0, command_failed: 1, tool_failed: 1, runtime_failed: 0 },
+      });
+      const calls = report.all("tool_call");
+      const described = calls.map((call) =>
+        `${call.name} ${call.outcome} ${call.source}${call.subagent_id === undefined ? "" : `#${call.subagent_id}`}`);
+      expect(described).toEqual(expect.arrayContaining([
+        "shell succeeded subagent#1",
+        "subagent succeeded parent",
+        "shell command_failed parent",
+        "edit_file tool_failed parent",
+      ]));
+      for (const call of calls) expect(call.duration_ms).toEqual(expect.any(Number));
+      const failedCalls = report.problems("tool_call").map((problem) => problem.call as { name: string; outcome: string });
+      expect(failedCalls.map((call) => `${call.name} ${call.outcome}`)).toEqual(
+        expect.arrayContaining(["edit_file tool_failed", "shell command_failed"]),
       );
-      const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
-      expect(localCalls).toBeDefined();
-      expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
-      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
-      expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
-      expect(localCalls).toMatch(/name=edit_file outcome=tool_failed duration=\d+ms source=parent\n/);
-      expect(report).toContain("name=edit_file outcome=tool_failed");
-      expect(report).toContain("name=shell outcome=command_failed");
-      expect(report).not.toContain("name=edit_file outcome=runtime_failed");
-      expect(report).not.toContain("name=shell outcome=runtime_failed");
+      expect(calls.filter((call) => call.outcome === "runtime_failed")).toEqual([]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -1827,18 +1821,31 @@ describe("effect-aware command permissions", () => {
           : "Trace saved at",
         TIMEOUT,
       );
-      const reportPath = latestTraceReportPath(root);
-      const report = readFileSync(reportPath, "utf8");
+      const reportPath = latestTraceReportPath(root.root);
+      const report = readTraceReport(reportPath);
 
       expect(gateway.requests).toHaveLength(1);
-      expect(report).toContain("## Problems");
-      expect(report).toContain("## Network Calls");
-      expect(report).toContain("status=400");
-      expect(report).toContain('gateway_schema="path=prompt.0.content expected=string received=array"');
-      expect(report).toContain("request_shape=");
-      expect(report).toContain("prompt.0 role=system content=string");
-      expect(report).toContain("role=user content=array");
-      expect(report).not.toContain('"text":"Trigger the gateway schema diagnostic."');
+      const refused = report.all("network_call").filter((call) => call.status === 400);
+      expect(refused).toHaveLength(1);
+      expect(refused[0]!.gateway_schema).toBe("path=prompt.0.content expected=string received=array");
+      const shape = String(refused[0]!.request_shape);
+      expect(shape).toContain("prompt.0 role=system content=string");
+      expect(shape).toContain("role=user content=array");
+      // The request shape names roles and types, never the prompt's text.
+      expect(shape).not.toContain("Trigger the gateway schema diagnostic.");
+      // No record holds the raw request body. The prompt itself is only in
+      // the transcript and in the screen rows of the renderer state, so a
+      // gateway error, schema diagnostic, or any other record that leaks it
+      // fails. The test does not set FX_TRACE_LOG, so the trace has no debug
+      // log lines to check.
+      const strings = (value: unknown): string[] =>
+        typeof value === "string" ? [value] : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+      expect(report.records.flatMap(strings).filter((text) => text.includes('"text":"Trigger the gateway schema diagnostic."'))).toEqual([]);
+      const elsewhere = report.records.filter((record) => record.type !== "transcript_entry" && record.type !== "renderer_state");
+      expect(elsewhere.flatMap(strings).filter((text) => text.includes("Trigger the gateway schema diagnostic."))).toEqual([]);
+      expect(report.all("transcript_entry").some((entry) => String(entry.text).includes("Trigger the gateway schema diagnostic."))).toBe(true);
+      expect(report.problems("network_call").map((problem) => (problem.call as { status?: number }).status)).toContain(400);
+      expect(report.one("problems").count).toBeGreaterThan(0);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -1851,7 +1858,103 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI creates a private Markdown trace without a feedback CTA",
+    "TUI trace keeps a failed network call and catalog load after later calls fill the window",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const failPrompt = "Trigger the kept network failure.";
+      const fillPrompt = "Fill the network call window.";
+      // More successful model calls than the 32-call window holds.
+      const fills = 40;
+      let catalogFetches = 0;
+      const gateway = startDynamicFakeGateway(async (body) => {
+        // The fill turn's history holds the failed prompt too, so it is checked first.
+        if (body.includes(fillPrompt)) {
+          const done = [...body.matchAll(/"toolCallId":"window_ok_(\d+)"/g)].map((match) => Number(match[1]));
+          const next = done.length === 0 ? 0 : Math.max(...done) + 1;
+          if (next < fills) return toolCall("true", {}, `window_ok_${next}`);
+          return finalText("network window filled");
+        }
+        if (body.includes(failPrompt)) {
+          return Response.json({ error: { message: "Synthetic upstream rejection" } }, { status: 400 });
+        }
+        return finalText("unexpected request");
+      }, {
+        // The first catalog load fails; the retry a prompt starts succeeds.
+        models: () => ++catalogFetches === 1
+          ? new Response("catalog unavailable", { status: 500 })
+          : [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateways.push(gateway);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(failPrompt);
+      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.sendText(fillPrompt);
+      await activeSession.waitForText("network window filled", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readTraceReport(latestTraceReportPath(root.root));
+
+      // The window has moved past the failed call, and the kept failures hold it.
+      const network = report.one("network");
+      expect(network.complete).toBe(false);
+      expect(network.retained).toBe(32);
+      expect((network.session as { errors?: number }).errors).toBe(1);
+      const windowCalls = report.all("network_call");
+      expect(windowCalls).toHaveLength(32);
+      expect(windowCalls.filter((call) => call.status === 400)).toEqual([]);
+      const networkFailures = report.all("failed_network_call");
+      expect(networkFailures).toHaveLength(1);
+      expect(network.kept_failures).toBe(1);
+      expect(networkFailures[0]).toMatchObject({
+        source: "parent",
+        status: 400,
+        gateway_error: "HTTP 400 · Synthetic upstream rejection",
+      });
+
+      const catalogFailures = report.all("failed_model_catalog_event");
+      expect(catalogFailures.length).toBeGreaterThan(0);
+      expect(report.one("model_catalog").kept_failures).toBe(catalogFailures.length);
+      const failedLoad = (record: { event?: unknown; detail?: unknown }) =>
+        record.event === "load" && String(record.detail).startsWith("outcome=failed ");
+      expect(catalogFailures.some((event) => event.failed === true && failedLoad(event))).toBe(true);
+
+      expect(report.problems("network_call").map((problem) => (problem.call as { status?: number }).status)).toContain(400);
+      expect(report.problems("model_catalog").some(failedLoad)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI creates a private JSONL trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([finalText(
@@ -1900,20 +2003,35 @@ describe("effect-aware command permissions", () => {
       expect(escapes).not.toContain("Report issue");
       expect(escapes).not.toContain("fx.sh/feedback");
       expect(escapes).not.toContain("github.com");
-      const reportPath = latestTraceReportPath(root);
-      const report = readFileSync(reportPath, "utf8");
-      expect(report).toContain("# fx trace");
-      expect(report).toContain("## Summary");
-      expect(report).toContain(root.workspace);
-      expect(report).toContain("terminal_hosts: tmux=true");
-      expect(report).toContain("projection: view=");
-      const rendererEvents = report.split("## Recent Renderer Events\n")[1]?.split("## Transcript Timeline")[0];
-      expect(rendererEvents).toBeDefined();
-      expect(rendererEvents).toContain("kind=transition");
-      expect(rendererEvents).toContain("kind=commit");
-      expect(rendererEvents).toContain("kind=resize");
-      expect(rendererEvents).not.toContain("TRACE_RENDER_ROW_");
-      expect(rendererEvents).not.toContain("[truncated]");
+      const reportPath = latestTraceReportPath(root.root);
+      const report = readTraceReport(reportPath);
+      // The Markdown report is gone.
+      expect(readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))).toEqual([]);
+      const header = report.records[0]!;
+      expect(header).toMatchObject({ type: "fx_trace", format_version: 1 });
+      expect(header.fx_version).toEqual(expect.any(String));
+      expect(header.written_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(String(report.one("summary").workspace)).toContain(root.workspace);
+      expect(report.one("runtime_context").tmux).toBe(true);
+      expect(report.one("renderer_state").projection).toMatchObject({ view: expect.any(Number) });
+      const rendererEvents = report.all("renderer_event");
+      expect(report.one("renderer_events").retained).toBe(rendererEvents.length);
+      const rendererKinds = rendererEvents.map((event) => event.kind);
+      expect(rendererKinds).toContain("transition");
+      expect(rendererKinds).toContain("commit");
+      expect(rendererKinds).toContain("resize");
+      for (const event of rendererEvents) {
+        expect(String(event.detail)).not.toContain("TRACE_RENDER_ROW_");
+        expect(event.truncated).toBe(false);
+      }
+      const entries = report.all("transcript_entry");
+      expect(report.one("transcript").emitted).toBe(entries.length);
+      expect(entries.some((entry) => entry.kind === "assistant" && String(entry.text).includes("TRACE_RENDER_DONE"))).toBe(true);
+      if (process.platform !== "darwin") {
+        // The notice names the file, however the pane wraps it.
+        const screen = (await activeSession.captureFullScrollback()).replace(/\s+/g, "");
+        expect(screen).toContain(`Tracesavedat${reportPath}.`);
+      }
       expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       if (process.platform === "darwin") {
@@ -1921,6 +2039,68 @@ describe("effect-aware command permissions", () => {
       } else {
         expect(existsSync(clipboardPath)).toBe(false);
       }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace reports a temp folder it cannot write and a last-shutdown report it cannot read",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([finalText("TRACE_FAULT_READY")]);
+      const stderrPath = join(root.root, "trace-fault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // Valid JSON that is not the object fx saves when it shuts down.
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(join(root.home, ".fx", "diagnostics", "last-shutdown.json"), "[1, 2]");
+      const tmpDir = join(root.root, "tmp-not-yet");
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say ready.");
+      await activeSession.waitForText("TRACE_FAULT_READY", TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText("Could not create trace.", TIMEOUT);
+      expect(existsSync(tmpDir)).toBe(false);
+
+      // With the folder there, the same session writes a whole trace, and the
+      // damaged report reads as unreadable.
+      mkdirSync(tmpDir);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_shutdown").status).toBe("unreadable");
+      expect(report.all("transcript_entry").some((entry) => String(entry.text).includes("TRACE_FAULT_READY"))).toBe(true);
+
+      // A report time past year 9999 is left out instead of stopping fx.
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-shutdown.json"),
+        '{"total_ms":42,"recorded_at_ms":9000000000000000000}',
+      );
+      const before = new Set(traceReportNames(tmpDir));
+      await activeSession.sendText("/trace");
+      const farReport = await waitForNewTraceReport(tmpDir, before);
+      const farShutdown = farReport.one("last_shutdown");
+      expect(farShutdown).toMatchObject({ status: "recorded", total_ms: 42 });
+      expect(farShutdown.recorded_at).toBeUndefined();
+      expect(farShutdown.recorded_at_ms).toBeUndefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

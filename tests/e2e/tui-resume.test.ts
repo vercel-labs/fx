@@ -6664,6 +6664,8 @@ test.skipIf(!tmuxAvailable())(
     const workspaceRoot = realpathSync(workspace);
     const questionMarker = "RESUME_QUESTION_VERIFICATION_DEPTH";
     const answer = "Thorough";
+    const markdownMarker = "RESUME_MARKDOWN_QUESTION";
+    const markdownAnswer = "Keep both";
     const completion = "RESUME_QUESTION_COMPLETED";
     const flagFollowUp = "RESUME_QUESTION_FLAG_FOLLOW_UP";
     const pickerFollowUp = "RESUME_QUESTION_PICKER_FOLLOW_UP";
@@ -6673,6 +6675,16 @@ test.skipIf(!tmuxAvailable())(
     const expectCompactQuestion = (scrollback: string) => {
       expect(scrollback).toContain(`\n  1) ${questionMarker}`);
       expect(scrollback).toContain(`     ${answer}`);
+      // A Markdown question replays in the shape the prompt showed.
+      const rows = scrollback.split("\n").map((row) => row.trimEnd());
+      const markdown = rows.indexOf(`  2) ${markdownMarker}:`);
+      expect(markdown).toBeGreaterThanOrEqual(0);
+      expect(rows.slice(markdown + 1, markdown + 5)).toEqual([
+        "",
+        "     • first item",
+        "     • second item",
+        `     ${markdownAnswer}`,
+      ]);
       expect(scrollback).not.toContain("● Asked");
       expect(scrollback).not.toContain(`\"question\":\"${questionMarker}\"`);
     };
@@ -6699,6 +6711,10 @@ test.skipIf(!tmuxAvailable())(
                 { label: answer, description: "Run every verification step." },
                 { label: "Fast", description: "Run only the focused checks." },
               ],
+            },
+            {
+              question: `${markdownMarker}:\n\n- **first** item\n- \`second\` item`,
+              options: [{ label: markdownAnswer }, { label: "Drop one" }],
             },
           ],
         }),

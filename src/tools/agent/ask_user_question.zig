@@ -1,6 +1,8 @@
 const std = @import("std");
 const observation = @import("../../core/agent/runtime/observation.zig");
 const question_answer = @import("../../core/agent/question_answer.zig");
+const question_prompt = @import("../../core/agent/question_prompt.zig");
+const display_width = @import("../../core/shared/display_width.zig");
 const core_types = @import("../../core/shared/types.zig");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
@@ -39,6 +41,12 @@ const QuestionBatchParseError = Allocator.Error || error{
     OptionLabelNotString,
     EmptyOptionLabel,
     DuplicateOptionLabel,
+};
+
+/// Where a parse error sits in the batch, counted from 1; 0 is unset.
+const ParsePosition = struct {
+    question: usize = 0,
+    option: usize = 0,
 };
 
 pub const Input = struct {
@@ -120,7 +128,8 @@ pub fn executeWithRequester(result_alloc: Allocator, args_json: []const u8, requ
     defer parse_arena_state.deinit();
     const parse_arena = parse_arena_state.allocator();
 
-    const entries = parseQuestionBatch(parse_arena, args_json) catch |err| return invalidArgsBody(result_alloc, err);
+    var position: ParsePosition = .{};
+    const entries = parseQuestionBatch(parse_arena, args_json, &position) catch |err| return invalidArgsBody(result_alloc, err, position);
     const wait = if (requester.observer) |observer| observer.beginWait(.{ .kind = .question, .call_id = requester.call_id, .questions = entries }) else null;
     const answers_opt = requester.request(requester.ctx, requester.response_alloc, entries) catch |err| {
         if (wait) |value| value.end(.failed, &.{}, @errorName(err));
@@ -176,7 +185,13 @@ test "question observer records answers cancellation and failure at the real req
     try std.testing.expect(!capture.invalid);
 }
 
-fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchParseError![]const core_types.QuestionBatchEntry {
+/// Parses the batch into `arena`. On a question or option error, `position`
+/// names the failing one.
+fn parseQuestionBatch(
+    arena: Allocator,
+    args_json: []const u8,
+    position: *ParsePosition,
+) QuestionBatchParseError![]const core_types.QuestionBatchEntry {
     var parsed = std.json.parseFromSlice(std.json.Value, arena, args_json, .{}) catch {
         return error.InvalidArguments;
     };
@@ -199,14 +214,15 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
     var entries_buf: std.ArrayList(core_types.QuestionBatchEntry) = .empty;
     try entries_buf.ensureTotalCapacity(arena, questions_arr.items.len);
 
-    for (questions_arr.items) |q_item| {
+    for (questions_arr.items, 1..) |q_item, question_number| {
+        position.* = .{ .question = question_number };
         if (q_item != .object) return error.QuestionNotObject;
 
         const question_value = q_item.object.get("question") orelse return error.MissingQuestionText;
         if (question_value != .string) return error.QuestionTextNotString;
         const question_trimmed = std.mem.trim(u8, question_value.string, whitespace);
         if (question_trimmed.len == 0) return error.EmptyQuestionText;
-        const question_safe = try dupeTerminalSafeQuestionText(arena, question_trimmed);
+        const question_safe = try dupeQuestionMarkdown(arena, question_trimmed);
 
         const options_value = q_item.object.get("options") orelse return error.MissingOptions;
         if (options_value != .array) return error.OptionsNotArray;
@@ -216,15 +232,24 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
 
         var options_buf: std.ArrayList(core_types.QuestionOption) = .empty;
         try options_buf.ensureTotalCapacity(arena, options_arr.items.len);
+        var saw_freeform_label = false;
 
-        for (options_arr.items) |item| {
+        for (options_arr.items, 1..) |item, option_number| {
+            position.option = option_number;
             if (item != .object) return error.OptionNotObject;
             const label_value = item.object.get("label") orelse return error.MissingOptionLabel;
             if (label_value != .string) return error.OptionLabelNotString;
             const label_trimmed = std.mem.trim(u8, label_value.string, whitespace);
             if (label_trimmed.len == 0) return error.EmptyOptionLabel;
-            const label_safe = try dupeTerminalSafeQuestionText(arena, label_trimmed);
+            const label_safe = try dupeLabelText(arena, label_trimmed);
 
+            // The prompt adds its own "Other" row for a typed answer, so a
+            // second one from the model would only return the word itself.
+            if (std.ascii.eqlIgnoreCase(label_safe, question_prompt.freeform_option_label)) {
+                if (saw_freeform_label) return error.DuplicateOptionLabel;
+                saw_freeform_label = true;
+                continue;
+            }
             for (options_buf.items) |existing| {
                 if (std.ascii.eqlIgnoreCase(existing.label, label_safe)) return error.DuplicateOptionLabel;
             }
@@ -233,7 +258,7 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
             if (item.object.get("description")) |desc_value| {
                 if (desc_value == .string) {
                     const trimmed_desc = std.mem.trim(u8, desc_value.string, whitespace);
-                    if (trimmed_desc.len > 0) desc_slice = try dupeTerminalSafeQuestionText(arena, trimmed_desc);
+                    if (trimmed_desc.len > 0) desc_slice = try dupeDescriptionMarkdown(arena, trimmed_desc);
                 }
             }
 
@@ -243,8 +268,10 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
             });
         }
 
+        position.option = 0;
         entries_buf.appendAssumeCapacity(.{
             .question = question_safe,
+            .markdown = true,
             .options = try options_buf.toOwnedSlice(arena),
         });
     }
@@ -252,33 +279,107 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
     return entries_buf.toOwnedSlice(arena);
 }
 
-fn dupeTerminalSafeQuestionText(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+/// A label is one line: it names an option and comes back as the answer.
+/// Line breaks and tabs become one space, and control bytes become visible
+/// escapes, so model text cannot drive the terminal.
+fn dupeLabelText(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     if (text_utils.isTerminalSafe(text)) return arena.dupe(u8, text);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, text, std.math.maxInt(usize));
     return encoded.bytes;
 }
 
-fn invalidArgsBody(alloc: Allocator, err: QuestionBatchParseError) Allocator.Error![]u8 {
-    const body = switch (err) {
+/// A question keeps its lines. It is Markdown, which the prompt renders as
+/// the transcript renders a reply.
+fn dupeQuestionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var rest = text;
+    while (true) {
+        const end = std.mem.findAny(u8, rest, "\r\n") orelse rest.len;
+        try appendMarkdownLine(arena, &out, rest[0..end]);
+        if (end == rest.len) return out.items;
+        try out.append(arena, '\n');
+        // A carriage return ends a line with or without a line feed after it.
+        const crlf = rest[end] == '\r' and end + 1 < rest.len and rest[end + 1] == '\n';
+        rest = rest[end + @as(usize, if (crlf) 2 else 1) ..];
+    }
+}
+
+/// A description keeps its lines and is Markdown, as the question is.
+/// Blank lines are dropped so an option's rows stay together.
+fn dupeDescriptionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (lines.next()) |raw_line| {
+        // A line's indent can nest a list item, so only its end is trimmed.
+        const line = std.mem.trimEnd(u8, raw_line, " \t");
+        if (line.len == 0) continue;
+        if (out.items.len > 0) try out.append(arena, '\n');
+        try appendMarkdownLine(arena, &out, line);
+    }
+    return out.items;
+}
+
+/// Markdown reads a tab as the columns up to the next multiple of four.
+const markdown_tab_stop = 4;
+
+/// Appends one line of Markdown that holds only what the prompt can measure
+/// and draw. Control bytes, invalid UTF-8, and non-printing code points such
+/// as bidi overrides and zero-width characters become the visible escapes a
+/// label gets, so model text cannot drive the terminal or show a question
+/// other than the one it holds. Each tab becomes the spaces up to its tab
+/// stop: a terminal draws a tab up to eight cells wide and the prompt
+/// measures none, so a row with one would not fit where it is drawn.
+fn appendMarkdownLine(
+    arena: Allocator,
+    out: *std.ArrayList(u8),
+    line: []const u8,
+) Allocator.Error!void {
+    var column: usize = 0;
+    var pieces = std.mem.splitScalar(u8, line, '\t');
+    var first = true;
+    while (pieces.next()) |piece| {
+        if (!first) {
+            const spaces = markdown_tab_stop - column % markdown_tab_stop;
+            try out.appendNTimes(arena, ' ', spaces);
+            column += spaces;
+        }
+        first = false;
+        const piece_start = out.items.len;
+        try text_utils.appendTerminalSafeLine(arena, out, piece);
+        column += display_width.visibleWidth(out.items[piece_start..]);
+    }
+}
+
+/// Explains a parse error to the model. An error inside a question or an
+/// option leads with its position, so a long batch needs no search.
+fn invalidArgsBody(
+    alloc: Allocator,
+    err: QuestionBatchParseError,
+    position: ParsePosition,
+) Allocator.Error![]u8 {
+    const reason = switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidArguments => invalid_args_sentinel,
-        error.MissingQuestions => "(ask_user_question: missing required array \"questions\")",
-        error.QuestionsNotArray => "(ask_user_question: \"questions\" must be an array)",
-        error.QuestionCount => question_count_sentinel,
-        error.QuestionNotObject => "(ask_user_question: each question must be an object with a \"question\" and \"options\")",
-        error.MissingQuestionText => "(ask_user_question: each question requires a \"question\" string)",
-        error.QuestionTextNotString => "(ask_user_question: question \"question\" must be a string)",
-        error.EmptyQuestionText => "(ask_user_question: question text must not be empty)",
-        error.MissingOptions => "(ask_user_question: each question requires an \"options\" array)",
-        error.OptionsNotArray => "(ask_user_question: \"options\" must be an array)",
-        error.OptionCount => "(ask_user_question: provide 2 to 6 options per question)",
-        error.OptionNotObject => "(ask_user_question: each option must be an object with a \"label\")",
-        error.MissingOptionLabel => "(ask_user_question: each option requires a \"label\" string)",
-        error.OptionLabelNotString => "(ask_user_question: option \"label\" must be a string)",
-        error.EmptyOptionLabel => "(ask_user_question: option labels must not be empty)",
-        error.DuplicateOptionLabel => "(ask_user_question: option labels must be unique within a question)",
+        error.InvalidArguments => return alloc.dupe(u8, invalid_args_sentinel),
+        error.MissingQuestions => return alloc.dupe(u8, "(ask_user_question: missing required array \"questions\")"),
+        error.QuestionsNotArray => return alloc.dupe(u8, "(ask_user_question: \"questions\" must be an array)"),
+        error.QuestionCount => return alloc.dupe(u8, question_count_sentinel),
+        error.QuestionNotObject => "must be an object with a \"question\" and \"options\"",
+        error.MissingQuestionText => "requires a \"question\" string",
+        error.QuestionTextNotString => "\"question\" must be a string",
+        error.EmptyQuestionText => "question text must not be empty",
+        error.MissingOptions => "requires an \"options\" array",
+        error.OptionsNotArray => "\"options\" must be an array",
+        error.OptionCount => "provide 2 to 6 options",
+        error.OptionNotObject => "must be an object with a \"label\"",
+        error.MissingOptionLabel => "requires a \"label\" string",
+        error.OptionLabelNotString => "\"label\" must be a string",
+        error.EmptyOptionLabel => "label must not be empty",
+        error.DuplicateOptionLabel => "label repeats an earlier option; labels must be unique within a question",
     };
-    return alloc.dupe(u8, body);
+    if (position.option > 0) {
+        return alloc.print("(ask_user_question: question {d}, option {d}: {s})", .{ position.question, position.option, reason });
+    }
+    return alloc.print("(ask_user_question: question {d}: {s})", .{ position.question, reason });
 }
 
 fn freeAnswers(alloc: Allocator, answers: [][]u8) void {
@@ -338,11 +439,12 @@ const TerminalSafeRequester = struct {
         const self: *TerminalSafeRequester = @ptrCast(@alignCast(raw_ctx.?));
         self.called = true;
         if (entries.len == 1 and
-            std.mem.eql(u8, entries[0].question, "Q \\x1b[31m?") and
+            std.mem.eql(u8, entries[0].question, "Q\n\\x1b[31m?") and
+            entries[0].markdown and
             entries[0].options.len == 2 and
             std.mem.eql(u8, entries[0].options[0].label, "Alpha Fake") and
             entries[0].options[0].description != null and
-            std.mem.eql(u8, entries[0].options[0].description.?, "Desc Gap") and
+            std.mem.eql(u8, entries[0].options[0].description.?, "Desc    Gap") and
             std.mem.eql(u8, entries[0].options[1].label, "\\x1b[31mRed\\x1b[0m"))
         {
             self.saw_terminal_safe = true;
@@ -380,18 +482,74 @@ test "ask_user_question validates arguments and returns active sentinels" {
     try expectRequesterOutput("{}", "(ask_user_question: missing required array \"questions\")");
     try expectRequesterOutput("{\"questions\":{}}", "(ask_user_question: \"questions\" must be an array)");
     try expectRequesterOutput("{\"questions\":[]}", "(ask_user_question: provide 1 to 20 questions)");
-    try expectRequesterOutput("{\"questions\":[1]}", "(ask_user_question: each question must be an object with a \"question\" and \"options\")");
-    try expectRequesterOutput("{\"questions\":[{}]}", "(ask_user_question: each question requires a \"question\" string)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":1}]}", "(ask_user_question: question \"question\" must be a string)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"  \",\"options\":[]}]}", "(ask_user_question: question text must not be empty)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\"}]}", "(ask_user_question: each question requires an \"options\" array)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":1}]}", "(ask_user_question: \"options\" must be an array)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[]}]}", "(ask_user_question: provide 2 to 6 options per question)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[1,2]}]}", "(ask_user_question: each option must be an object with a \"label\")");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{},{}]}]}", "(ask_user_question: each option requires a \"label\" string)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":1},{\"label\":\"No\"}]}]}", "(ask_user_question: option \"label\" must be a string)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"\"},{\"label\":\"No\"}]}]}", "(ask_user_question: option labels must not be empty)");
-    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\" yes \"}]}]}", "(ask_user_question: option labels must be unique within a question)");
+    try expectRequesterOutput("{\"questions\":[1]}", "(ask_user_question: question 1: must be an object with a \"question\" and \"options\")");
+    try expectRequesterOutput("{\"questions\":[{}]}", "(ask_user_question: question 1: requires a \"question\" string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":1}]}", "(ask_user_question: question 1: \"question\" must be a string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"  \",\"options\":[]}]}", "(ask_user_question: question 1: question text must not be empty)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\"}]}", "(ask_user_question: question 1: requires an \"options\" array)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":1}]}", "(ask_user_question: question 1: \"options\" must be an array)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[]}]}", "(ask_user_question: question 1: provide 2 to 6 options)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[1,2]}]}", "(ask_user_question: question 1, option 1: must be an object with a \"label\")");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{},{}]}]}", "(ask_user_question: question 1, option 1: requires a \"label\" string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":1},{\"label\":\"No\"}]}]}", "(ask_user_question: question 1, option 1: \"label\" must be a string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"\"},{\"label\":\"No\"}]}]}", "(ask_user_question: question 1, option 1: label must not be empty)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\" yes \"}]}]}", "(ask_user_question: question 1, option 2: label repeats an earlier option; labels must be unique within a question)");
+}
+
+test "ask_user_question names the question and option an error is in" {
+    const valid = "{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"}]}";
+    inline for (.{
+        .{ "{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"}]}", "(ask_user_question: question 3: provide 2 to 6 options)" },
+        .{ "{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"},\"Maybe\"]}", "(ask_user_question: question 3, option 3: must be an object with a \"label\")" },
+        .{ "{\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"}]}", "(ask_user_question: question 3: requires a \"question\" string)" },
+    }) |case| {
+        try expectRequesterOutput("{\"questions\":[" ++ valid ++ "," ++ valid ++ "," ++ case[0] ++ "]}", case[1]);
+    }
+}
+
+const OtherLabelRequester = struct {
+    option_counts: [2]usize = .{ 0, 0 },
+
+    fn request(raw_ctx: ?*anyopaque, alloc: Allocator, entries: []const core_types.QuestionBatchEntry) anyerror!?[][]u8 {
+        const self: *OtherLabelRequester = @ptrCast(@alignCast(raw_ctx.?));
+        for (entries, 0..) |entry, index| {
+            self.option_counts[index] = entry.options.len;
+            for (entry.options) |option| {
+                if (std.ascii.eqlIgnoreCase(option.label, "Other")) return error.TestUnexpectedResult;
+            }
+        }
+        const answers = try alloc.alloc([]u8, entries.len);
+        errdefer alloc.free(answers);
+        var filled: usize = 0;
+        errdefer for (answers[0..filled]) |answer| alloc.free(answer);
+        while (filled < entries.len) : (filled += 1) {
+            answers[filled] = try alloc.dupe(u8, entries[filled].options[0].label);
+        }
+        return answers;
+    }
+};
+
+test "ask_user_question leaves the Other row to the prompt" {
+    const alloc = std.testing.allocator;
+    var requester = OtherLabelRequester{};
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":[" ++
+            "{\"question\":\"First?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"},{\"label\":\" other \",\"description\":\"Something else\"}]}," ++
+            "{\"question\":\"Second?\",\"options\":[{\"label\":\"Other\"},{\"label\":\"Keep\"}]}]}",
+        .{ .ctx = &requester, .response_alloc = alloc, .request = OtherLabelRequester.request },
+    );
+    defer alloc.free(output);
+    try std.testing.expectEqual([2]usize{ 2, 1 }, requester.option_counts);
+    try std.testing.expectEqualStrings(
+        "[{\"question\":\"First?\",\"answer\":\"Yes\"},{\"question\":\"Second?\",\"answer\":\"Keep\"}]",
+        output,
+    );
+
+    try expectRequesterOutput(
+        "{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"Other\"},{\"label\":\"other\"}]}]}",
+        "(ask_user_question: question 1, option 2: label repeats an earlier option; labels must be unique within a question)",
+    );
 }
 
 test "ask_user_question normalizes descriptions and encodes ordered answers" {
@@ -447,7 +605,8 @@ fn fuzzQuestionsText(_: void, smith: *std.testing.Smith) !void {
     const arena = arena_state.allocator();
 
     const args_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = text }, .{});
-    if (parseQuestionBatch(arena, args_json)) |entries| {
+    var position: ParsePosition = .{};
+    if (parseQuestionBatch(arena, args_json, &position)) |entries| {
         try std.testing.expect(entries.len >= 1 and entries.len <= question_answer.max_questions);
     } else |err| switch (err) {
         error.OutOfMemory => return err,
@@ -467,7 +626,7 @@ test "ask_user_question questions sent as JSON text decode or refuse arbitrary b
     });
 }
 
-test "ask_user_question flattens model-controlled prompt text for terminal display" {
+test "ask_user_question makes model-controlled prompt text safe for terminal display" {
     const alloc = std.testing.allocator;
     var requester = TerminalSafeRequester{};
     const output = try executeWithRequester(
@@ -484,9 +643,184 @@ test "ask_user_question flattens model-controlled prompt text for terminal displ
     try std.testing.expect(requester.called);
     try std.testing.expect(requester.saw_terminal_safe);
     try std.testing.expectEqualStrings(
-        "[{\"question\":\"Q \\\\x1b[31m?\",\"answer\":\"Alpha Fake\"}]",
+        "[{\"question\":\"Q\\n\\\\x1b[31m?\",\"answer\":\"Alpha Fake\"}]",
         output,
     );
+}
+
+const MultilineRequester = struct {
+    question: []const u8 = "",
+    descriptions: [3][]const u8 = .{ "", "", "" },
+    labels: [3][]const u8 = .{ "", "", "" },
+    markdown: bool = false,
+    arena: Allocator,
+
+    fn request(raw_ctx: ?*anyopaque, alloc: Allocator, entries: []const core_types.QuestionBatchEntry) anyerror!?[][]u8 {
+        const self: *MultilineRequester = @ptrCast(@alignCast(raw_ctx.?));
+        self.question = try self.arena.dupe(u8, entries[0].question);
+        self.markdown = entries[0].markdown;
+        for (entries[0].options, 0..) |option, index| {
+            self.labels[index] = try self.arena.dupe(u8, option.label);
+            self.descriptions[index] = try self.arena.dupe(u8, option.description orelse "");
+        }
+        const answers = try alloc.alloc([]u8, 1);
+        errdefer alloc.free(answers);
+        answers[0] = try alloc.dupe(u8, entries[0].options[0].label);
+        return answers;
+    }
+};
+
+test "ask_user_question keeps the lines of a question and a description" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var requester = MultilineRequester{ .arena = arena_state.allocator() };
+
+    const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
+        .question = "\n  Two ways to migrate:\r\n\r\n- **online**\r- `offline`\n\n```sh\n\tfx migrate\n```\n\nWhich one?  \n",
+        .options = .{
+            .{ .label = "Online\nnow", .description = " No downtime.\n \t\n  Takes two\thours. \rSlow writes.\r\n" },
+            .{ .label = "Offline", .description = "\n \n" },
+            .{ .label = "Later", .description = "One line." },
+        },
+    }} }, .{});
+    const output = try executeWithRequester(alloc, args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = MultilineRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expect(requester.markdown);
+    try std.testing.expectEqualStrings(
+        "Two ways to migrate:\n\n- **online**\n- `offline`\n\n```sh\n    fx migrate\n```\n\nWhich one?",
+        requester.question,
+    );
+    try std.testing.expectEqualStrings("Online now", requester.labels[0]);
+    try std.testing.expectEqualStrings("No downtime.\n  Takes two hours.\nSlow writes.", requester.descriptions[0]);
+    try std.testing.expectEqualStrings("", requester.descriptions[1]);
+    try std.testing.expectEqualStrings("One line.", requester.descriptions[2]);
+
+    // The result returns the question as it was shown, so a saved session
+    // replays the same card.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(requester.question, parsed.value.array.items[0].object.get("question").?.string);
+    try std.testing.expectEqualStrings("Online now", parsed.value.array.items[0].object.get("answer").?.string);
+}
+
+test "ask_user_question shows control bytes on every line of a question and a description" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var requester = MultilineRequester{ .arena = arena_state.allocator() };
+
+    const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
+        .question = "First \x1b[2J line\nSecond \x1b]0;title\x07 line\x08",
+        .options = .{
+            .{ .label = "Yes", .description = "Clear \x1b[2J\nscroll \x1b[3J back" },
+            .{ .label = "No" },
+        },
+    }} }, .{});
+    const output = try executeWithRequester(alloc, args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = MultilineRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expectEqualStrings(
+        "First \\x1b[2J line\nSecond \\x1b]0;title\\x07 line\\x08",
+        requester.question,
+    );
+    try std.testing.expectEqualStrings("Clear \\x1b[2J\nscroll \\x1b[3J back", requester.descriptions[0]);
+    for ([_][]const u8{ requester.question, requester.descriptions[0] }) |text| {
+        try expectEveryLineTerminalSafe(text);
+    }
+}
+
+fn expectEveryLineTerminalSafe(text: []const u8) !void {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| try std.testing.expect(text_utils.isTerminalSafe(line));
+}
+
+test "ask_user_question shows bidi overrides and zero-width characters as text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var requester = MultilineRequester{ .arena = arena_state.allocator() };
+
+    // U+202E reverses the text after it, U+2028 is a line separator, U+200B
+    // and U+2060 are invisible, and U+FEFF is a byte order mark.
+    const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
+        .question = "Pay \u{202e}eteled\u{202c} now?\nSecond\u{2028}line with zero\u{200b}width and\u{feff} a mark",
+        .options = .{
+            .{ .label = "Ok\u{202e}", .description = "keeps \u{202e}reversed\u{202c} text\n- item\u{2060} two\u{200f}" },
+            .{ .label = "No" },
+        },
+    }} }, .{});
+    const output = try executeWithRequester(alloc, args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = MultilineRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expectEqualStrings(
+        "Pay \\u{202e}eteled\\u{202c} now?\nSecond\\u{2028}line with zero\\u{200b}width and\\u{feff} a mark",
+        requester.question,
+    );
+    try std.testing.expectEqualStrings(
+        "keeps \\u{202e}reversed\\u{202c} text\n- item\\u{2060} two\\u{200f}",
+        requester.descriptions[0],
+    );
+    try std.testing.expectEqualStrings("Ok\\u{202e}", requester.labels[0]);
+    for ([_][]const u8{ requester.question, requester.descriptions[0], requester.labels[0] }) |text| {
+        try expectEveryLineTerminalSafe(text);
+    }
+
+    // The tool result carries the escaped question too, so the model and a
+    // resumed session see what the prompt showed.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    const result = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings(requester.question, result.get("question").?.string);
+    try std.testing.expectEqualStrings("Ok\\u{202e}", result.get("answer").?.string);
+}
+
+test "ask_user_question writes each tab as the spaces up to its tab stop" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var requester = MultilineRequester{ .arena = arena_state.allocator() };
+
+    // A tab nests a list item and indents code, so its columns stay. A tab
+    // after an escape or a wide character counts the cells before it.
+    const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
+        .question = "a\tb\n- item\n\t- nested\n```go\nfunc main() {\n\tif ok {\n\t\treturn\n\t}\n}\n```\n| x\ty |\n\u{65e5}\u{672c}\t\u{8a9e}\n[^n]: A\tB\tC",
+        .options = .{
+            .{ .label = "Go\tnow", .description = "run\x07\tnow\n- one\n\t- two\n\t\t\n[^d]: A\tB" },
+            .{ .label = "No" },
+        },
+    }} }, .{});
+    const output = try executeWithRequester(alloc, args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = MultilineRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expectEqualStrings(
+        "a   b\n- item\n    - nested\n```go\nfunc main() {\n    if ok {\n        return\n    }\n}\n```\n| x y |\n\u{65e5}\u{672c}    \u{8a9e}\n[^n]: A B   C",
+        requester.question,
+    );
+    try std.testing.expectEqualStrings("run\\x07 now\n- one\n    - two\n[^d]: A B", requester.descriptions[0]);
+    try std.testing.expectEqualStrings("Go now", requester.labels[0]);
+    for ([_][]const u8{ requester.question, requester.descriptions[0], requester.labels[0], output }) |text| {
+        try std.testing.expect(std.mem.findScalar(u8, text, '\t') == null);
+    }
+    try expectEveryLineTerminalSafe(requester.question);
+    try expectEveryLineTerminalSafe(requester.descriptions[0]);
 }
 
 const batch_option_count = 6;

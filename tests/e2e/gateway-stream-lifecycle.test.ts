@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
@@ -5826,11 +5827,10 @@ describe("gateway stream lifecycle", () => {
       expect((await tui.captureFullScrollback()).match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       await tui.sendText("/trace");
       await tui.waitForText("Trace saved at", 10_000);
-      const traceFile = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
-      expect(traceFile).toBeDefined();
-      const report = readFileSync(join(root.root, traceFile!), "utf8");
-      expect(report).toContain("invalid JSON arguments");
-      expect(report).not.toContain("MUST_NOT_EXECUTE");
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      const transcript = report.all("transcript_entry").map((entry) => String(entry.text)).join("\n");
+      expect(transcript).toContain("invalid JSON arguments");
+      expect(report.text).not.toContain("MUST_NOT_EXECUTE");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
@@ -11452,6 +11452,159 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 60_000);
 
+  // A branch switched by another process changes the runtime context while the
+  // turn runs. The change joins the turn at the next step's boundary as a note,
+  // next to the nudge fx sends after an empty reply. The saved turn restores a
+  // boundary's notes before its steering (D93), so the request that carries
+  // both must send them in that order, or the next request, a resume and a
+  // crash recovery rebuild a different request.
+  const CONTEXT_UPDATE_BRANCH = "feature/saved-order";
+  const initGitWorkspace = (workspace: string) => {
+    const init = Bun.spawnSync(["git", "init", "-q", "-b", "main"], { cwd: workspace });
+    if (init.exitCode !== 0) throw new Error(init.stderr.toString());
+  };
+  const switchBranch = (workspace: string) =>
+    writeFileSync(join(workspace, ".git", "HEAD"), `ref: refs/heads/${CONTEXT_UPDATE_BRANCH}\n`);
+  const CLAUDE_MODEL = "anthropic/claude-sonnet-4.5";
+  const branchChangeGateway = (replies: Array<() => Response | Promise<Response>>) => {
+    let index = 0;
+    return startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      {
+        models: [
+          { id: MODEL, type: "language", tags: ["tool-use"] },
+          { id: CLAUDE_MODEL, type: "language", tags: ["tool-use"] },
+        ],
+      },
+    );
+  };
+  const carriesNoteAndNudge = (body: string) => {
+    expect(body).toContain(`git_branch: ${CONTEXT_UPDATE_BRANCH}`);
+    expect(body).toContain(EMPTY_REPLY_NUDGE);
+  };
+
+  for (const model of [MODEL, CLAUDE_MODEL]) {
+    test(`${model}: a runtime context change after an empty reply joins before the nudge, and a resumed session's next request starts with that request`, async () => {
+      const root = createFixtureRoot("empty-other-context-change");
+      initGitWorkspace(root.workspace);
+      const gateway = branchChangeGateway([
+        () => {
+          switchBranch(root.workspace);
+          return emptyOtherReply()();
+        },
+        () => fakeGatewayFinalText("continued after the nudge"),
+        () => fakeGatewayFinalText("second turn answered"),
+      ]);
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: model };
+        const first = await runFx(["ask", "--json", "--auto", "Answer briefly."], {
+          cwd: root.workspace, env, timeoutMs: 30_000,
+        });
+        expect(first.code).toBe(0);
+        expect(gateway.requests).toHaveLength(2);
+        carriesNoteAndNudge(gateway.requests[1]!.body);
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--resume", parseAskJson(first.stdout).session_id, "And once more."],
+          { cwd: root.workspace, env, timeoutMs: 30_000 },
+        );
+        expect(resumed.code).toBe(0);
+        expect(parseAskJson(resumed.stdout).final_output).toContain("second turn answered");
+        expect(gateway.requests).toHaveLength(3);
+        expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+  }
+
+  test("a request that carries the nudge and the runtime context note fails once and is sent again in the same order, and the next request extends the one that went through", async () => {
+    const root = createFixtureRoot("empty-other-context-change-retry");
+    initGitWorkspace(root.workspace);
+    const gateway = branchChangeGateway([
+      () => {
+        switchBranch(root.workspace);
+        return emptyOtherReply()();
+      },
+      () => new Response("bad gateway", { status: 502 }),
+      () => fakeGatewayFinalText("continued after the nudge"),
+      () => fakeGatewayFinalText("second turn answered"),
+    ]);
+    try {
+      const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
+      const first = await runFx(["ask", "--json", "--auto", "Answer briefly."], {
+        cwd: root.workspace, env, timeoutMs: 60_000,
+      });
+      expect(first.code).toBe(0);
+      expect(gateway.requests).toHaveLength(3);
+      carriesNoteAndNudge(gateway.requests[2]!.body);
+      expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", parseAskJson(first.stdout).session_id, "And once more."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(gateway.requests).toHaveLength(4);
+      expectPromptExtends(gateway.requests[2]!.body, gateway.requests[3]!.body);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("a turn killed while the request with the nudge and the runtime context note waits resumes with that request's messages first", async () => {
+    const root = createFixtureRoot("empty-other-context-change-crash");
+    initGitWorkspace(root.workspace);
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    let releaseHeld: (() => void) | undefined;
+    const gateway = branchChangeGateway([
+      () => {
+        switchBranch(root.workspace);
+        return emptyOtherReply()();
+      },
+      async () => {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return fakeGatewayFinalText("too late");
+      },
+      () => fakeGatewayFinalText("recovered after the crash"),
+    ]);
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "Answer briefly."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      proc.kill("SIGKILL");
+      await proc.exited;
+      expect(gateway.requests).toHaveLength(2);
+      carriesNoteAndNudge(gateway.requests[1]!.body);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", onlySessionId(root.home), "Continue after the crash."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(gateway.requests).toHaveLength(3);
+      expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
   test("a second empty reply in a row that stops for another reason says so instead of Done.", async () => {
     const { result, bodies } = await askWithReplies("empty-other-twice", [
       emptyOtherReply(),
@@ -11833,7 +11986,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 70_000);
 
-  test("provider error finish reconciles without authorizing local tool execution", async () => {
+  test("provider error finish resends without running the local tool call it carried", async () => {
     const root = createFixtureRoot("provider-error");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
@@ -11872,8 +12025,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
       expectOnlyLeadingSystemMessages(gateway.requests[1]!.body);
-      expect(gateway.requests[1]!.body).toContain("Reconcile the available tool evidence");
-      expect(gateway.requests[1]!.body).toContain(
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
       expect(trace).not.toContain("event=before_tool_execution");
@@ -13191,7 +13344,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("streamed tool calls without finish reconcile without executing the uncertain call", async () => {
+  test("streamed tool calls without finish resend without executing the unfinished call", async () => {
     const root = createFixtureRoot("tool-without-finish");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "should-not-exist.txt");
@@ -13226,9 +13379,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(2);
       expect(trace).toContain("termination cause=done_without_finish");
       expectOnlyLeadingSystemMessages(gateway.requests[1]!.body);
-      expect(gateway.requests[1]!.body).toContain("Reconcile the available tool evidence");
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
       expect(gateway.requests[1]!.body).not.toContain("network_recovery");
-      expect(gateway.requests[1]!.body).toContain(
+      expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
       expect(trace).toContain("event=prompt_finish");
@@ -13259,19 +13412,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("uncertain tool reconciliation refuses a second tool result", async () => {
-    const root = createFixtureRoot("uncertain-tool-repeat");
+  test("a resend after an unexecuted local tool call runs the model's new call once", async () => {
+    const root = createFixtureRoot("unexecuted-tool-regenerated");
     const tracePath = join(root.root, "trace.log");
-    const sentinelPath = join(root.workspace, "must-not-repeat.txt");
+    const writtenPath = join(root.workspace, "written-once.txt");
     const responses = [
       sse(
-        'data: {"type":"tool-call","toolCallId":"write_uncertain","toolName":"write_file","input":{"path":"must-not-repeat.txt","content":"unsafe"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"write_unexecuted","toolName":"write_file","input":{"path":"written-once.txt","content":"once"}}\n\n' +
           "data: [DONE]\n\n",
       ),
-      fakeGatewayToolCall("write_repeat", "write_file", {
-        path: "must-not-repeat.txt",
-        content: "unsafe",
+      fakeGatewayToolCall("write_regenerated", "write_file", {
+        path: "written-once.txt",
+        content: "once",
       }),
+      fakeGatewayFinalText("Wrote the fixture file once."),
     ];
     const gateway = startGateway(() =>
       responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -13288,18 +13442,72 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      // The turn stops for review with fx's own terminal wording.
-      expect(result.code).toBe(1);
-      expect(json.recovery?.state).toBe("failed");
-      expect(json.recovery?.message).toContain("Tool state needs review");
-      expect(json.recovery?.need).toBeUndefined();
-      expect(gateway.requestCount()).toBe(2);
-      expect(gateway.requests[1]!.body).toContain(
+      // fx never ran the first call, so the resend may call the tool again,
+      // and the new call runs once.
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Wrote the fixture file once.");
+      expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
-      expect(existsSync(sentinelPath)).toBe(false);
-      expect(trace).toContain("event=uncertain_provider_tool_rejected");
-      expect(trace).not.toContain("event=before_tool_execution");
+      expect(readFileSync(writtenPath, "utf8")).toBe("once");
+      expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a malformed function call finish lets the resend call a tool", async () => {
+    const root = createFixtureRoot("malformed-function-call");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "malformed call fixture\n");
+    // Gemini ends a reply with MALFORMED_FUNCTION_CALL after a local tool
+    // call, and its answer to the resend calls a tool again.
+    const responses = [
+      fakeGatewaySse([
+        { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+        { type: "tool-call", toolCallId: "read_malformed", toolName: "read_file", input: { path: "notes.txt" } },
+        { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+      ]),
+      fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: "I'll read the file directly.\n" },
+        { type: "tool-input-start", id: "read_resent", toolName: "read_file" },
+        { type: "tool-call", toolCallId: "read_resent", toolName: "read_file", input: { path: "notes.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+      ]),
+      fakeGatewayFinalText("Read the notes after the malformed call."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Read notes.txt."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Read the notes after the malformed call.");
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(json.recovery?.message ?? "").not.toContain("Tool state needs review");
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).not.toContain(
+        '"toolChoice":{"type":"none"}',
+      );
+      expect(toolResultOutput(gateway.requests[2]!.body, "read_resent")).toContain(
+        "malformed call fixture",
+      );
+      expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

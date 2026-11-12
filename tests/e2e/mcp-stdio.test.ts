@@ -3,7 +3,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -22,6 +21,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -2464,16 +2464,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
 
       await tui.sendText("/trace");
-      let reports: string[] = [];
-      const deadline = Date.now() + 15_000;
-      while (reports.length === 0 && Date.now() < deadline) {
-        reports = readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"));
-        if (reports.length === 0) await Bun.sleep(50);
-      }
-      expect(reports).toHaveLength(1);
-      const report = readFileSync(join(root.root, reports[0]!), "utf8");
-      const problems = report.split("## Problems")[1]?.split("\n## ")[0] ?? "";
-      expect(problems).toContain(`cause="${cause}"`);
+      const report = await waitForNewTraceReport(root.root);
+      expect(traceReportNames(root.root)).toHaveLength(1);
+      const problemCalls = report.problems("tool_call").map((problem) => problem.call as Record<string, unknown>);
+      expect(problemCalls.filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(report.all("tool_call").filter((call) => call.cause === cause)).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       const wire = readWire(root.wireLogPath);
