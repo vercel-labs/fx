@@ -397,4 +397,76 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
     },
     TIMEOUT,
   );
+
+  /// How many times `text` appears in the whole scrollback.
+  async function countInScrollback(text: string): Promise<number> {
+    return (await session!.captureFullScrollback()).split(text).length - 1;
+  }
+
+  /// Polls until `text` appears at least `count` times in the scrollback.
+  async function waitForCount(text: string, count: number, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (await countInScrollback(text) < count) {
+      if (Date.now() > deadline) throw new Error(`expected ${count}x ${JSON.stringify(text)}, saw ${await countInScrollback(text)}`);
+      await Bun.sleep(100);
+    }
+  }
+
+  test(
+    "loop runs its prompt on the interval as a marked run",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LOOP_OK"));
+      const { stderrPath } = await launchLoopTerminal("run", { FX_TEST_LOOP_INTERVAL_MS: "500" });
+
+      await session!.sendText("/loop 1m say LOOP_OK");
+      await session!.waitForText("Loop 1 runs every 1m", 5_000);
+      // A draft in the composer does not hold a run back, and survives it.
+      await session!.sendLiteral("draft stays");
+      await waitForCount("loop 1 · every 1m · say LOOP_OK", 2, 10_000);
+      await waitForCount("LOOP_OK", 4, 10_000);
+      expect(await session!.capturePane()).toContain("draft stays");
+
+      await session!.sendKeys("C-u");
+      await session!.sendText("/loop stop 1");
+      await session!.waitForText("Stopped loop 1.", 5_000);
+
+      // A builtin command in a loop prompt is text for the model, never run.
+      await session!.sendText("/loop 1m /status");
+      await waitForCount("loop 2 · every 1m · /status", 1, 10_000);
+      await session!.waitForComposer(5_000);
+      expect(showsStatusPanel((await session!.capturePane()).split("\n"))).toBe(false);
+      await session!.sendText("/loop stop all");
+      await session!.waitForText("Stopped loop 2.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "loop waits for a running turn and runs once",
+    async () => {
+      const held = heldFakeGatewayFinalText();
+      let first = true;
+      gateway = startDynamicFakeGateway(() => {
+        if (!first) return fakeGatewayFinalText("ONCE_DONE");
+        first = false;
+        return held.response;
+      });
+      await launchLoopTerminal("busy", { FX_TEST_LOOP_INTERVAL_MS: "300" });
+
+      await session!.sendText("/loop 1m say ONCE");
+      await waitForCount("loop 1 · every 1m · say ONCE", 1, 10_000);
+      // Four intervals pass while the first run's turn is still going.
+      await Bun.sleep(1_200);
+      expect(await countInScrollback("loop 1 · every 1m · say ONCE")).toBe(1);
+      held.release("FIRST_DONE");
+      await session!.waitForText("FIRST_DONE", 5_000);
+      // The missed intervals collapse into one run, not a burst.
+      await waitForCount("loop 1 · every 1m · say ONCE", 2, 5_000);
+      expect(await countInScrollback("loop 1 · every 1m · say ONCE")).toBe(2);
+      await session!.sendText("/loop stop 1");
+      await session!.waitForText("Stopped loop 1.", 5_000);
+    },
+    TIMEOUT,
+  );
 });

@@ -4,12 +4,26 @@
 
 const std = @import("std");
 const loops = @import("../loops/loops.zig");
+const agents = @import("../agents/agents.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 /// Longest prompt excerpt a notice shows, after terminal-safe encoding.
 const max_prompt_display_bytes: usize = 200;
+
+/// The wait between runs that tests set with `FX_TEST_LOOP_INTERVAL_MS`, so
+/// an E2E test sees runs without waiting the 1m minimum. Bounded so a typo
+/// cannot hot-loop; null outside that range or when unset.
+fn testWaitMs() ?u64 {
+    const text = io_mod.getenv("FX_TEST_LOOP_INTERVAL_MS") orelse return null;
+    const parsed = std.fmt.parseInt(u64, text, 10) catch return null;
+    if (parsed < 100 or parsed > loops.min_interval_ms) return null;
+    return parsed;
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -24,7 +38,78 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Starts the run of every loop that is due on an idle instance. Runs
+        /// on each main-loop pass; a run that cannot be queued counts as a
+        /// failure and waits an interval, so no error leaves this function.
+        pub fn tick(app: *App) void {
+            if (comptime !agents.hasAgentField(App, "loops")) return;
+            const now_ms = app_permission_runtime.monotonicMillis();
+            if (app_agents_runtime.Runtime(App).firstOpen(app)) tickAgent(app, &app.main_agent, now_ms);
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .instance) continue;
+                tickAgent(app, &child.agent, now_ms);
+            }
+        }
+
+        fn tickAgent(app: *App, agent: *agents.Agent, now_ms: i64) void {
+            if (agent.loops.count() == 0 or !agentIdle(agent)) return;
+            const loop = agent.loops.nextDue(now_ms) orelse return;
+            // Only the agent on screen has the transcript a notice draws in.
+            // A hidden instance still shows the run's prompt as a user card.
+            if (agents.screenAgentOf(app) == agent) writeRunMarker(app, loop.*) catch |err| debug_trace.logf("loop", "event=marker_failed id={d} err={s}", .{ loop.id, @errorName(err) });
+            const turn_id = debug_trace.nextTurnId();
+            app.queueLoopRun(agent, loop.prompt, turn_id) catch |err| {
+                const finished = agent.loops.noteAdmissionFailed(loop, now_ms);
+                debug_trace.logf("loop", "event=admission_failed id={d} err={s} failures={d}", .{ loop.id, @errorName(err), finished.failures });
+                writeCouldNotStart(app, loop.*, err) catch {};
+                return;
+            };
+            agent.loops.markStarted(loop, turn_id);
+            debug_trace.logf("loop", "event=run_started id={d} turn={d}", .{ loop.id, turn_id });
+        }
+
+        /// Records how a loop's run ended, so the loop waits an interval
+        /// from now before its next run.
+        pub fn noteTurnFinished(app: *App, agent: anytype, finished: types.TurnFinished) !void {
+            _ = app;
+            const outcome: loops.Outcome = switch (finished.outcome) {
+                .completed => .completed,
+                .interrupted => .interrupted,
+                .failed => .failed,
+                .paused => .paused,
+            };
+            const result = agent.loops.noteTurnFinished(finished.turn_id, outcome, app_permission_runtime.monotonicMillis()) orelse return;
+            debug_trace.logf("loop", "event=run_finished id={d} outcome={s} failures={d}", .{ result.id, @tagName(outcome), result.failures });
+        }
+
+        /// The `/compact` busy check (`input_submit_runtime.zig`) negated: no
+        /// prompt waiting to be sent, no turn running or queued, and no
+        /// compaction, so a message the user just sent always goes first.
+        fn agentIdle(agent: *agents.Agent) bool {
+            return agent.submission.pending == null and !agent.worker.isProcessing() and
+                agent.worker.queuedPromptCount() == 0 and agent.worker.contextCompactionStatus() == .idle;
+        }
+
+        fn writeRunMarker(app: *App, loop: loops.Loop) !void {
+            var shown = try text_utils.encodeTerminalSafe(app.alloc, loop.prompt, max_prompt_display_bytes);
+            defer shown.deinit(app.alloc);
+            var interval_buf: [32]u8 = undefined;
+            try writeNotice(app, .neutral, "loop {d} · every {s} · {s}", .{ loop.id, formatInterval(&interval_buf, loop.interval_ms), shown.bytes });
+        }
+
+        fn writeCouldNotStart(app: *App, loop: loops.Loop, err: anyerror) !void {
+            var interval_buf: [32]u8 = undefined;
+            try writeNotice(app, .warning, "Loop {d} could not start: {s}. Next try in {s} (failure {d} of {d}).", .{
+                loop.id,
+                @errorName(err),
+                formatInterval(&interval_buf, loop.interval_ms),
+                loop.consecutive_failures,
+                loops.pause_after_failures,
+            });
+        }
+
         fn armLoop(app: *App, agent: anytype, interval_ms: u64, prompt: []const u8) !void {
+            agent.loops.wait_override_ms = testWaitMs();
             const id = agent.loops.arm(app.alloc, interval_ms, prompt, app_permission_runtime.monotonicMillis()) catch |err| switch (err) {
                 error.TooManyLoops => return writeNotice(app, .warning, "A conversation holds at most {d} loops. Stop one with /loop stop <id>.", .{loops.max_loops}),
                 error.OutOfMemory => return err,

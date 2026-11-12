@@ -44,6 +44,7 @@ const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_agents_runtime = @import("core/app/app_agents_runtime.zig");
+const app_loop_runtime = @import("core/app/app_loop_runtime.zig");
 const render_input = @import("ui/footer/render_input.zig");
 const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const app_instances_runtime = @import("core/app/app_instances_runtime.zig");
@@ -433,6 +434,7 @@ const App = struct {
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const AgentsAppRuntime = app_agents_runtime.Runtime(Self);
+    const LoopAppRuntime = app_loop_runtime.Runtime(Self);
     const InstancesAppRuntime = app_instances_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
@@ -1524,6 +1526,21 @@ const App = struct {
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent),
         );
         return true;
+    }
+
+    /// Queues a `/loop` run of `prompt` as the user's own request, behind
+    /// any running turn and never steering it. The run shows its prompt as a
+    /// user card; an already-presented prompt needs a pending composer
+    /// submission (`acceptPresentedPrompt`), which a loop run never has.
+    pub fn queueLoopRun(self: *App, agent: *agents.Agent, prompt: []const u8, turn_id: u64) !void {
+        const queued = try self.snapshotPrompt(agent, prompt, &.{}, null, &.{}, turn_id, false);
+        errdefer releaseUnadmittedPrompt(agent, queued);
+        try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        WorkerAppRuntime.syncState(
+            self,
+            agent,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent),
+        );
     }
 
     pub fn resumeSelectedSession(self: *App, agent: *agents.Agent) !bool {
@@ -3401,6 +3418,7 @@ const App = struct {
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.
         AgentsAppRuntime.takePosts(self);
+        LoopAppRuntime.tick(self);
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);

@@ -98,6 +98,9 @@ pub const Finished = struct { id: u32, failed: bool, failures: u8, paused: bool 
 pub const Loops = struct {
     items: std.ArrayList(Loop) = .empty,
     next_id: u32 = 1,
+    /// Test hook: the wait between runs for every loop, in place of each
+    /// loop's interval. Lists and notices still show the interval.
+    wait_override_ms: ?u64 = null,
 
     /// Copies `prompt`. The first run is due one interval from `now_ms`.
     pub fn arm(self: *Loops, alloc: Allocator, interval_ms: u64, prompt: []const u8, now_ms: i64) error{ TooManyLoops, OutOfMemory }!u32 {
@@ -110,7 +113,7 @@ pub const Loops = struct {
             .interval_ms = interval_ms,
             .prompt = owned,
             .state = .waiting,
-            .next_due_ms = after(now_ms, interval_ms),
+            .next_due_ms = after(now_ms, self.wait_override_ms orelse interval_ms),
         });
         self.next_id += 1;
         return id;
@@ -134,7 +137,7 @@ pub const Loops = struct {
         if (loop.state != .paused) return error.NotPaused;
         loop.state = .waiting;
         loop.consecutive_failures = 0;
-        loop.next_due_ms = after(now_ms, loop.interval_ms);
+        loop.next_due_ms = after(now_ms, self.waitMs(loop.*));
     }
 
     /// The waiting loop due earliest at `now_ms`, or null. Running and paused
@@ -164,12 +167,12 @@ pub const Loops = struct {
             if (loop.state != .running or loop.running_turn_id != turn_id) continue;
             loop.running_turn_id = 0;
             switch (outcome) {
-                .failed => return recordFailure(loop, now_ms),
+                .failed => return self.recordFailure(loop, now_ms),
                 .completed => loop.consecutive_failures = 0,
                 .interrupted, .paused => {},
             }
             loop.state = .waiting;
-            loop.next_due_ms = after(now_ms, loop.interval_ms);
+            loop.next_due_ms = after(now_ms, self.waitMs(loop.*));
             return .{ .id = loop.id, .failed = false, .failures = loop.consecutive_failures, .paused = false };
         }
         return null;
@@ -178,8 +181,7 @@ pub const Loops = struct {
     /// Counts a run that could not be queued as a failure, so a persistent
     /// queue error waits an interval instead of retrying on every pass.
     pub fn noteAdmissionFailed(self: *Loops, loop: *Loop, now_ms: i64) Finished {
-        _ = self;
-        return recordFailure(loop, now_ms);
+        return self.recordFailure(loop, now_ms);
     }
 
     /// Frees every loop; how many there were.
@@ -205,15 +207,19 @@ pub const Loops = struct {
         for (self.items.items, 0..) |loop, index| if (loop.id == id) return index;
         return null;
     }
-};
 
-fn recordFailure(loop: *Loop, now_ms: i64) Finished {
-    loop.consecutive_failures +|= 1;
-    loop.running_turn_id = 0;
-    loop.next_due_ms = after(now_ms, loop.interval_ms);
-    loop.state = if (loop.consecutive_failures >= pause_after_failures) .paused else .waiting;
-    return .{ .id = loop.id, .failed = true, .failures = loop.consecutive_failures, .paused = loop.state == .paused };
-}
+    fn waitMs(self: *const Loops, loop: Loop) u64 {
+        return self.wait_override_ms orelse loop.interval_ms;
+    }
+
+    fn recordFailure(self: *const Loops, loop: *Loop, now_ms: i64) Finished {
+        loop.consecutive_failures +|= 1;
+        loop.running_turn_id = 0;
+        loop.next_due_ms = after(now_ms, self.waitMs(loop.*));
+        loop.state = if (loop.consecutive_failures >= pause_after_failures) .paused else .waiting;
+        return .{ .id = loop.id, .failed = true, .failures = loop.consecutive_failures, .paused = loop.state == .paused };
+    }
+};
 
 /// `now_ms` plus `interval_ms`, saturating instead of overflowing.
 fn after(now_ms: i64, interval_ms: u64) i64 {
@@ -441,4 +447,14 @@ test "count includes paused loops and endAll empties the list" {
     try testing.expectEqual(@as(usize, 2), loops.count());
     try testing.expectEqual(@as(usize, 2), loops.endAll(testing.allocator));
     try testing.expectEqual(@as(usize, 0), loops.count());
+}
+
+test "wait override schedules runs without changing the interval" {
+    var loops: Loops = .{ .wait_override_ms = 500 };
+    defer loops.deinit(testing.allocator);
+    _ = try loops.arm(testing.allocator, hour_ms, "p", 0);
+    try testing.expectEqual(@as(u64, hour_ms), loops.items.items[0].interval_ms);
+    loops.markStarted(loops.nextDue(500).?, 1);
+    _ = loops.noteTurnFinished(1, .completed, 600).?;
+    try testing.expectEqual(@as(i64, 1_100), loops.items.items[0].next_due_ms);
 }

@@ -6,6 +6,7 @@ const activity_status = @import("../output/activity_status.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const app_loop_runtime = @import("app_loop_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -1586,6 +1587,10 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime agents.hasAgentField(App, "child_run")) {
                 if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished);
+            }
+            if (comptime agents.hasAgentField(App, "loops")) {
+                if (lifecycle == .turn_finished) app_loop_runtime.Runtime(App).noteTurnFinished(app, agent, lifecycle.turn_finished) catch |err|
+                    debug_trace.logf("loop", "event=note_failed turn={d} err={s}", .{ lifecycle.turn_finished.turn_id, @errorName(err) });
             }
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&agent.stream, kind);
