@@ -61,7 +61,10 @@ pub fn Runtime(comptime App: type) type {
             app.queueLoopRun(agent, loop.prompt, turn_id) catch |err| {
                 const finished = agent.loops.noteAdmissionFailed(loop, now_ms);
                 debug_trace.logf("loop", "event=admission_failed id={d} err={s} failures={d}", .{ loop.id, @errorName(err), finished.failures });
-                writeCouldNotStart(app, loop.*, err) catch {};
+                if (agents.screenAgentOf(app) == agent) {
+                    writeCouldNotStart(app, loop.*, err) catch {};
+                    if (finished.paused) writeFailure(app, finished) catch {};
+                }
                 return;
             };
             agent.loops.markStarted(loop, turn_id);
@@ -69,9 +72,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Records how a loop's run ended, so the loop waits an interval
-        /// from now before its next run.
+        /// from now before its next run, and says when a run failed or the
+        /// loop paused.
         pub fn noteTurnFinished(app: *App, agent: anytype, finished: types.TurnFinished) !void {
-            _ = app;
             const outcome: loops.Outcome = switch (finished.outcome) {
                 .completed => .completed,
                 .interrupted => .interrupted,
@@ -80,6 +83,17 @@ pub fn Runtime(comptime App: type) type {
             };
             const result = agent.loops.noteTurnFinished(finished.turn_id, outcome, app_permission_runtime.monotonicMillis()) orelse return;
             debug_trace.logf("loop", "event=run_finished id={d} outcome={s} failures={d}", .{ result.id, @tagName(outcome), result.failures });
+            if (!result.failed or agents.screenAgentOf(app) != agent) return;
+            try writeFailure(app, result);
+        }
+
+        /// The failure notice, or the pause notice once the loop paused.
+        fn writeFailure(app: *App, result: loops.Finished) !void {
+            if (result.paused) {
+                debug_trace.logf("loop", "event=paused id={d}", .{result.id});
+                return writeNotice(app, .warning, "Loop {d} paused after {d} failed runs. Fix the cause, then run /loop resume {d}.", .{ result.id, loops.pause_after_failures, result.id });
+            }
+            try writeNotice(app, .warning, "Loop {d} failed ({d} of {d} before it pauses).", .{ result.id, result.failures, loops.pause_after_failures });
         }
 
         /// The `/compact` busy check (`input_submit_runtime.zig`) negated: no
@@ -263,4 +277,37 @@ test "formatRemaining rounds down to the largest units" {
     try std.testing.expectEqualStrings("59m", formatRemaining(&buf, 60 * 60_000 - 1));
     try std.testing.expectEqualStrings("2h 5m", formatRemaining(&buf, (2 * 60 + 5) * 60_000));
     try std.testing.expectEqualStrings("3d 4h", formatRemaining(&buf, (3 * 24 + 4) * 60 * 60_000));
+}
+
+test "noteTurnFinished reports each failed run, then the pause" {
+    const FakeAgent = struct { loops: loops.Loops = .{} };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        main_agent: FakeAgent = .{},
+        notices: std.ArrayList([]u8) = .empty,
+
+        pub fn agent(self: *@This()) *FakeAgent {
+            return &self.main_agent;
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, record: bool) !void {
+            _ = record;
+            try self.notices.append(self.alloc, try self.alloc.dupe(u8, notice.body));
+        }
+    };
+    var app: FakeApp = .{ .alloc = std.testing.allocator };
+    defer {
+        for (app.notices.items) |notice| app.alloc.free(notice);
+        app.notices.deinit(app.alloc);
+        app.main_agent.loops.deinit(app.alloc);
+    }
+    _ = try app.main_agent.loops.arm(app.alloc, 60_000, "p", 0);
+    for (1..loops.pause_after_failures + 1) |turn| {
+        app.main_agent.loops.markStarted(&app.main_agent.loops.items.items[0], turn);
+        try Runtime(FakeApp).noteTurnFinished(&app, &app.main_agent, .{ .turn_id = turn, .outcome = .failed });
+    }
+    try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
+    try std.testing.expectEqualStrings("Loop 1 failed (1 of 3 before it pauses).", app.notices.items[0]);
+    try std.testing.expectEqualStrings("Loop 1 failed (2 of 3 before it pauses).", app.notices.items[1]);
+    try std.testing.expectEqualStrings("Loop 1 paused after 3 failed runs. Fix the cause, then run /loop resume 1.", app.notices.items[2]);
 }

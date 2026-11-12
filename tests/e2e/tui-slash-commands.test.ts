@@ -469,4 +469,31 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "loop holds while a rejected run waits for the user, then carries on",
+    async () => {
+      // A rejected request (HTTP 400) does not end the turn: fx asks the user
+      // to act, so the loop holds at one run instead of counting failures.
+      let failing = true;
+      gateway = startDynamicFakeGateway(() =>
+        failing ? new Response("bad request", { status: 400 }) : fakeGatewayFinalText("BACK"));
+      await launchLoopTerminal("held", { FX_TEST_LOOP_INTERVAL_MS: "300" });
+
+      await session!.sendText("/loop 1m ping");
+      await session!.waitForText("The provider rejected this request", 10_000);
+      await Bun.sleep(1_500);
+      expect(await countInScrollback("loop 1 · every 1m · ping")).toBe(1);
+      await session!.sendText("/loop resume 1");
+      await session!.waitForText("Loop 1 is not paused.", 5_000);
+
+      failing = false;
+      await session!.sendText("hello");
+      await waitForCount("BACK", 1, 10_000);
+      await waitForCount("loop 1 · every 1m · ping", 2, 10_000);
+      await session!.sendText("/loop stop 1");
+      await session!.waitForText("Stopped loop 1.", 5_000);
+    },
+    TIMEOUT,
+  );
 });
