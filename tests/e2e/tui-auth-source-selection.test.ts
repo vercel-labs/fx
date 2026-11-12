@@ -2250,6 +2250,50 @@ tmuxTest(
 );
 
 tmuxTest(
+  "a sign-in team list with bad entries shows only the usable team and finishes the request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-bad-teams-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      fakeGatewayFinalText("BAD_TEAM_LIST_RESPONSE"),
+    ]);
+    // The refresh token is rejected, so fx opens a sign-in. One team's name
+    // and another team's slug hold control characters.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "\u001b]2;NAME_TITLE\u0007Vercel Labs" },
+        { id: "team_bad", slug: "\u001b[2JBAD_SLUG", name: "BAD_TEAM" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after I sign in again.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    // The team with a bad name shows under its slug; the team fx could not
+    // send is left out.
+    const picker = await session.waitForPane((pane) => pane.includes("› vercel-labs"), TIMEOUT);
+    expect(picker).not.toContain("BAD_TEAM");
+    expect(picker).not.toContain("BAD_SLUG");
+    expect(picker).not.toContain("NAME_TITLE");
+    await session.sendKeys("Enter");
+    await session.waitForText("BAD_TEAM_LIST_RESPONSE", TIMEOUT);
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "an expired login during a request opens sign-in and finishes the request",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-sign-in-"));
