@@ -88,7 +88,7 @@ pub fn toolCallLifetimeStats() ToolCallLifetimeStats {
 }
 
 /// Records a subagent turn as it starts, so `/trace` can say which subagent
-/// a `subagent#N` belongs to.
+/// a `subagent_id` belongs to.
 pub fn recordSubagentTurnStart(start: SubagentTurnStart) void {
     subagent_turn_metrics.recordStart(start);
 }
@@ -107,8 +107,6 @@ pub fn snapshotSubagentTurns(out: []SubagentTurn) usize {
 pub fn subagentTurnTotal() u64 {
     return subagent_turn_metrics.totalTurns();
 }
-
-pub const writeSubagentTextLine = subagent_turn_metrics.writeOneLine;
 
 pub fn resetSession() void {
     network_metrics.reset();

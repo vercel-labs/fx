@@ -5720,7 +5720,7 @@ pub fn processAgentPrompt(
     var observed_error: ?anyerror = null;
     if (deps.observer) |observer| observer.beginTurn(job.prompt, job.recovery_checkpoint != null);
     // A subagent's turn is recorded for `/trace`, which says which subagent
-    // each `subagent#N` in its tool lines belongs to.
+    // each `subagent_id` in its tool and network records belongs to.
     const traced_subagent_id: u64 = if (effective_config.origin == .subagent) effective_config.subagent_id else 0;
     if (traced_subagent_id != 0) diagnostics.recordSubagentTurnStart(.{
         .subagent_id = traced_subagent_id,

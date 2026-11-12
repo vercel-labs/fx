@@ -1812,9 +1812,12 @@ describe("effect-aware command permissions", () => {
         }
         return finalText("unexpected request");
       }
-      if (currentUserText(body).startsWith("Subagent report")) {
+      // A failed ship tells main that its request waits; that message stays
+      // in main's history, so only the report itself names who reported.
+      const current = currentUserText(body);
+      if (current.startsWith("Subagent report")) {
         for (const name of ["cards", "ship"]) {
-          if (body.includes(`\\"agent\\":\\"${name}\\"`)) reported.add(name);
+          if (current.includes(`"agent":"${name}"`)) reported.add(name);
         }
         return finalText(`report noted ${reported.size}`);
       }
@@ -1857,32 +1860,41 @@ describe("effect-aware command permissions", () => {
       process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
       TIMEOUT,
     );
-    const report = readFileSync(latestTraceReportPath(root), "utf8");
-    const subagents = report.split("## Subagents\n")[1]?.split("\n## ")[0];
-    expect(subagents).toBeDefined();
-    const entry = (name: string) => {
-      const start = subagents!.indexOf(`- ${name} session=`);
-      expect(start).toBeGreaterThanOrEqual(0);
-      const next = subagents!.indexOf("\n- ", start + 1);
-      return subagents!.slice(start, next < 0 ? undefined : next);
-    };
+    const report = readTraceReport(latestTraceReportPath(root.root));
+    const summary = report.one("subagents");
+    expect(summary.open).toBe(2);
+    expect(summary.turns_total).toBeGreaterThanOrEqual(Number(summary.turns_retained));
+    // Both are open, so no closed session is listed.
+    const listed = report.all("subagent");
+    expect(listed.map((record) => record.name).sort()).toEqual(["cards", "ship"]);
+    const entry = (name: string) => listed.find((record) => record.name === name)!;
+    const turnsOf = (sessionId: unknown) => report.all("subagent_turn").filter((turn) => turn.session_id === sessionId);
     const cards = entry("cards");
     const ship = entry("ship");
-    expect(subagents).toMatch(/^children=2 turns_kept=\d+ of \d+\n/);
-    expect(cards).toContain(`task: ${cardsTask}`);
-    expect(ship).toContain(`task: ${shipTask}`);
-    expect(cards).toMatch(/ profile=\S+ state=(idle|finished) work=\S+ last=completed\n/);
-    expect(cards).toContain("window tool calls: 1 (1 not succeeded)");
+    expect(cards).toMatchObject({ open: true, task: cardsTask, last_outcome: "completed", tool_calls: { retained: 1, not_succeeded: 1 } });
+    expect(ship).toMatchObject({ open: true, task: shipTask });
+    expect(cards.state).toMatch(/^(idle|finished)$/);
+    expect(cards.profile).toEqual(expect.any(String));
+    expect(cards.activity).toEqual(expect.any(String));
 
     // The number on cards' failed command is one of cards' turns.
-    const failedCall = report.match(/name=shell outcome=command_failed duration=\d+ms source=subagent#(\d+)/);
-    expect(failedCall).not.toBeNull();
-    expect(cards).toMatch(new RegExp(`\\n  turn subagent#${failedCall![1]} outcome=completed model=${MODEL} `));
+    // Not toMatchObject with expect.any: Bun writes the matcher into the
+    // record it checks.
+    const failedCall = report.all("tool_call").find((call) => call.name === "shell" && call.outcome === "command_failed");
+    expect(failedCall?.source).toBe("subagent");
+    const failedId = failedCall?.subagent_id;
+    expect(typeof failedId).toBe("number");
+    expect(turnsOf(cards.session_id).find((turn) => turn.subagent_id === failedId))
+      .toMatchObject({ source: "subagent", outcome: "completed", model: MODEL });
+    // Each subagent model request names exactly one listed turn.
+    const turnIds = report.all("subagent_turn").map((turn) => turn.subagent_id);
+    for (const call of report.all("network_call").filter((call) => call.source === "subagent")) {
+      expect(turnIds.filter((id) => id === call.subagent_id)).toHaveLength(1);
+    }
 
     // Each session ID is that subagent's own session folder.
-    for (const text of [cards, ship]) {
-      const id = text.match(/ session=(\S+)/)![1]!;
-      expect(existsSync(join(storeRoot(root.home), id, "log.jsonl"))).toBe(true);
+    for (const subagent of [cards, ship]) {
+      expect(existsSync(join(storeRoot(root.home), String(subagent.session_id), "log.jsonl"))).toBe(true);
     }
     expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -1890,15 +1902,16 @@ describe("effect-aware command permissions", () => {
     expect(await activeSession.waitForSessionEnd()).toBe(true);
     await activeSession.kill();
     activeSession = null;
-    return { ship };
+    return { report, ship, shipTurns: turnsOf(ship.session_id) };
   }
 
   test.skipIf(!tmuxAvailable())(
     "TUI trace names each subagent, its task, its state, and its turns",
     async () => {
-      const { ship } = await traceTwoSubagents(false);
-      expect(ship).toMatch(/ state=(idle|finished) work=\S+ last=completed\n/);
-      expect(ship).toMatch(/\n  turn subagent#\d+ outcome=completed /);
+      const { ship, shipTurns } = await traceTwoSubagents(false);
+      expect(ship.state).toMatch(/^(idle|finished)$/);
+      expect(ship.last_outcome).toBe("completed");
+      expect(shipTurns.some((turn) => turn.outcome === "completed")).toBe(true);
     },
     TIMEOUT * 4,
   );
@@ -1906,11 +1919,16 @@ describe("effect-aware command permissions", () => {
   test.skipIf(!tmuxAvailable())(
     "TUI trace shows a subagent whose model request failed",
     async () => {
-      const { ship } = await traceTwoSubagents(true);
+      const { report, ship, shipTurns } = await traceTwoSubagents(true);
       // Its request failed and waits for the user, as the agent list says.
-      expect(ship).toMatch(/ state=needs_you work=running last=none\n/);
-      expect(ship).toMatch(/\n  status: \S/);
-      expect(ship).toMatch(/\n  turn subagent#\d+ outcome=running /);
+      expect(ship).toMatchObject({ state: "needs_you", activity: "running", last_outcome: "none" });
+      expect(ship.status).toMatch(/\S/);
+      const running = shipTurns.filter((turn) => turn.outcome === "running");
+      expect(running).toHaveLength(1);
+      // The refused request carries the number of ship's running turn.
+      const refused = report.all("network_call").filter((call) => call.status === 400);
+      expect(refused.length).toBeGreaterThan(0);
+      for (const call of refused) expect(call).toMatchObject({ source: "subagent", subagent_id: running[0]!.subagent_id });
     },
     TIMEOUT * 4,
   );
@@ -1946,8 +1964,10 @@ describe("effect-aware command permissions", () => {
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
         TIMEOUT,
       );
-      const report = readFileSync(latestTraceReportPath(root), "utf8");
-      expect(report).toContain("\n## Subagents\n(none)\n");
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      expect(report.one("subagents")).toMatchObject({ open: 0, turns_retained: 0, turns_total: 0 });
+      expect(report.all("subagent")).toEqual([]);
+      expect(report.all("subagent_turn")).toEqual([]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

@@ -2215,7 +2215,7 @@ pub fn Runtime(comptime App: type) type {
                     .name = child.name,
                     .profile = if (child.profile.len > 0) child.profile else profiles.main_name,
                     .title = agent.session_title.items,
-                    .state = @tagName(instanceState(agent, requestWaitsForUser(app, child))),
+                    .state = @tagName(stateOf(app, child)),
                     .model = model,
                     .effort = effortLabel(app, agent, model),
                     .status = try statusText(app, child, alloc),

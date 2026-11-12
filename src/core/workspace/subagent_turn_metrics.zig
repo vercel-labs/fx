@@ -1,16 +1,15 @@
 //! In-memory record of recent subagent turns, for `/trace`.
 //!
 //! Each subagent turn gets a new number (`debug_trace.nextSubagentId`), and a
-//! tool call names only that number, as `source=subagent#N`. This ring keeps
-//! which subagent session each number ran for, with the turn's model, effort,
-//! the start of its prompt, and how it ended, so the report can say which
-//! subagent did what. Every agent's worker thread records here, so one mutex
-//! guards the ring.
+//! tool call names only that number, as its trace record's `subagent_id`.
+//! This ring keeps which subagent session each number ran for, with the
+//! turn's model, effort, the start of its prompt, and how it ended, so the
+//! report can say which subagent did what. Every agent's worker thread
+//! records here, so one mutex guards the ring.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const display_width = @import("../shared/display_width.zig");
 
 pub const ring_capacity: usize = 128;
 pub const max_session_id_len: usize = 64;
@@ -158,37 +157,6 @@ pub fn reset() void {
     total = 0;
 }
 
-/// Writes `text` as one line a terminal prints safely: line breaks and tabs
-/// become spaces, other control characters and bytes that are not UTF-8
-/// become `\xNN`.
-pub fn writeOneLine(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-    var index: usize = 0;
-    while (index < text.len) {
-        const byte = text[index];
-        if (byte == '\n' or byte == '\r' or byte == '\t') {
-            try writer.writeByte(' ');
-            index += 1;
-            continue;
-        }
-        const len: usize = std.unicode.utf8ByteSequenceLength(byte) catch 1;
-        const codepoint = if (index + len <= text.len)
-            display_width.decodeUtf8Sequence(text[index..][0..len]) catch null
-        else
-            null;
-        if (codepoint == null) {
-            try writer.print("\\x{x:0>2}", .{byte});
-            index += 1;
-            continue;
-        }
-        if (codepoint.? < 0x20 or (codepoint.? >= 0x7f and codepoint.? < 0xa0)) {
-            for (text[index..][0..len]) |part| try writer.print("\\x{x:0>2}", .{part});
-        } else {
-            try writer.writeAll(text[index..][0..len]);
-        }
-        index += len;
-    }
-}
-
 const testing = std.testing;
 
 fn startForTest(subagent_id: u64, session_id: []const u8) Start {
@@ -293,13 +261,6 @@ test "a reset clears the turns" {
     defer freeForTest(turns);
     try testing.expectEqual(@as(usize, 0), turns.len);
     try testing.expectEqual(@as(u64, 0), totalTurns());
-}
-
-test "one-line text has no line break or control byte" {
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-    try writeOneLine(&out.writer, "line one\nline two\ttab \x1b[31mred\x1b[0m caf\xc3\xa9 \xff end");
-    try testing.expectEqualStrings("line one line two tab \\x1b[31mred\\x1b[0m café \\xff end", out.written());
 }
 
 test "the ring matches a reference list on seeded random sequences" {
@@ -421,33 +382,4 @@ fn turnIsWhole(turn: *const Turn) bool {
     const seq = turn.subagent_id % 1_000_000 - 1;
     const want: []const u8 = if (seq % 2 == 0) "completed" else "failed";
     return std.mem.eql(u8, turn.outcome(), want) and turn.ended_at_ms == turn.started_at_ms + 1;
-}
-
-test "one-line text stays safe on fuzzed bytes" {
-    try testing.fuzz({}, fuzzOneLine, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "plain text",
-            "two\nlines\r\n\ttabbed",
-            "\x1b[31mred\x1b[0m\x7f\xc2\x85",
-            "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
-        }) ++ @import("fuzz_corpus").subagent_task_line.*),
-    });
-}
-
-fn fuzzOneLine(_: void, smith: *testing.Smith) !void {
-    var buffer: [512]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    var out_buffer: [512 * 4]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&out_buffer);
-    try writeOneLine(&writer, buffer[0..len]);
-    const written = writer.buffered();
-    try testing.expect(std.unicode.utf8ValidateSlice(written));
-    try testing.expect(written.len <= len * 4);
-    var view = std.unicode.Utf8View.initUnchecked(written);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |codepoint| {
-        try testing.expect(codepoint >= 0x20);
-        try testing.expect(codepoint < 0x7f or codepoint >= 0xa0);
-    }
 }
