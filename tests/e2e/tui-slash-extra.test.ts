@@ -20,6 +20,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   hasEmptyComposer,
+  isComposerLine,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -224,7 +225,220 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
   );
 });
 
+describe.skipIf(!tmuxAvailable())("tui: copy history", () => {
+  test(
+    "recalling /copy leaves Up available for older history",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        session = await TmuxSession.create({ env: { HOME: home } });
+        await session.waitForComposer(10_000);
+        await session.sendText("/copy older");
+        await session.waitForText("No assistant reply to copy.", 5_000);
+        await session.sendText("/copy");
+        await session.waitForPane((pane) => (pane.match(/No assistant reply to copy\./g) ?? []).length >= 2, 5_000);
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => pane.split("\n").filter(isComposerLine).at(-1)?.includes("/copy") ?? false, 5_000);
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => pane.split("\n").filter(isComposerLine).at(-1)?.includes("/copy older") ?? false, 5_000);
+        expect(session.isAlive()).toBe(true);
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(!tmuxAvailable() || CLIPBOARD_PROGRAM === null)("tui: clipboard host", () => {
+  test(
+    "/copy picker lists session targets, filters, completes, and survives resize",
+    async () => {
+      if (CLIPBOARD_PROGRAM === null) throw new Error("unsupported clipboard platform");
+      const home = createIsolatedTestHome();
+      const stderrPath = join(home, "stderr.log");
+      const binDir = join(home, "bin");
+      const capturePath = join(home, "clipboard.txt");
+      mkdirSync(binDir);
+      const clipboardPath = join(binDir, CLIPBOARD_PROGRAM);
+      writeFileSync(clipboardPath, "#!/bin/sh\ncat > \"$FX_TEST_CLIPBOARD_CAPTURE\"\n");
+      chmodSync(clipboardPath, 0o755);
+      const replies = [
+        "Ancient reply\n```\nextinctzzzz\n```",
+        "Command reply\n```sh\nfind . -name ...\n```",
+        "Table reply\n| A | B | C |\n| - | - | - |\n| 1 | 2 | 3 |\n",
+        "Newer reply\n```\nnewer code\n```\n> Once upon a time...\n> the end\n\n" +
+          Array.from({ length: 40 }, (_, i) => `\`\`\`\nitem_${i}\n\`\`\`\n`).join("\n"),
+      ];
+      let request = 0;
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText(replies[request++]));
+      try {
+        session = await TmuxSession.create({
+          stderrPath,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "clipboard-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_TEST_CLIPBOARD_CAPTURE: capturePath,
+            PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          },
+          width: 100,
+          height: 28,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/copy");
+        await session.waitForText("No assistant reply to copy.", 5_000);
+        await session.waitForComposer(10_000);
+        for (const [i, marker] of ["Ancient reply", "Command reply", "Table reply", "item_39"].entries()) {
+          await session.sendText(`reply ${i}`);
+          await session.waitForText(marker, 10_000);
+          await session.waitForComposer(10_000);
+        }
+
+        await session.sendLiteral("/copy");
+        await session.waitForText("all", 5_000);
+        await session.resizeWindow(70, 20);
+        await session.waitForText("all", 5_000);
+        await session.sendLiteral(" code_newer");
+        await session.waitForText("code_newer_code", 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForText("/copy code_newer_code", 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForText("Copied to clipboard.", 5_000);
+        expect(readFileSync(capturePath, "utf8")).toBe("newer code\n");
+
+        // Up wraps to the final target, past all 40 code blocks in the newest reply.
+        rmSync(capturePath);
+        await session.sendLiteral("/copy ");
+        await session.sendKeys("Up");
+        await session.waitForText("cmd_find_name", 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForText("/copy cmd_find_name", 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane(() => existsSync(capturePath) && readFileSync(capturePath, "utf8") === "find . -name ...\n", 5_000);
+        expect(readFileSync(capturePath, "utf8")).toBe("find . -name ...\n");
+
+        for (const [query, target, text] of [
+          ["table_a", "table_a_b_c", "| A | B | C |\n| - | - | - |\n| 1 | 2 | 3 |\n"],
+          ["quote_once", "quote_once_upon_a_time", "> Once upon a time...\n> the end\n"],
+          ["code_item_39", "code_item_39", "item_39\n"],
+        ]) {
+          rmSync(capturePath);
+          await session.sendLiteral(`/copy ${query}`);
+          await session.waitForText(target, 5_000);
+          await session.sendKeys("Tab");
+          await session.waitForText(`/copy ${target}`, 5_000);
+          await session.sendKeys("Enter");
+          await session.waitForPane(() => existsSync(capturePath) && readFileSync(capturePath, "utf8") === text, 5_000);
+          expect(readFileSync(capturePath, "utf8")).toBe(text);
+        }
+
+        await session.sendLiteral("/copy code_extinctzzzz");
+        await session.waitForText("no matching copy targets", 5_000);
+        await session.sendKeys("Escape");
+        expect(session.isAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/copy rejects a selected duplicate when replies change",
+    async () => {
+      if (CLIPBOARD_PROGRAM === null) throw new Error("unsupported clipboard platform");
+      const home = createIsolatedTestHome();
+      const binDir = join(home, "bin");
+      const capturePath = join(home, "clipboard.txt");
+      const stderrPath = join(home, "stderr.log");
+      mkdirSync(binDir);
+      const clipboardPath = join(binDir, CLIPBOARD_PROGRAM);
+      writeFileSync(clipboardPath, "#!/bin/sh\ncat > \"$FX_TEST_CLIPBOARD_CAPTURE\"\n");
+      chmodSync(clipboardPath, 0o755);
+      writeFileSync(capturePath, "unchanged");
+      let release = () => {};
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      const replies = ["first_value", "old_value", "new_value", "later_value"];
+      let request = 0;
+      const gateway = startDynamicFakeGateway(async () => {
+        const index = request++;
+        if (index === 3) await pending;
+        return fakeGatewayFinalText(`\`\`\`\nsame\n${replies[index]}\n\`\`\``);
+      });
+      try {
+        session = await TmuxSession.create({
+          stderrPath,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "clipboard-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_TEST_CLIPBOARD_CAPTURE: capturePath,
+            PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          },
+          width: 100,
+          height: 28,
+        });
+        await session.waitForComposer(10_000);
+        for (const [i, marker] of replies.slice(0, 3).entries()) {
+          await session.sendText(`request ${i}`);
+          await session.waitForText(marker, 10_000);
+          await session.waitForComposer(10_000);
+        }
+        await session.sendText("reply later");
+        await session.waitForPane(() => request >= 4, 10_000);
+        await session.sendLiteral("/copy code_same_2");
+        await session.waitForPane((pane) => pane.split("code_same_2").length >= 3, 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForText("/copy code_same_2", 5_000);
+        release();
+        const stale = "copy targets changed or unavailable; edit to refresh";
+        await session.waitForText(stale, 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(stale), 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForText(stale, 5_000);
+        expect(readFileSync(capturePath, "utf8")).toBe("unchanged");
+        await session.sendKeys("BSpace");
+        await session.sendLiteral("2");
+        await session.waitForPane((pane) => !pane.includes(stale) && pane.split("\n").filter(isComposerLine).at(-1)?.includes("/copy code_same_2") === true, 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane(() => readFileSync(capturePath, "utf8") === "same\nnew_value\n", 5_000);
+        expect(readFileSync(capturePath, "utf8")).toBe("same\nnew_value\n");
+        expect(session.isAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        release();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "/copy sends exact reply bytes to the host clipboard and reports process failure",
     async () => {

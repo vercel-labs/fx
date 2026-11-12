@@ -1867,6 +1867,24 @@ pub const SessionRuntime = struct {
         return mutable.conversation_language;
     }
 
+    /// Returns up to three nonempty replies, newest first. The slice uses buffer;
+    /// its text borrows from history until that history changes.
+    pub fn copyReplies(self: *const SessionRuntime, buffer: *[3][]const u8) []const []const u8 {
+        var count: usize = 0;
+        var i = self.agent.history.items.len;
+        while (i > 0 and count < buffer.len) {
+            i -= 1;
+            switch (self.agent.history.items[i]) {
+                .assistant => |entry| if (entry.assistant.len > 0) {
+                    buffer[count] = entry.assistant;
+                    count += 1;
+                },
+                else => {},
+            }
+        }
+        return buffer[0..count];
+    }
+
     pub fn lastAssistantReply(self: *const SessionRuntime) ?[]const u8 {
         var i = self.agent.history.items.len;
         while (i > 0) {
@@ -4741,6 +4759,33 @@ test "SessionRuntime.languageSnapshot reads restored language through mutex path
 
     try runtime.restore(alloc, ConversationLanguage.literal("und-Grek"), &.{});
     try std.testing.expectEqual(ConversationLanguage.literal("und-Grek"), runtime.languageSnapshot());
+}
+
+test "SessionRuntime.copyReplies borrows the latest three nonempty replies" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 0 };
+    defer runtime.deinit(alloc);
+    var buffer: [3][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), runtime.copyReplies(&buffer).len);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "first", "one");
+    try runtime.appendAssistantHistoryTurn(alloc, "second", "two");
+    try runtime.appendHistoryEntry(alloc, .{ .compacted_summary = .{
+        .summary = @constCast("summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } });
+    try runtime.appendAssistantHistoryTurn(alloc, "third", "three");
+    try runtime.appendAssistantHistoryTurn(alloc, "empty", "");
+    try runtime.appendAssistantHistoryTurn(alloc, "fourth", "four");
+    try runtime.appendAssistantHistoryTurn(alloc, "empty", "");
+
+    const replies = runtime.copyReplies(&buffer);
+    try std.testing.expectEqual(@as(usize, 3), replies.len);
+    for (replies, [_][]const u8{ "four", "three", "two" }, [_]usize{ 5, 3, 1 }) |reply, expected, index| {
+        try std.testing.expectEqualStrings(expected, reply);
+        try std.testing.expect(reply.ptr == runtime.agent.history.items[index].assistant.assistant.ptr);
+    }
 }
 
 test "SessionRuntime.lastAssistantReply and lastSummary return borrowed stored slices" {

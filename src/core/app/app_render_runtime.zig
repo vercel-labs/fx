@@ -544,6 +544,7 @@ pub fn Runtime(comptime App: type) type {
             shimmer_pos: i16,
             steering: *const SteeringProjection,
         ) render_input.RenderContext {
+            const copy_query = app.input_runtime.picker.activeCopyPickerQuery(&app.input_runtime.edit_state);
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
             // `/effort ` lists the current model's levels, whatever a `/model`
             // flow left pending.
@@ -605,7 +606,19 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const provider_query = if (model_query == null)
+            var copy_picker_failed = false;
+            if (copy_query) |query| {
+                picker_items = input_completion_runtime.CompletionRuntime(App).copyPickerCompletions(app, agent) catch |err| blk: {
+                    debug_trace.logf("input", "copy picker failed err={s}", .{@errorName(err)});
+                    copy_picker_failed = true;
+                    break :blk &.{};
+                };
+                picker_index = input_completion_runtime.CompletionRuntime(App).copyPickerIndex(app, picker_items);
+                picker_window_start = input_completion_runtime.CompletionRuntime(App).copyPickerWindowStart(app, picker_items.len, picker_index);
+                picker_anchor = query.token_start;
+            }
+
+            const provider_query = if (model_query == null and copy_query == null)
                 app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state)
             else
                 null;
@@ -643,7 +656,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const completion_rt = input_completion_runtime.CompletionRuntime(App);
-            const file_query = if (model_query == null and provider_query == null and completion_rt.hasFileQuery(app))
+            const file_query = if (copy_query == null and model_query == null and provider_query == null and completion_rt.hasFileQuery(app))
                 app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
             else
                 null;
@@ -764,10 +777,11 @@ pub fn Runtime(comptime App: type) type {
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
                 .shimmer_pos = shimmer_pos,
                 .now_ms = now_ms,
-                .model_query_active = model_query != null and !effort_command_without_levels,
+                .model_query_active = copy_query != null or (model_query != null and !effort_command_without_levels),
+                .copy_query_active = copy_query != null,
                 .model_picker_stage = model_picker_stage,
                 .model_completions_loading = if (model_query != null and model_picker_stage == .model) app.isModelCacheLoading() else false,
-                .model_completions_failed = if (model_query != null and model_picker_stage == .model) app.isModelCacheFailed() else false,
+                .model_completions_failed = copy_picker_failed or (copy_query != null and app.input_runtime.picker.copy_snapshot_stale) or (if (model_query != null and model_picker_stage == .model) app.isModelCacheFailed() else false),
                 .model_completions = picker_items,
                 .model_completion_index = picker_index,
                 .model_completion_window_start = picker_window_start,

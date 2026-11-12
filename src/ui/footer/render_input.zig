@@ -430,6 +430,7 @@ pub const RenderContext = struct {
     shimmer_pos: i16 = -render_request.animation_padding,
     now_ms: i64 = 0,
     model_query_active: bool = false,
+    copy_query_active: bool = false,
     model_picker_stage: picker_state.ModelPickerStage = .model,
     model_completions_loading: bool = false,
     model_completions_failed: bool = false,

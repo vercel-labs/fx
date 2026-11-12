@@ -1368,6 +1368,8 @@ pub fn Runtime(comptime App: type) type {
                         try completion_rt.openCurrentModelPicker(app);
                     } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentEffortPicker(app);
+                    } else if (completion_rt.hasCopyQuery(app)) {
+                        _ = try completion_rt.autocompleteCopyPickerSelection(app, agent);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, agent, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1454,6 +1456,17 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app, agent)) return;
                         if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
+                    }
+                    if (app.input_runtime.picker.rawCopyPickerQuery(&app.input_runtime.edit_state)) |query| {
+                        const picker = &app.input_runtime.picker;
+                        if ((query.query.len > 0 or picker.copy_completion_moved) and try completion_rt.copyPickerStale(app, agent)) {
+                            picker.revealStaleCopyPicker();
+                            app.shell.render_requests.request(.footer);
+                            return;
+                        }
+                        if (completion_rt.hasCopyQuery(app) and (query.query.len > 0 or picker.copy_completion_moved)) {
+                            _ = try completion_rt.autocompleteCopyPickerSelection(app, agent);
+                        }
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, agent, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -2660,6 +2673,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn nonSlashPickerOwnsEnter(app: *App, agent: *AppAgent) bool {
+            if (completion_rt.hasCopyQuery(app)) return true;
             if (completion_rt.filePickerOwnsSurface(app, agent)) return true;
             // Bare `/model` and `/model …` own Enter over slash/skill bind. Mid-turn
             // commit is gated separately when the model list stays hidden.
