@@ -6,10 +6,10 @@ import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 // The TUI reports a custom connection's wrong settings the way `fx ask` does:
 // the file, the setting's path, and what to do
 // (`tests/e2e/configured-providers.test.ts` covers the other surfaces).
-// fx exits before it draws, so this reads the whole scrollback for its
-// message. The exit status comes from the pane's wrapper, which records it as
-// fx exits: tmux can leave a pane whose process exits this early unreaped, and
-// so not dead, for many seconds.
+// tmux's exit line can push fx's message above the visible screen, so this
+// reads the whole scrollback. The exit status comes from the pane's wrapper,
+// which records it as fx exits: tmux can leave a pane whose process exits this
+// early unreaped, and so not dead, for many seconds.
 async function waitForExit(tui: TmuxSession, message: string): Promise<string> {
   const deadline = Date.now() + 15000;
   let screen = "";
