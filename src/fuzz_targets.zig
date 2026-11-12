@@ -20,6 +20,7 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("core/cli/cli_flags.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/compactor/checkpoint.zig");
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/cli/doctor_child_status.zig");
@@ -77,6 +78,7 @@ test {
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
     _ = @import("gateway/tool_call_ids.zig");
+    _ = @import("gateway/vercel_protocol.zig");
     _ = @import("main.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/capabilities/toolbox.zig");

@@ -39,6 +39,57 @@ pub fn singleSystemMessage(model: []const u8) bool {
     return std.mem.startsWith(u8, model, "alibaba/");
 }
 
+pub const ProviderCompaction = model_capabilities.ProviderCompaction;
+
+/// The provider whose own on-demand compaction writes `model`'s compaction
+/// block. Its block keeps the reasoning of the turns sent after it, which
+/// fx's own summary cannot: the provider binds that reasoning to everything
+/// sent before it. Claude 4.6 and later answer Anthropic's on-demand
+/// compaction (Claude 4.5 rejects it), and GPT-6 and later answer OpenAI's.
+pub fn providerCompaction(model: []const u8) ?ProviderCompaction {
+    if (versionAfter(model, "anthropic/claude-", true)) |version| {
+        if (version.major > 4 or (version.major == 4 and version.minor >= 6)) return .anthropic;
+    }
+    if (versionAfter(model, "openai/gpt-", false)) |version| {
+        if (version.major >= 6) return .openai;
+    }
+    return null;
+}
+
+const ModelVersion = struct { major: u32, minor: u32 };
+
+/// The version after `prefix` in `model`, past a family name when
+/// `after_family`: "anthropic/claude-opus-4.6" reads 4.6, and a version
+/// without a minor part reads as .0.
+fn versionAfter(model: []const u8, prefix: []const u8, after_family: bool) ?ModelVersion {
+    if (!std.mem.startsWith(u8, model, prefix)) return null;
+    var rest = model[prefix.len..];
+    if (after_family) {
+        const dash = std.mem.findScalar(u8, rest, '-') orelse return null;
+        rest = rest[dash + 1 ..];
+    }
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    const major = std.fmt.parseUnsigned(u32, rest[0..end], 10) catch return null;
+    if (end >= rest.len or rest[end] != '.') return .{ .major = major, .minor = 0 };
+    var minor_end = end + 1;
+    while (minor_end < rest.len and std.ascii.isDigit(rest[minor_end])) minor_end += 1;
+    const minor = std.fmt.parseUnsigned(u32, rest[end + 1 .. minor_end], 10) catch return null;
+    return .{ .major = major, .minor = minor };
+}
+
+test "Claude 4.6 and later and GPT-6 and later compact through their provider" {
+    for ([_][]const u8{ "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8-fast", "anthropic/claude-haiku-5.5", "anthropic/claude-fable-5", "anthropic/claude-fable-5.2", "anthropic/claude-opus-5.5-batch" }) |model| {
+        try std.testing.expectEqual(@as(?ProviderCompaction, .anthropic), providerCompaction(model));
+    }
+    for ([_][]const u8{ "openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-6.1-terra-fast", "openai/gpt-7" }) |model| {
+        try std.testing.expectEqual(@as(?ProviderCompaction, .openai), providerCompaction(model));
+    }
+    for ([_][]const u8{ "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.5", "anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet", "anthropic/claude-", "openai/gpt-5.6-sol", "openai/gpt-5", "openai/gpt-oss-120b", "openai/gpt-", "zai/glm-5.3", "google/gemini-4-argon", "fixture/compaction" }) |model| {
+        try std.testing.expectEqual(@as(?ProviderCompaction, null), providerCompaction(model));
+    }
+}
+
 /// Whether `model` takes OpenAI's `promptCacheOptions`: GPT-5.6 and later.
 pub fn takesPromptCacheOptions(model: []const u8) bool {
     const prefix = "openai/gpt-";

@@ -58,6 +58,9 @@ pub const Agent = struct {
     /// A request size limit learned from a provider rejection, kept for later
     /// requests to the same model in this conversation. Plain value state.
     request_byte_limit: ?RequestByteLimitState = null,
+    /// `/compact` asked for a compaction the provider writes: the next
+    /// request compacts first, as if it were due. Plain value state.
+    compaction_requested: bool = false,
     /// The toolbox menu this conversation sent first. Later requests send the
     /// same bytes until the conversation is cleared, compactions included,
     /// whatever the skills and MCP servers do meanwhile
@@ -136,6 +139,7 @@ pub const Agent = struct {
         self.dropHistory(alloc);
         // A new conversation lists what the toolbox holds now.
         self.toolbox_menu = .{};
+        self.compaction_requested = false;
     }
 
     /// Frees every saved turn so a compaction can put its checkpoint in their
