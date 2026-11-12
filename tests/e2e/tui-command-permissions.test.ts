@@ -1837,7 +1837,9 @@ describe("effect-aware command permissions", () => {
       expect(shape).not.toContain("Trigger the gateway schema diagnostic.");
       // No record holds the raw request body. The prompt itself is only in
       // the transcript and in the screen rows of the renderer state, so a
-      // gateway error, schema diagnostic, or log line that leaks it fails.
+      // gateway error, schema diagnostic, or any other record that leaks it
+      // fails. The test does not set FX_TRACE_LOG, so the trace has no debug
+      // log lines to check.
       const strings = (value: unknown): string[] =>
         typeof value === "string" ? [value] : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
       expect(report.records.flatMap(strings).filter((text) => text.includes('"text":"Trigger the gateway schema diagnostic."'))).toEqual([]);
