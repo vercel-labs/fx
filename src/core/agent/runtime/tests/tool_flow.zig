@@ -368,8 +368,7 @@ const FreshnessApplicableContext = struct {
     var select_calls: usize = 0;
     var first_saw_old_target = false;
     var first_saw_new_target = false;
-    var reissue_saw_new_target = false;
-    var execution_reissue_saw_new_target = false;
+    var new_target_selects: usize = 0;
 
     fn reset(old: []const u8, new: []const u8) void {
         old_target = old;
@@ -377,8 +376,7 @@ const FreshnessApplicableContext = struct {
         select_calls = 0;
         first_saw_old_target = false;
         first_saw_new_target = false;
-        reissue_saw_new_target = false;
-        execution_reissue_saw_new_target = false;
+        new_target_selects = 0;
     }
 
     fn gather(
@@ -393,6 +391,7 @@ const FreshnessApplicableContext = struct {
         input: context_contract.LaterContextInput,
     ) context_contract.ProviderError!context_contract.ProviderContext {
         select_calls += 1;
+        var saw_new_target = false;
         for (input.targets) |target| {
             if (select_calls == 1 and std.mem.eql(u8, target.path, old_target)) {
                 first_saw_old_target = true;
@@ -400,14 +399,15 @@ const FreshnessApplicableContext = struct {
             if (select_calls == 1 and std.mem.eql(u8, target.path, new_target)) {
                 first_saw_new_target = true;
             }
-            if (select_calls == 2 and std.mem.eql(u8, target.path, new_target)) {
-                reissue_saw_new_target = true;
-            }
-            if (select_calls == 3 and std.mem.eql(u8, target.path, new_target)) {
-                execution_reissue_saw_new_target = true;
-            }
+            if (std.mem.eql(u8, target.path, new_target)) saw_new_target = true;
         }
-        if (select_calls == 2 and reissue_saw_new_target) {
+        if (saw_new_target) new_target_selects += 1;
+        // Answer by target, as the real registry does: the rules apply to the
+        // new target until a note delivers them.
+        const delivered = for (input.delivered_sources) |delivered_source| {
+            if (std.mem.eql(u8, delivered_source, source)) break true;
+        } else false;
+        if (saw_new_target and !delivered) {
             var selected: context_contract.ProviderContext = .{};
             errdefer selected.deinit(alloc);
             selected.content = try alloc.dupe(u8, content);
@@ -432,6 +432,69 @@ const FreshnessApplicableContext = struct {
 
     const registry = context_contract.Registry{ .default_provider = .{
         .id = "test.freshness_applicable_context",
+        .gather_project_context_fn = gather,
+        .select_applicable_project_context_fn = select,
+        .append_static_fn = appendStatic,
+        .append_transient_fn = appendTransient,
+    } };
+};
+
+/// Scoped rules that apply to one target path until a note delivers them, as
+/// a project instruction file behaves for the folder that holds the target.
+const CreatedFileScopedContext = struct {
+    const content = "CREATED_FILE_SCOPED_CONTEXT";
+    const source = "/test/created/AGENTS.md";
+    const endpoint = "/test/created";
+
+    var scoped_target: []const u8 = "";
+    var select_calls: usize = 0;
+
+    fn reset(target: []const u8) void {
+        scoped_target = target;
+        select_calls = 0;
+    }
+
+    fn gather(
+        _: std.mem.Allocator,
+        _: context_contract.InitialContextInput,
+    ) context_contract.ProviderError!context_contract.ProviderContext {
+        return .{};
+    }
+
+    fn select(
+        alloc: std.mem.Allocator,
+        input: context_contract.LaterContextInput,
+    ) context_contract.ProviderError!context_contract.ProviderContext {
+        select_calls += 1;
+        for (input.targets) |target| {
+            if (!std.mem.eql(u8, target.path, scoped_target)) continue;
+            for (input.delivered_sources) |delivered| {
+                if (std.mem.eql(u8, delivered, source)) return .{};
+            }
+            var selected: context_contract.ProviderContext = .{};
+            errdefer selected.deinit(alloc);
+            selected.content = try alloc.dupe(u8, content);
+            selected.delivered_sources = try ApplicableContextDelta.dupeStrings(alloc, &.{source});
+            selected.evaluated_endpoints = try ApplicableContextDelta.dupeStrings(alloc, &.{endpoint});
+            return selected;
+        }
+        return .{};
+    }
+
+    fn appendStatic(
+        _: context_contract.StaticContextInput,
+        _: std.mem.Allocator,
+        _: *std.ArrayList(ChatMessage),
+    ) context_contract.ProviderError!void {}
+
+    fn appendTransient(
+        _: context_contract.TransientContextInput,
+        _: std.mem.Allocator,
+        _: *std.ArrayList(ChatMessage),
+    ) context_contract.ProviderError!void {}
+
+    const registry = context_contract.Registry{ .default_provider = .{
+        .id = "test.created_file_scoped_context",
         .gather_project_context_fn = gather,
         .select_applicable_project_context_fn = select,
         .append_static_fn = appendStatic,
@@ -3149,8 +3212,7 @@ test "same-batch retarget defers stale scoped call before permission and reloads
 
     try std.testing.expectEqual(@as(usize, 2), FreshnessApplicableContext.select_calls);
     try std.testing.expect(FreshnessApplicableContext.first_saw_old_target);
-    try std.testing.expect(FreshnessApplicableContext.reissue_saw_new_target);
-    try std.testing.expect(!FreshnessApplicableContext.execution_reissue_saw_new_target);
+    try std.testing.expectEqual(@as(usize, 1), FreshnessApplicableContext.new_target_selects);
     try expectBodyNotContains(&gateway, 1, FreshnessApplicableContext.content);
     try expectBodyContains(&gateway, 2, FreshnessApplicableContext.content);
     const expected_ids = [_][]const u8{ "retarget", "stable_info", "scoped_reissue" };
@@ -3323,10 +3385,10 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 2), FreshnessApplicableContext.select_calls);
+    // The late-resolution probe asks the registry once more before the read is deferred.
+    try std.testing.expectEqual(@as(usize, 3), FreshnessApplicableContext.select_calls);
     try std.testing.expect(!FreshnessApplicableContext.first_saw_new_target);
-    try std.testing.expect(FreshnessApplicableContext.reissue_saw_new_target);
-    try std.testing.expect(!FreshnessApplicableContext.execution_reissue_saw_new_target);
+    try std.testing.expectEqual(@as(usize, 2), FreshnessApplicableContext.new_target_selects);
     try expectBodyNotContains(&gateway, 0, FreshnessApplicableContext.content);
     try expectBodyNotContains(&gateway, 1, FreshnessApplicableContext.content);
     try expectBodyContains(&gateway, 2, FreshnessApplicableContext.content);
@@ -3361,6 +3423,144 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     try std.testing.expectEqualStrings("scope resolved", execution.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqualStrings("Not executed", execution.tool_steps[0].tool_results[1].output);
     try std.testing.expectEqualStrings("new scope access", execution.tool_steps[1].tool_results[0].output);
+}
+
+test "same-batch read of a file an earlier call created runs when no scoped instructions apply" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const made_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "made.txt" });
+    defer alloc.free(made_path);
+
+    const first_calls = [_]ToolCall{
+        toolCall("make", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("read_made", "read_file", "{\"path\":\"made.txt\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls, .streamed_tool_starts = &first_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = EmptyApplicableContext.registry;
+    hooks.create_file_on_execute_name = "terminal";
+    hooks.create_file_on_execute_path = made_path;
+    hooks.create_file_on_execute_content = "made-content";
+    // The fake runtime does not run the tools: each result comes from
+    // `exec_plans`, so the read's output is the plan text, not the file.
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "made" } },
+        .{ .result = .{ .model_output = "made-content" } },
+    };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    const expected_ids = [_][]const u8{ "make", "read_made" };
+    try std.testing.expectEqual(expected_ids.len, hooks.executed_call_ids.items.len);
+    for (expected_ids, hooks.executed_call_ids.items) |expected, execution_id| {
+        try std.testing.expectEqualStrings(expected, execution_id);
+    }
+    // The read keeps its legacy preparation, so execution still runs the
+    // availability check for it. The index matches `executed_call_ids`.
+    try std.testing.expectEqual(
+        expected_ids.len,
+        hooks.execution_classification_complete.items.len,
+    );
+    try std.testing.expect(!hooks.execution_classification_complete.items[1]);
+    // The terminal call has no applicable target, so the only registry query is the
+    // late check of the created file.
+    try std.testing.expectEqual(@as(usize, 1), EmptyApplicableContext.select_calls);
+    try std.testing.expectEqual(@as(usize, 1), EmptyApplicableContext.last_target_count);
+    try expectBodyNotContains(&gateway, 1, "Not executed");
+
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings("made", execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings("made-content", execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqual(
+        types.PersistedToolStatus.success,
+        execution.tool_steps[0].tool_results[1].status,
+    );
+}
+
+test "same-batch read of a file an earlier call created stays deferred when scoped instructions apply" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const made_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "made.txt" });
+    defer alloc.free(made_path);
+
+    const first_calls = [_]ToolCall{
+        toolCall("make", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("read_made", "read_file", "{\"path\":\"made.txt\"}"),
+    };
+    const reissue_calls = [_]ToolCall{
+        toolCall("reissue", "read_file", "{\"path\":\"made.txt\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls, .streamed_tool_starts = &first_calls },
+        .{ .tool_calls = &reissue_calls, .streamed_tool_starts = &reissue_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = CreatedFileScopedContext.registry;
+    hooks.create_file_on_execute_name = "terminal";
+    hooks.create_file_on_execute_path = made_path;
+    hooks.create_file_on_execute_content = "made-content";
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "made" } },
+        .{ .result = .{ .model_output = "made-content" } },
+    };
+    CreatedFileScopedContext.reset(made_path);
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    // The late check of the created file, then the reissue gate, which
+    // delivers the rules. The terminal call has no applicable target, so the first
+    // step has no gate query.
+    try std.testing.expectEqual(@as(usize, 2), CreatedFileScopedContext.select_calls);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    const expected_ids = [_][]const u8{ "make", "reissue" };
+    try std.testing.expectEqual(expected_ids.len, hooks.executed_call_ids.items.len);
+    for (expected_ids, hooks.executed_call_ids.items) |expected, execution_id| {
+        try std.testing.expectEqualStrings(expected, execution_id);
+    }
+    try expectBodyContains(&gateway, 1, "Not executed");
+    try expectBodyNotContains(&gateway, 1, CreatedFileScopedContext.content);
+    try expectBodyContains(&gateway, 2, CreatedFileScopedContext.content);
+
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings("made", execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings("Not executed", execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqual(
+        types.PersistedToolStatus.failure,
+        execution.tool_steps[0].tool_results[1].status,
+    );
+    try std.testing.expectEqualStrings("made-content", execution.tool_steps[1].tool_results[0].output);
 }
 
 test "modern mixed batch materializes unsupported terminal before admission" {
