@@ -317,8 +317,11 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
         line_offset = line.next;
         const trimmed = std.mem.trim(u8, line.bytes, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        if (previous_line_recognized and (line.bytes[0] == ' ' or line.bytes[0] == '\t')) {
-            setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
+        // Recognized keys live only at the top level. An indented line continues
+        // the previous key's value, so a `name` or `description` nested under a
+        // map such as `metadata:` belongs to that map, not to the skill.
+        if (line.bytes[0] == ' ' or line.bytes[0] == '\t') {
+            if (previous_line_recognized) setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
             previous_line_recognized = false;
             continue;
         }
@@ -1246,6 +1249,34 @@ test "parseSkillFile rejects unsupported indented continuations" {
             MetadataStatus{ .invalid = .unsupported_multiline },
             parsed.status,
         );
+    }
+}
+
+test "parseSkillFile ignores recognized keys nested under other keys" {
+    const cases = [_]struct { content: []const u8, description: ?[]const u8 }{
+        .{
+            .content = "---\nname: workflow\ndescription: top\nmetadata:\n  name: nested\n  description: nested\n---\nBody",
+            .description = "top",
+        },
+        .{
+            .content = "---\nmetadata:\n  description: nested\nname: workflow\ndescription: top\n---\nBody",
+            .description = "top",
+        },
+        .{
+            .content = "---\nname: workflow\nmetadata:\n  inner:\n    name: deep\n    description: deep\n---\nBody",
+            .description = null,
+        },
+    };
+
+    for (cases) |case| {
+        const parsed = parseSkillFile(case.content);
+        try std.testing.expectEqual(MetadataStatus.valid, parsed.status);
+        try std.testing.expectEqualStrings("workflow", parsed.name.?);
+        if (case.description) |description| {
+            try std.testing.expectEqualStrings(description, parsed.description.?);
+        } else {
+            try std.testing.expect(parsed.description == null);
+        }
     }
 }
 
