@@ -111,7 +111,7 @@ To change fx itself, read [AGENTS.md](AGENTS.md) first, then build and verify th
 
 ## Feedback
 
-Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose). If something looks wrong in your terminal, `/trace` creates a private diagnostic report you can attach ([share feedback](https://fx.sh/docs/using-fx/share-feedback)).
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose). If something looks wrong in your terminal, `/trace` creates a private diagnostic trace that you can share as a link from [fx.sh/share](https://fx.sh/share) ([share feedback](https://fx.sh/docs/using-fx/share-feedback)).
 
 ## Contributing
 
