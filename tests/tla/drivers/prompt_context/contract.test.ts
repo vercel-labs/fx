@@ -27,7 +27,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary, targetHelpers } from "../lib/context";
 import {
-  PROPERTIES, checkRuntime, observe, simulate, timelineMarkdown,
+  PROPERTIES, abstractRequest, checkRuntime, observe, simulate, timelineMarkdown,
   type Design, type Family, type ObservedRequest, type RuntimeResult,
 } from "./bridge";
 import { activityLogger, collectObservations, type CapturedRequest } from "./scenarios";
@@ -138,7 +138,7 @@ test("bridge rejects a planted marker, missing coverage and empty evidence", asy
   const design: Design = "proposed";
   const reports = join(folder(ANTHROPIC), "tlc");
 
-  // A marker on the skills block, which no design places.
+  // A marker on the toolbox menu block, which no design places.
   const planted: ObservedRequest[] = structuredClone(observed);
   planted[0]!.manual = [...new Set([...planted[0]!.manual, 3])].sort((a, b) => a - b);
   const rejected = await checkRuntime(planted, design, "anthropic", join(reports, "control-planted"), { notes: true });
@@ -162,4 +162,40 @@ test("bridge rejects a planted marker, missing coverage and empty evidence", asy
   const foreign = observe(capturedByModel.get(GPT)!, "anthropic").errors;
   log("control", { control: "foreign_marker", errors: foreign.length });
   assert.ok(foreign.some((e) => e.includes("carries an openai marker on an anthropic request")), `foreign markers: ${JSON.stringify(foreign)}`);
+}, TIMEOUT);
+
+test("bridge names the toolbox menu, a warning line before it included, and rejects the old catalogs", async () => {
+  await observations(ANTHROPIC);
+  const body = JSON.parse(capturedByModel.get(ANTHROPIC)!.find((r) => r.kind === "agent")!.body);
+  const at = body.prompt.findIndex((m: any) => m.role === "system" && String(m.content).includes("<toolbox>\n"));
+  assert.ok(at > 0, "the first request carries the toolbox menu in a system message");
+  const menu: string = body.prompt[at].content;
+  const abstractWith = (content: string, index = at) => {
+    const copy = structuredClone(body);
+    copy.prompt[index].content = content;
+    return abstractRequest(JSON.stringify(copy), "anthropic");
+  };
+
+  // The line that tells the model skill discovery skipped something leads the
+  // menu (src/core/skills/skill_runtime.zig discoveryWarningMarker).
+  const warning = '<skill_discovery_warning skipped_candidate_count="1" incomplete_root_count="0" missing_from_incomplete_roots="0" />\n';
+  const led = abstractWith(warning + menu);
+  log("control", { control: "menu_with_warning", errors: led.errors });
+  assert.deepEqual(led.errors, [], "a menu led by the warning is still the menu block");
+
+  // A repository's own rules may name the menu's tag; they stay the project block.
+  const projectAt = body.prompt.findIndex((m: any) => m.role === "system" && String(m.content).startsWith("<project-instructions-guidance>"));
+  assert.ok(projectAt > at, "the project rules follow the menu");
+  const named = abstractWith(`${body.prompt[projectAt].content}\nThe menu opens with <toolbox>\n and closes with </toolbox>.\n`, projectAt);
+  log("control", { control: "project_rules_name_the_menu_tag", errors: named.errors });
+  assert.deepEqual(named.errors, [], "project rules that name the menu's tag are still the project block");
+
+  // The skill catalog and the MCP catalog are what the menu replaced. A request
+  // that still sends one is named, not read as a marker inside the base group.
+  for (const old of ["Skills provide task instructions. Use named skills.\n", "Configured MCP servers visible to this model turn are listed below.\n"]) {
+    const { errors } = abstractWith(old);
+    log("control", { control: "old_catalog", errors });
+    assert.ok(errors.some((e) => e.includes("skill or MCP catalog")), `old catalog: ${JSON.stringify(errors)}`);
+    assert.ok(!errors.some((e) => e.includes("marker inside")), `old catalog: ${JSON.stringify(errors)}`);
+  }
 }, TIMEOUT);

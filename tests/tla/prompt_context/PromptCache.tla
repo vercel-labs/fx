@@ -26,8 +26,9 @@
 (* instructions, before the per-step overlay (MarkStable). Design =        *)
 (* "current" is fx before those markers. Mutation plants known-bad         *)
 (* designs:                                                                *)
-(*   "mark_every_system"   the design fx had before a0b393743: a marker on *)
-(*                         every stable system message;                    *)
+(*   "mark_every_system"   a marker on every system block, turn context    *)
+(*                         and runtime notes too: fx marked every          *)
+(*                         system message before a0b393743;                *)
 (*   "fence_after_context" the stable marker placed after the turn context;*)
 (*   "no_auto"             the manual markers without caching "auto".      *)
 (*                                                                         *)
@@ -52,7 +53,7 @@
 (* sends no markers to, whose provider caches prefixes by itself: Grok,    *)
 (* GLM, Kimi, Gemini, DeepSeek and MiniMax.                               *)
 (*                                                                         *)
-(* PathScoped = FALSE is fx: the skill catalog and the project rules name  *)
+(* PathScoped = FALSE is fx: the toolbox menu and the project rules name   *)
 (* workspace paths relative to the workspace root, so worktrees of one     *)
 (* repository send the same bytes there. TRUE models absolute paths, fx    *)
 (* before that change; mutant-absolute-paths.cfg keeps it failing.         *)
@@ -123,7 +124,7 @@ CONSTANTS
   MaxSessions,  \* sessions started in one behavior
   MaxSteps,     \* model requests after the first in one session
   Limit,        \* blocks per request that may carry a cache marker
-  PathScoped,   \* skill catalog and project rules embed the worktree path
+  PathScoped,   \* toolbox menu and project rules embed the worktree path
   Family,       \* "anthropic" | "openai": the provider's cache rules
   Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside"}
   Notes,        \* mid-session changes join the conversation, not the instructions
@@ -146,9 +147,9 @@ Block(k, v) == [k |-> k, v |-> v]
 (* compares like with like.                                                *)
 (*   tools    tool schemas: the same for one profile and fx version        *)
 (*   base     system prompt and custom tool guidance                       *)
-(*   skills   skill catalog: lists each root by absolute path              *)
+(*   menu     toolbox menu: the skills, MCP servers and tools behind       *)
+(*            toolbox, by name, kept as the session first sent it          *)
 (*   project  AGENTS.md project context, tagged with the file's path       *)
-(*   mcp      MCP catalog                                                  *)
 (*   ctx      <fx-turn-context>: worktree path, date, branch               *)
 (*   rt       permission, verification and response-language notes         *)
 (*   scoped   rules from a subfolder AGENTS.md, delivered at tool time     *)
@@ -159,15 +160,15 @@ Block(k, v) == [k |-> k, v |-> v]
 Scoped(w) == IF PathScoped THEN w ELSE RepoOf[w]
 
 Stable(w) ==
-  << Block("tools", "p"), Block("base", "p"), Block("skills", Scoped(w)),
-     Block("project", Scoped(w)), Block("mcp", "p") >>
+  << Block("tools", "p"), Block("base", "p"), Block("menu", Scoped(w)),
+     Block("project", Scoped(w)) >>
 
 Overlay(w, br) == << Block("ctx", w \o "@" \o br), Block("rt", "p") >>
 
 Instructions(w, br) == Stable(w) \o Overlay(w, br)
 
 PosProfile == 2   \* last repo-independent block: base
-PosStable  == 5   \* last stable block of a session's first request: mcp
+PosStable  == 4   \* last stable block of a session's first request: project
 
 (* Where a block kind sits in req. Every request has one of each           *)
 (* instruction kind, so positions follow today's mid-session insertions.   *)
@@ -182,10 +183,10 @@ MessageKinds == UserKinds \cup {"asst", "asstc"}
 LastUser(req) == Max({i \in 1..Len(req) : req[i].k \in UserKinds})
 
 Manual(req) ==
-  CASE Mutation = "mark_every_system" -> {2, 3, 4, PosOf(req, "mcp")}
+  CASE Mutation = "mark_every_system" -> 2..NInstr(req)
     [] Design = "current" -> {}
     [] Mutation = "fence_after_context" -> {PosProfile, PosOf(req, "ctx")}
-    [] OTHER -> {PosProfile, PosOf(req, "mcp")}
+    [] OTHER -> {PosProfile, PosOf(req, "project")}
 
 (* OpenAI eligible message endings after the instructions.                 *)
 Eligible(req) == {j \in (NInstr(req) + 1)..Len(req) : req[j].k \in MessageKinds}
@@ -266,9 +267,8 @@ LeadBlocks(a) ==
     IF Mutation = "contract_late" /\ a.delivered
     THEN [Instructions(a.w, LeadBranch(a)) EXCEPT ![2] = Block("base", "p+contract")]
     ELSE Instructions(a.w, LeadBranch(a))
-  ELSE SubSeq(Stable(a.w), 1, 4)
+  ELSE Stable(a.w)
          \o (IF a.scopedStable THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
-         \o << Block("mcp", "p") >>
          \o (IF a.scopedTurn THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
          \o (IF a.skill THEN << Block("skill", "k") >> ELSE << >>)
          \o Overlay(a.w, LeadBranch(a))

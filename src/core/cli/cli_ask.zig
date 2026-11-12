@@ -2225,6 +2225,7 @@ fn refreshGatewayCredential(
     source: credentials.Source,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -2237,6 +2238,7 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
     // A team change is refused above, so the request keeps its team.
