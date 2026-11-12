@@ -2174,20 +2174,25 @@ pub fn Runtime(comptime App: type) type {
             noteQuitting(app);
             attach(app, null);
             closeHandoffs(app);
+            // A slot thread still reads its child's worker while it detaches,
+            // so each worker is told to stop and each slot lets go before any
+            // agent is freed, as `dropHosted` does for one. One whose slot
+            // never lets go is closed but kept.
+            for (app.child_agents.items) |child| {
+                child.agent.worker.requestShutdown();
+                child.agent.managed_executions.shutdown();
+            }
+            for (app.child_agents.items) |child| _ = child.bound.waitReleased(releaseTimeoutMs());
             var index = app.child_agents.items.len;
             while (index > 0) {
                 index -= 1;
                 const child = app.child_agents.items[index];
-                visit(app, child, {}, shutdownInContext) catch |err| {
+                const kept = child.bound.held();
+                const closed = if (kept) visit(app, child, {}, closeInContext) else visit(app, child, {}, shutdownInContext);
+                closed catch |err| {
                     app_session_runtime.Runtime(App).recordShutdownFailure(firstInstance(app) orelse &app.main_agent, err);
                 };
-            }
-            // Each run still in flight ended once its worker was joined; its
-            // slot thread holds the worker until it frees the turn context.
-            for (app.child_agents.items) |child| {
-                if (!child.bound.waitReleased(release_timeout_ms)) {
-                    debug_trace.logf("host", "child_release_timeout child={s} at=shutdown", .{child.id});
-                }
+                if (kept) noteKept(child, "shutdown");
             }
         }
 
@@ -2997,9 +3002,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Frees every child agent's screen and storage. Call `shutdownChildren`
-        /// first.
+        /// first. A child whose slot thread still holds its worker stays
+        /// allocated, as `shutdownChildren` kept it.
         pub fn deinitChildren(app: *App) void {
             for (app.child_agents.items) |child| {
+                if (child.bound.held()) {
+                    debug_trace.logf("host", "child_kept child={s} at=deinit reason=slot_thread_holds_worker", .{child.id});
+                    continue;
+                }
                 child.screen.deinit(app.alloc);
                 if (child.name.len > 0) app.alloc.free(child.name);
                 if (child.profile.len > 0) app.alloc.free(child.profile);

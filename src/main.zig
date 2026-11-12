@@ -6474,6 +6474,31 @@ test "closing a subagent whose slot thread does not let go closes its session bu
     try app.child_agents.append(alloc, child);
 }
 
+test "quitting waits for a subagent's slot thread to let go before it frees the subagent" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+
+    // Stands in for the run's slot thread: it still reads the subagent's
+    // worker as it detaches, and only then lets go.
+    const Slot = struct {
+        fn run(held: *app_agents_runtime.ChildAgent, whole: *bool) void {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            whole.* = held.agent.role == .subagent;
+            held.bound.release();
+        }
+    };
+    child.bound.hold();
+    var whole = false;
+    const thread = try std.Thread.spawn(.{}, Slot.run, .{ child, &whole });
+    App.AgentsAppRuntime.shutdownChildren(&app);
+    thread.join();
+    try std.testing.expect(whole);
+}
+
 test "a child agent's worker thread starts for that agent and stops at shutdown" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
