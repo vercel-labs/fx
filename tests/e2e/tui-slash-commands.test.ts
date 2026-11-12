@@ -385,12 +385,20 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       await session!.waitForText("No active loops. Start one with /loop <interval> <prompt>.", 5_000);
       await session!.sendText("/loop 1h say LOOP_OK");
       await session!.waitForText("Loop 1 runs every 1h until you stop it or fx exits: say LOOP_OK", 5_000);
+      // The footer counts the loops the agent on screen holds.
+      await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
       await session!.sendText("/loop");
       await session!.waitForText(/1 +every 1h +next in \d+m +runs 0 +failures 0\/3 +say LOOP_OK/, 5_000);
+      await session!.sendText("/loop 2h second");
+      await session!.waitForText(/gpt-5 · 2 loops\s*$/m, 5_000);
       await session!.sendText("/loop stop 1");
       await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
       await session!.sendText("/loop stop 1");
       await session!.waitForText("No loop 1. /loop lists active loops.", 5_000);
+      await session!.sendText("/loop stop all");
+      await session!.waitForText("Stopped loop 2.", 5_000);
+      await session!.waitForText(/gpt-5\s*$/m, 5_000);
       await session!.sendText("/loop 30s ping");
       await session!.waitForText("30s is shorter than the 1m minimum.", 5_000);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

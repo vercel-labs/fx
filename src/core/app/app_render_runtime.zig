@@ -728,6 +728,7 @@ pub fn Runtime(comptime App: type) type {
                 agent.worker.agent_turn_settings.ultrafast_mode
             else
                 false;
+            if (comptime agents.hasAgentField(App, "loops")) statusline.loop_count = agent.loops.count();
 
             const waiting_note: []const u8 = if (comptime @hasDecl(App, "hiddenAgentWaitingNote"))
                 app.hiddenAgentWaitingNote(waiting_note_buf)

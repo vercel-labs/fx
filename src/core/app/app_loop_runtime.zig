@@ -129,6 +129,7 @@ pub fn Runtime(comptime App: type) type {
                 error.OutOfMemory => return err,
             };
             debug_trace.logf("loop", "event=armed id={d} interval_ms={d}", .{ id, interval_ms });
+            requestFooter(app);
             var shown = try text_utils.encodeTerminalSafe(app.alloc, prompt, max_prompt_display_bytes);
             defer shown.deinit(app.alloc);
             var interval_buf: [32]u8 = undefined;
@@ -172,6 +173,7 @@ pub fn Runtime(comptime App: type) type {
                 .id => |id| {
                     _ = agent.loops.stop(app.alloc, target) catch return writeUnknownLoop(app, id);
                     debug_trace.logf("loop", "event=stopped id={d}", .{id});
+                    requestFooter(app);
                     try writeNotice(app, .neutral, "Stopped loop {d}.", .{id});
                 },
                 .all => {
@@ -180,6 +182,7 @@ pub fn Runtime(comptime App: type) type {
                     defer app.alloc.free(ids);
                     const stopped = agent.loops.endAll(app.alloc);
                     debug_trace.logf("loop", "event=stopped ids={s}", .{ids});
+                    requestFooter(app);
                     try writeNotice(app, .neutral, "Stopped {s} {s}.", .{ loopWord(stopped), ids });
                 },
             }
@@ -191,6 +194,7 @@ pub fn Runtime(comptime App: type) type {
                 error.NotPaused => return writeNotice(app, .neutral, "Loop {d} is not paused.", .{id}),
             };
             debug_trace.logf("loop", "event=resumed id={d}", .{id});
+            requestFooter(app);
             const loop = for (agent.loops.items.items) |item| {
                 if (item.id == id) break item;
             } else unreachable;
@@ -206,6 +210,7 @@ pub fn Runtime(comptime App: type) type {
             if (agent.loops.count() == 0) return;
             try agent.loops.endForConversation(app.alloc);
             debug_trace.logf("loop", "event=ended reason=conversation_changed count={d}", .{agent.loops.ended_ids.items.len});
+            requestFooter(app);
         }
 
         /// Writes, in the conversation a switch opened, which loops the
@@ -242,6 +247,11 @@ pub fn Runtime(comptime App: type) type {
                 error.PromptTooLong => try writeNotice(app, .warning, "A loop prompt holds at most {d} bytes.", .{loops.max_prompt_bytes}),
                 error.InvalidId => try writeNotice(app, .warning, "Usage: /loop stop <id|all> or /loop resume <id>", .{}),
             }
+        }
+
+        /// Redraws the footer, whose loop count a state change just moved.
+        fn requestFooter(app: *App) void {
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
         }
 
         fn writeNotice(app: *App, tone: anytype, comptime fmt: []const u8, args: anytype) !void {
