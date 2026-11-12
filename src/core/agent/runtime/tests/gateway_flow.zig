@@ -6,6 +6,7 @@ const builtin_context = @import("../../../../builtins/context.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
 const types = @import("../../../shared/types.zig");
 const token_estimate = @import("../../../shared/token_estimate.zig");
+const recovery_prompt = @import("../../../shared/recovery_prompt.zig");
 const result_store = @import("../../../session/result_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
@@ -9792,6 +9793,183 @@ test "completed assistant provider replay survives turn materialization" {
     defer messages.deinit(alloc);
     try session_runtime.appendHistoryChatMessages(alloc, &messages, hooks.history_turns.items);
     try std.testing.expectEqualStrings(state, messages.items[messages.items.len - 1].provider_replay.?.parts_json);
+}
+
+/// What a two-turn check scripts around the boundary under test: whether review
+/// mode is on, and the runtime context the first turn reads at each step, so a
+/// later step sees it change. The second turn reads the last of them.
+const BoundaryScript = struct {
+    review: bool = false,
+    runtime_contexts: []const []const u8 = &.{},
+};
+
+/// Runs a turn on `completions`, whose request number `last_request` ends it
+/// and carries `needle`. Then runs a second turn over the history the first
+/// saved, and fails unless the second turn's first request opens with all of
+/// that request, message by message: the provider's prompt cache still covers
+/// it. Unlike `expectNextTurnExtendsLastRequest`, the first turn can run with
+/// review mode on and a runtime context that changes between its steps.
+fn expectNextTurnExtendsBoundaryRequest(
+    script: BoundaryScript,
+    completions: []const FakeCompletion,
+    last_request: usize,
+    needle: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.runtime_context_texts = script.runtime_contexts;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.review_enabled = script.review;
+    var job = fixture.job();
+    job.model = @constCast(unmarked_model);
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(last_request + 1, gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, last_request, needle);
+
+    const next_completions = [_]FakeCompletion{.{ .content = "Second answer" }};
+    var next_gateway = FakeGateway.init(alloc, &next_completions);
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    if (script.runtime_contexts.len > 0) next_hooks.runtime_context_text = script.runtime_contexts[script.runtime_contexts.len - 1];
+    var next_fixture = PromptFixture{};
+    var next_job = next_fixture.job();
+    next_job.model = @constCast(unmarked_model);
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(&next_gateway, &next_hooks, next_fixture.config(), next_job);
+
+    try std.testing.expectEqual(@as(usize, 1), next_gateway.request_bodies.items.len);
+    try test_support.expectPromptExtends(
+        gateway.request_bodies.items[last_request],
+        next_gateway.request_bodies.items[0],
+    );
+}
+
+const review_prompt = "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.";
+const two_runtime_contexts = [_][]const u8{ "runtime context one", "runtime context two" };
+
+// No host turns review mode on today (`review_enabled` is false in
+// `app_agent_runtime.zig`), so only a flow test reaches this message.
+test "the next turn extends the request that carried review mode's message" {
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Reviewed" },
+    };
+    try expectNextTurnExtendsBoundaryRequest(.{ .review = true }, &completions, 1, review_prompt);
+}
+
+test "review mode's message is saved as fx's own steering, not dropped and not the user's words" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Reviewed" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.review_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings(review_prompt, recovery_prompt.fromSaved(saved.steering[0].text).?);
+}
+
+test "review mode asks for no review after a step that wrote nothing" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Read it" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.review_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 1, review_prompt);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items[0].assistant.execution.steering.len);
+}
+
+test "the next turn extends a request that carried review mode's message and a changed runtime context" {
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Reviewed" },
+    };
+    try expectNextTurnExtendsBoundaryRequest(
+        .{ .review = true, .runtime_contexts = &two_runtime_contexts },
+        &completions,
+        1,
+        "runtime context two",
+    );
+}
+
+test "the next turn extends the request that carried a changed runtime context after the empty-reply nudge" {
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &two_runtime_contexts }, &completions, 1, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried a changed runtime context after a tool step and the nudge" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    const contexts = [_][]const u8{ "runtime context one", "runtime context one", "runtime context two" };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &contexts }, &completions, 2, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried a changed runtime context after the continuation" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n" },
+        .{ .content = "Summary" },
+    };
+    const contexts = [_][]const u8{ "runtime context one", "runtime context one", "runtime context one", "runtime context two" };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &contexts }, &completions, 3, continuation_prompt);
+}
+
+test "the next turn extends the request that carried a changed runtime context after the assistant-prefill recovery" {
+    const calls = [_]ToolCall{toolCall("call_bad_prefill", "read_file", "{\"path\":\"a\",}")};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered after malformed call" },
+    };
+    const contexts = [_][]const u8{ "runtime context one", "runtime context one", "runtime context two" };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &contexts }, &completions, 2, "Continue from the preceding tool result.");
 }
 
 test "tool presentation groups span silent steps and split on visible assistant prose" {
