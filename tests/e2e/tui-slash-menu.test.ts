@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -2988,6 +2988,64 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "inline model picker shows loading while a failed catalog retries",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const home = createIsolatedTestHome();
+      workDirs.push(home);
+      const recoveredModel = "acme/recovered-model";
+      const catalog = [{ id: recoveredModel, type: "language" }];
+      const retry = Promise.withResolvers<typeof catalog>();
+      const retryGateway = startFakeGateway([], {
+        models: () =>
+          retryGateway.modelRequests.length === 1
+            ? new Response("catalog unavailable", { status: 503 })
+            : retry.promise,
+      });
+      gateway = retryGateway;
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-models-retry-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: "acme/active-model",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      try {
+        await session.waitForComposer(10_000);
+        await session.sendLiteralText("/model ");
+        await session.waitForText("unable to load models", 5_000);
+        await session.sendKeys("C-u");
+        await Bun.sleep(5_500);
+        await session.sendKeys("C-p");
+        await session.waitForText("Loading models…", 5_000);
+        expect(retryGateway.modelRequests).toHaveLength(2);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+        await session.sendLiteralText("/model ");
+        await session.waitForText("loading models...", 5_000);
+        retry.resolve(catalog);
+        await session.waitForPane((pane) => pane.includes(recoveredModel) && !pane.includes("loading models..."), 5_000);
+        await session.sendKeys("C-u");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      } finally {
+        retry.resolve(catalog);
+      }
     },
     TEST_TIMEOUT,
   );
