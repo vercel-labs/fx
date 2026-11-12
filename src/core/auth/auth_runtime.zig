@@ -226,9 +226,9 @@ fn resetRequestPathCredentialVerification() void {
 /// Returns one complete owned credential after a provider-specific refresh.
 /// The caller owns every field and must call `Credential.deinit`.
 /// `rejected_token` is the access token the provider just answered 401 for.
-/// With `.force` an fx login then rotates only while the saved login still
-/// holds it, so the login another fx already refreshed is used as it is;
-/// Codex and Grok refresh whatever they hold.
+/// With `.force` the saved fx, Codex, or Grok login then rotates only while
+/// it still holds that token, so a login another fx already refreshed is used
+/// as it is (`oauth.rejectedLoginRotates`).
 pub fn refreshCredentialForAccount(
     transport: oauth_transport.Provider,
     alloc: Allocator,
@@ -348,11 +348,11 @@ fn loadCredentialForRefresh(
         },
         .chatgpt_subscription => switch (mode) {
             .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
-            .force => credentials.refreshChatGptCredential(alloc, transport),
+            .force => credentials.refreshChatGptCredential(alloc, transport, rejected_token),
         },
         .grok_subscription => switch (mode) {
             .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
-            .force => credentials.refreshGrokCredential(alloc, transport),
+            .force => credentials.refreshGrokCredential(alloc, transport, rejected_token),
         },
         else => null,
     };

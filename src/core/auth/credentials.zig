@@ -267,11 +267,8 @@ const FxLoginRefreshMode = union(enum) {
     if_needed,
     /// Whatever the saved login holds.
     force,
-    /// The gateway rejected this access token. Only while the saved login
-    /// still holds it or is past its refresh deadline: otherwise another fx
-    /// already replaced it, and rotating again would make the token every
-    /// other fx holds fail too (`tests/tla/auth/SharedLoginRefresh.tla`
-    /// NoRedundantRotation).
+    /// The gateway rejected this access token: as `oauth.rejectedLoginRotates`
+    /// decides.
     replace_rejected: []const u8,
 };
 
@@ -787,18 +784,28 @@ pub fn refreshFxLoginCredential(
     return refreshFxLoginCredentialLocked(alloc, transport, mode);
 }
 
+/// Refreshes the saved Codex login after OpenAI rejected `rejected_token`,
+/// as `refreshFxLoginCredential` does for the fx login. Null rotates it
+/// whatever it holds.
 pub fn refreshChatGptCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
 ) !?Credential {
-    return loadChatGptCredential(alloc, transport, .force);
+    const mode: chatgpt_oauth.RefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return loadChatGptCredential(alloc, transport, mode);
 }
 
+/// Refreshes the saved Grok login after xAI rejected `rejected_token`, as
+/// `refreshFxLoginCredential` does for the fx login. Null rotates it
+/// whatever it holds.
 pub fn refreshGrokCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
 ) !?Credential {
-    return loadGrokCredential(alloc, transport, .force);
+    const mode: grok_oauth.RefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return loadGrokCredential(alloc, transport, mode);
 }
 
 fn refreshFxLoginCredentialLocked(
@@ -829,7 +836,7 @@ fn fxLoginNeedsRotation(mode: FxLoginRefreshMode, saved_access_token: []const u8
     return switch (mode) {
         .if_needed => saved_expired,
         .force => true,
-        .replace_rejected => |rejected| saved_expired or std.mem.eql(u8, saved_access_token, rejected),
+        .replace_rejected => |rejected| oauth.rejectedLoginRotates(saved_access_token, rejected, saved_expired),
     };
 }
 
@@ -1730,6 +1737,188 @@ test "a forced fx login refresh rotates only a rejected or expired saved login o
             "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
             "abababababababababababab",
         }) ++ @import("fuzz_corpus").fx_login_replace_rejected.*),
+    });
+}
+
+const Subscription = enum { codex, grok };
+
+/// A HOME holding a Codex or Grok subscription login whose saved access token
+/// and expiry the test chooses, as another fx would have left it.
+const SavedSubscriptionFixture = struct {
+    alloc: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    env: *CredentialTestEnv,
+    home: []u8,
+    auth_path: []u8,
+
+    fn install(alloc: std.mem.Allocator, which: Subscription, access_token: []const u8, expires_at_ms: i64) !SavedSubscriptionFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+        errdefer alloc.free(home);
+        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+        const file_name = switch (which) {
+            .codex => profile_paths.chatgpt_auth_file_name,
+            .grok => profile_paths.grok_auth_file_name,
+        };
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", file_name });
+        errdefer alloc.free(auth_path);
+
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        try std.json.Stringify.value(.{
+            .version = 1,
+            .access_token = access_token,
+            .refresh_token = "saved-refresh",
+            .expires_at_ms = expires_at_ms,
+            .account_id = "acct_fixture",
+        }, .{}, &body.writer);
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), body.written());
+
+        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home, .auth_path = auth_path };
+    }
+
+    fn readSaved(self: *const SavedSubscriptionFixture) ![]u8 {
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.auth_path, .{});
+        defer file.close(io_mod.getIo());
+        return io_mod.readFileToEnd(self.alloc, &file, 64 * 1024);
+    }
+
+    fn deinit(self: *SavedSubscriptionFixture) void {
+        self.env.deinit();
+        self.alloc.free(self.auth_path);
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+};
+
+/// The Codex token the probe hands out: a JWT whose claim names acct_fixture.
+const rotated_codex_access = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9maXh0dXJlIn19.rotated";
+const rotated_grok_access = "grok-rotated";
+
+/// Answers a Codex or Grok refresh with a rotated login for acct_fixture, and
+/// Grok's userinfo with that account.
+const SubscriptionRefreshProbe = struct {
+    which: Subscription,
+    token_calls: usize = 0,
+
+    fn provider(self: *SubscriptionRefreshProbe) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn rotatedAccess(which: Subscription) []const u8 {
+        return switch (which) {
+            .codex => rotated_codex_access,
+            .grok => rotated_grok_access,
+        };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: std.mem.Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *SubscriptionRefreshProbe = @ptrCast(@alignCast(raw.?));
+        const body = switch (request.method) {
+            .get => try alloc.dupe(u8, "{\"sub\":\"acct_fixture\"}"),
+            .post_form, .post_json => blk: {
+                self.token_calls += 1;
+                break :blk try alloc.print(
+                    "{{\"access_token\":\"{s}\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600}}",
+                    .{rotatedAccess(self.which)},
+                );
+            },
+        };
+        return .{ .disposition = .accepted, .body = body };
+    }
+};
+
+/// Forces a refresh of the fixture's subscription login after the provider
+/// rejected `rejected`, and checks that it rotated exactly when `rotates`.
+fn expectSubscriptionReplaceRejected(fixture: *const SavedSubscriptionFixture, which: Subscription, saved: []const u8, rejected: []const u8, rotates: bool) !void {
+    const alloc = fixture.alloc;
+    const before = try fixture.readSaved();
+    defer alloc.free(before);
+    var refresh = SubscriptionRefreshProbe{ .which = which };
+    var credential = (switch (which) {
+        .codex => try refreshChatGptCredential(alloc, refresh.provider(), rejected),
+        .grok => try refreshGrokCredential(alloc, refresh.provider(), rejected),
+    }) orelse return error.TestUnexpectedResult;
+    defer credential.deinit(alloc);
+    const after = try fixture.readSaved();
+    defer alloc.free(after);
+    if (rotates) {
+        try std.testing.expectEqual(@as(usize, 1), refresh.token_calls);
+        try std.testing.expectEqualStrings(SubscriptionRefreshProbe.rotatedAccess(which), credential.token);
+        try std.testing.expect(std.mem.find(u8, after, "rotated-refresh") != null);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), refresh.token_calls);
+        try std.testing.expectEqualStrings(saved, credential.token);
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+test "a forced Codex or Grok refresh after a 401 uses the login another fx saved" {
+    for ([_]Subscription{ .codex, .grok }) |which| {
+        var fixture = try SavedSubscriptionFixture.install(std.testing.allocator, which, "saved-by-another-fx", io_mod.milliTimestamp() + hour_ms);
+        defer fixture.deinit();
+        try expectSubscriptionReplaceRejected(&fixture, which, "saved-by-another-fx", "rejected-access", false);
+    }
+}
+
+test "a forced Codex or Grok refresh after a 401 rotates the saved login that holds the rejected token" {
+    for ([_]Subscription{ .codex, .grok }) |which| {
+        var fixture = try SavedSubscriptionFixture.install(std.testing.allocator, which, "rejected-access", io_mod.milliTimestamp() + hour_ms);
+        defer fixture.deinit();
+        try expectSubscriptionReplaceRejected(&fixture, which, "rejected-access", "rejected-access", true);
+    }
+}
+
+test "a forced Codex or Grok refresh after a 401 rotates a replaced login past its refresh deadline" {
+    // The refresh deadline is a minute before expiry (subscription_session expiry_skew_ms).
+    for ([_]Subscription{ .codex, .grok }) |which| {
+        var fixture = try SavedSubscriptionFixture.install(std.testing.allocator, which, "saved-by-another-fx", io_mod.milliTimestamp() + 30 * 1000);
+        defer fixture.deinit();
+        try expectSubscriptionReplaceRejected(&fixture, which, "saved-by-another-fx", "rejected-access", true);
+    }
+}
+
+fn fuzzSubscriptionReplaceRejected(_: void, smith: *std.testing.Smith) !void {
+    const which: Subscription = if (smith.value(bool)) .codex else .grok;
+    var saved_buf: [8]u8 = undefined;
+    var rejected_buf: [9]u8 = undefined;
+    const saved = fuzzFxLoginToken(smith, &saved_buf);
+    const rejected: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => saved,
+        1 => saved[0..smith.valueRangeAtMost(u8, 0, @intCast(saved.len - 1))],
+        2 => blk: {
+            @memcpy(rejected_buf[0..saved.len], saved);
+            rejected_buf[saved.len] = if (smith.value(bool)) 'a' else 'b';
+            break :blk rejected_buf[0 .. saved.len + 1];
+        },
+        else => fuzzFxLoginToken(smith, &rejected_buf),
+    };
+    // Clear of the refresh deadline a minute before expiry, on either side.
+    const expired = smith.value(bool);
+    const offset_ms: i64 = if (expired)
+        smith.valueRangeAtMost(i64, -hour_ms, 59 * 1000)
+    else
+        smith.valueRangeAtMost(i64, 61 * 1000, hour_ms);
+    var fixture = try SavedSubscriptionFixture.install(std.testing.allocator, which, saved, io_mod.milliTimestamp() + offset_ms);
+    defer fixture.deinit();
+    try expectSubscriptionReplaceRejected(&fixture, which, saved, rejected, expired or std.mem.eql(u8, saved, rejected));
+}
+
+test "a forced Codex or Grok refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines" {
+    try std.testing.fuzz({}, fuzzSubscriptionReplaceRejected, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            "abababababababababababab",
+        }) ++ @import("fuzz_corpus").subscription_replace_rejected.*),
     });
 }
 

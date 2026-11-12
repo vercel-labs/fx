@@ -29,10 +29,14 @@ const e2e_revoke_url_env = "FX_TEST_GROK_REVOKE_URL";
 const browser_scope = "openid profile email offline_access grok-cli:access api:access";
 const browser_login_timeout_seconds: i64 = 5 * 60;
 
-pub const RefreshMode = enum {
+pub const RefreshMode = union(enum) {
     if_needed,
     force,
     stored,
+    /// xAI rejected this access token: rotate only as
+    /// `oauth.rejectedLoginRotates` decides, so a login another fx already
+    /// refreshed is used as it is.
+    replace_rejected: []const u8,
 };
 
 pub const Access = struct {
@@ -511,8 +515,16 @@ pub fn loadAccess(
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
 
-    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+    const expired = session.expired(io_mod.milliTimestamp());
+    const rotate = switch (mode) {
+        .if_needed, .stored => expired,
+        .force => true,
+        .replace_rejected => |rejected| oauth.rejectedLoginRotates(session.access_token, rejected, expired),
+    };
+    if (rotate) {
         try refreshSession(alloc, transport, &mutation, &session);
+    } else if (mode == .replace_rejected) {
+        debug_trace.logf("auth", "Grok refresh skipped reason=saved_login_replaced", .{});
     }
     return takeAccess(&session);
 }

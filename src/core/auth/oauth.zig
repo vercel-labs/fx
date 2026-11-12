@@ -130,6 +130,16 @@ pub const TokenTypeHint = enum {
     refresh_token,
 };
 
+/// Whether a refresh forced by a 401 for `rejected_token` rotates a saved
+/// login that holds `saved_access_token`, and is `saved_expired` when past
+/// its refresh deadline: only while it still holds the rejected token or is
+/// past that deadline. Otherwise another fx already replaced it, and rotating
+/// again would make the token every other fx holds fail too
+/// (`tests/tla/auth/SharedLoginRefresh.tla` NoRedundantRotation).
+pub fn rejectedLoginRotates(saved_access_token: []const u8, rejected_token: []const u8, saved_expired: bool) bool {
+    return saved_expired or std.mem.eql(u8, saved_access_token, rejected_token);
+}
+
 pub fn expiryTimestampMs(now_ms: i64, expires_in_seconds: i64) OAuthError!i64 {
     if (expires_in_seconds <= 0) return OAuthError.InvalidOAuthResponse;
     const duration_ms = std.math.mul(i64, expires_in_seconds, std.time.ms_per_s) catch

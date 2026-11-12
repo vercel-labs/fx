@@ -5,6 +5,7 @@
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "fx_login_replace_rejected", "module": "fx", "test": "a forced fx login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
+    {"name": "subscription_replace_rejected", "module": "fx", "test": "a forced Codex or Grok refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
     {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 4000000},
