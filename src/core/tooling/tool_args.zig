@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const json_depth = @import("../../gateway/json_depth.zig");
+const json_depth = @import("../shared/json_depth.zig");
 
 pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std.json.ObjectMap {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, args_json, .{});
@@ -36,8 +36,8 @@ fn normalizeCompositeValue(
 ) !void {
     if (value.* != .string) return;
     // The gateway's depth check doesn't count brackets inside a string, and
-    // std.json.Stringify stops at 256 levels, so text deeper than tool input
-    // may be is refused before it is read.
+    // std.json.Stringify stops at 256 levels, so text that nests deeper than
+    // `json_depth.max_depth` is refused before it is read.
     if (json_depth.exceeds(value.string)) return error.InvalidCompositeArgument;
     const decoded = try std.json.parseFromSliceLeaky(
         std.json.Value,
