@@ -826,8 +826,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // The gateway sees main's request before fx runs the message it
           // returns. Close only once main shows the message working, which it
           // does while the message waits for the start; a close before that
-          // makes the message start a new worker instead.
-          await session.waitForPane((pane) => pane.includes("worker working \u00b7 SWITCH_START_NOTE"), 15_000);
+          // makes the message start a new worker instead. The worker's row
+          // reads "Messaged worker" after the first message and "worker
+          // working" while the second one waits.
+          await session.waitForPane((pane) => /^[●├└] worker working$/m.test(pane), 15_000);
           await selectAgent(session, "worker");
           await session.sendKeys("BSpace");
           await session.waitForText("press delete again to close this subagent", 10_000);
