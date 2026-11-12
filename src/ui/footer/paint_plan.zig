@@ -1188,7 +1188,7 @@ fn pushQuestionPanelRows(
     projection: question_state.Projection,
     width: u16,
 ) !void {
-    const text = try question_ui.composeQuestionPanelText(alloc, projection, width);
+    const text = try question_ui.composeQuestionPanelText(alloc, projection, width, row_count);
     defer alloc.free(text);
 
     var line_start: usize = 0;
