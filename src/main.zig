@@ -5966,6 +5966,13 @@ fn waitCountOwnedByMain(app: *App, children: []const *app_agents_runtime.ChildAg
     return App.AgentsAppRuntime.subagentWaitCount(app);
 }
 
+/// The state the agent list shows for the row named `name`. The list puts an
+/// agent that waits for the user first, so a row's place does not name it.
+fn menuRowState(projection: anytype, name: []const u8) ![]const u8 {
+    for (projection.rows) |row| if (std.mem.eql(u8, row.name, name)) return row.state;
+    return error.RowNotListed;
+}
+
 test "an idle agent's waiting row counts a subagent until its finished turn is applied" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
@@ -5995,14 +6002,14 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     try finishing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
     try std.testing.expect(!finishing.agent.worker.isProcessing());
     try runtime.openMenu(&app);
-    try std.testing.expectEqualStrings("working", runtime.menuProjection(&app).rows[1].state);
+    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(&app), "finishing"));
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 
     // Once the loop has applied the finish, nothing is left to wait for.
     var events = finishing.agent.worker.takeEvents();
     for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
     events.deinit(alloc);
-    try std.testing.expectEqualStrings("idle", runtime.menuProjection(&app).rows[1].state);
+    try std.testing.expectEqualStrings("idle", try menuRowState(runtime.menuProjection(&app), "finishing"));
     try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
 
     // A subagent that waits for the user's approval is still one main waits on,
@@ -6011,7 +6018,7 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     defer asking.agent.worker.worker_processing = false;
     app.approval_lender = asking;
     defer app.approval_lender = null;
-    try std.testing.expectEqualStrings("needs approval", runtime.menuProjection(&app).rows[2].state);
+    try std.testing.expectEqualStrings("needs approval", try menuRowState(runtime.menuProjection(&app), "asking"));
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 }
 
