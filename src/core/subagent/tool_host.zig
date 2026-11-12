@@ -412,7 +412,8 @@ pub const Runtime = struct {
     };
 
     /// Every subagent of the root, with its work phase and last outcome,
-    /// one that is closing too. Free with `freeTraceChildren`.
+    /// one that is closing too. `alloc` owns the listing: `/trace` passes an
+    /// arena, and this file's tests free it with `freeTraceChildren`.
     pub fn traceChildren(self: *Runtime, alloc: Allocator) ![]TraceChild {
         // Admission before the registry, as everywhere in this host.
         self.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -443,7 +444,7 @@ pub const Runtime = struct {
         return listing;
     }
 
-    pub fn freeTraceChildren(alloc: Allocator, listing: []TraceChild) void {
+    fn freeTraceChildren(alloc: Allocator, listing: []TraceChild) void {
         for (listing) |entry| freeTraced(alloc, entry);
         alloc.free(listing);
     }
