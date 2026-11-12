@@ -148,7 +148,9 @@ pub const State = struct {
     copy_completion_window_start: usize = 0,
     copy_completion_moved: bool = false,
     copy_completion_storage: std.ArrayList(u8) = .empty,
+    copy_completion_all_labels: std.ArrayList([]const u8) = .empty,
     copy_completion_labels: std.ArrayList([]const u8) = .empty,
+    copy_completion_cached: bool = false,
     copy_snapshot_storage: std.ArrayList(u8) = .empty,
     copy_snapshot_lengths: [3]usize = @splat(0),
     copy_snapshot_count: ?usize = null,
@@ -193,6 +195,7 @@ pub const State = struct {
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.file_completion.deinit(alloc);
         self.copy_completion_storage.deinit(alloc);
+        self.copy_completion_all_labels.deinit(alloc);
         self.copy_completion_labels.deinit(alloc);
         self.copy_snapshot_storage.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
@@ -213,6 +216,7 @@ pub const State = struct {
         self.copy_completion_index = 0;
         self.copy_completion_window_start = 0;
         self.copy_completion_moved = false;
+        self.copy_completion_cached = false;
         self.copy_snapshot_count = null;
         self.copy_snapshot_stale = false;
         self.inline_picker_suppression = null;
@@ -444,6 +448,7 @@ pub const State = struct {
         self.copy_completion_index = 0;
         self.copy_completion_window_start = 0;
         self.copy_completion_moved = false;
+        self.copy_completion_cached = false;
         self.copy_snapshot_count = null;
         self.copy_snapshot_stale = false;
         self.resetActiveModelPickerIndex();

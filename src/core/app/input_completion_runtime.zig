@@ -689,26 +689,38 @@ pub fn CompletionRuntime(comptime App: type) type {
             var replies: [3][]const u8 = undefined;
             const found = copyReplies(agent, &replies);
             if (!try app.input_runtime.picker.reconcileCopySnapshot(app.alloc, @intFromPtr(agent), found)) return &.{};
-            const targets = try copy_targets.collect(app.alloc, found);
-            defer copy_targets.free(app.alloc, targets);
-            return storeCopyPickerLabels(app, targets, query.query);
+            const picker = &app.input_runtime.picker;
+            if (!picker.copy_completion_cached) {
+                const targets = try copy_targets.collect(app.alloc, found);
+                defer copy_targets.free(app.alloc, targets);
+                return storeCopyPickerLabels(app, targets, query.query);
+            }
+            return filterCopyPickerLabels(picker, query.query);
         }
 
         fn storeCopyPickerLabels(app: *App, targets: []const copy_targets.Target, query: []const u8) ![]const []const u8 {
             const picker = &app.input_runtime.picker;
+            picker.copy_completion_cached = false;
             picker.copy_completion_storage.clearRetainingCapacity();
+            picker.copy_completion_all_labels.clearRetainingCapacity();
             picker.copy_completion_labels.clearRetainingCapacity();
             var bytes: usize = 0;
             for (targets) |target| bytes += target.name.len;
             try picker.copy_completion_storage.ensureTotalCapacity(app.alloc, bytes);
-            try picker.copy_completion_labels.ensureTotalCapacity(app.alloc, targets.len);
+            try picker.copy_completion_all_labels.ensureTotalCapacity(app.alloc, targets.len);
+            try picker.copy_completion_labels.resize(app.alloc, targets.len);
             for (targets) |target| {
                 const start = picker.copy_completion_storage.items.len;
                 picker.copy_completion_storage.appendSliceAssumeCapacity(target.name);
-                picker.copy_completion_labels.appendAssumeCapacity(picker.copy_completion_storage.items[start..]);
+                picker.copy_completion_all_labels.appendAssumeCapacity(picker.copy_completion_storage.items[start..]);
             }
+            picker.copy_completion_cached = true;
+            return filterCopyPickerLabels(picker, query);
+        }
+
+        fn filterCopyPickerLabels(picker: *picker_state.State, query: []const u8) []const []const u8 {
             const labels = picker.copy_completion_labels.items;
-            const matching_count = picker_state.filterCompletionLabels(query, labels, labels);
+            const matching_count = picker_state.filterCompletionLabels(query, picker.copy_completion_all_labels.items, labels);
             return labels[0..matching_count];
         }
 
@@ -1713,6 +1725,49 @@ pub fn CompletionRuntime(comptime App: type) type {
             return speedSelection(labels[speedPickerIndex(app, labels[0..count])]);
         }
     };
+}
+
+test "copy picker caches labels until the snapshot resets" {
+    const TestSession = struct {
+        replies: []const []const u8,
+        pub fn copyReplies(self: *const @This(), out: *[3][]const u8) []const []const u8 {
+            @memcpy(out[0..self.replies.len], self.replies);
+            return out[0..self.replies.len];
+        }
+    };
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        input_runtime: core_input_runtime.Runtime = .{},
+        main_agent: struct { session: TestSession },
+    };
+    const alloc = std.testing.allocator;
+    var app: TestApp = .{ .alloc = alloc, .main_agent = .{ .session = .{ .replies = &.{"```sh\necho hello\n```\n| a | b |\n| - | - |\n"} } } };
+    defer app.input_runtime.deinit(alloc);
+    const rt = CompletionRuntime(TestApp);
+    try app.input_runtime.edit_state.setText(alloc, "/copy ");
+    const initial = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 3), initial.len);
+
+    // A redraw and query filtering must not parse or allocate again.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    try app.input_runtime.edit_state.setText(alloc, "/copy cmd_echo");
+    const filtered = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("cmd_echo_hello", filtered[0]);
+    try app.input_runtime.edit_state.setText(alloc, "/copy ");
+    const restored = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 3), restored.len);
+    try std.testing.expectEqualStrings("all", restored[0]);
+
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    try std.testing.expectError(error.OutOfMemory, rt.copyPickerCompletions(&app, &app.main_agent));
+    app.alloc = alloc;
+    app.main_agent.session.replies = &.{"```\nreplacement\n```"};
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    const changed = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 2), changed.len);
+    try std.testing.expectEqualStrings("code_replacement", changed[1]);
 }
 
 test "copy picker lists and filters the selected agent replies" {
