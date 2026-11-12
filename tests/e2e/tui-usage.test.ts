@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 import {
   codexBreakdownBody,
   codexProfileBody,
@@ -115,6 +116,45 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       expect(fake.reportRanges()).toHaveLength(4);
       const pane = await session.capturePane();
       expect(pane).not.toContain("e2e-usage-key");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "an fx login's /usage refused for a token another fx replaced reads again with the newer stored login",
+    async () => {
+      const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+      let usage: ReturnType<typeof usageFake> | undefined;
+      const { home, fake, env } = start("fx-tui-usage-renewed-", {
+        // The fake records each request before it answers.
+        report: (from) => usage?.requests.at(-1)?.authorization === "Bearer launch-token"
+          ? Response.json({ error: { message: "token expired" } }, { status: 401 })
+          : rows(from),
+      });
+      usage = fake;
+      const stopGateway = stop;
+      stop = () => {
+        stopGateway?.();
+        issuer.stop();
+      };
+      writeFxLogin(home, issuer.issuerUrl, "launch-token");
+      session = await TmuxSession.create({
+        env: { ...env, FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl, FX_OAUTH_CLIENT_ID: "test-client", FX_NO_OPEN_BROWSER: "1" },
+      });
+      await session.waitForComposer(TIMEOUT);
+      // Another fx renews the shared login after this one read it.
+      rotateFxLogin(home, "rotated-token");
+      await session.sendText("/usage");
+      const month = await session.waitForText("model (month)", TIMEOUT);
+      expect(month).toContain("(fx login)");
+      expect(month).toMatch(/month\s+\$2\.50\s+6\s/);
+      expect(fake.requests.filter((request) => request.path === "/v1/report").map((request) => request.authorization)).toEqual([
+        "Bearer launch-token",
+        "Bearer rotated-token",
+        "Bearer rotated-token",
+        "Bearer rotated-token",
+      ]);
+      expect(issuer.refreshes).toHaveLength(0);
     },
     TIMEOUT * 2,
   );

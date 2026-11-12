@@ -14,6 +14,7 @@ const oauth_session = @import("../auth/oauth_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const stored_login_testing = @import("../auth/stored_login_testing.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -24,7 +25,7 @@ const clock_file_env = "FX_TEST_USAGE_CLOCK_FILE";
 
 /// A host with no home directory, for a dashboard that `host` replaces once
 /// the home is known.
-pub const unset: usage.Host = .{ .fetch_fn = fetch, .now_fn = now, .io_fn = io, .home = "" };
+pub const unset: usage.Host = .{ .fetch_fn = fetch, .now_fn = now, .io_fn = io, .home = "", .renew_fn = renewFromStore };
 
 /// `home` is the user's home directory; the cache follows `$FX_HOME`.
 pub fn host(home: []const u8) usage.Host {
@@ -34,6 +35,7 @@ pub fn host(home: []const u8) usage.Host {
         .io_fn = io,
         .home = profile_paths.rootParent(home),
         .fx_dir_name = profile_paths.rootName(),
+        .renew_fn = renewFromStore,
     };
 }
 
@@ -57,6 +59,26 @@ pub fn cooperativeHost(comptime App: type, app: *App, home: []const u8) usage.Ho
 
 fn io(_: ?*anyopaque) std.Io {
     return io_mod.getIo();
+}
+
+/// A newer token for a sign-in the provider refused, which another fx process
+/// saved since this one read it: the stored fx login for the same team, or
+/// the stored Codex or Grok sign-in for the same account. Never refreshes the
+/// sign-in; an API key has nothing to renew.
+fn renewFromStore(_: ?*anyopaque, alloc: Allocator, renewal: usage.Renewal) ?[]u8 {
+    const sign_in: auth_runtime.SharedSignIn = switch (renewal.scope) {
+        .member => .{ .source = .fx_login, .team = renewal.team },
+        .codex => .{ .source = .chatgpt_subscription, .account_id = renewal.account_id },
+        .grok => .{ .source = .grok_subscription, .account_id = renewal.account_id },
+        .api_key => return null,
+    };
+    var stored = (auth_runtime.storedReplacement(alloc, sign_in, renewal.rejected) catch return null) orelse {
+        debug_trace.logf("usage", "refused sign-in has no newer stored token scope={t}", .{renewal.scope});
+        return null;
+    };
+    defer stored.deinit(alloc);
+    debug_trace.logf("usage", "refused sign-in renewed from the store scope={t}", .{renewal.scope});
+    return alloc.dupe(u8, stored.token) catch null;
 }
 
 /// Room for a credential's display label.
@@ -228,4 +250,23 @@ fn readClockFile(path: []const u8) ?i64 {
     defer file.close(file_io);
     const len = file.readPositionalAll(file_io, &buf, 0) catch return null;
     return std.fmt.parseInt(i64, std.mem.trim(u8, buf[0..len], " \t\r\n"), 10) catch null;
+}
+
+test "a refused /usage sign-in renews only to a newer stored token for the same sign-in" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    // Another fx process renewed the login after this one read it.
+    try home.store("rotated-token", "team-id", stored_login_testing.far_future_ms);
+
+    const renewed = renewFromStore(null, alloc, .{ .scope = .member, .rejected = "launch-token", .team = "team-id", .account_id = null }).?;
+    defer alloc.free(renewed);
+    try std.testing.expectEqualStrings("rotated-token", renewed);
+    // The store still holds the refused token: nothing newer to send.
+    try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .member, .rejected = "rotated-token", .team = "team-id", .account_id = null }) == null);
+    // Another team's login is never sent.
+    try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .member, .rejected = "launch-token", .team = "team-other", .account_id = null }) == null);
+    // An API key has nothing to renew.
+    try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .api_key, .rejected = "vck_key", .team = null, .account_id = null }) == null);
 }
