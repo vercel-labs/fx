@@ -2,12 +2,15 @@
 
 const std = @import("std");
 const io_mod = @import("io.zig");
+const net_accept = @import("net_accept.zig");
+
+const posix = std.posix;
 
 /// How long one wait for a connection lasts before the stop flag is read
 /// again.
 const stop_check_ms = 10;
 
-pub const AcceptError = std.posix.PollError || std.Io.net.Server.AcceptError;
+pub const AcceptError = posix.PollError || std.Io.net.Server.AcceptError;
 
 /// Accepts the next connection on `server`, or returns null once `stopping`
 /// is set. A test server's thread uses this in place of a blocking `accept`,
@@ -16,20 +19,24 @@ pub const AcceptError = std.posix.PollError || std.Io.net.Server.AcceptError;
 /// listening socket wakes it on Linux but fails with `ENOTCONN` on macOS, and
 /// a connection opened only to wake it can fail like any other. The caller
 /// owns the returned stream.
+///
+/// A connection that is gone by the time `accept` runs sends the loop back
+/// to waiting, through `net_accept.acceptIfWaiting`, so the stop is still
+/// read.
 pub fn acceptUnlessStopping(
     server: *std.Io.net.Server,
     io: std.Io,
     stopping: *const std.atomic.Value(bool),
 ) AcceptError!?std.Io.net.Stream {
-    var fds = [_]std.posix.pollfd{.{
+    var fds = [_]posix.pollfd{.{
         .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
+        .events = posix.POLL.IN,
         .revents = 0,
     }};
     while (!stopping.load(.seq_cst)) {
         fds[0].revents = 0;
-        if (try std.posix.poll(&fds, stop_check_ms) == 0) continue;
-        return try server.accept(io);
+        if (try posix.poll(&fds, stop_check_ms) == 0) continue;
+        if (try net_accept.acceptIfWaiting(server, io)) |stream| return stream;
     }
     return null;
 }
@@ -131,6 +138,66 @@ pub const ServerThread = struct {
     }
 };
 
+/// A thread that polls a listener it shares with a server under test and
+/// takes one connection with its own accept. Both can see the connection
+/// ready, and only one accept gets it, so the server's own accept can find
+/// it gone. The rival's accept blocks when the server took the connection
+/// first and the listener still blocks.
+pub const Rival = struct {
+    listener: posix.fd_t,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    taken: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *Rival) !void {
+        std.debug.assert(self.thread == null);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *Rival) void {
+        defer self.done.store(true, .seq_cst);
+        var fds = [_]posix.pollfd{.{ .fd = self.listener, .events = posix.POLL.IN, .revents = 0 }};
+        while (!self.stopping.load(.seq_cst)) {
+            fds[0].revents = 0;
+            const ready = posix.poll(&fds, stop_check_ms) catch return;
+            if (ready == 0) continue;
+            const rc = posix.system.accept(self.listener, null, null);
+            if (posix.errno(rc) != .SUCCESS) continue;
+            _ = posix.system.close(@intCast(rc));
+            self.taken.store(true, .seq_cst);
+            return;
+        }
+    }
+
+    /// Stops the thread and joins it. While it still waits in `accept`, as
+    /// when the server took the connection, `wake` opens one connection to
+    /// the listener, which ends that wait.
+    pub fn finish(self: *Rival, context: *const anyopaque, wake: *const fn (*const anyopaque) void) void {
+        const thread = self.thread orelse return;
+        self.thread = null;
+        self.stopping.store(true, .seq_cst);
+        while (!waitFor(&self.done, 100)) wake(context);
+        thread.join();
+    }
+};
+
+/// `Rival.finish`'s wake for a loopback listener: `context` is its `u16` port.
+pub fn wakeLoopback(context: *const anyopaque) void {
+    const port: *const u16 = @ptrCast(@alignCast(context));
+    connectToLoopback(port.*);
+}
+
+/// Opens and closes one connection to the loopback `port`, ignoring a
+/// failure, for a `Rival.finish` or a test's own wake.
+pub fn connectToLoopback(port: u16) void {
+    var backend: std.Io.Threaded = .init_single_threaded;
+    const zio = backend.io();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = address.connect(zio, .{ .mode = .stream }) catch return;
+    stream.close(zio);
+}
+
 /// A loopback listener with a thread waiting on it, for the tests below.
 const Waiter = struct {
     backend: std.Io.Threaded = .init_single_threaded,
@@ -189,6 +256,78 @@ const Waiter = struct {
     }
 };
 
+/// Two threads that wait on one loopback listener through
+/// `acceptUnlessStopping`, for the test of a connection only one of them
+/// can take.
+const Rivals = struct {
+    backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server = undefined,
+    stopping: std.atomic.Value(bool) = .init(false),
+    threads: [2]?std.Thread = @splat(null),
+    started: [2]std.atomic.Value(bool) = @splat(.init(false)),
+    done: [2]std.atomic.Value(bool) = @splat(.init(false)),
+    taken: std.atomic.Value(bool) = .init(false),
+    accepted: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    /// Listens on a free loopback port and starts both threads. The rivals
+    /// must not move until `finish` returns.
+    fn start(self: *Rivals) !void {
+        const zio = self.backend.io();
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(zio, .{ .reuse_address = true });
+        errdefer self.server.deinit(zio);
+        for (&self.threads, 0..) |*thread, index| {
+            thread.* = std.Thread.spawn(.{}, run, .{ self, index }) catch |err| {
+                self.stopping.store(true, .seq_cst);
+                for (self.threads[0..index]) |started| started.?.join();
+                return err;
+            };
+        }
+    }
+
+    fn run(self: *Rivals, index: usize) void {
+        defer self.done[index].store(true, .seq_cst);
+        var backend: std.Io.Threaded = .init_single_threaded;
+        const zio = backend.io();
+        self.started[index].store(true, .seq_cst);
+        const stream = acceptUnlessStopping(&self.server, zio, &self.stopping) catch {
+            self.failed.store(true, .seq_cst);
+            return;
+        } orelse return;
+        _ = self.accepted.fetchAdd(1, .seq_cst);
+        self.taken.store(true, .seq_cst);
+        stream.close(zio);
+    }
+
+    fn waitUntilStarted(self: *Rivals) void {
+        for (&self.started) |*started| {
+            while (!started.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        }
+        // Give both threads time to settle into their wait.
+        io_mod.sleep(20 * std.time.ns_per_ms);
+    }
+
+    /// Stops both threads and joins them, then closes the listener. A thread
+    /// still running after `limit_ms` is woken by one more connection, so the
+    /// test fails instead of hanging.
+    fn finish(self: *Rivals, limit_ms: u32) error{TestThreadStillWaiting}!void {
+        defer self.server.deinit(self.backend.io());
+        self.stopping.store(true, .seq_cst);
+        var still_waiting = false;
+        for (&self.threads, &self.done) |*slot, *done| {
+            const thread = slot.* orelse continue;
+            slot.* = null;
+            if (!waitFor(done, limit_ms)) {
+                still_waiting = true;
+                connectOnce(&self.server) catch {};
+            }
+            thread.join();
+        }
+        if (still_waiting) return error.TestThreadStillWaiting;
+    }
+};
+
 fn connectOnce(server: *std.Io.net.Server) !void {
     var backend: std.Io.Threaded = .init_single_threaded;
     const zio = backend.io();
@@ -218,6 +357,26 @@ test "a waiting accept returns the client that connects" {
     try waiter.finish(5_000);
     try std.testing.expect(waiter.accepted);
     try std.testing.expectEqual(@as(?AcceptError, null), waiter.failure);
+}
+
+test "a waiting accept ends at the stop when another thread takes the connection it saw" {
+    // Both threads can see the one connection as ready, and only one accept
+    // gets it. The other must go back to waiting for the stop: an accept that
+    // blocks there never reads the flag again.
+    for (0..10) |_| {
+        var rivals: Rivals = .{};
+        try rivals.start();
+        rivals.waitUntilStarted();
+        connectOnce(&rivals.server) catch |err| {
+            rivals.finish(5_000) catch {};
+            return err;
+        };
+        const taken = waitFor(&rivals.taken, 5_000);
+        try rivals.finish(2_000);
+        try std.testing.expect(taken);
+        try std.testing.expectEqual(@as(usize, 1), rivals.accepted.load(.seq_cst));
+        try std.testing.expect(!rivals.failed.load(.seq_cst));
+    }
 }
 
 test "a stop that the thread ignores fails within its limit" {

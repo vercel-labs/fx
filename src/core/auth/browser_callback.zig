@@ -1,6 +1,8 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const net_accept = @import("../shared/net_accept.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -96,10 +98,9 @@ fn await_request(
     var accepts: usize = 0;
     while (accepts < max_accepts_per_poll) : (accepts += 1) {
         if (!try listenerReady(listener, cancel_flag)) return null;
-        var stream = listener.accept(io_mod.getIo()) catch |err| switch (err) {
-            error.ConnectionAborted, error.WouldBlock => continue,
-            else => return err,
-        };
+        // A connection gone before the accept sends the loop back to the
+        // cancel check.
+        var stream = (try net_accept.acceptIfWaiting(listener, io_mod.getIo())) orelse continue;
         var handed_off = false;
         defer if (!handed_off) stream.close(io_mod.getIo());
         setSocketTimeouts(stream.socket.handle);
@@ -735,6 +736,59 @@ fn expectResetPreconnectSurvives(hold_ms: u64) !void {
     )) orelse return error.CallbackNeverArrived;
     defer accepted.deinit();
     try std.testing.expectEqualStrings("granted", accepted.callback.code);
+}
+
+/// `await` on its own thread until the test sets the cancel flag.
+const CallbackWaiter = struct {
+    listener: *std.Io.net.Server,
+    cancel_flag: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *CallbackWaiter) void {
+        defer self.done.store(true, .seq_cst);
+        while (!self.cancel_flag.load(.seq_cst)) {
+            var accepted = (await(
+                TestCallback,
+                parseTestCallback,
+                std.testing.allocator,
+                self.listener,
+                null,
+                &self.cancel_flag,
+                null,
+            ) catch return) orelse continue;
+            accepted.deinit();
+        }
+    }
+};
+
+test "browser callback cancels when another thread takes the connection it saw" {
+    // The callback's wait and a rival can both see the one connection as
+    // ready, and only one accept gets it. When the rival wins, the callback
+    // must go back to its poll and see the cancel, not wait in accept.
+    for (0..10) |_| {
+        var listener = try bindTestListener();
+        defer listener.deinit(io_mod.getIo());
+        const port = listener.socket.address.getPort();
+        const wake_context: *const anyopaque = @ptrCast(&port);
+        var rival: testing_listener.Rival = .{ .listener = listener.socket.handle };
+        try rival.start();
+        defer rival.finish(wake_context, testing_listener.wakeLoopback);
+        var waiter: CallbackWaiter = .{ .listener = &listener };
+        const thread = try std.Thread.spawn(.{}, CallbackWaiter.run, .{&waiter});
+        io_mod.sleep(20 * std.time.ns_per_ms);
+        testing_listener.connectToLoopback(port);
+        _ = testing_listener.waitFor(&rival.taken, 1_000);
+        rival.finish(wake_context, testing_listener.wakeLoopback);
+        waiter.cancel_flag.store(true, .seq_cst);
+        const ended = testing_listener.waitFor(&waiter.done, 2_000);
+        // A wait still in accept ends with one more connection.
+        while (!waiter.done.load(.seq_cst)) {
+            testing_listener.connectToLoopback(port);
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+        thread.join();
+        try std.testing.expect(ended);
+    }
 }
 
 test "browser callback survives a reset preconnect before the redirect" {
