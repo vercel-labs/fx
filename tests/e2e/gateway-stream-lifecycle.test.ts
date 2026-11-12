@@ -11984,7 +11984,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 70_000);
 
-  test("provider error finish reconciles without authorizing local tool execution", async () => {
+  test("provider error finish resends without running the local tool call it carried", async () => {
     const root = createFixtureRoot("provider-error");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
@@ -12023,8 +12023,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
       expectOnlyLeadingSystemMessages(gateway.requests[1]!.body);
-      expect(gateway.requests[1]!.body).toContain("Reconcile the available tool evidence");
-      expect(gateway.requests[1]!.body).toContain(
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
       expect(trace).not.toContain("event=before_tool_execution");
@@ -13342,7 +13342,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("streamed tool calls without finish reconcile without executing the uncertain call", async () => {
+  test("streamed tool calls without finish resend without executing the unfinished call", async () => {
     const root = createFixtureRoot("tool-without-finish");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "should-not-exist.txt");
@@ -13377,9 +13377,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(2);
       expect(trace).toContain("termination cause=done_without_finish");
       expectOnlyLeadingSystemMessages(gateway.requests[1]!.body);
-      expect(gateway.requests[1]!.body).toContain("Reconcile the available tool evidence");
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
       expect(gateway.requests[1]!.body).not.toContain("network_recovery");
-      expect(gateway.requests[1]!.body).toContain(
+      expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
       expect(trace).toContain("event=prompt_finish");
@@ -13410,19 +13410,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("uncertain tool reconciliation refuses a second tool result", async () => {
-    const root = createFixtureRoot("uncertain-tool-repeat");
+  test("a resend after an unexecuted local tool call runs the model's new call once", async () => {
+    const root = createFixtureRoot("unexecuted-tool-regenerated");
     const tracePath = join(root.root, "trace.log");
-    const sentinelPath = join(root.workspace, "must-not-repeat.txt");
+    const writtenPath = join(root.workspace, "written-once.txt");
     const responses = [
       sse(
-        'data: {"type":"tool-call","toolCallId":"write_uncertain","toolName":"write_file","input":{"path":"must-not-repeat.txt","content":"unsafe"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"write_unexecuted","toolName":"write_file","input":{"path":"written-once.txt","content":"once"}}\n\n' +
           "data: [DONE]\n\n",
       ),
-      fakeGatewayToolCall("write_repeat", "write_file", {
-        path: "must-not-repeat.txt",
-        content: "unsafe",
+      fakeGatewayToolCall("write_regenerated", "write_file", {
+        path: "written-once.txt",
+        content: "once",
       }),
+      fakeGatewayFinalText("Wrote the fixture file once."),
     ];
     const gateway = startGateway(() =>
       responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -13439,18 +13440,72 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      // The turn stops for review with fx's own terminal wording.
-      expect(result.code).toBe(1);
-      expect(json.recovery?.state).toBe("failed");
-      expect(json.recovery?.message).toContain("Tool state needs review");
-      expect(json.recovery?.need).toBeUndefined();
-      expect(gateway.requestCount()).toBe(2);
-      expect(gateway.requests[1]!.body).toContain(
+      // fx never ran the first call, so the resend may call the tool again,
+      // and the new call runs once.
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Wrote the fixture file once.");
+      expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
-      expect(existsSync(sentinelPath)).toBe(false);
-      expect(trace).toContain("event=uncertain_provider_tool_rejected");
-      expect(trace).not.toContain("event=before_tool_execution");
+      expect(readFileSync(writtenPath, "utf8")).toBe("once");
+      expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a malformed function call finish lets the resend call a tool", async () => {
+    const root = createFixtureRoot("malformed-function-call");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "malformed call fixture\n");
+    // Gemini ends a reply with MALFORMED_FUNCTION_CALL after a local tool
+    // call, and its answer to the resend calls a tool again.
+    const responses = [
+      fakeGatewaySse([
+        { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+        { type: "tool-call", toolCallId: "read_malformed", toolName: "read_file", input: { path: "notes.txt" } },
+        { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+      ]),
+      fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: "I'll read the file directly.\n" },
+        { type: "tool-input-start", id: "read_resent", toolName: "read_file" },
+        { type: "tool-call", toolCallId: "read_resent", toolName: "read_file", input: { path: "notes.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+      ]),
+      fakeGatewayFinalText("Read the notes after the malformed call."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Read notes.txt."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Read the notes after the malformed call.");
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(json.recovery?.message ?? "").not.toContain("Tool state needs review");
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).not.toContain(
+        '"toolChoice":{"type":"none"}',
+      );
+      expect(toolResultOutput(gateway.requests[2]!.body, "read_resent")).toContain(
+        "malformed call fixture",
+      );
+      expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

@@ -6126,7 +6126,7 @@ test "processQueuedPrompt empty history recovery preserves validation and source
     }
 }
 
-test "processQueuedPrompt reconciles provider error before tool execution" {
+test "processQueuedPrompt regenerates a local tool call that a provider error left unexecuted" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -6149,10 +6149,36 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
+}
+
+test "processQueuedPrompt runs the resend's tool call after a provider error left a local call unexecuted" {
+    const alloc = std.testing.allocator;
+    const failed = [_]ToolCall{toolCall("call_read_failed", "read_file", "{\"path\":\"a\"}")};
+    const resent = [_]ToolCall{toolCall("call_read_resent", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &failed, .finish_reason = .provider_error },
+        .{ .tool_calls = &resent },
+        .{ .content = "Read after the resend" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt stops for review when uncertain tool reconciliation returns another tool" {
@@ -6449,10 +6475,39 @@ test "processQueuedPrompt preserves the provider-executed subset of mixed failed
     );
 }
 
-test "processQueuedPrompt Esc while an uncertain tool request waits ends the turn without running it" {
+test "processQueuedPrompt reconciles local calls when the failed stream also started a provider tool" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("provider_search", "web_search", "{}")};
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .tool_calls = &calls, .finish_reason = .provider_error },
+        .{ .content = "Reconciled without tools" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The provider may have run its search, so the local call does not make
+    // the attempt unexecuted: the resend reconciles with tools off.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "Reconcile the available tool evidence");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(
+        session_codec.RecoveryToolState.uncertain,
+        hooks.recovery_checkpoints.items[1].tool_state,
+    );
+}
+
+test "processQueuedPrompt Esc while a resend after an unexecuted tool call waits ends the turn without running it" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
-        toolCall("uncertain_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
+        toolCall("unexecuted_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls, .finish_reason = .provider_error },
@@ -6477,7 +6532,7 @@ test "processQueuedPrompt Esc while an uncertain tool request waits ends the tur
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
-    try std.testing.expectEqual(session_codec.RecoveryToolState.uncertain, checkpoint.tool_state);
+    try std.testing.expectEqual(session_codec.RecoveryToolState.proven_unexecuted, checkpoint.tool_state);
     // Saving the cancelled turn as interrupted ends its checkpoint, so no
     // separate clear ends the turn a second time.
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);

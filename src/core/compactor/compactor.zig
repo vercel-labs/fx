@@ -55,6 +55,9 @@ pub const traceLog = trace.log;
 pub const TraceEvent = trace.Event;
 pub const trace_ring_capacity = trace.ring_capacity;
 pub const snapshotTrace = trace.snapshot;
+pub const trace_failure_capacity = trace.failure_ring_capacity;
+pub const snapshotTraceFailures = trace.snapshotFailures;
+pub const traceFailureCount = trace.failureCount;
 pub const resetTrace = trace.reset;
 
 // The `auto_compact_percent` setting.
