@@ -258,3 +258,153 @@ fn expectFuzzMethod(line: []const u8, method: []const u8) !void {
     try testing.expect(@intFromPtr(method.ptr) > @intFromPtr(line.ptr));
     try testing.expectEqual(@as(u8, '"'), (method.ptr - 1)[0]);
 }
+
+// ---- Elicitation answers: the same string, written with different escapes ----
+
+/// A fuzz input is one byte string that this reads as a script: where the string
+/// sits in a form, whether the answer holds the same string, how many code
+/// points it has, and for each one a code point and how each side spells it.
+const EscapeScript = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn next(s: *EscapeScript) u8 {
+        if (s.at >= s.bytes.len) return 0;
+        defer s.at += 1;
+        return s.bytes[s.at];
+    }
+};
+
+/// Code points that sit on the edges of the escape rules: a short escape, a
+/// control, ASCII, two- and three-byte UTF-8, and the first and last of the
+/// astral planes, which JSON writes as a surrogate pair.
+const escape_code_points = [_]u21{
+    'a', 'A', 0xe9, '/', '"', '\\', '\n', 0x00, 0x1f, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x1f600, 0x10ffff,
+};
+
+fn escapeCodePoint(s: *EscapeScript) u21 {
+    const selector = s.next();
+    if (selector & 0x80 == 0) return escape_code_points[selector % escape_code_points.len];
+    const code_point: u21 = (@as(u21, selector & 0x7f) << 8) | s.next();
+    return if (code_point >= 0xd800 and code_point <= 0xdfff) code_point + 0x800 else code_point;
+}
+
+fn appendHex4(alloc: Allocator, out: *std.ArrayList(u8), unit: u16, upper: bool) !void {
+    const digits = if (upper) "0123456789ABCDEF" else "0123456789abcdef";
+    try out.appendSlice(alloc, "\\u");
+    var shift: u4 = 12;
+    while (true) : (shift -= 4) {
+        try out.append(alloc, digits[(unit >> shift) & 0xf]);
+        if (shift == 0) break;
+    }
+}
+
+/// `code_points` as a JSON string token. Each is written the way `style` says:
+/// plainly when JSON allows it, as a `\uXXXX` escape in either case of hex
+/// digit (a surrogate pair above U+FFFF), or as a short escape when there is one.
+fn appendSpelled(alloc: Allocator, out: *std.ArrayList(u8), code_points: []const u21, s: *EscapeScript) !void {
+    try out.append(alloc, '"');
+    for (code_points) |code_point| {
+        const style = s.next() % 4;
+        const short: ?u8 = switch (code_point) {
+            '"' => '"',
+            '\\' => '\\',
+            '/' => '/',
+            0x08 => 'b',
+            0x0c => 'f',
+            0x0a => 'n',
+            0x0d => 'r',
+            0x09 => 't',
+            else => null,
+        };
+        const needs_escape = code_point < 0x20 or code_point == '"' or code_point == '\\';
+        const plain_ok = !needs_escape;
+        if ((style == 0 and plain_ok) or (style == 3 and short == null and plain_ok)) {
+            var encoded: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(code_point, &encoded) catch unreachable;
+            try out.appendSlice(alloc, encoded[0..n]);
+        } else if ((style == 0 or style == 3) and short != null) {
+            try out.appendSlice(alloc, &.{ '\\', short.? });
+        } else {
+            const upper = style == 2;
+            if (code_point >= 0x10000) {
+                const v = code_point - 0x10000;
+                try appendHex4(alloc, out, @intCast(0xd800 + (v >> 10)), upper);
+                try appendHex4(alloc, out, @intCast(0xdc00 + (v & 0x3ff)), upper);
+            } else try appendHex4(alloc, out, @intCast(code_point), upper);
+        }
+    }
+    try out.append(alloc, '"');
+}
+
+/// The string `token` holds, as `std.json` reads it: the host reads a form and
+/// an answer with it.
+fn decodedByStdJson(arena: Allocator, token: []const u8) ![]const u8 {
+    return std.json.parseFromSliceLeaky([]const u8, arena, token, .{});
+}
+
+fn fuzzEscapedStrings(_: void, smith: *testing.Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var script: EscapeScript = .{ .bytes = buffer[0..len] };
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const place = script.next() % 3;
+    const same = script.next() % 2 == 0;
+    const count = script.next() % 12 + 1;
+    var server_points: [12]u21 = undefined;
+    for (server_points[0..count]) |*code_point| code_point.* = escapeCodePoint(&script);
+    var answer_points = server_points;
+    if (!same) {
+        // One code point differs, or the answer is a code point shorter.
+        const change = escapeCodePoint(&script);
+        if (change == answer_points[count - 1]) {
+            if (count == 1) return;
+        } else answer_points[count - 1] = change;
+    }
+    const answer_count = if (!same and answer_points[count - 1] == server_points[count - 1]) count - 1 else count;
+
+    var server: std.ArrayList(u8) = .empty;
+    try appendSpelled(arena, &server, server_points[0..count], &script);
+    var answer: std.ArrayList(u8) = .empty;
+    try appendSpelled(arena, &answer, answer_points[0..answer_count], &script);
+
+    const properties = switch (place) {
+        0 => try arena.print("{{{s}:{{\"type\":\"boolean\"}}}}", .{server.items}),
+        1 => try arena.print("{{\"c\":{{\"type\":\"string\",\"enum\":[{s},\"zz\"]}}}}", .{server.items}),
+        else => try arena.print("{{\"c\":{{\"type\":\"string\",\"oneOf\":[{{\"const\":{s}}},{{\"const\":\"zz\"}}]}}}}", .{server.items}),
+    };
+    const content = switch (place) {
+        0 => try arena.print("{{{s}:true}}", .{answer.items}),
+        else => try arena.print("{{\"c\":{s}}}", .{answer.items}),
+    };
+    const params = try arena.print("{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{s}}}}}", .{properties});
+
+    var form: mcp.elicitation.Form = .{};
+    const request = mcp.elicitation.parse(params, &form) catch return;
+    const accepted = if (mcp.elicitation.check(request.mode, &form, .{ .action = .accept, .content = content })) true else |_| false;
+
+    // The law: the engine accepts the answer exactly when the two strings are
+    // the same string once decoded, as `std.json` decodes them.
+    const want = try decodedByStdJson(arena, server.items);
+    const got = try decodedByStdJson(arena, answer.items);
+    const matches = std.mem.eql(u8, want, got) or (place != 0 and std.mem.eql(u8, got, "zz"));
+    if (accepted != matches) {
+        std.debug.print("the engine {s} {s}, std.json says {s}: server wrote {s}, answer wrote {s}\n", .{
+            if (accepted) "accepted" else "refused",
+            if (place == 0) "a key" else "a choice",
+            if (matches) "they match" else "they differ",
+            server.items,
+            answer.items,
+        });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "the engine's equality of a form's strings and an answer's matches std.json's decoded equality" {
+    try testing.fuzz({}, fuzzEscapedStrings, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_elicitation_escapes.*),
+    });
+}

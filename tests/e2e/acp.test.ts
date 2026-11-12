@@ -70,6 +70,11 @@ const MCP_STDIO_FIXTURE = join(
   "fixtures",
   "mcp-modern-stdio.mjs",
 );
+const MCP_LEGACY_STDIO_FIXTURE = join(
+  import.meta.dirname,
+  "fixtures",
+  "mcp-legacy-stdio.mjs",
+);
 const MCP_TOOL_NAME = "mcp_fixture_echo";
 
 function acpStdioServer(
@@ -5579,6 +5584,180 @@ describe("acp: model-independent", () => {
     },
     LIVE_TIMEOUT,
   );
+
+  // A server writes a form's keys and enum values as JSON text, and may spell a
+  // character with an escape. fx shows the form with the characters decoded,
+  // and sends the answer back as JSON that writes them out. The server's check
+  // of the answer must not depend on how either side spelled them.
+  const FORM_ESCAPES: Array<[name: string, written: string]> = [
+    ["\\u00e9 (non-ASCII)", String.raw`"caf\u00e9"`],
+    ["\\/ (escaped slash)", String.raw`"a\/b"`],
+    ["\\u0041 (escaped ASCII letter)", String.raw`"\u0041"`],
+    ["\\\" (escaped quote)", String.raw`"say \"hi\""`],
+    ["\\\\ (escaped backslash)", String.raw`"a\\b"`],
+    ["a surrogate pair", String.raw`"\ud83d\ude00"`],
+    ["no escape", `"plain"`],
+  ];
+  const FORM_PLACES: Record<string, (written: string) => { schema: string; content: Record<string, unknown> }> = {
+    "a field key": (written) => ({
+      schema: `{"type":"object","properties":{${written}:{"type":"boolean"}},"required":[${written}]}`,
+      content: { [JSON.parse(written)]: true },
+    }),
+    "an enum value": (written) => ({
+      schema: `{"type":"object","properties":{"choice":{"type":"string","enum":[${written},"other"]}},"required":["choice"]}`,
+      content: { choice: JSON.parse(written) },
+    }),
+    "a oneOf const": (written) => ({
+      schema: `{"type":"object","properties":{"choice":{"type":"string","oneOf":[{"const":${written},"title":"T"},{"const":"other","title":"O"}]}},"required":["choice"]}`,
+      content: { choice: JSON.parse(written) },
+    }),
+    "a multi-select value": (written) => ({
+      schema: `{"type":"object","properties":{"choice":{"type":"array","items":{"type":"string","enum":[${written},"other"]}}},"required":["choice"]}`,
+      content: { choice: [JSON.parse(written)] },
+    }),
+  };
+  /** What a user gives: yes to a boolean, the first option of a choice. */
+  const answerToForm = (params: Record<string, any>) => {
+    const content: Record<string, unknown> = {};
+    for (const [key, field] of Object.entries<any>(params.requestedSchema.properties)) {
+      if (field.type === "boolean") content[key] = true;
+      else if (field.type === "array") content[key] = [(field.items.enum ?? field.items.anyOf.map((o: any) => o.const))[0]];
+      else content[key] = (field.enum ?? field.oneOf.map((o: any) => o.const))[0];
+    }
+    return content;
+  };
+  type FormTransport = "a 2026 input round" | "a 2025 elicitation/create request";
+  const FORM_TRANSPORTS: FormTransport[] = ["a 2026 input round", "a 2025 elicitation/create request"];
+  type FormRun = {
+    shown: Array<Record<string, any>>;
+    answered: Array<Record<string, unknown>>;
+    trace: string[];
+    wire: Array<Record<string, any>>;
+    ended: boolean;
+  };
+  /**
+   * Runs one MCP form, with `schema` as the server's raw requestedSchema text, through fx as an ACP agent. The client
+   * answers it as a user would, and the server's wire log shows what fx sent back.
+   */
+  async function driveForm(transport: FormTransport, schema: string): Promise<FormRun> {
+    const root = createIsolatedRoot("fx-acp-mcp-form-escape-");
+    const pidPath = join(root.root, "mcp-form-escape.pid");
+    const wirePath = join(root.root, "mcp-form-escape.wire.jsonl");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("select_form", "toolbox", { open: MCP_TOOL_NAME }),
+      fakeGatewayToolCall("call_form", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp-form-escape" } }),
+      finalText("ACP form escape complete"),
+    ]);
+    const shown: Array<Record<string, any>> = [];
+    const answered: Array<Record<string, unknown>> = [];
+    try {
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "mcp" },
+      });
+      // The 2025-11-25 server asks only a client that takes forms and URLs.
+      const elicitation = transport === "a 2026 input round" ? { form: {} } : { form: {}, url: {} };
+      await client.request("initialize", { protocolVersion: 1, clientCapabilities: { elicitation } }, 1);
+      const server = transport === "a 2026 input round"
+        ? acpStdioServer("unused", pidPath, "mrtr_input_required", {
+          FX_MCP_WIRE_LOG: wirePath,
+          FX_MCP_EXPECT_ELICITATION: "form",
+          FX_MCP_RAW_FORM_SCHEMA: schema,
+        })
+        : {
+          name: "fixture",
+          command: process.execPath,
+          args: [MCP_LEGACY_STDIO_FIXTURE],
+          env: Object.entries({
+            FX_MCP_RESULT_TEXT: "unused",
+            FX_MCP_PID_PATH: pidPath,
+            FX_MCP_MODE: "direct_form",
+            FX_MCP_LEGACY_VERSION: "2025-11-25",
+            FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND: "1",
+            FX_MCP_WIRE_LOG: wirePath,
+            FX_MCP_RAW_FORM_SCHEMA: schema,
+          }).map(([name, value]) => ({ name, value })),
+        };
+      const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
+      expect(created.error).toBeUndefined();
+      await client.readLine();
+      await client.request("session/set_mode", { modeId: "auto" }, 3);
+      client.setElicitationHandler((params) => {
+        shown.push(params);
+        answered.push(answerToForm(params));
+        return { action: "accept", content: answered[answered.length - 1] };
+      });
+      let ended = true;
+      try {
+        await runPrompt(client, "Call the supplied MCP tool and use the form response.", 15_000);
+      } catch {
+        ended = false;
+      }
+      const trace = (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").split("\n").filter(Boolean);
+      const wire = (existsSync(wirePath) ? readFileSync(wirePath, "utf8") : "")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line).message as Record<string, any>);
+      return { shown, answered, trace, wire, ended };
+    } finally {
+      await client?.close();
+      if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+  for (const transport of FORM_TRANSPORTS) {
+    for (const [place, build] of Object.entries(FORM_PLACES)) {
+      for (const [escapeName, written] of FORM_ESCAPES) {
+        test(
+          `ACP answers a form whose ${place} the server wrote with ${escapeName}, asked in ${transport}`,
+          async () => {
+            const { schema, content } = build(written);
+            const run = await driveForm(transport, schema);
+            // The client saw the form with the characters decoded, and answered it.
+            expect(run.shown).toHaveLength(1);
+            expect(run.answered[0]).toEqual(content);
+            // fx sent the answer to the server, and held nothing back.
+            expect(run.trace.filter((line) => line.includes("answer not sent"))).toEqual([]);
+            if (transport === "a 2026 input round") {
+              const calls = run.wire.filter((message) => message.method === "tools/call");
+              expect(calls).toHaveLength(2);
+              expect(calls[1]?.params?.inputResponses).toEqual({ confirm: { action: "accept", content } });
+            } else {
+              const answer = run.wire.find((message) => message.id === "legacy-elicitation" && message.method === undefined);
+              expect(answer?.result).toEqual({ action: "accept", content });
+            }
+            expect(run.ended).toBe(true);
+          },
+          LIVE_TIMEOUT,
+        );
+      }
+    }
+  }
+
+  // JSON gives "A" and "\u0041" one meaning, so a form that holds both has a name twice. fx reads it as it reads a
+  // name written twice alike: it cannot read the form, and shows it to no one. Before, "\u0041" was a second field.
+  for (const transport of FORM_TRANSPORTS) {
+    test(
+      `ACP reads a form whose two names are one name once decoded as a repeated name, asked in ${transport}`,
+      async () => {
+        const schemaWith = (second: string) => `{"type":"object","properties":{"A":{"type":"boolean"},${second}:{"type":"boolean"}}}`;
+        const repeated = await driveForm(transport, schemaWith(`"A"`));
+        const escaped = await driveForm(transport, schemaWith(String.raw`"\u0041"`));
+        expect(repeated.shown).toHaveLength(0);
+        expect(escaped.shown).toHaveLength(0);
+        // The same words in the trace and the same on the wire as for a name written twice alike.
+        const words = (run: FormRun) => run.trace.map((line) => line.replace(/^\d+ /, "")).filter((line) => /elicit|input request|MCP/i.test(line));
+        expect(words(escaped)).toEqual(words(repeated));
+        const sent = (run: FormRun) => run.wire.filter((message) => message.method === undefined || message.params?.inputResponses !== undefined);
+        expect(sent(escaped)).toEqual(sent(repeated));
+        expect(escaped.ended).toBe(repeated.ended);
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
   test(
     "ACP form elicitation answers an MCP server's input request",

@@ -13,6 +13,8 @@ const discoveryMethodNotFound = process.env.FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_F
 const discoveryInvalidParams = process.env.FX_MCP_LEGACY_DISCOVERY_INVALID_PARAMS === "1";
 const rejectNewerInitialize = process.env.FX_MCP_LEGACY_REJECT_NEWER_INITIALIZE === "1";
 const draft7Pattern = process.env.FX_MCP_DRAFT7_PATTERN;
+const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+const rawFormSchemaMark = "raw-form-schema-mark";
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/authorize";
 const urlRequiredOperation = process.env.FX_MCP_URL_REQUIRED_OPERATION ?? "tools";
 let buffer = Buffer.alloc(0);
@@ -43,7 +45,10 @@ if (startupFailure) {
 }
 
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  let line = JSON.stringify(message);
+  // A form schema given as raw JSON text goes out as written, with its escapes.
+  if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
+  process.stdout.write(`${line}\n`);
 }
 
 function log(message) {
@@ -182,10 +187,13 @@ function handle(message) {
   log(message);
 
   if (pendingToolCall && message.id === "legacy-elicitation") {
-    if (message.jsonrpc !== "2.0" || message.result?.action !== "accept") process.exit(8);
-    const answer = message.result?.content?.choice;
-    if (legacyVersion === "2025-06-18" && answer !== "legacy-alpha-choice") process.exit(9);
-    if (legacyVersion === "2025-11-25" && answer !== "legacyvalid") process.exit(10);
+    // With a raw form schema the answer is whatever the test gave: the wire log has it.
+    if (rawFormSchema === undefined) {
+      if (message.jsonrpc !== "2.0" || message.result?.action !== "accept") process.exit(8);
+      const answer = message.result?.content?.choice;
+      if (legacyVersion === "2025-06-18" && answer !== "legacy-alpha-choice") process.exit(9);
+      if (legacyVersion === "2025-11-25" && answer !== "legacyvalid") process.exit(10);
+    }
     const call = pendingToolCall;
     pendingToolCall = null;
     send({
@@ -435,7 +443,9 @@ function handle(message) {
         jsonrpc: "2.0",
         id: "legacy-elicitation",
         method: "elicitation/create",
-        params: legacyVersion === "2025-06-18"
+        params: rawFormSchema !== undefined
+          ? { mode: "form", message: "Fill in the form", requestedSchema: rawFormSchemaMark }
+          : legacyVersion === "2025-06-18"
           ? {
               message: "Choose a legacy value",
               requestedSchema: {

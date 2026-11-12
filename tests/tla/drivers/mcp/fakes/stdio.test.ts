@@ -78,6 +78,14 @@ test("can send notifications before the reply, raw malformed lines, and crash", 
   expect(proc.logged.filter((l) => l.dir === "in").length).toBeGreaterThanOrEqual(2);
 });
 
+test("beforeRaw writes a line as it is, keeping the escapes that JSON would drop", async () => {
+  const line = String.raw`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"key":"caf\u00e9 a\/b"}}`;
+  const proc = await exchange([{ method: "tools/call", beforeRaw: [line], result: { content: [] } }], [request(1, "tools/call")]);
+  const lines = proc.logged.filter((l) => l.dir === "out").map((l) => l.line);
+  expect(lines[0]).toBe(line); // the bytes, not a rewrite of them
+  expect(lines[1]).toBe(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [] } }));
+});
+
 test("rules can match the request's 2026 protocol version, or its absence", async () => {
   const rules: Rule[] = [
     { method: "tools/list", version: "2026-07-28", result: { era: "modern" } },

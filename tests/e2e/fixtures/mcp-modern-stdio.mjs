@@ -27,6 +27,8 @@ const catalogDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
+const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+const rawFormSchemaMark = "raw-form-schema-mark";
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 // FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
 // so a test with a short operation_timeout_ms can land just before or just
@@ -89,7 +91,10 @@ if (process.env.FX_MCP_ENV_NAMES_CAPTURE) {
 if (stallRecovery) setInterval(() => {}, 1000);
 
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  let line = JSON.stringify(message);
+  // A form schema given as raw JSON text goes out as written, with its escapes.
+  if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
+  process.stdout.write(`${line}\n`);
 }
 
 function sendCatalogResponse(message) {
@@ -765,7 +770,10 @@ function handle(message) {
       mode === "mrtr_unsafe_form"
     ) {
       if (message.params?.inputResponses === undefined) {
-        const params = compactField ? {
+        const params = rawFormSchema !== undefined ? {
+          message: "Fill in the form",
+          requestedSchema: rawFormSchemaMark,
+        } : compactField ? {
           message: "Choose the next step",
           requestedSchema: { type: "object", properties: { answer: compactField }, required: ["answer"] },
         } : mode === "mrtr_url_required"
