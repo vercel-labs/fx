@@ -65,6 +65,12 @@ interface EngineCase {
   control?: { server: string; maxAttempts: number };
   check?: (lines: Line[], logs: { [name: string]: Log }, trace: Step[]) => string | null;
   timeoutMs?: number;
+  /**
+   * What the elicitation trace's model is told about a form the records don't show (ElicitationTrace.tla):
+   * ObsEscaped 1 when a name or choice is written with an escape, ObsFits 1 or 2 when the answer matches the form's strings or not,
+   * and ObsRawCompare 1 for a planted control: the engine's trace is then checked against byte-for-byte matching and must be REJECTED.
+   */
+  elicitation?: { ObsFits?: number; ObsEscaped?: number; ObsRawCompare?: number };
 }
 
 const BASE: Machine[] = ["engine", "stdio", "request", "era"];
@@ -89,7 +95,7 @@ function engineScenario(c: EngineCase): Scenario {
       else if (m === "era") traces.push({ machine: "era", instance: remote, specDir: "tests/tla/mcp", wrapper: "EraTrace", verdict: "ACCEPTED", constants: { ObsPreferredCount: 1 } });
       else if (m === "catalog") traces.push({ machine: "catalog", instance: remote, specDir: "tests/tla/mcp", wrapper: "CatalogTrace", verdict: "ACCEPTED", constants: { ObsMaxPages: 100 } });
       else if (m === "subscription") traces.push({ machine: "subscription", instance: remote, specDir: "tests/tla/mcp", wrapper: "SubscriptionTrace", verdict: "ACCEPTED", constants: { ObsMaxTries: 8 } });
-      else if (m === "elicitation") traces.push({ machine: "elicitation", instance: remote, specDir: "tests/tla/mcp", wrapper: "ElicitationTrace", verdict: "ACCEPTED", constants: { ObsMaxPending: 16 } });
+      else if (m === "elicitation") traces.push({ machine: "elicitation", instance: remote, specDir: "tests/tla/mcp", wrapper: "ElicitationTrace", verdict: c.elicitation?.ObsRawCompare === 1 ? "REJECTED" : "ACCEPTED", constants: { ObsMaxPending: 16, ObsFits: 0, ObsEscaped: 0, ObsRawCompare: 0, ...c.elicitation } });
       else traces.push({ machine: "mrtr", instance: `${server}.${m.mrtr}`, specDir: "tests/tla/mcp", wrapper: "MrtrTrace", verdict: "ACCEPTED", constants: { ObsMaxRequests: 10, ObsMaxKeys: 16 } });
     }
   }
@@ -161,6 +167,133 @@ const same = (got: unknown, want: unknown, what: string) => (JSON.stringify(got)
 const form = { mode: "form", message: "Name?", requestedSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } };
 const askName = { k: { method: "elicitation/create", params: form } };
 const FORM = ["--capabilities", JSON.stringify({ elicitation: { form: {} } })];
+
+// ---- a form the server writes with escapes (D1) ----
+//
+// The host reads the person's answer with std.json and writes it back, which spells a string without the escapes
+// the server used (café, a/b, A, a surrogate pair as UTF-8). JSON gives both spellings one meaning, so the engine must
+// match the strings, not the bytes (ELIC-05; Elicitation.tla's FitAccepted). The fake servers write the form with
+// `beforeRaw` and `raw`, which keep the escapes that JSON.stringify would drop.
+
+interface Spelling {
+  name: string;
+  /** What the server writes between the quotes. */
+  written: string;
+  /** What the host writes back for the same string. */
+  sent: string;
+}
+const SPELLINGS: Spelling[] = [
+  { name: "u00e9", written: String.raw`caf\u00e9`, sent: "café" },
+  { name: "slash", written: String.raw`a\/b`, sent: "a/b" },
+  { name: "u0041", written: String.raw`\u0041`, sent: "A" },
+  { name: "surrogate-pair", written: String.raw`\ud83d\ude00`, sent: "😀" },
+  { name: "plain", written: "plain", sent: "plain" }, // a guard: no escape, so nothing differs
+];
+type Place = "key" | "enum" | "oneOf" | "multi";
+const PLACES: { place: Place; spellings: string[] }[] = [
+  { place: "key", spellings: SPELLINGS.map((x) => x.name) },
+  { place: "enum", spellings: SPELLINGS.map((x) => x.name) },
+  { place: "oneOf", spellings: ["u00e9"] },
+  { place: "multi", spellings: ["u00e9"] },
+];
+
+/** The form's JSON text, as the server writes it. */
+function escapedForm(place: Place, written: string): string {
+  const properties = {
+    key: `{"${written}":{"type":"string"}}`,
+    enum: `{"c":{"type":"string","enum":["${written}","other"]}}`,
+    oneOf: `{"c":{"type":"string","oneOf":[{"const":"${written}","title":"T"},{"const":"other","title":"U"}]}}`,
+    multi: `{"c":{"type":"array","items":{"type":"string","enum":["${written}","other"]}}}`,
+  }[place];
+  return `{"mode":"form","message":"Pick","requestedSchema":{"type":"object","properties":${properties}}}`;
+}
+/** What the host sends back: the content, with the string written the way std.json writes it. */
+function answeredContent(place: Place, sent: string): string {
+  const text = JSON.stringify(sent);
+  return place === "key" ? `{${text}:"x"}` : place === "multi" ? `{"c":[${text}]}` : `{"c":${text}}`;
+}
+
+function escapeScenarios(): Scenario[] {
+  const out: Scenario[] = [];
+  for (const { place, spellings } of PLACES) {
+    for (const name of spellings) {
+      const sp = SPELLINGS.find((x) => x.name === name)!;
+      const form = escapedForm(place, sp.written);
+      const content = answeredContent(place, sp.sent);
+      const wanted = JSON.parse(content);
+      const escaped = sp.written !== sp.sent;
+      out.push(
+        engineScenario({
+          name: `u12-escape-2025-${place}-${name}`,
+          description: `A 2025 server's form has a ${place} written ${escaped ? `with an escape (${sp.written})` : "plainly"}: the host's answer, written without it, goes back to the server as a response (ELIC-05, ELIC-09)`,
+          servers: { b: { rules: legacy({ ...ok25("asked"), beforeRaw: [`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":${form}}`] }) } },
+          labFlags: FORM,
+          script: ["call b go", "expect b.elicit 5000", `elicit b 1 accept ${content}`, "expect b.called.1.result 5000", "drain 300"],
+          machines: { b: ["elicitation"] },
+          elicitation: { ObsFits: 1, ObsEscaped: escaped ? 1 : 0 },
+          check: (_lines, logs) => same(replies(logs.b).find((m) => m.id === "e1")?.result, { action: "accept", content: wanted }, "the elicitation's answer"),
+        }),
+        engineScenario({
+          name: `u12-escape-2026-${place}-${name}`,
+          description: `A 2026 server's input round has a form with a ${place} written ${escaped ? `with an escape (${sp.written})` : "plainly"}: the host's answer, written without it, is the next round's input response (MRTR-03, ELIC-05)`,
+          servers: {
+            a: {
+              rules: modern({
+                method: "tools/call",
+                times: 1,
+                raw: `{"jsonrpc":"2.0","id":{id},"result":{"resultType":"input_required","inputRequests":{"k":{"method":"elicitation/create","params":${form}}}}}`,
+              }),
+            },
+          },
+          labFlags: FORM,
+          script: ["call a ask", "expect a.input.1", `respond 1 [{"action":"accept","content":${content}}]`, "expect a.called.1.result"],
+          machines: { a: [{ mrtr: "x3" }] },
+          check: (_lines, logs) => {
+            const calls = received(logs.a, "tools/call");
+            return first(same(calls.length, 2, "tools/call requests"), same(calls[1]?.params?.inputResponses, { k: { action: "accept", content: wanted } }, "the second round's answers"));
+          },
+        }),
+      );
+    }
+  }
+  // The planted control: the engine's trace of the answer to `café` written as \u00e9, checked against a model that
+  // matches bytes, is rejected. That is the model's finding, shown on the real engine's trace.
+  const control = SPELLINGS[0];
+  out.push(
+    engineScenario({
+      name: "u12-escape-control-raw-compare",
+      description: "Planted control: the trace of an answer accepted for a name the server wrote with an escape, checked against a model that matches bytes, is rejected",
+      servers: { b: { rules: legacy({ ...ok25("asked"), beforeRaw: [`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":${escapedForm("enum", control.written)}}`] }) } },
+      labFlags: FORM,
+      script: ["call b go", "expect b.elicit 5000", `elicit b 1 accept ${answeredContent("enum", control.sent)}`, "expect b.called.1.result 5000", "drain 300"],
+      machines: { b: ["elicitation"] },
+      elicitation: { ObsFits: 1, ObsEscaped: 1, ObsRawCompare: 1 },
+    }),
+  );
+  // Two names that are one name once decoded are a duplicate: the form is unreadable, so the host is never asked and
+  // the server gets the same error as for a repeated name (the one behavior change for such a form).
+  const duplicate = (name: string, a: string, b: string): Scenario => {
+    const form = `{"mode":"form","message":"Pick","requestedSchema":{"type":"object","properties":{"${a}":{"type":"string"},"${b}":{"type":"string"}}}}`;
+    return engineScenario({
+      name,
+      description: `A 2025 server's form with the names ${a} and ${b}: ${a === b ? "a repeated name" : "one name once decoded"}, so the form is unreadable and the server is answered with an error`,
+      servers: { b: { rules: legacy({ ...ok25("asked"), beforeRaw: [`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":${form}}`] }) } },
+      labFlags: FORM,
+      script: ["call b go", "expect b.called.1.result 5000", "drain 300"],
+      machines: { b: ["elicitation"] },
+      check: (lines, logs) => {
+        const reply = replies(logs.b).find((m) => m.id === "e1");
+        return first(
+          expectThat(!lines.some((l) => l.event?.tag === "b.elicit"), "the host was asked about an unreadable form"),
+          same(reply?.error?.code, -32602, "the code of the error the server got"),
+          same(reply?.error?.message, "Unsupported elicitation", "the words of the error the server got"),
+        );
+      },
+    });
+  };
+  out.push(duplicate("u12-escape-duplicate-raw", "A", "A"), duplicate("u12-escape-duplicate-decoded", "A", String.raw`\u0041`));
+  return out;
+}
 
 export const scenarios: Scenario[] = [
   engineScenario({
@@ -698,4 +831,5 @@ export const scenarios: Scenario[] = [
     machines: { a: ["engine"] },
     control: { server: "a", maxAttempts: 3 },
   }),
+  ...escapeScenarios(),
 ];

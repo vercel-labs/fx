@@ -18,14 +18,30 @@
 \* elicitation at any time. One that names a url elicitation the host still
 \* holds is kept, and told the moment the host accepts it. The ghosts
 \* record a broken rule when it breaks.
+\*
+\* How a form's names and choices are compared (ELIC-05). The server writes a
+\* form as JSON text, and a key or an enum value may carry an escape (\u00e9,
+\* \/, \u0041, a surrogate pair). The host reads the person's answer with
+\* std.json and writes it back, which spells the same string without those
+\* escapes. `spell[r]` is "escaped" when the server wrote a name or choice of
+\* request r with an escape the host's answer does not repeat. `Compare` is how
+\* the engine matches the answer to the form: "decoded" matches the strings
+\* (JSON's own equality: "A" and \u0041 are one name), "raw" matches the bytes
+\* (src/mcp/protocol/elicitation.zig before the fix: validContent, isOption and
+\* readSchema compared raw tokens). `fits` is whether the answer's strings
+\* match the form's by decoded value and the rest of the schema holds.
+\* Content the engine refuses is returned to the host, which can answer again.
+\* The ghost `refusedFit` records an answer that fits the form and was refused.
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Reqs, MaxPending
+CONSTANTS Reqs, MaxPending, Compare
 
 ASSUME Reqs \subseteq Nat /\ MaxPending \in Nat \ {0}
+ASSUME Compare \in {"decoded", "raw"}
 
 Modes == {"form", "url"}
 Origins == {"request", "required"}
+Spells == {"plain", "escaped"}
 Actions == {"accept", "decline", "cancel"}
 Phases == {"idle", "shown", "waiting", "done"}
 \* What a request was answered with: "content" is a form accept with its content.
@@ -45,9 +61,11 @@ VARIABLES
     decided,    \* [Reqs -> Actions \cup {"none"}]: what the host answered
     withdrawn,  \* [Reqs -> BOOLEAN]: the host was told it is withdrawn
     told,       \* [Reqs -> 0..2]: completions the host was told of
-    invalidSent \* content that failed the schema was sent
+    invalidSent, \* content that failed the schema was sent
+    spell,      \* [Reqs -> Spells]: the form's names or choices carry an escape
+    refusedFit  \* an answer that fits the form was refused
 
-vars == <<phase, origin, mode, eid, sent, declared, early, sends, shownEver, decided, withdrawn, told, invalidSent>>
+vars == <<phase, origin, mode, eid, sent, declared, early, sends, shownEver, decided, withdrawn, told, invalidSent, spell, refusedFit>>
 
 Pending == {r \in Reqs: phase[r] \in {"shown", "waiting"}}
 
@@ -65,6 +83,8 @@ TypeOK ==
     /\ withdrawn \in [Reqs -> BOOLEAN]
     /\ told \in [Reqs -> 0..2]
     /\ invalidSent \in BOOLEAN
+    /\ spell \in [Reqs -> Spells]
+    /\ refusedFit \in BOOLEAN
 
 Init ==
     /\ phase = [r \in Reqs |-> "idle"]
@@ -80,6 +100,8 @@ Init ==
     /\ withdrawn = [r \in Reqs |-> FALSE]
     /\ told = [r \in Reqs |-> 0]
     /\ invalidSent = FALSE
+    /\ spell = [r \in Reqs |-> "plain"]
+    /\ refusedFit = FALSE
 
 \* The server starts elicitation r. A -32042 error lists only url ones with
 \* an elicitationId, and only url ones carry one.
@@ -90,6 +112,7 @@ Ask(r, o, m, e, readable) ==
     /\ origin' = [origin EXCEPT ![r] = o]
     /\ mode' = [mode EXCEPT ![r] = m]
     /\ eid' = [eid EXCEPT ![r] = e]
+    /\ \E sp \in Spells: spell' = [spell EXCEPT ![r] = sp]
     /\ IF readable /\ m \in declared /\ Cardinality(Pending) < MaxPending
          THEN /\ phase' = [phase EXCEPT ![r] = "shown"]
               /\ shownEver' = [shownEver EXCEPT ![r] = TRUE]
@@ -100,16 +123,19 @@ Ask(r, o, m, e, readable) ==
                    THEN /\ sent' = [sent EXCEPT ![r] = "error"]
                         /\ sends' = [sends EXCEPT ![r] = @ + 1]
                    ELSE UNCHANGED <<sent, sends>>
-    /\ UNCHANGED <<declared, early, decided, withdrawn, told, invalidSent>>
+    /\ UNCHANGED <<declared, early, decided, withdrawn, told, invalidSent, refusedFit>>
 
 \* The host answers what it holds. Form content that fails the schema is
 \* refused back to the host, and nothing changes. An accepted url one
 \* with an elicitationId waits for its completion, unless it already came:
 \* then the host is told now.
-Answer(r, a, valid) ==
+Answer(r, a, fits) ==
+  LET valid == fits /\ (Compare = "decoded" \/ spell[r] = "plain")
+  IN
     /\ phase[r] = "shown"
     /\ IF a = "accept" /\ mode[r] = "form" /\ ~valid
-         THEN UNCHANGED vars
+         THEN /\ refusedFit' = (refusedFit \/ fits)
+              /\ UNCHANGED <<phase, origin, mode, eid, sent, declared, early, sends, shownEver, decided, withdrawn, told, invalidSent, spell>>
          ELSE /\ decided' = [decided EXCEPT ![r] = a]
               /\ IF origin[r] = "request"
                    THEN /\ sent' = [sent EXCEPT ![r] = IF a = "accept" /\ mode[r] = "form" THEN "content" ELSE a]
@@ -117,8 +143,8 @@ Answer(r, a, valid) ==
                    ELSE UNCHANGED <<sent, sends>>
               /\ phase' = [phase EXCEPT ![r] = IF a = "accept" /\ mode[r] = "url" /\ eid[r] /\ ~early[r] THEN "waiting" ELSE "done"]
               /\ told' = [told EXCEPT ![r] = IF a = "accept" /\ mode[r] = "url" /\ eid[r] /\ early[r] THEN @ + 1 ELSE @]
-              /\ invalidSent' = (invalidSent \/ (a = "accept" /\ mode[r] = "form" /\ ~valid))
-              /\ UNCHANGED <<origin, mode, eid, declared, early, shownEver, withdrawn>>
+              /\ invalidSent' = (invalidSent \/ (a = "accept" /\ mode[r] = "form" /\ ~fits))
+              /\ UNCHANGED <<origin, mode, eid, declared, early, shownEver, withdrawn, spell, refusedFit>>
 
 \* The server cancels its own request (2025 notifications/cancelled): one the
 \* host still holds is withdrawn, and any other cancel is ignored.
@@ -126,7 +152,7 @@ ServerCancel(r) ==
     IF phase[r] = "shown" /\ origin[r] = "request"
       THEN /\ phase' = [phase EXCEPT ![r] = "done"]
            /\ withdrawn' = [withdrawn EXCEPT ![r] = TRUE]
-           /\ UNCHANGED <<origin, mode, eid, sent, declared, early, sends, shownEver, decided, told, invalidSent>>
+           /\ UNCHANGED <<origin, mode, eid, sent, declared, early, sends, shownEver, decided, told, invalidSent, spell, refusedFit>>
       ELSE UNCHANGED vars
 
 \* The session ends (a new initialize, a DELETE, detection again): what the
@@ -136,7 +162,7 @@ SessionEnd ==
     /\ Pending # {}
     /\ phase' = [r \in Reqs |-> IF r \in Pending THEN "done" ELSE phase[r]]
     /\ withdrawn' = [r \in Reqs |-> withdrawn[r] \/ phase[r] = "shown"]
-    /\ UNCHANGED <<origin, mode, eid, sent, declared, early, sends, shownEver, decided, told, invalidSent>>
+    /\ UNCHANGED <<origin, mode, eid, sent, declared, early, sends, shownEver, decided, told, invalidSent, spell, refusedFit>>
 
 \* notifications/elicitation/complete naming r's elicitationId: one the host
 \* accepted and that still waits is told, once (ELIC-08). One still with
@@ -146,10 +172,10 @@ Complete(r) ==
     CASE phase[r] = "waiting" ->
            /\ phase' = [phase EXCEPT ![r] = "done"]
            /\ told' = [told EXCEPT ![r] = @ + 1]
-           /\ UNCHANGED <<origin, mode, eid, sent, declared, early, sends, shownEver, decided, withdrawn, invalidSent>>
+           /\ UNCHANGED <<origin, mode, eid, sent, declared, early, sends, shownEver, decided, withdrawn, invalidSent, spell, refusedFit>>
       [] phase[r] = "shown" /\ mode[r] = "url" /\ eid[r] ->
            /\ early' = [early EXCEPT ![r] = TRUE]
-           /\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, told, invalidSent>>
+           /\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, told, invalidSent, spell, refusedFit>>
       [] OTHER -> UNCHANGED vars
 
 Next ==
@@ -187,6 +213,10 @@ ContentGate ==
 
 \* Content that fails the schema is never sent (ELIC-05).
 ValidOnly == ~invalidSent
+
+\* An answer that fits the form is never refused, whatever either side's
+\* spelling of a name or a choice (ELIC-05): "A" and \u0041 are one name.
+FitAccepted == ~refusedFit
 
 \* A withdrawn elicitation is never answered.
 NothingAfterWithdraw == \A r \in Reqs: withdrawn[r] => sent[r] = "none" /\ decided[r] = "none"

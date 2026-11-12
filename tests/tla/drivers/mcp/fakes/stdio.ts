@@ -32,6 +32,8 @@ export interface Rule {
   times?: number;
   /** Lines to write before the reply, for example notifications. */
   before?: unknown[];
+  /** Lines to write as they are, after `before` (`{id}` becomes the request's id): JSON text that `before` would rewrite, such as a string with an escape. */
+  beforeRaw?: string[];
   /** Wait this long between `before` lines, in milliseconds. */
   beforeEveryMs?: number;
   /** Reply: a result, an error, a raw line (for malformed output; `{id}` becomes the request's id), or nothing. */
@@ -136,6 +138,7 @@ function main(): void {
       if (n > 0 && rule.beforeEveryMs) await Bun.sleep(rule.beforeEveryMs);
       send(JSON.stringify(withId(extra, message.id)));
     }
+    for (const line of rule.beforeRaw ?? []) send(line.replaceAll("{id}", JSON.stringify(message.id ?? null)));
     if (rule.raw !== undefined) send(rule.raw.replaceAll("{id}", JSON.stringify(message.id ?? null)));
     else if (rule.error) send(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: rule.error }));
     else if (!rule.noReply && (isRequest || rule.result !== undefined)) {

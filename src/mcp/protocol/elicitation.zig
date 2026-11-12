@@ -2,8 +2,10 @@
 //! a form or a URL, the defaults a host pre-fills, and reading the
 //! host's answer, whose form content is checked against the schema before
 //! anything is sent. Keys, enum values, and defaults
-//! stay the server's raw JSON tokens, so content written from them matches
-//! byte for byte, and nothing here allocates. Pure.
+//! stay the server's raw JSON tokens. An answer's key or choice matches one
+//! by the string the two tokens spell, not by their bytes (`sameString`):
+//! the host writes the answer back with `std.json`, which drops escapes the
+//! server used. Nothing here allocates. Pure.
 
 const std = @import("std");
 const wire = @import("wire.zig");
@@ -108,6 +110,89 @@ fn isString(raw: []const u8, value: []const u8) bool {
     return std.mem.eql(u8, wire.plainString(raw) orelse return false, value);
 }
 
+/// Whether two JSON string tokens, quotes included, spell the same string
+/// once decoded: `"caf\u00e9"` and `"café"`, `"a\/b"` and `"a/b"`, and a
+/// surrogate pair and the character in UTF-8 are one string each. This is
+/// JSON's equality, which is `std.json`'s. It decodes both tokens as it goes
+/// and allocates nothing. A token that is not a string, or holds an escape or
+/// UTF-8 that is not valid, matches only a token with the same bytes. Tokens
+/// that reach here have been through the scanner, which refuses invalid ones.
+fn sameString(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (a.len < 2 or b.len < 2 or a[0] != '"' or b[0] != '"' or a[a.len - 1] != '"' or b[b.len - 1] != '"') return false;
+    var x: Decoder = .{ .raw = a[1 .. a.len - 1] };
+    var y: Decoder = .{ .raw = b[1 .. b.len - 1] };
+    while (true) {
+        const p = x.next() catch return false;
+        const q = y.next() catch return false;
+        if (p == null or q == null) return p == null and q == null;
+        if (p.? != q.?) return false;
+    }
+}
+
+/// The code points of the inside of a JSON string token, one at a time.
+const Decoder = struct {
+    raw: []const u8,
+    at: usize = 0,
+
+    const Invalid = error{Invalid};
+
+    /// The next code point, or null at the end. A surrogate pair written as
+    /// two escapes is one code point, and a lone surrogate is invalid.
+    fn next(d: *Decoder) Invalid!?u21 {
+        if (d.at >= d.raw.len) return null;
+        const c = d.raw[d.at];
+        if (c != '\\') {
+            const n = std.unicode.utf8ByteSequenceLength(c) catch return error.Invalid;
+            if (d.at + n > d.raw.len) return error.Invalid;
+            const bytes = d.raw[d.at..][0..n];
+            // Each decoder refuses an overlong form; the three-byte one also refuses an encoded surrogate half.
+            const code_point: u21 = switch (n) {
+                1 => c,
+                2 => std.unicode.utf8Decode2(bytes[0..2].*) catch return error.Invalid,
+                3 => std.unicode.utf8Decode3(bytes[0..3].*) catch return error.Invalid,
+                4 => std.unicode.utf8Decode4(bytes[0..4].*) catch return error.Invalid,
+                else => return error.Invalid,
+            };
+            d.at += n;
+            return code_point;
+        }
+        if (d.at + 1 >= d.raw.len) return error.Invalid;
+        const escape = d.raw[d.at + 1];
+        d.at += 2;
+        switch (escape) {
+            '"' => return '"',
+            '\\' => return '\\',
+            '/' => return '/',
+            'b' => return 0x08,
+            'f' => return 0x0c,
+            'n' => return '\n',
+            'r' => return '\r',
+            't' => return '\t',
+            'u' => {},
+            else => return error.Invalid,
+        }
+        const unit = try d.hex4();
+        if (unit >= 0xdc00 and unit <= 0xdfff) return error.Invalid;
+        if (unit < 0xd800 or unit > 0xdbff) return unit;
+        // A high surrogate needs a low one, written as the next escape.
+        if (d.at + 1 >= d.raw.len or d.raw[d.at] != '\\' or d.raw[d.at + 1] != 'u') return error.Invalid;
+        d.at += 2;
+        const low = try d.hex4();
+        if (low < 0xdc00 or low > 0xdfff) return error.Invalid;
+        return 0x10000 + ((@as(u21, unit) - 0xd800) << 10) + (low - 0xdc00);
+    }
+
+    /// Four hex digits, in either case, and nothing else: no sign.
+    fn hex4(d: *Decoder) Invalid!u16 {
+        if (d.at + 4 > d.raw.len) return error.Invalid;
+        var unit: u16 = 0;
+        for (d.raw[d.at..][0..4]) |digit| unit = unit * 16 + (std.fmt.charToDigit(digit, 16) catch return error.Invalid);
+        d.at += 4;
+        return unit;
+    }
+};
+
 fn readSchema(schema: []const u8, form: *Form) Error!void {
     var s: [3]?[]const u8 = undefined;
     wire.objectFields(schema, &.{ "type", "properties", "required" }, &s) catch return error.Unreadable;
@@ -116,7 +201,7 @@ fn readSchema(schema: []const u8, form: *Form) Error!void {
     properties.init(s[1] orelse return error.Unreadable) catch return error.Unreadable;
     while (properties.next() catch return error.Unreadable) |p| {
         if (form.count == max_fields) return error.Unreadable;
-        for (form.slice()) |other| if (std.mem.eql(u8, other.key, p.key)) return error.Unreadable;
+        for (form.slice()) |other| if (sameString(other.key, p.key)) return error.Unreadable;
         form.fields[form.count] = try readField(p.key, p.value);
         form.count += 1;
     }
@@ -125,7 +210,7 @@ fn readSchema(schema: []const u8, form: *Form) Error!void {
         names.init(required) catch return error.Unreadable;
         while (names.next() catch return error.Unreadable) |name| {
             const field = for (form.fields[0..form.count]) |*field| {
-                if (std.mem.eql(u8, field.key, name)) break field;
+                if (sameString(field.key, name)) break field;
             } else return error.Unreadable;
             field.required = true;
         }
@@ -297,7 +382,7 @@ fn validContent(form: *const Form, content: []const u8) bool {
     var seen: u32 = 0;
     while (fields.next() catch return false) |c| {
         const i = for (form.slice(), 0..) |f, i| {
-            if (std.mem.eql(u8, f.key, c.key)) break i;
+            if (sameString(f.key, c.key)) break i;
         } else return false;
         const bit = @as(u32, 1) << @intCast(i);
         if (seen & bit != 0 or !validValue(&form.fields[i], c.value)) return false;
@@ -340,7 +425,7 @@ fn isOption(f: *const Field, value: []const u8) bool {
     if (value[0] != '"') return false;
     var options: Options = undefined;
     options.init(f) catch return false;
-    while (options.next()) |o| if (std.mem.eql(u8, o.value, value)) return true;
+    while (options.next()) |o| if (sameString(o.value, value)) return true;
     return false;
 }
 
@@ -623,4 +708,420 @@ test "the declared modes are read as multi round-trip requests read them" {
     try testing.expectEqual(core.Config{ .url = true }, declared("{\"elicitation\":{\"url\":{}}}"));
     try testing.expectEqual(core.Config{ .form = true, .url = true }, declared("{\"elicitation\":{\"form\":{},\"url\":{}}}"));
     try testing.expectEqual(core.Config{}, declared("{}"));
+}
+
+/// A JSON string the server writes with an escape, and the bytes the host
+/// sends for the same value: `runtime.zig` parses fx's answer with `std.json`
+/// and writes it back, which spells a value out without escapes.
+const EscapeCase = struct { name: []const u8, written: []const u8, sent: []const u8 };
+const escape_cases = [_]EscapeCase{
+    .{ .name = "\\u00e9 (non-ASCII)", .written = "\"caf\\u00e9\"", .sent = "\"café\"" },
+    .{ .name = "\\u00E9 (capital hex digit)", .written = "\"caf\\u00E9\"", .sent = "\"café\"" },
+    .{ .name = "\\/ (escaped slash)", .written = "\"a\\/b\"", .sent = "\"a/b\"" },
+    .{ .name = "\\u0041 (escaped ASCII letter)", .written = "\"\\u0041\"", .sent = "\"A\"" },
+    .{ .name = "\\u000a (escaped newline)", .written = "\"a\\u000ab\"", .sent = "\"a\\nb\"" },
+    .{ .name = "\\\" (escaped quote)", .written = "\"say \\\"hi\\\"\"", .sent = "\"say \\\"hi\\\"\"" },
+    .{ .name = "\\\\ (escaped backslash)", .written = "\"a\\\\b\"", .sent = "\"a\\\\b\"" },
+    .{ .name = "surrogate pair", .written = "\"\\ud83d\\ude00\"", .sent = "\"😀\"" },
+    .{ .name = "no escape", .written = "\"plain\"", .sent = "\"plain\"" },
+};
+
+/// What the host writes for the string token `written`: parsed and written
+/// back, as `elicitAnswer` and `inputValues` in `runtime.zig` do.
+fn hostWrites(arena: std.mem.Allocator, written: []const u8) ![]const u8 {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, written, .{ .parse_numbers = false });
+    return std.json.Stringify.valueAlloc(arena, value, .{});
+}
+
+/// Whether the engine accepts `content` for a form built from `schema`.
+fn accepts(arena: std.mem.Allocator, properties: []const u8, content: []const u8) !bool {
+    const params = try arena.print("{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{s}}}}}", .{properties});
+    var form: Form = .{};
+    const request = try parse(params, &form);
+    check(request.mode, &form, .{ .action = .accept, .content = content }) catch return false;
+    return true;
+}
+
+/// Every case the engine refuses, named, so a failure lists them all.
+fn expectAllAccepted(comptime what: []const u8, comptime shape: fn (std.mem.Allocator, EscapeCase, []const u8) anyerror!bool) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var refused: usize = 0;
+    for (escape_cases) |c| {
+        const sent = try hostWrites(arena, c.written);
+        try testing.expectEqualStrings(c.sent, sent); // the table says what the host writes
+        if (!try shape(arena, c, sent)) {
+            std.debug.print("refused a valid {s}: written {s}, sent {s}, escape {s}\n", .{ what, c.written, sent, c.name });
+            refused += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), refused);
+}
+
+fn keyIsAccepted(arena: std.mem.Allocator, c: EscapeCase, sent: []const u8) anyerror!bool {
+    const properties = try arena.print("{{{s}:{{\"type\":\"boolean\"}}}}", .{c.written});
+    return accepts(arena, properties, try arena.print("{{{s}:true}}", .{sent}));
+}
+
+fn enumValueIsAccepted(arena: std.mem.Allocator, c: EscapeCase, sent: []const u8) anyerror!bool {
+    const properties = try arena.print("{{\"c\":{{\"type\":\"string\",\"enum\":[{s},\"other\"]}}}}", .{c.written});
+    return accepts(arena, properties, try arena.print("{{\"c\":{s}}}", .{sent}));
+}
+
+fn oneOfConstIsAccepted(arena: std.mem.Allocator, c: EscapeCase, sent: []const u8) anyerror!bool {
+    const properties = try arena.print("{{\"c\":{{\"type\":\"string\",\"oneOf\":[{{\"const\":{s},\"title\":\"T\"}}]}}}}", .{c.written});
+    return accepts(arena, properties, try arena.print("{{\"c\":{s}}}", .{sent}));
+}
+
+fn multiSelectValueIsAccepted(arena: std.mem.Allocator, c: EscapeCase, sent: []const u8) anyerror!bool {
+    const properties = try arena.print("{{\"c\":{{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"enum\":[{s},\"other\"]}}}}}}", .{c.written});
+    return accepts(arena, properties, try arena.print("{{\"c\":[{s}]}}", .{sent}));
+}
+
+test "a key the server wrote with an escape is accepted as the host writes it" {
+    try expectAllAccepted("key", keyIsAccepted);
+}
+
+test "an enum value the server wrote with an escape is accepted as the host writes it" {
+    try expectAllAccepted("enum value", enumValueIsAccepted);
+}
+
+test "a oneOf const the server wrote with an escape is accepted as the host writes it" {
+    try expectAllAccepted("oneOf const", oneOfConstIsAccepted);
+}
+
+test "a multi-select value the server wrote with an escape is accepted as the host writes it" {
+    try expectAllAccepted("multi-select value", multiSelectValueIsAccepted);
+}
+
+/// A form whose properties are `properties`, as the server's text.
+fn formOf(arena: std.mem.Allocator, properties: []const u8, required: ?[]const u8) ![]const u8 {
+    return arena.print(
+        "{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{s}{s}}}}}",
+        .{ properties, if (required) |r| try arena.print(",\"required\":{s}", .{r}) else "" },
+    );
+}
+
+test "two names that are one name once decoded make the form unreadable, as a repeated name does" {
+    // JSON gives `"A"` and `"\u0041"` the same name, which is how `std.json`
+    // reads them in the host and in the ACP projection. This is the one
+    // behavior change for such a form: it used to hold two fields.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const repeats = [_][]const u8{
+        "{\"A\":{\"type\":\"string\"},\"A\":{\"type\":\"string\"}}", // today's words for a raw repeat
+        "{\"A\":{\"type\":\"string\"},\"\\u0041\":{\"type\":\"string\"}}",
+        "{\"\\u0041\":{\"type\":\"string\"},\"A\":{\"type\":\"string\"}}",
+        "{\"caf\\u00e9\":{\"type\":\"string\"},\"café\":{\"type\":\"string\"}}",
+        "{\"caf\\u00e9\":{\"type\":\"string\"},\"caf\\u00E9\":{\"type\":\"string\"}}",
+        "{\"a\\/b\":{\"type\":\"string\"},\"a/b\":{\"type\":\"string\"}}",
+        "{\"\\ud83d\\ude00\":{\"type\":\"string\"},\"😀\":{\"type\":\"string\"}}",
+    };
+    for (repeats) |properties| {
+        var form: Form = .{};
+        try testing.expectError(error.Unreadable, parse(try formOf(arena, properties, null), &form));
+    }
+    // Names that only look alike stay two fields.
+    var form: Form = .{};
+    _ = try parse(try formOf(arena, "{\"A\":{\"type\":\"string\"},\"\\u0042\":{\"type\":\"string\"},\"a\":{\"type\":\"string\"}}", null), &form);
+    try testing.expectEqual(@as(usize, 3), form.slice().len);
+}
+
+test "a required name written with an escape names the key it spells" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pairs = [_]struct { key: []const u8, required: []const u8 }{
+        .{ .key = "\"caf\\u00e9\"", .required = "[\"café\"]" },
+        .{ .key = "\"café\"", .required = "[\"caf\\u00e9\"]" },
+        .{ .key = "\"\\u0041\"", .required = "[\"A\"]" },
+        .{ .key = "\"a\\/b\"", .required = "[\"a\\/b\"]" },
+        .{ .key = "\"\\ud83d\\ude00\"", .required = "[\"😀\"]" },
+    };
+    for (pairs) |pair| {
+        var form: Form = .{};
+        const properties = try arena.print("{{{s}:{{\"type\":\"string\"}}}}", .{pair.key});
+        _ = try parse(try formOf(arena, properties, pair.required), &form);
+        try testing.expect(form.slice()[0].required);
+    }
+    // A required field is still required, whichever way its name is spelled.
+    var required: Form = .{};
+    _ = try parse(try formOf(arena, "{\"\\u0041\":{\"type\":\"boolean\"}}", "[\"A\"]"), &required);
+    try testing.expectError(error.InvalidContent, check(.form, &required, .{ .action = .accept, .content = "{}" }));
+    try check(.form, &required, .{ .action = .accept, .content = "{\"A\":true}" });
+    // A required name that no key spells is still unreadable.
+    var form: Form = .{};
+    try testing.expectError(error.Unreadable, parse(try formOf(arena, "{\"A\":{\"type\":\"string\"}}", "[\"\\u0042\"]"), &form));
+}
+
+test "an answer that is wrong stays refused with the same words when either side escapes" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const wrong = [_]struct { properties: []const u8, required: ?[]const u8 = null, content: []const u8, why: []const u8 }{
+        .{ .properties = "{\"c\":{\"type\":\"string\",\"enum\":[\"caf\\u00e9\"]}}", .content = "{\"c\":\"cafe\"}", .why = "a value that is not an option" },
+        .{ .properties = "{\"c\":{\"type\":\"string\",\"enum\":[\"caf\\u00e9\"]}}", .content = "{\"c\":\"caf\\u00e8\"}", .why = "an option that differs in one code point" },
+        .{ .properties = "{\"\\u0041\":{\"type\":\"boolean\"}}", .content = "{\"B\":true}", .why = "a key the form does not have" },
+        .{ .properties = "{\"\\u0041\":{\"type\":\"boolean\"}}", .content = "{\"\\u0042\":true}", .why = "an escaped key the form does not have" },
+        .{ .properties = "{\"\\u0041\":{\"type\":\"boolean\"}}", .required = "[\"\\u0041\"]", .content = "{}", .why = "a missing required field" },
+        .{ .properties = "{\"A\":{\"type\":\"boolean\"}}", .content = "{\"A\":true,\"\\u0041\":true}", .why = "one key twice, once escaped" },
+        .{ .properties = "{\"A\":{\"type\":\"boolean\"}}", .content = "{\"\\u0041\":true,\"A\":true}", .why = "one key twice, escaped first" },
+        .{ .properties = "{\"A\":{\"type\":\"boolean\"}}", .content = "{\"A\":true,\"A\":true}", .why = "one key twice" },
+        .{ .properties = "{\"\\ud83d\\ude00\":{\"type\":\"boolean\"}}", .content = "{\"😀\":true,\"\\ud83d\\ude00\":true}", .why = "a surrogate pair and the character as two keys" },
+    };
+    for (wrong) |case| {
+        var form: Form = .{};
+        _ = try parse(try formOf(arena, case.properties, case.required), &form);
+        testing.expectError(error.InvalidContent, check(.form, &form, .{ .action = .accept, .content = case.content })) catch |err| {
+            std.debug.print("expected InvalidContent for {s}: {s}\n", .{ case.why, case.content });
+            return err;
+        };
+    }
+}
+
+test "an invalid escape or a lone surrogate is unreadable in a form and invalid in an answer, as before" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bad_names = [_][]const u8{
+        "\"a\\q\"", // not an escape
+        "\"a\\u12\"", // too few hex digits
+        "\"a\\u12zz\"", // not hex digits
+        "\"\\ud83d\"", // lone high surrogate
+        "\"\\ude00\"", // lone low surrogate
+        "\"\\ud83dx\"", // high surrogate then a plain character
+        "\"\\ud83d\\u0041\"", // high surrogate then another escape
+        "\"\\ude00\\ud83d\"", // the pair the wrong way round
+    };
+    for (bad_names) |name| {
+        var form: Form = .{};
+        const as_key = try arena.print("{{{s}:{{\"type\":\"string\"}}}}", .{name});
+        testing.expectError(error.Unreadable, parse(try formOf(arena, as_key, null), &form)) catch |err| {
+            std.debug.print("expected Unreadable for a key written {s}\n", .{name});
+            return err;
+        };
+        var plain: Form = .{};
+        _ = try parse(try formOf(arena, "{\"A\":{\"type\":\"string\"},\"c\":{\"type\":\"string\",\"enum\":[\"A\"]}}", null), &plain);
+        const as_answer_key = try arena.print("{{{s}:\"x\"}}", .{name});
+        testing.expectError(error.InvalidContent, check(.form, &plain, .{ .action = .accept, .content = as_answer_key })) catch |err| {
+            std.debug.print("expected InvalidContent for an answer key written {s}\n", .{name});
+            return err;
+        };
+        const as_answer_value = try arena.print("{{\"c\":{s}}}", .{name});
+        testing.expectError(error.InvalidContent, check(.form, &plain, .{ .action = .accept, .content = as_answer_value })) catch |err| {
+            std.debug.print("expected InvalidContent for an answer value written {s}\n", .{name});
+            return err;
+        };
+    }
+}
+
+test "the check is the same when the answer escapes and the form does not" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (escape_cases) |c| {
+        // The form holds the decoded text, and the answer is the escaped token.
+        const properties = try arena.print("{{{s}:{{\"type\":\"boolean\"}}}}", .{c.sent});
+        try testing.expect(try accepts(arena, properties, try arena.print("{{{s}:true}}", .{c.written})));
+    }
+}
+
+test "a very long name and value written entirely with escapes are accepted, with no allocation" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n = 2000;
+    const escaped = try arena.alloc(u8, 2 + n * 6);
+    const plain = try arena.alloc(u8, 2 + n);
+    escaped[0] = '"';
+    plain[0] = '"';
+    for (0..n) |i| {
+        @memcpy(escaped[1 + i * 6 ..][0..6], "\\u0041");
+        plain[1 + i] = 'A';
+    }
+    escaped[escaped.len - 1] = '"';
+    plain[plain.len - 1] = '"';
+    const as_key = try arena.print("{{{s}:{{\"type\":\"boolean\"}}}}", .{escaped});
+    try testing.expect(try accepts(arena, as_key, try arena.print("{{{s}:true}}", .{plain})));
+    const as_choice = try arena.print("{{\"c\":{{\"type\":\"string\",\"enum\":[{s}]}}}}", .{escaped});
+    try testing.expect(try accepts(arena, as_choice, try arena.print("{{\"c\":{s}}}", .{plain})));
+    // One code point fewer is a different string.
+    try testing.expect(!try accepts(arena, as_choice, try arena.print("{{\"c\":{s}\"}}", .{plain[0 .. plain.len - 2]})));
+}
+
+test "a form at its field limit, with every name and choice escaped and long, takes the host's answer" {
+    // Stress: max_fields properties, each name 600 code points written as \u escapes, each with two escaped choices.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var properties: std.ArrayList(u8) = .empty;
+    var plain_properties: std.ArrayList(u8) = .empty;
+    var content: std.ArrayList(u8) = .empty;
+    try properties.append(arena, '{');
+    try plain_properties.append(arena, '{');
+    try content.append(arena, '{');
+    for (0..max_fields) |i| {
+        if (i > 0) {
+            try properties.append(arena, ',');
+            try plain_properties.append(arena, ',');
+            try content.append(arena, ',');
+        }
+        var name_escaped: std.ArrayList(u8) = .empty;
+        var name_plain: std.ArrayList(u8) = .empty;
+        for (0..600) |_| {
+            try name_escaped.appendSlice(arena, "\\u0061");
+            try name_plain.append(arena, 'a');
+        }
+        // The index tells the names apart: two digits, escaped.
+        try name_escaped.print(arena, "\\u{x:0>4}\\u{x:0>4}", .{ '0' + i / 10, '0' + i % 10 });
+        try name_plain.print(arena, "{d}{d}", .{ i / 10, i % 10 });
+        try properties.print(arena, "\"{s}\":{{\"type\":\"string\",\"enum\":[\"\\u00e9{s}\",\"\\ud83d\\ude00\"]}}", .{ name_escaped.items, name_escaped.items });
+        try plain_properties.print(arena, "\"{s}\":{{\"type\":\"string\",\"enum\":[\"é{s}\",\"😀\"]}}", .{ name_plain.items, name_plain.items });
+        try content.print(arena, "\"{s}\":\"é{s}\"", .{ name_plain.items, name_plain.items });
+    }
+    try properties.append(arena, '}');
+    try plain_properties.append(arena, '}');
+    try content.append(arena, '}');
+    // The same form written without escapes is within the engine's limits.
+    if (!try accepts(arena, plain_properties.items, content.items)) {
+        std.debug.print("refused the form written without escapes, so the limits and not the escapes are at fault\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    if (!try accepts(arena, properties.items, content.items)) {
+        std.debug.print("refused the same form with every name and choice escaped\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a form or an answer cut anywhere, inside an escape or not, is refused cleanly" {
+    // Fault injection: every prefix of a valid escaped form is unreadable, and every prefix of a valid escaped answer is invalid.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const form_text =
+        \\{"message":"m","requestedSchema":{"type":"object","properties":{"caf\u00e9":{"type":"string","enum":["\ud83d\ude00","a\/b"]}},"required":["caf\u00e9"]}}
+    ;
+    var whole: Form = .{};
+    _ = try parse(form_text, &whole);
+    for (0..form_text.len) |cut| {
+        var form: Form = .{};
+        testing.expectError(error.Unreadable, parse(form_text[0..cut], &form)) catch |err| {
+            std.debug.print("a form cut at byte {d} was not refused as unreadable\n", .{cut});
+            return err;
+        };
+    }
+    const answer_text =
+        \\{"caf\u00e9":"\ud83d\ude00"}
+    ;
+    try check(.form, &whole, .{ .action = .accept, .content = answer_text });
+    for (0..answer_text.len) |cut| {
+        testing.expectError(error.InvalidContent, check(.form, &whole, .{ .action = .accept, .content = answer_text[0..cut] })) catch |err| {
+            std.debug.print("an answer cut at byte {d} was not refused as invalid\n", .{cut});
+            return err;
+        };
+    }
+    _ = arena;
+}
+
+test "sameString is JSON's equality of two string tokens" {
+    const same = [_][2][]const u8{
+        .{ "\"\"", "\"\"" },
+        .{ "\"\\u0041\"", "\"A\"" },
+        .{ "\"A\"", "\"\\u0041\"" },
+        .{ "\"\\u00e9\"", "\"é\"" },
+        .{ "\"\\u00E9\"", "\"\\u00e9\"" },
+        .{ "\"\\uD83D\\uDE00\"", "\"😀\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"\\uD83D\\uDE00\"" },
+        .{ "\"\\ud800\\udc00\"", "\"\u{10000}\"" }, // the first astral code point
+        .{ "\"\\udbff\\udfff\"", "\"\u{10ffff}\"" }, // the last
+        .{ "\"\\ud7ff\"", "\"\u{d7ff}\"" }, // just below the surrogates
+        .{ "\"\\ue000\"", "\"\u{e000}\"" }, // just above
+        .{ "\"\\uffff\"", "\"\u{ffff}\"" },
+        .{ "\"\\u0080\"", "\"\u{80}\"" }, // the first two-byte code point
+        .{ "\"\\u07ff\"", "\"\u{7ff}\"" }, // the last
+        .{ "\"\\u0800\"", "\"\u{800}\"" }, // the first three-byte one
+        .{ "\"\\u20ac\"", "\"€\"" },
+        .{ "\"a\\/b\"", "\"a/b\"" },
+        .{ "\"\\n\"", "\"\\u000a\"" },
+        .{ "\"\\b\\f\\r\\t\"", "\"\\u0008\\u000C\\u000d\\u0009\"" },
+        .{ "\"\\\"\\\\\"", "\"\\u0022\\u005c\"" },
+        .{ "\"\\u0000\"", "\"\\u0000\"" },
+        .{ "\"x\\u00e9y\\ud83d\\ude00z\"", "\"xéy😀z\"" },
+    };
+    for (same) |pair| {
+        testing.expect(sameString(pair[0], pair[1]) and sameString(pair[1], pair[0])) catch |err| {
+            std.debug.print("expected the same string: {s} and {s}\n", .{ pair[0], pair[1] });
+            return err;
+        };
+    }
+    const different = [_][2][]const u8{
+        .{ "\"A\"", "\"a\"" },
+        .{ "\"\\u0041\"", "\"B\"" },
+        .{ "\"\\u00e9\"", "\"e\"" },
+        .{ "\"\\u00e9\"", "\"\\u00e8\"" },
+        .{ "\"ab\"", "\"a\"" },
+        .{ "\"a\"", "\"ab\"" },
+        .{ "\"\\u0041\"", "\"AA\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"\\ud83d\\ude01\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"😁\"" },
+        .{ "\"\\u0041\"", "\"\\u0041\\u0000\"" },
+        // An escape or a surrogate that is not valid matches only the same bytes.
+        .{ "\"\\u+041\"", "\"A\"" },
+        .{ "\"\\u 041\"", "\"A\"" },
+        .{ "\"\\u004\"", "\"A\"" },
+        .{ "\"\\u00\"", "\"\\u00\"x" },
+        .{ "\"\\q\"", "\"q\"" },
+        .{ "\"\\ud83d\"", "\"\\uD83D\"" }, // a lone high surrogate, spelled two ways
+        .{ "\"\\ude00\"", "\"\\uDE00\"" }, // a lone low one
+        .{ "\"\\ud83d\\u0041\"", "\"\\uD83D\\u0041\"" }, // a high surrogate then another escape
+        .{ "\"\\ud83dx\"", "\"\\uD83Dx\"" },
+        .{ "\"\\ude00\\ud83d\"", "\"\\uDE00\\uD83D\"" }, // the pair the wrong way round
+        // UTF-8 that is not valid matches only the same bytes: an overlong form, an encoded surrogate half, a code
+        // point past U+10FFFF, a cut sequence, a stray continuation byte.
+        .{ "\"\xc0\xaf\"", "\"/\"" },
+        .{ "\"\xe0\x80\xaf\"", "\"/\"" },
+        .{ "\"\xf0\x80\x80\xaf\"", "\"/\"" },
+        .{ "\"\xed\xa0\x80\"", "\"\\ud800\"" },
+        .{ "\"\xed\xb0\x80\"", "\"\\udc00\"" },
+        // The same encoded half on both sides, then the same text spelled two ways: still not valid.
+        .{ "\"\xed\xa0\x80\\u0041\"", "\"\xed\xa0\x80A\"" },
+        .{ "\"\xed\xb0\x80\\u0041\"", "\"\xed\xb0\x80A\"" },
+        .{ "\"\xf4\x90\x80\x80\"", "\"x\"" },
+        .{ "\"\xe2\x82\"", "\"\\u20ac\"" },
+        .{ "\"\xc3\"", "\"\\u00c3\"" },
+        .{ "\"\x80\"", "\"\\u0080\"" },
+        // Not strings.
+        .{ "1", "\"1\"" },
+        .{ "\"\\u0031\"", "1" },
+        .{ "true", "\"true\"" },
+        .{ "\"", "\"a\"" },
+        // A token whose inside is empty is not the empty string.
+        .{ "12", "\"\"" },
+        .{ "{}", "\"\"" },
+        .{ "[]", "\"\"" },
+        .{ "true", "\"ru\"" },
+    };
+    for (different) |pair| {
+        testing.expect(!sameString(pair[0], pair[1]) and !sameString(pair[1], pair[0])) catch |err| {
+            std.debug.print("expected different strings: {s} and {s}\n", .{ pair[0], pair[1] });
+            return err;
+        };
+    }
+    // The same bytes are the same string, whatever they hold.
+    try testing.expect(sameString("1", "1"));
+    try testing.expect(sameString("\"\\ud83d\"", "\"\\ud83d\""));
+    try testing.expect(sameString("\"\xed\xa0\x80\"", "\"\xed\xa0\x80\""));
+}
+
+test "an empty name and a name made of NUL are names like any other" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expect(try accepts(arena, "{\"\":{\"type\":\"boolean\"}}", "{\"\":true}"));
+    try testing.expect(try accepts(arena, "{\"\\u0000\":{\"type\":\"boolean\"}}", "{\"\\u0000\":true}"));
+    try testing.expect(try accepts(arena, "{\"\\u0000x\":{\"type\":\"boolean\"}}", "{\"\\u0000x\":true}"));
+    try testing.expect(!try accepts(arena, "{\"\\u0000\":{\"type\":\"boolean\"}}", "{\"\":true}"));
+    try testing.expect(!try accepts(arena, "{\"\":{\"type\":\"boolean\"}}", "{\"\\u0000\":true}"));
 }

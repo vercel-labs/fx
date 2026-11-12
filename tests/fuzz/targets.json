@@ -54,6 +54,7 @@
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
+    {"name": "mcp_elicitation_escapes", "module": "fx", "test": "the engine's equality of a form's strings and an answer's matches std.json's decoded equality", "iterations": 1000000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
     {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000},
