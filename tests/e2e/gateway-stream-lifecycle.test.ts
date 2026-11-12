@@ -384,7 +384,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
   }
 }, 60000);
 
-const COMPACTION_ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+const COMPACTION_ACTIVITY = /Compacting \d+% \((?:\d+h)?(?:\d+m)?\d+s\)/;
 
 function compactionIdle(pane: string): boolean {
   return hasEmptyComposer(pane) && !COMPACTION_ACTIVITY.test(pane);

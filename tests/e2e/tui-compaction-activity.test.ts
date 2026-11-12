@@ -23,9 +23,9 @@ const TAIL = "HISTORY_TAIL_16d3";
 const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
-const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
-// The compaction row's own clock and the step it shows after it.
-const COMPACTION_CLOCK = /Compacting \(((?:\d+h)?(?:\d+m)?\d+s)\)(?: · (\w+))?/;
+const ACTIVITY = /Compacting \d+% \((?:\d+h)?(?:\d+m)?\d+s\)/;
+// The share of the summary written, then the compaction row's own clock.
+const COMPACTION_CLOCK = /Compacting (\d+)% \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
 const TURN_CLOCK = /Thinking \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
 function clockSeconds(clock: string): number {
   const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?:(\d+)m)?(\d+)s$/.exec(clock)!;
@@ -299,7 +299,7 @@ async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
     const rows = pane.split("\n").filter((line) => ACTIVITY.test(line));
     if (rows.length === 0) return false;
     expect(rows).toHaveLength(1);
-    expect(rows[0]).not.toMatch(/[↑↓]|tokens|chunk|%/i);
+    expect(rows[0]).not.toMatch(/[↑↓]|tokens|chunk/i);
     markers.add(rows[0].includes("•"));
     return markers.size === 2 && !rows[0].includes(clock);
   }, 5000);
@@ -377,7 +377,78 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     }, 120_000);
   }
 
-  test("overflow: compaction counts its own time from zero with its step, and the turn clock goes on from where it stopped", async () => {
+  test("manual: the row shows the percentage of the summary written so far", async () => {
+    const f = await fixture("manual", "success");
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("/compact");
+      await until(() => f.counts().summaries === 1, "first summary request");
+      const seen: number[] = [];
+      const record = (pane: string) => {
+        const rows = pane.split("\n").filter((line) => COMPACTION_CLOCK.test(line));
+        if (rows.length === 0) return null;
+        expect(rows).toHaveLength(1);
+        const value = Number(COMPACTION_CLOCK.exec(rows[0]!)![1]);
+        seen.push(value);
+        return value;
+      };
+      // Nothing of the summary has arrived while the model reads.
+      await terminal.waitForPane((pane) => record(pane) === 0, 10_000);
+      // Two of the sections the model must write arrive; the rest is held.
+      f.summaryHold.send("Rules:\nnone\n\nDecisions:\nnone\n\n");
+      await terminal.waitForPane((pane) => {
+        const value = record(pane);
+        return value !== null && value > 0;
+      }, 10_000);
+      expect(seen.at(-1)!).toBeLessThan(100);
+      f.summaryHold.release(HANDOFF);
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      await terminal.waitForPane((pane) => {
+        record(pane);
+        return !ACTIVITY.test(pane) && hasEmptyComposer(pane) && compactedSeconds(pane).length === 1;
+      }, 10_000);
+      // The percentage only goes up.
+      for (let i = 1; i < seen.length; i++) expect(seen[i]!).toBeGreaterThanOrEqual(seen[i - 1]!);
+      expect(seen.some((value) => value > 0 && value < 100)).toBe(true);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 120_000);
+
+  test("manual: a summary stream that breaks midway keeps its count while another model finishes", async () => {
+    const f = await fixture("manual", "success");
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("/compact");
+      await until(() => f.counts().summaries === 1, "first summary request");
+      const seen: number[] = [];
+      const record = (pane: string) => {
+        const row = COMPACTION_CLOCK.exec(pane);
+        if (row) seen.push(Number(row[1]));
+        return row ? Number(row[1]) : null;
+      };
+      await terminal.waitForPane((pane) => record(pane) === 0, 10_000);
+      f.summaryHold.send("Rules:\nnone\n\nDecisions:\nnone\n\n");
+      await terminal.waitForPane((pane) => (record(pane) ?? 0) > 0, 10_000);
+      const before = seen.at(-1)!;
+      // The stream ends before the reply is finished; fx asks another model.
+      f.summaryHold.dispose();
+      await until(() => f.counts().summaries >= 2, "a second summary request");
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      await terminal.waitForPane((pane) => {
+        record(pane);
+        return !ACTIVITY.test(pane) && hasEmptyComposer(pane) && compactedSeconds(pane).length === 1;
+      }, 10_000);
+      for (let i = 1; i < seen.length; i++) expect(seen[i]!).toBeGreaterThanOrEqual(seen[i - 1]!);
+      expect(Math.min(...seen.slice(seen.indexOf(before)))).toBeGreaterThanOrEqual(before);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 120_000);
+
+  test("overflow: compaction counts its own time from zero with its count, and the turn clock goes on from where it stopped", async () => {
     // The turn's first request answers with the overflow only after 3 s, so
     // the turn clock is past zero when compaction starts.
     const f = await fixture("overflow", "success", false, 3000);
@@ -392,14 +463,14 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         return COMPACTION_CLOCK.test(pane);
       }, 15_000);
       expect(before).toBeGreaterThanOrEqual(2);
-      expect(clockSeconds(COMPACTION_CLOCK.exec(started)![1]!)).toBeLessThanOrEqual(1);
-      // The summary is held, so the row stays on the summary step while its
+      expect(clockSeconds(COMPACTION_CLOCK.exec(started)![2]!)).toBeLessThanOrEqual(1);
+      // The summary is held, so the row's count stays below 100% while its
       // own clock runs well past what the turn showed.
       let most = 0;
       await terminal.waitForPane((pane) => {
         const row = COMPACTION_CLOCK.exec(pane);
-        if (row) most = Math.max(most, clockSeconds(row[1]!));
-        return row !== null && row[2] === "summarizing" && clockSeconds(row[1]!) >= 6;
+        if (row) most = Math.max(most, clockSeconds(row[2]!));
+        return row !== null && Number(row[1]) < 100 && clockSeconds(row[2]!) >= 6;
       }, 15_000);
       f.summaryHold.release(HANDOFF);
       await until(() => f.durable() > 0, "acknowledged checkpoint");
@@ -817,7 +888,7 @@ const LIVE_TURN_CLOCK = /(?:Thinking|Running|Generating) \(((?:\d+h)?(?:\d+m)?\d
 const LIVE_PROMPT = "Use read_file to read part1.txt, then part2.txt, then part3.txt, one file per step. Then reply with the single word DONE.";
 
 describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live model", () => {
-  test("live: compaction in the middle of a turn counts from zero with its step, and the turn clock goes on from where it stopped", async () => {
+  test("live: compaction in the middle of a turn counts from zero with its count, and the turn clock goes on from where it stopped", async () => {
     const root = mkdtempSync(join(tmpdir(), "fx-live-compaction-"));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -844,7 +915,7 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
     const stderrPath = join(root, "terminal.stderr");
     const tracePath = join(root, "terminal.trace");
     let terminal: InstanceType<typeof TmuxSession> | undefined;
-    const samples: { at: number; turn?: number; compaction?: number; step?: string }[] = [];
+    const samples: { at: number; turn?: number; compaction?: number; percent?: number }[] = [];
     let passed = false;
     try {
       const seed = Bun.spawn([binary, "ask", "--json", "--auto", "Read seed.txt."], {
@@ -887,8 +958,8 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
         samples.push({
           at: Date.now() - sent,
           turn: turn ? clockSeconds(turn[1]!) : undefined,
-          compaction: compaction ? clockSeconds(compaction[1]!) : undefined,
-          step: compaction?.[2],
+          compaction: compaction ? clockSeconds(compaction[2]!) : undefined,
+          percent: compaction ? Number(compaction[1]) : undefined,
         });
         if (finished(pane)) break;
         await Bun.sleep(100);
@@ -898,7 +969,7 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
       // Each stretch of compaction rows, with the turn clock's last reading
       // before it, how long before the stretch that was, and the turn
       // clock's first reading after it.
-      type Episode = { before?: number; gap: number; first: number; most: number; steps: Set<string>; after?: number };
+      type Episode = { before?: number; gap: number; first: number; most: number; percents: number[]; after?: number };
       const episodes: Episode[] = [];
       let lastTurn: { seconds: number; at: number } | undefined;
       let compacting = false;
@@ -907,13 +978,13 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
           if (!compacting) {
             episodes.push({
               before: lastTurn?.seconds, gap: lastTurn ? sample.at - lastTurn.at : 0,
-              first: sample.compaction, most: sample.compaction, steps: new Set(),
+              first: sample.compaction, most: sample.compaction, percents: [],
             });
           }
           compacting = true;
           const episode = episodes.at(-1)!;
           episode.most = Math.max(episode.most, sample.compaction);
-          if (sample.step) episode.steps.add(sample.step);
+          if (sample.percent !== undefined && episode.percents.at(-1) !== sample.percent) episode.percents.push(sample.percent);
           continue;
         }
         compacting = false;
@@ -922,13 +993,15 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
         if (open && open.after === undefined) open.after = sample.turn;
         lastTurn = { seconds: sample.turn, at: sample.at };
       }
-      console.log(`live compaction with ${LIVE_MODEL}: ${JSON.stringify(episodes.map((e) => ({ ...e, steps: [...e.steps] })))}`);
+      console.log(`live compaction with ${LIVE_MODEL}: ${JSON.stringify(episodes)}`);
       expect(episodes.length).toBeGreaterThan(0);
       // At least one compaction came after the turn had shown its clock.
       expect(episodes.some((episode) => episode.before !== undefined && episode.after !== undefined)).toBe(true);
       for (const episode of episodes) {
         expect(episode.first).toBeLessThanOrEqual(1);
-        expect(episode.steps.size).toBeGreaterThan(0);
+        // The count only goes up, and it moves while the summary streams in.
+        for (let i = 1; i < episode.percents.length; i++) expect(episode.percents[i]!).toBeGreaterThan(episode.percents[i - 1]!);
+        expect(episode.percents.some((value) => value > 0)).toBe(true);
         if (episode.before === undefined || episode.after === undefined) continue;
         // The turn goes on from where it stopped: at most the seconds from
         // its last reading to the compaction, plus one for each sampling

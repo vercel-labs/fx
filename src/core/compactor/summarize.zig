@@ -27,6 +27,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const checkpoint = @import("checkpoint.zig");
 const ledger = @import("ledger.zig");
+const progress = @import("progress.zig");
 const lint = @import("lint.zig");
 const compacted_records = @import("records.zig");
 const trace = @import("trace.zig");
@@ -106,6 +107,10 @@ pub const Request = struct {
     /// final replies and notes clipped, each naming the saved turn that
     /// keeps it whole.
     max_text_tokens: usize = std.math.maxInt(usize),
+    /// Counts the notes while the model writes them. Borrowed.
+    counter: ?*progress.Counter = null,
+    /// These turns are the compaction's last part, whose sections count.
+    last_part: bool = true,
 };
 
 /// What the model is asked. A `Model` sends it as one system message and one
@@ -187,6 +192,7 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
     };
     // Turns too large for one request go oldest first. Each part adds its
     // turns and entries to what the one before it kept.
+    if (request.counter) |counter| counter.begin(toolCallCount(request.turns), fold != null);
     var previous: ?Result = null;
     defer if (previous) |*part| part.deinit();
     var start: usize = 0;
@@ -198,6 +204,7 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
         part.earlier = earlier;
         part.turns = request.turns[start..end];
         part.last_turn_open = request.last_turn_open and end == request.turns.len;
+        part.last_part = end == request.turns.len;
         // The conversation holds every turn, so it serves only a request for
         // all of them.
         if (start > 0 or end < request.turns.len) part.conversation_room = null;
@@ -212,6 +219,17 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
         earlier = next.compacted;
         start = end;
     }
+}
+
+/// The tool calls of `turns`, which the notes give a line each.
+fn toolCallCount(turns: []const Turn) usize {
+    var count: usize = 0;
+    for (turns) |turn| {
+        for (turn.items) |item| {
+            if (item == .tool_call) count += 1;
+        }
+    }
+    return count;
 }
 
 /// The previous compaction, saved whole as L<ledger> as this one starts.
@@ -427,6 +445,12 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
             next_turn += 1;
         }
     }
+
+    if (request.counter) |counter| {
+        const first_tool = earlier.tool_count + 1;
+        counter.startPart(try scratch.alloc(bool, next_tool - first_tool), first_tool, request.last_part);
+    }
+    defer if (request.counter) |counter| counter.endPart();
 
     const plan: Plan = .{
         .earlier = earlier,

@@ -5682,7 +5682,7 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
 }
 
-test "core.app_render_runtime compaction row shows its own clock and step in the VT, then the turn row goes on" {
+test "core.app_render_runtime compaction row shows its count and its own clock in the VT, then the turn row goes on" {
     const activity_status = @import("../output/activity_status.zig");
     const turn_clock = @import("../output/turn_clock.zig");
     const alloc = std.testing.allocator;
@@ -5721,14 +5721,14 @@ test "core.app_render_runtime compaction row shows its own clock and step in the
         app.agent().stream = .{ .active = true, .phase = .thinking, .turn_started_ms = began - 615_000 };
         const id = app.agent().worker.compaction.begin(.automatic, 1, began);
         app.agent().worker.compaction.running(id, .summary);
+        app.agent().worker.compaction.written(id, 66);
         activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), began);
         app.shell.render_requests.request(.footer);
         try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         const grid = app.shell.shadow_vt.?;
-        // The compaction's own clock replaces the turn row. A narrow row
-        // cuts the step and keeps the clock.
-        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting (12s) ·"));
-        try std.testing.expectEqual(cols >= 40, try coordinatorGridContains(grid.*, "• Compacting (12s) · summarizing"));
+        // The compaction's count and its own clock replace the turn row,
+        // whole even on a narrow row.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting 66% (12s)"));
         try std.testing.expect(!(try coordinatorGridContains(grid.*, "Thinking")));
         try std.testing.expect(try coordinatorGridContains(grid.*, "earlier turn output"));
 

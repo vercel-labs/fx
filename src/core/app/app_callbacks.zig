@@ -339,6 +339,7 @@ pub fn Bindings(comptime App: type) type {
                     .begin = beginCompactionActivity,
                     .running = runCompactionActivity,
                     .settle = settleCompactionActivity,
+                    .written = if (comptime @hasDecl(@TypeOf(agent.worker), "writtenCompactionActivity")) writtenCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
@@ -1158,6 +1159,11 @@ pub fn Bindings(comptime App: type) type {
         fn runCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             agent.worker.runCompactionActivity(id, stage);
+        }
+
+        fn writtenCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            agent.worker.writtenCompactionActivity(id, percent);
         }
 
         fn settleCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {

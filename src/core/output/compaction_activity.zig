@@ -50,6 +50,8 @@ pub const Operation = struct {
     expires_at_ms: ?i64 = null,
     /// When the operation settled; 0 while it runs.
     settled_at_ms: i64 = 0,
+    /// How much of the summary the model has written, from 0 to 99.
+    written_percent: u8 = 0,
     dismissed: bool = false,
 
     pub fn visible(self: Operation, now_ms: i64) bool {
@@ -108,6 +110,16 @@ pub const State = struct {
         const next: Phase = if (op.phase == .stopping) .{ .stopping = stage } else .{ .running = stage };
         if (std.meta.eql(op.phase, next)) return;
         op.phase = next;
+        self.snapshot.revision += 1;
+    }
+
+    /// Only a higher count replaces a lower one, and only for the operation
+    /// still running (`tests/tla/turn_clock/TurnClock.tla` CountNeverFalls,
+    /// CountIsThisCompactions).
+    pub fn written(self: *State, id: OperationId, percent: u8) void {
+        const op = self.match(id) orelse return;
+        if (!op.active() or percent <= op.written_percent) return;
+        op.written_percent = @min(percent, 99);
         self.snapshot.revision += 1;
     }
 
@@ -218,4 +230,29 @@ test "compaction activity failure retains error and publication provenance" {
     try std.testing.expectEqual(Outcome.cancelled, failure(error.Aborted, .publication, true).outcome);
     try std.testing.expectEqual(Outcome.failed, failure(error.Aborted, .publication, false).outcome);
     try std.testing.expectEqual(Outcome.failed, failure(error.ConnectionTimedOut, .summary, true).outcome);
+}
+
+test "the summary's count only goes up, and only for the compaction still running" {
+    var state: State = .{};
+    const first = state.begin(.manual, null, 1_000);
+    state.running(first, .summary);
+    state.written(first, 30);
+    state.written(first, 20);
+    try std.testing.expectEqual(@as(u8, 30), state.snapshot.operation.?.written_percent);
+    // A count that arrives after the compaction ended changes nothing.
+    state.settle(first, .{ .outcome = .succeeded }, 2_000);
+    state.written(first, 60);
+    try std.testing.expectEqual(@as(u8, 30), state.snapshot.operation.?.written_percent);
+    const second = state.begin(.automatic, 1, 3_000);
+    // A new compaction starts at 0%, and a late count for the old one is
+    // ignored.
+    try std.testing.expectEqual(@as(u8, 0), state.snapshot.operation.?.written_percent);
+    state.written(first, 80);
+    try std.testing.expectEqual(@as(u8, 0), state.snapshot.operation.?.written_percent);
+    const revision = state.snapshot.revision;
+    state.written(second, 0);
+    try std.testing.expectEqual(revision, state.snapshot.revision);
+    // The count holds below 100 until fx has saved the summary.
+    state.written(second, 100);
+    try std.testing.expectEqual(@as(u8, 99), state.snapshot.operation.?.written_percent);
 }

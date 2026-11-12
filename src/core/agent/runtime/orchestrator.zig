@@ -7083,7 +7083,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report };
+        return .{ .context = self, .report_fn = report, .written_fn = written };
+    }
+
+    fn written(context: *anyopaque, percent: u8) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.written) |write| write(self.deps.ctx, id, percent);
     }
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {

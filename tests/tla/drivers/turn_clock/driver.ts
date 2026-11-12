@@ -39,6 +39,7 @@ type Result = {
   phase: string;
   compaction_seconds: number | null;
   error: string | null;
+  written: number;
 };
 type Step = { label: string; from: string; to: string; ops: Op[] };
 type Walk = { steps: Step[] };
@@ -138,7 +139,12 @@ async function loadGraph(out: string): Promise<Graph> {
 // What the code can see of a model state: everything but the ghost count of
 // worked seconds and whether the UI has synced since the last event.
 const codeView = (s: Model) =>
-  JSON.stringify([s.now, s.turn, s.prompt, s.phase, s.origin, s.opStart, s.compStart, s.started, s.since]);
+  JSON.stringify([s.now, s.turn, s.prompt, s.phase, s.origin, s.opStart, s.compStart, s.started, s.since, s.written]);
+
+// The model counts the summary on a small scale; these are the percentages
+// the code is sent and keeps for each level. 100% is shown only while
+// saving, so the count itself stops at 99.
+const LEVEL_PERCENT = [0, 25, 50, 75, 99];
 
 const active = (phase: string) => ["preparation", "summary", "publication", "stopping"].includes(phase);
 
@@ -157,6 +163,10 @@ function opsFor(label: string, s: Model, t: Model, index: number): Op[] {
     case "Stop": return [{ op: "stop", now }];
     case "Settle": return [{ op: "settle", now, ok: t.phase === "done" }];
     case "Dismiss": return [{ op: "dismiss", now }];
+    // A write that raises the count names its new level; any other changes
+    // nothing, as a 0 does.
+    case "Write": return [{ op: "write", now, percent: LEVEL_PERCENT[t.fresh > s.fresh ? t.fresh : 0] }];
+    case "StaleWrite": return [{ op: "stale_write", now, percent: LEVEL_PERCENT[3] }];
     case "Tick": return [{ op: "read", now }];
     default: throw new Error(`no mapping for model action ${label}`);
   }
@@ -283,6 +293,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("turn clock seconds", turnShown, real.turn_seconds);
       expect("compaction phase", t.phase, real.phase);
       expect("compaction clock seconds", active(t.phase) ? t.now - t.compStart : null, real.compaction_seconds);
+      expect("summary count", LEVEL_PERCENT[t.written], real.written);
     });
   });
   return { mismatches, seen };

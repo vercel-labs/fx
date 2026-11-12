@@ -68,6 +68,7 @@
     {"name": "network_error_message", "module": "fx", "test": "fuzzed gateway error messages stay one bounded line of UTF-8", "iterations": 2000000},
     {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000},
     {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000},
-    {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000}
+    {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
+    {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000}
   ]
 }

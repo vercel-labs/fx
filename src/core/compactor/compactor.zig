@@ -27,6 +27,7 @@ const window = @import("window.zig");
 const summarize = @import("summarize.zig");
 const ledger = @import("ledger.zig");
 const model = @import("model.zig");
+const progress = @import("progress.zig");
 const checkpoint = @import("checkpoint.zig");
 const records = @import("records.zig");
 const settings = @import("settings.zig");
@@ -43,6 +44,7 @@ pub const Size = window.Size;
 // Reaching the model; the caller hands in a `ModelCaller`.
 pub const ModelCaller = model.ModelCaller;
 pub const Call = model.Call;
+pub const TextSink = progress.TextSink;
 pub const CallError = model.CallError;
 pub const Reply = model.Reply;
 
@@ -98,9 +100,12 @@ pub const Progress = struct {
     context: *anyopaque,
     /// An error stops the compaction.
     report_fn: *const fn (context: *anyopaque, step: Step) anyerror!void,
+    /// How much of the summary the model has written, from 1 to 99, each
+    /// time it goes up while the summary streams in.
+    written_fn: ?*const fn (context: *anyopaque, percent: u8) void = null,
 
     fn report(self: ?Progress, step: Step) !void {
-        if (self) |progress| try progress.report_fn(progress.context, step);
+        if (self) |reported| try reported.report_fn(reported.context, step);
     }
 };
 
@@ -199,7 +204,17 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     const earlier = try earlierFrom(out, request.records, chosen.earlier);
     const turns = try turnsFrom(out, chosen.older, request.append_messages);
     if (turns.len == 0) return error.NothingToCompact;
-    var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
+    var counter: progress.Counter = .{};
+    if (request.progress) |reported| if (reported.written_fn) |written| {
+        counter.sink = .{ .context = reported.context, .written_fn = written };
+    };
+    const counts = counter.sink != null;
+    var summarizer: model.Summarizer = .{
+        .caller = caller,
+        .cancel_flag = request.cancel_flag,
+        .trace_ctx = trace_ctx,
+        .on_text = if (counts) counter.textSink() else null,
+    };
     trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
     // The caller's allocator, so the summary gives its working memory back
     // when it is done instead of keeping it in this result.
@@ -212,6 +227,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .max_prompt_tokens = request.size.summaryRequestTokens(),
         .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
         .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
+        .counter = if (counts) &counter else null,
     }, summarizer.model(), request.records);
     defer summary.deinit();
     trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
@@ -415,4 +431,5 @@ test {
     _ = records;
     _ = settings;
     _ = trace;
+    _ = progress;
 }

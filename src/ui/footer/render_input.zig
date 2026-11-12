@@ -1042,11 +1042,11 @@ test "frame compaction overrides idle and tool activity but not blocking feedbac
         .input = &input,
     };
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("• Compacting (1s) · summarizing", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
     try std.testing.expect(!ctx.stream.active);
     ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
-    try std.testing.expectEqualStrings("• Compacting (1s) · summarizing", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqualStrings("• Compacting 0% (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
     try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
     ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
