@@ -5578,6 +5578,7 @@ test {
     _ = @import("core/tooling/web_search_runtime.zig");
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
+    _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
