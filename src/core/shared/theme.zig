@@ -325,7 +325,9 @@ fn writeColorParam(writer: *std.Io.Writer, prefix: []const u8, rgb: Rgb, truecol
 
 /// True when an SGR open sets the given parameter ("1" bold, "3" italic, "48"
 /// background), parsed from the parameter list rather than substring matched.
-/// Handles slots built from multiple concatenated SGR escapes.
+/// An empty parameter, as in `ESC[m`, is "". The arguments of a foreground,
+/// background, or underline color are not parameters of their own. Handles
+/// slots built from multiple concatenated SGR escapes.
 pub fn sgrHasParam(open: []const u8, param: []const u8) bool {
     var rest = open;
     while (std.mem.find(u8, rest, "\x1b[")) |start| {
@@ -338,7 +340,7 @@ pub fn sgrHasParam(open: []const u8, param: []const u8) bool {
                 skip -= 1;
                 continue;
             }
-            if (std.mem.eql(u8, part, "38") or std.mem.eql(u8, part, "48")) {
+            if (std.mem.eql(u8, part, "38") or std.mem.eql(u8, part, "48") or std.mem.eql(u8, part, "58")) {
                 if (std.mem.eql(u8, part, param)) return true;
                 // Color introducer: 5;n consumes one parameter, 2;r;g;b three.
                 // Skipping keeps RGB triples from reading as bold/italic.
@@ -1127,6 +1129,14 @@ test "sgrHasParam parses the parameter list exactly" {
     try std.testing.expect(!sgrHasParam("\x1b[38;5;245m", "8"));
     try std.testing.expect(!sgrHasParam("\x1b[38;5;245m", "48"));
     try std.testing.expect(!sgrHasParam("\x1b[39m", "38"));
+    try std.testing.expect(sgrHasParam("\x1b[4;58;5;1m", "58"));
+    try std.testing.expect(!sgrHasParam("\x1b[58;5;1m", "1"));
+    try std.testing.expect(!sgrHasParam("\x1b[58;2;3;22;0m", "22"));
+    try std.testing.expect(sgrHasParam("\x1b[m", ""));
+    try std.testing.expect(sgrHasParam("\x1b[;1m", ""));
+    try std.testing.expect(!sgrHasParam("\x1b[0m", ""));
+    try std.testing.expect(!sgrHasParam("\x1b]8;;\x1b\\", ""));
+    try std.testing.expect(!sgrHasParam("\x1b[2K", "2"));
     try std.testing.expect(!sgrHasParam("plain", "38"));
     try std.testing.expect(!sgrHasParam("\x1b[38;5;245", "38"));
 }
