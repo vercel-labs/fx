@@ -1835,6 +1835,15 @@ describe("effect-aware command permissions", () => {
       expect(shape).toContain("role=user content=array");
       // The request shape names roles and types, never the prompt's text.
       expect(shape).not.toContain("Trigger the gateway schema diagnostic.");
+      // No record holds the raw request body. The prompt itself is only in
+      // the transcript and in the screen rows of the renderer state, so a
+      // gateway error, schema diagnostic, or log line that leaks it fails.
+      const strings = (value: unknown): string[] =>
+        typeof value === "string" ? [value] : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+      expect(report.records.flatMap(strings).filter((text) => text.includes('"text":"Trigger the gateway schema diagnostic."'))).toEqual([]);
+      const elsewhere = report.records.filter((record) => record.type !== "transcript_entry" && record.type !== "renderer_state");
+      expect(elsewhere.flatMap(strings).filter((text) => text.includes("Trigger the gateway schema diagnostic."))).toEqual([]);
+      expect(report.all("transcript_entry").some((entry) => String(entry.text).includes("Trigger the gateway schema diagnostic."))).toBe(true);
       expect(report.problems("network_call").map((problem) => (problem.call as { status?: number }).status)).toContain(400);
       expect(report.one("problems").count).toBeGreaterThan(0);
       expect(statSync(reportPath).mode & 0o077).toBe(0);

@@ -68,8 +68,10 @@
 //!   bounded ring dropped; then a `compaction_event` per retained event:
 //!   `at`, `sequence`, `event`, `turn_id`, `step_id`, `subagent_id`, `failed`,
 //!   `detail`, and `truncated`, whether the detail was cut when recorded.
-//!   These are recorded even when `FX_TRACE` is off, and hold internal
-//!   counters and names only, so they are not masked.
+//!   These are recorded even when `FX_TRACE` is off. A `detail` holds
+//!   internal counters and names, and for a failed summary request the
+//!   provider's error text, which is masked when it is recorded, so the trace
+//!   does not mask it again.
 //! - `interrupted_turn`, only when the last turn was interrupted by the user:
 //!   `in_flight_tool`, `in_flight_args` (masked, the first 1200 bytes),
 //!   `in_flight_args_bytes`, and `completed_tools`, a list of names.
@@ -162,6 +164,10 @@ const notice_text = "Private diagnostic report. It may include prompts, file pat
 const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
+const network_problems_shown: usize = 3;
+const tool_problems_shown: usize = 5;
+const compaction_problems_shown: usize = 3;
+const model_catalog_problems_shown: usize = 3;
 /// The last millisecond of year 9999. ISO 8601 writes a later year with more
 /// than four digits, and `formatUtc` overflows on a year past 65535.
 const max_time_ms: i64 = 253_402_300_799_999;
@@ -678,7 +684,7 @@ fn writeNetworkProblems(p: *Records) !void {
     const count = diagnostics.snapshotNetworkCalls(calls);
     var reported: usize = 0;
     var index = count;
-    while (index > 0 and reported < 3) {
+    while (index > 0 and reported < network_problems_shown) {
         index -= 1;
         const call = &calls[index];
         if (!call.isError()) continue;
@@ -696,7 +702,7 @@ fn writeToolProblems(p: *Records) !void {
     const count = diagnostics.snapshotToolCalls(calls);
     var reported: usize = 0;
     var index = count;
-    while (index > 0 and reported < 5) {
+    while (index > 0 and reported < tool_problems_shown) {
         index -= 1;
         const call = &calls[index];
         if (call.outcome == .succeeded) continue;
@@ -714,7 +720,7 @@ fn writeCompactionProblems(p: *Records) !void {
     const count = diagnostics.snapshotCompactionEvents(events);
     var reported: usize = 0;
     var index = count;
-    while (index > 0 and reported < 3) {
+    while (index > 0 and reported < compaction_problems_shown) {
         index -= 1;
         const event = &events[index];
         if (!event.failed) continue;
@@ -756,7 +762,7 @@ fn writeModelCatalogProblems(p: *Records) !void {
     const count = diagnostics.snapshotModelCatalogEvents(&events);
     var reported: usize = 0;
     var index = count;
-    while (index > 0 and reported < 3) {
+    while (index > 0 and reported < model_catalog_problems_shown) {
         index -= 1;
         const event = &events[index];
         if (!event.failed) continue;
@@ -824,8 +830,9 @@ fn writeCompaction(r: *Records) !void {
         if (event.step_id != 0) try r.number("step_id", event.step_id);
         if (event.subagent_id != 0) try r.number("subagent_id", event.subagent_id);
         try r.boolean("failed", event.failed);
-        // Compaction events carry internal counters and enum names only,
-        // never user payloads, so they are not masked.
+        // A detail holds internal counters and names, and for a failed
+        // summary request the provider's error text, which was masked when
+        // it was recorded (src/core/compactor/trace.zig).
         if (event.detail_len > 0) try r.text("detail", try neutralized(r.arena, event.detail()));
         try r.boolean("truncated", event.truncated);
         try r.end();
@@ -3088,11 +3095,9 @@ test "trace stays well formed with every ring full and a long transcript" {
     try writeRendererEvents(&w.records);
     try writeTranscript(&w.records, entries);
     try writeEnd(&w.records);
-    const elapsed = io_mod.milliTimestamp() - started;
 
     var trace = try w.trace();
     defer trace.deinit();
-    std.debug.print("trace stress: {d} records, {d} bytes, written in {d} ms\n", .{ trace.records.len, w.out.written().len, elapsed });
     try expectNotIn(w.out.written(), "abcdefghijklmnop");
     try std.testing.expectEqual(@as(i64, @intCast(trace.records.len - 1)), try testInt(trace.records[trace.records.len - 1], "records"));
     try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
@@ -3105,9 +3110,9 @@ test "trace stays well formed with every ring full and a long transcript" {
     try std.testing.expectEqual(@as(i64, 1), try testInt(try trace.one("compaction"), "overwritten_before"));
     try std.testing.expect(!try testBool(try trace.one("tool_calls"), "complete"));
     try std.testing.expect(!try testBool(try trace.one("network"), "complete"));
-    // 3 network, 5 tool, 3 compaction, and 3 catalog problems.
-    try std.testing.expectEqual(@as(i64, 14), try testInt(try trace.one("problems"), "count"));
-    try std.testing.expectEqual(@as(usize, 14), trace.count("problem"));
+    const problems = network_problems_shown + tool_problems_shown + compaction_problems_shown + model_catalog_problems_shown;
+    try std.testing.expectEqual(@as(i64, problems), try testInt(try trace.one("problems"), "count"));
+    try std.testing.expectEqual(problems, trace.count("problem"));
     const last_entry = try trace.nth("transcript_entry", entry_count - 1);
     const last_text = try testString(last_entry, "text");
     try expectStartsWith(last_text, "AI_GATEWAY_API_KEY=[redacted]");
