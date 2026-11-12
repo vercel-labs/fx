@@ -276,9 +276,7 @@ LeadBlocks(a) ==
     IF Mutation = "contract_late" /\ a.delivered
     THEN [Instructions(a.w, LeadBranch(a)) EXCEPT ![2] = Block("base", "p+contract")]
     ELSE IF a.attach
-    THEN SubSeq(Instructions(a.w, LeadBranch(a)), 1, 5)
-           \o << Block("scoped", Scoped(a.w)) >>
-           \o SubSeq(Instructions(a.w, LeadBranch(a)), 6, 7)
+    THEN Stable(a.w) \o << Block("scoped", Scoped(a.w)) >> \o Overlay(a.w, LeadBranch(a))
     ELSE Instructions(a.w, LeadBranch(a))
   ELSE Stable(a.w)
          \o (IF a.scopedStable THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
