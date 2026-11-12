@@ -193,10 +193,14 @@ const Outcome = union(enum) {
     signal: u32,
 };
 
+/// The direct read-only executor runs commands only on macOS and Linux.
+const direct_supported = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
+
 /// Runs `argv`, a safe git command, in `cwd` through the direct read-only
 /// executor with safe git's environment. The command runs in its own process
 /// group, which the executor terminates and reaps when `deadline_ms` passes;
-/// then this returns `error.TimeoutExpired`.
+/// then this returns `error.TimeoutExpired`. Where the executor does not
+/// run, such as WebAssembly, the command fails.
 fn runBefore(
     alloc: Allocator,
     argv: []const []const u8,
@@ -206,6 +210,17 @@ fn runBefore(
 ) error{ OutOfMemory, TimeoutExpired }!Outcome {
     const now = io_mod.milliTimestamp();
     if (now >= deadline_ms) return error.TimeoutExpired;
+    return if (direct_supported) runDirect(alloc, argv, cwd, now, deadline_ms, output_limit) else .failed;
+}
+
+fn runDirect(
+    alloc: Allocator,
+    argv: []const []const u8,
+    cwd: []const u8,
+    now: i64,
+    deadline_ms: i64,
+    output_limit: usize,
+) error{ OutOfMemory, TimeoutExpired }!Outcome {
     const stages = [_]command_effect.DirectStage{.{
         .executable = argv[0],
         .argv = argv,
