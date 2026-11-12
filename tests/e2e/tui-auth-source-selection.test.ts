@@ -677,6 +677,7 @@ function startFakeGrokOAuth(options: {
   rejectRefresh?: boolean;
   beforeRefreshResponse?: () => void | Promise<void>;
   revokeStatus?: number;
+  revokeDelayMs?: number;
   revokeDrip?: boolean;
   userinfoSub?: string;
   modelsResponse?: () => Promise<Response | void>;
@@ -769,6 +770,7 @@ function startFakeGrokOAuth(options: {
         return Response.json({ sub: options.userinfoSub ?? "acct_grok_e2e" });
       }
       if (url.pathname === "/oauth2/revoke") {
+        if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
         const form = new URLSearchParams(body ?? "");
         const valid = form.get("client_id") === "b1a00492-073a-47ea-816f-4c329264a828" &&
           (form.get("token") === "grok-refresh-next" || form.get("token") === "grok-refresh");
@@ -5188,6 +5190,160 @@ function codexLogoutEnv(testHome: string, revokeUrl: string): Record<string, str
     FX_TEST_CHATGPT_REVOKE_URL: revokeUrl,
   };
 }
+
+/**
+ * Starts `fx <args>` in a terminal and prints its exit status after it. The
+ * command keeps the pane open itself: the launch that `remainOnExit` gates
+ * can drop the first line of a command that writes at once.
+ */
+const FX_EXITED = "fx exited with";
+function startOnTerminal(args: string, env: Record<string, string | undefined>): Promise<TmuxSession> {
+  return TmuxSession.create({ cmd: `${FX_BIN} ${args}; echo "${FX_EXITED} $?"; sleep 60`, env });
+}
+
+/**
+ * Runs `fx logout` in a terminal against a provider that answers its
+ * revocation after `REVOKE_DELAY_MS`. Checks that the wait line is on screen
+ * before the sign-out line, and that fx then exits with status 0.
+ */
+const REVOKE_DELAY_MS = 3_000;
+async function expectLogoutWaitLine(
+  args: string,
+  env: Record<string, string | undefined>,
+  waitLine: string,
+  signedOut: string,
+): Promise<void> {
+  const session = await startOnTerminal(args, env);
+  try {
+    await session.waitForText(waitLine, 10_000);
+    // The provider has not answered yet, so fx is still waiting.
+    expect(await session.capturePane()).not.toContain(signedOut);
+    await session.waitForText(`${FX_EXITED} `, 20_000);
+    const pane = await session.capturePane();
+    expect(pane).toContain(`${FX_EXITED} 0`);
+    expect(pane.indexOf(waitLine)).toBeLessThan(pane.indexOf(signedOut));
+    expect(pane).not.toContain("could not be");
+  } finally {
+    await session.kill();
+  }
+}
+
+test("fx logout codex on a terminal says it waits for OpenAI", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-wait-line-"));
+  const codex = startFakeChatGptOAuth({ revokeDelayMs: REVOKE_DELAY_MS });
+  try {
+    writeSeededChatGptLogin(home, codex.accessToken);
+    await expectLogoutWaitLine(
+      "logout codex",
+      codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL),
+      "revoking the Codex login at OpenAI (up to 15 s)...",
+      "Signed out of Codex.",
+    );
+    expect(codex.revocations()).toHaveLength(1);
+  } finally {
+    codex.stop();
+  }
+}, 60_000);
+
+/** Runs `fx <args>` in a terminal and returns its pane once fx exited 0. */
+async function paneAfterExit(args: string, env: Record<string, string | undefined>): Promise<string> {
+  const session = await startOnTerminal(args, env);
+  try {
+    await session.waitForText(`${FX_EXITED} `, 30_000);
+    const pane = await session.capturePane();
+    expect(pane).toContain(`${FX_EXITED} 0`);
+    return pane;
+  } finally {
+    await session.kill();
+  }
+}
+
+test("fx logout codex on a terminal prints no wait line when it sends nothing", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-no-wait-line-"));
+  const codex = startFakeChatGptOAuth();
+  try {
+    const env = codexLogoutEnv(home, codex.env.FX_TEST_CHATGPT_REVOKE_URL);
+    const missing = await paneAfterExit("logout codex", env);
+    expect(missing).toContain("No Codex login session found.");
+    expect(missing).not.toContain("revoking the Codex login");
+
+    writeSeededChatGptLogin(home, codex.accessToken);
+    writeFileSync(join(home, ".fx", "chatgpt-auth.json"), "{invalid-json");
+    const unreadable = await paneAfterExit("logout codex", env);
+    expect(unreadable).toContain("Signed out of Codex.");
+    expect(unreadable).not.toContain("revoking the Codex login");
+    expect(unreadable).toContain(CODEX_REVOCATION_WARNING);
+    expect(codex.revocations()).toHaveLength(0);
+  } finally {
+    codex.stop();
+  }
+}, 60_000);
+
+test("fx logout codex on a terminal shows the wait line before a failed revocation's warning", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-logout-wait-line-failure-"));
+  const codex = startFakeChatGptOAuth({ revokeStatus: 503 });
+  // A port that was just listening and is now closed refuses the connection.
+  const closed = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null) });
+  const closedUrl = `http://127.0.0.1:${closed.port}/oauth/revoke`;
+  closed.stop(true);
+  try {
+    for (const revokeUrl of [codex.env.FX_TEST_CHATGPT_REVOKE_URL, closedUrl]) {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      const pane = await paneAfterExit("logout codex", codexLogoutEnv(home, revokeUrl));
+      expect(pane).toContain("Signed out of Codex.");
+      const wait = pane.indexOf("revoking the Codex login at OpenAI (up to 15 s)...");
+      expect(wait, pane).toBeGreaterThanOrEqual(0);
+      expect(wait).toBeLessThan(pane.indexOf(CODEX_REVOCATION_WARNING));
+    }
+    expect(codex.revocations()).toHaveLength(1);
+  } finally {
+    codex.stop();
+  }
+}, 60_000);
+
+test("fx logout grok on a terminal says it waits for xAI", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-logout-wait-line-"));
+  const grok = startFakeGrokOAuth({ revokeDelayMs: REVOKE_DELAY_MS });
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    await expectLogoutWaitLine(
+      "logout grok",
+      {
+        HOME: home,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_TEST_GROK_REVOKE_URL: grok.env.FX_TEST_GROK_REVOKE_URL,
+      },
+      "revoking the Grok login at xAI (up to 15 s)...",
+      "Signed out of Grok.",
+    );
+    expect(grok.requests.filter((request) => request.path === "/oauth2/revoke")).toHaveLength(1);
+  } finally {
+    grok.stop();
+  }
+}, 60_000);
+
+test("fx logout on a terminal says it waits for the fx login's issuer", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cli-logout-wait-line-"));
+  oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+    revokeDelayMs: REVOKE_DELAY_MS,
+  });
+  writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+  await expectLogoutWaitLine(
+    "logout",
+    {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
+    },
+    "revoking the fx login at Vercel (up to 45 s)...",
+    "Signed out of fx.",
+  );
+}, 60_000);
 
 test("Codex logout revokes the saved login at OpenAI", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-codex-logout-revoke-"));
