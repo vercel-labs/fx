@@ -6855,3 +6855,37 @@ test "a subagent's view is rebuilt from its saved conversation without touching 
     try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
     try std.testing.expectEqualStrings("SCREEN_DIM", app.shell.command_output_render.styles.dim_style);
 }
+
+test "a theme change rewrites hidden agents' transcripts and paced text" {
+    const alloc = std.testing.allocator;
+    const shared_theme = @import("core/shared/theme.zig");
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.shell.layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 };
+    const child = try addTestChildAgent(&app, "child-1");
+
+    var dark = shared_theme.fx_dark;
+    dark.name = "probe-dark";
+    dark.inline_code_open = "\x1b[38;2;136;192;208m";
+    var light = shared_theme.fx_light;
+    light.name = "probe-light";
+    light.inline_code_open = "\x1b[38;2;23;108;116m";
+
+    const Fill = struct {
+        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
+            _ = try a.shell.appendRawTranscriptEntryClassified(a.alloc, "\x1b[38;2;136;192;208mshown\x1b[39m\n", .tool_status);
+            try a.pacer.enqueue(a.alloc, "\x1b[38;2;136;192;208mpaced\x1b[39m");
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, {}, Fill.run);
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "\x1b[38;2;136;192;208mmain\x1b[39m\n", .tool_status);
+
+    App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
+
+    try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;23;108;116mshown") != null);
+    try std.testing.expect(std.mem.find(u8, child.screen.pacer.pending.items, "\x1b[38;2;23;108;116mpaced") != null);
+    // The agent on screen is the theme change's own work, not this one's.
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "\x1b[38;2;136;192;208mmain") != null);
+}

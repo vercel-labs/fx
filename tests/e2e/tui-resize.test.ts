@@ -4915,6 +4915,123 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
+    "a custom theme flip recolors inline code and links in prose, table cells, and a hidden agent",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-custom-theme-flip-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "custom-theme-flip.fxtape");
+      tempDirs.push(root);
+      mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      // A theme pair named like the files editors ship: fx follows the
+      // terminal from one variant to its sibling.
+      writeFileSync(
+        join(home, ".fx", "themes", "probe-dark.json"),
+        JSON.stringify({ type: "dark", name: "probe-dark", colors: { inline_code: "#88C0D0", link: "#81A1C1" } }),
+      );
+      writeFileSync(
+        join(home, ".fx", "themes", "probe-light.json"),
+        JSON.stringify({ type: "light", name: "probe-light", colors: { inline_code: "#176C74", link: "#0064B0" } }),
+      );
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ theme: "probe-dark" }));
+      writeFileSync(stderrPath, "");
+      const dark = { code: "\x1b[38;2;136;192;208m", link: "\x1b[38;2;129;161;193m" };
+      const light = { code: "\x1b[38;2;23;108;116m", link: "\x1b[38;2;0;100;176m" };
+
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText(
+          "Prose has `PROSE_CODE` and [PROSE_LINK](https://example.com/prose).\n\n" +
+            "| Command | Docs |\n" +
+            "|---------|------|\n" +
+            "| `TABLE_CODE` | [TABLE_LINK](https://example.com/table) |\n\n" +
+            "CUSTOM_THEME_TAIL\n",
+        ),
+      ]);
+      gateways.push(gateway);
+      session = await createResizeSession({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-custom-theme-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          COLORTERM: "truecolor",
+          FX_RECORD: tapePath,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "theme",
+        },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Show prose and a table with code and links.");
+      await session.waitForText("CUSTOM_THEME_TAIL", TIMEOUT);
+
+      // The text before the last full redraw is the screen fx drew last.
+      const lastRedraw = (): string => {
+        const stdout = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString();
+        return stdout.slice(stdout.lastIndexOf("\x1b[3J"));
+      };
+      const expectColors = (drawn: string, want: typeof dark, other: typeof dark): void => {
+        for (const marker of ["PROSE_CODE", "TABLE_CODE"]) {
+          expect(drawn).toContain(`${want.code}${marker}`);
+        }
+        for (const marker of ["PROSE_LINK", "TABLE_LINK"]) {
+          expect(drawn).toMatch(new RegExp(`${want.link.replace(/[[\]]/g, "\\$&")}(\\x1b\\[[0-9;]*m)*${marker}`));
+        }
+        expect(drawn).not.toContain(other.code);
+        expect(drawn).not.toContain(other.link);
+      };
+      const resets = (): number =>
+        countOccurrences(Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(), "\x1b[3J");
+
+      // A second instance takes the screen, so the first one's transcript is
+      // hidden when the terminal turns light.
+      await session.sendText("/launch");
+      await session.waitForPane((pane) => pane.includes("fx 2/2"), TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      let resetsBefore = resets();
+      setPaneBackground(session, "#ffffff");
+      sendRawTmuxBytes(session, "custom-theme-to-light", Buffer.from("\x1b[?997;2n"));
+      await waitForTraceText(tracePath, "theme_update_settled light=true");
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetsBefore + 1);
+
+      // Back on the first instance, its transcript shows the light colors.
+      resetsBefore = resets();
+      await session.sendKeys("C-x");
+      await session.waitForText("enter switch", TIMEOUT);
+      await session.sendKeys("Up");
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("fx 1/2") && !pane.includes("enter switch"), TIMEOUT);
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetsBefore + 1);
+      await session.waitForText("CUSTOM_THEME_TAIL", TIMEOUT);
+      expectColors(lastRedraw(), light, dark);
+
+      // And with it on screen, the flip back to dark recolors it again.
+      resetsBefore = resets();
+      setPaneBackground(session, "#000000");
+      sendRawTmuxBytes(session, "custom-theme-to-dark", Buffer.from("\x1b[?997;1n"));
+      await waitForTraceText(tracePath, "theme_update_settled light=false");
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetsBefore + 1);
+      await session.waitForText("CUSTOM_THEME_TAIL", TIMEOUT);
+      expectColors(lastRedraw(), dark, light);
+
+      expect(session.isPaneAlive()).toBe(true);
+      expect(readFileSync(tracePath, "utf8")).toContain("theme_variant_swapped from=probe-dark to=probe-light");
+      expectEmptyStderr(stderrPath);
+    },
+    90_000,
+  );
+
+  test(
     "grow keeps the current composer at the wider terminal width",
     async () => {
       session = await launchAt(80, 30);

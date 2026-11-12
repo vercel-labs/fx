@@ -163,6 +163,191 @@ pub fn builtin(light: bool) Theme {
     return if (light) fx_light else fx_dark;
 }
 
+// --- Escape slots ---
+
+/// Number of escape slots in a Theme: every string field but `name`, then the
+/// syntax palette's.
+pub const style_slot_count: usize = blk: {
+    var count: usize = 0;
+    const theme_info = @typeInfo(Theme).@"struct";
+    for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
+        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) count += 1;
+    }
+    for (@typeInfo(SyntaxPalette).@"struct".field_types) |field_type| {
+        if (field_type == []const u8) count += 1;
+    }
+    break :blk count;
+};
+
+/// The escape slot at `index`, in `style_slot_count` order.
+pub fn styleSlot(theme: Theme, index: usize) []const u8 {
+    var copy = theme;
+    return styleSlotPtr(&copy, index).*;
+}
+
+/// Keep field dispatch out of callers' loops so each slot does not expand
+/// another copy of their bodies.
+noinline fn styleSlotPtr(theme: *Theme, index: usize) *[]const u8 {
+    comptime var field_index: usize = 0;
+    const theme_info = @typeInfo(Theme).@"struct";
+    inline for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
+        if (comptime field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
+            if (index == field_index) return &@field(theme.*, field_name);
+            field_index += 1;
+        }
+    }
+    const syntax_palette_info = @typeInfo(SyntaxPalette).@"struct";
+    inline for (syntax_palette_info.field_names, syntax_palette_info.field_types) |field_name, field_type| {
+        if (comptime field_type == []const u8) {
+            if (index == field_index) return &@field(theme.syntax, field_name);
+            field_index += 1;
+        }
+    }
+    unreachable;
+}
+
+/// Gives every escape slot a loaded theme sets its own bytes. Theme files
+/// often use one color for several slots, and the transcript keeps text as
+/// drawn bytes, so a light/dark flip could not tell which slot drew a color
+/// that two slots share, and both would get the first one's new color. A
+/// repeated escape gets leading zeros on its last color's values (`;23;68m`
+/// becomes `;23;068m`), which terminals read as the same numbers, so it draws
+/// the same color. Slots the file leaves to the builtin variant keep its
+/// bytes, and an escape whose last parameter is not a color value stays as
+/// it is.
+fn giveSlotsDistinctEscapes(alloc: std.mem.Allocator, theme: *Theme) ParseError!void {
+    const base = builtin(theme.light);
+    var originals: [style_slot_count][]const u8 = undefined;
+    var inherited: [style_slot_count]bool = undefined;
+    for (&originals, &inherited, 0..) |*original, *from_base, index| {
+        original.* = styleSlotPtr(theme, index).*;
+        from_base.* = std.mem.eql(u8, original.*, styleSlot(base, index));
+    }
+    for (originals, inherited, 0..) |original, from_base, index| {
+        if (original.len == 0 or from_base) continue;
+        // Inherited slots all keep the one original form, wherever they are,
+        // so sharing it with any of them takes one form; each earlier set slot
+        // that shares it takes another.
+        var shares_inherited = false;
+        var earlier_set: usize = 0;
+        for (originals, inherited, 0..) |other, other_from_base, other_index| {
+            if (other_index == index or !std.mem.eql(u8, other, original)) continue;
+            if (other_from_base) {
+                shares_inherited = true;
+            } else if (other_index < index) {
+                earlier_set += 1;
+            }
+        }
+        const repeats = @intFromBool(shares_inherited) + earlier_set;
+        if (repeats == 0) continue;
+        if (try zeroPaddedEscape(alloc, original, repeats)) |padded| styleSlotPtr(theme, index).* = padded;
+    }
+}
+
+/// `escape` with leading zeros on the values of its last color, as the
+/// `repeat`th distinct form, or null when the escape is not one SGR sequence
+/// that ends with a color. Forms are ordered by how many zeros they add, so
+/// the first nine repeats of a three-value color add at most two bytes.
+/// Caller owns the returned slice.
+fn zeroPaddedEscape(alloc: std.mem.Allocator, escape: []const u8, repeat: usize) ParseError!?[]u8 {
+    var starts: [3]usize = undefined;
+    const values = lastColorValueStarts(escape, &starts) orelse return null;
+    var zeros: [3]usize = .{ 0, 0, 0 };
+    distinctZeroCounts(repeat, zeros[0..values]);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var copied: usize = 0;
+    for (starts[0..values], zeros[0..values]) |start, count| {
+        try out.appendSlice(alloc, escape[copied..start]);
+        try out.appendNTimes(alloc, '0', count);
+        copied = start;
+    }
+    try out.appendSlice(alloc, escape[copied..]);
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Writes into `zeros` the `repeat`th (from 1) way to spread leading zeros
+/// over its values, counting ways with fewer zeros first.
+fn distinctZeroCounts(repeat: usize, zeros: []usize) void {
+    var seen: usize = 0;
+    var total: usize = 1;
+    while (true) : (total += 1) {
+        if (zeros.len == 1) {
+            seen += 1;
+            if (seen == repeat) {
+                zeros[0] = total;
+                return;
+            }
+            continue;
+        }
+        // Two or three values: walk the splits of `total` in a fixed order.
+        var first: usize = 0;
+        while (first <= total) : (first += 1) {
+            if (zeros.len == 2) {
+                seen += 1;
+                if (seen == repeat) {
+                    zeros[0] = first;
+                    zeros[1] = total - first;
+                    return;
+                }
+                continue;
+            }
+            var second: usize = 0;
+            while (second <= total - first) : (second += 1) {
+                seen += 1;
+                if (seen == repeat) {
+                    zeros[0] = first;
+                    zeros[1] = second;
+                    zeros[2] = total - first - second;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Finds where each value of the last color in a single SGR escape starts,
+/// as byte offsets into `escape`. Returns how many values the color has (1
+/// for `5;n`, 3 for `2;r;g;b`), or null when the escape is not one SGR
+/// sequence of digits that ends with a color's values.
+fn lastColorValueStarts(escape: []const u8, starts: *[3]usize) ?usize {
+    if (escape.len < 4 or !std.mem.startsWith(u8, escape, "\x1b[") or escape[escape.len - 1] != 'm') return null;
+    const body_start: usize = 2;
+    const body = escape[body_start .. escape.len - 1];
+    var owed: usize = 0;
+    var expect_mode = false;
+    var color_values: usize = 0;
+    var ends_with_color = false;
+    var part_start: usize = 0;
+    var index: usize = 0;
+    while (index <= body.len) : (index += 1) {
+        if (index < body.len and body[index] != ';') {
+            if (!std.ascii.isDigit(body[index])) return null;
+            continue;
+        }
+        const part = body[part_start..index];
+        if (part.len == 0) return null;
+        if (expect_mode) {
+            expect_mode = false;
+            owed = if (std.mem.eql(u8, part, "2")) 3 else if (std.mem.eql(u8, part, "5")) 1 else return null;
+            color_values = 0;
+            ends_with_color = false;
+        } else if (owed > 0) {
+            starts[color_values] = body_start + part_start;
+            color_values += 1;
+            owed -= 1;
+            ends_with_color = owed == 0;
+        } else {
+            expect_mode = std.mem.eql(u8, part, "38") or std.mem.eql(u8, part, "48");
+            ends_with_color = false;
+        }
+        part_start = index + 1;
+    }
+    if (!ends_with_color) return null;
+    return color_values;
+}
+
 /// The theme currently applied to the process. Core producers that cannot
 /// import ui state read their colors through `current()`; `activate` is called
 /// by the ui layer whenever a theme is applied.
@@ -423,8 +608,9 @@ pub fn parse(alloc: std.mem.Allocator, bytes: []const u8, options: ParseOptions)
         .object => |object| object,
         else => return error.InvalidTheme,
     };
-    if (looksLikeVsCode(root)) return parseVsCode(alloc, root, options);
-    return parseNative(alloc, root, options);
+    var theme = if (looksLikeVsCode(root)) try parseVsCode(alloc, root, options) else try parseNative(alloc, root, options);
+    try giveSlotsDistinctEscapes(alloc, &theme);
+    return theme;
 }
 
 fn looksLikeVsCode(root: std.json.ObjectMap) bool {
@@ -1214,6 +1400,85 @@ test "parse maps the link color and split syntax scopes" {
     // A VS Code theme without textLink keeps the builtin link color.
     const no_link = try parse(alloc, "{ \"type\": \"dark\", \"colors\": {} }", .{ .truecolor = true });
     try std.testing.expectEqualStrings(fx_dark.link_style, no_link.link_style);
+}
+
+test "repeated escapes get zero padded forms of the same color" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { escape: []const u8, repeat: usize, want: ?[]const u8 }{
+        .{ .escape = "\x1b[38;2;20;20;20m", .repeat = 1, .want = "\x1b[38;2;20;20;020m" },
+        .{ .escape = "\x1b[38;2;20;20;20m", .repeat = 2, .want = "\x1b[38;2;20;020;20m" },
+        .{ .escape = "\x1b[38;2;20;20;20m", .repeat = 3, .want = "\x1b[38;2;020;20;20m" },
+        .{ .escape = "\x1b[38;2;20;20;20m", .repeat = 4, .want = "\x1b[38;2;20;20;0020m" },
+        .{ .escape = "\x1b[1;38;5;23m", .repeat = 2, .want = "\x1b[1;38;5;0023m" },
+        // The last color is the background.
+        .{ .escape = "\x1b[38;2;1;2;3;48;2;4;5;6m", .repeat = 1, .want = "\x1b[38;2;1;2;3;48;2;4;5;06m" },
+        // Ends with an attribute, or holds several escapes: left alone.
+        .{ .escape = "\x1b[38;5;235;1m", .repeat = 1, .want = null },
+        .{ .escape = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m", .repeat = 1, .want = null },
+    };
+    for (cases) |case| {
+        const got = try zeroPaddedEscape(alloc, case.escape, case.repeat);
+        defer if (got) |value| alloc.free(value);
+        if (case.want) |want| {
+            try std.testing.expectEqualStrings(want, got.?);
+            // Parsed by parameter, the padded form opens what the original does.
+            try std.testing.expectEqualStrings(closingFor(case.escape), closingFor(got.?));
+            try std.testing.expectEqual(sgrHasParam(case.escape, "1"), sgrHasParam(got.?, "1"));
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+}
+
+test "the first nine repeats of a truecolor escape stay distinct within two extra bytes" {
+    const alloc = std.testing.allocator;
+    var seen: [10][]u8 = undefined;
+    var count: usize = 0;
+    defer for (seen[0..count]) |value| alloc.free(value);
+    for (1..10) |repeat| {
+        const padded = (try zeroPaddedEscape(alloc, "\x1b[38;2;240;240;240m", repeat)).?;
+        seen[count] = padded;
+        count += 1;
+        try std.testing.expect(padded.len <= "\x1b[38;2;240;240;240m".len + 2);
+        for (seen[0 .. count - 1]) |earlier| try std.testing.expect(!std.mem.eql(u8, earlier, padded));
+    }
+}
+
+test "a loaded theme gives every slot it sets its own escape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // Like cursor-light: red text and removed diff lines share one color, as
+    // do body text and shell variables.
+    const theme = try parse(alloc,
+        \\{ "type": "light", "name": "probe-light",
+        \\  "colors": { "hint": "#141414", "system_notice_text": "#141414", "red": "#BE1744", "diff_removed": "#BE1744" },
+        \\  "syntax": { "variable": "#141414", "operator": "#141414" } }
+    , .{ .truecolor = true });
+    try std.testing.expectEqualStrings("\x1b[38;2;20;20;20m", theme.hint_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;190;23;68m", theme.red_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;190;23;068m", theme.diff_removed_style);
+    for (0..style_slot_count) |index| {
+        const slot = styleSlot(theme, index);
+        if (std.mem.eql(u8, slot, styleSlot(fx_light, index))) continue;
+        for (0..index) |earlier| try std.testing.expect(!std.mem.eql(u8, styleSlot(theme, earlier), slot));
+    }
+    // Slots the file leaves alone keep the builtin bytes.
+    try std.testing.expectEqualStrings(fx_light.warning_style, theme.warning_style);
+    try std.testing.expectEqualStrings(fx_light.green_style, theme.green_style);
+}
+
+test "a set slot that quantizes onto inherited slots takes one padded form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // #D0D0D0 rounds to palette 252, which fx_dark gives warning, green, red,
+    // and others after hint in slot order.
+    const theme = try parse(alloc, "{ \"name\": \"probe-256\", \"colors\": { \"hint\": \"#D0D0D0\", \"dim\": \"#D0D0D0\" } }", .{ .truecolor = false });
+    try std.testing.expectEqualStrings("\x1b[38;5;0252m", theme.hint_style);
+    try std.testing.expectEqualStrings("\x1b[38;5;00252m", theme.dim_style);
+    try std.testing.expectEqualStrings(fx_dark.warning_style, theme.warning_style);
+    try std.testing.expectEqualStrings("\x1b[38;5;252m", theme.warning_style);
 }
 
 test "builtin themes pin the new slot bytes" {
