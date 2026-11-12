@@ -1161,6 +1161,9 @@ const App = struct {
         // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
+        // The suspend restore turned theme notifications off, and the theme
+        // may have changed while fx was stopped.
+        self.terminal_input_runtime.terminal_theme_monitor.requestRearm();
     }
 
     pub fn ensurePromptCredential(self: *App, agent: *agents.Agent) !bool {
@@ -3206,6 +3209,22 @@ const App = struct {
                 });
             };
         }
+        if (self.terminal_input_runtime.terminal_theme_monitor.takeRearmRequest(now_ms)) {
+            debug_trace.logf("theme", "theme_notifications_rearmed", .{});
+            self.terminal.enableThemeNotifications() catch |err| {
+                debug_trace.logf("theme", "theme_notification_enable_failed err={s}", .{@errorName(err)});
+            };
+            self.terminal.requestThemeColorScheme() catch |err| {
+                debug_trace.logf("theme", "theme_color_scheme_query_failed err={s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn collectBracketedPasteFacts(self: *App) void {
+        if (!self.terminal_input_runtime.bracketed_paste_rearm.take(io_mod.milliTimestamp())) return;
+        self.terminal.enableBracketedPaste() catch |err| {
+            debug_trace.logf("input", "bracketed_paste_rearm_failed err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
@@ -3233,6 +3252,7 @@ const App = struct {
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
 
         try self.collectThemeFacts();
+        self.collectBracketedPasteFacts();
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -6080,7 +6100,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     // From another subagent's screen, main's own request comes first.
     try App.AgentsAppRuntime.show(&app, reviewer);
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
-    try std.testing.expectEqualStrings("main and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "the footer notes a hidden agent whose request waits for the user" {
@@ -6112,7 +6132,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
     // It counts with the agents waiting on an answer.
     try App.AgentsAppRuntime.show(&app, null);
     _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {

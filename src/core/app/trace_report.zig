@@ -56,10 +56,11 @@
 //!   {`status`, `reason`, `detail`}; `network_call`, for the newest 3 failed
 //!   calls, with `call` holding the `network_call` fields; `tool_call`, for
 //!   the newest 5 calls that did not succeed, with `call` {`at`, `name`,
-//!   `outcome`, `duration_ms`, `source`}; `compaction` {`event`, `turn_id`, `detail`}, for the newest 3
-//!   failures; `mcp_server` {`issue` (`failed`, `retrying`, `missing_env`,
-//!   `invalid_env`, or `needs_login`), `name`, `variable`, `error` (masked)};
-//!   `model_catalog` {`event`, `detail`}, for the newest 3 failures.
+//!   `outcome`, `duration_ms`, `source`, `cause`}; `compaction` {`event`,
+//!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
+//!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
+//!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
+//!   `detail`}, for the newest 3 failures.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
 //! - `compaction`: `retained`, `failed`, `overwritten_before`, the events the
@@ -96,8 +97,9 @@
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
 //!   {`calls`, `outcomes`, `total_ms`}, `complete`, and `web_search_retained`.
 //!   Then a `tool_call` per retained local call, oldest first: `at`, `name`,
-//!   `outcome`, `duration_ms`, `source`, `args` (masked), `args_bytes`,
-//!   `args_omitted_bytes`; a call that succeeded has `result_preview` (masked,
+//!   `outcome`, `duration_ms`, `source`, `cause` (only for a call that did not
+//!   succeed because an MCP server refused its parameters: which arguments it
+//!   rejected, masked), `args` (masked), `args_bytes`, `args_omitted_bytes`; a call that succeeded has `result_preview` (masked,
 //!   its first useful line, at most 180 bytes) and `result_bytes`, and any
 //!   other call has `result` (masked), `result_bytes`, and
 //!   `result_omitted_bytes`. A `web_fetch` call has no arguments or result.
@@ -144,6 +146,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const mcp_tool_result = @import("../mcp/tool_result.zig");
 const permissions = @import("../permissions/permissions.zig");
 const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -1070,6 +1073,11 @@ fn writeToolCallFields(r: *Records, call: *const diagnostics.ToolCallMetric) !vo
     try r.text("outcome", @tagName(call.outcome));
     try r.number("duration_ms", call.duration_ms);
     try r.source(call.subagent_id);
+    if (call.outcome != .succeeded) {
+        // Why an MCP server refused the call's parameters, so the call doesn't
+        // read as a limit or a crash. `invalidParamsCause` masks it.
+        if (try mcp_tool_result.invalidParamsCause(r.arena, call.result())) |cause| try r.text("cause", cause);
+    }
 }
 
 fn writeOutcomeCounts(r: *Records, counts: []const u64) !void {
@@ -2221,6 +2229,48 @@ test "trace session title reports the retained generation outcome" {
     try std.testing.expectEqualStrings("Fix renderer lag PASSWORD=[redacted]", try testString(installed_record, "title"));
     try std.testing.expectEqualStrings("installed", try testString(try testObject(installed_record, "generation"), "status"));
     try std.testing.expectEqual(@as(usize, 0), installed_trace.count("problem"));
+}
+
+test "trace tool calls name why an MCP server refused the parameters" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const refusal = "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"";
+    const fixtures = [_]struct { outcome: diagnostics.ToolCallOutcome, result: []const u8 }{
+        .{ .outcome = .tool_failed, .result = refusal },
+        // Another failure, and a success with the same text, have no cause.
+        .{ .outcome = .tool_failed, .result = "connection closed" },
+        .{ .outcome = .succeeded, .result = refusal },
+    };
+    for (fixtures, 0..) |fixture, index| {
+        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(1000 + index), .duration_ms = 1, .outcome = fixture.outcome };
+        call.setName("mcp__fixture__search");
+        call.setArgs("{\"limit\":\"40\"}");
+        call.setResult(fixture.result);
+        diagnostics.recordToolCall(call);
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{});
+    try writeToolProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const cause = "arguments rejected: limit is a string, the schema wants a number";
+    try std.testing.expectEqualStrings(cause, try testString(try trace.nth("tool_call", 0), "cause"));
+    try std.testing.expect((try trace.nth("tool_call", 1)).get("cause") == null);
+    try std.testing.expect((try trace.nth("tool_call", 2)).get("cause") == null);
+    // The two failures are problems, and only the refused call's names a cause.
+    try std.testing.expectEqual(@as(usize, 2), trace.count("problem"));
+    var causes: usize = 0;
+    for (0..2) |index| {
+        const call = try testObject(try trace.nth("problem", index), "call");
+        if (call.get("cause") != null) {
+            causes += 1;
+            try std.testing.expectEqualStrings(cause, try testString(call, "cause"));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), causes);
 }
 
 test "trace tool calls keep outcomes and mask obvious secrets" {
