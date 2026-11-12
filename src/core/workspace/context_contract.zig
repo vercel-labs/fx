@@ -346,6 +346,10 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
+    /// The agent's subagents as one runtime note, written by its subagent
+    /// host (`Runtime.teamNote` in src/core/subagent/tool_host.zig); null
+    /// when it has none.
+    subagents: ?[]const u8 = null,
 };
 
 pub const Provider = struct {

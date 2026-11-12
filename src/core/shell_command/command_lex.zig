@@ -497,6 +497,26 @@ fn is_safe_env_name(name: []const u8) bool {
         std.mem.eql(u8, name, "CMAKE_BUILD_TYPE");
 }
 
+/// `word` as a POSIX shell reads it back as that one word: bare when it is
+/// not empty and every byte is a letter, a digit, or one of `._/-`, and in
+/// single quotes otherwise, with each `'` written as `'\''`. A word that
+/// starts with `-` is still read as an option by the command it is passed
+/// to. The caller owns the result.
+pub fn quoteWord(alloc: std.mem.Allocator, word: []const u8) std.mem.Allocator.Error![]u8 {
+    const bare = word.len > 0 and for (word) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "._/-", byte) == null) break false;
+    } else true;
+    if (bare) return alloc.dupe(u8, word);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '\'');
+    for (word) |byte| {
+        if (byte == '\'') try out.appendSlice(alloc, "'\\''") else try out.append(alloc, byte);
+    }
+    try out.append(alloc, '\'');
+    return out.toOwnedSlice(alloc);
+}
+
 fn check_input(input: []const u8) LexError!void {
     if (std.mem.findScalar(u8, input, 0) != null) return error.EmbeddedNul;
     if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
@@ -613,6 +633,27 @@ test "pipe_segments reports malformed trailing escapes" {
 test "pipe_segments rejects embedded nul and invalid utf8" {
     try std.testing.expectError(error.EmbeddedNul, pipe_segments(std.testing.allocator, "cat \x00 file"));
     try std.testing.expectError(error.InvalidUtf8, pipe_segments(std.testing.allocator, "cat \xff"));
+}
+
+test "quoteWord leaves plain words bare and reads back every hostile word as one" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "github", "my-server_2", "/tmp/a.b", "v1.2" }) |word| {
+        const quoted = try quoteWord(alloc, word);
+        defer alloc.free(quoted);
+        try std.testing.expectEqualStrings(word, quoted);
+    }
+    const hostile = [_][]const u8{ "", "x; touch /tmp/p #", "$(id)", "`id`", "it's", "a\"b", "two words", "line\nbreak", "~/x", "a|b&c>d<e", "*?[x]", "\\" };
+    for (hostile) |word| {
+        const quoted = try quoteWord(alloc, word);
+        defer alloc.free(quoted);
+        try std.testing.expect(quoted[0] == '\'');
+        const command = try std.mem.concat(alloc, u8, &.{ "fx mcp approve ", quoted });
+        defer alloc.free(command);
+        var argv = try tokenize_argv(alloc, command);
+        defer argv.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 4), argv.tokens.len);
+        try std.testing.expectEqualStrings(word, argv.tokens[3].value);
+    }
 }
 
 test "tokenize_argv decodes single and double quoted tokens" {

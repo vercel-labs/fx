@@ -18,6 +18,9 @@ const max_wait_ticks: u32 = 120;
 /// A resend hands its status line back within a few seconds; a module that
 /// still holds it after this many ticks never will.
 const max_handoff_ticks: u32 = 10;
+/// A wait for a sign-in resends after three minutes, so its resend is always
+/// within this many ticks.
+const max_poll_ticks: u32 = 400;
 
 const Op = struct {
     op: []const u8,
@@ -74,8 +77,17 @@ const Lab = struct {
 
     /// Ticks once a second until the module sends.
     fn wait(lab: *Lab) recovery.Plan {
+        return lab.tickUntilSend(max_wait_ticks);
+    }
+
+    /// Ticks once a second until a wait for a sign-in resends by itself.
+    fn poll(lab: *Lab) recovery.Plan {
+        return lab.tickUntilSend(max_poll_ticks);
+    }
+
+    fn tickUntilSend(lab: *Lab, max_ticks: u32) recovery.Plan {
         var merged: recovery.Plan = .{};
-        for (0..max_wait_ticks) |_| {
+        for (0..max_ticks) |_| {
             lab.now_ms += tick_ms;
             const plan = lab.step(.tick);
             if (plan.status) |status| merged.status = status;
@@ -155,6 +167,7 @@ fn eventNamed(name: []const u8) ?recovery.Event {
     if (std.mem.eql(u8, name, "responding")) return .responding;
     if (std.mem.eql(u8, name, "succeeded")) return .succeeded;
     if (std.mem.eql(u8, name, "user_continue")) return .user_continue;
+    if (std.mem.eql(u8, name, "sign_in_closed")) return .sign_in_closed;
     if (std.mem.eql(u8, name, "user_cancel")) return .user_cancel;
     if (std.mem.eql(u8, name, "closing")) return .closing;
     return null;
@@ -185,6 +198,8 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         result.plan = planOut(lab.step(.{ .failed = .{ .kind = kind } }));
     } else if (is(op.op, "wait")) {
         result.plan = planOut(lab.wait());
+    } else if (is(op.op, "poll")) {
+        result.plan = planOut(lab.poll());
     } else if (is(op.op, "handoff")) {
         result.plan = planOut(lab.handOff());
     } else if (is(op.op, "exit")) {
