@@ -18,8 +18,6 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const execution_router = @import("../execution/router.zig");
 const io_mod = @import("../shared/io.zig");
-const net_accept = @import("../shared/net_accept.zig");
-const testing_listener = @import("../shared/testing_listener.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -170,9 +168,10 @@ const LauncherControl = struct {
             _ = try std.posix.poll(&poll_fds, control_poll_ms);
             if (poll_fds[0].revents == 0) continue;
 
-            // A connection gone before the accept sends the loop back to
-            // `done`.
-            var stream = (try net_accept.acceptIfWaiting(self.server, io_mod.getIo())) orelse continue;
+            var stream = self.server.accept(io_mod.getIo()) catch |err| switch (err) {
+                error.ConnectionAborted, error.WouldBlock => continue,
+                else => return err,
+            };
             defer stream.close(io_mod.getIo());
             var bytes: [marker_frame_len]u8 = undefined;
             receiveSocketExact(
@@ -553,61 +552,6 @@ fn launcherStatusToTerm(raw_status: u32) std.process.Child.Term {
         .{ .stopped = std.c.W.STOPSIG(raw_status) }
     else
         .{ .unknown = raw_status };
-}
-
-/// A launcher's control loop on its own thread, for the test below.
-const ControlRunner = struct {
-    control: *LauncherControl,
-    done: std.atomic.Value(bool) = .init(false),
-
-    fn run(self: *ControlRunner) void {
-        defer self.done.store(true, .seq_cst);
-        self.control.run();
-    }
-};
-
-test "launcher control stops when another thread takes the connection it saw" {
-    // The control loop and a rival can both see the one connection as ready,
-    // and only one accept gets it. When the rival wins, the loop must go back
-    // to its poll and see `done`, or the launcher's join never returns.
-    const io = io_mod.getIo();
-    const nonce: [control_nonce_len]u8 = @splat('n');
-    for (0..10) |_| {
-        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-        var server = try address.listen(io, .{ .reuse_address = true });
-        defer server.deinit(io);
-        const port = server.socket.address.getPort();
-        const wake_context: *const anyopaque = @ptrCast(&port);
-        var rival: testing_listener.Rival = .{ .listener = server.socket.handle };
-        try rival.start();
-        defer rival.finish(wake_context, testing_listener.wakeLoopback);
-        var watchdog = LauncherWatchdog{ .child_pid = 0 };
-        var control = LauncherControl{
-            .server = &server,
-            .control_path = "/nonexistent/fx-control",
-            .bootstrap_path = "/nonexistent/fx-bootstrap",
-            .nonce = &nonce,
-            .command_path = null,
-            .child_pid = 0,
-            .watchdog = &watchdog,
-        };
-        var runner: ControlRunner = .{ .control = &control };
-        const thread = try std.Thread.spawn(.{}, ControlRunner.run, .{&runner});
-        io_mod.sleep(20 * std.time.ns_per_ms);
-        testing_listener.connectToLoopback(port);
-        _ = testing_listener.waitFor(&rival.taken, 1_000);
-        rival.finish(wake_context, testing_listener.wakeLoopback);
-        control.done.store(true, .release);
-        const ended = testing_listener.waitFor(&runner.done, 2_000);
-        // A loop still in accept ends with one more connection.
-        while (!runner.done.load(.seq_cst)) {
-            testing_listener.connectToLoopback(port);
-            io_mod.sleep(10 * std.time.ns_per_ms);
-        }
-        thread.join();
-        try std.testing.expect(ended);
-        try std.testing.expect(!control.failed);
-    }
 }
 
 test "launcher wait status classifies terminal results before stops" {

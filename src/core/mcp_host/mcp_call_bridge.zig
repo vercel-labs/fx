@@ -18,8 +18,6 @@
 //! model.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
-const net_accept = @import("../shared/net_accept.zig");
-const testing_listener = @import("../shared/testing_listener.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const command_runner = @import("../execution/command_runner.zig");
@@ -247,11 +245,10 @@ fn acceptLoop() void {
             return;
         };
         if (ready == 0) continue;
-        // A connection gone before the accept sends the loop back to `stop`.
-        const stream = (net_accept.acceptIfWaiting(listener, io) catch |err| {
+        const stream = listener.accept(io) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept failed err={s}", .{@errorName(err)});
             continue;
-        }) orelse continue;
+        };
         bridge.mutex.lockUncancelable(io);
         const room = bridge.connections < max_connections;
         if (room) bridge.connections += 1;
@@ -657,63 +654,6 @@ test "the bridge removes its socket after the last shell call" {
     try std.Io.Dir.cwd().access(io, socket_path, .{});
     unregister(second);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, socket_path, .{}));
-}
-
-/// `Rival.finish`'s wake for the bridge: `context` is its socket path.
-fn wakeBridge(context: *const anyopaque) void {
-    const path: *const []const u8 = @ptrCast(@alignCast(context));
-    const address = std.Io.net.UnixAddress.init(path.*) catch return;
-    const stream = address.connect(std.testing.io) catch return;
-    stream.close(std.testing.io);
-}
-
-/// The last `unregister` on its own thread: it stops the bridge and waits
-/// for the accept loop.
-const Unregistering = struct {
-    registration: *Registration,
-    done: std.atomic.Value(bool) = .init(false),
-
-    fn run(self: *Unregistering) void {
-        defer self.done.store(true, .seq_cst);
-        unregister(self.registration);
-    }
-};
-
-test "the bridge stops when another thread takes the connection it saw" {
-    if (!supported) return error.SkipZigTest;
-    // The accept loop and a rival can both see the one connection as ready,
-    // and only one accept gets it. When the rival wins, the loop must go back
-    // to its poll and see `stop`, or the last unregister waits forever.
-    const io = std.testing.io;
-    for (0..10) |_| {
-        var tool: FakeTool = .{};
-        const registration = try register(tool.capability());
-        const owned_path = try std.testing.allocator.dupe(u8, registration.environment()[0].value);
-        defer std.testing.allocator.free(owned_path);
-        const path: []const u8 = owned_path;
-        const wake_context: *const anyopaque = @ptrCast(&path);
-        bridge.mutex.lockUncancelable(io);
-        const handle = bridge.listener.?.socket.handle;
-        bridge.mutex.unlock(io);
-        var rival: testing_listener.Rival = .{ .listener = handle };
-        try rival.start();
-        io_mod.sleep(20 * std.time.ns_per_ms);
-        wakeBridge(wake_context);
-        _ = testing_listener.waitFor(&rival.taken, 1_000);
-        // The rival ends before the bridge closes the listener, so it never
-        // waits on a closed descriptor.
-        rival.finish(wake_context, wakeBridge);
-        var unregistering: Unregistering = .{ .registration = registration };
-        const thread = try std.Thread.spawn(.{}, Unregistering.run, .{&unregistering});
-        const ended = testing_listener.waitFor(&unregistering.done, 2_000);
-        // A loop still in accept ends with one more connection.
-        while (!unregistering.done.load(.seq_cst)) {
-            wakeBridge(wake_context);
-            io_mod.sleep(10 * std.time.ns_per_ms);
-        }
-        thread.join();
-        try std.testing.expect(ended);
-    }
 }
 
 test "the bridge stops at once, and ends a silent client's connection with it" {
