@@ -91,6 +91,7 @@ Every TLA+ spec, its TLC checker, the Bun drivers that walk code along a spec, a
 - A model of code that has not landed says so at the top, and the drivers that need that code run only behind an explicit flag, such as `--next` or `FX_TLA_NEXT_MCP=1`. `tests/tla/README.md` lists them. Remove the flag in the change that lands the code.
 - When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs the `sdk/`, `mcp/`, `mcp_host/`, and `subagent/` models, the session-write and live sessions models in `session/`, and their drivers on `main` and on pull requests that change the code they cover (`scripts/detect-ci-need.sh`), the `mcp_call/` model on `main` and on pull requests labeled `ci:tla-mcp-call`, the `recovery/` and `agent_runtime/` models and their drivers on every pull request, and the `session_title/` model, without its driver, on every pull request; run the others yourself.
 - A new model, checker, or driver gets a row in `tests/tla/README.md`.
+- CI runs the `configured_provider/` model and its drivers only on pull requests labeled `ci:tla-configured-provider` and on a dispatch of `tla-configured-provider.yml`.
 
 ## Cite tests and specs from `src/`
 

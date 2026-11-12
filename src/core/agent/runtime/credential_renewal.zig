@@ -13,6 +13,7 @@ const runtime_deps = @import("deps.zig");
 const Allocator = std.mem.Allocator;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
+const RefreshedGatewayCredential = runtime_deps.RefreshedGatewayCredential;
 const TraceContext = debug_trace.TraceContext;
 
 /// The sign-in a request sent. Borrowed.
@@ -21,16 +22,30 @@ pub const SignIn = struct {
     account_id: ?[]const u8 = null,
 };
 
-/// What to hold after a 401.
+/// What the host gave after a 401. Both credentials are owned by the caller;
+/// adopt `stored` first and then `forced`, or `free` them.
 pub const Renewal = struct {
-    /// Owned by the caller; null when the host gave nothing.
-    credential: ?[]u8 = null,
-    /// The mode that gave `credential`.
-    mode: CredentialRefreshMode = .reload,
-    /// Whether `credential` differs from the rejected token, so one more send
-    /// can work.
+    /// The stored credential; null when the host holds none this sign-in can
+    /// send.
+    stored: ?RefreshedGatewayCredential = null,
+    /// The forced refresh's credential, asked for only while the store still
+    /// held the rejected token; null when there was none.
+    forced: ?RefreshedGatewayCredential = null,
+    /// Whether the newest credential differs from the rejected token, so one
+    /// more send can work.
     resend: bool = false,
+
+    /// The forced credential when there is one, else the stored one.
+    pub fn newest(self: Renewal) ?RefreshedGatewayCredential {
+        return self.forced orelse self.stored;
+    }
 };
+
+pub fn free(alloc: Allocator, credential: RefreshedGatewayCredential) void {
+    secret.zeroAndFree(alloc, credential.token);
+    if (credential.gateway_team) |team| alloc.free(team);
+    if (credential.gateway_team_label) |label| alloc.free(label);
+}
 
 /// The sign-in's credential from the host in `mode`, owned by the caller.
 /// Null when its source is not refreshable, the host holds none, or the host
@@ -41,7 +56,7 @@ pub fn load(
     sign_in: SignIn,
     mode: CredentialRefreshMode,
     trace_ctx: TraceContext,
-) Allocator.Error!?[]u8 {
+) Allocator.Error!?RefreshedGatewayCredential {
     const source = sign_in.source orelse return null;
     if (!credentials.sourceRefreshable(source)) return null;
     const refresh = deps.refresh_gateway_credential orelse return null;
@@ -78,10 +93,8 @@ pub fn renewRejected(
         debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
         return .{};
     };
-    errdefer secret.zeroAndFree(alloc, stored);
-    if (!std.mem.eql(u8, stored, rejected)) return .{ .credential = stored, .mode = .reload, .resend = true };
-    const forced = (try load(deps, alloc, sign_in, .force, trace_ctx)) orelse
-        return .{ .credential = stored, .mode = .reload, .resend = false };
-    secret.zeroAndFree(alloc, stored);
-    return .{ .credential = forced, .mode = .force, .resend = true };
+    errdefer free(alloc, stored);
+    if (!std.mem.eql(u8, stored.token, rejected)) return .{ .stored = stored, .resend = true };
+    const forced = (try load(deps, alloc, sign_in, .force, trace_ctx)) orelse return .{ .stored = stored };
+    return .{ .stored = stored, .forced = forced, .resend = true };
 }

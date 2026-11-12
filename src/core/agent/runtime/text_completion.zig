@@ -11,6 +11,7 @@ const runtime_gateway_step = @import("gateway_step.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
+const token_pass = @import("../../gateway/token_pass.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const types = @import("../../shared/types.zig");
@@ -250,13 +251,17 @@ pub const CompactorCaller = struct {
     /// an agent turn does (`credential_renewal.renewRejected`). Null when the
     /// caller cannot renew it. Must outlive the compaction.
     renewal_deps: ?*const runtime_deps.AgentRuntimeDeps = null,
-    /// The renewed credential `api_key` points to once renewed; `deinit` frees it.
+    /// The renewed credential and team `api_key` and `gateway_team` point to
+    /// once renewed; `deinit` frees them.
     renewed_api_key: ?[]u8 = null,
+    renewed_gateway_team: ?[]u8 = null,
     renewal_tried: bool = false,
 
     pub fn deinit(self: *CompactorCaller) void {
         if (self.renewed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
         self.renewed_api_key = null;
+        if (self.renewed_gateway_team) |team| std.heap.c_allocator.free(team);
+        self.renewed_gateway_team = null;
     }
 
     /// Borrows `self`, which must outlive the compaction.
@@ -268,6 +273,8 @@ pub const CompactorCaller = struct {
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,
+            // A Token Pass conversation retries its summary on Token Pass.
+            .fallback_model = if (self.provider == .gateway) token_pass.compactionFallback(self.model) else null,
         };
     }
 
@@ -323,14 +330,24 @@ pub const CompactorCaller = struct {
         const rejected = try alloc.dupe(u8, self.api_key);
         defer secret.zeroAndFree(alloc, rejected);
         const renewal = try credential_renewal.renewRejected(deps, alloc, .{ .source = self.credential_source, .account_id = self.account_id }, rejected, trace_ctx);
-        const credential = renewal.credential orelse return false;
+        // Only the newest credential is sent again.
+        if (renewal.forced != null) if (renewal.stored) |stored| credential_renewal.free(alloc, stored);
+        const newest = renewal.newest() orelse return false;
         if (!renewal.resend) {
-            secret.zeroAndFree(alloc, credential);
+            credential_renewal.free(alloc, newest);
             return false;
         }
+        if (newest.gateway_team_label) |label| alloc.free(label);
         if (self.renewed_api_key) |old| secret.zeroAndFree(alloc, old);
-        self.renewed_api_key = credential;
-        self.api_key = credential;
+        self.renewed_api_key = newest.token;
+        self.api_key = newest.token;
+        // A team the host now sends with the login, such as one the user
+        // picked, goes with the next send too.
+        if (newest.gateway_team) |team| {
+            if (self.renewed_gateway_team) |old| alloc.free(old);
+            self.renewed_gateway_team = team;
+            self.gateway_team = team;
+        }
         return true;
     }
 

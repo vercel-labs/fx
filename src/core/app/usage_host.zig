@@ -15,6 +15,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const stored_login_testing = @import("../auth/stored_login_testing.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -134,7 +135,7 @@ fn fromParts(
             .bearer = bearer,
             .team = team,
             .subject = account orelse team orelse "",
-            .label = std.mem.print(label_buf, "{s} (fx login)", .{team_slug orelse team orelse "no team"}) catch "fx login",
+            .label = std.mem.print(label_buf, "{s} (fx login)", .{types.displayGatewayTeam(team_slug, team) orelse "no team"}) catch "fx login",
         },
         .stored_key, .ai_gateway_api_key => .{
             .scope = .api_key,
@@ -269,4 +270,16 @@ test "a refused /usage sign-in renews only to a newer stored token for the same 
     try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .member, .rejected = "launch-token", .team = "team-other", .account_id = null }) == null);
     // An API key has nothing to renew.
     try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .api_key, .rejected = "vck_key", .team = null, .account_id = null }) == null);
+}
+
+test "the usage label names a login's team only by a valid team name" {
+    var bad_buf: LabelBuffer = undefined;
+    const bad = fromParts(.fx_login, "token", "team_123", "\x1b]2;title\x07", null, &bad_buf).?;
+    try std.testing.expectEqualStrings("team_123 (fx login)", bad.label);
+    var good_buf: LabelBuffer = undefined;
+    const good = fromParts(.fx_login, "token", "team_123", "vercel-labs", null, &good_buf).?;
+    try std.testing.expectEqualStrings("vercel-labs (fx login)", good.label);
+    var neither_buf: LabelBuffer = undefined;
+    const neither = fromParts(.fx_login, "token", "team 123", "\xe2\x80\xaeslug", null, &neither_buf).?;
+    try std.testing.expectEqualStrings("no team (fx login)", neither.label);
 }

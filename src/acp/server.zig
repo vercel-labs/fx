@@ -2881,9 +2881,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     var startup = loadConfiguredStartupState(state, alloc) catch |err| {
         const model_message = config_runtime.modelNotSelectedMessage(err);
+        const settings_message = if (model_message == null) try config_runtime.configuredProviderMessage(alloc, err) else null;
+        defer if (settings_message) |message| alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{
-            .code = if (model_message != null) ErrorCode.invalid_request else ErrorCode.internal_error,
-            .message = model_message orelse "Failed to load startup state",
+            .code = if (model_message != null or settings_message != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+            .message = model_message orelse settings_message orelse "Failed to load startup state",
         });
     };
     defer startup.deinit(alloc);

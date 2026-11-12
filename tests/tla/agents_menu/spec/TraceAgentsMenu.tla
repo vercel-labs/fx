@@ -2,32 +2,35 @@
 \* Checks runs of the built fx against AgentsMenu.
 \*
 \* tests/tla/drivers/agents_menu/binary-to-spec.ts drives zig-out/bin/fx in
-\* tmux with seeded key sequences (open, Up, Down, Enter, Esc or Ctrl+X, Delete
-\* twice) and releases held subagent turns while the list is open, so rows
-\* reorder under the highlight. After every step it reads the model's
-\* variables from the pane and the trace log, and writes each run as one
-\* sequence of states into TraceData.tla, with the step as `act`.
+\* tmux with seeded key sequences (open, Up, Down, Enter, Esc or Ctrl+X, a
+\* paste, search letters and Backspace, Delete twice, /close) and releases held
+\* subagent turns while the list is open, so rows reorder under the
+\* highlight. After every step it reads the model's variables from the pane
+\* and the trace log, and writes each run as one sequence of states into
+\* TraceData.tla, with the step as `act`.
 \*
 \* TLC walks every trace. ConformsToSpec holds when every recorded step is a
 \* step of AgentsMenu's Next, so each run is a behavior of the model; the
 \* names below re-export the model's rules, checked on what fx did.
 EXTENDS Integers, Sequences, FiniteSets, TraceData
 
-CONSTANTS InstanceOrder, Subs, Parent, InitOrder, EnvEvents, Mutation
+CONSTANTS InstanceOrder, Subs, Parent, InitOrder, EnvEvents, SearchKeys, Mutation
 
-VARIABLES order, onScreen, open, sel, armed, act, trace, at
+VARIABLES order, onScreen, open, sel, armed, origin, searching, hidden, act, trace, at
 
 AM == INSTANCE AgentsMenu
 
-vars == <<order, onScreen, open, sel, armed, act>>
+vars == <<order, onScreen, open, sel, armed, origin, searching, hidden, act>>
 
 Load(s) ==
     /\ order = s.order /\ onScreen = s.onScreen /\ open = s.open
-    /\ sel = s.sel /\ armed = s.armed /\ act = s.act
+    /\ sel = s.sel /\ armed = s.armed /\ origin = s.origin
+    /\ searching = s.searching /\ hidden = s.hidden /\ act = s.act
 
 LoadNext(s) ==
     /\ order' = s.order /\ onScreen' = s.onScreen /\ open' = s.open
-    /\ sel' = s.sel /\ armed' = s.armed /\ act' = s.act
+    /\ sel' = s.sel /\ armed' = s.armed /\ origin' = s.origin
+    /\ searching' = s.searching /\ hidden' = s.hidden /\ act' = s.act
 
 TraceInit == trace \in 1..Len(Traces) /\ at = 1 /\ Load(Traces[trace][1])
 
@@ -51,10 +54,18 @@ OnScreenListed == AM!OnScreenListed
 LastInstanceStays == AM!LastInstanceStays
 SelListed == AM!SelListed
 ClosedNoSel == AM!ClosedNoSel
+SearchHides == AM!SearchHides
 ArmedIsSel == AM!ArmedIsSel
-ScreenOnlyOnEnter == AM!ScreenOnlyOnEnter
+OriginListed == AM!OriginListed
+PreviewOnMove == AM!PreviewOnMove
+PreviewOnSearch == AM!PreviewOnSearch
+UpOnTopCloses == AM!UpOnTopCloses
+CloseShowsRowAbove == AM!CloseShowsRowAbove
 EnterShowsSelection == AM!EnterShowsSelection
+BackToOrigin == AM!BackToOrigin
+ScreenOnlyOnKeys == AM!ScreenOnlyOnKeys
 OpensOnScreen == AM!OpensOnScreen
+OriginKept == AM!OriginKept
 SelectionKept == AM!SelectionKept
 FallbackToScreen == AM!FallbackToScreen
 MoveOneRow == AM!MoveOneRow
