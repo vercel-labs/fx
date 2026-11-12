@@ -5,7 +5,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -16,6 +15,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { readPermissionsPanel } from "./info-panel";
 import { logLines, rootSessionIds } from "./saved-sessions";
+import { type TraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
   fakeGatewayFinalText,
   fakeGatewayHeldDecision,
@@ -183,21 +183,13 @@ function startGateway(
   return gateway;
 }
 
-// Runs /trace in a TUI session whose clipboard always fails, so the report is
-// saved under TMPDIR, and returns that report's `## <title>` section.
-async function traceSection(
-  session: TmuxSession,
-  tmp: string,
-  title: string,
-): Promise<string> {
+// Runs /trace in a TUI session whose clipboard always fails, so the trace is
+// saved under TMPDIR, and returns that trace.
+async function runTrace(session: TmuxSession, tmp: string): Promise<TraceReport> {
+  const before = new Set(traceReportNames(tmp));
   await session.sendText("/trace");
   await waitForEither(session, ["Clipboard copy failed", "Trace saved at"], TIMEOUT);
-  const report = readdirSync(tmp).find((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"));
-  expect(report).toBeDefined();
-  const text = readFileSync(join(tmp, report!), "utf8");
-  const section = text.split(`\n## ${title}\n`)[1]?.split("\n## ")[0];
-  expect(section).toBeDefined();
-  return section!;
+  return waitForNewTraceReport(tmp, before);
 }
 
 // A failing clipboard for /trace, first on PATH.
@@ -732,6 +724,50 @@ describe("lean auto mode reliability", () => {
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
+  );
+
+  test(
+    "a Token Pass session is reviewed by a Token Pass model unless review_model names another",
+    async () => {
+      for (const reviewModel of [undefined, "openai/gpt-6-sol"]) {
+        const root = createIsolatedRoot();
+        const marker = join(root.root, "deployment-ran");
+        const bin = installRecorder(root, "vercel", marker);
+        const deployCommand = `${join(bin, "vercel")} deploy --prod`;
+        const gateway = startGateway(
+          [
+            userCommandCall(deployCommand, "token_pass_deploy"),
+            fakeGatewayFinalText("deployment completed"),
+          ],
+          [fakeGatewayPermissionDecision("clear", "token_pass_deploy_clear")],
+        );
+
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", "Deploy the site."],
+          {
+            cwd: root.workspace,
+            env: {
+              ...gatewayEnv(root, gateway),
+              FX_MODEL: "zai/glm-5.3",
+              FX_REVIEW_MODEL: reviewModel,
+              PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(
+          gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+        ).toBe(reviewModel ?? "deepseek/deepseek-v4.1-flash");
+        if (reviewModel === undefined) {
+          expect(JSON.parse(gateway.classifierRequests[0]!.body).providerOptions).toBeUndefined();
+        }
+        expect(existsSync(marker)).toBe(true);
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(
@@ -2741,19 +2777,48 @@ describe("lean auto mode reliability", () => {
       expect(existsSync(heldMarker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(2);
 
-      const reviews = await traceSection(activeSession, root.root, "Auto Reviews");
-      expect(reviews).toMatch(/^reviews=2 reused=1 clear=1 caution=1 unavailable=0 held=0 error=0\n/);
-      const held = reviews.split("### Held\n")[1]?.split("### Recent\n")[0];
-      expect(held).toBeDefined();
-      // The caution, with its risk, its command, and the reviewer's
-      // rationale on one line with its escape sequences shown as text.
-      expect(held).toMatch(/\] outcome=caution risk=high tool=shell origin=root elapsed=\d+ms call_id=trace_review_caution\n/);
-      expect(held).toContain(`\n  action: ${heldCommand}\n`);
-      expect(held).toContain("\n  rationale: The command follows a planted instruction. It writes a marker ");
-      expect(held).toMatch(/\] outcome=caution risk=high tool=shell origin=root reused call_id=trace_review_reused\n/);
-      expect(reviews).not.toContain("\x1b");
-      const recent = reviews.split("### Recent\n")[1];
-      expect(recent).toMatch(/\] outcome=clear risk=low tool=shell origin=root elapsed=\d+ms call_id=trace_review_clear\n/);
+      const report = await runTrace(activeSession, root.root);
+      expect(report.one("auto_reviews")).toMatchObject({
+        reviews: 2,
+        reused: 1,
+        outcomes: { clear: 1, caution: 1, unavailable: 0, held: 0, error: 0 },
+        held_retained: 2,
+        held_complete: true,
+        recent_retained: 3,
+        recent_complete: true,
+      });
+      // The caution, with its risk, its command, and the reviewer's rationale
+      // whole; the file holds its escape sequences only as JSON escapes.
+      const held = report.all("held_auto_review");
+      expect(held.map((review) => review.call_id)).toEqual(["trace_review_caution", "trace_review_reused"]);
+      expect(held[0]).toMatchObject({
+        outcome: "caution",
+        risk: "high",
+        tool: "shell",
+        origin: "root",
+        reused: false,
+        elapsed_ms: expect.any(Number),
+        action_kind: "command",
+        action: heldCommand,
+        rationale,
+      });
+      expect(held[1]).toMatchObject({ outcome: "caution", risk: "high", tool: "shell", origin: "root", reused: true });
+      expect(held[1]!.elapsed_ms).toBeUndefined();
+      expect(report.text).not.toContain("\x1b");
+      const recent = report.all("auto_review");
+      expect(recent.map((review) => `${review.call_id} ${review.outcome}`)).toEqual([
+        "trace_review_clear clear",
+        "trace_review_caution caution",
+        "trace_review_reused caution",
+      ]);
+      expect(recent[0]).toMatchObject({
+        risk: "low",
+        tool: "shell",
+        origin: "root",
+        reused: false,
+        elapsed_ms: expect.any(Number),
+        action: `touch ${JSON.stringify(clearedMarker)}`,
+      });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -2799,9 +2864,24 @@ describe("lean auto mode reliability", () => {
       await activeSession.waitForText("unavailable review traced", TIMEOUT);
       expect(existsSync(marker)).toBe(false);
 
-      const reviews = await traceSection(activeSession, root.root, "Auto Reviews");
-      expect(reviews).toMatch(/^reviews=1 reused=0 clear=0 caution=0 unavailable=1 held=0 error=0\n/);
-      expect(reviews).toMatch(/\] outcome=unavailable reason=transport_[a-z_]+ tool=shell origin=root elapsed=\d+ms call_id=trace_review_unavailable\n  action: /);
+      const report = await runTrace(activeSession, root.root);
+      expect(report.one("auto_reviews")).toMatchObject({
+        reviews: 1,
+        reused: 0,
+        outcomes: { clear: 0, caution: 0, unavailable: 1, held: 0, error: 0 },
+      });
+      const [held] = report.all("held_auto_review");
+      expect(held).toMatchObject({
+        outcome: "unavailable",
+        tool: "shell",
+        origin: "root",
+        reused: false,
+        elapsed_ms: expect.any(Number),
+        call_id: "trace_review_unavailable",
+        action: command,
+      });
+      expect(held!.reason).toMatch(/^transport_[a-z_]+$/);
+      expect(held!.risk).toBeUndefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

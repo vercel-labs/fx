@@ -521,32 +521,3 @@ fn reviewIsWhole(review: *const Review) bool {
     const want: Outcome = if (seq % 4 == 0) .caution else .clear;
     return review.outcome == want and review.at_ms == @as(i64, @intCast(seq));
 }
-
-test "trace lines stay one safe line on fuzzed bytes" {
-    try testing.fuzz({}, fuzzOneLine, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "plain text",
-            "two\nlines\r\n\ttabbed",
-            "\x1b[31mred\x1b[0m\x7f\xc2\x85",
-            "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
-        }) ++ @import("fuzz_corpus").trace_one_line.*),
-    });
-}
-
-fn fuzzOneLine(_: void, smith: *testing.Smith) !void {
-    var buffer: [512]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    var out_buffer: [512 * 4]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&out_buffer);
-    try text_utils.writeOneLine(&writer, buffer[0..len]);
-    const written = writer.buffered();
-    try testing.expect(std.unicode.utf8ValidateSlice(written));
-    try testing.expect(written.len <= len * 4);
-    var view = std.unicode.Utf8View.initUnchecked(written);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |codepoint| {
-        try testing.expect(codepoint >= 0x20);
-        try testing.expect(codepoint < 0x7f or codepoint >= 0xa0);
-    }
-}

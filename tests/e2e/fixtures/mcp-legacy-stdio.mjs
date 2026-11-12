@@ -406,6 +406,23 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/call") {
+    if (mode === "invalid_params") {
+      // A server built on the Go MCP SDK refuses arguments of the wrong type
+      // with -32602, in its validator's words, then the tool's schema, as
+      // Datadog's server does.
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: {
+          code: -32602,
+          message: 'validating "arguments": validating root: validating /properties/limit: ' +
+            'type: "40" has type "string", want "number"\n\n' +
+            'Full input schema for tool "echo":\n' +
+            '{"type":"object","properties":{"limit":{"type":"number"}}}',
+        },
+      });
+      return;
+    }
     if (mode === "draft7_schema" && draft7Pattern && !new RegExp(draft7Pattern, "u").test(message.params?.arguments?.text)) {
       send({ jsonrpc: "2.0", id: message.id, result: { isError: true, content: [{ type: "text", text: "text violates the server pattern" }] } });
       return;
