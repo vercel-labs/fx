@@ -72,6 +72,12 @@
 //!   internal counters and names, and for a failed summary request the
 //!   provider's error text, which is masked when it is recorded, so the trace
 //!   does not mask it again.
+//!   The `compaction` record also has `kept_failures`, the failed events
+//!   kept apart from the ring, at most 32, which later events never push out
+//!   (0 when none failed), and `session_failures`, every failed event this
+//!   session. Then a `failed_compaction_event` per kept failure, oldest
+//!   first, with the `compaction_event` fields and the same `sequence`; the
+//!   `compaction` problems come from these.
 //! - `interrupted_turn`, only when the last turn was interrupted by the user:
 //!   `in_flight_tool`, `in_flight_args` (masked, the first 1200 bytes),
 //!   `in_flight_args_bytes`, and `completed_tools`, a list of names.
@@ -89,6 +95,11 @@
 //!   `input_tokens`, `output_tokens`, `web_search_requests` (web search calls
 //!   only), `stop_reason`, `provider_stop_reason`, `turn_id`, `step_id`, and
 //!   the masked `gateway_error`, `gateway_schema`, and `request_shape`.
+//!   The `network` record also has `kept_failures`, the failed calls kept
+//!   apart from the ring, at most 32, which later successful calls never
+//!   push out (0 when none failed); `session.errors` counts every failed
+//!   call. Then a `failed_network_call` per kept failure, oldest first, with
+//!   the `network_call` fields; the `network_call` problems come from these.
 //! - `model_catalog`: `cache` {`state`, `entries`, `last_attempt_age_ms`, and
 //!   after a failure `failure`, `retryable`, `http_status`,
 //!   `anonymous_fallback`}; `selected_model` {`model`, `image_input`,
@@ -96,6 +107,12 @@
 //!   `model_catalog_event` per event: `at`, `sequence`, `event`, `failed`,
 //!   `detail`, `truncated`. Catalog events are recorded even when `FX_TRACE`
 //!   is off.
+//!   The `model_catalog` record also has `kept_failures`, the failed events
+//!   kept apart from the ring, at most 32, which later events never push out
+//!   (0 when none failed), and `session_failures`, every failed event this
+//!   session. Then a `failed_model_catalog_event` per kept failure, oldest
+//!   first, with the `model_catalog_event` fields and the same `sequence`;
+//!   the `model_catalog` problems come from these.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
 //!   {`calls`, `outcomes`, `total_ms`}, `complete`, and `web_search_retained`.
@@ -679,15 +696,16 @@ fn writeSessionTitleProblem(p: *Records, app: anytype) !void {
     try p.end();
 }
 
+/// The newest failed calls. They come from the kept failures, not the
+/// window, so later successful calls never remove them.
 fn writeNetworkProblems(p: *Records) !void {
-    const calls = try p.arena.alloc(diagnostics.NetworkCall, diagnostics.network_ring_capacity);
-    const count = diagnostics.snapshotNetworkCalls(calls);
+    const calls = try p.arena.alloc(diagnostics.NetworkCall, diagnostics.failed_network_call_capacity);
+    const count = diagnostics.snapshotFailedNetworkCalls(calls);
     var reported: usize = 0;
     var index = count;
     while (index > 0 and reported < network_problems_shown) {
         index -= 1;
         const call = &calls[index];
-        if (!call.isError()) continue;
         reported += 1;
         try beginProblem(p, "network_call");
         try p.beginObject("call");
@@ -715,15 +733,16 @@ fn writeToolProblems(p: *Records) !void {
     }
 }
 
+/// The newest failed compaction events, from the kept failures rather than
+/// the window, so later events never remove them.
 fn writeCompactionProblems(p: *Records) !void {
-    const events = try p.arena.alloc(diagnostics.CompactionEvent, diagnostics.compaction_ring_capacity);
-    const count = diagnostics.snapshotCompactionEvents(events);
+    const events = try p.arena.alloc(diagnostics.CompactionEvent, diagnostics.failed_compaction_event_capacity);
+    const count = diagnostics.snapshotFailedCompactionEvents(events);
     var reported: usize = 0;
     var index = count;
     while (index > 0 and reported < compaction_problems_shown) {
         index -= 1;
         const event = &events[index];
-        if (!event.failed) continue;
         reported += 1;
         try beginProblem(p, "compaction");
         try p.text("event", event.name());
@@ -757,15 +776,16 @@ fn writeMcpHostProblems(p: *Records, app: anytype) !void {
 
 /// Failed model-catalog loads, capability lookup misses, and image gate
 /// rejections, so an unverifiable capability is never reported as no problem.
+/// They come from the kept failures, so later catalog events never remove
+/// them.
 fn writeModelCatalogProblems(p: *Records) !void {
-    var events: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
-    const count = diagnostics.snapshotModelCatalogEvents(&events);
+    var events: [diagnostics.failed_model_catalog_event_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const count = diagnostics.snapshotFailedModelCatalogEvents(&events);
     var reported: usize = 0;
     var index = count;
     while (index > 0 and reported < model_catalog_problems_shown) {
         index -= 1;
         const event = &events[index];
-        if (!event.failed) continue;
         reported += 1;
         try beginProblem(p, "model_catalog");
         try p.text("event", event.name());
@@ -812,6 +832,8 @@ fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
 fn writeCompaction(r: *Records) !void {
     const events = try r.arena.alloc(diagnostics.CompactionEvent, diagnostics.compaction_ring_capacity);
     const count = diagnostics.snapshotCompactionEvents(events);
+    const kept = try r.arena.alloc(diagnostics.CompactionEvent, diagnostics.failed_compaction_event_capacity);
+    const kept_count = diagnostics.snapshotFailedCompactionEvents(kept);
     var failed: usize = 0;
     for (events[0..count]) |*event| {
         if (event.failed) failed += 1;
@@ -820,23 +842,35 @@ fn writeCompaction(r: *Records) !void {
     try r.number("retained", count);
     try r.number("failed", failed);
     try r.number("overwritten_before", if (count > 0) events[0].sequence -| 1 else 0);
+    try r.number("kept_failures", kept_count);
+    // Read after the snapshot, so it is never less than `kept_failures`.
+    try r.number("session_failures", diagnostics.compactionFailureCount());
     try r.end();
     for (events[0..count]) |*event| {
         try r.begin("compaction_event");
-        try r.time("at", event.timestamp_ms);
-        try r.number("sequence", event.sequence);
-        try r.text("event", event.name());
-        if (event.turn_id != 0) try r.number("turn_id", event.turn_id);
-        if (event.step_id != 0) try r.number("step_id", event.step_id);
-        if (event.subagent_id != 0) try r.number("subagent_id", event.subagent_id);
-        try r.boolean("failed", event.failed);
-        // A detail holds internal counters and names, and for a failed
-        // summary request the provider's error text, which was masked when
-        // it was recorded (src/core/compactor/trace.zig).
-        if (event.detail_len > 0) try r.text("detail", try neutralized(r.arena, event.detail()));
-        try r.boolean("truncated", event.truncated);
+        try writeCompactionEventFields(r, event);
         try r.end();
     }
+    for (kept[0..kept_count]) |*event| {
+        try r.begin("failed_compaction_event");
+        try writeCompactionEventFields(r, event);
+        try r.end();
+    }
+}
+
+fn writeCompactionEventFields(r: *Records, event: *const diagnostics.CompactionEvent) !void {
+    try r.time("at", event.timestamp_ms);
+    try r.number("sequence", event.sequence);
+    try r.text("event", event.name());
+    if (event.turn_id != 0) try r.number("turn_id", event.turn_id);
+    if (event.step_id != 0) try r.number("step_id", event.step_id);
+    if (event.subagent_id != 0) try r.number("subagent_id", event.subagent_id);
+    try r.boolean("failed", event.failed);
+    // A detail holds internal counters and names, and for a failed
+    // summary request the provider's error text, which was masked when
+    // it was recorded (src/core/compactor/trace.zig).
+    if (event.detail_len > 0) try r.text("detail", try neutralized(r.arena, event.detail()));
+    try r.boolean("truncated", event.truncated);
 }
 
 fn lastInterruptedTurn(items: []const types.HistoryTurn) ?types.InterruptedHistoryTurn {
@@ -930,6 +964,10 @@ fn writeNetworkCallFields(r: *Records, call: *const diagnostics.NetworkCall) !vo
 noinline fn writeNetwork(r: *Records) !void {
     const calls = try r.arena.alloc(diagnostics.NetworkCall, diagnostics.network_ring_capacity);
     const count = diagnostics.snapshotNetworkCalls(calls);
+    // Before the totals, so `session.errors` is never less than
+    // `kept_failures`.
+    const kept = try r.arena.alloc(diagnostics.NetworkCall, diagnostics.failed_network_call_capacity);
+    const kept_count = diagnostics.snapshotFailedNetworkCalls(kept);
     var ok_count: u64 = 0;
     var error_count: u64 = 0;
     var total_ms: u64 = 0;
@@ -965,6 +1003,7 @@ noinline fn writeNetwork(r: *Records) !void {
     if (!complete) try r.time("oldest_retained_at", calls[0].started_at_ms);
     try r.number("turns_retained", rollup_count);
     try r.number("turns_evicted", lifetime.evicted_turns);
+    try r.number("kept_failures", kept_count);
     try r.end();
 
     for (rollups[0..rollup_count]) |*rollup| {
@@ -982,6 +1021,11 @@ noinline fn writeNetwork(r: *Records) !void {
         try writeNetworkCallFields(r, call);
         try r.end();
     }
+    for (kept[0..kept_count]) |*call| {
+        try r.begin("failed_network_call");
+        try writeNetworkCallFields(r, call);
+        try r.end();
+    }
 }
 
 /// Catalog cache state, the selected model's resolved capabilities, and the
@@ -991,6 +1035,8 @@ fn writeModelCatalog(r: *Records, app: anytype) !void {
     const App = @TypeOf(app.*);
     var events: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
     const count = diagnostics.snapshotModelCatalogEvents(&events);
+    const kept = try r.arena.alloc(diagnostics.ModelCatalogEvent, diagnostics.failed_model_catalog_event_capacity);
+    const kept_count = diagnostics.snapshotFailedModelCatalogEvents(kept);
 
     try r.begin("model_catalog");
     if (comptime @hasField(App, "model_cache")) {
@@ -1020,18 +1066,30 @@ fn writeModelCatalog(r: *Records, app: anytype) !void {
         try r.endObject();
     }
     try r.number("events", count);
+    try r.number("kept_failures", kept_count);
+    // Read after the snapshot, so it is never less than `kept_failures`.
+    try r.number("session_failures", diagnostics.modelCatalogFailureCount());
     try r.end();
 
     for (events[0..count]) |*event| {
         try r.begin("model_catalog_event");
-        try r.time("at", event.timestamp_ms);
-        try r.number("sequence", event.sequence);
-        try r.text("event", event.name());
-        try r.boolean("failed", event.failed);
-        try r.optionalText("detail", event.detail());
-        try r.boolean("truncated", event.truncated);
+        try writeModelCatalogEventFields(r, event);
         try r.end();
     }
+    for (kept[0..kept_count]) |*event| {
+        try r.begin("failed_model_catalog_event");
+        try writeModelCatalogEventFields(r, event);
+        try r.end();
+    }
+}
+
+fn writeModelCatalogEventFields(r: *Records, event: *const diagnostics.ModelCatalogEvent) !void {
+    try r.time("at", event.timestamp_ms);
+    try r.number("sequence", event.sequence);
+    try r.text("event", event.name());
+    try r.boolean("failed", event.failed);
+    try r.optionalText("detail", event.detail());
+    try r.boolean("truncated", event.truncated);
 }
 
 fn traceToolDisplayName(tool_name: []const u8) []const u8 {
@@ -2012,6 +2070,81 @@ test "trace compaction records events without file tracing" {
     try std.testing.expectEqual(diagnostics.compaction_ring_capacity, wrapped_trace.count("compaction_event"));
 }
 
+test "trace compaction keeps a failure after later events fill the window" {
+    const compactor = @import("../compactor/compactor.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    compactor.traceFailure(.{ .turn_id = 3 }, .summary_transport_failed, "err={s}", .{"ConnectionResetByPeer"});
+    for (0..diagnostics.compaction_ring_capacity) |index| {
+        compactor.traceEvent(.{ .turn_id = 4 }, .decision, "decision=compact index={d}", .{index});
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeCompaction(&w.records);
+    try writeCompactionProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    // The window has moved past the failure; the kept failures hold it.
+    const summary = try trace.one("compaction");
+    try std.testing.expectEqual(@as(i64, diagnostics.compaction_ring_capacity), try testInt(summary, "retained"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "failed"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "overwritten_before"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "session_failures"));
+    for (0..trace.count("compaction_event")) |index| {
+        try std.testing.expect(!try testBool(try trace.nth("compaction_event", index), "failed"));
+    }
+    const kept = try trace.one("failed_compaction_event");
+    try std.testing.expectEqualStrings("summary_transport_failed", try testString(kept, "event"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(kept, "sequence"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(kept, "turn_id"));
+    try std.testing.expect(try testBool(kept, "failed"));
+    try std.testing.expectEqualStrings("err=ConnectionResetByPeer", try testString(kept, "detail"));
+    try std.testing.expect(!try testBool(kept, "truncated"));
+    const problem = try trace.one("problem");
+    try std.testing.expectEqualStrings("compaction", try testString(problem, "kind"));
+    try std.testing.expectEqualStrings("summary_transport_failed", try testString(problem, "event"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(problem, "turn_id"));
+    try std.testing.expectEqualStrings("err=ConnectionResetByPeer", try testString(problem, "detail"));
+}
+
+test "trace failed compaction details keep whole characters past the ring's bound" {
+    const compactor = @import("../compactor/compactor.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Two-byte characters past the ring's detail bound, so a byte cut lands
+    // inside one for one of the two details.
+    const detail = text_utils.repeat("\xc3\xa9", 300);
+    compactor.traceFailure(.{ .turn_id = 2 }, .summary_incomplete, "{s}", .{detail});
+    compactor.traceFailure(.{ .turn_id = 2 }, .summary_incomplete, "x{s}", .{detail});
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeCompaction(&w.records);
+    try writeCompactionProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try expectNotIn(w.out.written(), "\\\\x");
+    for ([_][]const u8{ "compaction_event", "failed_compaction_event", "problem" }) |record_type| {
+        try std.testing.expectEqual(@as(usize, 2), trace.count(record_type));
+        for (0..2) |index| {
+            const record = try trace.nth(record_type, index);
+            const kept = try testString(record, "detail");
+            // Problems list the newest first.
+            const with_x = (index == 1) != std.mem.eql(u8, record_type, "problem");
+            const input: []const u8 = if (with_x) "x" ++ detail else detail;
+            try std.testing.expect(kept.len < input.len);
+            try std.testing.expect(std.mem.startsWith(u8, input, kept));
+            // A whole-character prefix of "é..." is even, of "xé..." odd.
+            try std.testing.expectEqual(@as(usize, @intFromBool(with_x)), kept.len % 2);
+            if (!std.mem.eql(u8, record_type, "problem")) try std.testing.expect(try testBool(record, "truncated"));
+        }
+    }
+}
+
 test "trace model catalog records events and its problems" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -2124,6 +2257,44 @@ test "trace model catalog records cache state and failure detail" {
     try std.testing.expectEqual(@as(i64, 12_500), try testInt(ready_cache, "last_attempt_age_ms"));
     try expectAbsent(ready_cache, "failure");
     try expectAbsent(ready_cache, "retryable");
+}
+
+test "trace model catalog keeps a failed load after later events fill the window" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+
+    diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
+    for (0..diagnostics.model_catalog_ring_capacity) |index| {
+        diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=missing_entry model=provider/model-{d}", .{index});
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeModelCatalog(&w.records, &stub);
+    try writeModelCatalogProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    // The window has moved past the failure; the kept failures hold it.
+    const summary = try trace.one("model_catalog");
+    try std.testing.expectEqual(@as(i64, diagnostics.model_catalog_ring_capacity), try testInt(summary, "events"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "session_failures"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.nth("model_catalog_event", 0), "sequence"));
+    for (0..trace.count("model_catalog_event")) |index| {
+        try std.testing.expect(!try testBool(try trace.nth("model_catalog_event", index), "failed"));
+    }
+    const kept = try trace.one("failed_model_catalog_event");
+    try std.testing.expectEqual(@as(i64, 1), try testInt(kept, "sequence"));
+    try std.testing.expectEqualStrings("load", try testString(kept, "event"));
+    try std.testing.expect(try testBool(kept, "failed"));
+    try std.testing.expectEqualStrings("outcome=failed category=transport status=503", try testString(kept, "detail"));
+    try std.testing.expect(!try testBool(kept, "truncated"));
+    const problem = try trace.one("problem");
+    try std.testing.expectEqualStrings("model_catalog", try testString(problem, "kind"));
+    try std.testing.expectEqualStrings("load", try testString(problem, "event"));
+    try std.testing.expectEqualStrings("outcome=failed category=transport status=503", try testString(problem, "detail"));
 }
 
 test "trace report file uses a private randomized jsonl path" {
@@ -2632,6 +2803,187 @@ test "trace network calls keep web search counts, stop reasons, and schema diagn
     try std.testing.expectEqual(@as(i64, 400), try testInt(problem_call, "status"));
     try std.testing.expectEqualStrings("zai/glm-5.2-fast", try testString(problem_call, "model"));
     try std.testing.expectEqualStrings("gateway", try testString(problem_call, "kind"));
+}
+
+test "trace network keeps a failed call after later calls fill the window" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var failed: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .status = 503, .turn_id = 4 };
+    failed.setModel("provider/model-a");
+    failed.setGatewayErrorMessage("upstream unavailable AI_GATEWAY_API_KEY=abcdefghijklmnop");
+    diagnostics.recordNetworkCall(failed);
+    for (0..diagnostics.network_ring_capacity) |index| {
+        diagnostics.recordNetworkCall(.{ .started_at_ms = 2_000 + @as(i64, @intCast(index)), .status = 200, .turn_id = 5 });
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetwork(&w.records);
+    try writeNetworkProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    // The window has moved past the failure; the kept failures hold it.
+    const summary = try trace.one("network");
+    try std.testing.expectEqual(@as(i64, diagnostics.network_ring_capacity), try testInt(summary, "retained"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "errors"));
+    try std.testing.expect(!try testBool(summary, "complete"));
+    const session = try testObject(summary, "session");
+    try std.testing.expectEqual(@as(i64, diagnostics.network_ring_capacity + 1), try testInt(session, "calls"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(session, "errors"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "kept_failures"));
+    for (0..trace.count("network_call")) |index| {
+        try std.testing.expectEqual(@as(i64, 200), try testInt(try trace.nth("network_call", index), "status"));
+    }
+    for ([_]std.json.ObjectMap{
+        try trace.one("failed_network_call"),
+        try testObject(try trace.one("problem"), "call"),
+    }) |call| {
+        try std.testing.expectEqual(@as(i64, 1_000), try testInt(call, "at_ms"));
+        try std.testing.expectEqualStrings("provider/model-a", try testString(call, "model"));
+        try std.testing.expectEqualStrings("parent", try testString(call, "source"));
+        try std.testing.expectEqual(@as(i64, 503), try testInt(call, "status"));
+        try std.testing.expectEqual(@as(i64, 4), try testInt(call, "turn_id"));
+        // Gateway text stays masked in the kept copy.
+        try std.testing.expectEqualStrings("upstream unavailable AI_GATEWAY_API_KEY=[redacted]", try testString(call, "gateway_error"));
+    }
+    try std.testing.expectEqualStrings("network_call", try testString(try trace.one("problem"), "kind"));
+    try expectNotIn(w.out.written(), "abcdefghijklmnop");
+}
+
+test "trace problems list the newest kept failures the windows no longer hold" {
+    const compactor = @import("../compactor/compactor.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Five failures of each kind, then enough successes to fill every window.
+    const failures = 5;
+    for (0..failures) |index| {
+        var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .status = 500, .step_id = index + 1 };
+        call.setModel("provider/model-a");
+        diagnostics.recordNetworkCall(call);
+        compactor.traceFailure(.{ .turn_id = index + 1 }, .summary_incomplete, "attempt={d}", .{index + 1});
+        diagnostics.recordModelCatalogEvent(true, .image_gate, "model=m{d}", .{index + 1});
+    }
+    const fills = @max(diagnostics.network_ring_capacity, diagnostics.compaction_ring_capacity, diagnostics.model_catalog_ring_capacity);
+    for (0..fills) |index| {
+        diagnostics.recordNetworkCall(.{ .started_at_ms = 2_000, .status = 200 });
+        compactor.traceEvent(.{ .turn_id = 9 }, .decision, "index={d}", .{index});
+        diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=missing_entry model=n{d}", .{index});
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetworkProblems(&w.records);
+    try writeCompactionProblems(&w.records);
+    try writeModelCatalogProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const shown = network_problems_shown + compaction_problems_shown + model_catalog_problems_shown;
+    try std.testing.expectEqual(shown, trace.count("problem"));
+    // Each kind lists its newest first.
+    var at: usize = 0;
+    for (0..network_problems_shown) |index| {
+        const problem = try trace.nth("problem", at + index);
+        try std.testing.expectEqualStrings("network_call", try testString(problem, "kind"));
+        const call = try testObject(problem, "call");
+        try std.testing.expectEqual(@as(i64, @intCast(failures - index)), try testInt(call, "step_id"));
+        try std.testing.expectEqual(@as(i64, 500), try testInt(call, "status"));
+    }
+    at += network_problems_shown;
+    for (0..compaction_problems_shown) |index| {
+        const problem = try trace.nth("problem", at + index);
+        try std.testing.expectEqualStrings("compaction", try testString(problem, "kind"));
+        try std.testing.expectEqual(@as(i64, @intCast(failures - index)), try testInt(problem, "turn_id"));
+        var buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.mem.print(&buf, "attempt={d}", .{failures - index}), try testString(problem, "detail"));
+    }
+    at += compaction_problems_shown;
+    for (0..model_catalog_problems_shown) |index| {
+        const problem = try trace.nth("problem", at + index);
+        try std.testing.expectEqualStrings("model_catalog", try testString(problem, "kind"));
+        try std.testing.expectEqualStrings("image_gate", try testString(problem, "event"));
+        var buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.mem.print(&buf, "model=m{d}", .{failures - index}), try testString(problem, "detail"));
+    }
+}
+
+test "trace failures count the session's failures past what is kept" {
+    const compactor = @import("../compactor/compactor.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+
+    // One failure more than each kept list holds; the oldest is the one
+    // dropped.
+    for (0..diagnostics.failed_network_call_capacity + 1) |index| {
+        diagnostics.recordNetworkCall(.{ .started_at_ms = 1_000, .status = 502, .step_id = index + 1 });
+    }
+    for (0..diagnostics.failed_compaction_event_capacity + 1) |index| {
+        compactor.traceFailure(.{ .turn_id = index + 1 }, .summary_incomplete, "attempt={d}", .{index + 1});
+    }
+    for (0..diagnostics.failed_model_catalog_event_capacity + 1) |index| {
+        diagnostics.recordModelCatalogEvent(true, .image_gate, "model=m{d}", .{index + 1});
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetwork(&w.records);
+    try writeCompaction(&w.records);
+    try writeModelCatalog(&w.records, &stub);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const network = try trace.one("network");
+    try std.testing.expectEqual(@as(i64, diagnostics.failed_network_call_capacity), try testInt(network, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, diagnostics.failed_network_call_capacity + 1), try testInt(try testObject(network, "session"), "errors"));
+    try std.testing.expectEqual(diagnostics.failed_network_call_capacity, trace.count("failed_network_call"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.nth("failed_network_call", 0), "step_id"));
+
+    const compaction = try trace.one("compaction");
+    try std.testing.expectEqual(@as(i64, diagnostics.failed_compaction_event_capacity), try testInt(compaction, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, diagnostics.failed_compaction_event_capacity + 1), try testInt(compaction, "session_failures"));
+    try std.testing.expectEqual(diagnostics.failed_compaction_event_capacity, trace.count("failed_compaction_event"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.nth("failed_compaction_event", 0), "sequence"));
+
+    const catalog = try trace.one("model_catalog");
+    try std.testing.expectEqual(@as(i64, diagnostics.failed_model_catalog_event_capacity), try testInt(catalog, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, diagnostics.failed_model_catalog_event_capacity + 1), try testInt(catalog, "session_failures"));
+    try std.testing.expectEqual(diagnostics.failed_model_catalog_event_capacity, trace.count("failed_model_catalog_event"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.nth("failed_model_catalog_event", 0), "sequence"));
+}
+
+test "trace says when no failure was kept" {
+    const compactor = @import("../compactor/compactor.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+
+    diagnostics.recordNetworkCall(.{ .started_at_ms = 1_000, .status = 200 });
+    compactor.traceEvent(.{ .turn_id = 1 }, .decision, "decision=no_op", .{});
+    diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d}", .{3});
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetwork(&w.records);
+    try writeCompaction(&w.records);
+    try writeModelCatalog(&w.records, &stub);
+    try writeNetworkProblems(&w.records);
+    try writeCompactionProblems(&w.records);
+    try writeModelCatalogProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(i64, 0), try testInt(try trace.one("network"), "kept_failures"));
+    for ([_][]const u8{ "compaction", "model_catalog" }) |record_type| {
+        const summary = try trace.one(record_type);
+        try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "kept_failures"));
+        try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "session_failures"));
+    }
+    for ([_][]const u8{ "failed_network_call", "failed_compaction_event", "failed_model_catalog_event", "problem" }) |record_type| {
+        try std.testing.expectEqual(@as(usize, 0), trace.count(record_type));
+    }
 }
 
 test "trace network section reports session totals and window coverage" {

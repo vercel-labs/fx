@@ -2174,6 +2174,7 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
     // The server refuses a team change during a request, so the request
@@ -2184,6 +2185,7 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     return .{ .token = token };
 }
