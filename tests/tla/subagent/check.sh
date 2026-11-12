@@ -21,6 +21,8 @@
 #   drop-waiting-at-end  the stopped turn's end drops the waiting messages      NoSilentLoss
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
+#   late-rearm           the slot clears the stop flags after the end hook
+#                        installed the next work, so a stop in between is erased  StopHoldsForQueued
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
 #   names-busy           a new subagent's start names every other open one      NamesTheIdle
@@ -109,6 +111,7 @@ StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
+StopMessage stop-message-mutation-late-rearm StopHoldsForQueued
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
 StopMessage stop-message-mutation-note-after-take IdleNoteHonest
