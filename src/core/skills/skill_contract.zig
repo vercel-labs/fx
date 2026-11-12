@@ -1238,7 +1238,6 @@ test "parseSkillFile rejects unsupported indented continuations" {
         "---\nname: workflow\ndescription:\n  first # comment\n  second\n---\nBody",
         "---\nname: workflow\ndescription: first\n  second\n# comment\n  third\n---\nBody",
         "---\nname: workflow\ndescription: first\n  second\nnot a key\n---\nBody",
-        "---\nname: workflow\nmetadata:\n  description: nested\n    words\n---\nBody",
         "---\nname: workflow\ndescription:\n  - nested sequence\n---\nBody",
         "---\nname: workflow\ndescription:\n  first\n\tsecond\n---\nBody",
     };
@@ -1264,6 +1263,12 @@ test "parseSkillFile ignores recognized keys nested under other keys" {
         },
         .{
             .content = "---\nname: workflow\nmetadata:\n  inner:\n    name: deep\n    description: deep\n---\nBody",
+            .description = null,
+        },
+        // A nested key is not the skill's description, so its continuation
+        // lines are the other key's content, not an unsupported multiline.
+        .{
+            .content = "---\nname: workflow\nmetadata:\n  description: nested\n    words\n---\nBody",
             .description = null,
         },
     };
