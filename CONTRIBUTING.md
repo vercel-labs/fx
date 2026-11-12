@@ -6,7 +6,7 @@ Code conventions live in [AGENTS.md](AGENTS.md): which module owns which behavio
 
 ## Report a problem
 
-Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, `/trace` copies a private diagnostic trace that you can attach. Issues are public, so review the trace and remove secrets before you post it.
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, run `/trace` to create a private diagnostic trace. GitHub doesn't accept its `.jsonl` file as an attachment, so share it as a link from [fx.sh/share](https://fx.sh/share), or open the file and paste its text into the issue's **Trace** field. On macOS, `/trace` copies the file itself to the clipboard, so paste it on fx.sh/share rather than in the issue. Issues are public, so review the trace and remove secrets before you post it.
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact), not in a public issue.
 
