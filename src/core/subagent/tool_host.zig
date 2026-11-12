@@ -15,6 +15,7 @@ const live_metrics = @import("live_metrics.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
+const end_test_controls = @import("end_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -881,7 +882,12 @@ pub const Runtime = struct {
     }
 
     /// Ends the owner's `wait` when a child's work ended with nothing to
-    /// post, so it can look again.
+    /// post, so it can look again. Call it only after the end has changed
+    /// what `anyWorking` reads, the child's busy flag cleared: `wait`
+    /// registers and then reads `anyWorking`, so a nudge sent before the
+    /// clear finds no waiter to wake, and a `wait` that reads the old state
+    /// afterwards blocks with nothing left to wake it
+    /// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns).
     fn nudgeWaiter(self: *Runtime) void {
         self.waiter_mutex.lockUncancelable(io_mod.getIo());
         defer self.waiter_mutex.unlock(io_mod.getIo());
@@ -889,12 +895,23 @@ pub const Runtime = struct {
     }
 
     /// The owner's hook for a child's work ending (`managed_owner.EndHook`),
-    /// on the child's slot thread: the report goes to the owner, or the
-    /// owner's wait is nudged, and the next waiting message, if any, becomes
-    /// the child's next work. Returns whether it did.
+    /// on the child's slot thread: the report goes to the owner, the child is
+    /// settled, and the owner's wait is nudged when nothing was posted, once
+    /// the child's busy flag is clear. The next waiting message, if any,
+    /// becomes the child's next work. Returns whether it did.
     fn workEnded(raw: *anyopaque, end: managed_owner.WorkEnd) bool {
         const self: *Runtime = @ptrCast(@alignCast(raw));
-        self.deliverEnd(end);
+        var posted = self.deliverEnd(end);
+        if (end_test_controls.settleArmed()) end_test_controls.holdBeforeSettle(end.child_id);
+        const next = self.settleEnd(end, &posted);
+        if (!posted) self.nudgeWaiter();
+        return next;
+    }
+
+    /// `workEnded` after the owner was told of `end`: settles the child and
+    /// returns whether its slot has a next work. `posted` is set when a turn
+    /// work finished here posts to the owner too.
+    fn settleEnd(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool) bool {
         if (self.endClosingWork(end)) {
             _ = self.settleClose(end.child_id);
             return false;
@@ -919,7 +936,7 @@ pub const Runtime = struct {
         // this slot take the parent's next message.
         defer ended.deinit(self.alloc);
         const reply = ended.ended.?.reply;
-        self.finishTurnWork(ended, ended.ended.?.outcome, reply);
+        if (self.finishTurnWork(ended, ended.ended.?.outcome, reply)) posted.* = true;
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         return self.nextOrIdleLocked(end.child_id);
@@ -1057,13 +1074,17 @@ pub const Runtime = struct {
 
     const Dropped = struct { count: usize = 0, closed: bool = false };
 
-    fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) void {
+    /// Tells the owner of `end`: its report, or the notice that a stop or
+    /// close dropped messages. True when the sink took one. When it did not,
+    /// the caller nudges the owner's `wait` once the child's busy flag is
+    /// clear (`nudgeWaiter`).
+    fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) bool {
         debug_trace.eventf("mailbox", "child_end", .{}, "child={s} work_id={s} outcome={s} report={}", .{ end.child_id, end.work_id, @tagName(end.outcome), end.report_owed });
         const dropped = self.takeUserDropped(end.child_id);
         if (end.report_owed) return self.postReportWith(end, dropped);
         // Nothing owed, but the parent's messages were dropped: say so.
         if (dropped.count > 0) return self.postReportWith(.{ .child_id = end.child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
-        self.nudgeWaiter();
+        return false;
     }
 
     /// Posts the reports `session`'s log still owes its owner, oldest first,
@@ -1088,17 +1109,19 @@ pub const Runtime = struct {
         }
     }
 
+    /// No work ends here, so no child's busy flag clears and no `wait` waits
+    /// on this post.
     fn postReport(self: *Runtime, end: managed_owner.WorkEnd) void {
-        self.postReportWith(end, .{});
+        _ = self.postReportWith(end, .{});
     }
 
     /// Posts `end`'s report, or with no `work_id` the notice that the user's
-    /// stop or close dropped `dropped` messages.
-    fn postReportWith(self: *Runtime, end: managed_owner.WorkEnd, dropped: Dropped) void {
+    /// stop or close dropped `dropped` messages. True when the sink took it.
+    fn postReportWith(self: *Runtime, end: managed_owner.WorkEnd, dropped: Dropped) bool {
         const sink = self.report_sink orelse {
             // Nothing here can take it; it stays owed in the log.
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason=no_sink", .{ end.child_id, end.work_id });
-            return self.nudgeWaiter();
+            return false;
         };
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -1126,7 +1149,7 @@ pub const Runtime = struct {
         } }) catch |err| {
             // A report stays owed in the log; a notice is lost.
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason={s} notice={}", .{ end.child_id, end.work_id, @errorName(err), notice });
-            return self.nudgeWaiter();
+            return false;
         };
         if (notice) {
             debug_trace.eventf("mailbox", "notice_queued", .{}, "to={s} from={s} dropped={d}", .{ self.ownerName(), end.child_id, dropped.count });
@@ -1141,6 +1164,7 @@ pub const Runtime = struct {
                 idle,
             });
         }
+        return true;
     }
 
     /// Whether `end`'s child is idle once its report goes. Read before the
@@ -1429,8 +1453,12 @@ pub const Runtime = struct {
             break :blk self.turn_works.swapRemove(index);
         };
         defer work.deinit(self.alloc);
-        self.finishTurnWork(work, outcome, reply);
+        const posted = self.finishTurnWork(work, outcome, reply);
+        if (end_test_controls.settleArmed()) end_test_controls.holdBeforeSettle(child_id);
         defer _ = self.settleClose(child_id);
+        // Runs once the lock below is released, so the child's busy flag is
+        // clear by then (`nudgeWaiter`).
+        defer if (!posted) self.nudgeWaiter();
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (self.closingIndexLocked(child_id) != null) return;
@@ -1444,14 +1472,15 @@ pub const Runtime = struct {
         self.clearBusyLocked(child_id);
     }
 
-    /// Finishes `work` in the log and posts its report, if it owes one.
-    fn finishTurnWork(self: *Runtime, work: TurnWork, outcome: child_state.Outcome, reply: []const u8) void {
+    /// Finishes `work` in the log and posts its report, if it owes one. True
+    /// when the sink took a post (`deliverEnd`).
+    fn finishTurnWork(self: *Runtime, work: TurnWork, outcome: child_state.Outcome, reply: []const u8) bool {
         const finished = self.managed.finishTurnWork(work.child_id, work.work_id, outcome, work.started_by, switch (work.stopped_by) {
             .none => .none,
             .parent => .parent,
             .user => .user,
         });
-        self.deliverEnd(.{
+        return self.deliverEnd(.{
             .child_id = work.child_id,
             .work_id = work.work_id,
             .outcome = outcome,
@@ -2446,6 +2475,8 @@ const MailboxFixture = struct {
     fail_first: bool = false,
     /// While set, each run saves an empty reply.
     empty_reply: bool = false,
+    /// While set, the sink takes no report, as when its owner is gone.
+    refuse_reports: bool = false,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -2499,6 +2530,7 @@ const MailboxFixture = struct {
 
     fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.refuse_reports) return error.AgentGone;
         const report = delivery.report;
         const line = if (report.dropped > 0)
             try std.testing.allocator.print("{s} {s} {s} {s} {s} dropped={d}", .{ report.agent, report.call_id, report.work_id, @tagName(report.outcome), report.output, report.dropped })
@@ -3434,6 +3466,286 @@ test "a subagent that reports never stays quiet when its work completes" {
     try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
     const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
     try std.testing.expect(std.mem.find(u8, status, "quiet: idle, last work completed, reports never") != null);
+}
+
+/// Holds the host in the gap where it has told the owner a work ended and
+/// has not yet cleared the child's busy flag (`end_test_controls.zig`).
+const SettleGap = struct {
+    var entered: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn arm() void {
+        entered = .unset;
+        go = .unset;
+        end_test_controls.test_settle_hold = hold;
+    }
+
+    fn disarm() void {
+        end_test_controls.test_settle_hold = null;
+    }
+
+    fn hold(_: []const u8) void {
+        entered.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+};
+
+/// A trace file for the `mailbox` scope, which a test reads to see that a
+/// `wait` has looked and is about to block (`wait_begin`).
+const GapTrace = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn init(self: *GapTrace, alloc: Allocator) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        defer alloc.free(root);
+        self.path = try std.Io.Dir.path.join(alloc, &.{ root, "gap.log" });
+        errdefer alloc.free(self.path);
+        debug_trace.resetForTest();
+        try debug_trace.configureForTestWithScopes(alloc, self.path, "mailbox");
+    }
+
+    fn deinit(self: *GapTrace, alloc: Allocator) void {
+        debug_trace.resetForTest();
+        alloc.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    fn waitFor(self: *const GapTrace, needle: []const u8) !void {
+        for (0..5000) |_| {
+            if (self.has(needle)) return;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        return error.Timeout;
+    }
+
+    fn has(self: *const GapTrace, needle: []const u8) bool {
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.path, .{}) catch return false;
+        defer file.close(io_mod.getIo());
+        const text = io_mod.readFileToEnd(std.testing.allocator, &file, 1 << 20) catch return false;
+        defer std.testing.allocator.free(text);
+        return std.mem.find(u8, text, needle) != null;
+    }
+};
+
+/// One `wait` call on its own thread, as main's worker makes it.
+const GapWait = struct {
+    runtime: *Runtime,
+    worker: *worker_runtime.WorkerRuntime,
+    body: ?[]u8 = null,
+    done: std.Io.Event = .unset,
+
+    fn run(self: *GapWait) void {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        if (callTool(self.runtime, arena_state.allocator(), .wait, "gap-wait", self.worker)) |text| {
+            self.body = std.testing.allocator.dupe(u8, text) catch null;
+        } else |_| {}
+        self.done.set(io_mod.getIo());
+    }
+};
+
+/// How long a `wait` may stay blocked after the end it raced has settled.
+const gap_wait_limit: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+
+/// Starts a `wait` once the host is held in the gap, lets the end go, and
+/// returns what `wait` said, which the caller frees. By then `wait` has seen
+/// the child working and is about to block, so only the end can wake it
+/// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns). Fails with
+/// `error.WaitStillBlocked` when `wait` has not returned within
+/// `gap_wait_limit` of the end; it is then cancelled so the test can finish.
+fn waitInSettleGap(runtime: *Runtime, worker: *worker_runtime.WorkerRuntime, trace: *const GapTrace) ![]u8 {
+    defer SettleGap.go.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    var gap = GapWait{ .runtime = runtime, .worker = worker };
+    const thread = try std.Thread.spawn(.{}, GapWait.run, .{&gap});
+    trace.waitFor("wait_begin") catch {
+        SettleGap.go.set(io_mod.getIo());
+        worker.requestCancel();
+        thread.join();
+        return error.WaitNeverBegan;
+    };
+    SettleGap.go.set(io_mod.getIo());
+    gap.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+        std.debug.print("wait blocked for 5 s after the end settled: nothing working, nothing queued, nothing to wake it\n", .{});
+        worker.requestCancel();
+        thread.join();
+        return error.WaitStillBlocked;
+    };
+    thread.join();
+    return gap.body orelse error.WaitFailed;
+}
+
+test "a wait that starts as a subagent's work ends with nothing to report still returns" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var trace: GapTrace = undefined;
+    try trace.init(alloc);
+    defer trace.deinit(alloc);
+    SettleGap.arm();
+    defer SettleGap.disarm();
+    defer SettleGap.go.set(io_mod.getIo());
+
+    // Its rule is never, so a completed work owes no report.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "quiet", .message = "go", .report = "never" } }, "call-1", null);
+    const said = try waitInSettleGap(runtime, &worker, &trace);
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+}
+
+test "a wait that starts as the parent's stop ends a subagent's turn still returns" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var trace: GapTrace = undefined;
+    try trace.init(alloc);
+    defer trace.deinit(alloc);
+    SettleGap.arm();
+    defer SettleGap.disarm();
+    defer SettleGap.go.set(io_mod.getIo());
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    // The stop answers for the turn it ends, so that end owes no report.
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-2", null);
+    const said = try waitInSettleGap(runtime, &worker, &trace);
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+}
+
+test "a wait that starts as a report its owner's sink refuses is held still returns" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .worker = &worker, .refuse_reports = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var trace: GapTrace = undefined;
+    try trace.init(alloc);
+    defer trace.deinit(alloc);
+    SettleGap.arm();
+    defer SettleGap.disarm();
+    defer SettleGap.go.set(io_mod.getIo());
+
+    // The work owes a report, which the sink refuses, so none is posted.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1", null);
+    const said = try waitInSettleGap(runtime, &worker, &trace);
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+}
+
+test "a wait that starts as the parent's close ends a subagent's turn still returns" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var trace: GapTrace = undefined;
+    try trace.init(alloc);
+    defer trace.deinit(alloc);
+    SettleGap.arm();
+    defer SettleGap.disarm();
+    defer SettleGap.go.set(io_mod.getIo());
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-2", null);
+    const said = try waitInSettleGap(runtime, &worker, &trace);
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+}
+
+test "a wait that starts as the user's turn on a subagent ends with nothing to report still returns" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var trace: GapTrace = undefined;
+    try trace.init(alloc);
+    defer trace.deinit(alloc);
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    // Drop the report that work owed, so the wait below has nothing queued.
+    const first = worker.takeQueuedPrompt(alloc).?;
+    worker_runtime.freeQueuedPrompt(alloc, first);
+    const child_id = try reviewerId(runtime, arena);
+    // The final rule reports only a user's turn that fails.
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    SettleGap.arm();
+    defer SettleGap.disarm();
+    defer SettleGap.go.set(io_mod.getIo());
+    const End = struct {
+        fn run(host: *Runtime, child: []const u8, work: []const u8) void {
+            host.endUserWork(child, work, .completed, "fine");
+        }
+    };
+    const ender = try std.Thread.spawn(.{}, End.run, .{ runtime, child_id, work_id });
+    const said = waitInSettleGap(runtime, &worker, &trace);
+    SettleGap.go.set(io_mod.getIo());
+    ender.join();
+    const text = try said;
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "ended without a report") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
 }
 
 test "rebinding a moved host context moves its report sink too" {

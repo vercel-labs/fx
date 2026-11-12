@@ -77,6 +77,20 @@
 #
 # tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
 # against it (MainMailTrace.tla).
+#
+# The WaitNudge configs:
+#
+# WaitNudge models main's wait against subagent works that end with nothing
+# to post (Runtime.waitForMail, workEnded, nudgeWaiter in tool_host.zig, and
+# WorkerRuntime.waitForPostOrNudge): wait always returns, so TLC never reaches
+# a blocked wait that nothing can wake (a deadlock). wait-nudge.cfg is the
+# design and must pass. wait-nudge-today.cfg is fx before it: the end nudged
+# before it cleared the busy flag, so a wait that began in between blocked for
+# good. wait-nudge-mutation-check-first.cfg plants one defect, a wait that
+# reads the busy flags before it registers. Both must reach a deadlock. No
+# trace driver runs fx along it: the inline tests in tool_host.zig and
+# "a wait that starts as a subagent's work ends with nothing to report still
+# returns" in tests/e2e/gateway-stream-lifecycle.test.ts hold fx in the gap.
 
 set -eu
 
@@ -120,4 +134,7 @@ MainMail main-mail-today-acp WaitHonest
 MainMail main-mail-mutation-wait-always-follows WaitHonest
 MainMail main-mail-mutation-lost-at-finish NoneLost
 MainMail main-mail-mutation-close-with-mail JoinsOpenTurn
+WaitNudge wait-nudge -
+WaitNudge wait-nudge-today deadlock
+WaitNudge wait-nudge-mutation-check-first deadlock
 VERDICTS
