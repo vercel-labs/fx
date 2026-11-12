@@ -1308,9 +1308,13 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
     };
 }
 
+/// A socket for one fetch, close-on-exec and non-blocking from the moment it
+/// exists where `socket` takes those flags, as std's own sockets are. macOS
+/// takes neither, so there `fcntl` sets both right after it opens.
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
+    const flags: u32 = posix.SOCK.STREAM | if (std.Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const fd = while (true) {
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
+        const rc = posix.system.socket(family, flags, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
             .INTR => continue,
@@ -1322,8 +1326,10 @@ fn openSocket(family: posix.sa_family_t) !posix.fd_t {
         }
     };
     errdefer closeFd(fd);
-    try setCloexec(fd);
-    try setNonblocking(fd);
+    if (std.Io.Threaded.socket_flags_unsupported) {
+        try setCloexec(fd);
+        try setNonblocking(fd);
+    }
     return fd;
 }
 
@@ -3875,6 +3881,23 @@ test "web_fetch deadline adapters retain invalid descriptor causes" {
     try writer.interface.writeAll("x");
     try std.testing.expectError(error.WriteFailed, writer.interface.flush());
     try std.testing.expectEqual(error.InvalidDescriptor, writer.err.?);
+}
+
+test "web_fetch sockets are close-on-exec and non-blocking from the start" {
+    for ([_]posix.sa_family_t{ posix.AF.INET, posix.AF.INET6 }) |family| {
+        const fd = openSocket(family) catch |err| switch (err) {
+            error.AddressFamilyUnsupported => continue,
+            else => return err,
+        };
+        defer closeFd(fd);
+        const fd_flags = posix.system.fcntl(fd, posix.F.GETFD, @as(usize, 0));
+        try std.testing.expect(fd_flags >= 0);
+        try std.testing.expect(@as(usize, @intCast(fd_flags)) & posix.FD_CLOEXEC != 0);
+        const status = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        try std.testing.expect(status >= 0);
+        const nonblock: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+        try std.testing.expect(@as(usize, @intCast(status)) & nonblock != 0);
+    }
 }
 
 test "web_fetch closed peer write returns a cause without terminating process" {
