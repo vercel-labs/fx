@@ -422,6 +422,49 @@ test "an unreadable checkpoint numbers new turns, tool calls and ledgers after t
     try std.testing.expectEqual(@as(usize, 7), recovered.tool_count);
 }
 
+// The fuzz binary reaches the compactor only through this file, so the
+// count's fuzz target lives here.
+fn fuzzNotesCount(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [1024]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const text = buffer[0..len];
+    var flags: [2][64]bool = undefined;
+    const count: usize = smith.valueRangeAtMost(u8, 0, 64);
+    const first: usize = smith.valueRangeAtMost(u16, 1, 300);
+    const folds = smith.valueRangeAtMost(u8, 0, 1) == 1;
+    var whole: progress.Counter = .{};
+    whole.begin(count, folds);
+    whole.startPart(flags[0][0..count], first, true);
+    whole.feed(text);
+    var split: progress.Counter = .{};
+    split.begin(count, folds);
+    split.startPart(flags[1][0..count], first, true);
+    var last: u8 = 0;
+    var at: usize = 0;
+    while (at < text.len) {
+        const size: usize = if (smith.eos()) text.len else smith.valueRangeAtMost(u8, 1, 32);
+        const end = @min(text.len, at + size);
+        split.feed(text[at..end]);
+        const now = split.percent();
+        try std.testing.expect(now >= last);
+        try std.testing.expect(now <= progress.most_before_saved);
+        last = now;
+        at = end;
+    }
+    try std.testing.expectEqual(whole.percent(), split.percent());
+    try std.testing.expect(whole.covered_count <= count);
+}
+
+test "the notes count keeps its laws on fuzzed replies" {
+    try std.testing.fuzz({}, fuzzNotesCount, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "Turn 1\nIn between: none\nT1: ran it\n- **T2**: read it\n\nRules:\nnone\n\n## Facts\nF1 (T1): x\n",
+            "T1\u{2013}T999:\nRules:\nFacts:\nDecisions:\nStatus:\nOpen:\nEarlier:\n",
+        }) ++ @import("fuzz_corpus").compaction_progress.*),
+    });
+}
+
 test {
     _ = window;
     _ = summarize;
