@@ -1307,6 +1307,64 @@ describe("cli: status", () => {
     );
   }
 
+  test("FX_HOME under a symlinked folder reads its own skills folder", async () => {
+    // macOS's $TMPDIR and /tmp are such folders. Before, fx read the profile's
+    // skills folder through the link but checked it against the resolved path,
+    // so doctor called it unreadable and its skills did not load.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-link-")));
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const real = join(root, "real");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      mkdirSync(real);
+      symlinkSync(real, join(root, "link"));
+      const options = {
+        cwd: workspace,
+        env: {
+          HOME: home,
+          FX_HOME: join(root, "link", "profile"),
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+        },
+      };
+      const skillChecks = async () => {
+        const doctor = await runFx(["doctor", "--json"], options);
+        expect(doctor.stderr).toBe("");
+        return JSON.parse(doctor.stdout).checks.filter((check: { name: string }) => check.name === "skills");
+      };
+      const skills = join(real, "profile", "skills");
+
+      // A new profile has no skills folder yet, and that is not a problem.
+      expect(await skillChecks()).toEqual([]);
+
+      // A skill in the profile's own folder loads without a warning.
+      mkdirSync(join(skills, "linked-home"), { recursive: true });
+      writeFileSync(
+        join(skills, "linked-home", "SKILL.md"),
+        "---\nname: linked-home\ndescription: skill under a linked FX_HOME\n---\n\nBody\n",
+      );
+      expect(await skillChecks()).toEqual([]);
+
+      // A skills path fx cannot read still warns, and names the resolved path.
+      rmSync(skills, { recursive: true });
+      writeFileSync(skills, "not a folder\n");
+      expect(await skillChecks()).toEqual([
+        {
+          name: "skills",
+          status: "warn",
+          detail: `${skills} could not be read, so some skills may be missing`,
+          fix: "fix access to that folder",
+        },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test("FX_HOME holds settings and sessions in place of ~/.fx", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-")));
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_UNDER_FX_HOME")]);
