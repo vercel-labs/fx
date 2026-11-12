@@ -8865,6 +8865,260 @@ test "processQueuedPrompt resends a login the gateway refuses after a refresh th
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt sends a refused request again with the team a reload returns" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    // The first send and its replay are refused for the first team. The
+    // reload before the resend finds the login on another team, as after a
+    // team choice while the request waited.
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // The 401's reload finds the refused token still stored, so fx forces a
+    // refresh, which keeps the team.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after", "token-team-b" };
+    hooks.credential_refresh_teams = &.{ null, null, "team_a", "team_b" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_a".*;
+    var label = "team-a".*;
+    job.gateway_team = &team;
+    job.gateway_team_label = &label;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_teams.items.len);
+    // A refresh that keeps the team, or returns none, changes nothing.
+    try std.testing.expectEqualStrings("team_a", gateway.request_teams.items[0].?);
+    try std.testing.expectEqualStrings("team_a", gateway.request_teams.items[1].?);
+    try std.testing.expectEqualStrings("team_b", gateway.request_teams.items[2].?);
+    try std.testing.expectEqualStrings("token-team-b", gateway.request_api_keys.items[2]);
+    // With the reason, the wait named the team fx sent and how to change it.
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "not allowed for this team") != null);
+    try std.testing.expectEqualStrings(
+        "fx sent this request for the Vercel team team-a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        hooks.system_notices.items[1],
+    );
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt keeps the request's team when no refresh runs" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "accepted answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // No refresh token: the refresh skips, as for a login verified recently.
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_a".*;
+    job.gateway_team = &team;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{.if_needed}, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_teams.items.len);
+    try std.testing.expectEqualStrings("team_a", gateway.request_teams.items[0].?);
+}
+
+test "processQueuedPrompt names a refused login's team by its id when the login has no slug" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_a".*;
+    job.gateway_team = &team;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[1], "for the Vercel team team_a. If that is the wrong team") != null);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt names a refused login's team by its id when its slug is not a team name" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_a".*;
+    // A saved login's slug is not checked when it loads.
+    var label = "\x1b]2;title\x07\x1b[2J".*;
+    job.gateway_team = &team;
+    job.gateway_team_label = &label;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "fx sent this request for the Vercel team team_a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        hooks.system_notices.items[1],
+    );
+}
+
+test "processQueuedPrompt names no team for a refused login whose slug and id are not team names" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team a\x07".*;
+    var label = "\xe2\x80\xaeslug".*;
+    job.gateway_team = &team;
+    job.gateway_team_label = &label;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        hooks.system_notices.items[1],
+    );
+}
+
+test "processQueuedPrompt sends each of many refused resends with the team its reload returned" {
+    const alloc = std.testing.allocator;
+    const rounds = 100;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    // Each round is a send and its replay, both refused. The 401's reload
+    // finds the refused token still stored, so fx forces a refresh, which
+    // keeps the team. Every reload before a resend returns one of three
+    // teams, or none, so the team changes on most resends and stays on some.
+    var completions: [2 * rounds + 1]FakeCompletion = undefined;
+    for (completions[0 .. 2 * rounds]) |*completion| completion.* = .{ .status = .unauthorized, .err_body = refused };
+    completions[2 * rounds] = .{ .content = "accepted answer" };
+    const team_names = [_][]const u8{ "team_0", "team_1", "team_2" };
+    var tokens: [3 * rounds + 1][]const u8 = undefined;
+    var teams: [3 * rounds + 1]?[]const u8 = undefined;
+    // What each round's two requests must send.
+    var expected: [rounds + 1][]const u8 = undefined;
+    expected[0] = "team_start";
+    for (&tokens) |*token| token.* = "token";
+    teams[0] = null;
+    for (0..rounds) |round| {
+        // The reload and the forced refresh after the first 401 keep the team.
+        teams[1 + 3 * round] = null;
+        teams[2 + 3 * round] = null;
+        const next: ?[]const u8 = if (round % 4 == 3) null else team_names[round % 3];
+        teams[3 + 3 * round] = next;
+        expected[round + 1] = next orelse expected[round];
+    }
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &tokens;
+    hooks.credential_refresh_teams = &teams;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_start".*;
+    job.gateway_team = &team;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2 * rounds + 1), gateway.request_teams.items.len);
+    for (0..rounds) |round| {
+        try std.testing.expectEqualStrings(expected[round], gateway.request_teams.items[2 * round].?);
+        try std.testing.expectEqualStrings(expected[round], gateway.request_teams.items[2 * round + 1].?);
+    }
+    try std.testing.expectEqualStrings(expected[rounds], gateway.request_teams.items[2 * rounds].?);
+    // The reason and the team show once, not once per resend.
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt replays a 401 with the team its forced refresh returns" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // The 401's reload finds the refused token still stored, so fx forces a
+    // refresh, which returns the login on another team.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-team-b" };
+    hooks.credential_refresh_teams = &.{ null, null, "team_b" };
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_a".*;
+    job.gateway_team = &team;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_teams.items.len);
+    try std.testing.expectEqualStrings("team_a", gateway.request_teams.items[0].?);
+    // The replay sends the refreshed key and the refreshed login's team together.
+    try std.testing.expectEqualStrings("team_b", gateway.request_teams.items[1].?);
+    try std.testing.expectEqualStrings("token-team-b", gateway.request_api_keys.items[1]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
 test "processQueuedPrompt waits for a sign-in when a refused login's refresh stops working" {
     const alloc = std.testing.allocator;
     const refused = "{\"error\":{\"message\":\"refused for now\"}}";

@@ -1327,9 +1327,15 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeTokenPassDenial(app, notice);
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
                     .model_call => |record| {
+                        if (comptime @hasField(App, "model_cache")) {
+                            if (record.outcome == .completed) {
+                                if (record.served_by) |served_by| app.model_cache.observeServedBy(served_by);
+                            }
+                        }
                         // After the text the call wrote. The line shows only
                         // in Ctrl+O, so it waits for text still being paced
                         // out instead of showing that text early, as in
@@ -1471,6 +1477,7 @@ pub fn Runtime(comptime App: type) type {
                         if (comptime @hasField(App, "program_status")) {
                             if (notice.tone == .@"error" and !offScreen(app, agent)) app.program_status.noteFailure();
                         }
+                        observeTokenPassDenial(app, notice);
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
                     },
@@ -1609,6 +1616,14 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        /// A warning or error that AI Gateway's Token Pass denial produced
+        /// tells the model cache the team has no active Token Pass.
+        fn observeTokenPassDenial(app: *App, notice: types.SemanticNotice) void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (notice.tone != .warning and notice.tone != .@"error") return;
+            app.model_cache.observeErrorText(notice.body);
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {

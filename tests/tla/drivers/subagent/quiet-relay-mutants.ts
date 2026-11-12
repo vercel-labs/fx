@@ -75,12 +75,6 @@ const mutants: Mutant[] = [
     to: "head, max_label_bytes)",
   },
   {
-    name: "wait-says-mail-follows",
-    file: "src/core/subagent/tool_host.zig",
-    from: ".result = if (worker.queuedMailWaitsForNextTurn())",
-    to: ".result = if (false and worker.queuedMailWaitsForNextTurn())",
-  },
-  {
     name: "row-hides-call",
     file: "src/ui/footer/agents_menu_presentation.zig",
     from: "    if (row.activity.len > 0) return row.activity;\n",
@@ -98,7 +92,6 @@ const unitFilters = [
   "working subagent's row",
   "dupeToolResultMemory",
   "command sidebands merge",
-  "mail waits for the next turn only",
 ];
 
 const commands: Array<{ name: string; argv: string[]; cwd: string }> = [

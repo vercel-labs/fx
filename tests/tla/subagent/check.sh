@@ -21,6 +21,12 @@
 #   drop-waiting-at-end  the stopped turn's end drops the waiting messages      NoSilentLoss
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
+#   note-after-take      the idle note is decided after the next turn took the
+#                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
+#   names-busy           a new subagent's start names every other open one      NamesTheIdle
+#
+# stop-message-before-idle.cfg and -before-names.cfg are fx before the idle
+# note: no report says its subagent is idle, and no start names any.
 #
 # StopMessageTrace.tla checks runs of the built fx binary against it;
 # tests/tla/drivers/subagent/stop-message.test.ts runs it.
@@ -66,6 +72,27 @@
 #   ./check.sh
 #   ./check.sh steer-queue steer-queue-mutation-no-start-prune
 #   TLA2TOOLS_JAR=/path/tla2tools.jar ./check.sh
+#
+# The MainMail configs:
+#
+# MainMail models how a subagent's report or message reaches main
+# (postMailWith, takeSteeringBoundaryIntoInner and finishProcessing in
+# src/core/agent/worker_runtime.zig, runAskTurn in src/core/cli/cli_ask.zig)
+# and what wait says about it (Runtime.waitForMail in tool_host.zig).
+# main-mail.cfg is the design where turns take mail, the app and fx ask;
+# main-mail-acp.cfg is ACP, whose turns never do. Both must pass.
+# main-mail-today.cfg is fx ask before it: no turn takes mail, so a report
+# that reached an open turn waits for the next one. main-mail-today-acp.cfg
+# is ACP before it: wait says the report follows. Each
+# main-mail-mutation-*.cfg plants one defect:
+#
+#   wait-always-follows  wait says it follows whatever the mail does   WaitHonest
+#   lost-at-finish       a finished turn drops the mail left for it    NoneLost
+#   close-with-mail      a final boundary closes with mail unread      JoinsOpenTurn
+#
+# tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
+# against it (MainMailTrace.tla).
+
 set -eu
 
 cd "$(dirname "$0")"
@@ -97,6 +124,17 @@ StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
+StopMessage stop-message-before-idle IdleNoteHonest
+StopMessage stop-message-before-names NamesTheIdle
+StopMessage stop-message-mutation-note-after-take IdleNoteHonest
+StopMessage stop-message-mutation-names-busy NamesTheIdle
+MainMail main-mail -
+MainMail main-mail-acp -
+MainMail main-mail-today JoinsOpenTurn
+MainMail main-mail-today-acp WaitHonest
+MainMail main-mail-mutation-wait-always-follows WaitHonest
+MainMail main-mail-mutation-lost-at-finish NoneLost
+MainMail main-mail-mutation-close-with-mail JoinsOpenTurn
 QuietRelay quiet-relay -
 QuietRelay quiet-relay-deep -
 QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell

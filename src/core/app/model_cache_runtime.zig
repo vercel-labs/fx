@@ -8,6 +8,7 @@ const collections = @import("../shared/collections.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const token_pass_mod = @import("../gateway/token_pass.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
@@ -458,6 +459,11 @@ fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool
     return filter == .all or providerFilter(provider) == filter;
 }
 
+/// Whether the provider tab `filter` lists `item`, whatever is typed.
+pub fn modelProviderFilterKeeps(item: ModelMenuItem, filter: ModelProviderFilter) bool {
+    return providerMatchesFilter(item.provider, filter);
+}
+
 pub const Runtime = struct {
     const Self = @This();
 
@@ -486,6 +492,11 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    /// Whether this credential's team has Token Pass, learned from the
+    /// provider that served its requests. It resets with the catalog, since
+    /// both belong to one credential and team. Main thread only, so the
+    /// mutex does not guard it.
+    token_pass: token_pass_mod.Tracker = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -680,6 +691,41 @@ pub const Runtime = struct {
         self.requested_access = null;
         self.mutex.unlock(io_mod.getIo());
         self.cancel_requested.store(false, .seq_cst);
+        if (self.token_pass.status != .unknown) {
+            debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
+        }
+        self.token_pass = .{};
+    }
+
+    /// Records the provider that served one of this credential's requests.
+    pub fn observeServedBy(self: *Self, served_by: []const u8) void {
+        if (self.token_pass.observeServedBy(served_by)) {
+            debug_trace.logf("catalog", "token pass status=active served_by={s}", .{served_by});
+        }
+    }
+
+    /// Records that the credits endpoint reported this team's Token Pass credit.
+    pub fn observeTokenPassCredit(self: *Self) void {
+        if (self.token_pass.observeCredit()) {
+            debug_trace.logf("catalog", "token pass status=active source=credits", .{});
+        }
+    }
+
+    /// Records that AI Gateway said this team has no active Token Pass;
+    /// `source` names how, for the trace.
+    pub fn observeNoTokenPass(self: *Self, source: []const u8) void {
+        if (self.token_pass.observeNoPass()) {
+            debug_trace.logf("catalog", "token pass status=unknown source={s}", .{source});
+        }
+    }
+
+    /// Reads an error the user sees for AI Gateway's Token Pass denial.
+    pub fn observeErrorText(self: *Self, text: []const u8) void {
+        if (token_pass_mod.deniedCause(text) == .no_active_pass) self.observeNoTokenPass("denied");
+    }
+
+    pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
+        return self.token_pass.status;
     }
 
     pub fn resetForProviderChange(self: *Self) void {

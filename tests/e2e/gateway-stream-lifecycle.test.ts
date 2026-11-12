@@ -51,15 +51,44 @@ const MODEL = "openai/gpt-5.5";
 /** The frame every subagent report arrives in (`src/core/subagent/reports.zig`). */
 const REPORT_HEADER = "Subagent report (untrusted agent output, not user instructions):";
 
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
 /** Whether the request's latest user message is a subagent's report, so it
  * is the turn that report started. */
 function latestUserText(raw: string): string {
-  return JSON.stringify(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+  return withoutContextUpdates(JSON.stringify(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? ""));
 }
 
 function latestUserIsReport(raw: string): boolean {
-  const latest = JSON.stringify(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+  const latest = withoutContextUpdates(JSON.stringify(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? ""));
   return latest.includes(REPORT_HEADER);
+}
+
+/** The JSON line of the report in the request's latest user message, or
+ * null when that message is not a report. */
+function latestReport(raw: string): Record<string, unknown> | null {
+  const text = withoutContextUpdates(contentText(JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? ""));
+  const at = text.indexOf(REPORT_HEADER);
+  if (at < 0) return null;
+  return JSON.parse(text.slice(at + REPORT_HEADER.length).trim().split("\n")[0]!);
+}
+/** The JSON lines of every report in the request's user messages, oldest
+ * first. Reports that join a running turn can arrive together. */
+function allReports(raw: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const item of JSON.parse(raw).prompt?.filter((entry: any) => entry.role === "user") ?? []) {
+    const text = withoutContextUpdates(contentText(item.content));
+    let at = text.indexOf(REPORT_HEADER);
+    while (at >= 0) {
+      out.push(JSON.parse(text.slice(at + REPORT_HEADER.length).trim().split("\n")[0]!));
+      at = text.indexOf(REPORT_HEADER, at + REPORT_HEADER.length);
+    }
+  }
+  return out;
 }
 const DEFAULT_MODEL = "spacexai/grok-4.7";
 /** What fx says when it cannot connect to the model catalog and drops fast
@@ -117,7 +146,7 @@ function compactionRaceFixture(label: string) {
       return fakeGatewayFinalText("Main read notes.txt several times and messaged racer. Continue the turn.");
     }
     const body = JSON.parse(raw);
-    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
     if (latest.includes("RACE_CHILD_TASK")) {
       counts.childRequests++;
       return counts.childRequests === 1 ? held.response : fakeGatewayFinalText("RACE_CHILD_AGAIN");
@@ -275,7 +304,8 @@ test("the user talks to the parent while its subagent works, and a stop ends the
   let reportTurns = 0;
   const gateway = startDynamicFakeGateway(raw => {
     const body = JSON.parse(raw);
-    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    // Main's list of subagents quotes the child's task, so it is left out.
+    const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
     if (latest.includes("STEERING_CHILD")) {
       childRequests++;
       return held.response;
@@ -922,6 +952,20 @@ type ShellResult = {
 
 function shellResult(body: string, callId: string): ShellResult {
   return JSON.parse(toolResultOutput(body, callId)) as ShellResult;
+}
+
+/** The text of tool result `callId` anywhere in the request, or null. */
+function toolResultAnywhere(body: string, callId: string): string | null {
+  return hasToolResult(body, callId) ? toolResultOutput(body, callId) : null;
+}
+
+function hasToolResult(body: string, callId: string): boolean {
+  return gatewayRequest(body).prompt.some((message) =>
+    Array.isArray(message.content) &&
+    (message.content as Array<Record<string, unknown>>).some((part) =>
+      part.type === "tool-result" && part.toolCallId === callId
+    )
+  );
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
@@ -8261,10 +8305,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         let compactions = 0;
         let diagnosticHandle = "";
         let restartReport = "";
+        let summarizedFollowUp = false;
+        let readCompacted = false;
         const gateway = startDynamicFakeGateway((body) => {
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
             compactions++;
+            summarizedFollowUp = body.includes("FOLLOW_UP_FACT");
             // The cancelled wait reaches the summarizer as it happened and is saved as T2.
             expect(body).toContain("[Tool result T2: subagent]");
             expect(body).toContain("aborted by user");
@@ -8289,6 +8336,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           if (hasCurrentToolResult(body, "cancel-follow-up-read")) {
             expect(toolResultOutput(body, "cancel-follow-up-read")).toContain("FOLLOW_UP_FACT");
             expect(compactions).toBe(trigger === "automatic" ? 1 : 0);
+            return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
+          }
+          // This fixture's usage leaves the compaction room for only a few
+          // dozen tokens of the running turn, and the turn starts with main's
+          // list of subagents, which rides with its step. Then the read is
+          // compacted along with the cancelled turn, and the summary has it.
+          if (trigger === "automatic" && compactions > 0 && latest.includes("Read the follow-up file") && !hasToolResult(body, "cancelled-history-wait")) {
+            expect(summarizedFollowUp).toBe(true);
+            readCompacted = true;
             return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
           }
           if (latest.includes("Read the follow-up file")) {
@@ -8337,8 +8393,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           if (trigger === "manual") {
             await compactAndWait(tui, root, 20000);
           }
-          expect(compactions).toBe(1);
-          expect(gateway.requests).toHaveLength(6);
+          // One compaction. The same tight room can make its notes take a
+          // second summary request, so the requests count each one.
+          expect(compactions).toBeGreaterThanOrEqual(1);
+          expect(compactions).toBeLessThanOrEqual(trigger === "automatic" ? 2 : 1);
+          expect(gateway.requests).toHaveLength(5 + compactions);
           const saved = readFileSync(logPath, "utf8");
           expect(saved.startsWith(before)).toBe(true);
           expect(compactionCount(saved)).toBe(1);
@@ -8356,7 +8415,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await tui.sendText("Continue without repeating cancelled work.");
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
           // One more for the report turn the restart owed.
-          expect(gateway.requests).toHaveLength(8);
+          expect(gateway.requests).toHaveLength(7 + compactions);
           // The reply shows before its turn is saved, so wait for the save.
           const saveDeadline = Date.now() + 15_000;
           let history = (await savedSession(root.home, sessionId)).history;
@@ -8366,7 +8425,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           }
           const calls = savedToolCallIds(history);
           expect(calls.filter((id) => id === "cancelled-history-child")).toHaveLength(1);
-          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(1);
+          // A read the compaction took is in its record, not the saved turn.
+          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(readCompacted ? 0 : 1);
           expect(history.some((turn) => turn.assistant === "CANCEL_RESTART_COMPLETE")).toBe(true);
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
@@ -10023,7 +10083,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         seen[delegation].push(JSON.parse(contentText(result.output)));
         return fakeGatewayFinalText("REPLAY_PARENT_DONE");
       }
-      const asked = contentText(prompt[lastUser]?.content);
+      // Main's list of subagents quotes each one's task, so it is left out.
+      const asked = withoutContextUpdates(contentText(prompt[lastUser]?.content));
       if (asked.includes(tasks.ok)) {
         childRequests++;
         return fakeGatewayFinalText("REPLAY_CHILD_DONE");
@@ -10138,6 +10199,390 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 15_000);
 
+  // Main tends to start a new subagent for each task and leave the finished
+  // ones idle. A new subagent's start names the idle ones, and each report
+  // says its subagent is idle, so main can send related work to one that
+  // has the context, or close it.
+  test("a new subagent's start names the idle ones, and each report says its subagent is idle", async () => {
+    const root = createFixtureRoot("subagent-idle-reuse");
+    const tracePath = join(root.root, "trace.log");
+    const tasks = {
+      first: "Reply exactly IDLE_FIRST_DONE without using tools.",
+      second: "Reply exactly IDLE_SECOND_DONE without using tools.",
+      third: "Reply exactly IDLE_THIRD_DONE without using tools.",
+      again: "Reply exactly IDLE_FIRST_AGAIN without using tools.",
+    };
+    const message = (id: string, agent: string, text: string) =>
+      fakeGatewayToolCall(id, "subagent", { request: { action: "message", agent, message: text } });
+    const results: Record<string, string> = {};
+    const reports: Record<string, unknown>[] = [];
+    const seenWorks = new Set<string>();
+    let releaseSecond: () => void = () => {};
+    const secondHeld = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // first's second turn carries its first task too, so it goes first.
+        if (body.includes(tasks.again)) return fakeGatewayFinalText("IDLE_FIRST_AGAIN");
+        if (body.includes(tasks.second)) {
+          // second keeps working until third has reported, so third's
+          // start finds it busy.
+          await secondHeld;
+          return fakeGatewayFinalText("IDLE_SECOND_DONE");
+        }
+        if (body.includes(tasks.third)) return fakeGatewayFinalText("IDLE_THIRD_DONE");
+        if (body.includes(tasks.first)) return fakeGatewayFinalText("IDLE_FIRST_DONE");
+        return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+      }
+      // A report can join main's turn at a step boundary, so each result is
+      // taken wherever it is, once.
+      const fresh: string[] = [];
+      for (const id of ["idle_first", "idle_second", "idle_third", "idle_again"]) {
+        if (id in results) continue;
+        const text = toolResultAnywhere(body, id);
+        if (text === null) continue;
+        results[id] = text;
+        fresh.push(id);
+      }
+      // Reports that join a running turn can arrive together, so each new
+      // one is taken wherever it is, once.
+      const newReports = allReports(body).filter((report) => !seenWorks.has(String(report.work_id)));
+      for (const report of newReports) {
+        seenWorks.add(String(report.work_id));
+        reports.push(report);
+      }
+      if (newReports.length > 0) {
+        const outputs = newReports.map((report) => String(report.output));
+        if (outputs.some((output) => output.includes("IDLE_FIRST_DONE")) && !("idle_second" in results)) return message("idle_second", "second", tasks.second);
+        if (outputs.some((output) => output.includes("IDLE_THIRD_DONE"))) {
+          releaseSecond();
+          return message("idle_again", "first", tasks.again);
+        }
+        return fakeGatewayFinalText(`IDLE_REPORT_READ ${newReports.map((report) => String(report.agent)).join(" ")}`);
+      }
+      if (fresh.includes("idle_second")) return message("idle_third", "third", tasks.third);
+      if (fresh.length > 0) return fakeGatewayFinalText(`IDLE_SENT ${fresh.join(" ")}`);
+      if (Object.keys(results).length > 0) return fakeGatewayFinalText("IDLE_NOTHING_NEW");
+      return message("idle_first", "first", tasks.first);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Exercise idle subagents."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent" },
+        timeoutMs: 30_000,
+      });
+      releaseSecond();
+      if (run.code !== 0) {
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+        throw new Error(`idle subagent flow failed: code=${run.code}\nstdout=${run.stdout}\nstderr=${run.stderr}\ntrace=${trace}`);
+      }
+      const answer = (id: string) => String(JSON.parse(results[id]!).result);
+      // The first subagent starts with no other: its answer is as before.
+      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      // A new subagent's start names the idle one.
+      expect(answer("idle_second")).toContain("second is new and starts with no history.");
+      expect(answer("idle_second")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\n`);
+      expect(answer("idle_second")).toContain("Give related work to the one whose context fits instead of a new name. Keep or close each as its work requires, and ask the user when you cannot tell.");
+      // A working subagent is not idle: third's start names first only.
+      expect(answer("idle_third")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\nGive related work`);
+      expect(answer("idle_third")).not.toContain("- second");
+      // A message to a subagent that exists starts its turn and names none.
+      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      // Every report of a finished work says its subagent is idle now.
+      expect(reports.map((report) => report.agent).sort()).toEqual(["first", "first", "second", "third"]);
+      for (const report of reports) {
+        expect(report.outcome).toBe("completed");
+        expect(report.next).toBe(`${String(report.agent)} is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.`);
+      }
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      releaseSecond();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  // A failed work leaves its subagent idle, and its report says so.
+  test("a failed subagent's report still says it is idle", async () => {
+    const root = createFixtureRoot("subagent-idle-failure");
+    const task = "IDLE_FAILURE: perform the prepared task once.";
+    let failed: Record<string, unknown> | null = null;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "idle_failure")) return fakeGatewayFinalText("IDLE_FAILURE_SENT");
+      const report = latestReport(body);
+      if (report) {
+        failed = report;
+        return fakeGatewayFinalText("IDLE_FAILURE_OBSERVED");
+      }
+      if (body.includes('"name":"subagent"')) {
+        return fakeGatewayToolCall("idle_failure", "subagent", { request: { action: "message", agent: "flaky", message: task } });
+      }
+      if (body.includes(task)) {
+        return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
+          status: 401, headers: { "content-type": "application/json" },
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Observe a failed subagent."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        timeoutMs: 15_000,
+      });
+      expect(run.code).toBe(0);
+      expect(failed).not.toBeNull();
+      expect(failed!.outcome).toBe("failed");
+      expect(String(failed!.output)).toContain("HTTP 401");
+      expect(failed!.next).toBe("flaky is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.");
+      expect(parseAskJson(run.stdout).output).toContain("IDLE_FAILURE_OBSERVED");
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  // In fx ask a report that arrives while main's turn runs joins that turn at
+  // its next step, as it does in the app, so main reads it before it answers.
+  // wait says so, and no turn starts for the report.
+  test("in fx ask, a report that arrives while main's turn runs joins main in that turn", async () => {
+    const root = createFixtureRoot("subagent-report-joins");
+    const tracePath = join(root.root, "trace.log");
+    const task = "Reply exactly JOIN_CHILD_DONE without using tools.";
+    let releaseChild: () => void = () => {};
+    const childHeld = new Promise<void>((resolve) => { releaseChild = resolve; });
+    let stage = 0;
+    let waitText: string | null = null;
+    let joined: Record<string, unknown> | null = null;
+    let reportTurns = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        await childHeld;
+        return fakeGatewayFinalText("JOIN_CHILD_DONE");
+      }
+      if (stage === 0) {
+        stage = 1;
+        return fakeGatewayToolCall("join_send", "subagent", { request: { action: "message", agent: "builder", message: task } });
+      }
+      if (stage === 1) {
+        stage = 2;
+        // The child ends while main waits for it.
+        setTimeout(releaseChild, 300);
+        return fakeGatewayToolCall("join_wait", "subagent", { request: { action: "wait" } });
+      }
+      if (stage === 2) {
+        stage = 3;
+        waitText = String(JSON.parse(toolResultAnywhere(body, "join_wait") ?? "{}").result);
+        joined = latestReport(body);
+        return fakeGatewayFinalText(joined ? "JOIN_SEEN_IN_TURN" : "JOIN_MISSING");
+      }
+      if (latestUserIsReport(body)) reportTurns += 1;
+      return fakeGatewayFinalText("JOIN_NEXT_TURN");
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Delegate the task and wait for its report."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent,worker" },
+        timeoutMs: 20_000,
+      });
+      releaseChild();
+      if (run.code !== 0) {
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+        throw new Error(`report join failed: code=${run.code}\nstdout=${run.stdout}\nstderr=${run.stderr}\ntrace=${trace}`);
+      }
+      expect(waitText).toBe("A report or message arrived. It follows this result.");
+      expect(joined).not.toBeNull();
+      expect(String(joined!.output)).toContain("JOIN_CHILD_DONE");
+      expect(reportTurns).toBe(0);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("event=ask_next_turn");
+      const output = parseAskJson(run.stdout).output;
+      expect(output).toContain("JOIN_SEEN_IN_TURN");
+      expect(output).not.toContain("JOIN_NEXT_TURN");
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      releaseChild();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // Main sees its subagents at the start of each turn: what each is for and
+  // whether it works or is idle, with the call to keep, close, or ask the
+  // user. The list holds still within a turn. Each purpose survives a
+  // restart, and status and a new subagent's start say it too.
+  test("main's context lists its subagents at each turn's start, with what each is for", async () => {
+    const root = createFixtureRoot("subagent-team-list");
+    const tracePath = join(root.root, "trace.log");
+    const builderTask = "Build the fix.";
+    const reviewerTask = "Review src/stats.js and report every bug.\nThe file has three functions.";
+    const fixerTask = "Reply exactly TEAM_FIXER_DONE without using tools.";
+    const teamHead = "Runtime context: your subagents. Each keeps its own conversation until you close it.";
+    const calls = (...items: Array<[string, Record<string, unknown>]>) => fakeGatewaySse([
+      ...items.map(([id, request]) => ({ type: "tool-call", toolCallId: id, toolName: "subagent", input: { request } })),
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+    const firstRun: string[] = [];
+    const secondRun: string[] = [];
+    let phase: "first" | "second" = "first";
+    let statusText: string | null = null;
+    let fixerText: string | null = null;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewayFinalText(body.includes(fixerTask) ? "TEAM_FIXER_DONE" : "TEAM_CHILD_DONE");
+      }
+      const runBodies = phase === "first" ? firstRun : secondRun;
+      runBodies.push(body);
+      if (phase === "first") {
+        if (runBodies.length === 1) {
+          return calls(
+            ["team_builder", { action: "message", agent: "builder", instructions: "You build the parser fix for issue 12.\nUse small commits.", message: builderTask }],
+            ["team_reviewer", { action: "message", agent: "reviewer", message: reviewerTask }],
+          );
+        }
+        return fakeGatewayFinalText(latestReport(body) ? "TEAM_REPORT_READ" : "TEAM_TURN_ONE");
+      }
+      if (runBodies.length === 1) return calls(["team_status", { action: "status" }]);
+      if (runBodies.length === 2) {
+        statusText = String(JSON.parse(toolResultAnywhere(body, "team_status") ?? "{}").result);
+        return calls(["team_fixer", { action: "message", agent: "fixer", message: fixerTask }]);
+      }
+      if (runBodies.length === 3) {
+        fixerText = String(JSON.parse(toolResultAnywhere(body, "team_fixer") ?? "{}").result);
+        return fakeGatewayFinalText("TEAM_TURN_TWO");
+      }
+      return fakeGatewayFinalText("TEAM_REPORT_READ");
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent" };
+      const first = await runFx(["ask", "--json", "--auto", "Start the team."], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      // No subagents, no list; and the list the turn started with holds for
+      // its whole turn, though main started two in its first step.
+      expect(promptText(firstRun[0]!)).not.toContain(teamHead);
+      expect(promptText(firstRun[1]!)).not.toContain(teamHead);
+
+      phase = "second";
+      const second = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Plan the next step."], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      if (second.code !== 0) {
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+        throw new Error(`team list failed: code=${second.code}\nstdout=${second.stdout}\nstderr=${second.stderr}\ntrace=${trace}`);
+      }
+      // After a restart the turn starts with both, idle, each with its
+      // purpose: the first line of its instructions, or else of its task.
+      const opening = promptText(secondRun[0]!);
+      expect(opening).toContain([
+        teamHead,
+        "- builder: idle, last work completed. For: You build the parser fix for issue 12.",
+        "- reviewer: idle, last work completed. For: Review src/stats.js and report every bug.",
+      ].join("\n"));
+      expect(opening).toContain("ask the user");
+      expect(opening).toContain("Do not close one only to shorten this list.");
+      expect(statusText).toBe([
+        "builder: idle, last work completed, reports final. For: You build the parser fix for issue 12.",
+        "reviewer: idle, last work completed, reports final. For: Review src/stats.js and report every bug.",
+      ].join("\n"));
+      expect(fixerText).toContain([
+        "fixer is new and starts with no history. Idle subagents, each with its own context:",
+        "- builder: You build the parser fix for issue 12.",
+        "- reviewer: Review src/stats.js and report every bug.",
+      ].join("\n"));
+      // The new subagent joins the list at the next turn's start, not in
+      // this one.
+      expect(promptText(secondRun[2]!)).not.toContain("- fixer:");
+      expect(second.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // fx is killed after a subagent finished and before main took its report.
+  // The resumed session posts the owed report once, and it says the
+  // subagent is idle.
+  test("a report owed when fx is killed arrives once after resume and says its subagent is idle", async () => {
+    const root = createFixtureRoot("subagent-idle-crash");
+    const tracePath = join(root.root, "trace.log");
+    const task = "Reply exactly IDLE_KEEPER_DONE without using tools.";
+    const resumePrompt = "Continue after the restart.";
+    const reports: Record<string, unknown>[] = [];
+    const resumedPrompts: string[] = [];
+    let mainHeld = false;
+    let killed = false;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return body.includes(task) ? fakeGatewayFinalText("IDLE_KEEPER_DONE") : fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+      }
+      if (killed) resumedPrompts.push(promptText(body));
+      const report = latestReport(body);
+      if (report) {
+        reports.push(report);
+        return fakeGatewayFinalText("IDLE_KEEPER_REPORT_READ");
+      }
+      if (promptText(body).includes(resumePrompt)) return fakeGatewayFinalText("IDLE_RESUMED");
+      // Main's turn never ends before the kill, so the report stays owed.
+      if (hasCurrentToolResult(body, "idle_keeper")) {
+        mainHeld = true;
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayToolCall("idle_keeper", "subagent", { request: { action: "message", agent: "keeper", message: task } });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const first = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "Start the keeper."], {
+      cwd: root.workspace,
+      env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent", FX_SOUND: "0" },
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    try {
+      // Wait until the keeper's finish is saved as owing a report, while
+      // main's request is held.
+      const deadline = Date.now() + 15_000;
+      let parentId = "";
+      for (;;) {
+        let finished: any;
+        try {
+          parentId = existsSync(join(root.home, ".fx", "sessions", "v2")) ? rootSessionIds(root.home)[0] ?? "" : "";
+          finished = parentId ? childLines(root.home, parentId).find((line) => line.kind === "child_finished") : undefined;
+        } catch {
+          // A log fx is still writing can end mid-line.
+        }
+        if (mainHeld && finished?.data?.report === true) break;
+        if (Date.now() > deadline) throw new Error(`the keeper's report was never owed: held=${mainHeld} finished=${JSON.stringify(finished)}`);
+        await Bun.sleep(20);
+      }
+      first.kill(9);
+      await first.exited;
+      killed = true;
+      expect(reports).toHaveLength(0);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", parentId, resumePrompt], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "mailbox,subagent" },
+        timeoutMs: 20_000,
+      });
+      if (resumed.code !== 0) throw new Error(`resume failed: code=${resumed.code}\nstdout=${resumed.stdout}\nstderr=${resumed.stderr}`);
+      // The owed report arrives once, and says the keeper is idle.
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.agent).toBe("keeper");
+      expect(reports[0]!.outcome).toBe("completed");
+      expect(String(reports[0]!.output)).toContain("IDLE_KEEPER_DONE");
+      expect(reports[0]!.next).toBe("keeper is idle now and keeps this conversation. Keep it if related work may follow, close it if its work is done, or ask the user if you cannot tell.");
+      // The resumed session's list names the keeper, idle, with what it is
+      // for, read back from its saved spawn line.
+      expect(resumedPrompts.some((text) => text.includes(`- keeper: idle, last work completed. For: ${task}`))).toBe(true);
+      expect(resumed.stderr).not.toMatch(/panic:|unreachable/);
+    } finally {
+      first.kill(9);
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("sibling subagents start before either terminal result is awaited", async () => {
     const root = createFixtureRoot("subagent-sibling-start-order");
     const tracePath = join(root.root, "trace.log");
@@ -10153,10 +10598,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
     const started = new Set<string>();
     const reports: string[] = [];
+    const seenWorks = new Set<string>();
     const gateway = startDynamicFakeGateway((body) => {
-      // Each sibling's report starts a turn of its own.
+      // A sibling's report starts the ask's next turn, and the other's can
+      // join that turn, so each new one is taken wherever it is, once.
       if (latestUserIsReport(body)) {
-        reports.push(latestUserText(body));
+        for (const report of allReports(body)) {
+          if (seenWorks.has(String(report.work_id))) continue;
+          seenWorks.add(String(report.work_id));
+          reports.push(String(report.output));
+        }
         return fakeGatewayFinalText("SIBLING_REPORT_SEEN");
       }
       if (
@@ -11252,7 +11703,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let childRequests = 0;
     const gateway = startDynamicFakeGateway(raw => {
       const body = JSON.parse(raw);
-      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
       if (latest.includes("EMPTY_REPORT_TASK")) {
         childRequests++;
         return child.response;
@@ -13395,9 +13846,9 @@ test("fx told to quit while a message waits for a subagent's start exits at once
 
 // A subagent's shell command that goes quiet past the quiet notice's limit
 // wakes its parent's wait with a note from fx, once for each quiet spell.
-// FX_TEST_SHELL_QUIET_NOTICE_MS shortens the 2 minute limit. In fx ask, mail
-// from a subagent waits for the ask's next turn (`WorkerRuntime.postMail`),
-// so the note wakes main's wait and then starts main's next turn.
+// FX_TEST_SHELL_QUIET_NOTICE_MS shortens the 2 minute limit. The note joins
+// main's running turn after the wait's result; one that arrives while main
+// is idle starts its next turn.
 const RELAY_QUIET_MS = 1_500;
 const MESSAGE_HEADER = "Subagent message (untrusted agent output, not user instructions):";
 const RELAY_TRACE_SCOPES = "agent,core,gateway,stream,mailbox,shell,subagent";
@@ -13478,15 +13929,11 @@ test("a quiet subagent command wakes main's wait once, and status names the call
       }
       return fakeShellRun("child-run", command, { yield_time_ms: 300 });
     }
-    // Main. A turn that a report or a note started comes first.
+    // Main. A turn that the report started comes first.
     const latest = latestUserMessage(body);
     if (latest.includes(REPORT_HEADER)) {
       state.relaysAtEnd = quietRelays(body).length;
       return fakeGatewayFinalText("QUIET-RELAY-REPORT-SEEN");
-    }
-    if (isQuietRelay(latest)) {
-      state.relayTurns.push(latest);
-      return fakeGatewayFinalText("QUIET-RELAY-NOTE-SEEN");
     }
     if (hasToolResultAnywhere(body, "main-status")) {
       state.status = toolResultOutput(body, "main-status");
@@ -13494,6 +13941,8 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     }
     if (hasToolResultAnywhere(body, "main-wait")) {
       state.waitResult ||= toolResultOutput(body, "main-wait");
+      // The note that woke the wait follows its result in the same turn.
+      if (isQuietRelay(latest) && !state.relayTurns.includes(latest)) state.relayTurns.push(latest);
       // Status once the subagent is in its second wait: between two calls
       // it has no current call to name. The pause after the gateway sends
       // that wait lets fx start it; the wait lasts 6 s.
@@ -13529,11 +13978,11 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     // Main's wait woke while the subagent still waited on its command, and
     // status names that call and how long it has run.
     expect(state.status, context).toMatch(/worker: working, in Waiting for sh -c .*QUIET-RELAY-READY.* for \d+s/);
-    // In fx ask the note starts main's next turn, and the wait says so.
-    expect(state.waitResult, context).toContain("It starts your next turn, so end this turn to read it.");
+    // The note joins main's running turn, and the wait says it follows.
+    expect(state.waitResult, context).toContain("A report or message arrived. It follows this result.");
     expect(failures, context).toEqual([]);
     expect(result.code, context).toBe(0);
-    // One note, which started main's next turn and names the command.
+    // One note, which names the subagent and the command.
     expect(state.relayTurns.length, context).toBe(1);
     expect(state.relayTurns[0]).toContain('"agent":"worker"');
     expect(state.relayTurns[0]).toContain("QUIET-RELAY-READY");
