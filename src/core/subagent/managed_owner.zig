@@ -969,6 +969,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;
     turn.child_name = if (snapshot.name.len > 0) snapshot.name else null;
+    turn.child_purpose = if (snapshot.purpose.len > 0) snapshot.purpose else null;
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
@@ -1286,11 +1287,14 @@ const RunSnapshot = struct {
     instructions: []u8,
     /// The name the parent gave a persistent child, or empty for a one-off.
     name: []u8,
+    /// What the child is for, or empty when it has none.
+    purpose: []u8,
 
     fn deinit(self: *RunSnapshot, alloc: Allocator) void {
         self.active.deinit(alloc);
         if (self.instructions.len > 0) alloc.free(self.instructions);
         if (self.name.len > 0) alloc.free(self.name);
+        if (self.purpose.len > 0) alloc.free(self.purpose);
         self.* = undefined;
     }
 };
@@ -1313,10 +1317,13 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
         try owner.alloc.dupe(u8, child.instructions());
     errdefer if (instructions.len > 0) owner.alloc.free(instructions);
     const name: []u8 = if (child.agentName()) |value| try owner.alloc.dupe(u8, value) else &.{};
+    errdefer if (name.len > 0) owner.alloc.free(name);
+    const purpose: []u8 = if (child.purpose) |value| try owner.alloc.dupe(u8, value) else &.{};
     return .{
         .active = owned_active,
         .instructions = instructions,
         .name = name,
+        .purpose = purpose,
     };
 }
 
