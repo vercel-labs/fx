@@ -2496,12 +2496,14 @@ test "trace tool calls name why an MCP server refused the parameters" {
         .{ .outcome = .tool_failed, .result = "connection closed" },
         .{ .outcome = .succeeded, .result = refusal },
     };
-    for (fixtures, 0..) |fixture, index| {
-        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(1000 + index), .duration_ms = 1, .outcome = fixture.outcome };
-        call.setName("mcp__fixture__search");
-        call.setArgs("{\"limit\":\"40\"}");
-        call.setResult(fixture.result);
-        diagnostics.recordToolCall(call);
+    for (fixtures) |fixture| {
+        diagnostics.recordToolCallResult(.{
+            .name = "mcp__fixture__search",
+            .arguments_json = "{\"limit\":\"40\"}",
+            .model_output = fixture.result,
+            .outcome = fixture.outcome,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
 
     const w = try TestWriter.create();
@@ -2544,17 +2546,17 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
         .{ .name = "read_file", .outcome = .tool_failed, .args = "{}", .result = "missing" },
         .{ .name = "run_command", .outcome = .runtime_failed, .args = "{\"command\":\"AI_GATEWAY_API_KEY=abcdefghijklmnop zig build\"}", .result = "failed with PASSWORD=abcdefghijklmnop", .subagent_id = 3 },
     };
+    // Each call started `index + 1` seconds ago, so its duration in whole
+    // seconds is known while the clock runs.
     for (fixtures, 0..) |fixture, index| {
-        var call: diagnostics.ToolCallMetric = .{
-            .started_at_ms = @intCast(1000 + index),
-            .duration_ms = @intCast(index + 1),
+        diagnostics.recordToolCallResult(.{
+            .name = fixture.name,
+            .arguments_json = fixture.args,
+            .model_output = fixture.result,
             .outcome = fixture.outcome,
+            .started_at_ms = io_mod.milliTimestamp() - @as(i64, @intCast(index + 1)) * 1000,
             .subagent_id = fixture.subagent_id,
-        };
-        call.setName(fixture.name);
-        call.setArgs(fixture.args);
-        call.setResult(fixture.result);
-        diagnostics.recordToolCall(call);
+        });
     }
 
     const w = try TestWriter.create();
@@ -2571,10 +2573,15 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
     inline for (.{ "succeeded", "rejected", "command_failed", "tool_failed", "runtime_failed" }) |name| {
         try std.testing.expectEqual(@as(i64, 1), try testInt(outcomes, name));
     }
-    try std.testing.expectEqual(@as(i64, 15), try testInt(summary, "total_ms"));
+    const total_ms = try testInt(summary, "total_ms");
+    try std.testing.expectEqual(@as(i64, 15), @divFloor(total_ms, 1000));
     try std.testing.expectEqual(@as(i64, 5), try testInt(try testObject(summary, "session"), "calls"));
     try std.testing.expect(try testBool(summary, "complete"));
     try std.testing.expectEqual(@as(usize, 5), trace.count("tool_call"));
+    var duration_sum: i64 = 0;
+    for (0..5) |index| duration_sum += try testInt(try trace.nth("tool_call", index), "duration_ms");
+    try std.testing.expectEqual(total_ms, duration_sum);
+    try std.testing.expectEqual(@as(usize, 4), trace.count("failed_tool_call"));
 
     const first = try trace.nth("tool_call", 0);
     try std.testing.expectEqualStrings("read_file", try testString(first, "name"));
@@ -2589,7 +2596,7 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
     try std.testing.expectEqualStrings("runtime_failed", try testString(failed, "outcome"));
     try std.testing.expectEqualStrings("subagent", try testString(failed, "source"));
     try std.testing.expectEqual(@as(i64, 3), try testInt(failed, "subagent_id"));
-    try std.testing.expectEqual(@as(i64, 5), try testInt(failed, "duration_ms"));
+    try std.testing.expectEqual(@as(i64, 5), @divFloor(try testInt(failed, "duration_ms"), 1000));
     try expectStartsWith(try testString(failed, "args"), "{\"command\":\"AI_GATEWAY_API_KEY=[redacted]");
     try std.testing.expectEqualStrings("failed with PASSWORD=[redacted]", try testString(failed, "result"));
     try expectAbsent(failed, "result_preview");
@@ -2639,14 +2646,17 @@ test "trace tool payloads cut at the ring's bound keep whole characters" {
     defer diagnostics.resetForTest();
     const exact: [tool_args_max_bytes]u8 = @splat('a');
     const over: [tool_args_max_bytes + 1]u8 = @splat('b');
-    // 1199 bytes of 'c', then a three-byte character that the ring cuts after its first byte.
+    // 1199 bytes of 'c', then a three-byte character that the ring's bound
+    // falls inside of, so the ring leaves the whole character out.
     const cut = text_utils.repeat("c", tool_args_max_bytes - 1) ++ "\xe2\x94\x80";
-    for ([_][]const u8{ &exact, &over, cut }, 0..) |args, index| {
-        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(10 + index), .outcome = .rejected };
-        call.setName("edit_file");
-        call.setArgs(args);
-        call.setResult("x");
-        diagnostics.recordToolCall(call);
+    for ([_][]const u8{ &exact, &over, cut }) |args| {
+        diagnostics.recordToolCallResult(.{
+            .name = "edit_file",
+            .arguments_json = args,
+            .model_output = "x",
+            .outcome = .rejected,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
     const w = try TestWriter.create();
     defer w.destroy();
@@ -2937,12 +2947,21 @@ test "trace network section states complete coverage when nothing was evicted" {
 test "trace tool section reports session totals and window coverage" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
-    var i: u64 = 0;
+    // The first call fails the way a tool does; the later ones push it out of
+    // the window.
+    diagnostics.recordToolCallResult(.{
+        .name = "shell",
+        .arguments_json = "{}",
+        .model_output = "refused",
+        .outcome = .rejected,
+        .started_at_ms = io_mod.milliTimestamp() - 50,
+    });
+    var i: u64 = 1;
     while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
         var call: diagnostics.ToolCallMetric = .{
             .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 100,
             .duration_ms = 50,
-            .outcome = if (i == 0) .rejected else .succeeded,
+            .outcome = .succeeded,
         };
         call.setName("shell");
         diagnostics.recordToolCall(call);
@@ -2960,7 +2979,10 @@ test "trace tool section reports session totals and window coverage" {
     try std.testing.expectEqual(@as(i64, total - 1), try testInt(session_outcomes, "succeeded"));
     try std.testing.expectEqual(@as(i64, 1), try testInt(session_outcomes, "rejected"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(session_outcomes, "runtime_failed"));
-    try std.testing.expectEqual(@as(i64, total * 50), try testInt(session, "total_ms"));
+    // The session total counts the failure the window no longer holds.
+    const failed_ms = try testInt(try trace.one("failed_tool_call"), "duration_ms");
+    try std.testing.expect(failed_ms >= 50);
+    try std.testing.expectEqual(@as(i64, (total - 1) * 50) + failed_ms, try testInt(session, "total_ms"));
     try std.testing.expect(!try testBool(summary, "complete"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(try testObject(summary, "outcomes"), "rejected"));
 
@@ -3484,15 +3506,13 @@ test "trace stays well formed with every ring full and a long transcript" {
     const plain_big = text_utils.repeat("\"quoted\" \\ \xff\xc3 \u{2028}\n", 30);
     // Two of every three calls fail, more than the failure ring holds.
     for (0..diagnostics.tool_call_ring_capacity + 1) |index| {
-        var call: diagnostics.ToolCallMetric = .{
-            .started_at_ms = @intCast(1_000 + index),
-            .duration_ms = 7,
+        diagnostics.recordToolCallResult(.{
+            .name = "shell",
+            .arguments_json = big,
+            .model_output = big,
             .outcome = if (index % 3 == 0) .succeeded else .tool_failed,
-        };
-        call.setName("shell");
-        call.setArgs(big);
-        call.setResult(big);
-        diagnostics.recordToolCall(call);
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
     for (0..diagnostics.network_ring_capacity + 1) |index| {
         var call: diagnostics.NetworkCall = .{

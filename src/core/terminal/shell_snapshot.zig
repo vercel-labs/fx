@@ -221,25 +221,13 @@ pub const TraceView = struct {
     state: []const u8,
     dirty: bool,
     failure: ?[]const u8 = null,
-    shell_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
-    shell_path_len: usize = 0,
     /// Every alias and function name the snapshot holds.
     names_total: usize = 0,
     redefined_buf: [traced_command_names.len]RedefinedCommand = undefined,
     redefined_len: usize = 0,
 
-    pub fn shellPath(self: *const TraceView) []const u8 {
-        return self.shell_path_buf[0..self.shell_path_len];
-    }
-
     pub fn redefined(self: *const TraceView) []const RedefinedCommand {
         return self.redefined_buf[0..self.redefined_len];
-    }
-
-    fn setShellPath(self: *TraceView, path: []const u8) void {
-        const len = @min(path.len, self.shell_path_buf.len);
-        @memcpy(self.shell_path_buf[0..len], path[0..len]);
-        self.shell_path_len = len;
     }
 
     /// Lists each traced name the snapshot defines, reading every alias
@@ -557,11 +545,8 @@ pub const Owner = struct {
                 null,
         };
         if (self.active) |generation| {
-            view.setShellPath(generation.shell_path);
             view.names_total = generation.names.count();
             view.collectRedefined(generation);
-        } else if (self.state == .failed) {
-            view.setShellPath(self.failed_shell[0..self.failed_shell_len]);
         }
         return view;
     }
@@ -1264,7 +1249,6 @@ test "snapshot trace view names redefined common commands and what their aliases
     const view = owner.traceView();
     try testing.expectEqualStrings("ready", view.state);
     try testing.expect(view.failure == null);
-    try testing.expectEqualStrings("/bin/zsh", view.shellPath());
     try testing.expectEqual(@as(usize, 5), view.names_total);
     const redefined = view.redefined();
     try testing.expectEqual(@as(usize, 3), redefined.len);
@@ -1287,7 +1271,6 @@ test "snapshot trace view says why the capture failed" {
     const view = owner.traceView();
     try testing.expectEqualStrings("failed", view.state);
     try testing.expectEqualStrings("the login shell did not finish within 10 s", view.failure.?);
-    try testing.expectEqualStrings("/bin/zsh", view.shellPath());
     try testing.expectEqual(@as(usize, 0), view.redefined().len);
 }
 

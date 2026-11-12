@@ -142,16 +142,6 @@ pub const KeptText = struct {
         self.total_bytes = @intCast(kept.len);
     }
 
-    /// Keeps `prefix`, the first bytes of a value `total_bytes` long, as the
-    /// head; the bytes after it count as omitted.
-    fn setPrefix(self: *KeptText, prefix: []const u8, total_bytes: u32) void {
-        const n = utf8PrefixLen(prefix, max_failure_field_len);
-        @memcpy(self.buf[0..n], prefix[0..n]);
-        self.head_len = @intCast(n);
-        self.tail_len = 0;
-        self.total_bytes = @max(total_bytes, @as(u32, @intCast(n)));
-    }
-
     fn clear(self: *KeptText) void {
         self.head_len = 0;
         self.tail_len = 0;
@@ -282,7 +272,6 @@ pub fn record(call: ToolCallMetric) void {
     mutex.lockUncancelable(zio);
     defer mutex.unlock(zio);
     recordLocked(call);
-    if (call.outcome != .succeeded) recordMetricFailureLocked(&call);
 }
 
 fn recordLocked(call: ToolCallMetric) void {
@@ -298,19 +287,13 @@ fn recordLocked(call: ToolCallMetric) void {
     lifetime.total_duration_ms += stored_call.duration_ms;
 }
 
-/// The failure slot to fill next, the oldest once the ring is full. Callers
-/// fill it in place: a kept failure is about 17 KiB.
-fn nextFailureSlotLocked() *FailedToolCall {
+/// Writes a failed call into the failure ring from its whole arguments and
+/// output. The slot is filled in place: a kept failure is about 17 KiB.
+fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32) void {
     const slot = &failures[failures_head];
     failures_head = (failures_head + 1) % failure_ring_capacity;
     if (failures_stored < failure_ring_capacity) failures_stored += 1;
-    return slot;
-}
 
-/// Writes a failed call into the failure ring from its whole arguments and
-/// output.
-fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32) void {
-    const slot = nextFailureSlotLocked();
     slot.started_at_ms = input.started_at_ms;
     slot.duration_ms = duration_ms;
     slot.outcome = input.outcome;
@@ -330,29 +313,6 @@ fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32) void {
     } else {
         slot.args.set(input.arguments_json);
         slot.result.set(tool_result_display.contentForDisplay(input.model_output));
-    }
-}
-
-/// Keeps a failure that arrives as a window metric, so every failure in the
-/// window is also in the failure ring. A metric holds only the window's cuts
-/// of its payloads, so the kept failure has those and no folder.
-fn recordMetricFailureLocked(call: *const ToolCallMetric) void {
-    const slot = nextFailureSlotLocked();
-    slot.started_at_ms = call.started_at_ms;
-    slot.duration_ms = call.duration_ms;
-    slot.outcome = call.outcome;
-    slot.subagent_id = call.subagent_id;
-    slot.name_buf = call.name_buf;
-    slot.name_len = call.name_len;
-    slot.call_id_buf = call.call_id_buf;
-    slot.call_id_len = call.call_id_len;
-    slot.dir_len = 0;
-    if (omitsPayloadsForName(call.name())) {
-        slot.args.clear();
-        slot.result.clear();
-    } else {
-        slot.args.setPrefix(call.args(), call.args_total_bytes);
-        slot.result.setPrefix(call.result(), call.result_total_bytes);
     }
 }
 
@@ -656,36 +616,6 @@ test "a session reset clears the failure ring" {
     defer freeFailuresForTest(kept);
     try std.testing.expectEqual(@as(usize, 0), kept.len);
     try std.testing.expectEqual(@as(u64, 0), lifetimeStats().failureCount());
-}
-
-test "a failure recorded from a window metric is kept with the window's cuts" {
-    resetForTest();
-    defer resetForTest();
-
-    const long_args: [max_args_len + 10]u8 = @splat('a');
-    var failed: ToolCallMetric = .{ .started_at_ms = 1000, .duration_ms = 4, .outcome = .tool_failed, .subagent_id = 2 };
-    failed.setName("read_file");
-    failed.setCallId("call_metric");
-    failed.setArgs(&long_args);
-    failed.setResult("missing");
-    record(failed);
-    var ok: ToolCallMetric = .{ .started_at_ms = 1001, .outcome = .succeeded };
-    ok.setName("read_file");
-    record(ok);
-
-    const kept = try snapshotFailuresForTest();
-    defer freeFailuresForTest(kept);
-    try std.testing.expectEqual(@as(usize, 1), kept.len);
-    try std.testing.expectEqualStrings("call_metric", kept[0].callId());
-    try std.testing.expectEqualStrings("read_file", kept[0].name());
-    try std.testing.expectEqual(@as(u32, 4), kept[0].duration_ms);
-    try std.testing.expectEqual(@as(u64, 2), kept[0].subagent_id);
-    try std.testing.expectEqualStrings("", kept[0].dir());
-    try std.testing.expectEqual(max_args_len, kept[0].args.head().len);
-    try std.testing.expectEqual(@as(u32, max_args_len + 10), kept[0].args.total_bytes);
-    try std.testing.expectEqual(@as(u32, 10), kept[0].args.omittedBytes());
-    try std.testing.expectEqualStrings("missing", kept[0].result.head());
-    try std.testing.expectEqual(@as(u32, 0), kept[0].result.omittedBytes());
 }
 
 test "the rings match a reference list on seeded random sequences" {
