@@ -3521,7 +3521,7 @@ fn checkReviewAndSetupRecords(input: []const u8) !void {
     defer w.destroy();
     try writeAutoReviews(&w.records);
     try writeGitParts(&w.records, .{ .in_git_repo = true, .branch = @constCast(input), .status = @constCast(input), .log = @constCast(input) });
-    const entries = [_]settings_entries.Entry{.{ .key = input, .value = .{ .string = input }, .origin = .env, .variable = "FX_PROBE" }};
+    const entries = [_]settings_entries.Entry{.{ .key = input, .value = .{ .string = input }, .origin = .env, .variable = "FX_MODEL" }};
     try writeSettingRecords(&w.records, &entries, &.{}, input);
     const skills = [_]skill_runtime.Skill{.{ .name = input, .description = "", .path = input, .source = .workspace_agents }};
     const problems = [_]skill_runtime.SkillDiagnostic{.{ .path = input, .source = .workspace_agents, .scope = .candidate, .cause = .unreadable }};
