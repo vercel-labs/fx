@@ -29,7 +29,7 @@ PC == INSTANCE PromptCache WITH
   MaxSessions <- 0, MaxSteps <- 0, Limit <- 4, PathScoped <- TRUE, Events <- {"switch", "deliver", "skill"},
   sessions <- 0, active <- 0, branchOf <- 0
 
-Kinds == <<"tools", "base", "skills", "project", "mcp", "ctx", "rt">>
+Kinds == <<"tools", "base", "menu", "project", "ctx", "rt">>
 
 Has(req, kind) == \E j \in 1..Len(req) : req[j].k = kind
 

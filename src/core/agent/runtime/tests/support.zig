@@ -644,6 +644,8 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_index: usize = 0,
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
+    /// The rejected token each refresh carried, in the order of the modes.
+    credential_refresh_rejected: std.ArrayList(?[]u8) = .empty,
     credential_refresh_error: ?anyerror = null,
     /// A forced refresh finds nothing, as when the refresh token is rejected.
     credential_refresh_fail_force: bool = false,
@@ -758,6 +760,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
+        for (self.credential_refresh_rejected.items) |token| if (token) |value| self.alloc.free(value);
+        self.credential_refresh_rejected.deinit(self.alloc);
         if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
@@ -913,10 +917,12 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.default_model_capabilities;
     }
 
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?runtime_deps.RefreshedGatewayCredential {
+    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) !?runtime_deps.RefreshedGatewayCredential {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
+        try self.credential_refresh_rejected.ensureUnusedCapacity(self.alloc, 1);
+        self.credential_refresh_rejected.appendAssumeCapacity(if (rejected_token) |token| try self.alloc.dupe(u8, token) else null);
         if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
             try self.alloc.dupe(u8, account_id)

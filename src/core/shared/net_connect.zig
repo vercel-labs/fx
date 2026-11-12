@@ -160,16 +160,19 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
 
 const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
 
-fn setCloexec(fd: posix.fd_t) error{Unexpected}!void {
+/// Closes `fd` when the process runs another program.
+pub fn setCloexec(fd: posix.fd_t) error{Unexpected}!void {
     _ = try fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
 }
 
-fn setNonblocking(fd: posix.fd_t) error{Unexpected}!void {
+/// Makes calls on `fd` return instead of waiting.
+pub fn setNonblocking(fd: posix.fd_t) error{Unexpected}!void {
     const flags = try fcntl(fd, posix.F.GETFL, 0);
     _ = try fcntl(fd, posix.F.SETFL, flags | nonblock_flag);
 }
 
-fn setBlocking(fd: posix.fd_t) error{Unexpected}!void {
+/// Makes calls on `fd` wait until they can finish.
+pub fn setBlocking(fd: posix.fd_t) error{Unexpected}!void {
     const flags = try fcntl(fd, posix.F.GETFL, 0);
     _ = try fcntl(fd, posix.F.SETFL, flags & ~nonblock_flag);
 }
