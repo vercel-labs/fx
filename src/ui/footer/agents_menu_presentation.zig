@@ -275,23 +275,23 @@ pub fn composeAgentsMenuRow(
 }
 
 const hint_variants = [_][]const u8{
-    "↑↓ move     enter switch     esc back",
-    "↑↓ move  enter switch  esc back",
-    "↑↓ move  enter  esc",
+    "↑↓ preview     enter switch     esc back",
+    "↑↓ preview  enter switch  esc back",
+    "↑↓ preview  enter  esc",
     "enter switch  esc back",
 };
 
 const closable_hint_variants = [_][]const u8{
-    "↑↓ move     enter switch     delete close     esc back",
-    "↑↓ move  enter switch  delete close  esc back",
-    "↑↓ move  enter  delete close  esc",
+    "↑↓ preview     enter switch     delete close     esc back",
+    "↑↓ preview  enter switch  delete close  esc back",
+    "↑↓ preview  enter  delete close  esc",
     "enter switch  esc back",
 };
 
 const search_hint_variants = [_][]const u8{
-    "↑↓ move     enter switch     esc clear",
-    "↑↓ move  enter switch  esc clear",
-    "↑↓ move  enter  esc clear",
+    "↑↓ preview     enter switch     esc clear",
+    "↑↓ preview  enter switch  esc clear",
+    "↑↓ preview  enter  esc clear",
     "enter switch  esc clear",
 };
 
@@ -366,7 +366,7 @@ test "a search counts what it matched, and keeps the list open when nothing does
     defer std.testing.allocator.free(heading.text);
     try std.testing.expectEqualStrings("  Agents 1", heading.text);
     try std.testing.expectEqual(@as(u16, 3), menuRowCount(matched, max_inline_rows));
-    try std.testing.expectEqualStrings("↑↓ move     enter switch     esc clear", hintVariants(matched)[0]);
+    try std.testing.expectEqualStrings("↑↓ preview     enter switch     esc clear", hintVariants(matched)[0]);
 
     try expectRows(.{ .search = "nobody" }, 80, max_inline_rows, &.{ "  Agents 0", "" });
     try std.testing.expect(!(AgentsMenuProjection{}).active());
