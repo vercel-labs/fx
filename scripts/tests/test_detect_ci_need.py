@@ -130,6 +130,7 @@ class DetectCiNeedTests(unittest.TestCase):
             "src/mcp/engine.zig",
             "src/core/mcp_host/host.zig",
             "src/core/mcp/config.zig",
+            "src/core/shared/net_connect.zig",
             "tests/tla/mcp/Engine.tla",
             "tests/tla/mcp_host/Host.tla",
             "tests/tla/drivers/mcp/driver.ts",

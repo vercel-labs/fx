@@ -21,6 +21,7 @@
 //! (https://codeberg.org/ziglang/zig/issues/31391).
 const std = @import("std");
 const builtin = @import("builtin");
+const debug_trace = @import("debug_trace.zig");
 
 const posix = std.posix;
 const net = std.Io.net;
@@ -71,20 +72,85 @@ fn connect(
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
+    return connectWith(startConnect, io, address, options);
+}
+
+/// The call that starts the kernel's connect on `fd`. Tests give `connectWith`
+/// a stand-in, to make a connect that fails at once or never ends.
+fn startConnect(fd: posix.fd_t, address: *const posix.sockaddr, length: posix.socklen_t) posix.E {
+    return posix.errno(posix.system.connect(fd, address, length));
+}
+
+/// `connect` with `start` as the call that starts the kernel's connect.
+fn connectWith(
+    comptime start: anytype,
+    io: std.Io,
+    address: *const net.IpAddress,
+    options: net.IpAddress.ConnectOptions,
+) net.IpAddress.ConnectError!net.Socket {
     try io.checkCancel();
     const fd = try openSocket(Threaded.posixAddressFamily(address), options);
-    errdefer Threaded.closeFd(fd);
+    traceConnect(io, fd, "start", null);
+    const socket = connectOpened(start, io, fd, address) catch |err| {
+        // The line comes before the close: a closed descriptor's number can go to
+        // another thread's connect, whose lines would then mix with these.
+        traceConnect(io, fd, "done", resultName(err));
+        Threaded.closeFd(fd);
+        return err;
+    };
+    traceConnect(io, fd, "done", "ok");
+    return socket;
+}
+
+/// Connects the open socket `fd` and returns it blocking. The caller closes
+/// `fd` when this fails.
+fn connectOpened(
+    comptime start: anytype,
+    io: std.Io,
+    fd: posix.fd_t,
+    address: *const net.IpAddress,
+) net.IpAddress.ConnectError!net.Socket {
     try setNonblocking(fd);
     var storage: Threaded.PosixAddress = undefined;
     const length = Threaded.addressToPosix(address, &storage);
-    switch (posix.errno(posix.system.connect(fd, &storage.any, length))) {
+    switch (start(fd, &storage.any, length)) {
         .SUCCESS => {},
         // Interrupted or not, the connection goes on in the kernel.
-        .INPROGRESS, .INTR => try awaitConnected(io, fd),
+        .INTR => {
+            traceConnect(io, fd, "intr", null);
+            try awaitConnected(io, fd);
+        },
+        .INPROGRESS => try awaitConnected(io, fd),
         else => |err| return connectError(err),
     }
     try setBlocking(fd);
     return .{ .handle = fd, .address = try localAddress(fd) };
+}
+
+/// One FX_TRACE line per event under the scope `net`: the descriptor and the
+/// outcome, never an address. tests/tla/drivers/mcp_host/connect.test.ts reads
+/// them and has TLC check each socket against tests/tla/mcp_host/Connect.tla.
+///
+/// `debug_trace` writes its file with an Io call that is a cancelation point,
+/// and drops the line when that call ends `error.Canceled`. That would take the
+/// cancel that this connect is waiting for, so the write runs with cancelation
+/// blocked and the cancel stays for the next `io.checkCancel`.
+fn traceConnect(io: std.Io, fd: posix.fd_t, comptime event: []const u8, result: ?[]const u8) void {
+    const before = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(before);
+    if (result) |name| {
+        debug_trace.logf("net", "connect fd={d} event=" ++ event ++ " result={s}", .{ fd, name });
+    } else {
+        debug_trace.logf("net", "connect fd={d} event=" ++ event, .{fd});
+    }
+}
+
+fn resultName(err: net.IpAddress.ConnectError) []const u8 {
+    return switch (err) {
+        error.Canceled => "canceled",
+        error.ConnectionRefused => "refused",
+        else => "other",
+    };
 }
 
 fn awaitConnected(io: std.Io, fd: posix.fd_t) net.IpAddress.ConnectError!void {
@@ -93,7 +159,7 @@ fn awaitConnected(io: std.Io, fd: posix.fd_t) net.IpAddress.ConnectError!void {
         const ready = posix.system.poll(&fds, fds.len, cancel_check_ms);
         switch (posix.errno(ready)) {
             .SUCCESS => if (ready > 0) return socketError(fd),
-            .INTR => {},
+            .INTR => traceConnect(io, fd, "intr", null),
             .AGAIN, .NOMEM => return error.SystemResources,
             else => |err| return posix.unexpectedErrno(err),
         }
@@ -197,6 +263,7 @@ fn localAddress(fd: posix.fd_t) error{Unexpected}!net.IpAddress {
 }
 
 const testing = std.testing;
+const io_mod = @import("io.zig");
 
 fn loopback(port: u16) net.IpAddress {
     return .{ .ip4 = .loopback(port) };
@@ -456,4 +523,186 @@ test "waiting for a connect ends promptly when its task is canceled" {
 
     try testing.expectError(error.Canceled, result);
     try testing.expect(waited.raw.toMilliseconds() < 1000);
+}
+
+/// CPU time the process has used so far, user and system, in microseconds.
+fn cpuMicroseconds() i64 {
+    const usage = posix.getrusage(0);
+    return (@as(i64, usage.utime.sec) + usage.stime.sec) * std.time.us_per_s + usage.utime.usec + usage.stime.usec;
+}
+
+/// The descriptor of the socket the last stand-in start call was given.
+var started_fd: std.atomic.Value(posix.fd_t) = .init(-1);
+
+/// Starts the real connect and remembers the descriptor.
+fn recordingStart(fd: posix.fd_t, address: *const posix.sockaddr, length: posix.socklen_t) posix.E {
+    started_fd.store(fd, .release);
+    return startConnect(fd, address, length);
+}
+
+/// A connect that fails at once.
+fn failAtOnceStart(fd: posix.fd_t, _: *const posix.sockaddr, _: posix.socklen_t) posix.E {
+    started_fd.store(fd, .release);
+    return .NETUNREACH;
+}
+
+/// A connect that never ends: a listening socket never becomes writable, on
+/// macOS and on Linux, so the wait goes on until a cancel.
+fn holdStart(fd: posix.fd_t, _: *const posix.sockaddr, _: posix.socklen_t) posix.E {
+    started_fd.store(fd, .release);
+    _ = posix.system.listen(fd, 1);
+    return .INPROGRESS;
+}
+
+/// Whether `fd` is still a stream socket that is not connected: what a
+/// connect that failed leaves behind if it does not close its socket. A closed
+/// descriptor is not, and neither is one that another thread of the test
+/// process reused for a file or a connected socket, so this does not depend on
+/// how many descriptors the process has open.
+fn looksLeaked(fd: posix.fd_t) bool {
+    if (posix.errno(posix.system.fcntl(fd, posix.F.GETFD, @as(usize, 0))) != .SUCCESS) return false;
+    var kind: c_int = 0;
+    var kind_length: posix.socklen_t = @sizeOf(c_int);
+    if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, @ptrCast(&kind), &kind_length)) != .SUCCESS) return false;
+    if (kind != posix.SOCK.STREAM) return false;
+    var storage: Threaded.PosixAddress = undefined;
+    var length: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
+    // Which errno a socket that never connected, or whose connect failed, gives
+    // differs between macOS and Linux; only a peer means it is in use.
+    return posix.errno(posix.system.getpeername(fd, &storage.any, &length)) != .SUCCESS;
+}
+
+/// Each connect of `start` that must fail with `expected` closes its socket.
+fn expectFailureClosesSocket(comptime start: anytype, expected: anyerror, address: *const net.IpAddress) !void {
+    for (0..20) |_| {
+        started_fd.store(-1, .release);
+        try testing.expectError(expected, connectWith(start, testing.io, address, .{ .mode = .stream }));
+        const fd = started_fd.load(.acquire);
+        try testing.expect(fd >= 0);
+        try testing.expect(!looksLeaked(fd));
+    }
+}
+
+test "a refused connect closes its socket" {
+    // macOS reports the refusal through SO_ERROR after EINPROGRESS; Linux may
+    // report it from connect itself. Both end in the cleanup of `connectWith`.
+    const io = testing.io;
+    var server = try loopback(0).listen(io, .{});
+    const closed = server.socket.address;
+    server.deinit(io);
+    try expectFailureClosesSocket(recordingStart, error.ConnectionRefused, &closed);
+}
+
+test "a connect that fails at once closes its socket" {
+    const address = loopback(9);
+    try expectFailureClosesSocket(failAtOnceStart, error.NetworkUnreachable, &address);
+}
+
+fn holdConnect(io: std.Io, address: net.IpAddress) net.IpAddress.ConnectError!net.Socket {
+    return connectWith(holdStart, io, &address, .{ .mode = .stream });
+}
+
+test "a cancel while a connect waits closes its socket and ends within 100 ms" {
+    const io = testing.io;
+    var task = try io.concurrent(holdConnect, .{ io, loopback(9) });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const result = task.cancel(io);
+    const waited = started.untilNow(io);
+
+    try testing.expectError(error.Canceled, result);
+    try testing.expect(waited.raw.toMilliseconds() < 100);
+    const fd = started_fd.load(.acquire);
+    try testing.expect(fd >= 0);
+    try testing.expect(!looksLeaked(fd));
+}
+
+var gate_ready: std.atomic.Value(bool) = .init(false);
+var gate_open: std.atomic.Value(bool) = .init(false);
+
+/// Waits, without any Io call, until the test has asked this task to cancel,
+/// then writes a trace line and checks for the cancel.
+fn traceWhileCancelRequested(io: std.Io) error{Canceled}!void {
+    gate_ready.store(true, .release);
+    while (!gate_open.load(.acquire)) std.Thread.yield() catch {};
+    traceConnect(io, 3, "start", null);
+    try io.checkCancel();
+}
+
+fn openGateSoon(io: std.Io) void {
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    gate_open.store(true, .release);
+}
+
+test "a trace line does not swallow the cancel that a connect is waiting for" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "net.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "net");
+
+    gate_ready.store(false, .release);
+    gate_open.store(false, .release);
+    var task = try io.concurrent(traceWhileCancelRequested, .{io});
+    var opener = try io.concurrent(openGateSoon, .{io});
+    while (!gate_ready.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    // The cancel is requested while the task is still between Io calls: it is
+    // delivered at the task's next cancelation point.
+    const result = task.cancel(io);
+    opener.await(io);
+    try testing.expectError(error.Canceled, result);
+}
+
+test "a connect writes one start and one done line to the net trace, and no address" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "net.log" });
+    defer alloc.free(path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "net");
+
+    var server = try loopback(0).listen(io, .{});
+    const listening = server.socket.address;
+    const socket = try connect(io, &listening, .{ .mode = .stream });
+    Threaded.closeFd(socket.handle);
+    const accepted = try server.accept(io);
+    accepted.close(io);
+    server.deinit(io);
+    try testing.expectError(error.ConnectionRefused, connect(io, &listening, .{ .mode = .stream }));
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(alloc, &file, 8192);
+    defer alloc.free(text);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "event=start"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "event=done result=ok"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "event=done result=refused"));
+    try testing.expect(std.mem.find(u8, text, "127.0.0.1") == null);
+}
+
+test "waiting for a connect uses no CPU while it waits" {
+    // A slice of 20 ms wakes the waiting thread 50 times a second; a loop that
+    // spun would use the whole interval.
+    const io = testing.io;
+    const pair = try StalledPair.open();
+    defer pair.close();
+
+    var task = try io.concurrent(awaitConnected, .{ io, pair.fds[0] });
+    const cpu_start = cpuMicroseconds();
+    try io.sleep(.fromMilliseconds(1500), .awake);
+    const cpu_ms = @divTrunc(cpuMicroseconds() - cpu_start, std.time.us_per_ms);
+    try testing.expectError(error.Canceled, task.cancel(io));
+    try testing.expect(cpu_ms < 150);
 }
