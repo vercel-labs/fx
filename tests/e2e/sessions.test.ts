@@ -3654,6 +3654,62 @@ test("fx session shows saved control bytes as visible escapes, with --tail and w
   }
 }, TIMEOUT * 2);
 
+test.skipIf(!tmuxAvailable())("fx sessions fits a terminal in color, and NO_COLOR, TERM=dumb, and a pipe get whole plain titles", async () => {
+  const fixture = createFixture("fx-v2-list-terminal-");
+  const prompt = "Plan the move of every saved session to the new store and check each one.";
+  const gateway = startFakeGateway([fakeGatewayFinalText("PLANNED")]);
+  const panes: TmuxSession[] = [];
+  const sgr = /\x1b\[[0-9;]*m/g;
+  // What `fx sessions` printed in a 60-column terminal with `extra` in its environment, with its escapes.
+  const inTerminal = async (extra: Record<string, string | undefined>) => {
+    const pane = await TmuxSession.create({
+      cmd: `${FX_BIN} sessions`,
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), NO_COLOR: undefined, ...extra },
+      width: 60,
+      remainOnExit: true,
+    });
+    panes.push(pane);
+    await pane.waitForText("Running now", TIMEOUT);
+    // Only the list, through its last line, and not what tmux shows after fx exits.
+    const lines = (await pane.capturePaneEscapes()).split("\n");
+    return lines.slice(0, lines.findIndex((line) => line.replace(sgr, "").startsWith("Running now")) + 1).join("\n");
+  };
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, [prompt])).stdout).session_id;
+    const saved = JSON.parse((await command(fixture, gateway, ["sessions", "--json"])).stdout).sessions[0];
+    expect(saved.id).toBe(id);
+    // Wider than the 29 columns the title gets in this window.
+    const title: string = saved.title;
+    expect(title.length).toBeGreaterThan(29);
+
+    // A terminal that takes color gets color, and the title is cut so the row fits the window.
+    const styled = await inTerminal({});
+    expect(styled).toContain("\x1b[");
+    const rows = styled.replace(sgr, "").split("\n").map((line) => line.trimEnd());
+    const row = rows.find((line) => line.endsWith(id))!;
+    expect(row).toContain("…");
+    expect(row).not.toContain(title);
+    for (const line of rows) expect(line.length).toBeLessThanOrEqual(60);
+
+    // NO_COLOR, TERM=dumb, and a pipe get no color and the whole title.
+    for (const extra of [{ NO_COLOR: "1" }, { TERM: "dumb" }]) {
+      const plain = await inTerminal(extra);
+      expect(plain).not.toContain("\x1b[");
+      expect(plain).toContain(title);
+      expect(plain).not.toContain("…");
+    }
+    const piped = await command(fixture, gateway, ["sessions"]);
+    expect(piped.code).toBe(0);
+    expect(piped.stdout).not.toMatch(/[\x1b…]/);
+    expect(piped.stdout.split("\n").find((line) => line.includes(id))).toContain(title);
+  } finally {
+    for (const pane of panes) await pane.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
 test("fx session <id>/<agent> reads a subagent by the name its parent gave it", async () => {
   const fixture = createFixture("fx-v2-agent-read-");
   let round: 1 | 2 = 1;

@@ -3302,12 +3302,15 @@ fn writeJsonCommandFailureCode(
 
 /// How `fx sessions` prints for a person: in color and fitted to the window
 /// when it writes to a terminal that takes color, with ages counted from
-/// now. Output a test captures is plain, so it reads the same everywhere.
+/// now. A pipe, `NO_COLOR`, or `TERM=dumb` gets plain text with whole titles,
+/// and output a test captures is plain, so it reads the same everywhere.
 fn sessionListStyle(deps: RunDeps) output_contracts.ListStyle {
-    const terminal = deps.write_stdout == &writeRealStdout and terminal_env.stdoutIsTerminal();
+    const styled = deps.write_stdout == &writeRealStdout and
+        terminal_env.stdoutIsTerminal() and
+        !terminal_env.colorDisabled();
     return .{
-        .color = terminal and !terminal_env.colorDisabled(),
-        .columns = if (terminal) terminal_env.stdoutColumns() else null,
+        .color = styled,
+        .columns = if (styled) terminal_env.stdoutColumns() else null,
         .now_ms = io_mod.milliTimestamp(),
         .home = io_mod.homeDir(),
     };
