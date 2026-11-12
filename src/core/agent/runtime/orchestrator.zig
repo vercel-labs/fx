@@ -5293,11 +5293,25 @@ fn refreshGatewayCredentialForJob(
     owned_api_key: *?[]u8,
     trace_ctx: TraceContext,
 ) !bool {
-    const source = job.credential_source orelse return false;
-    if (!credentials.sourceRefreshable(source)) return false;
-    const refresh = deps.refresh_gateway_credential orelse return false;
+    const refreshed = (try loadJobCredential(deps, alloc, job, mode, trace_ctx)) orelse return false;
+    adoptJobCredential(alloc, job, mode, refreshed, active_api_key, owned_api_key, trace_ctx);
+    return true;
+}
 
-    const refreshed = refresh(deps.ctx, alloc, source, mode, job.account_id) catch |err| {
+/// The job's credential from the host in `mode`, owned by the caller. Null
+/// when its source is not refreshable, the host holds none, or the host
+/// refused it, such as a stored sign-in for another account or team.
+fn loadJobCredential(
+    deps: *const AgentRuntimeDeps,
+    alloc: Allocator,
+    job: QueuedPrompt,
+    mode: CredentialRefreshMode,
+    trace_ctx: TraceContext,
+) !?[]u8 {
+    const source = job.credential_source orelse return null;
+    if (!credentials.sourceRefreshable(source)) return null;
+    const refresh = deps.refresh_gateway_credential orelse return null;
+    return refresh(deps.ctx, alloc, source, mode, job.account_id) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.eventf(
             "gateway",
@@ -5306,19 +5320,62 @@ fn refreshGatewayCredentialForJob(
             "source={s} mode={s} err={s}",
             .{ @tagName(source), @tagName(mode), @errorName(err) },
         );
-        return false;
-    } orelse return false;
+        return null;
+    };
+}
+
+fn adoptJobCredential(
+    alloc: Allocator,
+    job: QueuedPrompt,
+    mode: CredentialRefreshMode,
+    credential: []u8,
+    active_api_key: *[]const u8,
+    owned_api_key: *?[]u8,
+    trace_ctx: TraceContext,
+) void {
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
-    owned_api_key.* = refreshed;
-    active_api_key.* = refreshed;
+    owned_api_key.* = credential;
+    active_api_key.* = credential;
     debug_trace.eventf(
         "gateway",
         "credential_refreshed",
         trace_ctx,
         "source={s} mode={s}",
-        .{ @tagName(source), @tagName(mode) },
+        .{ if (job.credential_source) |source| @tagName(source) else "none", @tagName(mode) },
     );
-    return true;
+}
+
+/// Renews the credential the provider rejected with 401 for one replay: the
+/// stored credential when another fx process already replaced the rejected
+/// token, and a forced refresh only when the store still holds it, because
+/// every forced refresh rotates the sign-in all fx processes share
+/// (`tests/e2e/auth-refresh.test.ts` "fx ask replays a rejected request with
+/// the login another fx already renewed, without refreshing"). When the store
+/// holds nothing this job can send, such as another team's sign-in, nothing is
+/// refreshed (`tests/e2e/auth-refresh.test.ts` "fx ask does not refresh the
+/// login another fx signed in to another team when its request is rejected").
+fn renewRejectedCredentialForJob(
+    deps: *const AgentRuntimeDeps,
+    alloc: Allocator,
+    job: QueuedPrompt,
+    active_api_key: *[]const u8,
+    owned_api_key: *?[]u8,
+    trace_ctx: TraceContext,
+) !bool {
+    // A host can free the active key while it loads the stored one, such as
+    // when ACP publishes it to the session, so keep the rejected bytes for the
+    // comparison.
+    const rejected = try alloc.dupe(u8, active_api_key.*);
+    defer secret.zeroAndFree(alloc, rejected);
+    const stored = (try loadJobCredential(deps, alloc, job, .reload, trace_ctx)) orelse {
+        debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
+        return false;
+    };
+    // Adopt it even when it is the rejected token: the job then owns the bytes
+    // it holds if the forced refresh gives nothing.
+    adoptJobCredential(alloc, job, .reload, stored, active_api_key, owned_api_key, trace_ctx);
+    if (!std.mem.eql(u8, stored, rejected)) return true;
+    return refreshGatewayCredentialForJob(deps, alloc, job, .force, active_api_key, owned_api_key, trace_ctx);
 }
 
 const ProviderAdmission = struct {
@@ -8667,11 +8724,10 @@ fn processQueuedPromptLoop(
                 .already_replayed = auth_retry_used,
             });
             if (auth_replay == .refresh_and_replay) {
-                if (try refreshGatewayCredentialForJob(
+                if (try renewRejectedCredentialForJob(
                     deps,
                     std.heap.c_allocator,
                     job,
-                    .force,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
