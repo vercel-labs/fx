@@ -1113,6 +1113,53 @@ fn storyArgInt(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key:
     return if (value == .integer) value.integer else null;
 }
 
+fn withoutSuffix(text: []const u8, suffix: []const u8) ?[]const u8 {
+    if (text.len <= suffix.len or !std.mem.endsWith(u8, text, suffix)) return null;
+    return text[0 .. text.len - suffix.len];
+}
+
+/// A subagent row by its action and the subagent's name, such as
+/// "Messaged reviewer" or "reviewer finished", without the message or the
+/// reply, which Ctrl+O shows. It rewords core's row text, so a state core
+/// adds later still shows, in core's words, without its message. Null for
+/// other rows.
+fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) !?[]const u8 {
+    if (!std.mem.eql(u8, record.tool_name, "subagent")) return null;
+    const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
+    if (lead.len == 0) return null;
+    const action = storyArgString(scratch, record, "action");
+    if (action) |name| if (std.mem.eql(u8, name, "message")) {
+        if (std.mem.startsWith(u8, lead, "sent to ")) return try scratch.print("Messaged {s}", .{lead["sent to ".len..]});
+        if (withoutSuffix(lead, " busy; message not sent")) |agent| return try scratch.print("Couldn't message {s} (busy)", .{agent});
+        if (withoutSuffix(lead, " failed")) |agent| return try scratch.print("Couldn't message {s}", .{agent});
+        if (withoutSuffix(lead, " interrupted")) |agent| return try scratch.print("Cancelled message to {s}", .{agent});
+        if (withoutSuffix(lead, " feedback not applied")) |agent| return try scratch.print("Feedback to {s} not applied", .{agent});
+        if (withoutSuffix(lead, " feedback queued") orelse withoutSuffix(lead, " feedback applied")) |agent|
+            return try scratch.print("Sent feedback to {s}", .{agent});
+        // "reviewer working", "reviewer still running": the subagent works.
+        return lead;
+    };
+    if (action == null) {
+        // A report or a message a subagent sent to main.
+        if (std.mem.startsWith(u8, lead, "from ")) return try scratch.print("Message from {s}", .{lead["from ".len..]});
+        if (std.mem.startsWith(u8, lead, "report from ")) return try scratch.print("Report from {s}", .{lead["report from ".len..]});
+        if (withoutSuffix(lead, " completed")) |agent| return try scratch.print("{s} finished", .{agent});
+        for ([_][]const u8{ " cancelled", " interrupted", " lost" }) |ending| {
+            if (withoutSuffix(lead, ending)) |agent| return try scratch.print("{s} was{s}", .{ agent, ending });
+        }
+        return lead;
+    }
+    // A wait, status, stop, or close leads with its verb, which takes a
+    // capital like "Ran" and "Read".
+    const verbs = [_][]const u8{ "waited ", "waiting ", "checked ", "checking ", "stopped ", "stopping ", "closed ", "closing ", "couldn't " };
+    for (verbs) |verb| if (std.mem.startsWith(u8, lead, verb)) {
+        const capital = try scratch.dupe(u8, lead);
+        capital[0] = std.ascii.toUpper(capital[0]);
+        return capital;
+    };
+    return lead;
+}
+
 /// A read row by the file's name and the lines it read, such as
 /// "Read orchestrator.zig L15-200", in place of the whole path. An absolute
 /// path makes the name a file link, so Cmd+click opens the file. Null when
@@ -1369,8 +1416,11 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) 
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
+    const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record) else null;
     const phrase = if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
         read
+    else if (agent_phrase) |agent|
+        agent
     else if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
         short
     else
@@ -3029,10 +3079,10 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
 
     try std.testing.expectEqualStrings(
         "● Made 4 subagent calls\n" ++
-            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
-            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
-            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
-            "└ Subagent working · inspect auth\n  glm-5.3-flash · max",
+            "├ Subagent working\n│ glm-5.3-flash · max\n" ++
+            "├ Subagent working\n│ glm-5.3-flash · max\n" ++
+            "├ Subagent working\n│ glm-5.3-flash · max\n" ++
+            "└ Subagent working\n  glm-5.3-flash · max",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -4885,6 +4935,48 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
     try std.testing.expect(std.mem.find(u8, highlighted, "\x1b[38;5;252mprintf\x1b[39m") != null);
 }
 
+test "subagent rows name the action and the subagent, not the message" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { phrase: []const u8, args: ?[]const u8, want: []const u8 };
+    const message = "{\"action\":\"message\",\"agent\":\"pr-lister\",\"message\":\"List open PRs\"}";
+    const cases = [_]Case{
+        // Main's calls.
+        .{ .phrase = "sent to pr-lister · List open PRs", .args = message, .want = "Messaged pr-lister" },
+        .{ .phrase = "pr-lister working · List open PRs", .args = message, .want = "pr-lister working" },
+        .{ .phrase = "pr-lister failed · List open PRs", .args = message, .want = "Couldn't message pr-lister" },
+        .{ .phrase = "pr-lister busy; message not sent · List open PRs", .args = message, .want = "Couldn't message pr-lister (busy)" },
+        .{ .phrase = "pr-lister interrupted · List open PRs", .args = message, .want = "Cancelled message to pr-lister" },
+        .{ .phrase = "pr-lister feedback queued · List open PRs", .args = message, .want = "Sent feedback to pr-lister" },
+        .{ .phrase = "pr-lister feedback not applied · List open PRs", .args = message, .want = "Feedback to pr-lister not applied" },
+        .{ .phrase = "waited for pr-lister, tester", .args = "{\"action\":\"wait\"}", .want = "Waited for pr-lister, tester" },
+        .{ .phrase = "checked pr-lister", .args = "{\"request\":{\"action\":\"status\",\"agent\":\"pr-lister\"}}", .want = "Checked pr-lister" },
+        .{ .phrase = "closed pr-lister", .args = "{\"action\":\"close\",\"agent\":\"pr-lister\"}", .want = "Closed pr-lister" },
+        .{ .phrase = "couldn't stop pr-lister", .args = "{\"action\":\"stop\",\"agent\":\"pr-lister\"}", .want = "Couldn't stop pr-lister" },
+        // Rows a subagent's report or message starts.
+        .{ .phrase = "pr-lister completed · Open non-draft PRs in vercel-labs/fx", .args = "{}", .want = "pr-lister finished" },
+        .{ .phrase = "pr-lister failed · the token expired", .args = "{}", .want = "pr-lister failed" },
+        .{ .phrase = "pr-lister cancelled", .args = "{}", .want = "pr-lister was cancelled" },
+        .{ .phrase = "pr-lister interrupted · stopped at step 3", .args = "{}", .want = "pr-lister was interrupted" },
+        .{ .phrase = "from pr-lister · need the repo name", .args = "{}", .want = "Message from pr-lister" },
+        .{ .phrase = "report from a subagent · done", .args = null, .want = "Report from a subagent" },
+    };
+    for (cases) |case| {
+        const record: ToolDetailRecord = .{
+            .entry_id = 1,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = if (case.args) |args| @constCast(args) else null,
+        };
+        const got = (try subagentRowPhrase(arena, case.phrase, &record)) orelse "(null)";
+        std.testing.expectEqualStrings(case.want, got) catch |err| {
+            std.debug.print("phrase: {s}\n", .{case.phrase});
+            return err;
+        };
+    }
+}
+
 test "a deferred call gets no row and does not count as a run" {
     const alloc = std.testing.allocator;
     const arguments = "{\"command\":\"cat AGENTS.md\"}";
@@ -5370,10 +5462,10 @@ test "repeated bare subagent waits share one row of their own" {
     // status keeps its own row, so each says what main did.
     try std.testing.expectEqualStrings(
         "● Started 2 subagents\n" ++
-            "├ sent to reviewer · review the change\n" ++
-            "├ sent to tester · run the tests\n" ++
-            "├ waited for tester\n" ++
-            "└ checked reviewer, tester",
+            "├ Messaged reviewer\n" ++
+            "├ Messaged tester\n" ++
+            "├ Waited for tester\n" ++
+            "└ Checked reviewer, tester",
         projection.entry_actions.items[0].override.bytes,
     );
 
@@ -5382,7 +5474,7 @@ test "repeated bare subagent waits share one row of their own" {
     const lone_details = [_]ToolDetailRecord{ details[2], details[4] };
     var waits = try build(alloc, &lone_entries, &lone_details, 120);
     defer waits.deinit(alloc);
-    try std.testing.expectEqualStrings("● waited for tester", waits.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● Waited for tester", waits.entry_actions.items[0].override.bytes);
 }
 
 test "saved arguments that are not usable leave rows unmerged" {

@@ -280,10 +280,13 @@ test.skipIf(!tmuxAvailable())(
     // The two waits share one row; the status keeps its own.
     const rows = treeRows(group(lines, "● Started 2 subagents"));
     expect(rows).toHaveLength(4);
-    expect(rows[0]).toContain("reviewer");
-    expect(rows[1]).toContain("tester");
-    expect(rows.filter((row) => row.includes("waited for"))).toHaveLength(1);
-    expect(rows[3]).toContain("checked");
+    // Each row names the action and the subagent, with no message; Ctrl+O
+    // shows the message.
+    expect(rows[0]).toBe("├ Messaged reviewer");
+    expect(rows[1]).toBe("├ Messaged tester");
+    expect(lines.join("\n")).not.toContain("Review the createWindow change");
+    expect(rows.filter((row) => row.includes("Waited for"))).toHaveLength(1);
+    expect(rows[3]).toContain("Checked");
   },
   TIMEOUT * 2,
 );
