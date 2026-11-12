@@ -222,7 +222,7 @@ fn parseValue(arena: Allocator, reader: *Reader) ParseError![]const u8 {
 }
 
 /// git's git_config_bool. Null for a value git rejects.
-fn parseBool(value: ?[]const u8) ?bool {
+pub fn parseBool(value: ?[]const u8) ?bool {
     const v = value orelse return true;
     if (v.len == 0) return false;
     for ([_][]const u8{ "true", "yes", "on" }) |word| {
