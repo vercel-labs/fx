@@ -872,14 +872,121 @@ fn creditsSnapshotFromJsonValue(
     if (obj.get("balance")) |field| {
         if (field == .string) snapshot.balance = try alloc.dupe(u8, field.string);
     }
-    if (obj.get("used")) |field| {
-        if (field == .string) snapshot.used = try alloc.dupe(u8, field.string);
+    // The Gateway reports spend as `total_used`; older responses named it `used`.
+    for ([_][]const u8{ "total_used", "used" }) |key| {
+        const field = obj.get(key) orelse continue;
+        if (field != .string) continue;
+        snapshot.used = try alloc.dupe(u8, field.string);
+        break;
     }
     if (obj.get("plan")) |field| {
         if (field == .string) snapshot.plan = try alloc.dupe(u8, field.string);
     }
+    // The team's Token Pass credit, or null when it has no active Token Pass.
+    if (obj.get("token_pass")) |field| switch (field) {
+        .null => snapshot.no_token_pass = true,
+        .object => |credit| snapshot.token_pass = try tokenPassCreditFromJson(alloc, credit),
+        else => {},
+    };
 
     return snapshot;
+}
+
+/// The Token Pass credit in a credits reply, owned by the caller, or null
+/// when its amount is missing or malformed. The values reach the terminal,
+/// so only a plain amount and an ISO 8601 time are kept.
+fn tokenPassCreditFromJson(alloc: Allocator, credit: std.json.ObjectMap) !?output_contracts.CreditsSnapshot.TokenPassCredit {
+    const remaining = jsonString(credit.get("remaining")) orelse return null;
+    if (!isCreditAmount(remaining)) return null;
+    const resets_at = if (jsonString(credit.get("resets_at"))) |value| (if (isIsoTime(value)) value else null) else null;
+
+    const owned_remaining = try alloc.dupe(u8, remaining);
+    errdefer alloc.free(owned_remaining);
+    return .{
+        .remaining = owned_remaining,
+        .resets_at = if (resets_at) |value| try alloc.dupe(u8, value) else null,
+    };
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const field = value orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+/// A decimal amount such as `79.92906` or `-1`.
+fn isCreditAmount(text: []const u8) bool {
+    if (text.len == 0 or text.len > 32) return false;
+    const digits = if (text[0] == '-') text[1..] else text;
+    var seen_digit = false;
+    var seen_point = false;
+    for (digits) |byte| switch (byte) {
+        '0'...'9' => seen_digit = true,
+        '.' => {
+            if (seen_point) return false;
+            seen_point = true;
+        },
+        else => return false,
+    };
+    return seen_digit;
+}
+
+/// A time such as `2026-12-05T08:00:00.000Z`.
+fn isIsoTime(text: []const u8) bool {
+    if (text.len == 0 or text.len > 40) return false;
+    for (text) |byte| switch (byte) {
+        '0'...'9', 'T', 'Z', ':', '.', '-', '+' => {},
+        else => return false,
+    };
+    return true;
+}
+
+test "built-in credits provider reads the Token Pass credit" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"balance\":\"12.50\",\"token_pass\":{\"remaining\":\"79.92906\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("79.92906", snapshot.token_pass.?.remaining);
+    try std.testing.expectEqualStrings("2026-12-05T08:00:00.000Z", snapshot.token_pass.?.resets_at.?);
+    try std.testing.expect(!snapshot.no_token_pass);
+
+    const cases = [_]struct { body: []const u8, no_token_pass: bool }{
+        // An explicit null: the team has no active Token Pass.
+        .{ .body = "{\"balance\":\"1\",\"token_pass\":null}", .no_token_pass = true },
+        // A reply from before the field existed says nothing either way.
+        .{ .body = "{\"balance\":\"1\"}", .no_token_pass = false },
+        .{ .body = "{\"balance\":\"1\",\"token_pass\":{\"remaining\":79}}", .no_token_pass = false },
+        // Values that could forge lines or drive the terminal are refused.
+        .{ .body = "{\"token_pass\":{\"remaining\":\"79\\n[credits] balance=999999\"}}", .no_token_pass = false },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"\\u001b]52;c;aGk=\\u0007\"}}", .no_token_pass = false },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"1.2.3\"}}", .no_token_pass = false },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"123456789012345678901234567890123\"}}", .no_token_pass = false },
+    };
+    for (cases) |case| {
+        var none = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
+        defer none.deinit();
+        var without = try creditsSnapshotFromJsonValue(std.testing.allocator, none.value);
+        defer without.deinit(std.testing.allocator);
+        try std.testing.expect(without.token_pass == null);
+        try std.testing.expectEqual(case.no_token_pass, without.no_token_pass);
+    }
+
+    // A malformed reset time drops only the time.
+    var bad_time = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"token_pass\":{\"remaining\":\"5\",\"resets_at\":\"soon\\u001b[2K\"}}",
+        .{},
+    );
+    defer bad_time.deinit();
+    var without_time = try creditsSnapshotFromJsonValue(std.testing.allocator, bad_time.value);
+    defer without_time.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("5", without_time.token_pass.?.remaining);
+    try std.testing.expect(without_time.token_pass.?.resets_at == null);
 }
 
 fn creditsErrorSnapshot(
@@ -2232,6 +2339,22 @@ test "built-in credits provider returns owned string fields" {
         "[credits] balance=10\n[credits] used=2\n[credits] plan=pro\n",
         text,
     );
+}
+
+test "built-in credits provider reads the Gateway's total_used as used" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"balance\":\"12.50\",\"total_used\":\"1.25\",\"used\":\"9\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("12.50", snapshot.balance.?);
+    try std.testing.expectEqualStrings("1.25", snapshot.used.?);
 }
 
 test "built-in credits provider ignores non-string fields" {

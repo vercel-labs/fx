@@ -77,6 +77,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-input-line-delete.test.ts",
     "tui-input-navigation.test.ts",
     "tui-host-switch.test.ts",
+    "tui-mcp-http-many-servers.test.ts",
     "tui-render-replay.test.ts",
     "tui-resume.test.ts",
     "tui-slash-commands.test.ts",
@@ -87,6 +88,8 @@ VERIFICATION_E2E_TESTS = (
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
     "yolo-permission-mode.test.ts",
+    "doctor.test.ts",
+    "tui-custom-connection-errors.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (
@@ -303,6 +306,44 @@ class PgsoCorpusTests(unittest.TestCase):
                 with self.assertRaisesRegex(PgsoError, "profile_runs"):
                     load_corpus(self.write_manifest(payload), repo_root=self.root)
 
+    def test_load_rejects_invalid_expected_exit(self) -> None:
+        for value in (True, -1, 256, 1.5, "1"):
+            with self.subTest(value=value):
+                payload = self.manifest()
+                scenarios = payload["scenarios"]
+                assert isinstance(scenarios, list)
+                scenarios[-1]["expected_exit"] = value
+                with self.assertRaisesRegex(PgsoError, "expected_exit"):
+                    load_corpus(self.write_manifest(payload), repo_root=self.root)
+
+    def test_load_rejects_expected_exit_for_e2e_scenarios(self) -> None:
+        test_file = "expected-exit.test.ts"
+        (self.root / "tests" / "e2e" / test_file).write_text("test")
+        payload = self.manifest()
+        scenarios = payload["scenarios"]
+        assert isinstance(scenarios, list)
+        scenario = self.e2e_scenario(test_file)
+        scenario["expected_exit"] = 1
+        scenarios.append(scenario)
+
+        with self.assertRaisesRegex(PgsoError, "expected_exit"):
+            load_corpus(self.write_manifest(payload), repo_root=self.root)
+
+    def test_direct_scenario_passes_its_expected_exit_to_the_runner(self) -> None:
+        payload = self.manifest()
+        scenarios = payload["scenarios"]
+        assert isinstance(scenarios, list)
+        scenarios[-1]["expected_exit"] = 1
+        loaded = load_corpus(self.write_manifest(payload), repo_root=self.root)
+        self.assertEqual(1, loaded.scenarios[-1].expected_exit)
+        self.assertEqual(0, loaded.scenarios[0].expected_exit)
+        corpus = self.make_corpus(loaded.scenarios[-1])
+
+        result, calls, _, _, _ = self.run_fixture(corpus)
+
+        self.assertEqual(1, result.passed)
+        self.assertEqual((1,), calls[0]["allowed_returncodes"])
+
     def test_load_rejects_profile_runs_for_e2e_scenarios(self) -> None:
         test_file = "profile-repeat.test.ts"
         (self.root / "tests" / "e2e" / test_file).write_text("test")
@@ -382,7 +423,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(69, len(corpus.candidate_scenarios))
+        self.assertEqual(72, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
@@ -540,6 +581,7 @@ class PgsoCorpusTests(unittest.TestCase):
                     "argv": tuple(argv),
                     "env": dict(environment),
                     "cwd": kwargs["cwd"],
+                    "allowed_returncodes": tuple(kwargs.get("allowed_returncodes", (0,))),
                 }
             )
             if scenario_name == fail_scenario:

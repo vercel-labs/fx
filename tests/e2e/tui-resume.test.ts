@@ -18,7 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -5881,7 +5881,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
   const home = join(root, "home");
   mkdirSync(home);
   const currentRevision = (await runFx(["status", "--json"], {
-    env: { AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined },
+    env: { AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, HOME: home },
   })).stdout;
   const revision = "abcdef0123456789abcdef0123456789abcdef01";
   const release = startUpgradeServer(root, argvLogPath, { revision });
@@ -5890,7 +5890,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
 
   try {
     const stable = Bun.spawn([installedFx, "upgrade", "--channel", "stable"], {
-      env: { ...process.env, HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
+      env: { ...envWithoutFxHome(), HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -5903,7 +5903,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
     copyFileSync(FX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
     const dev = Bun.spawn([installedFx, "upgrade", "--channel", "dev"], {
-      env: { ...process.env, HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
+      env: { ...envWithoutFxHome(), HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -5934,7 +5934,7 @@ test("update runs the manual upgrade", async () => {
 
   try {
     const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
-      env: { ...process.env, HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
+      env: { ...envWithoutFxHome(), HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -6216,7 +6216,7 @@ function replayPaneBytes(
   const gridPath = join(root, `${name}.grid.txt`);
   writeFileSync(tapePath, Buffer.concat([header, frame, bytes]));
   const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--golden", gridPath], {
-    env: { ...process.env, HOME: home, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+    env: { ...envWithoutFxHome(), HOME: home, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -6654,6 +6654,8 @@ test.skipIf(!tmuxAvailable())(
     const workspaceRoot = realpathSync(workspace);
     const questionMarker = "RESUME_QUESTION_VERIFICATION_DEPTH";
     const answer = "Thorough";
+    const markdownMarker = "RESUME_MARKDOWN_QUESTION";
+    const markdownAnswer = "Keep both";
     const completion = "RESUME_QUESTION_COMPLETED";
     const flagFollowUp = "RESUME_QUESTION_FLAG_FOLLOW_UP";
     const pickerFollowUp = "RESUME_QUESTION_PICKER_FOLLOW_UP";
@@ -6663,6 +6665,16 @@ test.skipIf(!tmuxAvailable())(
     const expectCompactQuestion = (scrollback: string) => {
       expect(scrollback).toContain(`\n  1) ${questionMarker}`);
       expect(scrollback).toContain(`     ${answer}`);
+      // A Markdown question replays in the shape the prompt showed.
+      const rows = scrollback.split("\n").map((row) => row.trimEnd());
+      const markdown = rows.indexOf(`  2) ${markdownMarker}:`);
+      expect(markdown).toBeGreaterThanOrEqual(0);
+      expect(rows.slice(markdown + 1, markdown + 5)).toEqual([
+        "",
+        "     • first item",
+        "     • second item",
+        `     ${markdownAnswer}`,
+      ]);
       expect(scrollback).not.toContain("● Asked");
       expect(scrollback).not.toContain(`\"question\":\"${questionMarker}\"`);
     };
@@ -6689,6 +6701,10 @@ test.skipIf(!tmuxAvailable())(
                 { label: answer, description: "Run every verification step." },
                 { label: "Fast", description: "Run only the focused checks." },
               ],
+            },
+            {
+              question: `${markdownMarker}:\n\n- **first** item\n- \`second\` item`,
+              options: [{ label: markdownAnswer }, { label: "Drop one" }],
             },
           ],
         }),

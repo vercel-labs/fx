@@ -293,7 +293,7 @@ class ShardPlanningTests(unittest.TestCase):
             {
                 "include": [
                     {"name": name}
-                    for name in ("help", "version", "status", "doctor", "sessions")
+                    for name in ("help", "version", "status", "sessions")
                 ]
             },
             run_plan("startup", missing_corpus, 20),
@@ -571,15 +571,15 @@ class ShardAggregationTests(unittest.TestCase):
 
     def test_measurement_aggregate_requires_all_passing_gates(self) -> None:
         measurements = aggregate_measurement_shards(
-            (self.measurement("startup-help"), self.measurement("startup-doctor")),
+            (self.measurement("startup-help"), self.measurement("startup-sessions")),
             phase="startup",
-            expected_names=("startup-help", "startup-doctor"),
+            expected_names=("startup-help", "startup-sessions"),
             expected_identity=self.identity,
             expected_artifact_sha256="e" * 64,
         )
 
         self.assertEqual(
-            ["startup-help", "startup-doctor"],
+            ["startup-help", "startup-sessions"],
             [item["name"] for item in measurements],
         )
 

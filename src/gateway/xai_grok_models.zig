@@ -5,6 +5,7 @@ const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const testing_listener = @import("../core/shared/testing_listener.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
@@ -751,16 +752,12 @@ const CatalogBodyFixture = struct {
 
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -772,24 +769,15 @@ const CatalogBodyFixture = struct {
         return self.server.socket.address.getPort();
     }
 
-    fn wakeAccept(self: *@This()) void {
-        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_io_backend.io();
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port()) };
-        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
-        stream.close(zio);
-    }
-
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         var socket_buffer: [4096]u8 = undefined;

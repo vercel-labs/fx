@@ -21,8 +21,10 @@ const randomUrlSafeSecret = oauth.randomUrlSafeSecret;
 pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const token_url = "https://auth.openai.com/oauth/token";
 pub const issuer_url = "https://auth.openai.com";
+const revoke_url = "https://auth.openai.com/oauth/revoke";
 const e2e_token_url_env = "FX_TEST_CHATGPT_TOKEN_URL";
 const e2e_issuer_url_env = "FX_TEST_CHATGPT_ISSUER_URL";
+const e2e_revoke_url_env = "FX_TEST_CHATGPT_REVOKE_URL";
 const jwt_auth_claim = "https://api.openai.com/auth";
 const browser_scope = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const browser_callback_ports = [_]u16{ 1455, 1457 };
@@ -350,10 +352,71 @@ pub fn runLogin(
     }
 }
 
-pub fn logout() !chatgpt_session.DeleteOutcome {
-    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return .missing;
+pub const LogoutResult = struct {
+    deletion: chatgpt_session.DeleteOutcome,
+    revocation_failed: bool,
+};
+
+/// Deletes the saved Codex login, then revokes its refresh token at OpenAI.
+pub fn logout(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) !LogoutResult {
+    const local = try logoutLocally(alloc);
+    defer if (local.refresh_token) |token| secret.zeroAndFree(alloc, token);
+    var result = local.result;
+    if (local.refresh_token) |token| {
+        if (before_revocation) |notice| notice.run(notice.context);
+        revokeToken(alloc, transport, token) catch |err| {
+            debug_trace.logf("auth", "Codex logout revocation failed err={s}", .{@errorName(err)});
+            result.revocation_failed = true;
+        };
+    }
+    return result;
+}
+
+/// A deleted Codex login, with its refresh token kept for `revokeToken`.
+pub const LocalLogout = struct {
+    result: LogoutResult,
+    /// Owned by the caller; release it with `secret.zeroAndFree`.
+    refresh_token: ?[]u8 = null,
+};
+
+/// Deletes the saved Codex login first, so a failed deletion never leaves a revoked token on disk.
+pub fn logoutLocally(alloc: Allocator) !LocalLogout {
+    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return .{ .result = .{
+        .deletion = .missing,
+        .revocation_failed = false,
+    } };
     defer mutation.deinit();
-    return mutation.delete();
+    var revocation_failed = false;
+    var refresh_token: ?[]u8 = null;
+    errdefer if (refresh_token) |token| secret.zeroAndFree(alloc, token);
+    const loaded_session = mutation.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "Codex logout could not load the saved credential err={s}", .{@errorName(err)});
+        revocation_failed = true;
+        break :blk null;
+    };
+    if (loaded_session) |loaded| {
+        var session = loaded;
+        defer session.deinit(alloc);
+        refresh_token = try alloc.dupe(u8, session.refresh_token);
+    }
+    return .{
+        .result = .{
+            .deletion = try mutation.delete(),
+            .revocation_failed = revocation_failed,
+        },
+        .refresh_token = refresh_token,
+    };
+}
+
+/// Revokes a Codex refresh token at OpenAI, which ends its login there.
+pub fn revokeToken(alloc: Allocator, transport: oauth_transport.Provider, token: []const u8) !void {
+    const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
+    defer alloc.free(endpoint_url);
+    try oauth.revokeToken(alloc, transport, endpoint_url, client_id, token, .refresh_token);
 }
 
 pub fn sourceExists(alloc: Allocator) !bool {

@@ -22,6 +22,7 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -2592,16 +2593,26 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "sessionTitleModel")) return;
 
             const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
-            const title_model = app.sessionTitleModel();
-            if (!session_title_generation.shouldGenerate(.{
+            const title_model = titleModelFor(app, agent, app.sessionTitleModel());
+            const session_id = activeSessionId(agent) orelse return;
+            const gate: session_title_generation.Gate = .{
                 .setting_enabled = app.session_title_generation,
                 .provider_supports_titles = title_model != null,
                 .session_untitled = agent.session_title.items.len == 0 and
                     agent.session.agent.history.items.len == 0,
                 .recovery_replay = false,
                 .task_running = agent.session_persistence.title_generation.task != null,
-            })) return;
-            const session_id = activeSessionId(agent) orelse return;
+                .title_started = agent.session_persistence.title_generation.startedFor(session_id),
+            };
+            if (!session_title_generation.shouldGenerate(gate)) {
+                var without_record = gate;
+                without_record.title_started = false;
+                if (session_title_generation.shouldGenerate(without_record)) {
+                    debug_trace.logf("session", "event=title_generation_skipped reason=already_started session={s}", .{session_id});
+                }
+                return;
+            }
+
             const credential = app.auth.gatewayCredential() orelse return;
 
             const task = session_title_generation.Task.create(.{
@@ -2612,6 +2623,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = credential.gateway_team,
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
+                .reads_shared_sign_in = true,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {
                 agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
@@ -2626,6 +2638,15 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
+        /// The provider's title model, or a Token Pass model when the
+        /// agent's AI Gateway model is a Token Pass model.
+        fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
+            const default_model = provider_title_model orelse return null;
+            if (comptime !provider_runtime.supported(App)) return default_model;
+            if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
+            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+        }
+
         /// Applies a finished background title generation on the main loop.
         /// Returns true when the session title changed.
         pub fn pollSessionTitleGeneration(app: *App, agent: *AppAgent) !bool {
@@ -2636,7 +2657,10 @@ pub fn Runtime(comptime App: type) type {
             const task = agent.session_persistence.title_generation.takeCompleted() orelse return false;
             defer task.destroy();
             agent.session_persistence.title_generation.recordFinished(task);
-            const title = task.takeTitle() orelse return false;
+            const title = task.takeTitle() orelse {
+                debug_trace.logf("session", "event=title_generation_apply result=unavailable session={s}", .{task.session_id});
+                return false;
+            };
             defer std.heap.c_allocator.free(title);
             const active_id = activeSessionId(agent) orelse {
                 debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
@@ -10969,6 +10993,34 @@ test "session title generation gates on setting, history, and prompt text" {
         .execution = .{},
     } });
     Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "refactor the renderer loop");
+    try std.testing.expect(app.agent().session_persistence.title_generation.task == null);
+}
+
+test "session title generation starts once per session, even before a stopped turn reaches the history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+    app.stream_content = "";
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "refactor the renderer loop");
+    try std.testing.expect(app.agent().session_persistence.title_generation.task != null);
+    try awaitTitleTask(&app);
+    try std.testing.expectEqual(.failed, app.agent().session_persistence.title_generation.last.status);
+
+    // The history is still empty, as when the next prompt interrupts the
+    // first turn before that turn is committed.
+    try std.testing.expectEqual(@as(usize, 0), app.agent().session.agent.history.items.len);
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "now write the regression test");
     try std.testing.expect(app.agent().session_persistence.title_generation.task == null);
 }
 

@@ -1,9 +1,15 @@
 {
   "spec": [
-    {"name": "preview", "config": "agents-menu-mutation-preview", "rule": "ScreenOnlyOnEnter", "bug": "a move shows the row it lands on, as fx did before this change"},
+    {"name": "move_only", "config": "agents-menu-mutation-move-only", "rule": "PreviewOnMove", "bug": "a move changes only the highlight and the agent on screen stays, as fx did before this change"},
+    {"name": "search_stays", "config": "agents-menu-mutation-search-stays", "rule": "PreviewOnSearch", "bug": "a search edit that hides the highlighted row moves the highlight without showing its agent"},
+    {"name": "up_stays", "config": "agents-menu-mutation-up-stays", "rule": "UpOnTopCloses", "bug": "Up on the first row stays there instead of closing the list"},
+    {"name": "close_parent", "config": "agents-menu-mutation-close-parent", "rule": "CloseShowsRowAbove", "bug": "a close of the agent on screen shows its instance or the next instance instead of the row above the closed agent"},
+    {"name": "back_stays", "config": "agents-menu-mutation-back-stays", "rule": "BackToOrigin", "bug": "Esc keeps the agent shown instead of the agent the list opened on"},
+    {"name": "paste_back", "config": "agents-menu-mutation-paste-back", "rule": "ScreenOnlyOnKeys", "bug": "a paste goes back to the agent the list opened on instead of keeping the agent shown"},
+    {"name": "stale_origin", "config": "agents-menu-mutation-stale-origin", "rule": "OriginListed", "bug": "the agent the list opened on stays the one Esc goes back to after it closed"},
     {"name": "enter_noop", "config": "agents-menu-mutation-enter-noop", "rule": "EnterShowsSelection", "bug": "Enter closes the list without showing the highlighted row"},
     {"name": "open_first", "config": "agents-menu-mutation-open-first", "rule": "OpensOnScreen", "bug": "the list opens on its first row instead of the agent on screen"},
-    {"name": "pin", "config": "agents-menu-mutation-pin", "rule": "SelectionKept", "bug": "the highlight snaps back to the agent on screen when the rows change"},
+    {"name": "row", "config": "agents-menu-mutation-row", "rule": "SelectionKept", "bug": "the highlight stays on its row, not its agent, when the rows change"},
     {"name": "stale_sel", "config": "agents-menu-mutation-stale-sel", "rule": "SelListed", "bug": "the highlight stays on an agent that closed"},
     {"name": "worker_flag", "config": "row-order-mutation-worker-flag", "rule": "IdleRowIsApplied", "bug": "a subagent's row follows the worker flag alone, so a turn that ended but is not applied shows idle at its old place"},
     {"name": "worker_flag_flip", "config": "row-order-mutation-worker-flag-flip", "rule": "PlaceChangesWithLabel", "bug": "the same bug, seen as a row that moves with no change of its state"}
