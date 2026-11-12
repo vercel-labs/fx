@@ -7,7 +7,9 @@
 \* from the 401 replay in src/core/agent/runtime/orchestrator.zig.
 \*
 \* Each process holds the access token it last loaded. The saved login sits
-\* behind one lock (src/core/auth/oauth_session.zig beginExistingMutation).
+\* behind one lock: src/core/auth/oauth_session.zig beginExistingMutation for
+\* the fx login, and src/core/auth/subscription_session.zig
+\* beginExistingMutation for a Codex or Grok login.
 \* The issuer rotates the refresh token on every refresh and the gateway then
 \* takes only the newest access token, so one process's refresh leaves every
 \* other process holding a token the gateway rejects. Tokens are numbered by
