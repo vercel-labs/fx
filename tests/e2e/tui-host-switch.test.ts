@@ -1615,6 +1615,164 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Main calls `status` while the subagent waits for the user, which the
+  // subagent's first request starts, then again once the user has answered
+  // and the subagent's report has reached main. `statuses` holds the two
+  // results the model read.
+  async function mainReadsStatus(
+    child: Response,
+    agent: string,
+    task: string,
+    waitUntilPromptShows: (session: TmuxSession) => Promise<void>,
+    answer: (session: TmuxSession) => Promise<void>,
+    setupHome: (home: string) => void = () => {},
+  ): Promise<string[]> {
+    const statuses: string[] = [];
+    const promptShows = held();
+    let stage = 0;
+    let childCalls = 0;
+    await withFx(async (body) => {
+      if (!isMainRequest(body)) {
+        childCalls += 1;
+        return childCalls === 1 ? child : text("child_done", "SWITCH_CHILD_DONE");
+      }
+      stage += 1;
+      if (stage === 1) {
+        return toolCall("main_sub", "subagent", { request: { action: "message", agent, message: task, ...(agent === "writer" ? { profile: "writer" } : {}) } });
+      }
+      if (stage === 2) {
+        // Main's next step waits for the prompt on its screen, so the subagent
+        // is blocked on the user when `status` runs.
+        await promptShows.promise;
+        return toolCall("main_status_1", "subagent", { request: { action: "status" } });
+      }
+      if (stage === 3) {
+        statuses.push(toolResultText(body, "main_status_1"));
+        return text("main_idle", "SWITCH_MAIN_WAITED");
+      }
+      // The subagent's report starts main's next turn.
+      if (stage === 4) return toolCall("main_status_2", "subagent", { request: { action: "status" } });
+      statuses.push(toolResultText(body, "main_status_2"));
+      return text("main_done", "SWITCH_MAIN_DONE");
+    }, async (session) => {
+      await session.sendText("SWITCH_USER");
+      await waitUntilPromptShows(session);
+      promptShows.release();
+      await until("main's first status", () => statuses.length === 1);
+      await answer(session);
+      await until("main's second status", () => statuses.length === 2, 60_000);
+    }, setupHome);
+    return statuses;
+  }
+
+  test(
+    "main's status says a subagent waits for an approval, and not once it is answered",
+    async () => {
+      const [waiting, answered] = await mainReadsStatus(
+        toolCall("child_write", "write_file", { path: "switch-wait.txt", content: "SWITCH_WROTE\n" }),
+        "writer",
+        "SWITCH_WRITE_TASK",
+        async (session) => {
+          await session.waitForText("Subagent writer needs permission", 30_000);
+        },
+        async (session) => {
+          await session.sendKeys("1");
+        },
+        (home) => {
+          const folder = join(home, ".fx", "agents", "writer");
+          mkdirSync(folder, { recursive: true });
+          writeFileSync(join(folder, "profile.json"), JSON.stringify({
+            description: "Writes one file",
+            tools: ["read_file", "write_file"],
+            permission_mode: "ask",
+          }));
+        },
+      );
+      expect(waiting).toContain("writer: waiting for an approval");
+      expect(waiting).not.toContain("writer: working");
+      expect(answered).toContain("writer: idle");
+      expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says a subagent waits for the user's answer, and not once it is answered",
+    async () => {
+      const [waiting, answered] = await mainReadsStatus(
+        toolCall("child_ask", "ask_user_question", {
+          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
+        }),
+        "asker",
+        "SWITCH_ASK_TASK",
+        async (session) => {
+          await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+        },
+        async (session) => {
+          await session.sendKeys("1");
+        },
+      );
+      expect(waiting).toContain("asker: waiting for the user's answer");
+      expect(waiting).not.toContain("asker: working");
+      expect(answered).toContain("asker: idle");
+      expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's stop ends a subagent's open question, which its status then no longer says waits",
+    async () => {
+      const statuses: string[] = [];
+      let stopResult = "";
+      let childCalls = 0;
+      let stage = 0;
+      const promptShows = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) {
+            return toolCall("child_ask", "ask_user_question", {
+              questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
+            });
+          }
+          return text("child_after", "SWITCH_ASKER_STOPPED");
+        }
+        stage += 1;
+        if (stage === 1) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "asker", message: "SWITCH_ASK_TASK" } });
+        }
+        if (stage === 2) {
+          await promptShows.promise;
+          return toolCall("main_status_1", "subagent", { request: { action: "status" } });
+        }
+        if (stage === 3) {
+          statuses.push(toolResultText(body, "main_status_1"));
+          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "asker" } });
+        }
+        if (stage === 4) {
+          stopResult = toolResultText(body, "main_stop");
+          return toolCall("main_status_2", "subagent", { request: { action: "status" } });
+        }
+        statuses.push(toolResultText(body, "main_status_2"));
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+        promptShows.release();
+        await until("main's second status", () => statuses.length === 2, 60_000);
+        // The question left main's screen with the subagent's turn.
+        const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && !pane.includes("SWITCH_QUESTION pick one"), 30_000);
+        expect(main).not.toContain("asker asks");
+      });
+      expect(statuses[0]).toContain("asker: waiting for the user's answer");
+      expect(stopResult).toContain("Stopped asker: its turn ended");
+      expect(statuses[1]).toContain("asker: ");
+      expect(statuses[1]).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
   test(
     "a subagent with no mode of its own follows main's as it changes, on its next tool call",
     async () => {

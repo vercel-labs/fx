@@ -1539,6 +1539,7 @@ pub const Runtime = struct {
     /// What a subagent is doing, as `status` says it.
     const ChildState = enum {
         awaiting_approval,
+        awaiting_answer,
         working,
         interrupted,
         finished,
@@ -1547,6 +1548,7 @@ pub const Runtime = struct {
         fn label(self: ChildState) []const u8 {
             return switch (self) {
                 .awaiting_approval => "waiting for an approval",
+                .awaiting_answer => "waiting for the user's answer",
                 .working => "working",
                 .interrupted => "interrupted",
                 .finished => "finished",
@@ -1555,10 +1557,40 @@ pub const Runtime = struct {
         }
     };
 
-    /// Under `admission_mutex`.
-    fn childStateLocked(self: *const Runtime, child: child_state.Child) ChildState {
+    /// The children whose running turns wait for the user to answer a
+    /// permission request or a question now, which `childStateLocked`
+    /// reports as waiting, not working. In the app a child's request waits on
+    /// its own agent's worker and the registry says nothing of it, so this
+    /// reads the workers: the owner's, for the parent's works, and those of
+    /// the turns the user started on a child's screen. (ACP and `fx ask` keep
+    /// the approval in the registry as `.awaiting_approval`.) Call it under
+    /// `admission_mutex` and before taking the state-store lock
+    /// (`managed_owner.Owner.userWaits`). The result is in `alloc`, which
+    /// should be an arena.
+    fn userWaitsLocked(self: *Runtime, alloc: Allocator) ![]const managed_owner.Owner.UserWaiting {
+        var waits: std.ArrayList(managed_owner.Owner.UserWaiting) = .empty;
+        for (self.turn_works.items) |work| {
+            const worker = work.worker orelse continue;
+            const waiting_for = worker.userWait() orelse continue;
+            try waits.append(alloc, .{ .child_id = work.child_id, .wait = waiting_for });
+        }
+        try waits.appendSlice(alloc, try self.managed.userWaits(alloc));
+        return waits.items;
+    }
+
+    /// Under `admission_mutex`. `waits` is what `userWaitsLocked` returned
+    /// while the lock was held.
+    fn childStateLocked(self: *const Runtime, child: child_state.Child, waits: []const managed_owner.Owner.UserWaiting) ChildState {
         if (child.phase == .awaiting_approval) return .awaiting_approval;
-        if (self.isBusyLocked(child.id)) return .working;
+        if (self.isBusyLocked(child.id)) {
+            // A wait counts only while the child works, so one a turn's end
+            // left behind could not outlast it.
+            for (waits) |entry| if (std.mem.eql(u8, entry.child_id, child.id)) return switch (entry.wait) {
+                .approval => .awaiting_approval,
+                .question => .awaiting_answer,
+            };
+            return .working;
+        }
         return switch (child.phase) {
             .interrupted => .interrupted,
             .finished => .finished,
@@ -1586,7 +1618,9 @@ pub const Runtime = struct {
             const name = child.agentName() orelse continue;
             if (std.mem.eql(u8, child.id, except_child_id)) continue;
             if (self.closingIndexLocked(child.id) != null or self.hasPendingLocked(child.id)) continue;
-            if (self.childStateLocked(child) != .idle) continue;
+            // A child that waits for the user is busy, so it is not idle
+            // whichever way it waits.
+            if (self.childStateLocked(child, &.{}) != .idle) continue;
             try entries.append(alloc, .{ .name = name, .purpose = child.purpose });
         }
         return entries.items;
@@ -1642,6 +1676,7 @@ pub const Runtime = struct {
     fn buildTeamNote(self: *Runtime, alloc: Allocator) !BuiltTeam {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
+        const waits = try self.userWaitsLocked(alloc);
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         const registry = try self.managed.state_store.load(alloc);
@@ -1651,7 +1686,7 @@ pub const Runtime = struct {
             if (self.closingIndexLocked(child.id) != null) continue;
             try rows.append(alloc, .{
                 .name = name,
-                .state = self.childStateLocked(child).label(),
+                .state = self.childStateLocked(child, waits).label(),
                 .outcome = if (child.last_outcome) |outcome| @tagName(outcome) else null,
                 .purpose = child.purpose,
             });
@@ -1673,6 +1708,7 @@ pub const Runtime = struct {
         var open: std.ArrayList([]const u8) = .empty;
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
+        const waits = try self.userWaitsLocked(a);
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = try self.managed.state_store.load(a);
@@ -1686,7 +1722,7 @@ pub const Runtime = struct {
                 if (std.mem.eql(u8, item.child_id, child.id)) waiting += 1;
             }
             if (listed > 0) try out.writer.writeByte('\n');
-            try out.writer.print("{s}: {s}", .{ name, self.childStateLocked(child).label() });
+            try out.writer.print("{s}: {s}", .{ name, self.childStateLocked(child, waits).label() });
             if (waiting > 0) try out.writer.print(", {d} waiting message{s}", .{ waiting, if (waiting == 1) "" else "s" });
             if (child.last_outcome) |outcome| try out.writer.print(", last work {s}", .{@tagName(outcome)});
             try out.writer.print(", reports {s}", .{@tagName(child.report_rule)});
@@ -2446,6 +2482,13 @@ const MailboxFixture = struct {
     fail_first: bool = false,
     /// While set, each run saves an empty reply.
     empty_reply: bool = false,
+    /// What each run waits on the user for, through its worker, before it
+    /// goes on: a permission request or a question, as a child's tool call
+    /// does in the app.
+    asks: enum { nothing, permission, question } = .nothing,
+    /// The worker of the child agent that runs each turn, as the app's does:
+    /// set, the runs are hosted (`bind`), and a hosted run saves nothing.
+    hosted: ?*worker_runtime.WorkerRuntime = null,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -2466,6 +2509,33 @@ const MailboxFixture = struct {
         return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
     }
 
+    fn bind(raw: ?*anyopaque, turn: *execution.TurnContext, _: *std.atomic.Value(bool)) execution.ServiceError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        turn.hosted_worker = self.hosted orelse return error.ProviderFailed;
+    }
+
+    /// Blocks on the user as `asks` says, until the answer, or until the
+    /// turn is cancelled or the worker stops.
+    fn ask(self: *const MailboxFixture, worker: *worker_runtime.WorkerRuntime, content: []const u8) void {
+        const alloc = std.testing.allocator;
+        // Only a message that starts with "ask" does.
+        if (!std.mem.startsWith(u8, content, "ask")) return;
+        switch (self.asks) {
+            .nothing => {},
+            .permission => {
+                var response = worker.requestPermissionBlocking(alloc, .{ .label = "Run it?" }) catch return;
+                response.deinit();
+            },
+            .question => {
+                const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+                const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+                const answers = worker.requestQuestionBatchAnswerBlocking(alloc, &entries) catch return;
+                for (answers orelse return) |answer| alloc.free(answer);
+                alloc.free(answers.?);
+            },
+        }
+    }
+
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         const worker = turn.workerRuntime();
@@ -2482,9 +2552,11 @@ const MailboxFixture = struct {
             _ = worker.takeSteeringBoundaryInto(std.testing.allocator, boundary.allocator(), turn_id, .finalizing) catch return error.ProviderFailed;
         }
         const run_number = self.runs.fetchAdd(1, .seq_cst) + 1;
+        self.ask(worker, message.content);
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
         if (cancel.load(.seq_cst)) return error.Cancelled;
         if (self.fail_first and run_number == 1) return error.ProviderFailed;
+        if (turn.isHosted()) return .completed;
         const reply = if (self.empty_reply)
             std.testing.allocator.dupe(u8, "") catch return error.ProviderFailed
         else
@@ -2530,6 +2602,13 @@ const MailboxFixture = struct {
         return self.reports.items.len;
     }
 };
+
+/// A host whose children run on an agent of their own, as the app's do.
+fn hostedMailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *child_state.TestParent) !*Runtime {
+    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = fixture, .bind_fn = MailboxFixture.bind, .run_fn = MailboxFixture.run });
+    runtime.report_sink = .{ .context = fixture, .post_fn = MailboxFixture.post };
+    return runtime;
+}
 
 fn mailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *child_state.TestParent) !*Runtime {
     const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = fixture, .run_fn = MailboxFixture.run });
@@ -3595,6 +3674,203 @@ fn waitUntilQuiet(runtime: *Runtime) !void {
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.Timeout;
+}
+
+/// Waits until `worker` blocks on the user: a permission request or a
+/// question.
+fn waitForBlockedOnUser(worker: *worker_runtime.WorkerRuntime) !void {
+    for (0..5000) |_| {
+        worker.worker_mutex.lockUncancelable(io_mod.getIo());
+        const blocked = worker.pending_permission_waiting or worker.pending_question_shared != null;
+        worker.worker_mutex.unlock(io_mod.getIo());
+        if (blocked) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// The user's decision on the permission request `worker` waits on.
+fn decideWaitingPermission(worker: *worker_runtime.WorkerRuntime, decision: types.ToolPermissionDecision) !void {
+    const permission_request = @import("../permissions/permission_request.zig");
+    worker.worker_mutex.lockUncancelable(io_mod.getIo());
+    const request_id = worker.pending_permission_request_shared.?.id;
+    worker.worker_mutex.unlock(io_mod.getIo());
+    const response = permission_request.OwnedPermissionResponse.init(std.testing.allocator, decision, null);
+    try std.testing.expectEqual(worker_runtime.PermissionSubmissionResult.accepted, worker.submitPermissionResponse(request_id, response));
+}
+
+const AskKind = enum { permission, question };
+
+/// How a wait for the user, or the work around it, can end.
+const AskEnd = enum {
+    answered,
+    /// The user declines a permission request.
+    declined,
+    /// Esc on the child's own screen.
+    escaped,
+    parent_stop,
+    parent_close,
+    user_close,
+    quit,
+};
+
+/// Fails, printing `haystack`, when it lacks `needle`.
+fn expectHas(haystack: []const u8, needle: []const u8) !void {
+    if (std.mem.find(u8, haystack, needle) != null) return;
+    std.debug.print("expected \"{s}\" in:\n{s}\n", .{ needle, haystack });
+    return error.TestExpectedEqual;
+}
+
+fn expectNoWaitingLabel(runtime: *Runtime, arena: Allocator) !void {
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-status", null);
+    if (std.mem.find(u8, status, "waiting for") != null) {
+        std.debug.print("expected no wait in:\n{s}\n", .{status});
+        return error.TestExpectedEqual;
+    }
+    const note = try runtime.teamNote(std.testing.allocator, 0);
+    defer if (note) |text| std.testing.allocator.free(text);
+    if (note) |text| if (std.mem.find(u8, text, "waiting for") != null) {
+        std.debug.print("expected no wait in:\n{s}\n", .{text});
+        return error.TestExpectedEqual;
+    };
+}
+
+/// A hosted subagent blocks on the user as `kind` says, and `end` ends it.
+/// While it waits, `status` and the team note say so, not "working"; once it
+/// has ended, they do not.
+fn expectAskEnds(kind: AskKind, end: AskEnd) !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted = worker_runtime.WorkerRuntime{};
+    defer hosted.deinit(alloc);
+    var fixture = MailboxFixture{ .asks = if (kind == .permission) .permission else .question, .hosted = &hosted };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    // A wait still open when a test fails is released, so `deinit` can join.
+    defer hosted.requestStop();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "ask" } }, "call-1", null);
+    try waitForBlockedOnUser(&hosted);
+    const child_id = try reviewerId(runtime, arena);
+    const label = switch (kind) {
+        .permission => "reviewer: waiting for an approval, reports final",
+        .question => "reviewer: waiting for the user's answer, reports final",
+    };
+    const waiting = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-2", null);
+    try expectHas(waiting, label);
+    const note = (try runtime.teamNote(alloc, 0)).?;
+    defer alloc.free(note);
+    try expectHas(note, label[0 .. label.len - ", reports final".len]);
+
+    switch (end) {
+        .answered => switch (kind) {
+            .permission => try decideWaitingPermission(&hosted, .once),
+            .question => try hosted.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null),
+        },
+        .declined => try decideWaitingPermission(&hosted, .deny),
+        .escaped => switch (kind) {
+            .permission => hosted.cancelApprovalTurn(),
+            .question => try hosted.submitQuestionBatchAnswer(alloc, null, null),
+        },
+        .parent_stop => _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null),
+        .parent_close => _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null),
+        .user_close => _ = (try runtime.closeChild(child_id, .user)).?,
+        .quit => {
+            runtime.managed.noteQuitting();
+            hosted.requestCancel();
+            hosted.requestShutdown();
+        },
+    }
+    try waitUntilQuiet(runtime);
+    try expectNoWaitingLabel(runtime, arena);
+}
+
+test "status and the team note say a hosted subagent waits for the user, and no longer once the wait ends, however it ends" {
+    for (std.enums.values(AskKind)) |kind| {
+        for (std.enums.values(AskEnd)) |end| {
+            if (kind == .question and end == .declined) continue;
+            errdefer std.debug.print("wait: {s}, end: {s}\n", .{ @tagName(kind), @tagName(end) });
+            try expectAskEnds(kind, end);
+        }
+    }
+}
+
+test "only the subagent that waits for the user says so" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted = worker_runtime.WorkerRuntime{};
+    defer hosted.deinit(alloc);
+    var fixture = MailboxFixture{ .asks = .permission, .hosted = &hosted };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    defer hosted.requestStop();
+
+    // builder finishes its work and is idle; reviewer then waits.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "builder", .message = "work" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "ask" } }, "call-2", null);
+    try waitForBlockedOnUser(&hosted);
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-3", null);
+    try expectHas(status, "builder: idle");
+    try expectHas(status, "reviewer: waiting for an approval");
+    try decideWaitingPermission(&hosted, .once);
+    try waitUntilQuiet(runtime);
+}
+
+fn askThread(worker: *worker_runtime.WorkerRuntime) void {
+    var response = worker.requestPermissionBlocking(std.testing.allocator, .{ .label = "Run it?" }) catch return;
+    response.deinit();
+}
+
+test "a turn the user typed on a hosted subagent's screen shows its wait too" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted = worker_runtime.WorkerRuntime{};
+    defer hosted.deinit(alloc);
+    var fixture = MailboxFixture{ .hosted = &hosted };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    defer hosted.requestStop();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+
+    // The user types on the child's screen, and its tool call asks.
+    try std.testing.expect(hosted.beginDirectProcessing(9));
+    const work_id = runtime.beginUserWork(alloc, child_id, &hosted).?;
+    defer alloc.free(work_id);
+    const thread = try std.Thread.spawn(.{}, askThread, .{&hosted});
+    try waitForBlockedOnUser(&hosted);
+    const waiting = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-2", null);
+    try expectHas(waiting, "reviewer: waiting for an approval");
+    try decideWaitingPermission(&hosted, .once);
+    thread.join();
+    const answered = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+    try expectHas(answered, "reviewer: working");
+    runtime.endUserWork(child_id, work_id, .completed, "done");
+    hosted.finishProcessing();
+    try waitUntilQuiet(runtime);
+    const ended = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-4", null);
+    try expectHas(ended, "reviewer: idle");
 }
 
 const OverrideResolverFixture = struct {

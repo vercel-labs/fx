@@ -651,6 +651,15 @@ pub const WorkerRuntime = struct {
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_permission_waiting: bool = false,
+    /// How many tool calls of the running turn wait for the user right now: for
+    /// the answer to a permission request, and to a question the agent or an
+    /// MCP server asked. A request that failed and waits for a sign-in
+    /// (`route_recovery`) is not counted, because a subagent's parent may
+    /// send it again. Changed under `worker_mutex` and read with no lock
+    /// (`userWait`), so a reader that holds other locks cannot deadlock with a
+    /// wait that is ending.
+    permission_waits: std.atomic.Value(u32) = .init(0),
+    question_waits: std.atomic.Value(u32) = .init(0),
     /// Set for a subagent's agent. Feedback main steered into a turn, which
     /// carries a receipt, is set aside when the turn ends without taking it,
     /// and the subagent's owner takes it back (`takeLeftoverMessages`) to run
@@ -834,11 +843,14 @@ pub const WorkerRuntime = struct {
 
     /// Cancels the turn in flight without stopping the worker, which goes on
     /// to run later turns, as a subagent's agent does: every wait wakes to
-    /// see the cancel, and a permission request the turn is waiting on is
-    /// declined.
+    /// see the cancel, a permission request the turn is waiting on is
+    /// declined, and a question it is waiting on is cancelled.
     pub fn requestTurnCancel(self: *WorkerRuntime) void {
         self.requestCancel();
         self.cancelApprovalTurn();
+        if (self.cancelPendingQuestionBatch()) {
+            debug_trace.logf("worker", "pending question cancelled reason=turn_cancel", .{});
+        }
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
@@ -2837,6 +2849,18 @@ pub const WorkerRuntime = struct {
         };
     }
 
+    /// What a turn waits for the user to answer.
+    pub const UserWait = enum { approval, question };
+
+    /// What the running turn waits for the user to answer, or null. It reads
+    /// atomics, so any thread may call it with any lock held. An approval
+    /// wins over a question when a turn has both.
+    pub fn userWait(self: *const WorkerRuntime) ?UserWait {
+        if (self.permission_waits.load(.acquire) > 0) return .approval;
+        if (self.question_waits.load(.acquire) > 0) return .question;
+        return null;
+    }
+
     pub const PermissionRequestObserver = struct {
         context: *anyopaque,
         observe_fn: *const fn (
@@ -2895,9 +2919,11 @@ pub const WorkerRuntime = struct {
             };
         }
 
+        _ = self.permission_waits.fetchAdd(1, .release);
         while (self.pending_permission_response == null and !self.worker_stop_requested) {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
+        _ = self.permission_waits.fetchSub(1, .release);
 
         const response = self.pending_permission_response orelse
             permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
@@ -3074,9 +3100,12 @@ pub const WorkerRuntime = struct {
         owns_pending_question = false;
         self.worker_cond.broadcast(io_mod.getIo());
 
+        const waits_for_user = source != .route_recovery;
+        if (waits_for_user) _ = self.question_waits.fetchAdd(1, .release);
         while (self.pending_question_response == .pending and !self.worker_stop_requested) {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
+        if (waits_for_user) _ = self.question_waits.fetchSub(1, .release);
 
         if (self.pending_question_shared) |pending| {
             freeOwnedQuestionBatch(alloc, pending);
@@ -8337,6 +8366,156 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+/// Whether `runtime` has stopped waiting on the user, polled for a bounded
+/// time so a wait that does not end fails the test instead of hanging it.
+fn userWaitEnds(runtime: *const WorkerRuntime) bool {
+    for (0..500) |_| {
+        if (runtime.userWait() == null) return true;
+        io_mod.sleep(1 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "a turn that waits for a permission answer says so until the wait ends, however it ends" {
+    const alloc = std.testing.allocator;
+    const Ends = enum { allowed, denied, approval_cancelled, turn_cancelled, stopped };
+    for (std.enums.values(Ends)) |how| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+
+        var state = PermissionThreadState{};
+        const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+        const request_id = try waitForPermissionLabel(&runtime, "Allow?");
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .approval), runtime.userWait());
+        switch (how) {
+            .allowed => try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitPermissionDecisionForTest(&runtime, request_id, .once)),
+            .denied => try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitPermissionDecisionForTest(&runtime, request_id, .deny)),
+            .approval_cancelled => runtime.cancelApprovalTurn(),
+            .turn_cancelled => runtime.requestTurnCancel(),
+            .stopped => runtime.requestStop(),
+        }
+        const ended = userWaitEnds(&runtime);
+        if (!ended) runtime.requestStop();
+        thread.join();
+        try std.testing.expect(ended);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+    }
+}
+
+test "a turn that waits for a question's answer says so until the wait ends, however it ends" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    const Ends = enum { answered, escaped, stopped };
+    for (std.enums.values(Ends)) |how| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+
+        var state = QuestionThreadState{};
+        const thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries });
+        var snapshot = try waitForQuestionSnapshot(&runtime);
+        snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .question), runtime.userWait());
+        switch (how) {
+            .answered => try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null),
+            .escaped => try runtime.submitQuestionBatchAnswer(alloc, null, null),
+            .stopped => runtime.requestStop(),
+        }
+        const ended = userWaitEnds(&runtime);
+        if (!ended) runtime.requestStop();
+        thread.join();
+        defer freeAnswers(alloc, state.answers);
+        try std.testing.expect(ended);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+    }
+}
+
+test "cancelling a turn that waits for a question's answer ends the wait, as it does a permission's" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var state = QuestionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries });
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+    runtime.requestTurnCancel();
+    const ended = userWaitEnds(&runtime);
+    // A wait that did not end is released, so the test fails instead of hanging.
+    if (!ended) runtime.requestStop();
+    thread.join();
+    defer freeAnswers(alloc, state.answers);
+    try std.testing.expect(ended);
+    try std.testing.expect(state.answers == null);
+}
+
+test "an MCP server's question waits for the user, and a request that waits for a sign-in does not count" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+
+    var elicited = WorkerRuntime{};
+    defer elicited.deinit(alloc);
+    var elicitation = QuestionThreadState{};
+    const elicitation_thread = try std.Thread.spawn(.{}, runMcpElicitationRequest, .{ &elicitation, &elicited, &entries });
+    var elicitation_snapshot = try waitForQuestionSnapshot(&elicited);
+    elicitation_snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .question), elicited.userWait());
+    try elicited.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    elicitation_thread.join();
+    defer freeAnswers(alloc, elicitation.answers);
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), elicited.userWait());
+
+    // A parent may send a failed request again, so it is not "waiting for the user".
+    var route = WorkerRuntime{};
+    defer route.deinit(alloc);
+    var recovery = QuestionThreadState{};
+    const route_thread = try std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ &recovery, &route, &entries });
+    var route_snapshot = try waitForQuestionSnapshot(&route);
+    route_snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), route.userWait());
+    try route.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    route_thread.join();
+    defer freeAnswers(alloc, recovery.answers);
+}
+
+test "a permission request and a question that wait together are both counted" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+
+    var question = QuestionThreadState{};
+    const question_thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &question, &runtime, &entries });
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+    var permission = PermissionThreadState{};
+    const permission_thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &permission, &runtime, "Allow?" });
+    const request_id = try waitForPermissionLabel(&runtime, "Allow?");
+    // An approval wins in what it reports, and answering it leaves the question.
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .approval), runtime.userWait());
+    try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitPermissionDecisionForTest(&runtime, request_id, .once));
+    permission_thread.join();
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .question), runtime.userWait());
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    question_thread.join();
+    defer freeAnswers(alloc, question.answers);
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+}
+
+fn runMcpElicitationRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    state.answers = runtime.requestMcpElicitationAnswerBlocking(std.testing.allocator, entries) catch |err| {
+        state.err = err;
+        return;
+    };
 }
 
 test "question resume observer runs only for accepted answers before releasing the worker" {
