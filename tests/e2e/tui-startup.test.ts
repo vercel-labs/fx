@@ -1304,3 +1304,76 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
     TIMEOUT,
   );
 });
+
+describe.skipIf(SKIP_TMUX)("tui: theme notifications", () => {
+  const notificationsOff = "\x1b[?2031l";
+  const notificationsOn = "\x1b[?2031h";
+
+  function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, "'\\''")}'`;
+  }
+
+  function notificationsOnAfterLastOff(bytes: string): boolean {
+    const off = bytes.lastIndexOf(notificationsOff);
+    return off >= 0 && bytes.indexOf(notificationsOn, off) > off;
+  }
+
+  test(
+    "turns theme notifications on again after a job-control resume",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-resume-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const capturePath = join(root, "pane-output.bin");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeFileSync(stderrPath, "");
+      writeFileSync(capturePath, "");
+      try {
+        session = await TmuxSession.create({
+          cmd: "/bin/sh -i",
+          cwd: root,
+          isolated: true,
+          remainOnExit: true,
+          width: 100,
+          height: 30,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_THEME: undefined,
+            FX_SOUND: "0",
+            PS1: "THEME_SHELL> ",
+          },
+        });
+        await session.waitForText("THEME_SHELL>", TIMEOUT);
+        session.startPaneOutputCapture(capturePath);
+        await session.sendText(`${shellQuote(FX_BIN)} 2>${shellQuote(stderrPath)}`);
+        await session.waitForComposer(10_000);
+
+        // The suspend restore turns theme notifications off, so the terminal
+        // stops reporting light and dark switches until fx turns them on again.
+        await session.sendKeys("C-z");
+        await session.waitForPane((pane) => /stopped|suspended/i.test(pane), TIMEOUT);
+        expect(readFileSync(capturePath, "latin1")).toContain(notificationsOff);
+
+        await session.sendText("fg");
+        await session.waitForComposer(10_000);
+        await session.waitForPane(
+          () => notificationsOnAfterLastOff(readFileSync(capturePath, "latin1")),
+          10_000,
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});

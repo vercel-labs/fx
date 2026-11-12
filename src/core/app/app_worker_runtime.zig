@@ -1327,9 +1327,15 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeTokenPassDenial(app, notice);
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
                     .model_call => |record| {
+                        if (comptime @hasField(App, "model_cache")) {
+                            if (record.outcome == .completed) {
+                                if (record.served_by) |served_by| app.model_cache.observeServedBy(served_by);
+                            }
+                        }
                         // After the text the call wrote. The line shows only
                         // in Ctrl+O, so it waits for text still being paced
                         // out instead of showing that text early, as in
@@ -1348,6 +1354,7 @@ pub fn Runtime(comptime App: type) type {
                         // recovered or failed; the error itself arrives on
                         // its own. The status line returns to normal activity.
                         const was_waiting_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
+                        const was_waiting = app.shell.worker_status_state().waitsForUser();
                         if (status.kind == .recovered or status.kind == .failed) {
                             _ = app.shell.worker_status_state().clear_route_recovery();
                         } else {
@@ -1364,12 +1371,19 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);
-                        if (comptime agents.hasAgentField(App, "child_run")) app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
+                        if (comptime agents.hasAgentField(App, "child_run")) {
+                            app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
+                            const waiting = app.shell.worker_status_state().waitsForUser();
+                            if (!was_waiting and waiting) app_agents_runtime.Runtime(App).noteChildWaiting(app, agent, status);
+                            // A wait the user ended leaves nothing for the parent to answer.
+                            if (!waiting) agent.worker.parent_may_continue.store(false, .seq_cst);
+                        }
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
                             app.shell.render_requests.request(.footer);
                         }
+                        if (comptime agents.hasAgentField(App, "child_run")) agent.worker.parent_may_continue.store(false, .seq_cst);
                     },
                     // The serving provider already appears on the ctrl+o
                     // network record; nothing interactive consumes the event
@@ -1460,6 +1474,7 @@ pub fn Runtime(comptime App: type) type {
                         if (comptime @hasField(App, "program_status")) {
                             if (notice.tone == .@"error" and !offScreen(app, agent)) app.program_status.noteFailure();
                         }
+                        observeTokenPassDenial(app, notice);
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
                     },
@@ -1598,6 +1613,14 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        /// A warning or error that AI Gateway's Token Pass denial produced
+        /// tells the model cache the team has no active Token Pass.
+        fn observeTokenPassDenial(app: *App, notice: types.SemanticNotice) void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (notice.tone != .warning and notice.tone != .@"error") return;
+            app.model_cache.observeErrorText(notice.body);
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {

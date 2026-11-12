@@ -22,6 +22,7 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -94,7 +95,21 @@ const resumePageLimitForRows = session_persistence.resumePageLimitForRows;
 
 /// What the footer draws of `menu`.
 pub fn forkMenuProjection(menu: *const session_persistence.ForkMenu) render_input.ForkMenuProjection {
-    return .{ .points = menu.points, .selected = menu.selected, .window_start = menu.window_start };
+    return .{
+        .points = menu.points,
+        .selected = menu.selected,
+        .window_start = menu.window_start,
+        .question = if (menu.question) |children| copyableCount(children) else null,
+    };
+}
+
+/// How many of `children` a fork can take a copy of (D97).
+fn copyableCount(children: []const session_adapter.Child) usize {
+    var count: usize = 0;
+    for (children) |child| {
+        if (subagent_child_state.copyableAtFork(child)) count += 1;
+    }
+    return count;
 }
 
 const Allocator = std.mem.Allocator;
@@ -973,6 +988,26 @@ pub fn Runtime(comptime App: type) type {
             // first keeps the app's selection across sessions.
             if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
+            try noteStoppedSubagentTasks(app, agent);
+        }
+
+        fn stopSubagentsForSwitch(app: *App, agent: *AppAgent) !usize {
+            if (comptime !@hasField(App, "child_agents")) return 0;
+            return @import("app_agents_runtime.zig").Runtime(App).stopSubagentsForSwitch(app, agent);
+        }
+
+        /// Says, in the session a switch opened, how many subagent tasks the
+        /// switch stopped; the subagents stay in the session it left (D97).
+        fn noteStoppedSubagentTasks(app: *App, agent: *AppAgent) !void {
+            const stopped = agent.session_persistence.switch_stopped_tasks;
+            agent.session_persistence.switch_stopped_tasks = 0;
+            if (stopped == 0) return;
+            var buf: [128]u8 = undefined;
+            const body = if (stopped == 1)
+                "stopped 1 running subagent task; the subagent stays in the previous session"
+            else
+                try std.mem.print(&buf, "stopped {d} running subagent tasks; the subagents stay in the previous session", .{stopped});
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = body }, true);
         }
 
         /// Whether `agent`, an instance launched after the first, runs the
@@ -1083,6 +1118,10 @@ pub fn Runtime(comptime App: type) type {
             // it to the next transition, which reads it again.
             if (agent.session_persistence.next_session_preferences) |*previous| previous.deinit(app.alloc);
             agent.session_persistence.next_session_preferences = savedPreferences(app, agent);
+            // The session's subagents stop before its host joins their slot
+            // threads, as /close and quit stop them (D97;
+            // `tests/tla/session_manager/Wiring.tla` SwitchEnds).
+            agent.session_persistence.switch_stopped_tasks = try stopSubagentsForSwitch(app, agent);
             closeWritableSession(app, agent);
             app.stopStream(agent);
             app.shell.clearTranscript(app.alloc);
@@ -1373,6 +1412,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionWarmup(app: *App) void {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+            // The subagents the session started before count at once, so the
+            // footer offers the list before it is first opened.
+            if (comptime @hasField(App, "child_agents")) @import("app_agents_runtime.zig").Runtime(App).listRestoredSubagents(app);
         }
 
         pub fn resumeSelectedSession(app: *App, agent: *AppAgent) !bool {
@@ -1390,6 +1432,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, agent, v2, .session);
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
             startPendingResume(app, agent);
             return true;
         }
@@ -1422,15 +1465,50 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Forks the session before the fork menu's selected prompt and
-        /// switches to the fork, which opens before the source closes (D58).
-        /// Returns that prompt's text for the composer; caller owns it.
-        pub fn forkBeforeSelectedPrompt(app: *App, agent: *AppAgent) ![]u8 {
+        /// Enter on `/fork`'s menu, and the answer to its question (D97). On
+        /// the prompts, Enter (`bring` null) asks whether the fork takes
+        /// copies of the subagents the session had at the chosen prompt, or
+        /// forks at once when it had none to copy. The answer forks with a
+        /// copy of each of them or of none. Returns the chosen prompt's text
+        /// for the composer once it forked, else null; caller owns it.
+        pub fn submitForkMenu(app: *App, agent: *AppAgent, bring: ?bool) !?[]u8 {
+            const menu = &agent.session_persistence.fork_menu;
+            if (menu.question) |children| {
+                const yes = bring orelse return null;
+                if (!yes) return try forkBeforeSelectedPrompt(app, agent, &.{});
+                var arena = std.heap.ArenaAllocator.init(app.alloc);
+                defer arena.deinit();
+                var copies: std.ArrayList(session_adapter.Session.ChildCopy) = .empty;
+                for (children) |child| {
+                    if (!subagent_child_state.copyableAtFork(child)) continue;
+                    try copies.append(arena.allocator(), try subagent_child_state.forkCopy(arena.allocator(), child));
+                }
+                return try forkBeforeSelectedPrompt(app, agent, copies.items);
+            }
+            const source = agent.session_persistence.v2 orelse return error.SessionStoreUnavailable;
+            const children = try source.forkChildren(app.alloc, menu.points[menu.selected].turn);
+            if (copyableCount(children) == 0) {
+                session_adapter.freeChildren(app.alloc, children);
+                return try forkBeforeSelectedPrompt(app, agent, &.{});
+            }
+            menu.question = children;
+            app.shell.render_requests.request(.footer);
+            return null;
+        }
+
+        /// Forks the session before the fork menu's selected prompt, with
+        /// `copies` of its subagents (D97), and switches to the fork, which
+        /// opens before the source closes (D58). Returns that prompt's text
+        /// for the composer; caller owns it.
+        fn forkBeforeSelectedPrompt(app: *App, agent: *AppAgent, copies: []const session_adapter.Session.ChildCopy) ![]u8 {
             const menu = &agent.session_persistence.fork_menu;
             const points = menu.points;
             const point = points[menu.selected];
+            // `copies` borrow the question's children until the fork is made.
+            const question = menu.question;
             menu.* = .{};
             defer session_adapter.Session.freeForkPoints(app.alloc, points);
+            defer if (question) |children| session_adapter.freeChildren(app.alloc, children);
             const source = agent.session_persistence.v2 orelse return error.SessionStoreUnavailable;
             const source_id = try app.alloc.dupe(u8, source.id());
             defer app.alloc.free(source_id);
@@ -1441,6 +1519,7 @@ pub fn Runtime(comptime App: type) type {
                 .workspace = app.workspace_root,
                 .host = .app,
                 .title = cachedSessionTitle(agent),
+                .children = copies,
             });
             var fork_owned = true;
             errdefer if (fork_owned) fork.close();
@@ -1449,6 +1528,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, agent, fork, .{ .fork = source_id });
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
             return prompt;
         }
 
@@ -2513,16 +2593,26 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "sessionTitleModel")) return;
 
             const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
-            const title_model = app.sessionTitleModel();
-            if (!session_title_generation.shouldGenerate(.{
+            const title_model = titleModelFor(app, agent, app.sessionTitleModel());
+            const session_id = activeSessionId(agent) orelse return;
+            const gate: session_title_generation.Gate = .{
                 .setting_enabled = app.session_title_generation,
                 .provider_supports_titles = title_model != null,
                 .session_untitled = agent.session_title.items.len == 0 and
                     agent.session.agent.history.items.len == 0,
                 .recovery_replay = false,
                 .task_running = agent.session_persistence.title_generation.task != null,
-            })) return;
-            const session_id = activeSessionId(agent) orelse return;
+                .title_started = agent.session_persistence.title_generation.startedFor(session_id),
+            };
+            if (!session_title_generation.shouldGenerate(gate)) {
+                var without_record = gate;
+                without_record.title_started = false;
+                if (session_title_generation.shouldGenerate(without_record)) {
+                    debug_trace.logf("session", "event=title_generation_skipped reason=already_started session={s}", .{session_id});
+                }
+                return;
+            }
+
             const credential = app.auth.gatewayCredential() orelse return;
 
             const task = session_title_generation.Task.create(.{
@@ -2533,6 +2623,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = credential.gateway_team,
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
+                .reads_shared_sign_in = true,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {
                 agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
@@ -2547,6 +2638,15 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
+        /// The provider's title model, or a Token Pass model when the
+        /// agent's AI Gateway model is a Token Pass model.
+        fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
+            const default_model = provider_title_model orelse return null;
+            if (comptime !provider_runtime.supported(App)) return default_model;
+            if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
+            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+        }
+
         /// Applies a finished background title generation on the main loop.
         /// Returns true when the session title changed.
         pub fn pollSessionTitleGeneration(app: *App, agent: *AppAgent) !bool {
@@ -2557,7 +2657,10 @@ pub fn Runtime(comptime App: type) type {
             const task = agent.session_persistence.title_generation.takeCompleted() orelse return false;
             defer task.destroy();
             agent.session_persistence.title_generation.recordFinished(task);
-            const title = task.takeTitle() orelse return false;
+            const title = task.takeTitle() orelse {
+                debug_trace.logf("session", "event=title_generation_apply result=unavailable session={s}", .{task.session_id});
+                return false;
+            };
             defer std.heap.c_allocator.free(title);
             const active_id = activeSessionId(agent) orelse {
                 debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
@@ -10890,6 +10993,34 @@ test "session title generation gates on setting, history, and prompt text" {
         .execution = .{},
     } });
     Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "refactor the renderer loop");
+    try std.testing.expect(app.agent().session_persistence.title_generation.task == null);
+}
+
+test "session title generation starts once per session, even before a stopped turn reaches the history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+    app.stream_content = "";
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "refactor the renderer loop");
+    try std.testing.expect(app.agent().session_persistence.title_generation.task != null);
+    try awaitTitleTask(&app);
+    try std.testing.expectEqual(.failed, app.agent().session_persistence.title_generation.last.status);
+
+    // The history is still empty, as when the next prompt interrupts the
+    // first turn before that turn is committed.
+    try std.testing.expectEqual(@as(usize, 0), app.agent().session.agent.history.items.len);
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "now write the regression test");
     try std.testing.expect(app.agent().session_persistence.title_generation.task == null);
 }
 
