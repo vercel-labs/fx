@@ -1160,11 +1160,13 @@ fn composeFileApprovalFooterFrame(
 
     const profile_top = plan.footer.top_divider;
     const allocated_rows = plan.footer.hint - profile_top + 1;
-    const projection = approval_ui.projectFileApproval(request, input.approval.?.choice_index, shell.layout.cols, allocated_rows);
+    const origin = input.approval.?.request.origin;
+    const projection = approval_ui.projectFileApproval(request, origin, input.approval.?.choice_index, shell.layout.cols, allocated_rows);
     for (projection.slice(), 0..) |kind, row_index| {
         var row = try approval_ui.composeFileApprovalRow(
             alloc,
             request,
+            origin,
             &projection,
             input.approval.?.choice_index,
             input.approval,

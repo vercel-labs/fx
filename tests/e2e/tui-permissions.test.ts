@@ -349,6 +349,38 @@ async function decide(session: TmuxSession, choice: 1 | 2 | 3) {
 
 describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
+  test("a single agent's prompts keep their session-wide words exactly", async () => {
+    const root = createIsolatedRoot();
+    const gateway = startFakeGateway([
+      toolCall("single_write", "write_file", { path: "single.txt", content: "SINGLE\n" }),
+      toolCall("single_shell", "shell", { command: "touch single-marker" }),
+      finalText("SINGLE_DONE"),
+    ]);
+    const { session, stderrPath } = await launch(root, gateway, { width: 80, height: 24 });
+
+    await session.sendText("Create the single-agent fixture.");
+    const file = await waitForFileApproval(session, { required: ["single.txt"] });
+    const fileRows = file.split("\n").map((row) => row.trimEnd());
+    expect(file).toContain("Permission needed · Review change");
+    expect(fileRows).toContain("  ❯ 1  Apply once");
+    expect(fileRows).toContain("    2  Apply + allow workspace file access for this session");
+    expect(fileRows).toContain("    3  Don't apply");
+    await decide(session, 3);
+
+    const command = await session.waitForText("exact command", TIMEOUT);
+    const commandRows = command.split("\n").map((row) => row.trimEnd());
+    expect(command).toContain("Permission needed · Choose one");
+    expect(commandRows).toContain("  ❯ 1. Yes");
+    expect(commandRows).toContain("    2. Yes, and don't ask again for this exact command");
+    expect(commandRows).toContain("    3. No");
+    await decide(session, 3);
+
+    await session.waitForText("SINGLE_DONE", TIMEOUT);
+    expect(existsSync(join(root.workspace, "single.txt"))).toBe(false);
+    expect(existsSync(join(root.workspace, "single-marker"))).toBe(false);
+    expectCleanStderr(stderrPath);
+  }, TIMEOUT);
+
   test("resized file approval restores complete history once", async () => {
     const paragraphs = Array.from({ length: 28 }, (_, index) => {
       const row = String(index + 1).padStart(2, "0");

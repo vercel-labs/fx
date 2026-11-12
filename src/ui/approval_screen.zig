@@ -1790,6 +1790,13 @@ test "subagent file approval renders its bounded preview without a live review" 
     ) != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "note.txt") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "changed") != null);
+    // Its session-wide option reaches main and every other subagent too.
+    try std.testing.expect(std.mem.find(
+        u8,
+        rendered.bytes,
+        "Apply + allow workspace file access for all agents",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "for this session") == null);
     try std.testing.expect(rendered.file_identity_visible);
     try std.testing.expect(rendered.changed_or_notice_visible);
     try std.testing.expect(rendered.all_decision_controls_visible);

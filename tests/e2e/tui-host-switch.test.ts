@@ -1575,6 +1575,108 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // The prompt's rows with trailing blanks cut, so a row can be matched whole.
+  const promptRows = (pane: string) => pane.split("\n").map((row) => row.trimEnd());
+
+  test(
+    "a subagent's session-wide options say they cover all agents, whole at 80 and 60 columns",
+    async () => {
+      let mainCalls = 0;
+      let childCalls = 0;
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) {
+            return toolCall("child_write", "write_file", { path: "wide-child.txt", content: "WIDE_WROTE\n" });
+          }
+          if (childCalls === 2) {
+            return toolCall("child_shell", "shell", { command: "touch wide-child-marker" });
+          }
+          return text("child_done", "WIDE_CHILD_DONE");
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "writer", message: "SWITCH_WIDE_TASK", profile: "writer" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("Subagent writer needs permission", 30_000);
+
+        // Its file prompt, which main's screen shows, offers a session-wide
+        // grant that main and every other agent read too.
+        for (const width of [80, 60]) {
+          await session.resizeWindow(width, 40, 500);
+          const rows = promptRows(await session.waitForPane((pane) => pane.includes("Apply + allow workspace file access"), 10_000));
+          expect(rows).toContain("  ❯ 1  Apply once");
+          expect(rows).toContain("    2  Apply + allow workspace file access for all agents");
+          expect(rows).toContain("    3  Don't apply");
+          expect(rows.join("\n")).not.toContain("for this session");
+          expect(rows.join("\n")).not.toContain("resize to review");
+        }
+        await session.sendKeys("1");
+        await until("the write", () => existsSync(join(workspace, "wide-child.txt")));
+
+        // So does its command prompt.
+        for (const width of [80, 60]) {
+          await session.resizeWindow(width, 40, 500);
+          const rows = promptRows(await session.waitForPane((pane) => pane.includes("exact command"), 10_000));
+          expect(rows).toContain("  ❯ 1. Yes");
+          expect(rows).toContain("    2. Yes, and no agent asks again for this exact command");
+          expect(rows).toContain("    3. No");
+          expect(rows.join("\n")).not.toContain("don't ask again");
+        }
+        await session.sendKeys("3");
+        await session.waitForText("WIDE_CHILD_DONE", 30_000);
+        expect(existsSync(join(workspace, "wide-child-marker"))).toBe(false);
+      }, (home) => {
+        const folder = join(home, ".fx", "agents", "writer");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "profile.json"), JSON.stringify({
+          description: "Writes one file and runs one command",
+          tools: ["read_file", "write_file", "shell"],
+          permission_mode: "ask",
+        }));
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's own prompt keeps its session-wide words while it has an open subagent",
+    async () => {
+      let mainCalls = 0;
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "SWITCH_OPEN_CHILD_DONE");
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_OPEN_TASK" },
+          });
+        }
+        if (mainCalls === 2) {
+          return toolCall("main_write", "write_file", { path: "main-own.txt", content: "MAIN_OWN\n" });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER");
+        // The subagent is open, working or idle, when main asks.
+        const rows = promptRows(await session.waitForText("Apply this change?", 30_000));
+        expect(rows.join("\n")).toContain("Permission needed · Review change");
+        expect(rows.join("\n")).not.toContain("needs permission");
+        expect(rows).toContain("  ❯ 1  Apply once");
+        expect(rows).toContain("    2  Apply + allow workspace file access for this session");
+        expect(rows).toContain("    3  Don't apply");
+        await session.sendKeys("1");
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        expect(readFileSync(join(workspace, "main-own.txt"), "utf8")).toBe("MAIN_OWN\n");
+      }, () => {}, false, { FX_PERMISSION_MODE: "ask" });
+    },
+    TIMEOUT,
+  );
+
   test(
     "a subagent's question shows on main's screen, named for it, and is answered there",
     async () => {

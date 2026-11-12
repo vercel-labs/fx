@@ -102,13 +102,14 @@ pub fn composeFileApprovalScreenRow(
             .text = try composeFileApprovalChoiceRowWithBlocked(
                 alloc,
                 request,
+                sharedWithAgents(origin),
                 selected_choice,
                 index,
                 amendment,
                 width,
                 index < 2 and !affirmative_visible,
             ),
-            .complete = fileApprovalChoiceLabelFits(request, index, width),
+            .complete = fileApprovalChoiceLabelFits(request, sharedWithAgents(origin), index, width),
         },
         .hint => .{
             .text = try composeFileApprovalHintRowWithText(
@@ -463,6 +464,7 @@ pub fn fileApprovalPickerRows(
 
 pub fn projectFileApproval(
     request: permission_request.FileApprovalRequest,
+    origin: permission_request.RequestOrigin,
     selected_choice: u8,
     width: u16,
     allocated_rows: u16,
@@ -580,11 +582,12 @@ pub fn projectFileApproval(
         header_selected and
         result.header.action_visible and
         result.header.path.complete_basename_visible;
+    const shared = sharedWithAgents(origin);
     result.all_choice_labels_visible =
         choice_rows == 3 and
-        fileApprovalChoiceLabelFits(request, 0, width) and
-        fileApprovalChoiceLabelFits(request, 1, width) and
-        fileApprovalChoiceLabelFits(request, 2, width);
+        fileApprovalChoiceLabelFits(request, shared, 0, width) and
+        fileApprovalChoiceLabelFits(request, shared, 1, width) and
+        fileApprovalChoiceLabelFits(request, shared, 2, width);
     return result;
 }
 
@@ -596,6 +599,7 @@ pub fn fileApprovalAffirmativeReady(
     const allocated_rows = approval_readiness.committedFooterApprovalRows(shell) orelse return false;
     return projectFileApproval(
         settled.file_request,
+        approval.request.origin,
         approval.choice_index,
         settled.cols,
         allocated_rows,
@@ -730,17 +734,19 @@ fn projectFileApprovalPath(
 
 fn fileApprovalChoiceLabelFits(
     request: permission_request.FileApprovalRequest,
+    shared: bool,
     choice_index: u8,
     width: u16,
 ) bool {
     const outer_width: usize = width;
     if (outer_width < file_approval_choice_prefix_width) return false;
-    return fileApprovalChoiceLabelWidth(request, choice_index) <=
+    return fileApprovalChoiceLabelWidth(request, shared, choice_index) <=
         outer_width - file_approval_choice_prefix_width;
 }
 
 fn fileApprovalChoiceLabelWidth(
     request: permission_request.FileApprovalRequest,
+    shared: bool,
     choice_index: u8,
 ) usize {
     const verb_width = display_width.visibleWidth(
@@ -749,7 +755,7 @@ fn fileApprovalChoiceLabelWidth(
     return switch (choice_index) {
         0 => verb_width + " once".len,
         1 => verb_width + " + allow ".len +
-            fileApprovalScopeSuffixWidth(request.scope),
+            fileApprovalScopeSuffixWidth(request.scope, shared),
         2 => if (request.intent == .equality_disclosure)
             "Don't reveal".len
         else
@@ -760,18 +766,20 @@ fn fileApprovalChoiceLabelWidth(
 
 fn fileApprovalScopeSuffixWidth(
     scope: permission_request.FileApprovalScope,
+    shared: bool,
 ) usize {
     return switch (scope) {
-        .workspace_files => "workspace file access for this session".len,
-        .external_tree => |root_tail| "file changes under ".len +
+        .workspace_files => (if (shared) workspace_scope_shared else workspace_scope_own).len,
+        .external_tree => |root_tail| (if (shared) external_scope_head_shared else external_scope_head_own).len +
             display_width.visibleWidth(root_tail) +
-            " for this session".len,
+            (if (shared) 0 else external_scope_tail_own.len),
     };
 }
 
 pub fn composeFileApprovalRow(
     alloc: Allocator,
     request: permission_request.FileApprovalRequest,
+    origin: permission_request.RequestOrigin,
     projection: *const FileApprovalProjection,
     choice_index: u8,
     amendment: ?ApprovalProjection,
@@ -812,6 +820,7 @@ pub fn composeFileApprovalRow(
         .choice => |index| composeFileApprovalChoiceRow(
             alloc,
             request,
+            sharedWithAgents(origin),
             projection.*,
             choice_index,
             index,
@@ -1052,6 +1061,7 @@ fn composeFileApprovalHiddenPreviewRow(
 fn composeFileApprovalChoiceRow(
     alloc: Allocator,
     request: permission_request.FileApprovalRequest,
+    shared: bool,
     projection: FileApprovalProjection,
     selected_index: u8,
     row_index: u8,
@@ -1063,6 +1073,7 @@ fn composeFileApprovalChoiceRow(
     return composeFileApprovalChoiceRowWithBlocked(
         alloc,
         request,
+        shared,
         selected_index,
         row_index,
         amendment,
@@ -1074,6 +1085,7 @@ fn composeFileApprovalChoiceRow(
 fn composeFileApprovalChoiceRowWithBlocked(
     alloc: Allocator,
     request: permission_request.FileApprovalRequest,
+    shared: bool,
     selected_index: u8,
     row_index: u8,
     amendment: ?ApprovalProjection,
@@ -1140,6 +1152,7 @@ fn composeFileApprovalChoiceRowWithBlocked(
         alloc,
         &label,
         request,
+        shared,
         row_index,
         amendment,
         remaining,
@@ -1174,6 +1187,7 @@ fn appendFileApprovalChoiceLabel(
     alloc: Allocator,
     out: *std.ArrayList(u8),
     request: permission_request.FileApprovalRequest,
+    shared: bool,
     choice_index: u8,
     amendment: ?ApprovalProjection,
     max_width: usize,
@@ -1204,12 +1218,15 @@ fn appendFileApprovalChoiceLabel(
             switch (request.scope) {
                 .workspace_files => try out.appendSlice(
                     alloc,
-                    "workspace file access for this session",
+                    if (shared) workspace_scope_shared else workspace_scope_own,
                 ),
                 .external_tree => |root_tail| {
-                    try out.appendSlice(alloc, "file changes under ");
+                    try out.appendSlice(
+                        alloc,
+                        if (shared) external_scope_head_shared else external_scope_head_own,
+                    );
                     try out.appendSlice(alloc, root_tail);
-                    try out.appendSlice(alloc, " for this session");
+                    if (!shared) try out.appendSlice(alloc, external_scope_tail_own);
                 },
             }
         },
@@ -1962,12 +1979,47 @@ pub fn commandTargetForApproval(label: []const u8, command: ?[]const u8) ?[]cons
     return command orelse commandTarget(label);
 }
 
+/// Whether the session-wide answer to a prompt for a request from `origin`
+/// reaches agents other than the one that asked. A subagent's answer is kept
+/// with the instance at the top of its tree (`allowForSession` in
+/// `src/core/app/app_permission_runtime.zig`), and main and every other
+/// subagent of that tree read it, so the prompt says so. An instance's own
+/// prompt keeps "for this session", which already covers its subagents.
+fn sharedWithAgents(origin: permission_request.RequestOrigin) bool {
+    return switch (origin) {
+        .active_session => false,
+        .subagent => true,
+    };
+}
+
+// The words a subagent's prompt uses where main's say "for this session". They
+// have to fit the narrowest layout, 60 columns, that shows a file prompt's
+// "allow" row whole, so "all agents" takes the place of "this session" and
+// follows what is allowed, ahead of a path, which is the part a narrow row cuts.
+const workspace_scope_own: []const u8 = "workspace file access for this session";
+const workspace_scope_shared: []const u8 = "workspace file access for all agents";
+const external_scope_head_own: []const u8 = "file changes under ";
+const external_scope_tail_own: []const u8 = " for this session";
+const external_scope_head_shared: []const u8 = "file changes for all agents under ";
+
 fn approvalAlwaysChoice(approval: ApprovalProjection, label: []const u8) []const u8 {
+    const shared = sharedWithAgents(approval.request.origin);
     if (approval.request.tool_arguments_preview != null) {
-        return "2. Allow this MCP tool for this session";
+        return if (shared)
+            "2. Allow this MCP tool for all agents"
+        else
+            "2. Allow this MCP tool for this session";
     }
-    if (commandLabelPrefix(label) != null) return "2. Yes, and don't ask again for this exact command";
-    return "2. Yes, and don't ask again for this request";
+    if (commandLabelPrefix(label) != null) {
+        return if (shared)
+            "2. Yes, and no agent asks again for this exact command"
+        else
+            "2. Yes, and don't ask again for this exact command";
+    }
+    return if (shared)
+        "2. Yes, and no agent asks again for this request"
+    else
+        "2. Yes, and don't ask again for this request";
 }
 
 fn commandLabelPrefix(label: []const u8) ?[]const u8 {
@@ -2037,7 +2089,7 @@ test "file approval full frame uses canonical vertical copy and spacing" {
         .truncated = false,
     };
     const request: permission_request.FileApprovalRequest = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files };
-    const projection = projectFileApproval(request, 0, 96, fileApprovalDesiredRows(preview));
+    const projection = projectFileApproval(request, .active_session, 0, 96, fileApprovalDesiredRows(preview));
     try std.testing.expect(projection.affirmativeEligible());
     try std.testing.expectEqual(@as(usize, fileApprovalDesiredRows(preview)), projection.slice().len);
 }
@@ -2058,7 +2110,7 @@ test "file approval constrained heights window canonical choices and disclose hi
         .truncated = false,
     };
     const request: permission_request.FileApprovalRequest = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files };
-    const constrained = projectFileApproval(request, 0, 96, 8);
+    const constrained = projectFileApproval(request, .active_session, 0, 96, 8);
     try std.testing.expect(constrained.affirmativeEligible());
     try std.testing.expect(constrained.hidden_preview_count > 0);
     try std.testing.expect(constrained.hidden_preview_disclosed);
@@ -2164,9 +2216,9 @@ test "file approval rows never overflow constrained width or height" {
     const preview = diff_mod.FileChangePreview{ .path = "src/profile.txt", .lines = &.{.{ .op = .addition, .new_line = 1, .text = "new" }}, .additions = 1, .deletions = 0, .truncated = false };
     const request: permission_request.FileApprovalRequest = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files };
     for ([_]u16{ 1, 7, 32, 96 }) |width| {
-        const projection = projectFileApproval(request, 0, width, 8);
+        const projection = projectFileApproval(request, .active_session, 0, width, 8);
         for (projection.slice()) |kind| {
-            var row = try composeFileApprovalRow(alloc, request, &projection, 0, null, width, kind);
+            var row = try composeFileApprovalRow(alloc, request, .active_session, &projection, 0, null, width, kind);
             defer row.deinit(alloc);
             try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
         }
@@ -2176,8 +2228,8 @@ test "file approval rows never overflow constrained width or height" {
 test "file approval projection gates basename choices preview and disclosure" {
     const preview = diff_mod.FileChangePreview{ .path = "src/profile.txt", .path_basename_start = "src/".len, .lines = &.{ .{ .op = .addition, .new_line = 1, .text = "new" }, .{ .op = .deletion, .old_line = 2, .text = "old" } }, .additions = 1, .deletions = 1, .truncated = false };
     const request: permission_request.FileApprovalRequest = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files };
-    try std.testing.expect(projectFileApproval(request, 0, 96, fileApprovalDesiredRows(preview)).affirmativeEligible());
-    try std.testing.expect(!projectFileApproval(request, 0, 12, fileApprovalDesiredRows(preview)).affirmativeEligible());
+    try std.testing.expect(projectFileApproval(request, .active_session, 0, 96, fileApprovalDesiredRows(preview)).affirmativeEligible());
+    try std.testing.expect(!projectFileApproval(request, .active_session, 0, 12, fileApprovalDesiredRows(preview)).affirmativeEligible());
 }
 
 test "file approval affirmative readiness requires settled committed geometry" {
@@ -2336,8 +2388,8 @@ test "file approval hints follow the selected amendment capability" {
     try std.testing.expect(try prompt.syncRequest(alloc, .{ .label = "edit_file note.txt", .file = request }));
     prompt.decision.choice_index = 1;
 
-    const projection = projectFileApproval(request, prompt.decision.choice_index, 120, fileApprovalDesiredRows(preview));
-    var inline_hint = try composeFileApprovalRow(alloc, request, &projection, prompt.decision.choice_index, prompt.projection().?, 120, .hint);
+    const projection = projectFileApproval(request, .active_session, prompt.decision.choice_index, 120, fileApprovalDesiredRows(preview));
+    var inline_hint = try composeFileApprovalRow(alloc, request, .active_session, &projection, prompt.decision.choice_index, prompt.projection().?, 120, .hint);
     defer inline_hint.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, inline_hint.items, "tab options") != null);
     try std.testing.expect(std.mem.find(u8, inline_hint.items, "tab amend") == null);
@@ -2857,6 +2909,193 @@ test "subagent approval header identifies requester and preserves command kind" 
         target.items,
         "$ touch child-marker",
     ) != null);
+}
+
+test "a subagent's session-wide option names all agents and main's keeps its words" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        label: []const u8,
+        preview: ?[]const u8 = null,
+        own: []const u8,
+        shared: []const u8,
+    }{
+        .{
+            .label = "shell.run zig build test",
+            .own = "2. Yes, and don't ask again for this exact command",
+            .shared = "2. Yes, and no agent asks again for this exact command",
+        },
+        .{
+            .label = "install_skill example-org/skills",
+            .own = "2. Yes, and don't ask again for this request",
+            .shared = "2. Yes, and no agent asks again for this request",
+        },
+        .{
+            .label = "mcp_fixture_echo",
+            .preview = "{\"text\":\"hi\"}",
+            .own = "2. Allow this MCP tool for this session",
+            .shared = "2. Allow this MCP tool for all agents",
+        },
+    };
+    for (cases) |case| {
+        const origins = [_]permission_request.RequestOrigin{
+            .active_session,
+            .{ .subagent = "approval-child" },
+        };
+        for (origins, 0..) |origin, index| {
+            var prompt = ApprovalPrompt{};
+            defer prompt.deinit(alloc);
+            try std.testing.expect(try prompt.syncRequest(alloc, .{
+                .label = case.label,
+                .tool_arguments_preview = case.preview,
+                .origin = origin,
+            }));
+            // 60 columns is the narrowest width these rows are shown whole at,
+            // so the words must be visible there.
+            var row = try composeApprovalPanelRow(
+                alloc,
+                prompt.projection().?,
+                60,
+                7,
+                interaction_state.approval_panel_rows_spacious,
+            );
+            defer row.deinit(alloc);
+            const expected = if (index == 0) case.own else case.shared;
+            const other = if (index == 0) case.shared else case.own;
+            try std.testing.expect(std.mem.find(u8, row.items, expected) != null);
+            try std.testing.expect(std.mem.find(u8, row.items, other) == null);
+        }
+    }
+}
+
+test "a subagent's file option names all agents and stays whole at 60 columns" {
+    const alloc = std.testing.allocator;
+    const preview = diff_mod.FileChangePreview{
+        .path = "note.txt",
+        .lines = &.{.{ .op = .addition, .new_line = 1, .text = "after" }},
+        .additions = 1,
+        .deletions = 0,
+        .truncated = false,
+    };
+    const cases = [_]struct {
+        intent: permission_request.FileApprovalIntent,
+        scope: permission_request.FileApprovalScope,
+        width: u16,
+        own: []const u8,
+        shared: []const u8,
+    }{
+        .{
+            .intent = .mutation,
+            .scope = .workspace_files,
+            .width = 60,
+            .own = "Apply + allow workspace file access for this session",
+            .shared = "Apply + allow workspace file access for all agents",
+        },
+        .{
+            .intent = .equality_disclosure,
+            .scope = .workspace_files,
+            .width = 60,
+            .own = "Reveal + allow workspace file access for this session",
+            .shared = "Reveal + allow workspace file access for all agents",
+        },
+        .{
+            .intent = .mutation,
+            .scope = .{ .external_tree = "/private/tmp/ext" },
+            .width = 80,
+            .own = "Apply + allow file changes under /private/tmp/ext for this session",
+            .shared = "Apply + allow file changes for all agents under /private/tmp/ext",
+        },
+    };
+    for (cases) |case| {
+        const request: permission_request.FileApprovalRequest = .{
+            .kind = .write,
+            .intent = case.intent,
+            .preview = preview,
+            .scope = case.scope,
+        };
+        const origins = [_]permission_request.RequestOrigin{
+            .active_session,
+            .{ .subagent = "approval-child" },
+        };
+        for (origins, 0..) |origin, index| {
+            var row = try composeFileApprovalScreenRow(
+                alloc,
+                request,
+                origin,
+                0,
+                case.width,
+                .{ .choice = 1 },
+                true,
+                false,
+                null,
+            );
+            defer row.text.deinit(alloc);
+            const expected = if (index == 0) case.own else case.shared;
+            const other = if (index == 0) case.shared else case.own;
+            try std.testing.expect(std.mem.find(u8, row.text.items, expected) != null);
+            try std.testing.expect(std.mem.find(u8, row.text.items, other) == null);
+            try std.testing.expect(row.complete);
+        }
+    }
+}
+
+test "a file option's measured width is the width it paints, for main and a subagent" {
+    const alloc = std.testing.allocator;
+    const preview = diff_mod.FileChangePreview{ .path = "note.txt", .lines = &.{}, .additions = 0, .deletions = 0, .truncated = false };
+    const scopes = [_]permission_request.FileApprovalScope{
+        .workspace_files,
+        .{ .external_tree = "/private/tmp/ext" },
+        .{ .external_tree = "…/漢字/ext" },
+    };
+    for (scopes) |scope| {
+        for ([_]permission_request.FileApprovalIntent{ .mutation, .equality_disclosure }) |intent| {
+            const request: permission_request.FileApprovalRequest = .{ .kind = .write, .intent = intent, .preview = preview, .scope = scope };
+            for ([_]bool{ false, true }) |shared| {
+                var label: std.ArrayList(u8) = .empty;
+                defer label.deinit(alloc);
+                try appendFileApprovalChoiceLabel(alloc, &label, request, shared, 1, null, 200);
+                try std.testing.expectEqual(
+                    display_width.visibleWidthIgnoringAnsi(label.items),
+                    fileApprovalChoiceLabelWidth(request, shared, 1),
+                );
+            }
+        }
+    }
+}
+
+test "a subagent's file prompt stays answerable at 60 columns and gains no width" {
+    const preview = diff_mod.FileChangePreview{
+        .path = "note.txt",
+        .lines = &.{.{ .op = .addition, .new_line = 1, .text = "after" }},
+        .additions = 1,
+        .deletions = 0,
+        .truncated = false,
+    };
+    const rows = fileApprovalDesiredRows(preview);
+    const child: permission_request.RequestOrigin = .{ .subagent = "approval-child" };
+    for ([_]permission_request.FileApprovalIntent{ .mutation, .equality_disclosure }) |intent| {
+        const request: permission_request.FileApprovalRequest = .{ .kind = .write, .intent = intent, .preview = preview, .scope = .workspace_files };
+        // Main's row needs 59 columns, or 60 for "Reveal"; a subagent's needs fewer.
+        try std.testing.expect(projectFileApproval(request, .active_session, 0, 60, rows).affirmativeEligible());
+        try std.testing.expect(projectFileApproval(request, child, 0, 60, rows).affirmativeEligible());
+        try std.testing.expect(!projectFileApproval(request, .active_session, 0, 56, rows).all_choice_labels_visible);
+        try std.testing.expect(projectFileApproval(request, child, 0, 58, rows).all_choice_labels_visible);
+        try std.testing.expect(!projectFileApproval(request, child, 0, 56, rows).all_choice_labels_visible);
+    }
+
+    // Under a root outside the workspace, "all agents" comes before the path, so
+    // a long path is what a narrow row cuts, and the words stay.
+    const external: permission_request.FileApprovalRequest = .{
+        .kind = .write,
+        .intent = .mutation,
+        .preview = preview,
+        .scope = .{ .external_tree = "/private/tmp/a-long-folder-name-that-reaches-past-the-row/ext" },
+    };
+    const alloc = std.testing.allocator;
+    var row = try composeFileApprovalScreenRow(alloc, external, child, 0, 60, .{ .choice = 1 }, true, false, null);
+    defer row.text.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.text.items, "Apply + allow file changes for all agents under") != null);
+    try std.testing.expect(std.mem.find(u8, row.text.items, "…") != null);
+    try std.testing.expect(!row.complete);
 }
 
 test "file approval uses compact review header path question and pointer marker" {
