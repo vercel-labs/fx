@@ -494,15 +494,15 @@ test "decode ignores empty fields the action does not take" {
 const optional_message_fields = [_][]const u8{ "instructions", "report", "model", "effort", "profile" };
 
 /// Decodes `args_json`, which must be a `message`, and runs `check` on the
-/// request while it is alive. A refusal prints its body, so a failing test
-/// shows the code the model would have got.
+/// request while it is alive. A refusal fails the test with its body in the
+/// string diff, so a failing test shows the code the model would have got.
 fn withMessage(args_json: []const u8, comptime check: fn (model_contract.Request) anyerror!void) !void {
     const alloc = std.testing.allocator;
     const result = try decode(.{ .allocator = alloc }, args_json);
     switch (result) {
         .failure => |body| {
             defer alloc.free(body);
-            std.debug.print("decode refused {s}\n  -> {s}\n", .{ args_json, body });
+            try std.testing.expectEqualStrings("a request that decodes", body);
             return error.TestUnexpectedResult;
         },
         .input => |input| {
