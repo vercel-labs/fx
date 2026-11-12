@@ -4596,8 +4596,10 @@ async function appExit(fixture: Fixture, gateway: any, args: string[]) {
     stderrPath,
     remainOnExit: true,
   });
-  await until(() => session.paneStatus().dead === true, "the app to exit");
-  const status = session.paneStatus().status;
+  // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+  // the pane dead many seconds later.
+  await until(() => session.recordedExitStatus() !== null, "the app to exit");
+  const status = session.recordedExitStatus();
   await session.kill();
   return { status, stderr: readFileSync(stderrPath, "utf8") };
 }
@@ -5448,10 +5450,12 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         writeFileSync(cmd, `#!/bin/sh\ntrap '' XFSZ\nulimit -f ${limit}\nexec '${FX_BIN}' ${args}\n`, { mode: 0o700 });
       }
       const session = await TmuxSession.create({ cmd, cwd: c.fixture.workspace, env: { ...env(c.fixture, gateway), NO_COLOR: "1" }, stderrPath, remainOnExit: true });
-      // The pane stays after fx exits, so its end is the pane dying.
+      // The pane stays after fx exits, so its end is the exit status the
+      // pane's wrapper records; tmux can mark the pane dead many seconds later.
+      const exited = () => session.recordedExitStatus() !== null;
       const exit = async (what: string) => {
         const deadline = Date.now() + TIMEOUT;
-        while (!session.paneStatus().dead) {
+        while (!exited()) {
           if (Date.now() > deadline) throw new Error(`${entry}: the app did not exit ${what}`);
           await Bun.sleep(50);
         }
@@ -5460,12 +5464,12 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         // Either the composer shows or the app refuses and exits.
         let settled = false;
         const died = (async () => {
-          while (!settled && !session.paneStatus().dead) await Bun.sleep(50);
+          while (!settled && !exited()) await Bun.sleep(50);
           return "exited";
         })();
         let started = await Promise.race([session.waitForComposer(TIMEOUT).then(() => "composer", () => "neither"), died]);
         settled = true;
-        if (started === "neither" && session.paneStatus().dead) started = "exited";
+        if (started === "neither" && exited()) started = "exited";
         if (started === "exited") return { entered: false, said: readFileSync(stderrPath, "utf8") };
         if (started === "neither") throw new Error(`${entry}: the app neither showed its composer nor exited`);
         await session.waitForStableComposer(TIMEOUT, 300);
