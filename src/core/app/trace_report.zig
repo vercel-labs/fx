@@ -129,14 +129,21 @@
 //!   `action_omitted_bytes`, `rationale` (masked; the reviewer's, at most
 //!   1024 bytes), `rationale_bytes`, `rationale_omitted_bytes`. Reviews are
 //!   recorded even when `FX_TRACE` is off.
-//! - `git`: the workspace's git state, read through safe git. `refused`,
-//!   why fx won't run git here, or `error`, why git could not run; otherwise
-//!   `repository`, and in a repository `branch` (left out when HEAD is
-//!   detached or unborn) and these lists of git's lines, each left out when
-//!   git printed nothing: `status` (`git status --short --branch`, at most
-//!   60 lines), `commits` (the last 5, one line each), `staged` and
-//!   `unstaged` (`git diff --stat`, at most 30 lines each). A list that was
-//!   cut has `<name>_lines_omitted`.
+//! - `git`: the workspace's git state, read through safe git within 3
+//!   seconds in all. `refused`, why fx won't run git here; or `error`:
+//!   `timeout` when the 3 seconds passed (with `timeout_ms`), `signal` when
+//!   a signal ended a git command (with `signal`, its number), or why git
+//!   could not run. With `timeout` or `signal`, `unfinished` maps each field
+//!   git did not finish to `timeout` or `signal`; a git command still
+//!   running at the limit is ended with its process group, the commands
+//!   after it do not start, and the record keeps what finished. Then
+//!   `repository` (left out when unfinished), and in a repository `branch`
+//!   (left out when HEAD is detached or unborn) and these lists of git's
+//!   lines, each left out when git printed nothing, failed, or printed more
+//!   than 1 MiB: `status` (`git status --short --branch`, at most 60
+//!   lines), `commits` (the last 5, one line each), `staged` and `unstaged`
+//!   (`git diff --stat`, at most 30 lines each). A list that was cut has
+//!   `<name>_lines_omitted`.
 //! - `settings`: what the settings files and `FX_*` variables set, as
 //!   `fx config list --show-origin` prints it. `set`, `omitted` past the
 //!   first 200, `unknown_keys`; or `unreadable`, the file fx could not parse,
@@ -1391,6 +1398,9 @@ fn writeAutoReviewFields(r: *Records, review: *const diagnostics.AutoReview) !vo
 const setup_line_max_bytes: usize = 400;
 const git_status_max_lines: usize = 60;
 const git_stat_max_lines: usize = 30;
+/// How long `/trace`, which runs on the terminal's thread, waits for git in
+/// all.
+const git_budget_ms: u32 = 3_000;
 const settings_shown_max: usize = 200;
 const skills_shown_max: usize = 400;
 
@@ -1405,7 +1415,7 @@ fn setupLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 fn writeGit(r: *Records, workspace_root: []const u8) !void {
     // The arena owns the parts.
-    const parts = git_context.queryParts(r.arena, workspace_root) catch |err| {
+    const parts = git_context.queryParts(r.arena, workspace_root, git_budget_ms) catch |err| {
         try r.begin("git");
         try r.text("error", @errorName(err));
         return r.end();
@@ -1419,8 +1429,23 @@ fn writeGitParts(r: *Records, parts: git_context.Parts) !void {
         try r.text("refused", @tagName(refusal));
         return r.end();
     }
-    try r.boolean("repository", parts.in_git_repo);
-    if (parts.in_git_repo) {
+    if (parts.timed_out) {
+        try r.text("error", "timeout");
+        try r.number("timeout_ms", git_budget_ms);
+    } else if (parts.signal != null) {
+        try r.text("error", "signal");
+    }
+    if (parts.signal) |signal| try r.number("signal", signal);
+    if (parts.unfinished.count() > 0) {
+        try r.beginObject("unfinished");
+        for (std.enums.values(git_context.Part)) |part| {
+            if (parts.unfinished.get(part)) |reason| try r.text(gitPartField(part), @tagName(reason));
+        }
+        try r.endObject();
+    }
+    const inside_known = !parts.unfinished.contains(.inside);
+    if (inside_known) try r.boolean("repository", parts.in_git_repo);
+    if (parts.in_git_repo or !inside_known) {
         if (parts.branch) |branch| try r.text("branch", try setupLine(r.arena, branch));
         try writeGitLines(r, "status", parts.status, git_status_max_lines);
         try writeGitLines(r, "commits", parts.log, git_status_max_lines);
@@ -1428,6 +1453,18 @@ fn writeGitParts(r: *Records, parts: git_context.Parts) !void {
         try writeGitLines(r, "unstaged", parts.unstaged, git_stat_max_lines);
     }
     try r.end();
+}
+
+/// The `git` record's field for what a git query reports.
+fn gitPartField(part: git_context.Part) []const u8 {
+    return switch (part) {
+        .inside => "repository",
+        .branch => "branch",
+        .log => "commits",
+        .status => "status",
+        .staged => "staged",
+        .unstaged => "unstaged",
+    };
 }
 
 /// Writes `<name>`, the first `max_lines` lines git printed, and
@@ -3350,6 +3387,60 @@ test "trace git record lists git's lines, masks them, and caps long output" {
     const unstaged = git.get("unstaged").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), unstaged.len);
     try std.testing.expectEqualStrings(" src/a.zig | 2 +-", unstaged[0].string);
+}
+
+test "trace git record says what git did not finish by the limit or because of a signal" {
+    var timed_out: git_context.Parts = .{
+        .in_git_repo = true,
+        .branch = @constCast("main"),
+        .log = @constCast("abc1234 Add a file"),
+        .timed_out = true,
+    };
+    for ([_]git_context.Part{ .status, .staged, .unstaged }) |part| timed_out.unfinished.put(part, .timeout);
+    var killed: git_context.Parts = .{ .in_git_repo = true, .branch = @constCast("main"), .signal = 9 };
+    killed.unfinished.put(.status, .signal);
+    var nothing: git_context.Parts = .{ .timed_out = true };
+    for (std.enums.values(git_context.Part)) |part| nothing.unfinished.put(part, .timeout);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeGitParts(&w.records, timed_out);
+    try writeGitParts(&w.records, killed);
+    try writeGitParts(&w.records, nothing);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const late = try trace.nth("git", 0);
+    try std.testing.expectEqualStrings("timeout", try testString(late, "error"));
+    try std.testing.expectEqual(@as(i64, git_budget_ms), try testInt(late, "timeout_ms"));
+    try expectAbsent(late, "signal");
+    const late_parts = try testObject(late, "unfinished");
+    try std.testing.expectEqual(@as(usize, 3), late_parts.count());
+    for ([_][]const u8{ "status", "staged", "unstaged" }) |name| {
+        try std.testing.expectEqualStrings("timeout", try testString(late_parts, name));
+    }
+    try std.testing.expect(try testBool(late, "repository"));
+    try std.testing.expectEqualStrings("main", try testString(late, "branch"));
+    try std.testing.expectEqualStrings("abc1234 Add a file", late.get("commits").?.array.items[0].string);
+    try expectAbsent(late, "status");
+
+    const ended = try trace.nth("git", 1);
+    try std.testing.expectEqualStrings("signal", try testString(ended, "error"));
+    try std.testing.expectEqual(@as(i64, 9), try testInt(ended, "signal"));
+    try expectAbsent(ended, "timeout_ms");
+    try std.testing.expectEqualStrings("signal", try testString(try testObject(ended, "unfinished"), "status"));
+    try std.testing.expectEqualStrings("main", try testString(ended, "branch"));
+
+    // Safe git's own checks ran out of time, so nothing about the folder is
+    // known, not even whether it is a repository.
+    const unknown = try trace.nth("git", 2);
+    try std.testing.expectEqualStrings("timeout", try testString(unknown, "error"));
+    const unknown_parts = try testObject(unknown, "unfinished");
+    try std.testing.expectEqual(@as(usize, 6), unknown_parts.count());
+    try std.testing.expectEqualStrings("timeout", try testString(unknown_parts, "repository"));
+    try std.testing.expectEqualStrings("timeout", try testString(unknown_parts, "commits"));
+    try expectAbsent(unknown, "repository");
+    try expectAbsent(unknown, "branch");
 }
 
 test "trace settings records keep each origin, mask values, and list unknown keys" {

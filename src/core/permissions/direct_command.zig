@@ -187,6 +187,62 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
     output_limit: usize,
     test_controls: DirectExecutionTestControls,
 ) !command_contract.RunCommandResult {
+    var run = try runDirectReadOnly(cfg, alloc, plan, output_limit, test_controls);
+    defer run.output.deinit();
+    return formatDirectResult(
+        alloc,
+        plan,
+        run.term,
+        run.output.stdout.items,
+        run.output.stderr.items,
+        run.output.stdout_bytes,
+        run.output.stderr_bytes,
+        run.duration_ms,
+    );
+}
+
+/// What a direct plan wrote to stdout, for a caller that reads the output
+/// itself instead of showing it to the model.
+pub const DirectCapture = struct {
+    /// With control characters and bytes that are not UTF-8 written as
+    /// visible escapes. Owned by the allocator given to
+    /// `captureDirectReadOnly`.
+    stdout: []u8,
+    status: command_contract.CommandStatus,
+};
+
+/// Runs `plan` as `executeDirectReadOnly` does: in its own process group,
+/// which `cfg`'s timeout or cancel flag terminates and reaps. Returns
+/// `error.TimeoutExpired` when the timeout passes and
+/// `error.DirectOutputLimitExceeded` past `output_limit` bytes of output.
+pub fn captureDirectReadOnly(
+    cfg: command_runner.Config,
+    alloc: std.mem.Allocator,
+    plan: command_effect.DirectReadOnlyPlan,
+    output_limit: usize,
+) !DirectCapture {
+    var run = try runDirectReadOnly(cfg, alloc, plan, output_limit, .{});
+    defer run.output.deinit();
+    return .{
+        .stdout = try run.output.stdout.toOwnedSlice(alloc),
+        .status = commandStatusFromTerm(run.term),
+    };
+}
+
+/// A direct run that finished. The caller deinits `output`.
+const DirectRun = struct {
+    output: DirectOutput,
+    term: std.process.Child.Term,
+    duration_ms: u64,
+};
+
+fn runDirectReadOnly(
+    cfg: command_runner.Config,
+    alloc: std.mem.Allocator,
+    plan: command_effect.DirectReadOnlyPlan,
+    output_limit: usize,
+    test_controls: DirectExecutionTestControls,
+) !DirectRun {
     if (plan.stages.len == 0) return error.InvalidDirectPlan;
     if (plan.stages.len > command_effect.max_direct_pipeline_stages) {
         return error.InvalidDirectPlan;
@@ -248,7 +304,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
     }
 
     var output = DirectOutput.init(alloc, execution_cfg);
-    defer output.deinit();
+    errdefer output.deinit();
     var shared: SharedExecution = .{
         .cfg = execution_cfg,
         .budget = .{ .limit = output_limit },
@@ -397,16 +453,8 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
             workers.len,
         },
     );
-    return formatDirectResult(
-        alloc,
-        plan,
-        final_term,
-        output.stdout.items,
-        output.stderr.items,
-        output.stdout_bytes,
-        output.stderr_bytes,
-        duration_ms,
-    );
+    // Every worker has joined, so nothing points at `output` any more.
+    return .{ .output = output, .term = final_term, .duration_ms = duration_ms };
 }
 
 fn environmentForProfile(
@@ -1783,6 +1831,35 @@ test "direct executor cancellation and timeout terminate and reap the process gr
             .timeout_started_ms = io_mod.milliTimestamp() - 10,
         }, std.testing.allocator, injectedPlan("/tmp", &stages)),
     );
+}
+
+test "a captured direct run returns its stdout and status, and stops at its timeout" {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const print_argv = [_][]const u8{ "/bin/sh", "-c", "printf 'one\\ntwo\\n'; printf err >&2" };
+    const print_stages = [_]command_effect.DirectStage{.{ .executable = "/bin/sh", .argv = &print_argv, .environment_profile = .basic_read_only }};
+    const printed = try captureDirectReadOnly(.{ .max_command_output_bytes = 1024 }, std.testing.allocator, injectedPlan("/tmp", &print_stages), 1024);
+    defer std.testing.allocator.free(printed.stdout);
+    try std.testing.expectEqualStrings("one\ntwo\n", printed.stdout);
+    try std.testing.expectEqual(command_contract.CommandStatus{ .exit_code = 0 }, printed.status);
+
+    // A child that a signal ends reports the signal; nothing reads an exit
+    // code it does not have.
+    const killed_argv = [_][]const u8{ "/bin/sh", "-c", "kill -KILL $$" };
+    const killed_stages = [_]command_effect.DirectStage{.{ .executable = "/bin/sh", .argv = &killed_argv, .environment_profile = .basic_read_only }};
+    const killed = try captureDirectReadOnly(.{ .max_command_output_bytes = 1024 }, std.testing.allocator, injectedPlan("/tmp", &killed_stages), 1024);
+    defer std.testing.allocator.free(killed.stdout);
+    try std.testing.expectEqual(command_contract.CommandStatus{ .signal = @backingInt(std.posix.SIG.KILL) }, killed.status);
+
+    const sleep_argv = [_][]const u8{ "/bin/sleep", "10" };
+    const sleep_stages = [_]command_effect.DirectStage{.{ .executable = "/bin/sleep", .argv = &sleep_argv, .environment_profile = .basic_read_only }};
+    const started = io_mod.milliTimestamp();
+    try std.testing.expectError(error.TimeoutExpired, captureDirectReadOnly(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 50,
+        .timeout_started_ms = started,
+    }, std.testing.allocator, injectedPlan("/tmp", &sleep_stages), 1024));
+    // The sleep got SIGTERM at 50 ms and was reaped well before its 10 s.
+    try std.testing.expect(io_mod.milliTimestamp() - started < 5_000);
 }
 
 test "direct executor flushes partial callback output before timeout" {

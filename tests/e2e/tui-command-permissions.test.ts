@@ -4212,7 +4212,7 @@ describe("effect-aware command permissions", () => {
       expect(status.join("\n")).not.toContain("\x1b");
       expect(gitRecord.commits).toEqual([expect.stringMatching(/^[0-9a-f]+ Add tracked file$/)]);
       expect(gitRecord.staged).toBeUndefined();
-      expect(gitRecord.unstaged).toEqual([expect.stringMatching(/tracked\.txt \| 2 \+-$/), expect.stringMatching(/^ 1 file changed/)]);
+      expect(gitRecord.unstaged).toEqual([expect.stringMatching(/^ tracked\.txt \| 2 \+-$/), expect.stringMatching(/^ 1 file changed/)]);
       expect(report.text).not.toContain("\x1b");
       expect(existsSync(root.commandMarkers.git!)).toBe(false);
 
@@ -4244,6 +4244,177 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  // A repository with one empty commit whose index is a FIFO that nothing
+  // writes: `git status` and `git diff` wait on it for good, while `git log`
+  // and `git branch` do not read it. Returns the FIFO's path.
+  function makeFifoIndexRepo(root: IsolatedRoot): string {
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(["git", ...args], {
+        cwd: root.workspace,
+        env: { ...process.env, HOME: root.home, GIT_CONFIG_NOSYSTEM: "1" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+    };
+    git("init", "-q", "-b", "feature/fifo-probe");
+    git("-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-q", "--allow-empty", "-m", "Add nothing");
+    const index = join(root.workspace, ".git", "index");
+    rmSync(index, { force: true });
+    execFileSync("mkfifo", [index]);
+    return index;
+  }
+
+  // Lets any reader blocked on the FIFO go, so a failed run leaves no git
+  // behind: opening it for reading and writing never waits, and closing it
+  // gives the reader the end of the file.
+  function releaseFifoReaders(path: string) {
+    try {
+      execFileSync("/bin/sh", ["-c", ': <>"$1"', "sh", path], { stdio: "ignore", timeout: 2_000 });
+    } catch {}
+  }
+
+  // The safe git commands `parent` started that still run, by process ID.
+  function safeGitChildren(parent: number, pattern = "no-optional-locks"): number[] {
+    try {
+      return execFileSync("pgrep", ["-P", String(parent), "-f", pattern], { encoding: "utf8" })
+        .split("\n")
+        .filter(Boolean)
+        .map(Number);
+    } catch {
+      return [];
+    }
+  }
+
+  async function startFifoTraceSession(root: IsolatedRoot, stderrPath: string) {
+    const gateway = startDynamicFakeGateway(async (body) =>
+      finalText(currentUserText(body).includes("again") ? "answered after trace" : "answered before trace"));
+    activeSession = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: root.workspace,
+      env: gatewayEnv(root, gateway, {
+        PATH: hostilePath(root),
+        TMPDIR: root.root,
+        FX_TRACE: "0",
+        FX_TRACE_LOG: undefined,
+        FX_TRACE_STDERR: "0",
+      }),
+      stderrPath,
+      width: 120,
+      height: 40,
+    });
+    await activeSession.waitForComposer(TIMEOUT);
+    await activeSession.sendText("Say hello.");
+    await activeSession.waitForText("answered before trace", TIMEOUT);
+    return activeSession;
+  }
+
+  // Waits for the trace that `/trace` writes, and says what fx printed to
+  // stderr when none comes.
+  async function waitForFifoTrace(root: IsolatedRoot, before: Set<string>, stderrPath: string) {
+    return waitForNewTraceReport(root.root, before, 10_000).catch((error: Error) => {
+      throw new Error(`${error.message}\nfx stderr:\n${readFileSync(stderrPath, "utf8")}`);
+    });
+  }
+
+  async function expectFxStillAnswers(session: TmuxSession, stderrPath: string) {
+    await session.sendText("Say hello again.");
+    await session.waitForText("answered after trace", TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd()).toBe(true);
+    await session.kill();
+    activeSession = null;
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace stops waiting for git at its limit and keeps answering",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const index = makeFifoIndexRepo(root);
+      try {
+        const session = await startFifoTraceSession(root, stderrPath);
+        const before = new Set(traceReportNames(root.root));
+        const started = Date.now();
+        await session.sendText("/trace");
+        const report = await waitForFifoTrace(root, before, stderrPath);
+        // The limit is 3 s in all; SIGTERM then ends the git that waits.
+        expect(Date.now() - started).toBeLessThan(8_000);
+
+        const gitRecord = report.one("git");
+        expect(gitRecord).toMatchObject({
+          error: "timeout",
+          timeout_ms: 3000,
+          unfinished: { status: "timeout", staged: "timeout", unstaged: "timeout" },
+          repository: true,
+          branch: "feature/fifo-probe",
+        });
+        expect(gitRecord.commits).toEqual([expect.stringMatching(/^[0-9a-f]+ Add nothing$/)]);
+        expect(gitRecord.status).toBeUndefined();
+        expect(gitRecord.signal).toBeUndefined();
+        // fx reaped the git it ended, and the hostile git on PATH never ran.
+        expect(safeGitChildren(session.processPid())).toEqual([]);
+        expect(existsSync(root.commandMarkers.git!)).toBe(false);
+        await expectFxStillAnswers(session, stderrPath);
+      } finally {
+        releaseFifoReaders(index);
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace reports a git command that a signal ended and keeps answering",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const index = makeFifoIndexRepo(root);
+      try {
+        const session = await startFifoTraceSession(root, stderrPath);
+        const fx = session.processPid();
+        const before = new Set(traceReportNames(root.root));
+        await session.sendText("/trace");
+        // Each git status or diff that waits on the index is killed as soon as
+        // it starts, until the trace is written.
+        const killed: number[] = [];
+        let tracing = true;
+        const killer = (async () => {
+          while (tracing) {
+            for (const pid of safeGitChildren(fx, "no-optional-locks.* (status|diff) ")) {
+              try {
+                process.kill(pid, "SIGKILL");
+                killed.push(pid);
+              } catch {}
+            }
+            await Bun.sleep(20);
+          }
+        })();
+        const report = await waitForFifoTrace(root, before, stderrPath).finally(async () => {
+          tracing = false;
+          await killer;
+        });
+
+        expect(killed.length).toBeGreaterThan(0);
+        const gitRecord = report.one("git");
+        expect(gitRecord).toMatchObject({ signal: 9, repository: true, branch: "feature/fifo-probe" });
+        // A kill the loop missed leaves that command to the time limit.
+        expect(["signal", "timeout"]).toContain(gitRecord.error as string);
+        expect((gitRecord.unfinished as Record<string, string>).status).toBe("signal");
+        expect(gitRecord.commits).toEqual([expect.stringMatching(/^[0-9a-f]+ Add nothing$/)]);
+        expect(safeGitChildren(fx)).toEqual([]);
+        await expectFxStillAnswers(session, stderrPath);
+      } finally {
+        releaseFifoReaders(index);
+      }
     },
     TIMEOUT * 2,
   );
