@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -3299,6 +3300,19 @@ fn writeJsonCommandFailureCode(
     try writeJsonLine(deps, json);
 }
 
+/// How `fx sessions` prints for a person: in color and fitted to the window
+/// when it writes to a terminal that takes color, with ages counted from
+/// now. Output a test captures is plain, so it reads the same everywhere.
+fn sessionListStyle(deps: RunDeps) output_contracts.ListStyle {
+    const terminal = deps.write_stdout == &writeRealStdout and terminal_env.stdoutIsTerminal();
+    return .{
+        .color = terminal and !terminal_env.colorDisabled(),
+        .columns = if (terminal) terminal_env.stdoutColumns() else null,
+        .now_ms = io_mod.milliTimestamp(),
+        .home = io_mod.homeDir(),
+    };
+}
+
 fn writeSessionList(
     alloc: Allocator,
     deps: RunDeps,
@@ -3320,6 +3334,7 @@ fn writeSessionList(
         .next_cursor = next_cursor,
         .skipped_invalid = page.skipped_invalid,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -3408,6 +3423,7 @@ fn runLiveSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions)
     const text = try (output_contracts.LiveSessionListSnapshot{
         .sessions = list.sessions,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);

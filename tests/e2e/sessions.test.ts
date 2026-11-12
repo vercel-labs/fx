@@ -3443,6 +3443,14 @@ function savedModel(fixture: Fixture, id: string): string {
   return (prefs.at(-1) as any).value.model;
 }
 
+/// How long ago a session list says a session changed.
+const AGE_TEXT = /^(just now|\d+[mhd] ago)$/;
+
+/// The cells of one row of a session list's text, which two or more spaces separate.
+function tableCells(line: string): string[] {
+  return line === "" ? [] : line.split(/ {2,}/);
+}
+
 /// The logs of the sessions `ids`, to show a read wrote nothing.
 function logBytesOf(fixture: Fixture, ids: string[]) {
   return ids.map((id) => readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")));
@@ -3477,7 +3485,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const none = await command(fixture, gateway, ["sessions", "--live"]);
     expect(none.code).toBe(0);
     expect(none.stderr).toBe("");
-    expect(none.stdout).toBe("[sessions] no live sessions\n");
+    expect(none.stdout).toBe("No live sessions in this workspace.\n");
 
     holders.push(spawnAsk(fixture, gateway, ["Hold the live turn."]));
     await until(() => mainHeld, "the held turn");
@@ -3515,17 +3523,29 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const text = await command(fixture, gateway, ["sessions", "--live", "--all"]);
     expect(text.code).toBe(0);
     expect(text.stderr).toBe("");
-    expect(text.stdout.replace(/updated [^\n]+/g, "updated <time>")).toBe([
-      "[sessions] 2 live",
-      " - Delegate the live review.",
-      `   id=${delegating} | idle | saved model ${savedModel(fixture, delegating!)} | updated <time>`,
-      `   workspace=${other}`,
-      `   - reviewer | working | ${delegating}/reviewer`,
-      " - Untitled session",
-      `   id=${working} | working | saved model ${savedModel(fixture, working!)} | updated <time>`,
-      `   workspace=${fixture.workspace}`,
+    const model = savedModel(fixture, working!);
+    expect(savedModel(fixture, delegating!)).toBe(model);
+    const lines = text.stdout.split("\n");
+    expect(lines.slice(0, 3)).toEqual(["2 live sessions in all workspaces  ·  1 working  ·  1 idle", `Model ${model}`, ""]);
+    // One row per session in columns, working ones first, each subagent in a tree below its session.
+    expect(lines.slice(3, 9).map(tableCells)).toEqual([
+      ["TITLE", "STATUS", "UPDATED", "SESSION ID", "WORKSPACE"],
+      ["Untitled session", "working", expect.stringMatching(AGE_TEXT), working, fixture.workspace],
+      [],
+      ["Delegate the live review.", "idle", expect.stringMatching(AGE_TEXT), delegating, other],
+      ["└─ reviewer", "working"],
+      [],
+    ]);
+    // Each session id starts where its column's head does.
+    const idColumn = lines[3]!.indexOf("SESSION ID");
+    expect(lines[4]!.indexOf(working!)).toBe(idColumn);
+    expect(lines[6]!.indexOf(delegating!)).toBe(idColumn);
+    expect(lines.slice(9)).toEqual([
+      "Read a session    fx session <session id> --tail 5",
+      "Read a subagent   fx session <session id>/<name> --tail 5",
+      "Every field       fx sessions --live --all --json",
       "",
-    ].join("\n"));
+    ]);
 
     // Listing took no lock that stayed and wrote nothing.
     expect(logBytesOf(fixture, [working!, delegating!, childId])).toEqual(before);
@@ -3930,7 +3950,7 @@ test.skipIf(!tmuxAvailable())("fx sessions --live shows an interactive fx's suba
       agents: [{ name: "helper", address: `${id}/lead/helper`, id: helperId, state: "working", agents: [] }],
     }]);
     const text = await command(fixture, gateway, ["sessions", "--live"]);
-    expect(text.stdout).toContain(`   - lead | idle | ${id}/lead\n     - helper | working | ${id}/lead/helper\n`);
+    expect(text.stdout).toMatch(/\n└─ lead +idle\n   └─ helper +working\n/);
     // The helper has no finished turn yet; lead has one.
     const helper = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead/helper`, "--tail", "1", "--json"])).stdout);
     expect(helper).toMatchObject({ id: helperId, address: `${id}/lead/helper`, history_len: 0, history: [] });
