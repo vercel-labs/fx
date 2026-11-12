@@ -6821,7 +6821,7 @@ test "runIfRequested credits renders through the configured provider" {
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(probe.saw_expected_input);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\"}\n",
+        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\",\"token_pass\":null}\n",
         capture.stdout.written(),
     );
 }
