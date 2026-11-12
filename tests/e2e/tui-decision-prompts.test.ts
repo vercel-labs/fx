@@ -3336,7 +3336,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
     async () => {
       const ctx = await launchScenario([
         outerMarkdownQuestionCall(
-          "First \u001b[2Jline\r\nSecond \u001b]0;MARKDOWN_TITLE\u0007line\rThird line",
+          "First \u001b[2Jline\r\nSecond \u001b]0;MARKDOWN_TITLE\u0007line\rThird \u202eline\u200b",
         ),
         outerText("markdown control question handled"),
       ]);
@@ -3344,7 +3344,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const grid = await waitForGridState(
         ctx.session,
         "markdown control question",
-        (rows) => rows.some((row) => row.includes("Third line")),
+        (rows) => rows.some((row) => row.includes("Third ")),
       );
       const rows = grid.map((row) => row.trimEnd());
       const first = rows.indexOf("  First \\x1b[2Jline");
@@ -3352,7 +3352,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(rows.slice(first, first + 3)).toEqual([
         "  First \\x1b[2Jline",
         "  Second \\x1b]0;MARKDOWN_TITLE\\x07line",
-        "  Third line",
+        // A bidi override and a zero-width space show as text, so the
+        // prompt cannot draw a question other than the one it holds.
+        "  Third \\u{202e}line\\u{200b}",
       ]);
       // The screen was not cleared and the title was not set.
       expect(rows.some((row) => row.includes("Ask me the control question."))).toBe(true);

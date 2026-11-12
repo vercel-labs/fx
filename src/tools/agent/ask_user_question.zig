@@ -288,7 +288,7 @@ fn dupeLabelText(arena: Allocator, text: []const u8) Allocator.Error![]const u8 
 }
 
 /// A question keeps its lines. It is Markdown, which the prompt renders as
-/// the transcript renders a reply. Control bytes become visible escapes.
+/// the transcript renders a reply. Each line is made safe as a label is.
 fn dupeQuestionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     // A carriage return ends a line with or without a line feed after it.
     var lines: std.ArrayList(u8) = .empty;
@@ -300,16 +300,15 @@ fn dupeQuestionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]co
             lines.appendAssumeCapacity('\n');
         }
     }
-    if (text_utils.isTerminalSafeText(lines.items)) return lines.items;
 
     var out: std.ArrayList(u8) = .empty;
-    try text_utils.appendTerminalSafeText(arena, &out, lines.items);
+    try appendTerminalSafeLines(arena, &out, lines.items);
     return out.items;
 }
 
 /// A description keeps its lines and is Markdown, as the question is.
-/// Blank lines are dropped so an option's rows stay together, and control
-/// bytes become visible escapes.
+/// Blank lines are dropped so an option's rows stay together, and each line
+/// is made safe as a label is.
 fn dupeDescriptionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.tokenizeAny(u8, text, "\r\n");
@@ -318,9 +317,32 @@ fn dupeDescriptionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![
         const line = std.mem.trimEnd(u8, raw_line, " \t");
         if (line.len == 0) continue;
         if (out.items.len > 0) try out.append(arena, '\n');
-        try text_utils.appendTerminalSafeText(arena, &out, line);
+        try appendTerminalSafeLines(arena, &out, line);
     }
     return out.items;
+}
+
+/// Appends `text` with its line breaks and tabs kept. Everything between
+/// them gets the escapes a label gets: control bytes, invalid UTF-8, and
+/// non-printing code points such as bidi overrides and zero-width characters
+/// become visible text, so model text cannot drive the terminal or show a
+/// question other than the one it holds.
+fn appendTerminalSafeLines(
+    arena: Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+) Allocator.Error!void {
+    var start: usize = 0;
+    while (true) {
+        const end = std.mem.findAnyPos(u8, text, start, "\n\t") orelse text.len;
+        if (end > start) {
+            const encoded = try text_utils.encodeTerminalSafe(arena, text[start..end], std.math.maxInt(usize));
+            try out.appendSlice(arena, encoded.bytes);
+        }
+        if (end == text.len) return;
+        try out.append(arena, text[end]);
+        start = end + 1;
+    }
 }
 
 /// Explains a parse error to the model. An error inside a question or an
@@ -708,9 +730,57 @@ test "ask_user_question shows control bytes on every line of a question and a de
     );
     try std.testing.expectEqualStrings("Clear \\x1b[2J\nscroll \\x1b[3J back", requester.descriptions[0]);
     for ([_][]const u8{ requester.question, requester.descriptions[0] }) |text| {
-        try std.testing.expect(text_utils.isTerminalSafeText(text));
-        try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+        try expectEveryLineTerminalSafe(text);
     }
+}
+
+fn expectEveryLineTerminalSafe(text: []const u8) !void {
+    var lines = std.mem.tokenizeAny(u8, text, "\n\t");
+    while (lines.next()) |line| try std.testing.expect(text_utils.isTerminalSafe(line));
+}
+
+test "ask_user_question shows bidi overrides and zero-width characters as text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var requester = MultilineRequester{ .arena = arena_state.allocator() };
+
+    // U+202E reverses the text after it, U+2028 is a line separator, U+200B
+    // and U+2060 are invisible, and U+FEFF is a byte order mark.
+    const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
+        .question = "Pay \u{202e}eteled\u{202c} now?\nSecond\u{2028}line with zero\u{200b}width\tand\u{feff} a mark",
+        .options = .{
+            .{ .label = "Ok\u{202e}", .description = "keeps \u{202e}reversed\u{202c} text\n- item\u{2060} two\u{200f}" },
+            .{ .label = "No" },
+        },
+    }} }, .{});
+    const output = try executeWithRequester(alloc, args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = MultilineRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expectEqualStrings(
+        "Pay \\u{202e}eteled\\u{202c} now?\nSecond\\u{2028}line with zero\\u{200b}width\tand\\u{feff} a mark",
+        requester.question,
+    );
+    try std.testing.expectEqualStrings(
+        "keeps \\u{202e}reversed\\u{202c} text\n- item\\u{2060} two\\u{200f}",
+        requester.descriptions[0],
+    );
+    try std.testing.expectEqualStrings("Ok\\u{202e}", requester.labels[0]);
+    for ([_][]const u8{ requester.question, requester.descriptions[0], requester.labels[0] }) |text| {
+        try expectEveryLineTerminalSafe(text);
+    }
+
+    // The tool result carries the escaped question too, so the model and a
+    // resumed session see what the prompt showed.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    const result = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings(requester.question, result.get("question").?.string);
+    try std.testing.expectEqualStrings("Ok\\u{202e}", result.get("answer").?.string);
 }
 
 const batch_option_count = 6;

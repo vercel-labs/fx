@@ -1,6 +1,7 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
@@ -235,22 +236,11 @@ fn writeRowOnBaseStyle(
 }
 
 /// True when the escape sequence is an SGR that turns off what `kind` sets:
-/// a reset, or the parameter that ends it. The arguments of a color are not
-/// parameters of their own.
+/// a reset, or the parameter that ends it.
 fn sgrEnds(sequence: []const u8, kind: BaseStyle) bool {
-    if (sequence.len < 3 or sequence[1] != '[' or sequence[sequence.len - 1] != 'm') return false;
-    const body = sequence[2 .. sequence.len - 1];
-    if (body.len == 0) return true;
-    var params = std.mem.splitScalar(u8, body, ';');
-    while (params.next()) |param| {
-        if (param.len == 0 or std.mem.eql(u8, param, "0") or std.mem.eql(u8, param, kind.endParameter())) return true;
-        if (std.mem.eql(u8, param, "38") or std.mem.eql(u8, param, "48") or std.mem.eql(u8, param, "58")) {
-            const mode = params.next() orelse return false;
-            const arguments: usize = if (std.mem.eql(u8, mode, "5")) 1 else if (std.mem.eql(u8, mode, "2")) 3 else 0;
-            for (0..arguments) |_| _ = params.next();
-        }
-    }
-    return false;
+    return shared_theme.sgrHasParam(sequence, "") or
+        shared_theme.sgrHasParam(sequence, "0") or
+        shared_theme.sgrHasParam(sequence, kind.endParameter());
 }
 
 /// Writes the first `shown` rows of `question`, each ended by a line break.
