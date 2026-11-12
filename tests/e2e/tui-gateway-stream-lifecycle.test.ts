@@ -7127,8 +7127,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The frame is the subagent's, never drawn as the user's prompt.
         expect(live).not.toContain(header);
         expect(live).not.toContain("REPORT_NEVER_JOINED");
-        // Main's waits say what they did, not the tool's name.
-        expect(live).toContain("waited for subagents");
+        // Main's waits say what they did, not the tool's name, and name the
+        // subagent that was working when the wait began.
+        expect(live).toContain("waited for helper");
+        expect(live).not.toContain("waited for subagents");
         expect(live).not.toContain("Managed subagent");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
@@ -7141,7 +7143,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const resumed = await session.captureFullScrollback();
         expect(countOccurrences(resumed, row)).toBe(1);
         expect(resumed).not.toContain(header);
-        expect(resumed).toContain("waited for subagents");
+        // The saved result names the subagent, so the resumed row does too.
+        expect(resumed).toContain("waited for helper");
+        expect(resumed).not.toContain("waited for subagents");
         // The saved turn kept the report, in its own frame.
         await session.sendText("AFTER_RESUME_PROMPT");
         await session.waitForText("AFTER_RESUME_DONE", TIMEOUT);

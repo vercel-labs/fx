@@ -88,6 +88,33 @@ function startJevStub(decision: "clear" | "caution" = "clear") {
   return stub;
 }
 
+// A System One endpoint that answers 200 and drops the connection partway
+// through the body.
+function startCutJevStub() {
+  let requests = 0;
+  const body = JSON.stringify(jevResponse("clear"));
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data(socket) {
+        requests++;
+        socket.write(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n${body.slice(0, 20)}`);
+        setTimeout(() => socket.terminate(), 50);
+      },
+    },
+  });
+  const stub = {
+    requests: () => requests,
+    url: `http://127.0.0.1:${server.port}/v1/systemone`,
+    stop() {
+      server.stop(true);
+    },
+  };
+  jevServers.push(stub);
+  return stub;
+}
+
 function overrideEnv(
   root: IsolatedRoot,
   gateway: ReturnType<typeof startFakeGateway>,
@@ -178,6 +205,36 @@ describe("review model override", () => {
       expect(result.stdout).not.toContain(EXECUTED_MARKER);
       expect(result.stdout).toContain("Understood, leaving it unexecuted.");
       expect(jev.requests).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a Jev answer cut off mid-body holds the action without crashing fx",
+    async () => {
+      const root = createIsolatedRoot();
+      const jev = startCutJevStub();
+      const gateway = startFakeGateway([
+        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
+        fakeGatewayFinalText("Understood, leaving it unexecuted."),
+      ]);
+      gateways.push(gateway);
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
+        {
+          cwd: root.workspace,
+          env: overrideEnv(root, gateway, {
+            FX_REVIEW_MODEL: JEV_MODEL_ID,
+            TYPESAFE_API_KEY: "e2e-typesafe-key",
+            TYPESAFE_BASE_URL: jev.url,
+          }),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.stderr).not.toContain("panic");
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).not.toContain(EXECUTED_MARKER);
+      expect(jev.requests()).toBeGreaterThan(0);
     },
     TIMEOUT,
   );

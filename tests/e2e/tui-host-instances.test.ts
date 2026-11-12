@@ -1871,10 +1871,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("NOTE_ONE go");
         await session.waitForPane((pane) => pane.includes("rm -rf"), 15_000);
-        // From fx 2, fx 1 comes first.
+        // From fx 2, the note counts the two waiting instances.
         await switchAgent(session, "next");
-        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("need you"), 15_000);
-        expect(pane).toContain("fx 1 and 1 more need you · fx 2/3 \u2193");
+        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("require attention"), 15_000);
+        expect(pane).toContain("2 agents require attention · fx 2/3 \u2193");
         expect(pane).not.toContain("main");
       });
     },
@@ -1896,8 +1896,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(list).not.toContain("Step limit");
         expect(list).toContain("Agents 3");
         expect(list).toMatch(instanceRow(1));
-        expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}main {2,}\S/m);
-        expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}\S+\s*$/m);
+        expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain(LIST_HINT);
         // The list opens on the agent on screen.
         expect(agentRows(await session.capturePaneEscapes())).toEqual([
@@ -2045,7 +2045,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2 finished · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
         const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
-        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}finished {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}finished {2,}\S+\s*$/m);
         await session.sendKeys("Escape");
         // Showing it clears the note.
         await switchAgent(session, "next");
@@ -2077,7 +2077,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
         const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
-        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}needs you {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}needs you {2,}\S+\s*$/m);
         await session.sendKeys("Escape");
         // Esc on its own screen ends the request, and the note goes.
         await switchAgent(session, "next");

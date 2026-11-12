@@ -1234,6 +1234,32 @@ test "a kill stops every tracked process before killing any" {
     try std.testing.expectEqual(@as(usize, 3), FakeEffects.sent_count);
 }
 
+test "a stopped child, an exited child, and a gone pid count as stopped, and a running one does not" {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var running = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const pid = running.id.?;
+    try std.testing.expect(!try processIsStopped(alloc, pid));
+    try std.posix.kill(pid, .STOP);
+    // The stop lands a moment after kill(2) returns.
+    const stopped = for (0..1_000) |_| {
+        if (try processIsStopped(alloc, pid)) break true;
+        io_mod.sleep(std.time.ns_per_ms);
+    } else false;
+    try std.testing.expect(stopped);
+    try std.posix.kill(pid, .KILL);
+    // Killed and not yet reaped, it has exited.
+    const exited = for (0..1_000) |_| {
+        if (!try processIsAlive(alloc, pid)) break true;
+        io_mod.sleep(std.time.ns_per_ms);
+    } else false;
+    try std.testing.expect(exited);
+    try std.testing.expect(try processIsStopped(alloc, pid));
+    _ = try running.wait(io);
+    try std.testing.expect(try processIsStopped(alloc, pid));
+}
+
 test "a kill resumes the processes it stopped but did not kill" {
     const FakeEffects = struct {
         var session_reads: usize = 0;
@@ -1514,11 +1540,60 @@ fn snapshotIsAlive(snapshot: ProcessSnapshot) bool {
     return !snapshot.zombie;
 }
 
+/// Whether `pid` can run no more: every thread of it is stopped by a signal,
+/// it has exited, or it is gone. kill(2) only queues a SIGSTOP, so a caller
+/// that must know the stop has landed, before it looks at what the process
+/// started, asks this.
+pub fn processIsStopped(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    return switch (builtin.target.os.tag) {
+        .linux => linuxProcessIsStopped(alloc, pid),
+        .macos => macOSProcessIsStopped(pid),
+        else => error.ProcessTreeUnsupported,
+    };
+}
+
+fn linuxProcessIsStopped(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    if (comptime builtin.target.os.tag != .linux) return error.ProcessTreeUnsupported;
+    const task_path = try alloc.print("/proc/{d}/task", .{pid});
+    defer alloc.free(task_path);
+    var task_dir = (try openLinuxProcDir(task_path)) orelse return true;
+    defer task_dir.close(io_mod.getIo());
+    var tasks = task_dir.iterateAssumeFirstIteration();
+    while (try tasks.next(io_mod.getIo())) |entry| {
+        const tid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        const path = try alloc.print("/proc/{d}/task/{d}/stat", .{ pid, tid });
+        defer alloc.free(path);
+        var file = (try openLinuxProcFile(path)) orelse continue;
+        defer file.close(io_mod.getIo());
+        var buffer: [4096]u8 = undefined;
+        const read_len = readLinuxProcFile(file, &buffer) catch |err| switch (err) {
+            error.ProcessNotFound => continue,
+            else => return err,
+        };
+        const stat = buffer[0..read_len];
+        const close_paren = std.mem.findScalarLast(u8, stat, ')') orelse return error.ProcessIdentityUnavailable;
+        if (close_paren + 2 >= stat.len) return error.ProcessIdentityUnavailable;
+        // T: stopped by a signal; t: stopped by a tracer; Z and X: exited.
+        if (std.mem.findScalar(u8, "TtZX", stat[close_paren + 2]) == null) return false;
+    }
+    return true;
+}
+
+fn macOSProcessIsStopped(pid: std.posix.pid_t) !bool {
+    if (comptime builtin.target.os.tag != .macos) return error.ProcessTreeUnsupported;
+    var info: Darwin.ProcBsdInfo = undefined;
+    const read_len = Darwin.proc_pidinfo(pid, 3, 0, &info, @sizeOf(Darwin.ProcBsdInfo));
+    if (read_len == 0) return true;
+    if (read_len != @sizeOf(Darwin.ProcBsdInfo)) return error.ProcessIdentityUnavailable;
+    return info.pbi_status == Darwin.process_status_stopped or info.pbi_status == Darwin.process_status_zombie;
+}
+
 const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
     const proc_pid_fd_pipe_info: c_int = 6;
+    const process_status_stopped: u32 = 4;
     const process_status_zombie: u32 = 5;
 
     const ProcFileInfo = extern struct {
