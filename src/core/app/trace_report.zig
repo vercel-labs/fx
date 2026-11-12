@@ -138,8 +138,10 @@
 //!   Each has `at`, `name`, `outcome`, `duration_ms`, `source`, `cause`, and
 //!   `call_id` as a `tool_call` has them; `dir`, the folder the tool ran
 //!   against, where a shell call runs when its arguments name no `cwd`; for a
-//!   `shell` call, `redefined`, the entries of the `shell` record's
-//!   `redefined` list that its arguments name, left out when there are none;
+//!   `shell` call that read the startup files, which means its arguments leave
+//!   `profile` unset or `user` and name no `shell`, `redefined`, the entries of
+//!   the `shell` record's `redefined` list that its arguments name, left out
+//!   when there are none;
 //!   and `args` and `result` (each masked), with `args_bytes` and
 //!   `result_bytes`. Each keeps up to 8 KiB of its value: a longer value keeps
 //!   its first bytes in `args` or `result` and its last bytes in `args_tail`
@@ -1352,8 +1354,9 @@ fn writeFailedToolCall(
     try r.begin("failed_tool_call");
     try writeFailedToolCallFields(r, call);
     try r.optionalText("dir", call.dir());
+    // Only a command that read the startup files ran their aliases.
     if (shell_view) |view| {
-        if (std.mem.eql(u8, call.name(), "shell")) try writeRedefinedWordsInCall(r, view, call);
+        if (call.reads_startup_files) try writeRedefinedWordsInCall(r, view, call);
     }
     try writeKeptText(r, "args", &call.args);
     try writeKeptText(r, "result", &call.result);
@@ -3477,6 +3480,40 @@ test "trace marks a window call whose failure is kept" {
     try std.testing.expectEqualStrings("not found", try testString(kept, "result"));
     // Without a shell view, a failure names no redefined commands.
     try expectAbsent(kept, "redefined");
+}
+
+test "trace names redefined commands only for a shell call that read the startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("shell", .command_failed, "call_user", "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", "exit 1");
+    // A clean profile starts the shell without the startup files, so their
+    // `ls` alias did not run.
+    recordTraceTestCall("shell", .command_failed, "call_clean", "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", "exit 1");
+    // A named shell may be another shell or a clean start.
+    recordTraceTestCall(
+        "shell",
+        .command_failed,
+        "call_named_shell",
+        "{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+        "exit 1",
+    );
+    const view = traceTestShellView("ready");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, &view);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), trace.count("failed_tool_call"));
+    const user = try trace.nth("failed_tool_call", 0);
+    try std.testing.expectEqualStrings("call_user", try testString(user, "call_id"));
+    try std.testing.expectEqualStrings("ls alias eza;", try testRedefined(trace.arena.allocator(), user));
+    for ([_][]const u8{ "call_clean", "call_named_shell" }, 1..) |call_id, index| {
+        const call = try trace.nth("failed_tool_call", index);
+        try std.testing.expectEqualStrings(call_id, try testString(call, "call_id"));
+        try expectAbsent(call, "redefined");
+    }
 }
 
 test "trace problems list a failure the window no longer holds" {

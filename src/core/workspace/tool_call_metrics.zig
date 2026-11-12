@@ -71,7 +71,7 @@ pub const ToolCallMetric = struct {
         self.name_len = @intCast(n);
     }
 
-    pub fn setCallId(self: *ToolCallMetric, value: []const u8) void {
+    fn setCallId(self: *ToolCallMetric, value: []const u8) void {
         const n = utf8PrefixLen(value, max_call_id_len);
         @memcpy(self.call_id_buf[0..n], value[0..n]);
         self.call_id_len = @intCast(n);
@@ -161,6 +161,9 @@ pub const FailedToolCall = struct {
     call_id_len: u8 = 0,
     dir_buf: [max_dir_len]u8 = @splat(0),
     dir_len: u16 = 0,
+    /// Whether this is a `shell` call whose command read the user's startup
+    /// files; see `shellArgsReadStartupFiles`.
+    reads_startup_files: bool = false,
     args: KeptText = .{},
     result: KeptText = .{},
 
@@ -179,14 +182,14 @@ pub const FailedToolCall = struct {
     }
 };
 
-pub const HeadTailCut = struct {
+const HeadTailCut = struct {
     head_len: usize,
     tail_len: usize,
 };
 
 /// Splits `value` into a head and a tail that fit `budget` bytes together,
 /// each cut on a UTF-8 boundary. A value that fits stays whole in the head.
-pub fn headTailCut(value: []const u8, budget: usize) HeadTailCut {
+fn headTailCut(value: []const u8, budget: usize) HeadTailCut {
     if (value.len <= budget) return .{ .head_len = value.len, .tail_len = 0 };
     const head_len = utf8PrefixLen(value, budget / 2);
     const tail_len = utf8SuffixLen(value, budget - head_len);
@@ -199,7 +202,7 @@ fn isContinuationByte(byte: u8) bool {
 
 /// Length of the longest prefix of `value` no longer than `limit` that does
 /// not end inside a UTF-8 sequence. Bytes that are not UTF-8 are cut as is.
-pub fn utf8PrefixLen(value: []const u8, limit: usize) usize {
+fn utf8PrefixLen(value: []const u8, limit: usize) usize {
     if (value.len <= limit) return value.len;
     var end = limit;
     var steps: usize = 0;
@@ -209,7 +212,7 @@ pub fn utf8PrefixLen(value: []const u8, limit: usize) usize {
 
 /// Length of the longest suffix of `value` no longer than `limit` that does
 /// not start inside a UTF-8 sequence.
-pub fn utf8SuffixLen(value: []const u8, limit: usize) usize {
+fn utf8SuffixLen(value: []const u8, limit: usize) usize {
     if (value.len <= limit) return value.len;
     var start = value.len - limit;
     var steps: usize = 0;
@@ -289,7 +292,7 @@ fn recordLocked(call: ToolCallMetric) void {
 
 /// Writes a failed call into the failure ring from its whole arguments and
 /// output. The slot is filled in place: a kept failure is about 17 KiB.
-fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32) void {
+fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32, reads_startup_files: bool) void {
     const slot = &failures[failures_head];
     failures_head = (failures_head + 1) % failure_ring_capacity;
     if (failures_stored < failure_ring_capacity) failures_stored += 1;
@@ -307,6 +310,7 @@ fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32) void {
     const dir_len = utf8PrefixLen(input.dir, max_dir_len);
     @memcpy(slot.dir_buf[0..dir_len], input.dir[0..dir_len]);
     slot.dir_len = @intCast(dir_len);
+    slot.reads_startup_files = reads_startup_files;
     if (omitsPayloadsForName(input.name)) {
         slot.args.clear();
         slot.result.clear();
@@ -335,6 +339,10 @@ pub fn recordResult(input: ToolCallRecord) void {
     metric.setName(input.name);
     metric.setCallId(input.call_id);
     metric.setPayloadsForName(input.name, input.arguments_json, input.model_output);
+    // Read before the lock, since it walks the whole arguments.
+    const reads_startup_files = input.outcome != .succeeded and
+        std.mem.eql(u8, input.name, "shell") and
+        shellArgsReadStartupFiles(input.arguments_json);
 
     const zio = io_mod.getIo();
     mutex.lockUncancelable(zio);
@@ -342,7 +350,37 @@ pub fn recordResult(input: ToolCallRecord) void {
     // One lock for both rings, so a snapshot never sees a failure in the
     // window that the failure ring does not hold yet.
     recordLocked(metric);
-    if (input.outcome != .succeeded) recordFailureLocked(input, metric.duration_ms);
+    if (input.outcome != .succeeded) recordFailureLocked(input, metric.duration_ms, reads_startup_files);
+}
+
+/// Whether a `shell` call's arguments leave the user's startup files on: one
+/// JSON object whose top-level `profile` is absent or `user` and that names no
+/// `shell`. A `clean` profile starts the shell without them, and a named shell
+/// may be another shell or a clean start. Arguments it cannot read count as
+/// off, so a trace never blames startup files a command may not have read.
+fn shellArgsReadStartupFiles(arguments_json: []const u8) bool {
+    // Holds the scanner's nesting stack; deeper arguments count as off.
+    var stack: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&stack);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), arguments_json);
+    defer scanner.deinit();
+    if ((scanner.next() catch return false) != .object_begin) return false;
+    while (true) {
+        const key = switch (scanner.next() catch return false) {
+            .object_end => return true,
+            .string => |text| text,
+            else => return false,
+        };
+        if (std.mem.eql(u8, key, "shell")) return false;
+        if (std.mem.eql(u8, key, "profile")) {
+            switch (scanner.next() catch return false) {
+                .string => |text| if (!std.mem.eql(u8, text, "user")) return false,
+                else => return false,
+            }
+        } else {
+            scanner.skipValue() catch return false;
+        }
+    }
 }
 
 pub fn snapshot(out: []ToolCallMetric) usize {
@@ -616,6 +654,42 @@ test "a session reset clears the failure ring" {
     defer freeFailuresForTest(kept);
     try std.testing.expectEqual(@as(usize, 0), kept.len);
     try std.testing.expectEqual(@as(u64, 0), lifetimeStats().failureCount());
+}
+
+test "shell arguments read the startup files only on the user profile without a named shell" {
+    const reads = [_][]const u8{
+        "{\"action\":\"run\",\"command\":\"ls\"}",
+        "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"user\"}",
+        // Words in a value are not keys.
+        "{\"command\":\"echo \\\"profile\\\":\\\"clean\\\" shell\",\"cwd\":{\"profile\":\"clean\"}}",
+        "{}",
+    };
+    for (reads) |arguments| try std.testing.expect(shellArgsReadStartupFiles(arguments));
+
+    const skips = [_][]const u8{
+        "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"clean\"}",
+        "{\"profile\":\"clean\",\"command\":\"ls\"}",
+        "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\"}}",
+        "{\"profile\":null,\"command\":\"ls\"}",
+        // An escaped key is not read, so it counts as off.
+        "{\"pro\\u0066ile\":\"user\",\"command\":\"ls\"}",
+        "",
+        "not json",
+        "[\"profile\",\"user\"]",
+        "{\"command\":\"ls\"",
+    };
+    for (skips) |arguments| try std.testing.expect(!shellArgsReadStartupFiles(arguments));
+
+    // Nesting deeper than the scanner's stack counts as off, not as a crash.
+    const prefix = "{\"command\":";
+    const depth = 4096;
+    const deep = try std.testing.allocator.alloc(u8, prefix.len + 2 * depth + 1);
+    defer std.testing.allocator.free(deep);
+    @memcpy(deep[0..prefix.len], prefix);
+    @memset(deep[prefix.len..][0..depth], '[');
+    @memset(deep[prefix.len + depth ..][0..depth], ']');
+    deep[deep.len - 1] = '}';
+    try std.testing.expect(!shellArgsReadStartupFiles(deep));
 }
 
 test "the rings match a reference list on seeded random sequences" {
