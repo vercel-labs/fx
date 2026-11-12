@@ -1,17 +1,12 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const mode_rearm = @import("mode_rearm.zig");
 const theme_protocol = @import("theme_protocol.zig");
 
 // OSC 11 shares Escape's prefix: allow fragmented replies without imposing
 // the cursor probe's full 100 ms delay on a standalone Escape key.
 pub const response_idle_timeout_ms: i64 = 75;
 pub const background_response_timeout_ms: i64 = 200;
-/// A terminal reset, or another program's restore on the same terminal, can
-/// turn DEC mode 2031 off under a running fx, and nothing tells fx. fx then
-/// misses every later theme change. On this interval fx turns the mode on
-/// again and asks for the color scheme; when nothing changed, the answer
-/// settles to the current theme and fx redraws nothing.
-pub const rearm_interval_ms: i64 = 30_000;
 
 const max_candidate_bytes = 64;
 
@@ -65,10 +60,8 @@ pub const Monitor = struct {
     theme_dirty: bool = false,
     notification_light: ?bool = null,
     settled_update: ?ThemeUpdate = null,
-    /// When fx next turns theme notifications on again. Null until the first
-    /// check, which schedules it one interval out, because startup has just
-    /// turned them on.
-    next_rearm_ms: ?i64 = null,
+    /// When fx next turns theme notifications (DEC mode 2031) on again.
+    rearm: mode_rearm.Schedule = .{},
 
     pub fn start(self: *Monitor) void {
         self.enabled = true;
@@ -77,22 +70,20 @@ pub const Monitor = struct {
     /// Makes the next `takeRearmRequest` due at once, such as after a
     /// job-control resume, whose terminal restore turned mode 2031 off.
     pub fn requestRearm(self: *Monitor) void {
-        self.next_rearm_ms = std.math.minInt(i64);
+        self.rearm.requestNow();
     }
 
     /// Returns true when fx should turn theme notifications on again and ask
-    /// for the color scheme. It waits while a theme query is in flight or a
-    /// notification still waits for its query, because that refresh already
-    /// reads the current theme.
+    /// for the color scheme. A theme change fx missed while the mode was off
+    /// then settles; when nothing changed, the answer settles to the current
+    /// theme and fx redraws nothing. It waits while a theme query is in flight
+    /// or a notification still waits for its query, because that refresh
+    /// already reads the current theme.
     pub fn takeRearmRequest(self: *Monitor, now_ms: i64) bool {
         if (!self.enabled) return false;
-        const due_ms = self.next_rearm_ms orelse {
-            self.next_rearm_ms = addMillis(now_ms, rearm_interval_ms);
-            return false;
-        };
-        if (now_ms < due_ms) return false;
+        if (!self.rearm.due(now_ms)) return false;
         if (self.theme_dirty or self.query_state != .idle) return false;
-        self.next_rearm_ms = addMillis(now_ms, rearm_interval_ms);
+        self.rearm.schedule(now_ms);
         return true;
     }
 
@@ -656,10 +647,9 @@ test "theme monitor rearms notifications once per interval after startup" {
     // Startup has just turned notifications on, so the first check only
     // schedules the next rearm.
     try std.testing.expect(!monitor.takeRearmRequest(1_000));
-    try std.testing.expect(!monitor.takeRearmRequest(1_000 + rearm_interval_ms - 1));
-    try std.testing.expect(monitor.takeRearmRequest(1_000 + rearm_interval_ms));
-    try std.testing.expect(!monitor.takeRearmRequest(1_000 + rearm_interval_ms + 1));
-    try std.testing.expect(monitor.takeRearmRequest(1_000 + 2 * rearm_interval_ms));
+    try std.testing.expect(!monitor.takeRearmRequest(1_000 + mode_rearm.interval_ms - 1));
+    try std.testing.expect(monitor.takeRearmRequest(1_000 + mode_rearm.interval_ms));
+    try std.testing.expect(!monitor.takeRearmRequest(1_000 + mode_rearm.interval_ms + 1));
 }
 
 test "theme monitor rearms at once on request" {
@@ -670,7 +660,7 @@ test "theme monitor rearms at once on request" {
     monitor.requestRearm();
     try std.testing.expect(monitor.takeRearmRequest(1));
     try std.testing.expect(!monitor.takeRearmRequest(2));
-    try std.testing.expect(monitor.takeRearmRequest(1 + rearm_interval_ms));
+    try std.testing.expect(monitor.takeRearmRequest(1 + mode_rearm.interval_ms));
 }
 
 test "theme monitor waits for a running theme refresh before it rearms" {
