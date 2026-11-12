@@ -11,7 +11,8 @@
 // native addon (kernel.ts), which needs `zig build libfx-napi
 // -Dnapi-surface=core`; --no-kernel leaves them out.
 //
-// --model fixed (the default) checks ACP v1's error rules. --model before
+// --model fixed (the default) checks ACP v1's error rules, with many sessions
+// open at once on fx acp and one on the kernel. --model before
 // checks the model of fx before them; a build of origin/main at 15dab7bb4,
 // chosen with FX_WORKTREE or FX_BIN, matches it and fails --model fixed.
 // --random sets how many seeded plans run, --steps their length, --seed the
@@ -353,7 +354,10 @@ async function main() {
     const dir = join(reportDir, "traces", plan.name);
     const run = await runPlan(plan, dir);
     const processFailed = run.processes.some((proc) => proc.exit !== 0);
-    const checked = run.error ? null : await validate(run.observations, dir, fixed);
+    // fx acp holds many sessions under the rules; the kernel, and fx acp
+    // before them, hold one.
+    const many = fixed && plan.kind === "acp";
+    const checked = run.error ? null : await validate(run.observations, dir, fixed, many);
     const verdict = run.error ? "RUN_ERROR" : processFailed ? "PROCESS_ERROR" : checked!.verdict;
     results.push({ name: plan.name, verdict, steps: run.observations.length, error: run.error, firstDivergence: checked?.firstDivergence ?? null, processes: run.processes.map((proc) => proc.exit) });
     const divergence = checked?.firstDivergence;
@@ -364,14 +368,14 @@ async function main() {
   // Controls show the checker separates runs the model allows from runs it doesn't.
   const controls = [];
   const synthetic = syntheticTrace(fixed);
-  controls.push({ name: "synthetic-conforming", expect: "ACCEPTED", got: (await validate(synthetic, join(reportDir, "controls", "synthetic-conforming"), fixed)).verdict });
-  controls.push({ name: "synthetic-tampered", expect: "REJECTED", got: (await validate(tamper(synthetic)!, join(reportDir, "controls", "synthetic-tampered"), fixed)).verdict });
-  controls.push({ name: "empty-trace", expect: "TOOL_ERROR", got: (await validate([], join(reportDir, "controls", "empty-trace"), fixed)).verdict });
+  controls.push({ name: "synthetic-conforming", expect: "ACCEPTED", got: (await validate(synthetic, join(reportDir, "controls", "synthetic-conforming"), fixed, fixed)).verdict });
+  controls.push({ name: "synthetic-tampered", expect: "REJECTED", got: (await validate(tamper(synthetic)!, join(reportDir, "controls", "synthetic-tampered"), fixed, fixed)).verdict });
+  controls.push({ name: "empty-trace", expect: "TOOL_ERROR", got: (await validate([], join(reportDir, "controls", "empty-trace"), fixed, fixed)).verdict });
   const firstAccepted = results.find((result) => result.verdict === "ACCEPTED");
   if (firstAccepted) {
     const observed = (await Bun.file(join(reportDir, "traces", firstAccepted.name, "observations.json")).json()) as Observation[];
     const tampered = tamper(observed);
-    if (tampered) controls.push({ name: `tampered-${firstAccepted.name}`, expect: "REJECTED", got: (await validate(tampered, join(reportDir, "controls", `tampered-${firstAccepted.name}`), fixed)).verdict });
+    if (tampered) controls.push({ name: `tampered-${firstAccepted.name}`, expect: "REJECTED", got: (await validate(tampered, join(reportDir, "controls", `tampered-${firstAccepted.name}`), fixed, fixed && !firstAccepted.name.startsWith("k"))).verdict });
   }
   for (const control of controls) console.log(`control ${control.name}: ${control.got} (expected ${control.expect})`);
 

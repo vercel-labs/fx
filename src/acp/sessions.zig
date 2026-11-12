@@ -148,7 +148,7 @@ pub fn handleNewLibfxSession(
         }),
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
-    try server.releaseActiveSession(state);
+    server.closeSessionsBeforeOpen(state);
     requested_owned = false;
     const session_id = requested orelse try session_store.generateSessionId(alloc);
     var session_id_owned = true;
@@ -160,17 +160,15 @@ pub fn handleNewLibfxSession(
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
 
-    const start = server.loadStartingMode(state, alloc);
-    state.active_session = .{
+    const start = server.loadStartingMode(state, alloc, state.launch.root);
+    const session = try openOneSession(state, .{
         .observer_hooks = observer_hooks,
         .session_id = session_id,
         .model = model,
         .provider = state.provider,
         .mode = start.id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .account_id = state.account_id,
+        .workspace_root = &.{},
+        .api_key = &.{},
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
@@ -183,12 +181,12 @@ pub fn handleNewLibfxSession(
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
         .client_system_prompt = client_system_prompt orelse &.{},
-    };
+    });
     client_system_prompt = null;
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    try writeNewSessionResponse(state, alloc, msg, session_id, observer_hooks);
+    try writeNewSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -196,9 +194,9 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = libfx_hooks.parseErrorMessage(err) }),
     };
-    try server.releaseActiveSession(state);
+    server.closeSessionsBeforeOpen(state);
 
-    var durable = try freshAcpState(state, alloc, state.workspace_root);
+    var durable = try freshAcpState(state, alloc, state.launch.root);
     var durable_owned = true;
     defer if (durable_owned) durable.deinit(alloc);
     const session_id = try alloc.dupe(u8, durable.id);
@@ -218,19 +216,16 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     var revision_owned = true;
     defer if (revision_owned) alloc.free(revision);
 
-    const start = server.loadStartingMode(state, alloc);
-    state.active_session = .{
+    const start = server.loadStartingMode(state, alloc, state.launch.root);
+    const session = try openOneSession(state, .{
         .session_id = session_id,
         .wasm_state = durable,
         .wasm_revision = revision,
         .model = model,
         .provider = durable.preferences.provider,
         .mode = start.id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
-        .account_id = state.account_id,
+        .workspace_root = &.{},
+        .api_key = &.{},
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
@@ -242,14 +237,21 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
-    };
+    });
     durable_owned = false;
     revision_owned = false;
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
 
-    try writeNewSessionResponse(state, alloc, msg, session_id, observer_hooks);
+    try writeNewSessionResponse(state, alloc, msg, session, observer_hooks);
+}
+
+/// Opens a session of the libfx kernel or the web core, which hold one: the
+/// open session closes first, and the new one uses the launch workspace.
+fn openOneSession(state: *server.ServerState, value: server.ActiveSessionState) !*server.ActiveSessionState {
+    server.closeSessionsBeforeOpen(state);
+    return server.openSession(state, value, null);
 }
 
 pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionState) !void {
@@ -421,7 +423,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer if (workspace) |*binding| binding.deinit(alloc);
-    const workspace_root = if (workspace) |binding| binding.root else state.workspace_root;
+    const workspace_root = if (workspace) |binding| binding.root else state.launch.root;
     var mcp_configs = mcp_servers.parse(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -500,7 +502,7 @@ fn startV2Session(
     const session_host = start.mcp_host;
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
-    const workspace_root = if (start.workspace) |binding| binding.root else state.workspace_root;
+    const workspace_root = if (start.workspace) |binding| binding.root else state.launch.root;
     const v2 = session_adapter.Session.create(alloc, v2_store, workspace_root, .acp, .{
         .preferences = .{
             .provider = state.provider,
@@ -534,8 +536,9 @@ fn startV2Session(
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
-    server.cancelAndReapActivePrompt(state);
-    activateSession(state, .{
+    // Every other open session runs on (`tests/tla/acp/AcpSessions.tla`
+    // OthersUntouched).
+    const session = activateSession(state, .{
         .session_id = session_id,
         .v2 = v2,
         .model = model_copy,
@@ -558,54 +561,58 @@ fn startV2Session(
     model_owned = false;
     session_rt_owned = false;
     session_host_owned = false;
-    try writeNewSessionResponse(state, alloc, msg, session_id, start.observer_hooks);
+    try writeNewSessionResponse(state, alloc, msg, session, start.observer_hooks);
 }
 
 fn writeNewSessionResponse(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
-    session_id: []const u8,
+    session: *server.ActiveSessionState,
     observer_hooks: ?libfx_hooks.Config,
 ) !void {
-    state.active_session.?.observer_hooks = observer_hooks;
-    try server.refreshModelCatalogForOptions(state);
+    setObserverHooks(session, observer_hooks);
+    const session_id = session.session_id;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-
-    try out.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(session_id, &out.writer);
-    try out.writer.writeAll(",\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
+    {
+        server.lockCatalog(state);
+        defer server.unlockCatalog(state);
+        try server.refreshModelCatalogForOptionsLocked(state, session);
+        try out.writer.writeAll("{\"sessionId\":");
+        try writeJsonStr(session_id, &out.writer);
+        try out.writer.writeAll(",\"configOptions\":[");
+        if (comptime !host_target.is_wasm) {
+            try writeProviderConfigOption(&out.writer, session.provider, state.configured_providers.definitions);
+            try out.writer.writeAll(",");
+        }
+        try writeModelConfigOption(
+            &out.writer,
+            session.model,
+            state.capability_resolver.catalogEntries(),
+        );
         try out.writer.writeAll(",");
-    }
-    try writeModelConfigOption(
-        &out.writer,
-        state.active_session.?.model,
-        state.capability_resolver.catalogEntries(),
-    );
-    try out.writer.writeAll(",");
-    try writeModeConfigOption(
-        &out.writer,
-        state.cfg.mode_registry,
-        state.active_session.?.mode,
-        state.extensions.contains(.permission_mode),
-    );
-    if (effortConfigState(state)) |config| {
-        try out.writer.writeAll(",");
-        try writeEffortConfigOption(&out.writer, config.efforts, config.current);
-    }
-    if (fastConfigState(state)) |current| {
-        try out.writer.writeAll(",");
-        try writeFastConfigOption(&out.writer, current);
-    }
-    if (ultrafastConfigState(state)) |current| {
-        try out.writer.writeAll(",");
-        try writeUltrafastConfigOption(&out.writer, current);
+        try writeModeConfigOption(
+            &out.writer,
+            state.cfg.mode_registry,
+            session.mode,
+            state.extensions.contains(.permission_mode),
+        );
+        if (effortConfigState(state, session)) |config| {
+            try out.writer.writeAll(",");
+            try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+        }
+        if (fastConfigState(state, session)) |current| {
+            try out.writer.writeAll(",");
+            try writeFastConfigOption(&out.writer, current);
+        }
+        if (ultrafastConfigState(state, session)) |current| {
+            try out.writer.writeAll(",");
+            try writeUltrafastConfigOption(&out.writer, current);
+        }
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
-    try writeJsonStr(state.active_session.?.mode, &out.writer);
+    try writeJsonStr(session.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
@@ -636,14 +643,12 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     else
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
 
-    if (state.active_session) |*active| {
-        if (sameSessionId(active.session_id, session_id)) {
-            var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
-            defer sources.deinit(alloc);
-            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
-            try sendActiveSessionInfoUpdate(state, alloc);
-            return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
-        }
+    if (server.findSession(state, session_id)) |active| {
+        var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+        defer sources.deinit(alloc);
+        for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, active, alloc, &sources, turn);
+        try sendSessionInfoUpdate(state, active, alloc, active.prompt == null);
+        return writeLoadSessionResponse(state, alloc, msg, active, observer_hooks);
     }
 
     var loaded = (js_host_session_store.load(alloc, session_id) catch
@@ -673,20 +678,16 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         loaded.state.permission_state,
     );
 
-    try server.releaseActiveSession(state);
-    const start = server.loadStartingMode(state, alloc);
-    state.active_session = .{
+    const start = server.loadStartingMode(state, alloc, state.launch.root);
+    const session = try openOneSession(state, .{
         .session_id = sid_copy,
         .wasm_state = loaded.state,
         .wasm_revision = loaded.revision,
         .model = model_copy,
         .provider = loaded.state.preferences.provider,
         .mode = start.id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
-        .account_id = state.account_id,
+        .workspace_root = &.{},
+        .api_key = &.{},
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = loaded.state.preferences.fast_mode,
@@ -698,16 +699,16 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
-    };
+    });
     loaded_owned = false;
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
-    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
-    try sendActiveSessionInfoUpdate(state, alloc);
-    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks);
+    for (session.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, session, alloc, &sources, turn);
+    try sendSessionInfoUpdate(state, session, alloc, true);
+    try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
 pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -725,7 +726,7 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(entry.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
+        try writeJsonStr(state.launch.root, &out.writer);
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, entry.updated_at_ms);
         defer alloc.free(iso);
@@ -747,9 +748,7 @@ pub fn handleDeleteWasmSession(state: *server.ServerState, alloc: Allocator, msg
     const value = if (parsed.value == .object) parsed.value.object.get("sessionId") else null;
     const session_id = if (value) |id| if (id == .string) id.string else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" }) else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
     js_host_session_store.remove(session_id) catch return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to remove session" });
-    if (state.active_session) |*active| {
-        if (sameSessionId(active.session_id, session_id)) try server.releaseActiveSession(state);
-    }
+    if (server.findSession(state, session_id)) |active| server.closeSession(state, active);
     try state.writer.writeResponse(alloc, msg.id, "{}");
 }
 
@@ -810,7 +809,11 @@ fn handleRestoreSession(
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
     };
 
-    var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
+    // A session open on this connection is reused once the request checks
+    // out, before any server starts (`tests/tla/acp/AcpSessions.tla`
+    // ReuseKeepsTurn). It keeps its workspace, so none is staged.
+    const open_session = server.findSession(state, session_id);
+    var workspace = if (open_session != null) null else workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -818,7 +821,7 @@ fn handleRestoreSession(
         }),
     };
     defer if (workspace) |*binding| binding.deinit(alloc);
-    const workspace_root = if (workspace) |binding| binding.root else state.workspace_root;
+    const workspace_root = if (workspace) |binding| binding.root else state.launch.root;
 
     var mcp_configs = switch (kind) {
         .load => mcp_servers.parse(alloc, msg.params_raw),
@@ -835,14 +838,16 @@ fn handleRestoreSession(
         defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
     }
-    if (!state.cfg.allow_acp_mcp) {
-        if (mcp_configs.items.items.len > 0) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "MCP servers are unavailable in this runtime",
-            });
-        }
-    } else {
+    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "MCP servers are unavailable in this runtime",
+        });
+    }
+    if (open_session) |open| {
+        return reuseOpenSession(state, alloc, msg, open, kind, observer_hooks, &requested_system_prompt);
+    }
+    if (state.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
@@ -864,58 +869,6 @@ fn handleRestoreSession(
     const session_host = mcp_preparation.takeHost();
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
-
-    if (state.active_session) |*active| {
-        // Loading the active session into another workspace releases it and
-        // reopens it through the ordinary rebinding path below.
-        if (sameSessionId(active.session_id, session_id) and workspace != null) {
-            server.cancelAndReapActivePrompt(state);
-            try server.releaseActiveSession(state);
-        }
-    }
-    if (state.active_session) |*active| {
-        if (sameSessionId(active.session_id, session_id)) {
-            server.cancelAndReapActivePrompt(state);
-            // With the prompt worker reaped, nothing reads the old text.
-            if (requested_system_prompt) |text| if (!std.mem.eql(u8, text, active.client_system_prompt)) {
-                if (active.v2) |session| session.setClientPrompt(text) catch |err| {
-                    debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
-                    return state.writer.writeError(alloc, msg.id, .{
-                        .code = ErrorCode.internal_error,
-                        .message = "Failed to save the client system prompt",
-                    });
-                };
-                if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
-                active.client_system_prompt = text;
-                requested_system_prompt = null;
-            };
-            server.disableSubagentHost(state);
-            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-            const previous_host = active.mcp_host;
-            active.mcp_host = session_host;
-            session_host_owned = false;
-            const start = server.loadStartingMode(state, alloc);
-            active.mode = start.id;
-            active.permission_mode = start.permission_mode;
-            state.subagent_authority_mutex.unlock(io_mod.getIo());
-            if (previous_host) |h| h.stop();
-            server.enableSubagentHost(state);
-            // One map, so a recovered read can name a call from an earlier turn.
-            var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
-            defer sources.deinit(alloc);
-            if (kind.replaysHistory()) {
-                try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
-            }
-            try sendActiveSessionInfoUpdate(state, alloc);
-            return writeLoadSessionResponse(
-                state,
-                alloc,
-                msg,
-                active.model,
-                observer_hooks,
-            );
-        }
-    }
 
     var v2: ?*session_adapter.Session = null;
     var v2_owned = true;
@@ -949,7 +902,7 @@ fn handleRestoreSession(
         state.selected_model
     else
         durable.preferences.model;
-    var staged_credential = server.prepareCredentialForProvider(state, effective_provider) catch |err| {
+    var staged_credential = server.prepareCredentialForProvider(state, null, effective_provider) catch |err| {
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -977,9 +930,8 @@ fn handleRestoreSession(
         durable.history,
         durable.permission_state,
     );
-    // Read before the active session is released, so an unreadable prompt
-    // fails this restore without replacing a different active session. A
-    // same-session `cwd` rebind has already released it above.
+    // Read before the session opens, so an unreadable prompt fails this
+    // restore with nothing opened.
     var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // A supplied prompt replaces one that can't be read.
@@ -1004,8 +956,7 @@ fn handleRestoreSession(
     }
     // The session's downloads are its blobs (D44).
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.?.childCapability(), v2.?.id());
-    server.cancelAndReapActivePrompt(state);
-    activateSession(state, .{
+    const session = activateSession(state, .{
         .session_id = sid_copy,
         .v2 = v2.?,
         .model = model_copy,
@@ -1033,17 +984,77 @@ fn handleRestoreSession(
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
     if (kind.replaysHistory()) {
-        try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
+        try sendActiveHistoryUpdates(state, session, alloc, &sources);
     }
-    try sendActiveSessionInfoUpdate(state, alloc);
+    try sendSessionInfoUpdate(state, session, alloc, true);
 
-    try writeLoadSessionResponse(
-        state,
-        alloc,
-        msg,
-        state.active_session.?.model,
-        observer_hooks,
-    );
+    try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
+}
+
+/// `session/load` or `session/resume` of a session open on this connection
+/// reuses it (Q108): its turn, mode, and MCP servers keep running, and load
+/// replays its saved history again. The open session keeps its workspace, so
+/// a request that names another one fails. A new system prompt applies at
+/// the next turn, so it fails while a turn runs.
+fn reuseOpenSession(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    session: *server.ActiveSessionState,
+    kind: RestoreKind,
+    observer_hooks: ?libfx_hooks.Config,
+    requested_system_prompt: *?[]u8,
+) !void {
+    const root = workspace_binding.resolveRoot(state, alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = workspace_binding.prepareErrorMessage(err),
+        }),
+    };
+    defer if (root) |path| alloc.free(path);
+    if (root) |path| if (!std.mem.eql(u8, path, session.workspace_root)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Session is open in another workspace",
+        });
+    };
+    if (requested_system_prompt.*) |text| if (!std.mem.eql(u8, text, session.client_system_prompt)) {
+        if (session.prompt != null) return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Prompt already in progress",
+        });
+        if (session.v2) |v2| v2.setClientPrompt(text) catch |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+        };
+        if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
+        session.client_system_prompt = text;
+        requested_system_prompt.* = null;
+    };
+    // History in memory changes as a turn runs; the saved history doesn't.
+    if (kind.replaysHistory() and session.v2 == null and session.prompt != null) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Prompt already in progress",
+        });
+    }
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
+    if (kind.replaysHistory()) try sendActiveHistoryUpdates(state, session, alloc, &sources);
+    try sendSessionInfoUpdate(state, session, alloc, session.prompt == null);
+    return writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
+}
+
+/// Sets the hooks the session's next turn reports to. Turns read them as
+/// they start, under the same lock.
+fn setObserverHooks(session: *server.ActiveSessionState, observer_hooks: ?libfx_hooks.Config) void {
+    session.waiting_prompts.lock();
+    defer session.waiting_prompts.unlock();
+    session.observer_hooks = observer_hooks;
 }
 
 /// Adds the user's profile MCP servers after the request's own servers when
@@ -1152,44 +1163,48 @@ fn writeLoadSessionResponse(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
-    model: []const u8,
+    session: *server.ActiveSessionState,
     observer_hooks: ?libfx_hooks.Config,
 ) !void {
-    state.active_session.?.observer_hooks = observer_hooks;
-    try server.refreshModelCatalogForOptions(state);
+    setObserverHooks(session, observer_hooks);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
+    {
+        server.lockCatalog(state);
+        defer server.unlockCatalog(state);
+        try server.refreshModelCatalogForOptionsLocked(state, session);
+        try out.writer.writeAll("{\"configOptions\":[");
+        if (comptime !host_target.is_wasm) {
+            try writeProviderConfigOption(&out.writer, session.provider, state.configured_providers.definitions);
+            try out.writer.writeAll(",");
+        }
+        try writeModelConfigOption(
+            &out.writer,
+            session.model,
+            state.capability_resolver.catalogEntries(),
+        );
         try out.writer.writeAll(",");
-    }
-    try writeModelConfigOption(
-        &out.writer,
-        model,
-        state.capability_resolver.catalogEntries(),
-    );
-    try out.writer.writeAll(",");
-    try writeModeConfigOption(
-        &out.writer,
-        state.cfg.mode_registry,
-        state.active_session.?.mode,
-        state.extensions.contains(.permission_mode),
-    );
-    if (effortConfigState(state)) |config| {
-        try out.writer.writeAll(",");
-        try writeEffortConfigOption(&out.writer, config.efforts, config.current);
-    }
-    if (fastConfigState(state)) |current| {
-        try out.writer.writeAll(",");
-        try writeFastConfigOption(&out.writer, current);
-    }
-    if (ultrafastConfigState(state)) |current| {
-        try out.writer.writeAll(",");
-        try writeUltrafastConfigOption(&out.writer, current);
+        try writeModeConfigOption(
+            &out.writer,
+            state.cfg.mode_registry,
+            session.mode,
+            state.extensions.contains(.permission_mode),
+        );
+        if (effortConfigState(state, session)) |config| {
+            try out.writer.writeAll(",");
+            try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+        }
+        if (fastConfigState(state, session)) |current| {
+            try out.writer.writeAll(",");
+            try writeFastConfigOption(&out.writer, current);
+        }
+        if (ultrafastConfigState(state, session)) |current| {
+            try out.writer.writeAll(",");
+            try writeUltrafastConfigOption(&out.writer, current);
+        }
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
-    try writeJsonStr(state.active_session.?.mode, &out.writer);
+    try writeJsonStr(session.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
@@ -1304,15 +1319,17 @@ fn restoredToolIdentities(
     };
 }
 
-fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {
-    try server.releaseActiveSession(state);
+/// Opens the session `activation` describes, in its own workspace and with
+/// its own credential, and returns it. Every other open session stays open,
+/// except where the connection holds one session.
+fn activateSession(state: *server.ServerState, activation: SessionActivation) !*server.ActiveSessionState {
+    server.closeSessionsBeforeOpen(state);
     const client_system_prompt: []u8 = activation.client_system_prompt orelse &.{};
-    if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
-    if (activation.credential) |credential| server.adoptServerCredential(state, credential);
-    const start = server.loadStartingMode(state, state.alloc);
-    // Nothing after this load can fail before the session takes ownership.
-    const tool_identities = try restoredToolIdentities(state.alloc, activation.v2);
-    state.active_session = .{
+    const workspace_root = if (activation.workspace) |binding| binding.root else state.launch.root;
+    const start = server.loadStartingMode(state, state.alloc, workspace_root);
+    var tool_identities = try restoredToolIdentities(state.alloc, activation.v2);
+    errdefer tool_identities.deinit(state.alloc);
+    const session = try server.openSession(state, .{
         .session_id = activation.session_id,
         .v2 = activation.v2,
         .client_system_prompt = client_system_prompt,
@@ -1320,11 +1337,8 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .model = activation.model,
         .provider = activation.provider,
         .mode = start.id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
-        .account_id = state.account_id,
+        .workspace_root = &.{},
+        .api_key = &.{},
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = activation.fast_mode,
@@ -1337,8 +1351,10 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .mcp_host = activation.mcp_host,
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
-    };
-    server.enableSubagentHost(state);
+    }, activation.workspace);
+    if (activation.credential) |credential| server.adoptSessionCredential(state.alloc, session, credential);
+    server.enableSubagentHost(session);
+    return session;
 }
 
 /// A v2 storage fault as one sentence after `what`, such as "Session could
@@ -1589,38 +1605,38 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
 
 fn sendActiveHistoryUpdates(
     state: *server.ServerState,
+    active: *server.ActiveSessionState,
     alloc: Allocator,
-    session_id: []const u8,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
 ) !void {
-    const active = &state.active_session.?;
     // Every saved turn, not only those in memory.
     if (active.v2) |v2| {
         const Visitor = struct {
             state: *server.ServerState,
+            session: *server.ActiveSessionState,
             alloc: Allocator,
-            session_id: []const u8,
             sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
 
             pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, self.sources, turn);
+                try sendHistoryTurnAsUpdates(self.state, self.session, self.alloc, self.sources, turn);
             }
         };
-        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = sources };
+        var visitor = Visitor{ .state = state, .session = active, .alloc = alloc, .sources = sources };
         return v2.visitHistory(alloc, &visitor);
     }
     for (active.session_rt.agent.history.items) |turn| {
-        try sendHistoryTurnAsUpdates(state, alloc, session_id, sources, turn);
+        try sendHistoryTurnAsUpdates(state, active, alloc, sources, turn);
     }
 }
 
 fn sendHistoryTurnAsUpdates(
     state: *server.ServerState,
+    session: *server.ActiveSessionState,
     alloc: Allocator,
-    session_id: []const u8,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
     turn: types.HistoryTurn,
 ) !void {
+    const session_id = session.session_id;
     switch (turn) {
         .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
         .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
@@ -1629,11 +1645,11 @@ fn sendHistoryTurnAsUpdates(
 
     switch (turn) {
         .assistant => |assistant| {
-            try sendExecutionHistory(state, alloc, session_id, sources, assistant.execution);
+            try sendExecutionHistory(state, session, alloc, sources, assistant.execution);
             try sendAgentHistoryChunk(state, alloc, session_id, assistant.assistant);
         },
         .interrupted => |i| {
-            try sendExecutionHistory(state, alloc, session_id, sources, i.execution);
+            try sendExecutionHistory(state, session, alloc, sources, i.execution);
             if (i.assistant) |assistant| {
                 if (assistant.len > 0) try sendAgentHistoryChunk(state, alloc, session_id, assistant);
             }
@@ -1727,26 +1743,32 @@ fn sendUserHistoryChunk(
 
 fn sendExecutionHistory(
     state: *server.ServerState,
+    session: *server.ActiveSessionState,
     alloc: Allocator,
-    session_id: []const u8,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
     execution: types.ExecutionMemory,
 ) !void {
     if (execution.isEmpty()) return;
+    const session_id = session.session_id;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(arena_state);
-    const frames = try planExecutionReplay(
-        arena_state.allocator(),
-        tool_call_presentation.activeToolRegistry(state),
-        activeSessionHost(state),
-        if (state.active_session) |*active| &active.tool_identities else null,
-        .{
-            .alloc = alloc,
-            .workspace_root = if (state.active_session) |*active| active.workspace_root else state.workspace_root,
-            .sources = sources,
-        },
-        execution,
-    );
+    const frames = frames: {
+        // The session's turn may record an identity while this reads them.
+        session.tool_identities_mutex.lockUncancelable(io_mod.getIo());
+        defer session.tool_identities_mutex.unlock(io_mod.getIo());
+        break :frames try planExecutionReplay(
+            arena_state.allocator(),
+            tool_call_presentation.activeToolRegistry(state),
+            sessionHost(session),
+            &session.tool_identities,
+            .{
+                .alloc = alloc,
+                .workspace_root = session.workspace_root,
+                .sources = sources,
+            },
+            execution,
+        );
+    };
     for (frames) |frame| {
         switch (frame) {
             .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, text),
@@ -1876,9 +1898,8 @@ fn planToolCallFrame(
     };
 }
 
-fn activeSessionHost(state: *server.ServerState) ?*mcp_host.Host {
+fn sessionHost(session: *const server.ActiveSessionState) ?*mcp_host.Host {
     if (comptime host_target.is_wasm) return null;
-    const session = if (state.active_session) |*active| active else return null;
     return session.mcp_host;
 }
 
@@ -2027,18 +2048,21 @@ fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator) !void {
-    const active = if (state.active_session) |*session| session else return;
-    var metadata = try session_display_metadata.deriveFromHistory(
-        alloc,
-        active.session_rt.agent.history.items,
-    );
-    defer metadata.deinit(alloc);
+/// Sends `session`'s title and time. The title comes from the saved session,
+/// or from the history in memory when `owns_history`: the caller is the
+/// session's own turn, or no turn runs.
+pub fn sendSessionInfoUpdate(state: *server.ServerState, active: *server.ActiveSessionState, alloc: Allocator, owns_history: bool) !void {
     const v2_info: ?session_adapter.Session.Info = if (active.v2) |v2| try v2.info(alloc) else null;
-    if (v2_info) |info| if (info.title) |title| {
-        metadata.deinit(alloc);
-        metadata = .{ .present = true, .title = title };
+    var metadata: session_display_metadata.DisplayMetadata = metadata: {
+        if (v2_info) |info| if (info.title) |title| break :metadata .{ .present = true, .title = title };
+        // The running turn sends the update when it ends.
+        if (!owns_history) return;
+        break :metadata try session_display_metadata.deriveFromHistory(
+            alloc,
+            active.session_rt.agent.history.items,
+        );
     };
+    defer metadata.deinit(alloc);
     const updated_at_ms = if (active.wasm_state) |durable|
         durable.updated_at_ms
     else if (v2_info) |info|
@@ -2059,15 +2083,18 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
-    const active = if (state.active_session) |*session| session else return;
+pub fn sendSessionUsageUpdate(state: *server.ServerState, active: *server.ActiveSessionState, alloc: Allocator) !void {
     const used = active.context_used.load(.acquire);
     if (used == 0) return;
     const provider_bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
-        active.model,
-        provider_bundle.fallbackModelCapabilities(active.model),
-    );
+    const capabilities = capabilities: {
+        server.lockCatalog(state);
+        defer server.unlockCatalog(state);
+        break :capabilities state.capability_resolver.available(
+            active.model,
+            provider_bundle.fallbackModelCapabilities(active.model),
+        );
+    };
     const context_window = capabilities.context_window orelse return;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2201,11 +2228,11 @@ pub const EffortConfigState = struct {
     current: types.ReasoningEffort,
 };
 
-/// Reasoning-effort selector state for the active session, or null when the
-/// active model advertises no effort options (matching the TUI, which hides
+/// Reasoning-effort selector state for a session, or null when its model
+/// advertises no effort options (matching the TUI, which hides
 /// the effort picker for those models).
-pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
-    const active = if (state.active_session) |*session| session else return null;
+/// Call with `catalog_mutex` held.
+pub fn effortConfigState(state: *server.ServerState, active: *const server.ActiveSessionState) ?EffortConfigState {
     const bundle = state.cfg.provider_set.select(active.provider);
     const capabilities = state.capability_resolver.available(
         active.model,
@@ -2217,8 +2244,8 @@ pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
 
 /// Active-session Fast selector state. Like the CLI's speed picker, the option
 /// is exposed only when the active model offers a Fast lane.
-pub fn fastConfigState(state: *server.ServerState) ?bool {
-    const active = if (state.active_session) |*session| session else return null;
+/// Call with `catalog_mutex` held.
+pub fn fastConfigState(state: *server.ServerState, active: *const server.ActiveSessionState) ?bool {
     const bundle = state.cfg.provider_set.select(active.provider);
     const capabilities = state.capability_resolver.available(
         active.model,
@@ -2252,8 +2279,8 @@ test "writeFastConfigOption produces an off/on select with the current value" {
 
 /// Active-session ultrafast selector state. The option is exposed only for a
 /// verified Gateway catalog model with the explicit capability.
-pub fn ultrafastConfigState(state: *server.ServerState) ?bool {
-    const active = if (state.active_session) |*session| session else return null;
+/// Call with `catalog_mutex` held.
+pub fn ultrafastConfigState(state: *server.ServerState, active: *const server.ActiveSessionState) ?bool {
     if (active.provider != .gateway) return null;
     const bundle = state.cfg.provider_set.select(active.provider);
     const capabilities = state.capability_resolver.available(
@@ -2761,10 +2788,24 @@ test "execution replay plan interleaves assistant text and orphan results" {
     try std.testing.expect(frames[2].tool_call.raw_input != null);
 }
 
+/// A session to replay history for in tests that open none.
+fn testReplaySession(state: *server.ServerState, session_id: []const u8) server.ActiveSessionState {
+    var session: server.ActiveSessionState = undefined;
+    session.server = state;
+    session.session_id = @constCast(session_id);
+    session.workspace = &state.launch;
+    session.workspace_root = state.launch.root;
+    session.tool_identities = .{};
+    session.tool_identities_mutex = .init;
+    session.mcp_host = null;
+    return session;
+}
+
 fn sendTestHistoryTurn(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
-    return sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
+    var session = testReplaySession(state, session_id);
+    return sendHistoryTurnAsUpdates(state, &session, alloc, &sources, turn);
 }
 
 test "execution replay titles reads with the call whose saved output they read" {
@@ -2852,14 +2893,15 @@ test "ACP load titles a read with the call from an earlier turn" {
     };
     var read_steps = [_]types.ToolExecutionStep{.{ .tool_calls = read_calls[0..] }};
 
+    var replay_session = testReplaySession(&state, "session-1");
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(arena);
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", &sources, .{ .assistant = .{
+    try sendHistoryTurnAsUpdates(&state, &replay_session, arena, &sources, .{ .assistant = .{
         .user = .{ .text = @constCast("run the tests") },
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = run_steps[0..] },
     } });
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", &sources, .{ .assistant = .{
+    try sendHistoryTurnAsUpdates(&state, &replay_session, arena, &sources, .{ .assistant = .{
         .user = .{ .text = @constCast("find the failure") },
         .assistant = @constCast("found it"),
         .execution = .{ .tool_steps = read_steps[0..] },
@@ -2900,7 +2942,7 @@ test "ACP load maps one-off child denial to invalid params" {
             "child-session",
             error.OneOffSessionNotResumable,
         );
-        try std.testing.expect(state.active_session == null);
+        try std.testing.expect(server.firstSession(&state) == null);
         try capture.sync(io_mod.getIo());
     }
     var captured_file = try tmp.dir.openFile(
@@ -3013,7 +3055,7 @@ fn initAcpSessionTestState(
         .alloc = alloc,
         .cfg = acpSessionTestConfig(),
         .writer = .{ .stdout = capture },
-        .workspace_root = workspace,
+        .launch = .{ .root = workspace },
         .api_key = api_key,
         .credential_source = .ai_gateway_api_key,
         .selected_model = selected_model,
@@ -3099,7 +3141,7 @@ test "ACP ultrafast new load and resume preserve configured baselines" {
                 .params_raw = "{\"mcpServers\":[]}",
             };
             try handleNewSession(&state, arena, &msg);
-            const active = &state.active_session.?;
+            const active = server.firstSession(&state).?;
             try std.testing.expectEqual(process orelse baseline, active.ultrafast_mode);
             const v2 = active.v2.?;
             const preferences = try v2.currentPreferences(arena);
@@ -3110,10 +3152,10 @@ test "ACP ultrafast new load and resume preserve configured baselines" {
             } }, types.ConversationLanguage.default());
             const id = try arena.dupe(u8, active.session_id);
             inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
-                try server.releaseActiveSession(&state);
+                server.closeSession(&state, server.firstSession(&state).?);
                 msg.params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{id});
                 try restore(&state, arena, &msg);
-                const resumed = &state.active_session.?;
+                const resumed = server.firstSession(&state).?;
                 try std.testing.expectEqual(process orelse baseline, resumed.ultrafast_mode);
                 const saved = (try resumed.v2.?.currentPreferences(arena)).ultrafast_mode;
                 try std.testing.expectEqual(baseline, saved);
@@ -3178,8 +3220,8 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         .params_raw = "{\"mcpServers\":[]}",
     };
     try handleNewSession(&state, arena, &new_msg);
-    try std.testing.expect(state.active_session.?.mcp_host == null);
-    const session_id = try alloc.dupe(u8, state.active_session.?.session_id);
+    try std.testing.expect(server.firstSession(&state).?.mcp_host == null);
+    const session_id = try alloc.dupe(u8, server.firstSession(&state).?.session_id);
     defer alloc.free(session_id);
 
     inline for (.{
@@ -3196,7 +3238,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
             .params_raw = params,
         };
         try restore.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp_host == null);
+        try std.testing.expect(server.firstSession(&state).?.mcp_host == null);
     }
 
     const local_request = try arena.print(
@@ -3226,10 +3268,10 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
             .params_raw = params,
         };
         try request.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp_host == null);
+        try std.testing.expect(server.firstSession(&state).?.mcp_host == null);
         try std.testing.expectEqualStrings(
             session_id,
-            state.active_session.?.session_id,
+            server.firstSession(&state).?.session_id,
         );
     }
 
@@ -3293,7 +3335,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         };
         try handleNewSession(&state, arena, &new_msg);
 
-        const new_active = &state.active_session.?;
+        const new_active = server.firstSession(&state).?;
         const new_v2 = new_active.v2.?;
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
@@ -3305,7 +3347,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
             "review",
         );
         try std.testing.expectEqualStrings("review", new_active.mode);
-        try std.testing.expect(state.subagent_host != null);
+        try std.testing.expect(server.firstSession(&state).?.subagent_host != null);
 
         try new_v2.commitTurn(.{ .assistant = .{
             .user = .{ .text = @constCast("remember this") },
@@ -3313,9 +3355,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         } }, .literal("en"));
         const session_id = try alloc.dupe(u8, new_active.session_id);
         defer alloc.free(session_id);
-        try server.releaseActiveSession(&state);
-        try std.testing.expect(state.active_session == null);
-        try std.testing.expect(state.subagent_host == null);
+        server.closeSession(&state, server.firstSession(&state).?);
+        try std.testing.expect(server.firstSession(&state) == null);
 
         var load_params: std.Io.Writer.Allocating = .init(arena);
         defer load_params.deinit();
@@ -3329,14 +3370,14 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         };
         try handleLoadSession(&state, arena, &load_msg);
 
-        const loaded_active = &state.active_session.?;
+        const loaded_active = server.firstSession(&state).?;
         try std.testing.expect(loaded_active.v2 != null);
         try std.testing.expectEqual(@as(usize, 1), loaded_active.session_rt.historyLen());
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
             loaded_active.mode,
         );
-        try std.testing.expect(state.subagent_host != null);
+        try std.testing.expect(server.firstSession(&state).?.subagent_host != null);
 
         try capture.sync(io_mod.getIo());
     }

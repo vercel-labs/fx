@@ -9,7 +9,7 @@ import { runTlc, sha256Text, writeJson } from "./tlc";
 const tla = (value: string) => JSON.stringify(value);
 const bool = (value: boolean) => (value ? "TRUE" : "FALSE");
 
-export function obsModule(observations: Observation[], fixed: boolean): string {
+export function obsModule(observations: Observation[], fixed: boolean, many: boolean): string {
   const record = (o: Observation) =>
     `[op |-> ${tla(o.op)}, arg |-> ${tla(o.arg)}, ok |-> ${bool(o.ok)}, code |-> ${o.code}, dataSid |-> ${bool(o.dataSid)}, result |-> ${tla(o.result)}]`;
   return [
@@ -17,6 +17,7 @@ export function obsModule(observations: Observation[], fixed: boolean): string {
     "(* Generated from one observed fx acp run. *)",
     "EXTENDS Integers",
     `TFixed == ${bool(fixed)}`,
+    `TMany == ${bool(many)}`,
     "TraceLog == <<",
     observations.map((o) => `  ${record(o)}`).join(",\n"),
     ">>",
@@ -28,6 +29,7 @@ export function obsModule(observations: Observation[], fixed: boolean): string {
 const TRACE_CFG = [
   "CONSTANTS",
   "    Fixed <- TFixed",
+  "    Many <- TMany",
   "INIT TraceInit",
   "NEXT TraceNext",
   "INVARIANT NotDone",
@@ -37,11 +39,12 @@ const TRACE_CFG = [
 
 export type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
-/// Checks one run against the model with `Fixed` set to `fixed`.
-export async function validate(observations: Observation[], dir: string, fixed: boolean) {
+/// Checks one run against the model with `Fixed` set to `fixed`, and `Many`
+/// to `many`: fx acp holds many sessions, libfx's minimal kernel one.
+export async function validate(observations: Observation[], dir: string, fixed: boolean, many: boolean) {
   mkdirSync(dir, { recursive: true });
   if (observations.length === 0) return { verdict: "TOOL_ERROR" as Verdict, matched: 0, firstDivergence: null };
-  const obs = obsModule(observations, fixed);
+  const obs = obsModule(observations, fixed, many);
   writeFileSync(join(dir, "AcpSessionTargetObs.tla"), obs);
   writeFileSync(join(dir, "AcpSessionTargetTrace.cfg"), TRACE_CFG);
   const run = await runTlc(dir, "AcpSessionTargetTrace.tla", "AcpSessionTargetTrace.cfg", ["AcpSessionTarget.tla", "AcpSessionTargetTrace.tla"]);
@@ -64,6 +67,7 @@ export async function validate(observations: Observation[], dir: string, fixed: 
     matched,
     length: observations.length,
     fixed,
+    many,
     firstDivergence: verdict === "REJECTED" ? { step: matched + 1, observation: observations[matched] ?? null } : null,
     tlc: { exitCode: run.exitCode, violated: run.violated, finalIndex, depth: run.depth, durationMs: run.durationMs },
     obs_sha256: sha256Text(obs),

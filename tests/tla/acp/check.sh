@@ -9,9 +9,10 @@
 # SDK's _sh.fx/* methods). AcpSystemPrompt: the client's systemPrompt on session/new,
 # session/load and session/resume, and the prompt each turn sends.
 # AcpPromptDelivery: steering and queued prompts as the sh.fx spec
-# defines them, which haven't landed in src/acp/ yet. AcpFollow: following a
-# session on several connections and catching up by log position, likewise
-# not landed. AcpSessionState: session state, session/status, and list
+# defines them. AcpSessions: one connection holding many sessions, each with
+# its own turn and workspace. AcpFollow: following a session on several
+# connections and catching up by log position, which hasn't landed in
+# src/acp/ yet. AcpSessionState: session state, session/status, and list
 # change hints, likewise not landed. AcpSharedSession: what the clients of
 # one session see of each other's prompts, approvals, cancels, and presence,
 # likewise not landed. AcpSubagents: child sessions in the shape of ACP's
@@ -28,6 +29,8 @@
 #   bun ../drivers/acp/speed/driver.ts
 #   bun ../drivers/acp/session_target/check-spec.ts
 #   bun ../drivers/acp/session_target/driver.ts   # kernel plans need the native addon
+#   bun ../drivers/acp/sessions/check-spec.ts
+#   bun ../drivers/acp/sessions/driver.ts
 #   bun ../drivers/acp/system_prompt/check-spec.ts
 #   bun ../drivers/acp/system_prompt/driver.ts
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
@@ -65,6 +68,13 @@ MCAcpSessionTarget MCAcpSessionTarget -
 MCAcpSessionTarget AcpSessionTargetBefore-unknown UnknownSessionAnswer
 MCAcpSessionTarget AcpSessionTargetBefore-close CloseIdempotent
 MCAcpSessionTarget AcpSessionTargetBefore-oversize NeverAuthCode
+MCAcpSessionTarget MCAcpSessionTargetOne -
+MCAcpSessionTarget AcpSessionTargetBefore-many OthersStayOpen
+MCAcpSessions MCAcpSessions -
+MCAcpSessions MCAcpSessionsOverlap AtMostOneRunning
+MCAcpSessions AcpSessionsToday-others OthersUntouched
+MCAcpSessions AcpSessionsToday-reuse ReuseKeepsTurn
+MCAcpSessions AcpSessionsToday-overlap -
 MCAcpSystemPrompt MCAcpSystemPrompt -
 MCAcpSystemPrompt AcpSystemPromptBefore-v1-refused V1Accepted
 MCAcpSystemPrompt AcpSystemPromptBefore-old-accepted OtherShapesRefused
@@ -85,7 +95,6 @@ MCAcpSessionState MCAcpSessionStateLists -
 MCAcpSessionState AcpSessionStateToday-state StateCurrent
 MCAcpSessionState AcpSessionStateToday-order UpdatesWhileRunning
 MCAcpSessionState AcpSessionStateToday-list ListFresh
-MCAcpSessionState AcpSessionStateToday-busy ListAnswered
 MCAcpSessionState AcpSessionStateToday-status StatusTruthful
 MCAcpSharedSession MCAcpSharedSession -
 MCAcpSharedSession MCAcpSharedSessionThree -
