@@ -40,6 +40,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
@@ -1661,7 +1662,8 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
+                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
@@ -1684,7 +1686,8 @@ fn runNonInteractiveWithDeps(
                 };
             }
             if (login_provider == .grok) {
-                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok };
+                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
                     return .handled_failure;
                 };
@@ -1706,7 +1709,8 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login };
+            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
                     return .handled_failure;
@@ -4416,6 +4420,33 @@ const DoctorProbes = struct {
         try doctor_probes.serverStatusChecks(out, alloc, self.mcp_statuses);
         try doctor_probes.serverChildChecks(out, results, alloc, self.processes.items[0..self.server_children], deadline_ms);
         try doctor_probes.ghCheck(out, alloc, self.gh, deadline_ms);
+    }
+};
+
+/// The line `fx logout` writes to a terminal's stderr while it waits for the
+/// provider to revoke the login, so a slow provider does not look like a hang.
+/// Like doctor's wait notice, pipes and unit tests never get it.
+const LogoutWaitLine = struct {
+    deps: RunDeps,
+    text: []const u8,
+
+    const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
+    const codex = std.fmt.comptimePrint("revoking the Codex login at OpenAI (up to {d} s)...\n", .{request_s});
+    const grok = std.fmt.comptimePrint("revoking the Grok login at xAI (up to {d} s)...\n", .{request_s});
+    /// The fx login asks for its issuer's endpoints, then revokes two tokens
+    /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
+    const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
+
+    fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
+        if (builtin.is_test or !stderrIsTerminal()) return null;
+        return .{ .context = self, .run = write };
+    }
+
+    fn write(context: *const anyopaque) void {
+        const self: *const LogoutWaitLine = @ptrCast(@alignCast(context));
+        writeStderr(self.deps, self.text) catch |err| {
+            debug_trace.logf("auth", "logout wait line not written err={s}", .{@errorName(err)});
+        };
     }
 };
 
