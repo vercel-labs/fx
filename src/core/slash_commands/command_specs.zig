@@ -37,6 +37,7 @@ pub const TopLevelKind = enum {
 };
 
 pub const SlashKind = enum {
+    edit,
     quit,
     clear_screen,
     new_session,
@@ -1954,6 +1955,12 @@ test "slash completion exposes interactive resume" {
     try std.testing.expectEqualStrings("/resume", nthSlashCompletion(testSlashRegistry(), "/resume", 0).?);
 }
 
+test "slash completion exposes edit and keeps help as the default" {
+    const registry = testSlashRegistry();
+    try std.testing.expectEqualStrings("/help", nthSlashCompletion(registry, "/", 0).?);
+    try std.testing.expectEqualStrings("/edit", nthSlashCompletion(registry, "/edit", 0).?);
+}
+
 test "top-level slash completion metadata is complete" {
     const registry = testSlashRegistry();
     for (registry.commands) |spec| {
@@ -1975,7 +1982,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 40), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 41), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));

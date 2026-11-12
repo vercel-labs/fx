@@ -9715,6 +9715,8 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
         @as(?anyerror, error.InvalidConversationEvent),
         app.agent().session_persistence.shutdown_failure,
     );
+    // /edit must not label the older disk archive as the full conversation.
+    try std.testing.expectError(error.HistoryUnavailable, @import("app_prompt_edit_runtime.zig").checkArchive(app.agent()));
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Couldn't save this turn") != null);

@@ -723,6 +723,10 @@ pub fn Runtime(comptime App: type) type {
         ) !bool {
             var delivered = false;
             while (!app.should_exit and agents.screenAgentOf(app).session_persistence.pending_live_session_policy == null) {
+                if (comptime @hasField(App, "prompt_edit_request")) if (app.prompt_edit_request) |*request| {
+                    if (app.terminal_input_runtime.discardDeferredSessionInput() > 0) request.suffix_discarded = true;
+                    break;
+                };
                 const item = app.terminal_input_runtime.takeDeferredSessionInput() orelse break;
                 delivered = true;
                 switch (item) {
@@ -752,6 +756,10 @@ pub fn Runtime(comptime App: type) type {
             input_limits: paste_framing.InputLimits,
             max_prompt_history: usize,
         ) !void {
+            if (comptime @hasField(App, "prompt_edit_request")) if (app.prompt_edit_request) |*request| {
+                request.suffix_discarded = true;
+                return;
+            };
             var context = try prepareTerminalDecode(app, agents.screenAgentOf(app)) orelse return;
             var ingress = app.terminal_input_runtime.decodeTerminalByte(
                 byte,
@@ -765,6 +773,10 @@ pub fn Runtime(comptime App: type) type {
                     max_prompt_history,
                 );
                 const replay = replay_byte orelse return;
+                if (comptime @hasField(App, "prompt_edit_request")) if (app.prompt_edit_request) |*request| {
+                    request.suffix_discarded = true;
+                    return;
+                };
                 context = try prepareTerminalDecode(app, agents.screenAgentOf(app)) orelse return;
                 ingress = app.terminal_input_runtime.decodeTerminalByte(replay, context);
             }
@@ -3740,6 +3752,7 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
+    prompt_edit_request: ?struct { suffix_discarded: bool = false } = null,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -12433,6 +12446,8 @@ const FakeSubmitApp = struct {
     prompt_admitted: bool = true,
     queue_admitted: bool = true,
     queue_accept_count: usize = 0,
+    adoption_count: usize = 0,
+    finalization_count: usize = 0,
     /// Every credential admission, blocking or queued.
     preflight_count: usize = 0,
     /// Admissions through `ensurePromptCredential`, which may refresh inline.
@@ -12552,10 +12567,12 @@ const FakeSubmitApp = struct {
     }
 
     pub fn adoptPendingUserPrompt(
-        _: *FakeSubmitApp,
+        self: *FakeSubmitApp,
         _: anytype,
         _: *const input_submit_runtime.PendingPromptDraft,
-    ) !void {}
+    ) !void {
+        self.adoption_count += 1;
+    }
 
     pub fn finalizePendingSubmission(
         self: *FakeSubmitApp,
@@ -12565,6 +12582,7 @@ const FakeSubmitApp = struct {
         if (self.fail_pending_finalization) {
             return error.InjectedPendingFinalizationFailure;
         }
+        self.finalization_count += 1;
         self.agent().worker.freeQueuedImageMetadata();
         self.agent().worker.queued_images = try types.dupeImageAttachmentSlice(
             self.alloc,
@@ -13024,6 +13042,158 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime literal edit submits reset text once through frame adoption and history" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    const submit = input_submit_runtime.SubmitRuntime(FakeSubmitApp);
+    const text = "/reset\nkeep this as prompt text  ";
+    app.agent().worker.hold_available = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/edit original");
+
+    try std.testing.expect(try submit.submitLiteral(&app, app.agent(), text, 100));
+    try std.testing.expectEqualStrings(text, app.agent().submission.pending.?.draft.prompt);
+    try std.testing.expectEqual(input_submit_runtime.PendingPhase.awaiting_frame, app.agent().submission.pending.?.phase);
+    try std.testing.expect(app.agent().worker.held);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.adoption_count);
+    try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    submit.collectPendingSubmissionFacts(&app, app.agent());
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+
+    submit.noteCommittedFrame(&app, app.agent());
+    try std.testing.expectEqual(input_submit_runtime.PendingPhase.adopted, app.agent().submission.pending.?.phase);
+    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+    submit.collectPendingSubmissionFacts(&app, app.agent());
+    const turn_id = app.agent().submission.pending.?.draft.turn_id;
+    try std.testing.expectEqual(input_submit_runtime.PendingPhase.queued, app.agent().submission.pending.?.phase);
+    try std.testing.expectEqual(@as(?u64, turn_id), app.agent().worker.queued_turn_id);
+    submit.noteCommittedFrame(&app, app.agent());
+    submit.collectPendingSubmissionFacts(&app, app.agent());
+    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 0), app.command_count);
+    try std.testing.expect(app.last_command == null);
+    try std.testing.expect(!app.agent().worker.held);
+    try submit.acceptPresentedPrompt(&app, app.agent(), turn_id);
+    try std.testing.expect(app.agent().submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(text, app.input_runtime.composer_history.entryText(0).?);
+}
+
+test "app_input_runtime literal edit rejection retains edited reset draft without slash routing" {
+    for ([_]bool{ false, true }) |credential_admitted| {
+        var app = FakeSubmitApp{
+            .alloc = std.testing.allocator,
+            .prompt_admitted = credential_admitted,
+            .queue_admitted = false,
+        };
+        defer app.deinit();
+        const text = "/reset edited draft";
+        try app.input_runtime.textReplacementState().replace(app.alloc, "/edit original");
+        try std.testing.expect(!try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitLiteral(&app, app.agent(), text, 100));
+        try std.testing.expectEqualStrings(text, app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(text.len, app.input_runtime.edit_state.cursor);
+        try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+        try std.testing.expectEqual(@as(usize, 0), app.blocking_preflight_count);
+        try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+        try std.testing.expectEqual(@as(usize, 0), app.command_count);
+        try std.testing.expect(app.last_command == null and app.last_prompt == null);
+        try std.testing.expect(app.agent().submission.pending == null);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    }
+}
+
+test "app_input_runtime literal edit preparation allocation failure preserves invocation and registered paste history" {
+    const base = testing_allocator.no_resize;
+    var app = FakeSubmitApp{ .alloc = base };
+    defer app.deinit();
+    try primeComposerHistoryForTest(FakeSubmitApp, &app, "unsent draft");
+    const invocation = "/edit [Pasted text #7, 1 line]";
+    try app.input_runtime.textReplacementState().replace(base, "");
+    try app.input_runtime.insertionState().insertSlice(base, invocation, .preserve);
+    try app.input_runtime.entities.pasted_blocks.append(base, .{
+        .id = 7,
+        .text = try base.dupe(u8, "original pasted backing"),
+        .line_count = 1,
+        .span = .{ .raw_start = "/edit ".len, .raw_end = invocation.len },
+    });
+    app.input_runtime.edit_state.cursor = 3;
+    app.input_runtime.edit_state.selection_anchor = 1;
+    const input_ptr = app.input_runtime.edit_state.input.items.ptr;
+    const backing_ptr = app.input_runtime.entities.pasted_blocks.items[0].text.ptr;
+    var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = base;
+    try std.testing.expectError(error.OutOfMemory, input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitLiteral(&app, app.agent(), "/reset edited", 100));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(input_ptr, app.input_runtime.edit_state.input.items.ptr);
+    try std.testing.expectEqualStrings(invocation, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 3), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(?usize, 1), app.input_runtime.edit_state.selection_anchor);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.pasted_blocks.items.len);
+    const block = app.input_runtime.entities.pasted_blocks.items[0];
+    try std.testing.expectEqual(backing_ptr, block.text.ptr);
+    try std.testing.expectEqualStrings("original pasted backing", block.text);
+    try std.testing.expectEqual(@as(usize, 7), block.id);
+    try std.testing.expectEqual(@as(usize, "/edit ".len), block.span.raw_start);
+    try std.testing.expectEqual(invocation.len, block.span.raw_end);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.edit_history.undo_stack.items.len);
+    try std.testing.expectEqualStrings(invocation, app.input_runtime.edit_history.undo_stack.items[0].inserted.items);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings("history entry", app.input_runtime.composer_history.entryText(0).?);
+    try std.testing.expectEqual(@as(?usize, 0), app.input_runtime.composer_history.activeIndex());
+    try std.testing.expectEqualStrings("unsent draft", app.input_runtime.composer_history.draftText().?);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.command_count);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+}
+
+test "app_input_runtime literal edit late enqueue error retains edited draft" {
+    var app = FakeSubmitApp{ .alloc = std.testing.allocator, .fail_enqueue_after_snapshot = true };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(app.alloc, "/edit original");
+    const text = "/reset edited draft";
+    try std.testing.expectError(error.InjectedEnqueueFailure, input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitLiteral(&app, app.agent(), text, 100));
+    try std.testing.expectEqualStrings(text, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(text.len, app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 0), app.command_count);
+    try std.testing.expect(app.last_command == null and app.last_prompt == null);
+    try std.testing.expect(app.agent().submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+}
+
+test "app_input_runtime editor suffix discards deferred submit and command without replay" {
+    var app = try RoutingFakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(app.alloc, "/edit original");
+    app.prompt_edit_request = .{};
+    for ("\r/reset\r") |byte| try std.testing.expect(try app.terminal_input_runtime.deferSessionInputByte(app.alloc, byte, 4096));
+    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(app.alloc);
+    try std.testing.expect(!try Runtime(RoutingFakeApp).flushDeferredSessionInput(&app, paste_framing.InputLimits.single(4096), 100));
+    try std.testing.expect(app.prompt_edit_request.?.suffix_discarded);
+    try std.testing.expect(!app.terminal_input_runtime.hasDeferredSessionInput());
+    try std.testing.expectEqualStrings("/edit original", app.input_runtime.edit_state.input.items);
+    app.prompt_edit_request.?.suffix_discarded = false;
+    try Runtime(RoutingFakeApp).handleTerminalByte(&app, '\r', 4096, 100);
+    try std.testing.expect(app.prompt_edit_request.?.suffix_discarded);
+    app.prompt_edit_request = null;
+    try app.input_runtime.textReplacementState().replace(app.alloc, "edited draft");
+    try std.testing.expect(!try Runtime(RoutingFakeApp).flushDeferredSessionInput(&app, paste_framing.InputLimits.single(4096), 100));
+    try std.testing.expectEqualStrings("edited draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.last_command == null);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
 test "app_input_runtime idle submit commits its frame before credential preflight" {

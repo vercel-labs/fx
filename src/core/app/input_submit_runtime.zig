@@ -619,6 +619,56 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            try submitImpl(app, max_prompt_history, false);
+        }
+
+        /// Same admission/history/presentation pipeline, with both slash routes
+        /// disabled. On rejection or error, the caller's composer stays owned.
+        pub fn submitLiteral(app: *App, owner: *AppAgent, text: []const u8, max_prompt_history: usize) !bool {
+            if (owner != agents.screenAgentOf(app)) return false;
+            var replacement = try app.input_runtime.textReplacementState().prepare(app.alloc, text);
+            defer replacement.deinit(app.alloc);
+            app.input_runtime.textReplacementState().commit(app.alloc, &replacement);
+            try submitImpl(app, max_prompt_history, true);
+            return app.input_runtime.edit_state.input.items.len == 0;
+        }
+
+        fn submitImpl(app: *App, max_prompt_history: usize, comptime literal: bool) !void {
+            const expanded_len = paste_blocks.expandedLen(
+                app.input_runtime.edit_state.input.items,
+                app.input_runtime.entities.pasted_blocks.items,
+            ) orelse std.math.maxInt(usize);
+            const max_input_len = if (comptime @hasDecl(App, "input_limits"))
+                App.input_limits.composer_bytes
+            else if (comptime @hasDecl(App, "input_byte_limit"))
+                App.input_byte_limit
+            else
+                std.math.maxInt(usize);
+            if (expanded_len > max_input_len) {
+                try input_limit_feedback.report(
+                    App,
+                    app,
+                    .composer,
+                    expanded_len,
+                );
+                return;
+            }
+            const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
+            defer if (expanded.owned) app.alloc.free(expanded.text);
+            // Before pending-admission checks and destructive slash cleanup,
+            // including the image-prefix route. Semantic entities are refused
+            // by the coordinator without changing the live draft.
+            if (comptime !literal and @hasDecl(App, "requestPromptEdit")) {
+                const left = std.mem.trimStart(u8, expanded.text, " \t\r\n");
+                var command_text = resolvedSlashSubmission(app, agents.screenAgentOf(app), left);
+                if (pendingImagesPrefixEnd(app.input_runtime.edit_state.input.items, expanded.text, app.input_runtime.entities.pasted_blocks.items, app.input_runtime.entities.image_tokens.items, agents.screenAgentOf(app).pending_images.items)) |start| command_text = expanded.text[start..];
+                if (knownSlashCommand(app, command_text)) |command| if (command.kind == .edit) {
+                    const end = std.mem.findAny(u8, command_text, " \t\r\n") orelse command_text.len;
+                    const seed = if (end == command_text.len) "" else command_text[end + 1 ..];
+                    try app.requestPromptEdit(seed);
+                    return;
+                };
+            }
             if (comptime agents.hasAgentField(App, "worker")) {
                 if (comptime @hasDecl(@TypeOf(agents.screenAgentOf(app).worker), "compactionActivitySnapshot")) {
                     const observed = agents.screenAgentOf(app).worker.compactionActivitySnapshot();
@@ -675,62 +725,41 @@ pub fn SubmitRuntime(comptime App: type) type {
                     }
                 }
             }
-            const expanded_len = paste_blocks.expandedLen(
-                app.input_runtime.edit_state.input.items,
-                app.input_runtime.entities.pasted_blocks.items,
-            ) orelse std.math.maxInt(usize);
-            const max_input_len = if (comptime @hasDecl(App, "input_limits"))
-                App.input_limits.composer_bytes
-            else if (comptime @hasDecl(App, "input_byte_limit"))
-                App.input_byte_limit
-            else
-                std.math.maxInt(usize);
-            if (expanded_len > max_input_len) {
-                try input_limit_feedback.report(
-                    App,
-                    app,
-                    .composer,
-                    expanded_len,
-                );
-                return;
-            }
 
-            const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
-            defer if (expanded.owned) app.alloc.free(expanded.text);
-
-            const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
-            const resolved_slash_submission = resolvedSlashSubmission(app, agents.screenAgentOf(app), left_trimmed);
-            if (knownSlashCommand(app, resolved_slash_submission)) |command| {
-                if (try refuseSessionCommandOnSubagentScreen(app, command)) return;
-                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightQueuedPrompt(app, agents.screenAgentOf(app))) return;
-                try submitSlashCommand(app, agents.screenAgentOf(app), left_trimmed, null, max_prompt_history);
-                return;
-            }
-            if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
-                try submitSlashCommand(app, agents.screenAgentOf(app), left_trimmed, null, max_prompt_history);
-                return;
-            }
-            if (pendingImagesPrefixEnd(
-                app.input_runtime.edit_state.input.items,
-                expanded.text,
-                app.input_runtime.entities.pasted_blocks.items,
-                app.input_runtime.entities.image_tokens.items,
-                agents.screenAgentOf(app).pending_images.items,
-            )) |command_start| {
-                const command_text = expanded.text[command_start..];
-                if (knownSlashCommand(app, command_text)) |command| {
-                    if (requiresPromptCredential(command, command_text) and !try preflightQueuedPrompt(app, agents.screenAgentOf(app))) return;
-                    try submitSlashCommand(
-                        app,
-                        agents.screenAgentOf(app),
-                        command_text,
-                        expanded.text[0..command_start],
-                        max_prompt_history,
-                    );
+            if (!literal) {
+                const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
+                const resolved_slash_submission = resolvedSlashSubmission(app, agents.screenAgentOf(app), left_trimmed);
+                if (knownSlashCommand(app, resolved_slash_submission)) |command| {
+                    if (try refuseSessionCommandOnSubagentScreen(app, command)) return;
+                    if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightQueuedPrompt(app, agents.screenAgentOf(app))) return;
+                    try submitSlashCommand(app, agents.screenAgentOf(app), left_trimmed, null, max_prompt_history);
                     return;
                 }
+                if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
+                    try submitSlashCommand(app, agents.screenAgentOf(app), left_trimmed, null, max_prompt_history);
+                    return;
+                }
+                if (pendingImagesPrefixEnd(
+                    app.input_runtime.edit_state.input.items,
+                    expanded.text,
+                    app.input_runtime.entities.pasted_blocks.items,
+                    app.input_runtime.entities.image_tokens.items,
+                    agents.screenAgentOf(app).pending_images.items,
+                )) |command_start| {
+                    const command_text = expanded.text[command_start..];
+                    if (knownSlashCommand(app, command_text)) |command| {
+                        if (requiresPromptCredential(command, command_text) and !try preflightQueuedPrompt(app, agents.screenAgentOf(app))) return;
+                        try submitSlashCommand(
+                            app,
+                            agents.screenAgentOf(app),
+                            command_text,
+                            expanded.text[0..command_start],
+                            max_prompt_history,
+                        );
+                        return;
+                    }
+                }
             }
-
             const trimmed = std.mem.trim(u8, expanded.text, " \t\r\n");
 
             // Nothing to send: no turn is readied for it.

@@ -377,6 +377,7 @@
     "COLUMNS",
     "COMSPEC",
     "DISPLAY",
+    "EDITOR",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_SYSTEM",
@@ -397,6 +398,7 @@
     "TYPESAFE_BASE_URL",
     "USER",
     "USERPROFILE",
+    "VISUAL",
     "WAYLAND_DISPLAY",
     "XDG_CONFIG_HOME",
     "ZDOTDIR"

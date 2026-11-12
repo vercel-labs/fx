@@ -116,6 +116,13 @@ await command("/login", "Vercel sign-in failed. The current credential is unchan
 await command("/resume", "Session resume is owned by the embedding SDK");
 await command("/mcp list", "MCP servers are unavailable in this host");
 await command("/skills list", "Skills are unavailable in this host");
+const beforeEdit = requests.length;
+await command("/edit retained draft", "The external editor is unavailable on this host.");
+runtime.write("\x1b[97;9u\x1b[99;9u");
+await waitFor(() => clipboardWrites.length === 3, "unavailable edit preserves draft");
+assert.equal(clipboardWrites[2], "/edit retained draft");
+assert.equal(requests.length, beforeEdit, "unavailable edit must not send a prompt");
+runtime.write("\x15");
 
 runtime.write("/model\r");
 await waitFor(() => grid().includes("feature-model") && grid().includes("other-model"), "model catalog menu");

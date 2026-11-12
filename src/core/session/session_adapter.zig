@@ -2900,12 +2900,28 @@ pub const Session = struct {
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
     }
 
+    /// Visits the complete archive. Returns `HistoryDamaged` on replay
+    /// damage, or `HistoryUnavailable` for unknown or unfinished pieces or
+    /// when a compaction names original turns absent from the archive.
+    /// Borrowed turns expire when `visitor.append` returns, as with `visitHistory`.
+    pub fn visitHistoryChecked(self: *Session, alloc: Allocator, visitor: anytype) !void {
+        var sink: VisitorSink(@TypeOf(visitor), .checked) = .{ .alloc = alloc, .visitor = visitor };
+        var damaged = false;
+        var replay_sink = ReplaySink.init(&sink);
+        replay_sink.damaged = &damaged;
+        replay_sink.require_complete = true;
+        try replay(self.source(), alloc, alloc, .start, null, replay_sink);
+        if (damaged) return error.HistoryDamaged;
+    }
+
     /// What a `visitHistory` reader does at a compaction summary. The
     /// transcript shows turns only, as v1's does, so a summary is never handed
     /// to the visitor.
     const AtSummary = enum {
         /// Replay on past it.
         skip,
+        /// Refuse a summary whose original turns are absent from the archive.
+        checked,
         /// End the replay with `error.CycleEnd`: one cycle has been read.
         end_cycle,
     };
@@ -2924,9 +2940,14 @@ pub const Session = struct {
                 try sink.visitor.append(value);
             }
 
-            fn summary(_: *@This(), _: []const u8) !void {
+            fn summary(sink: *@This(), data: []const u8) !void {
                 switch (at_summary) {
                     .skip => {},
+                    .checked => {
+                        const parsed = try json_decode.parseFromSlice(CompactedData, sink.alloc, data, .{});
+                        defer parsed.deinit();
+                        if (parsed.value.removed_turn_count > sink.turns) return error.HistoryUnavailable;
+                    },
                     .end_cycle => return error.CycleEnd,
                 }
             }
@@ -4957,6 +4978,8 @@ const ReplaySink = struct {
     /// Set when reading stopped at a damaged line, so the turns after it
     /// are missing. Null when the caller does not need to know.
     damaged: ?*bool = null,
+    /// Only the complete export refuses unfinished or unknown saved pieces.
+    require_complete: bool = false,
 
     fn init(sink: anytype) ReplaySink {
         const SinkPtr = @TypeOf(sink);
@@ -5056,6 +5079,7 @@ noinline fn replay(
                     // A mark for `reportLines`, not part of the conversation.
                     if (std.mem.eql(u8, piece.type, child_report_type)) continue;
                     const kind = pieceKind(piece.type) orelse {
+                        if (sink.require_complete) return error.HistoryUnavailable;
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
                     };
@@ -5142,7 +5166,10 @@ noinline fn replay(
         }
         from = .{ .at = page.next orelse break };
     }
-    if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
+    if (!builder.isIdle()) {
+        if (sink.require_complete) return error.HistoryUnavailable;
+        debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
+    }
 }
 
 /// `turn` with each stored result shown as v1 showed it: one the model saw
@@ -7026,6 +7053,8 @@ test "a damaged line in a compaction cycle shows that cycle's turns before it an
         }
     };
     var visitor: Visitor = .{};
+    try testing.expectError(error.HistoryDamaged, s.visitHistoryChecked(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{ "zero", "one-a" });
     // Forward, cycle 1 shows its turn before the damage and says the read
     // stopped there; the other cycles read whole.
     try testing.expect(try s.visitHistoryCycle(testing.allocator, opens_one, &visitor));
@@ -7158,6 +7187,23 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     try visitor.expectPrompts(&.{ "split", "after" });
 }
 
+test "the checked history visit refuses compaction without original turns" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.commitTurn(assistantTurn("remaining", "answer"), types.ConversationLanguage.default());
+    try s.commitCompaction(.{ .summary = @constCast("original turns unavailable"), .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    const Visitor = struct {
+        pub fn append(_: *@This(), _: types.HistoryTurn) !void {}
+    };
+    var visitor: Visitor = .{};
+    try s.visitHistory(testing.allocator, &visitor);
+    try testing.expectError(error.HistoryUnavailable, s.visitHistoryChecked(testing.allocator, &visitor));
+}
+
 test "the history visit shows every turn, even those a compaction summarized" {
     var t: TestHome = undefined;
     try t.init();
@@ -7192,6 +7238,11 @@ test "the history visit shows every turn, even those a compaction summarized" {
     try s.visitHistory(testing.allocator, &visitor);
     try testing.expectEqual(@as(usize, 3), visitor.prompts.items.len);
     for (visitor.prompts.items, [_][]const u8{ "one", "two", "three" }) |got, want| try testing.expectEqualStrings(want, got);
+    var checked: Visitor = .{};
+    defer checked.deinit();
+    try s.visitHistoryChecked(testing.allocator, &checked);
+    try testing.expectEqual(@as(usize, 3), checked.prompts.items.len);
+    for (checked.prompts.items, [_][]const u8{ "one", "two", "three" }) |got, want| try testing.expectEqualStrings(want, got);
     // The visit leaves what resume and compaction rely on unchanged.
     try testing.expectEqualSlices(?u64, numbers, s.turn_numbers.items);
 
@@ -7200,6 +7251,11 @@ test "the history visit shows every turn, even those a compaction summarized" {
     defer failing.deinit();
     try testing.expectError(error.ConsumerFailed, s.visitHistory(testing.allocator, &failing));
     try testing.expectEqual(@as(usize, 1), failing.prompts.items.len);
+
+    var checked_failing: Visitor = .{ .fail_at = 1 };
+    defer checked_failing.deinit();
+    try testing.expectError(error.ConsumerFailed, s.visitHistoryChecked(testing.allocator, &checked_failing));
+    try testing.expectEqual(@as(usize, 1), checked_failing.prompts.items.len);
 
     // A visitor may call back into the session, as the app does to read a
     // command replay's side file while it draws a turn.
@@ -11217,4 +11273,41 @@ test "only the adapter imports the session manager" {
         checked += 1;
     }
     try testing.expect(checked > 100);
+}
+
+test "the checked history visit refuses unfinished saved pieces" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.appendProgress(.{ .text = @constCast("unfinished user") }, .{}, .{});
+    const Visitor = struct {
+        pub fn append(_: *@This(), _: types.HistoryTurn) !void {}
+    };
+    var visitor: Visitor = .{};
+    try s.visitHistory(testing.allocator, &visitor);
+    try testing.expectError(error.HistoryUnavailable, s.visitHistoryChecked(testing.allocator, &visitor));
+}
+
+test "the checked history visit refuses unknown saved pieces without changing ordinary replay" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.commitTurn(assistantTurn("opening", "answer"), types.ConversationLanguage.default());
+    _ = try s.handle.append(&.{ .turn_started, .{ .item = .{ .type = "future_conversation_piece", .data = "{}" } }, .{ .turn_interrupted = .cancel } });
+    const Visitor = struct {
+        count: usize = 0,
+        pub fn append(self: *@This(), _: types.HistoryTurn) !void {
+            self.count += 1;
+        }
+    };
+    var visitor: Visitor = .{};
+    try s.visitHistory(testing.allocator, &visitor);
+    try testing.expectEqual(@as(usize, 1), visitor.count);
+    try testing.expectError(error.HistoryUnavailable, s.visitHistoryChecked(testing.allocator, &visitor));
 }
