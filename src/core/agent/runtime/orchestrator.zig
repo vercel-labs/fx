@@ -2572,6 +2572,7 @@ fn toolboxRunSubject(
     if (!std.mem.eql(u8, call.name, toolbox.tool_name) or call.argument_integrity != .valid) return null;
     const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return null;
     if (std.mem.eql(u8, run.name, toolbox.tool_name)) return null;
+    if (run.arguments_from_text) debug_trace.logf("toolbox", "run arguments read from JSON text call={s} tool={s}", .{ call.id, run.name });
     var subject = call;
     subject.name = run.name;
     subject.arguments_json = run.arguments_json;
