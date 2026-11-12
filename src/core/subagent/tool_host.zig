@@ -3554,8 +3554,9 @@ const gap_wait_limit: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5),
 /// returns what `wait` said, which the caller frees. By then `wait` has seen
 /// the child working and is about to block, so only the end can wake it
 /// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns). Fails with
-/// `error.WaitStillBlocked` when `wait` has not returned within
-/// `gap_wait_limit` of the end; it is then cancelled so the test can finish.
+/// `error.WaitBlockedAfterEndSettledWithNothingToWakeIt` when `wait` has not
+/// returned within `gap_wait_limit` of the end; it is then cancelled so the
+/// test can finish.
 fn waitInSettleGap(runtime: *Runtime, worker: *worker_runtime.WorkerRuntime, trace: *const GapTrace) ![]u8 {
     defer SettleGap.go.set(io_mod.getIo());
     SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
@@ -3569,10 +3570,9 @@ fn waitInSettleGap(runtime: *Runtime, worker: *worker_runtime.WorkerRuntime, tra
     };
     SettleGap.go.set(io_mod.getIo());
     gap.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
-        std.debug.print("wait blocked for 5 s after the end settled: nothing working, nothing queued, nothing to wake it\n", .{});
         worker.requestCancel();
         thread.join();
-        return error.WaitStillBlocked;
+        return error.WaitBlockedAfterEndSettledWithNothingToWakeIt;
     };
     thread.join();
     return gap.body orelse error.WaitFailed;
