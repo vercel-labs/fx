@@ -910,7 +910,9 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
 
     // The interactive app says what to do.
     const resumed = await startApp(fixture, gateway, ["--resume", id], false);
-    expect(await resumed.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    // The pane's wrapper records fx's exit status as fx exits; tmux can end
+    // the session many seconds later.
+    await until(() => resumed.session.recordedExitStatus() !== null, "the app to exit");
     await resumed.session.kill();
     expect(readFileSync(resumed.stderrPath, "utf8")).toBe(
       "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n",

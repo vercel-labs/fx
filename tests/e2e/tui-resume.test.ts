@@ -4758,12 +4758,14 @@ test.skipIf(!tmuxAvailable())(
       });
       await contender.sendLiteralText("/");
       await contender.sendLiteralText("/");
+      // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+      // the pane dead many seconds later.
       await waitForCondition(
-        () => contender?.paneStatus().dead === true,
+        () => contender!.recordedExitStatus() !== null,
         "contended resume to exit",
       );
 
-      expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
+      expect(contender.recordedExitStatus()).toBe(1);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
         "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
@@ -8660,13 +8662,18 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     expect(tui.paneStatus().status).toBe(0);
     await tui.kill();
   }
+  // fx's exit status once it exits by itself. The pane's wrapper records it as
+  // fx exits; tmux can mark the pane dead many seconds later.
+  async function exitStatus(tui: TmuxSession, timeout = TIMEOUT) {
+    await tui.waitForPane(() => tui.recordedExitStatus() !== null, timeout);
+    return tui.recordedExitStatus();
+  }
   try {
     const a = await runFx(["ask", "--json", "Remember conversation A."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(a.code).toBe(0);
     const aId = JSON.parse(a.stdout).session_id;
     active = await open(["-c"], "missing");
-    await active.waitForPane(() => active!.paneStatus().dead, TIMEOUT);
-    expect(active.paneStatus().status).toBe(1);
+    expect(await exitStatus(active)).toBe(1);
     expect(readFileSync(join(root, "missing.stderr"), "utf8")).toContain("no remembered session");
     await active.kill(); active = null;
     active = await open(["--resume", aId], "select-a");
@@ -8700,8 +8707,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     expect(trace).not.toContain("mode=workspace_writable_last");
     expect(trace).not.toContain("session picker catalog loaded");
     other = await open(["--continue"], "busy");
-    await other.waitForPane(() => other!.paneStatus().dead, TIMEOUT);
-    expect(other.paneStatus().status).toBe(1);
+    expect(await exitStatus(other)).toBe(1);
     expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another fx process");
     await other.kill(); other = null;
     await active.sendText("/resume");
@@ -8728,8 +8734,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     const fifo = Bun.spawnSync(["mkfifo", bookmark]);
     expect(fifo.exitCode).toBe(0);
     active = await open(["-c"], "invalid-bookmark", unread);
-    await active.waitForPane(() => active!.paneStatus().dead, 3000);
-    expect(active.paneStatus().status).toBe(1);
+    expect(await exitStatus(active, 3000)).toBe(1);
     expect(readFileSync(join(root, "invalid-bookmark.stderr"), "utf8")).toContain("remembered session ID could not be read");
     await active.kill(); active = null;
     passed = true;
