@@ -30,6 +30,17 @@ import {
   writeFxLogin as writeSharedFxLogin,
 } from "./fx-login-fakes";
 import { logLines, savedSessionIds } from "./saved-sessions";
+import {
+  authPath,
+  barrier,
+  savedGeneration,
+  seededRandom,
+  sharedAskAnswer,
+  sharedRefresh,
+  spawnSharedAsk,
+  startSharedLoginWorld,
+  type SharedLoginWorld,
+} from "./shared-login-fakes";
 
 const TIMEOUT = 30_000;
 const EXPIRED_REFRESH_TOKEN = "expired-refresh-token";
@@ -1122,4 +1133,325 @@ test(
     }
   },
   TIMEOUT,
+);
+
+// fx processes that share one saved fx login (tests/e2e/shared-login-fakes.ts).
+// The fake issuer rotates the refresh token on every refresh and the gateway
+// then takes only the newest access token, so one process's refresh leaves
+// the others holding a token the gateway rejects. A 401 rotates the login
+// only when the saved token is the one the gateway rejected, or is past its
+// refresh deadline; otherwise fx retries with the login another process
+// saved (`tests/tla/auth/SharedLoginRefresh.tla` NoRedundantRotation).
+
+const SHARED_TIMEOUT = 60_000;
+
+type SharedHold = (label: string, attempt: number) => Promise<void> | void;
+
+async function inSharedLogin(
+  name: string,
+  issuer: Parameters<typeof startSharedLoginWorld>[0]["issuer"],
+  run: (world: SharedLoginWorld, hooks: { hold?: SharedHold }) => Promise<void>,
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), `fx-shared-login-${name}-`));
+  const hooks: { hold?: SharedHold } = {};
+  const world = startSharedLoginWorld({ home, issuer, hold: (label, attempt) => hooks.hold?.(label, attempt) });
+  try {
+    await run(world, hooks);
+  } finally {
+    world.stop();
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function described(result: { code: number | null; stdout: string; stderr: string }): string {
+  return `exit ${result.code}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
+}
+
+/** The token generations each process sent, or that the gateway accepted. */
+function tokensBy(world: SharedLoginWorld, kind: "send" | "accepted"): Record<string, number[]> {
+  const by: Record<string, number[]> = {};
+  for (const e of world.events) {
+    if (kind === "send" && e.event === "send") (by[e.data.p] ??= []).push(e.data.tok);
+    if (kind === "accepted" && e.event === "answer" && e.data.ok) (by[e.data.p] ??= []).push(e.data.tok);
+  }
+  return by;
+}
+
+async function waitUntil(what: string, condition: () => boolean, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(10);
+  }
+}
+
+/**
+ * `count` processes holding generation 0, which the gateway no longer takes,
+ * all get their 401 at once. Each must exit 0 on generation 1, the one
+ * refresh between them.
+ */
+async function expectOneSharedRefresh(
+  name: string,
+  count: number,
+  opts: { issuerDelayMs?: () => number; answerDelayMs?: () => number } = {},
+): Promise<void> {
+  const allSent = barrier(count);
+  await inSharedLogin(
+    name,
+    { beforeAnswer: async () => { if (opts.issuerDelayMs) await Bun.sleep(opts.issuerDelayMs()); } },
+    async (world, hooks) => {
+      hooks.hold = async (_label, attempt) => {
+        if (attempt !== 0) return;
+        await allSent();
+        if (opts.answerDelayMs) await Bun.sleep(opts.answerDelayMs());
+      };
+      world.revoke(0);
+      const labels = Array.from({ length: count }, (_, i) => `p${i + 1}`);
+      const asks = labels.map((label) => spawnSharedAsk(world, label));
+      const results = await Promise.all(asks.map((ask) => ask.done));
+      for (const [i, result] of results.entries()) {
+        expect(result.code, described(result)).toBe(0);
+        expect(JSON.parse(result.stdout).output).toContain(sharedAskAnswer(labels[i]!));
+      }
+      expect(world.tokenRequests).toEqual([sharedRefresh(0)]);
+      expect(tokensBy(world, "accepted")).toEqual(Object.fromEntries(labels.map((label) => [label, [1]])));
+      expect(savedGeneration(world.home)).toBe(1);
+    },
+  );
+}
+
+test(
+  "two fx processes that get a 401 together share one refresh of their login",
+  () => expectOneSharedRefresh("together", 2),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "an fx whose token another fx replaced uses the login another fx saved after a 401",
+  () =>
+    inSharedLogin("replaced", {}, async (world, hooks) => {
+      hooks.hold = (_label, attempt) => {
+        if (attempt === 0) world.replaceOutside();
+      };
+      const result = await spawnSharedAsk(world, "p1").done;
+      expect(result.code, described(result)).toBe(0);
+      expect(world.tokenRequests).toEqual([]);
+      expect(tokensBy(world, "send")).toEqual({ p1: [0, 1] });
+      expect(tokensBy(world, "accepted")).toEqual({ p1: [1] });
+      expect(savedGeneration(world.home)).toBe(1);
+    }),
+  SHARED_TIMEOUT,
+);
+
+// The saved login's refresh deadline is a minute before expires_at_ms
+// (src/core/auth/oauth_session.zig expiry_skew_ms). These two put it half a
+// minute to either side of now instead of waiting for it.
+test(
+  "a 401 rotates a login another fx saved once it is past its refresh deadline",
+  () =>
+    inSharedLogin("past-deadline", {}, async (world, hooks) => {
+      hooks.hold = (_label, attempt) => {
+        if (attempt === 0) world.replaceOutside(Date.now() + 30_000);
+      };
+      const result = await spawnSharedAsk(world, "p1").done;
+      expect(result.code, described(result)).toBe(0);
+      expect(world.tokenRequests).toEqual([sharedRefresh(1)]);
+      expect(tokensBy(world, "accepted")).toEqual({ p1: [2] });
+      expect(savedGeneration(world.home)).toBe(2);
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "a 401 uses a login another fx saved just before its refresh deadline",
+  () =>
+    inSharedLogin("before-deadline", {}, async (world, hooks) => {
+      hooks.hold = (_label, attempt) => {
+        if (attempt === 0) world.replaceOutside(Date.now() + 90_000);
+      };
+      const result = await spawnSharedAsk(world, "p1").done;
+      expect(result.code, described(result)).toBe(0);
+      expect(world.tokenRequests).toEqual([]);
+      expect(tokensBy(world, "accepted")).toEqual({ p1: [1] });
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "a saved login the gateway rejects too ends the ask without another refresh or retry",
+  () =>
+    inSharedLogin("both-rejected", {}, async (world, hooks) => {
+      hooks.hold = (_label, attempt) => {
+        if (attempt !== 0) return;
+        world.replaceOutside();
+        world.revoke(1);
+      };
+      const result = await spawnSharedAsk(world, "p1").done;
+      expect(result.code, described(result)).not.toBe(0);
+      expect(world.tokenRequests).toEqual([]);
+      expect(tokensBy(world, "send")).toEqual({ p1: [0, 1] });
+      expect(tokensBy(world, "accepted")).toEqual({});
+      expect(savedGeneration(world.home)).toBe(1);
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "a 401 after the saved login was signed out refreshes nothing and asks to sign in",
+  () =>
+    inSharedLogin("signed-out", {}, async (world, hooks) => {
+      hooks.hold = (_label, attempt) => {
+        if (attempt !== 0) return;
+        // Signing out elsewhere deletes the saved login and its tokens stop working.
+        world.removeSaved();
+        world.revoke(0);
+      };
+      const result = await spawnSharedAsk(world, "p1").done;
+      expect(result.code, described(result)).not.toBe(0);
+      expect(world.tokenRequests).toEqual([]);
+      expect(tokensBy(world, "send")).toEqual({ p1: [0] });
+      expect(existsSync(authPath(world.home))).toBe(false);
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "a refused refresh of the rejected login retires it",
+  () =>
+    inSharedLogin("refused", { refuseAll: true }, async (world) => {
+      world.revoke(0);
+      const result = await spawnSharedAsk(world, "p1").done;
+      expect(result.code, described(result)).not.toBe(0);
+      expect(world.tokenRequests).toEqual([sharedRefresh(0)]);
+      expect(existsSync(authPath(world.home))).toBe(false);
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "a second fx waits for a slow refresh another fx started and uses its login",
+  () => expectOneSharedRefresh("slow-issuer", 2, { issuerDelayMs: () => 2_000 }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "when the first refresh fails, the next fx holding the rejected login refreshes it",
+  () =>
+    inSharedLogin("issuer-500", { failWith: (index) => (index === 0 ? 500 : null) }, async (world, hooks) => {
+      const bothSent = barrier(2);
+      hooks.hold = async (_label, attempt) => {
+        if (attempt === 0) await bothSent();
+      };
+      world.revoke(0);
+      const results = await Promise.all(["p1", "p2"].map((label) => spawnSharedAsk(world, label).done));
+      expect(results.filter((result) => result.code === 0), results.map(described).join("\n")).toHaveLength(1);
+      expect(world.tokenRequests).toEqual([sharedRefresh(0), sharedRefresh(0)]);
+      expect(savedGeneration(world.home)).toBe(1);
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "an fx killed after it saved a refreshed login leaves it to the next fx, which refreshes nothing",
+  () =>
+    inSharedLogin("killed-after-save", {}, async (world, hooks) => {
+      const bothSent = barrier(2);
+      let markKilled = () => {};
+      const killed = new Promise<void>((resolve) => {
+        markKilled = resolve;
+      });
+      hooks.hold = async (label, attempt) => {
+        if (attempt === 0) {
+          await bothSent();
+          if (label === "p2") await killed;
+        } else if (label === "p1") {
+          // p1's retry, sent after it saved the refreshed login, never gets an answer.
+          await killed;
+          throw new Error("p1 was killed");
+        }
+      };
+      world.revoke(0);
+      const p1 = spawnSharedAsk(world, "p1");
+      const p2 = spawnSharedAsk(world, "p2");
+      await waitUntil("p1's retry", () => world.events.some((e) => e.event === "send" && e.data.p === "p1" && e.data.tok === 1));
+      expect(savedGeneration(world.home)).toBe(1);
+      p1.kill();
+      world.noteKill("p1");
+      await p1.done;
+      markKilled();
+      const result = await p2.done;
+      expect(result.code, described(result)).toBe(0);
+      expect(world.tokenRequests).toEqual([sharedRefresh(0)]);
+      expect(tokensBy(world, "accepted")).toEqual({ p2: [1] });
+      expect(savedGeneration(world.home)).toBe(1);
+    }),
+  SHARED_TIMEOUT,
+);
+
+test(
+  "an fx killed while its refresh is in flight leaves the saved login whole for the next fx",
+  async () => {
+    let markKilled = () => {};
+    const killed = new Promise<void>((resolve) => {
+      markKilled = resolve;
+    });
+    await inSharedLogin(
+      "killed-mid-refresh",
+      { reuseGrace: true, beforeAnswer: async (index) => { if (index === 0) await killed; } },
+      async (world, hooks) => {
+        const bothSent = barrier(2);
+        hooks.hold = async (label, attempt) => {
+          if (attempt !== 0) return;
+          await bothSent();
+          if (label === "p2") await killed;
+        };
+        world.revoke(0);
+        const p1 = spawnSharedAsk(world, "p1");
+        const p2 = spawnSharedAsk(world, "p2");
+        await waitUntil("p1's refresh", () => world.tokenRequests.length === 1);
+        p1.kill();
+        world.noteKill("p1");
+        await p1.done;
+        expect(savedGeneration(world.home)).toBe(0);
+        markKilled();
+        const result = await p2.done;
+        expect(result.code, described(result)).toBe(0);
+        expect(world.tokenRequests).toEqual([sharedRefresh(0), sharedRefresh(0)]);
+        expect(tokensBy(world, "accepted")).toEqual({ p2: [2] });
+        expect(savedGeneration(world.home)).toBe(2);
+      },
+    );
+  },
+  SHARED_TIMEOUT,
+);
+
+// FX_AUTH_REFRESH_RACE_ROUNDS and FX_AUTH_REFRESH_RACE_SEED replay a run; the
+// seed is printed so a failing interleaving can be run again.
+test(
+  "fx processes that get a 401 together share one refresh however their requests interleave",
+  async () => {
+    const rounds = Number(process.env.FX_AUTH_REFRESH_RACE_ROUNDS ?? "3");
+    const seed = Number(process.env.FX_AUTH_REFRESH_RACE_SEED ?? String(Date.now() % 2_147_483_647));
+    console.log(`shared login race: seed=${seed} rounds=${rounds}`);
+    const random = seededRandom(seed);
+    for (let round = 0; round < rounds; round += 1) {
+      await expectOneSharedRefresh(`race-${round}`, 3, {
+        answerDelayMs: () => Math.floor(random() * 80),
+        issuerDelayMs: () => Math.floor(random() * 150),
+      });
+    }
+  },
+  SHARED_TIMEOUT * 4,
+);
+
+// FX_AUTH_REFRESH_STRESS sets how many processes share the login.
+test(
+  "many fx processes that get a 401 together share one refresh of their login",
+  async () => {
+    const count = Number(process.env.FX_AUTH_REFRESH_STRESS ?? "8");
+    const started = Date.now();
+    await expectOneSharedRefresh(`stress-${count}`, count);
+    console.log(`shared login stress: ${count} processes in ${Date.now() - started} ms`);
+  },
+  SHARED_TIMEOUT * 4,
 );

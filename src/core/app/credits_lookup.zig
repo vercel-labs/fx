@@ -128,6 +128,7 @@ const Task = struct {
                 renewal.source,
                 .if_needed,
                 self.renewal_account_id,
+                null,
             ) catch |err| {
                 debug_trace.logf("credits", "lookup could not renew source={t} err={s}", .{ renewal.source, @errorName(err) });
                 const message = if (auth_runtime.classifyCredentialFailure(renewal.source, err).requiresSignIn())
