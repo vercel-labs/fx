@@ -5064,7 +5064,8 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).toContain("● Ran 2 shell commands ✗");
       expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
-      expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
+      // The hold for project instructions gets no row in the compact view.
+      expect(scrollback).not.toContain("Reading project instructions before continuing");
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("├ terminal");
       expect(scrollback).not.toContain("└ terminal");
@@ -5072,7 +5073,7 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain("└ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
-      expect(scrollback).toContain("Read nested/input.txt");
+      expect(scrollback).toContain("Read input.txt");
       expect(scrollback).toContain(`Ran ${command}`);
       // The failure control's steps show in short form; `exit` drops out.
       expect(scrollback).toContain("Exited 7 printf");

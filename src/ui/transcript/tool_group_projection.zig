@@ -410,7 +410,9 @@ fn clipSummary(
     if (cols == 0) return try alloc.dupe(u8, "");
     if (cols == 1) return try alloc.dupe(u8, "…");
     const prefix = display_width.prefixByWidthIgnoringAnsi(text, cols - 1);
-    const clipped = try alloc.print("{s}…", .{prefix});
+    // A cut inside a file link closes it, so the rest of the screen does not
+    // link to the file.
+    const clipped = try alloc.print("{s}{s}…", .{ prefix, if (endsInsideLink(prefix)) link_close else "" });
     // A cut inside a styled run can leave the final SGR open; close it so the
     // accent cannot bleed into whatever the terminal paints next.
     if (std.mem.find(u8, clipped, "\x1b") == null or std.mem.endsWith(u8, clipped, "\x1b[0m"))
@@ -1013,6 +1015,9 @@ const StoryRowKind = enum {
     subagent_wait,
     /// The same pattern with the same search tool, in one folder or several.
     search,
+    /// Different commands, one after the other, that share a label such as
+    /// "Ran" and did not fail: one row that names their steps.
+    commands,
 };
 
 const StoryIdentity = struct {
@@ -1031,7 +1036,116 @@ const StoryRow = struct {
     /// The folders a search row looked in, each once, in the order of its
     /// calls; "" for a search that named none.
     search_paths: std.ArrayList([]const u8) = .empty,
+    /// The calls of a `.commands` row, in order.
+    combined: std.ArrayList(*const ToolDetailRecord) = .empty,
 };
+
+/// The label a command row's phrase puts before its command, such as "Ran "
+/// or "Running ". Null when the phrase does not end with the command.
+fn commandRowLabel(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord) !?[]const u8 {
+    const record = detail orelse return null;
+    if (record.activity_kind != .command) return null;
+    const display = record.command_display orelse return null;
+    const status = switch (entry) {
+        .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
+        else => null,
+    } orelse return null;
+    const phrase = try reprojectTruncatedCommandPhrase(scratch, status, record) orelse status;
+    if (display.len == 0 or phrase.len <= display.len or !std.mem.endsWith(u8, phrase, display)) return null;
+    const label = phrase[0 .. phrase.len - display.len];
+    return if (label[label.len - 1] == ' ') label else null;
+}
+
+/// Whether a command call joins the row before it as one more step: both
+/// share a label, neither failed, and the row is not a repeat of one command,
+/// so a failure, its reason line, and "×3" stay on rows of their own.
+fn joinsCommandRow(scratch: std.mem.Allocator, last: *const StoryRow, entry: TranscriptEntry, detail: ?*const ToolDetailRecord) !bool {
+    if (detail == null or storyCallFailed(detail)) return false;
+    switch (last.identity.kind) {
+        .commands => {},
+        .command => if (last.count != 1 or last.failures != 0 or storyCallFailed(last.detail)) return false,
+        else => return false,
+    }
+    const label = try commandRowLabel(scratch, entry, detail) orelse return false;
+    const last_label = try commandRowLabel(scratch, last.entry, last.detail) orelse return false;
+    return std.mem.eql(u8, label, last_label);
+}
+
+/// The steps of a `.commands` row's calls, each once, in the order they ran.
+fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const ToolDetailRecord) !ShortCommand {
+    var all: std.ArrayList([]const u8) = .empty;
+    for (records) |record| {
+        const source = storyArgString(scratch, record, "command") orelse record.command_display orelse continue;
+        var steps: std.ArrayList([]const u8) = .empty;
+        var raw_steps: usize = 0;
+        if (try collectShortSteps(scratch, source, &steps, &raw_steps, 0) and steps.items.len > 0) {
+            for (steps.items) |step| try StoryTally.addDistinct(&all, scratch, step);
+        } else {
+            const first = std.mem.trim(u8, source, " \t\r\n");
+            if (first.len > 0) try StoryTally.addDistinct(&all, scratch, first[0 .. std.mem.findAny(u8, first, " \t\r\n") orelse first.len]);
+        }
+    }
+    const kept = @min(all.items.len, short_command_max_steps);
+    return .{ .steps = all.items[0..kept], .more = all.items.len - kept };
+}
+
+const link_close = "\x1b]8;;\x1b\\";
+
+/// Writes `path` as the path of a file URL: every byte outside the unreserved
+/// set and "/" is percent-encoded, so the link carries no control bytes.
+fn writeFileUrlPath(writer: *std.Io.Writer, path: []const u8) !void {
+    for (path) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '-' or byte == '.' or byte == '_' or byte == '~') {
+            try writer.writeByte(byte);
+        } else try writer.print("%{X:0>2}", .{byte});
+    }
+}
+
+/// Whether `text` ends inside a link: its last link sequence opens one.
+fn endsInsideLink(text: []const u8) bool {
+    const last = std.mem.findLast(u8, text, "\x1b]8;") orelse return false;
+    return !std.mem.startsWith(u8, text[last..], link_close);
+}
+
+fn storyArgInt(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?i64 {
+    const args = storyArgs(scratch, record) orelse return null;
+    const value = args.get(key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
+/// A read row by the file's name and the lines it read, such as
+/// "Read orchestrator.zig L15-200", in place of the whole path. An absolute
+/// path makes the name a file link, so Cmd+click opens the file. Null when
+/// the phrase does not end with the path the call read.
+fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: StoryRow, merged: bool) !?[]const u8 {
+    const record = row.detail orelse return null;
+    if (!std.mem.eql(u8, record.tool_name, "read_file")) return null;
+    const path = storyArgString(scratch, record, "path") orelse return null;
+    if (phrase.len <= path.len or !std.mem.endsWith(u8, phrase, path)) return null;
+    const label = phrase[0 .. phrase.len - path.len];
+    if (label[label.len - 1] != ' ') return null;
+    const name = std.Io.Dir.path.basename(path);
+    if (name.len == 0) return null;
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    try out.writer.writeAll(label);
+    if (std.Io.Dir.path.isAbsolute(path)) {
+        try out.writer.writeAll("\x1b]8;;file://");
+        try writeFileUrlPath(&out.writer, path);
+        try out.writer.print("\x1b\\{f}" ++ link_close, .{text_utils.terminalSafe(name)});
+    } else try out.writer.print("{f}", .{text_utils.terminalSafe(name)});
+    if (!merged) {
+        const start = storyArgInt(scratch, record, "start_line");
+        const count = storyArgInt(scratch, record, "line_count");
+        if (start != null and start.? > 0 and count != null and count.? > 0) {
+            try out.writer.print(" L{d}-{d}", .{ start.?, start.? + count.? - 1 });
+        } else if (start != null and start.? > 1) {
+            try out.writer.print(" L{d}+", .{start.?});
+        } else if (count != null and count.? > 0) {
+            try out.writer.print(" L1-{d}", .{count.?});
+        }
+    }
+    return out.written();
+}
 
 /// The key that joins searches for the same pattern with the same tool,
 /// wherever they look. Null for other calls.
@@ -1155,6 +1269,10 @@ fn collectStoryRows(
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
+        // A call held for project instructions has not run. The call that
+        // runs once they load shows instead, so the hold gets no row; Ctrl+O
+        // still shows it.
+        if (detail) |record| if (record.outcome == .deferred) continue;
         const identity = try storyIdentity(scratch, detail);
 
         const target: ?*StoryRow = switch (identity.kind) {
@@ -1175,6 +1293,7 @@ fn collectStoryRows(
                 }
                 break :blk null;
             },
+            .commands => null,
             .command, .read => blk: {
                 if (rows.items.len == 0) break :blk null;
                 const last = &rows.items[rows.items.len - 1];
@@ -1190,6 +1309,22 @@ fn collectStoryRows(
             row.detail = detail;
             try addSearchPath(scratch, row, detail);
             continue;
+        }
+        // A different command right after one with the same label joins its
+        // row as one more step.
+        if (identity.kind == .command and rows.items.len > 0) {
+            const last = &rows.items[rows.items.len - 1];
+            if (try joinsCommandRow(scratch, last, entry, detail)) {
+                if (last.identity.kind == .command) {
+                    last.identity = .{ .kind = .commands };
+                    try last.combined.append(scratch, last.detail.?);
+                }
+                try last.combined.append(scratch, detail.?);
+                last.entry = entry;
+                last.entry_id = entry_id;
+                last.detail = detail;
+                continue;
+            }
         }
         try rows.append(scratch, .{
             .entry = entry,
@@ -1217,6 +1352,12 @@ const StoryRowText = struct {
 /// calls share the row. A command that passed after failing says so, so the
 /// earlier failures stay in the story.
 fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) !StoryRowText {
+    if (row.identity.kind == .commands) {
+        const label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
+        const steps = try combinedCommandSteps(scratch, row.combined.items);
+        const display = try scratch.print("{s}{s}", .{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        return .{ .display = display, .body = display, .suffix = "", .split_failure = null };
+    }
     const merged_read = row.identity.kind == .read and row.count > 1;
     const status_phrase = if (merged_read)
         try scratch.print("Read {f}", .{text_utils.terminalSafe(row.identity.key)})
@@ -1228,7 +1369,9 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) 
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
-    const phrase = if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
+    const phrase = if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
+        read
+    else if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
         short
     else
         try highlightCommandPhrase(scratch, full_phrase, row.detail, style.text_style) orelse full_phrase;
@@ -1249,7 +1392,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle) 
         .session => try scratch.print(" · {d} calls", .{row.count}),
         .read => try scratch.print(" · {d} parts", .{row.count}),
         .search => if (many_folders) "" else try scratch.print(" ×{d}", .{row.count}),
-        .single, .subagent, .subagent_wait => "",
+        .single, .subagent, .subagent_wait, .commands => "",
     };
     return .{
         .display = if (suffix.len == 0) display else try scratch.print("{s}{s}", .{ display, suffix }),
@@ -1512,7 +1655,9 @@ fn formatGroupBlock(
 
     // A group left with one row needs no summary above it: the row is the
     // header, so nothing is said twice.
-    const single_row: ?StoryRow = if (!focused_in_group and rows.items.len == 1) rows.items[0] else null;
+    // A row that names several commands' steps keeps the header above it, so
+    // the count of commands stays.
+    const single_row: ?StoryRow = if (!focused_in_group and rows.items.len == 1 and rows.items[0].identity.kind != .commands) rows.items[0] else null;
     const single_text: ?StoryRowText = if (single_row) |row| try storyRowText(scratch, row, style) else null;
 
     const header = if (single_row) |row| blk: {
@@ -1893,6 +2038,7 @@ fn finishShortStep(
     raw_steps: *usize,
     step: ShortStep,
     depth: usize,
+    defined: []const []const u8,
 ) ShortStepError!void {
     if (step.program.len == 0 and !step.after_wrapper) return;
     // A `sh -c` step shows the steps of its script, when they lex.
@@ -1902,6 +2048,8 @@ fn finishShortStep(
     };
     raw_steps.* += 1;
     if (step.dropped or step.program.len == 0 or shell_setup_programs.has(step.program)) return;
+    // A call to a function the command defined runs its body, which shows.
+    for (defined) |name| if (std.mem.eql(u8, step.program, name)) return;
     if (step.after_pipe and output_filter_programs.has(step.program)) return;
     var text: std.Io.Writer.Allocating = .init(scratch);
     try text.writer.writeAll(step.program);
@@ -1922,6 +2070,14 @@ fn expansionClose(command: []const u8, tokens: []const command_lex.ArgvToken, in
         '{' => if (after_dollar or (token.end < command.len and !std.ascii.isWhitespace(command[token.end]))) '}' else null,
         else => null,
     };
+}
+
+/// Whether the tokens at `index` are the `()` of a function definition.
+fn isFunctionParens(tokens: []const command_lex.ArgvToken, index: usize) bool {
+    if (index + 1 >= tokens.len) return false;
+    const open = tokens[index];
+    const close = tokens[index + 1];
+    return !open.quoted and !close.quoted and std.mem.eql(u8, open.value, "(") and std.mem.eql(u8, close.value, ")");
 }
 
 /// Whether the token at `index` is the file descriptor of a redirection
@@ -1953,7 +2109,7 @@ const short_command_max_steps = 3;
 
 /// The short form as plain text, such as "npm ci, npm run build".
 fn shortCommand(scratch: std.mem.Allocator, command: []const u8) !?[]const u8 {
-    const short = try shortCommandSteps(scratch, command) orelse return null;
+    const short = try shortCommandSteps(scratch, command, command) orelse return null;
     return try formatShortCommand(scratch, short, null);
 }
 
@@ -1979,10 +2135,11 @@ fn formatShortCommand(scratch: std.mem.Allocator, short: ShortCommand, base_styl
 /// The steps a shell command runs, by program and subcommand, without flags,
 /// arguments, `cd`, variables, wrappers, and output filters, so
 /// "cd desktop && npm ci --no-audit && npm run build -- --mode production"
-/// is "npm ci, npm run build". A one-step command of at most
-/// short_command_max_len bytes keeps its full text. Null when the command
-/// keeps its text or does not lex. The steps live in `scratch`.
-fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8) !?ShortCommand {
+/// is "npm ci, npm run build". A one-step command whose `shown` text, the
+/// command as its row shows it, is at most short_command_max_len bytes keeps
+/// that text. Null when the command keeps its text or does not lex. The steps
+/// live in `scratch`.
+fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8, shown_text: []const u8) !?ShortCommand {
     var steps: std.ArrayList([]const u8) = .empty;
     var raw_steps: usize = 0;
     if (!try collectShortSteps(scratch, command, &steps, &raw_steps, 0)) return null;
@@ -1993,9 +2150,9 @@ fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8) !?ShortCom
         try shown.append(scratch, text);
     }
     if (shown.items.len == 0) return null;
-    if (raw_steps <= 1 and command.len <= short_command_max_len) return null;
+    if (raw_steps <= 1 and shown_text.len <= short_command_max_len) return null;
     // A command that is already its own short form keeps its text.
-    if (shown.items.len == 1 and std.mem.eql(u8, shown.items[0], command)) return null;
+    if (shown.items.len == 1 and (std.mem.eql(u8, shown.items[0], command) or std.mem.eql(u8, shown.items[0], shown_text))) return null;
     const kept = @min(shown.items.len, short_command_max_steps);
     return .{ .steps = shown.items[0..kept], .more = shown.items.len - kept };
 }
@@ -2016,6 +2173,8 @@ fn collectShortSteps(
     const tokens = argv.tokens;
 
     var step: ShortStep = .{};
+    // Functions the command defines, such as `p() { sed -n "$1"p f; }`.
+    var defined: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     while (index <= tokens.len) : (index += 1) {
         const at_end = index == tokens.len;
@@ -2040,6 +2199,14 @@ fn collectShortSteps(
             }
             continue;
         };
+        // `name() { ...; }` defines a function: its body shows, and calls to
+        // it are not steps of their own.
+        if (!at_end and step.program.len > 0 and step.word_count == 0 and !step.dropped and isFunctionParens(tokens, index)) {
+            try defined.append(scratch, step.program);
+            step.dropped = true;
+            index += 1;
+            continue;
+        }
         const operator = if (token) |t| !t.quoted and command_operators.has(t.value) else false;
         const new_line = if (token) |t| index > 0 and gapHasNewline(command, tokens[index - 1].end, t.start) else false;
         const heredoc_end = blk: {
@@ -2058,12 +2225,20 @@ fn collectShortSteps(
             break :blk true;
         };
         if (at_end or operator or new_line or heredoc_end) {
-            try finishShortStep(scratch, steps, raw_steps, step, depth);
+            try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
             step = .{ .after_pipe = operator and std.mem.eql(u8, token.?.value, "|") };
             if (operator or heredoc_end or at_end) continue;
         }
         const t = token.?;
         if (isRedirectionFd(tokens, index)) continue;
+        if (step.program.len == 0 and !t.quoted and std.mem.eql(u8, t.value, "function") and index + 1 < tokens.len) {
+            try defined.append(scratch, tokens[index + 1].value);
+            step.program = "function";
+            step.dropped = true;
+            step.closed = true;
+            index += 1;
+            continue;
+        }
         if (!t.quoted and redirection_operators.has(t.value)) {
             // A redirection's target is not a word of the step.
             index += 1;
@@ -2094,7 +2269,7 @@ fn shortenCommandPhrase(
     // one, which would turn a comment line into a comment over the whole
     // command.
     const source = storyArgString(scratch, record, "command") orelse display;
-    const short = try shortCommandSteps(scratch, source) orelse return null;
+    const short = try shortCommandSteps(scratch, source, display) orelse return null;
     return try scratch.print("{s}{s}", .{ label, try formatShortCommand(scratch, short, base_style) });
 }
 
@@ -3224,10 +3399,10 @@ test "minimal tool groups keep instruction refresh neutral and denials visible" 
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
 
+    // The hold for project instructions gets no row, so the denial is the
+    // group's only row and its header.
     try std.testing.expectEqualStrings(
-        "● Reading project instructions before continuing · 1 denied\n" ++
-            "├ Denied by auto agent \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "└ Reading project instructions before continuing: runtime.zig",
+        "● Denied by auto agent \x1b[38;5;252mzig\x1b[39m build",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -4694,16 +4869,23 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
         },
     };
 
+    // The compact view drops the held call.
     var projection = try build(alloc, &entries, &details, 200);
     defer projection.deinit(alloc);
-    const rows = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "Reading project instructions") == null);
 
-    // The prose prefix stays plain; the trailing command shows in short form,
-    // with each step's program highlighted and the ", " between them plain.
-    try std.testing.expect(std.mem.endsWith(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m, \x1b[38;5;252mprintf\x1b[39m"));
+    // Ctrl+O shows it with the prose prefix plain and only the trailing
+    // command highlighted.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const phrase = "Reading project instructions before continuing: " ++ command;
+    const highlighted = (try highlightCommandPhrase(arena_state.allocator(), phrase, &details[1], "")).?;
+    try std.testing.expect(std.mem.startsWith(u8, highlighted, "Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m"));
+    try std.testing.expect(std.mem.find(u8, highlighted, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, highlighted, "\x1b[38;5;252mprintf\x1b[39m") != null);
 }
 
-test "a deferred call keeps its own row and does not count as a run" {
+test "a deferred call gets no row and does not count as a run" {
     const alloc = std.testing.allocator;
     const arguments = "{\"command\":\"cat AGENTS.md\"}";
     const entries = [_]TranscriptEntry{
@@ -4717,10 +4899,71 @@ test "a deferred call keeps its own row and does not count as a run" {
     var projection = try build(alloc, &entries, &details, 100);
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran 1 shell command ✓\n"));
-    try std.testing.expect(std.mem.find(u8, bytes, "\n├ Reading project instructions before continuing: ") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\n└ Ran ") != null);
+    // Only the call that ran shows, so it is the group's header.
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran "));
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, bytes, "\n"), " ✓"));
+    try std.testing.expect(std.mem.find(u8, bytes, "Reading project instructions") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "×") == null);
+
+    // A group of holds alone says so once, with no rows.
+    var held = try build(alloc, entries[0..1], details[0..1], 100);
+    defer held.deinit(alloc);
+    try std.testing.expectEqualStrings("● Reading project instructions before continuing", std.mem.trimEnd(u8, held.entry_actions.items[0].override.bytes, "\n"));
+}
+
+test "commands one after the other share a row, and reads show the file by name" {
+    const alloc = std.testing.allocator;
+    const path = "/Users/example/fx worktree/src/core/agent/runtime/orchestrator.zig";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read " ++ path ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran rg -n retry src\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sed -n 1,40p src/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran rg -n backoff src\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● Exited 1 rg -n missing src\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = "● Ran nl -ba src/b.zig\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\",\"start_line\":15,\"line_count\":186}"), .outcome = .completed },
+        storyCommandDetail(2, "{\"command\":\"rg -n retry src\"}", 0, null),
+        storyCommandDetail(3, "{\"command\":\"sed -n 1,40p src/a.zig\"}", 0, null),
+        storyCommandDetail(4, "{\"command\":\"rg -n backoff src\"}", 0, null),
+        storyCommandDetail(5, "{\"command\":\"rg -n missing src\"}", 1, null),
+        storyCommandDetail(6, "{\"command\":\"nl -ba src/b.zig\"}", 0, null),
+    };
+    const displays = [_][]const u8{ "rg -n retry src", "sed -n 1,40p src/a.zig", "rg -n backoff src", "rg -n missing src", "nl -ba src/b.zig" };
+    for (displays, 1..) |display, index| details[index].command_display = @constCast(display);
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    var rows = std.mem.splitScalar(u8, std.mem.trimEnd(u8, projection.entry_actions.items[0].override.bytes, "\n"), '\n');
+    _ = rows.next();
+    // The read names the file and its lines, and links to the whole path.
+    try std.testing.expectEqualStrings(
+        "├ Read \x1b]8;;file:///Users/example/fx%20worktree/src/core/agent/runtime/orchestrator.zig\x1b\\orchestrator.zig" ++ link_close ++ " L15-200",
+        rows.next().?,
+    );
+    // The passing commands before the failure share one row, each step once.
+    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252mrg\x1b[39m, \x1b[38;5;252msed\x1b[39m", rows.next().?);
+    // The failure keeps its own row and reason line, and the command after it
+    // starts a new row.
+    try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ Exited 1 "));
+    const next = rows.next().?;
+    const last = if (std.mem.startsWith(u8, next, "│ ")) rows.next().? else next;
+    try std.testing.expectEqualStrings("└ Ran \x1b[38;5;252mnl\x1b[39m \x1b[38;5;250m-ba\x1b[39m src/b.zig", last);
+    try std.testing.expect(rows.next() == null);
+
+    // A clip inside the link closes it.
+    var narrow = try build(alloc, entries[0..1], details[0..1], 16);
+    defer narrow.deinit(alloc);
+    const clipped = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expect(!endsInsideLink(clipped));
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(std.mem.trimEnd(u8, clipped, "\n")) <= 16);
+
+    // A relative path shows the name with no link.
+    const relative = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Read desktop/src/window.ts\n", .class = .tool_status } }};
+    const relative_details = [_]ToolDetailRecord{.{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"desktop/src/window.ts\"}"), .outcome = .completed }};
+    var plain = try build(alloc, &relative, &relative_details, 120);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("● Read window.ts", std.mem.trimEnd(u8, plain.entry_actions.items[0].override.bytes, "\n"));
 }
 
 fn storyCommandDetail(
@@ -4959,6 +5202,9 @@ test "a long shell command shows its steps in short form" {
         .{ .command = "for i in $(seq 1 96); do printf 'marker %03d\\n' \"$i\"; sleep 0.03; done", .short = "printf, sleep" },
         .{ .command = "echo \"$(date)\" started && npm test -- --run --reporter=dot --bail", .short = "echo, npm test" },
         .{ .command = "cat AGENTS.md && printf 'executed\\n' >> executions.log", .short = "cat, printf" },
+        // A command's own functions show their bodies, not their calls.
+        .{ .command = "p() { sed -n \"$2,+20p\" \"$1\"; }; p src/a.zig 675; p src/b.zig 86; p src/c.zig 857", .short = "sed" },
+        .{ .command = "function show { cat \"$1\"; }; show src/a.zig; show src/b.zig; rg -n retry src", .short = "cat, rg" },
         // A comment runs to the end of its line.
         .{ .command = "# large lifecycle\nprintf 'LARGE_MARKER\\n' && seq 1 200000 > /dev/null", .short = "printf, seq" },
         .{ .command = "npm test -- --run --reporter=dot --bail # watch the flaky one && retry", .short = "npm test" },
@@ -5091,7 +5337,7 @@ test "one file read in parts shares a row" {
     };
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
-    try std.testing.expectEqualStrings("● Read src/main.zig · 3 parts", projection.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● Read main.zig · 3 parts", projection.entry_actions.items[0].override.bytes);
 }
 
 test "repeated bare subagent waits share one row of their own" {
@@ -5402,17 +5648,38 @@ fn checkStoryRows(input: []const u8) !void {
         var lines = std.mem.splitScalar(u8, action.override.bytes, '\n');
         while (lines.next()) |line| {
             try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
-            // Apart from the styles fx writes, every byte is terminal-safe.
+            // Apart from the styles and file links fx writes, every byte is
+            // terminal-safe.
             var plain: std.Io.Writer.Allocating = .init(arena);
             var index: usize = 0;
             while (index < line.len) {
                 if (skipSgrSequence(line, &index)) continue;
+                if (skipFileLink(line, &index)) continue;
                 try plain.writer.writeByte(line[index]);
                 index += 1;
             }
             try std.testing.expect(text_utils.isTerminalSafe(plain.written()));
         }
     }
+}
+
+/// Skips a file link sequence fx writes: its close, or an open whose URL holds
+/// only percent-encoded path bytes.
+fn skipFileLink(text: []const u8, index: *usize) bool {
+    const rest = text[index.*..];
+    if (std.mem.startsWith(u8, rest, link_close)) {
+        index.* += link_close.len;
+        return true;
+    }
+    const open = "\x1b]8;;file://";
+    if (!std.mem.startsWith(u8, rest, open)) return false;
+    const end = std.mem.find(u8, rest, "\x1b\\") orelse return false;
+    for (rest[open.len..end]) |byte| {
+        const url_byte = std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '-' or byte == '.' or byte == '_' or byte == '~' or byte == '%';
+        if (!url_byte) return false;
+    }
+    index.* += end + 2;
+    return true;
 }
 
 fn fuzzStoryRows(_: void, smith: *std.testing.Smith) !void {

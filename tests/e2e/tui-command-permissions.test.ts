@@ -748,15 +748,6 @@ function expectNoHostileExecutables(root: IsolatedRoot) {
   }
 }
 
-// Where each copy of a row starts in `text`, in order. Both commands of the
-// two-command fixture show as `touch, printf` in short form, so their rows
-// are told apart by position.
-function rowPositions(text: string, row: string): number[] {
-  const positions: number[] = [];
-  for (let at = text.indexOf(row); at >= 0; at = text.indexOf(row, at + 1)) positions.push(at);
-  return positions;
-}
-
 function largeEffectfulCommand(marker: string) {
   const command = [
     ...Array.from(
@@ -865,10 +856,11 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("history feedback live complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      const [firstRow, secondRow] = rowPositions(scrollback, "Ran touch, printf");
-      expect(firstRow).toBeGreaterThanOrEqual(0);
-      expect(secondRow).toBeGreaterThan(firstRow!);
-      expect(scrollback.indexOf(feedback)).toBeGreaterThan(secondRow!);
+      // The two commands share one row by their steps, and the feedback comes
+      // after it.
+      const commandsRow = scrollback.indexOf("└ Ran touch, printf");
+      expect(commandsRow).toBeGreaterThanOrEqual(0);
+      expect(scrollback.indexOf(feedback)).toBeGreaterThan(commandsRow);
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
       expect(rawAnsiScrollback).toContain(feedback);
       expect(existsSync(join(root.workspace, "history-feedback-first.txt"))).toBe(true);
@@ -923,10 +915,9 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendKeys("Enter");
       await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
-      const [pickerFirstRow, pickerSecondRow] = rowPositions(pickerScrollback, "Ran touch, printf");
-      expect(pickerFirstRow).toBeGreaterThanOrEqual(0);
-      expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(pickerFirstRow!);
-      expect(pickerSecondRow).toBeGreaterThan(pickerScrollback.indexOf(feedback));
+      const pickerCommandsRow = pickerScrollback.indexOf("Ran touch, printf");
+      expect(pickerCommandsRow).toBeGreaterThanOrEqual(0);
+      expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(pickerCommandsRow);
       await activeSession.sendText("Continue through interactive resume.");
       await activeSession.waitForText("history feedback picker resume complete", TIMEOUT);
       expect(pickerGateway.requests).toHaveLength(1);

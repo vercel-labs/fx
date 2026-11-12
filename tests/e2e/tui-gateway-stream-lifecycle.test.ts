@@ -6362,7 +6362,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const currentInstruction = "NESTED_CURRENT_INSTRUCTION_SENTINEL";
       const refreshLabel = "Reading project instructions before continuing:";
       // The deferred call did not run, so the group ran one command.
-      const header = "● Ran 1 shell command ✓";
+      // The hold for project instructions gets no row, so the command that
+      // ran is the group's only row and its header.
+      const header = "● Ran cat, printf ✓";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(nested, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -6427,9 +6429,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(executionAtFinal).toBe("executed\n");
       expect(readFileSync(markerPath, "utf8")).toBe("executed\n");
       expect(compact).toContain(`${header}\n`);
-      expect(compact).toContain(refreshLabel);
-      // The command shows its steps in short form.
-      expect(compact).toContain("└ Ran cat, printf");
+      expect(compact).not.toContain(refreshLabel);
       expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       for (const output of [compact, escapes]) {
         expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
@@ -6461,8 +6461,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(refreshedOutput).toContain(currentInstruction);
       expect(executionBeforeNextRetry).toBe("executed\n");
       expect(readFileSync(markerPath, "utf8")).toBe("executed\nexecuted\n");
-      expect(countOccurrences(await session.captureFullScrollback(), refreshLabel))
-        .toBe(countOccurrences(compact, refreshLabel) + 1);
+      // Neither turn's hold for project instructions gets a row.
+      expect(countOccurrences(await session.captureFullScrollback(), refreshLabel)).toBe(0);
       expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -6472,7 +6472,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const recorded = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload))
         .toString("utf8");
-      expect(recorded).toContain(refreshLabel);
+      // The hold is never painted, not even while it waits.
+      expect(recorded).not.toContain(refreshLabel);
       expect(recorded).not.toMatch(/command not run|project instructions changed/i);
       const replay = execFileSync(FX_BIN, ["replay", tapePath], { encoding: "utf8" });
       expect(replay).toContain(finalText);
@@ -7268,11 +7269,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const compact = await session.captureFullScrollback();
       expect(compact).toContain("● Ran 3 shell commands ✓");
       // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
-      expect(compact).toContain("├ Ran pwd\n");
+      // The three commands share one row by their steps; Ctrl+O shows each.
+      expect(compact).toContain("└ Ran printf, pwd\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
-      expect(countOccurrences(compact, `Ran ${firstDisplayCommand}`)).toBe(1);
       expect(compact).not.toContain(`Ran ${firstCommand}`);
-      expect(countOccurrences(compact, `Ran ${thirdCommand}`)).toBe(1);
 
       await session.resizeWindow(80, 24);
       await session.waitForText("● Ran 3 shell commands ✓", TIMEOUT);
@@ -7339,8 +7339,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
       expect(resumed).toContain("● Ran 3 shell commands ✓");
-      expect(resumed).toContain("├ Ran pwd\n");
-      expect(resumed).toContain(`Ran ${firstDisplayCommand}`);
+      expect(resumed).toContain("└ Ran printf, pwd\n");
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);

@@ -172,9 +172,10 @@ test.skipIf(!tmuxAvailable())(
     const lines = paneLines(pane);
 
     const checks = group(lines, "● Ran 3 shell commands ✗");
+    // The two passing checks share a row by their step; the failure keeps
+    // its own.
     expect(treeRows(checks)).toEqual([
-      "├ Ran sh check.sh status",
-      "├ Ran sh check.sh remote",
+      "├ Ran sh check.sh",
       expect.stringMatching(/^└ .*sh build\.sh$/),
     ]);
     expect(checks).toContain("  ✗ exit 2 · src/main.ts:14:15 - error TS2554: Expected 1 arguments, but got 3.");
@@ -183,7 +184,8 @@ test.skipIf(!tmuxAvailable())(
     const fixRows = treeRows(fix);
     expect(fixRows).toHaveLength(4);
     expect(fixRows[0]).toStartWith("├ Searched");
-    expect(fixRows[1]).toBe("├ Read desktop/src/window.ts");
+    // A read shows the file by name.
+    expect(fixRows[1]).toBe("├ Read window.ts");
     expect(fixRows[2]).toBe("├ Edited desktop/src/main.ts +1 / -1");
     expect(fixRows[3]).toBe("└ Ran sh build.sh");
     expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands · /.test(line))).toBe(true);
@@ -234,7 +236,7 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     expect(lines).toContain("● Ran sh test.sh ×3 · passed on the 3rd run ✓");
-    expect(lines).toContain("● Read desktop/src/main.ts · 3 parts");
+    expect(lines).toContain("● Read main.ts · 3 parts");
     expect(lines.filter((line) => line.includes("sh test.sh"))).toHaveLength(1);
 
     await session.sendKeys("C-o");
