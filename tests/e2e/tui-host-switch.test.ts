@@ -2389,8 +2389,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("BSpace");
         await session.sendKeys("Down");
         const working = await session.waitForText("enter switch     delete close     esc back", 10_000);
-        // Main's row names the subagent it messaged; Ctrl+O has the task.
-        expect(working).toContain("Messaged reviewer");
+        // Behind the list is main's conversation, whose row names the
+        // reviewer it messaged, or the highlighted reviewer's, which starts
+        // with that message; which one shows first depends on timing.
+        expect(working).toMatch(/Messaged reviewer|Review src\/parser\.zig for bugs/);
         expectRowOrder(working, mainRow(), subagentRow("reviewer"));
         expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
         await session.sendKeys("BSpace");
