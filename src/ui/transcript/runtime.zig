@@ -8793,6 +8793,10 @@ pub const TranscriptRuntime = struct {
         const releasable_offset = self.finalityReleasableOffset(prepared, target_offset);
         const releasable_advance = releasable_offset -| anchor.history_visual_offset;
         const committed_projection_offset = committedProjectionVisualOffset(anchor);
+        // Rows between history and the viewport are on no screen, so only a
+        // history replay can write them; rows already on screen scroll out
+        // as they are.
+        const history_behind_viewport = committed_projection_offset > anchor.history_visual_offset;
         const geometry_history_rows: u32 = if (geometry_rebase and
             ((source_compatible and source_visual_growth) or
                 displaced_history_replay != null))
@@ -8813,18 +8817,31 @@ pub const TranscriptRuntime = struct {
             if (anchor.normal_buffer_recovery_pending)
                 target_offset -| anchor.history_visual_offset
             else if (anchor.history_catchup_pending)
-                releasable_advance
+                // The owed rows sit above the viewport; without a replay
+                // range nothing can write them, so they stay owed.
+                if (!history_behind_viewport or
+                    self.compatibleCommittedHistoryReplayRange(
+                        prepared,
+                        anchor,
+                        prepared.bytes,
+                        releasable_offset,
+                    ) != null)
+                    releasable_advance
+                else
+                    0
             else
                 // Rows leaving the screen top are [visual..visual+scroll);
                 // the floor clamps that range, so the budget is measured
                 // from the committed viewport, not from history.
                 releasable_offset -| anchor.visual_offset
-        else if (self.compatibleCommittedHistoryReplayRange(
-            prepared,
-            anchor,
-            prepared.bytes,
-            releasable_offset,
-        ) != null)
+        else if ((!history_behind_viewport or
+            stableHistoryReplayWanted(anchor, false, releasable_offset)) and
+            self.compatibleCommittedHistoryReplayRange(
+                prepared,
+                anchor,
+                prepared.bytes,
+                releasable_offset,
+            ) != null)
             releasable_advance
         else
             0;
@@ -8860,6 +8877,23 @@ pub const TranscriptRuntime = struct {
             semantic_rows,
             semantic_rows,
         );
+        if (history_behind_viewport and !geometry_rebase and
+            semantic_rows == 0 and releasable_advance > 0 and
+            (recovery_rebase or anchor.history_catchup_pending))
+        {
+            debug_trace.logf(
+                "scroll",
+                "transcript_history_debt_held owed_rows={d} history={d} viewport={d} source_compatible={s} catchup={s} restore={s} reason=no_history_replay",
+                .{
+                    releasable_advance,
+                    anchor.history_visual_offset,
+                    committed_projection_offset,
+                    if (source_compatible) "true" else "false",
+                    if (anchor.history_catchup_pending) "true" else "false",
+                    if (anchor.normal_buffer_recovery_pending) "true" else "false",
+                },
+            );
+        }
         if (semantic_rows > releasable_advance) {
             diagnostics.recordRenderEvent(
                 .transition,
@@ -9598,6 +9632,21 @@ pub const TranscriptRuntime = struct {
         return kept;
     }
 
+    /// Whether a stable frame replays history to reach `target_history_visual_offset`.
+    /// The plan grants rows past the viewport only when this holds, and the
+    /// append base replays them under the same rule, so no frame scrolls rows
+    /// that nothing writes.
+    fn stableHistoryReplayWanted(
+        anchor: CommittedTranscriptAnchor,
+        geometry_rebase: bool,
+        target_history_visual_offset: u32,
+    ) bool {
+        return target_history_visual_offset > anchor.history_visual_offset and
+            (geometry_rebase or
+                anchor.normal_buffer_recovery_pending or
+                anchor.history_catchup_pending);
+    }
+
     fn resolveTransitionAppendBase(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -9609,12 +9658,18 @@ pub const TranscriptRuntime = struct {
     ) !?TransitionAppendBase {
         switch (self.transcript_commit_state) {
             .stable => |anchor| {
-                if (!destructive_invalidation) {
-                    const replay_from_history = target_history_visual_offset >
-                        anchor.history_visual_offset and
-                        (scroll_facts.geometry_rebase or
-                            anchor.normal_buffer_recovery_pending or
-                            anchor.history_catchup_pending);
+                const replay_from_history = stableHistoryReplayWanted(
+                    anchor,
+                    scroll_facts.geometry_rebase,
+                    target_history_visual_offset,
+                );
+                // A history replay writes its rows from the transcript top
+                // and needs nothing from the screen a destructive
+                // invalidation spoiled. The plan grants those rows without
+                // knowing about the invalidation, so the replay cannot wait
+                // on it either; only a continuation of the retained screen
+                // does.
+                if (!destructive_invalidation or replay_from_history) {
                     if (replay_from_history) {
                         const replay = self.compatibleCommittedHistoryReplayRange(
                             prepared,
@@ -9637,7 +9692,8 @@ pub const TranscriptRuntime = struct {
                             };
                         }
                     }
-                    if (anchor.flow_materialized and self.committedLayoutMatches(anchor) and
+                    if (!destructive_invalidation and
+                        anchor.flow_materialized and self.committedLayoutMatches(anchor) and
                         target_flow.len >= anchor.flow.len and
                         std.mem.startsWith(u8, target_flow, anchor.flow))
                     {
