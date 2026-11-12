@@ -463,6 +463,8 @@ fn composeSelectionFailureRow(
     const message = switch (failure) {
         .open_elsewhere => "This session is open in another fx. Close it there, then press enter to retry.",
         .being_updated => "This session is being updated. Wait a moment, then press enter to retry.",
+        .connection_changed => "This session's custom connection changed in settings. Change it back, or start a new session.",
+        .connection_removed => "This session's custom connection is no longer in settings. Add it back, or start a new session.",
         .unavailable => "Unable to resume this session.",
     };
     try row_text.appendSingleLineEllipsized(

@@ -222,6 +222,11 @@ pub const TerminalState = struct {
         try stdout_file.writeStreamingAll(io_mod.getIo(), cursor_probe.queryBytes(protocol));
     }
 
+    pub fn enableBracketedPaste(_: TerminalState) !void {
+        var stdout_file = std.Io.File.stdout();
+        try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.bracketed_paste_enable_sequence);
+    }
+
     pub fn enableThemeNotifications(_: TerminalState) !void {
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.theme_notification_enable_sequence);

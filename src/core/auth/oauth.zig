@@ -283,6 +283,14 @@ pub fn refreshToken(
     return parseTokenSet(alloc, bytes);
 }
 
+/// Runs once just before a logout asks the issuer to revoke its login, so the
+/// command can say what it waits for. A logout with nothing to revoke never
+/// runs it.
+pub const BeforeRevocation = struct {
+    context: *const anyopaque,
+    run: *const fn (context: *const anyopaque) void,
+};
+
 pub fn revokeToken(
     alloc: Allocator,
     transport: oauth_transport.Provider,
