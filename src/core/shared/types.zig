@@ -1999,6 +1999,34 @@ pub const ProviderFinishRaw = struct {
     }
 };
 
+/// Gemini's stop reason for a function call it could not write, which the AI
+/// SDK reports as the finish `error`.
+pub const malformed_function_call_reason = "MALFORMED_FUNCTION_CALL";
+
+/// Whether a reply ended because the provider could not read the model's tool
+/// call. The reply's calls never ran, and the same request can fail the same
+/// way, so fx gives the model feedback instead of a plain resend.
+pub fn isMalformedToolCallFinish(
+    finish_reason: ?ProviderFinishReason,
+    finish_reason_raw: ProviderFinishRaw,
+) bool {
+    const reason = finish_reason orelse return false;
+    return reason == .provider_error and
+        std.mem.eql(u8, finish_reason_raw.slice(), malformed_function_call_reason);
+}
+
+test "only a provider error named MALFORMED_FUNCTION_CALL is a malformed tool call" {
+    const malformed = ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL");
+    try std.testing.expect(isMalformedToolCallFinish(.provider_error, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.other, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.stop, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(null, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("provider_error")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("malformed_function_call")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL_X")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("")));
+}
+
 test "provider finish raw keeps a bounded printable copy" {
     try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
     try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
@@ -2018,12 +2046,20 @@ fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
         try std.testing.expectEqual(if (source >= 0x21 and source <= 0x7e) source else '?', byte);
     }
+    // Only the exact reason marks a malformed tool call: a longer one cut to
+    // the capacity, or one whose unprintable bytes became '?', does not.
+    try std.testing.expectEqual(
+        std.mem.eql(u8, input, malformed_function_call_reason),
+        isMalformedToolCallFinish(.provider_error, raw),
+    );
+    try std.testing.expect(!isMalformedToolCallFinish(.other, raw));
 }
 
 test "fuzz provider finish raw" {
     try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
         .corpus = &(@import("fuzz_seed").slices(.{
             "UNEXPECTED_TOOL_CALL",
+            "MALFORMED_FUNCTION_CALL",
             "",
             "BAD\x07REASON",
             "\xc3\xa9 \x00\xff",

@@ -48,6 +48,17 @@ pub fn streamStartMayHaveExecutedAtProvider(
     return spec.provider_executed;
 }
 
+/// Whether a tool that may run at the provider only reads, as a search does,
+/// so running it again after a failed attempt is safe.
+pub fn providerToolOnlyReads(
+    registry: tool_dispatch.Registry,
+    tool_name: []const u8,
+) bool {
+    if (isProviderSearchAlias(tool_name)) return true;
+    const spec = registry.lookup(tool_name) orelse return false;
+    return spec.provider_executed and spec.activity_kind == .read;
+}
+
 fn fallbackToolDisplay(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
@@ -1902,6 +1913,26 @@ test "stream start execution certainty follows provider ownership" {
         test_tool_registry,
         "parallel_search",
     ));
+}
+
+test "only a provider-run tool that reads is safe to run again" {
+    const writing_provider_tool = blk: {
+        var spec = test_builtin_tools.web_search;
+        spec.name = "provider_publish";
+        spec.activity_kind = .write;
+        break :blk spec;
+    };
+    const provider_registry = tool_dispatch.Registry{
+        .tools = &.{ test_builtin_tools.web_search, writing_provider_tool, test_builtin_tools.read_file },
+    };
+
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "web_search"));
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "exa_search"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "provider_publish"));
+    // A local tool is not a provider-run tool, and an unknown name is not
+    // known to read.
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "read_file"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "unknown_tool"));
 }
 
 test "tool lifecycle uses activity metadata from the supplied registry" {
