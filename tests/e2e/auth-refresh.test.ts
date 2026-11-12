@@ -17,9 +17,19 @@ import {
   TITLE_GENERATION_MARKER,
   fakeGatewayFinalText,
   fakeResponsesTitleDefault,
+  startDynamicFakeGateway,
   startFakeGateway,
 } from "./tmux-helpers";
-import { savedSessionIds } from "./saved-sessions";
+import {
+  bearer,
+  rotateFxLogin,
+  signInFxLoginToTeam,
+  startFakeIssuer,
+  storedFxLoginToken,
+  unauthorized,
+  writeFxLogin as writeSharedFxLogin,
+} from "./fx-login-fakes";
+import { logLines, savedSessionIds } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const EXPIRED_REFRESH_TOKEN = "expired-refresh-token";
@@ -196,7 +206,12 @@ function subscriptionAccessToken(provider: Subscription, signature: string): str
   return `header.${payload}.${signature}`;
 }
 
-function writeExpiredSubscriptionLogin(home: string, provider: Subscription, accessToken: string): void {
+function writeExpiredSubscriptionLogin(
+  home: string,
+  provider: Subscription,
+  accessToken: string,
+  expiresAtMs = Date.now() - 60_000,
+): void {
   const fxDir = join(home, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
@@ -205,14 +220,23 @@ function writeExpiredSubscriptionLogin(home: string, provider: Subscription, acc
     version: 1,
     access_token: accessToken,
     refresh_token: `${provider}-refresh`,
-    expires_at_ms: Date.now() - 60_000,
+    expires_at_ms: expiresAtMs,
     account_id: SUBSCRIPTION_ACCOUNT,
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
 }
 
-/** Codex's or Grok's sign-in and model endpoints, answering refreshes after `beforeTokenResponse`. */
-function startFakeSubscription(provider: Subscription, refreshedAccessToken: string, beforeTokenResponse: () => Promise<void>) {
+/**
+ * Codex's or Grok's sign-in and model endpoints, answering refreshes after
+ * `beforeTokenResponse`. `respond`, when given, answers model requests in
+ * place of the default reply.
+ */
+function startFakeSubscription(
+  provider: Subscription,
+  refreshedAccessToken: string,
+  beforeTokenResponse: () => Promise<void>,
+  respond?: (request: Request) => Response,
+) {
   const tokenRequests: string[] = [];
   /** Each model request's headers. */
   const modelRequests: string[] = [];
@@ -238,6 +262,7 @@ function startFakeSubscription(provider: Subscription, refreshedAccessToken: str
       const body = await request.text();
       if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
       modelRequests.push(JSON.stringify([...request.headers.entries()]));
+      if (respond) return respond(request);
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "SUBSCRIPTION_ASK_DONE" })}\n\n` +
           'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
@@ -312,6 +337,156 @@ for (const provider of ["codex", "grok"] as const) {
           expect(headers).toContain(fresh);
           expect(headers).not.toContain(stale);
         }
+      } finally {
+        gateway.stop();
+        fake.stop();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+}
+
+// A Codex or Grok subscription's title request rejected with 401 is sent once
+// more with the login another fx process stored, as an fx login's is, and
+// never refreshes the subscription itself
+// (tests/tla/session_title/SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable).
+for (const provider of ["codex", "grok"] as const) {
+  test(
+    `a ${provider} title the subscription rejects is sent once more with the login another fx stored`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), `fx-auth-refresh-title-${provider}-e2e-`));
+      const stale = subscriptionAccessToken(provider, "stale");
+      const fresh = subscriptionAccessToken(provider, "fresh");
+      const titleAuthorizations: string[] = [];
+      let tokenRequests = 0;
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const path = new URL(request.url).pathname;
+          if (path === "/models") {
+            return Response.json(provider === "codex"
+              ? { models: [{ slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 }] }
+              : { data: [{ id: "grok-4.20", model: "grok-4.20", api_backend: "responses", context_window: 1_000_000, supports_reasoning_effort: false, reasoning_efforts: [] }] });
+          }
+          if (path === "/modalities") {
+            return Response.json({ models: [{ id: "grok-4.20", input_modalities: ["text"], output_modalities: ["text"] }] });
+          }
+          if (path === "/token") {
+            tokenRequests += 1;
+            return Response.json({ access_token: fresh, refresh_token: `${provider}-refresh-next`, expires_in: 3600 });
+          }
+          if (path === "/userinfo") return Response.json({ sub: SUBSCRIPTION_ACCOUNT });
+          const body = await request.text();
+          const authorization = request.headers.get("authorization") ?? "";
+          const text = (delta: string) => new Response(
+            `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n` +
+              'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+            { headers: { "content-type": "text/event-stream" } },
+          );
+          if (body.includes(TITLE_GENERATION_MARKER)) {
+            titleAuthorizations.push(authorization);
+            if (authorization.includes(stale)) {
+              // Another fx refreshed the subscription after this one read it.
+              writeExpiredSubscriptionLogin(home, provider, fresh, Date.now() + 60 * 60 * 1000);
+              return Response.json({ error: { message: "token expired" } }, { status: 401 });
+            }
+            return text("Renderer Loop Refactor");
+          }
+          return text("SUBSCRIPTION_ASK_DONE");
+        },
+      });
+      const base = `http://127.0.0.1:${server.port}`;
+      writeExpiredSubscriptionLogin(home, provider, stale, Date.now() + 60 * 60 * 1000);
+      // Unused: keeps fx away from the real gateway.
+      const gateway = startFakeGateway([]);
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        ...(provider === "codex"
+          ? {
+            FX_PROVIDER: "codex",
+            FX_MODEL: "gpt-5.4-mini",
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: `${base}/responses`,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: `${base}/models`,
+            FX_TEST_CHATGPT_TOKEN_URL: `${base}/token`,
+          }
+          : {
+            FX_PROVIDER: "grok",
+            FX_MODEL: "grok-4.20",
+            FX_TEST_XAI_GROK_RESPONSES_URL: `${base}/responses`,
+            FX_TEST_XAI_GROK_MODELS_URL: `${base}/models`,
+            FX_TEST_XAI_GROK_MODALITIES_URL: `${base}/modalities`,
+            FX_TEST_GROK_TOKEN_URL: `${base}/token`,
+            FX_TEST_GROK_USERINFO_URL: `${base}/userinfo`,
+          }),
+      };
+      try {
+        const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], { env, timeoutMs: TIMEOUT });
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(result.stdout).toContain("SUBSCRIPTION_ASK_DONE");
+        expect(titleAuthorizations).toHaveLength(2);
+        expect(titleAuthorizations[0]).toContain(stale);
+        expect(titleAuthorizations[1]).toContain(fresh);
+        expect(tokenRequests).toBe(0);
+        const titles = savedSessionIds(home).flatMap((id) =>
+          (logLines(home, id) as any[]).filter((line) => line.kind === "set" && line.key === "title").map((line) => line.value)
+        );
+        expect(titles.at(-1)).toBe("Renderer Loop Refactor");
+      } finally {
+        gateway.stop();
+        server.stop(true);
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+}
+
+// A provider's error can quote the token it refused, and fx shows the error,
+// so the token must not come with it.
+for (const provider of ["codex", "grok"] as const) {
+  test(
+    `a ${provider} error that quotes the token fx sent shows without the token`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), `fx-auth-error-mask-${provider}-e2e-`));
+      const stale = subscriptionAccessToken(provider, "stale");
+      const fresh = subscriptionAccessToken(provider, "fresh");
+      const fake = startFakeSubscription(provider, fresh, async () => {}, (request) => {
+        const token = (request.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+        return Response.json({ error: { message: `token ${token} is not allowed here` } }, { status: 400 });
+      });
+      writeExpiredSubscriptionLogin(home, provider, stale);
+      // Unused: keeps fx away from the real gateway.
+      const gateway = startFakeGateway([]);
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        ...fake.env,
+      };
+
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "hello"], { env, timeoutMs: TIMEOUT });
+        const output = `${result.stdout}\n${result.stderr}`;
+        expect(result.code, output).not.toBe(0);
+        // fx sent the refreshed token, and the provider quoted it back.
+        expect(fake.modelRequests.some((headers) => headers.includes(fresh))).toBe(true);
+        expect(output).toContain("is not allowed here");
+        expect(output).not.toContain(fresh);
       } finally {
         gateway.stop();
         fake.stop();
@@ -489,6 +664,100 @@ test(
     } finally {
       gateway.stop();
       oauth.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
+  "fx ask replays a rejected request with the login another fx already renewed, without refreshing",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-renewed-elsewhere-"));
+    const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+    writeSharedFxLogin(home, issuer.issuerUrl, "launch-token");
+    let mainRequests = 0;
+    // Another fx renews the shared login after this one read it, so the
+    // gateway rejects the copy this one sends first.
+    const gateway = startDynamicFakeGateway(() => {
+      mainRequests += 1;
+      if (mainRequests > 1) return fakeGatewayFinalText("RENEWED_ELSEWHERE_RESPONSE");
+      rotateFxLogin(home, "other-fx-token");
+      return unauthorized();
+    });
+
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "exercise the shared login"], {
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+        },
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain("RENEWED_ELSEWHERE_RESPONSE");
+      expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token", "other-fx-token"]);
+      expect(issuer.refreshes).toHaveLength(0);
+      expect(storedFxLoginToken(home)).toBe("other-fx-token");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
+  "fx ask does not refresh the login another fx signed in to another team when its request is rejected",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-other-team-"));
+    const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+    writeSharedFxLogin(home, issuer.issuerUrl, "launch-token");
+    let mainRequests = 0;
+    // Another fx signs the shared login in to another team, and the gateway
+    // rejects the token this one sends.
+    const gateway = startDynamicFakeGateway(() => {
+      mainRequests += 1;
+      if (mainRequests === 1) signInFxLoginToTeam(home, "other-team-token", "team_other");
+      return unauthorized();
+    });
+
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "exercise the shared login"], {
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+        },
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).not.toBe(0);
+      expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token"]);
+      expect(issuer.refreshes).toHaveLength(0);
+      expect(storedFxLoginToken(home)).toBe("other-team-token");
+    } finally {
+      gateway.stop();
+      issuer.stop();
       rmSync(home, { recursive: true, force: true });
     }
   },

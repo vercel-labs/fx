@@ -14,6 +14,7 @@ const oauth_session = @import("../auth/oauth_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -112,7 +113,7 @@ fn fromParts(
             .bearer = bearer,
             .team = team,
             .subject = account orelse team orelse "",
-            .label = std.mem.print(label_buf, "{s} (fx login)", .{team_slug orelse team orelse "no team"}) catch "fx login",
+            .label = std.mem.print(label_buf, "{s} (fx login)", .{types.displayGatewayTeam(team_slug, team) orelse "no team"}) catch "fx login",
         },
         .stored_key, .ai_gateway_api_key => .{
             .scope = .api_key,
@@ -228,4 +229,16 @@ fn readClockFile(path: []const u8) ?i64 {
     defer file.close(file_io);
     const len = file.readPositionalAll(file_io, &buf, 0) catch return null;
     return std.fmt.parseInt(i64, std.mem.trim(u8, buf[0..len], " \t\r\n"), 10) catch null;
+}
+
+test "the usage label names a login's team only by a valid team name" {
+    var bad_buf: LabelBuffer = undefined;
+    const bad = fromParts(.fx_login, "token", "team_123", "\x1b]2;title\x07", null, &bad_buf).?;
+    try std.testing.expectEqualStrings("team_123 (fx login)", bad.label);
+    var good_buf: LabelBuffer = undefined;
+    const good = fromParts(.fx_login, "token", "team_123", "vercel-labs", null, &good_buf).?;
+    try std.testing.expectEqualStrings("vercel-labs (fx login)", good.label);
+    var neither_buf: LabelBuffer = undefined;
+    const neither = fromParts(.fx_login, "token", "team 123", "\xe2\x80\xaeslug", null, &neither_buf).?;
+    try std.testing.expectEqualStrings("no team (fx login)", neither.label);
 }

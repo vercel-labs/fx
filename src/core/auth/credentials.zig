@@ -133,6 +133,19 @@ pub const CatalogAccess = union(enum) {
         };
     }
 
+    /// The same access with another token for the same sign-in, such as one
+    /// renewed after the first was rejected. Public access is unchanged.
+    pub fn withCredential(self: CatalogAccess, credential: []const u8) CatalogAccess {
+        return switch (self) {
+            .authenticated => |access| blk: {
+                var renewed = access;
+                renewed.credential = credential;
+                break :blk .{ .authenticated = renewed };
+            },
+            .public_only, .host_managed => self,
+        };
+    }
+
     pub fn withExplicitAuthority(self: CatalogAccess) CatalogAccess {
         return switch (self) {
             .public_only => |access| .{ .public_only = access },
@@ -735,6 +748,18 @@ fn loadStoredFxLoginCredential(alloc: std.mem.Allocator) !?Credential {
     var session = (try oauth_session.load(alloc)) orelse return null;
     defer session.deinit(alloc);
     return takeCredentialFromSession(&session, null);
+}
+
+/// Reads the stored credential of a source fx can refresh, as saved, and
+/// never calls the issuer, even for an expired one. Null for every other
+/// source and when nothing is stored. The caller owns the result.
+pub fn loadStoredSource(alloc: std.mem.Allocator, source: Source) !?Credential {
+    return switch (source) {
+        .fx_login => loadStoredFxLoginCredential(alloc),
+        .chatgpt_subscription => loadStoredChatGptCredential(alloc),
+        .grok_subscription => loadStoredGrokCredential(alloc),
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => null,
+    };
 }
 
 pub fn refreshFxLoginCredential(
@@ -1540,6 +1565,27 @@ const FxLoginRefreshProbe = struct {
         };
     }
 };
+
+test "the stored fx login is read as saved, without a refresh" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+
+    // The session is expired, and the issuer is unreachable: a refresh would fail.
+    var stored = (try loadStoredSource(alloc, .fx_login)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("access", stored.token);
+    try std.testing.expectEqual(Source.fx_login, stored.source);
+    try std.testing.expectEqualStrings("team-id", stored.gatewayTeam().?);
+
+    var persisted = (try oauth_session.load(alloc)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("rejected-refresh", persisted.refresh_token);
+
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured }) |source| {
+        try std.testing.expect((try loadStoredSource(alloc, source)) == null);
+    }
+}
 
 test "an invalid fx login refresh retires the rejected session" {
     const alloc = std.testing.allocator;

@@ -193,8 +193,9 @@ pub const AgentsMenuRow = struct {
     nested: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
-    /// The agent profile it runs in.
-    profile: []const u8,
+    /// The agent profile it runs in, or empty for the main one, which the
+    /// list leaves unnamed.
+    profile: []const u8 = "",
     /// What it is doing, such as "needs approval".
     state: []const u8,
     state_tone: AgentStateTone = .idle,
@@ -219,8 +220,8 @@ pub const AgentsMenuProjection = struct {
     selected_instance: bool = false,
     /// The first Delete armed the selected row's close.
     close_armed: bool = false,
-    /// What the user typed to search the list; `rows` holds the agents that
-    /// match it.
+    /// What the user typed in the composer to search the list; `rows` holds
+    /// the agents that match it.
     search: []const u8 = "",
 
     /// A search that matches nothing still shows the list, with no rows.

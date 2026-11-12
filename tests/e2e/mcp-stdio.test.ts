@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -80,6 +81,7 @@ type RootOptions = {
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "invalid_params"
     | "image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
@@ -106,7 +108,8 @@ type RootOptions = {
     | "startup_exit"
     | "startup_exit_after_delay"
     | "startup_garbage"
-    | "exit_after_result";
+    | "exit_after_result"
+    | "typed_arguments";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
   operationTimeoutMs?: number;
@@ -1630,6 +1633,103 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
+  test("typed MCP arguments the model wrote as text reach the server as their schema's types", async () => {
+    const root = createRoot("typed-arguments-repaired", MODERN_FIXTURE, { mode: "typed_arguments" });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("typed_call", "toolbox", {
+        run: TOOL_NAME,
+        arguments: {
+          text: "40",
+          limit: "40",
+          count: "7",
+          verbose: "true",
+          queries: "[\"sum:requests{*}\"]",
+          filter: "{\"env\":\"prod\"}",
+          either: "40",
+        },
+      }),
+      fakeGatewayFinalText("Typed MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Typed MCP arguments complete.");
+    const wire = readWire(root.wireLogPath);
+    // Only the string fields keep the model's text.
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([{
+        text: "40",
+        limit: 40,
+        count: 7,
+        verbose: true,
+        queries: ["sum:requests{*}"],
+        filter: { env: "prod" },
+        either: "40",
+      }]);
+    const typedResult = toolResultText(gateway.requests[2]!.body, "typed_call");
+    expect(typedResult).toContain("TYPED_ARGUMENTS_OK");
+    expect(typedResult).not.toContain("-32602");
+    // One trace line per changed field, with no argument values in it.
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    const repaired = trace.split("\n").filter((line) => line.includes("MCP argument sent as its schema's type"));
+    expect(repaired.map((line) => line.match(/field=(\S+) type=(\S+)/)?.slice(1))).toEqual([
+      ["limit", "number"],
+      ["count", "integer"],
+      ["verbose", "boolean"],
+      ["queries", "array"],
+      ["filter", "object"],
+    ]);
+    for (const line of repaired) {
+      expect(line).toContain("server=fixture tool=echo");
+      expect(line).not.toContain("requests");
+      expect(line).not.toContain("prod");
+    }
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("MCP arguments that aren't their schema's type reach the server as the model wrote them", async () => {
+    const root = createRoot("typed-arguments-kept", MODERN_FIXTURE, { mode: "typed_arguments" });
+    const sent = {
+      text: "true",
+      limit: "forty",
+      count: "4.5",
+      verbose: "True",
+      queries: "[\"unclosed\"",
+      filter: "[1]",
+      either: "40",
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("kept_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("kept_call", "toolbox", { run: TOOL_NAME, arguments: sent }),
+      fakeGatewayFinalText("Kept MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([sent]);
+    // The server's own error reaches the model.
+    const keptResult = toolResultText(gateway.requests[2]!.body, "kept_call");
+    expect(keptResult).toContain("-32602");
+    expect(keptResult).toContain("validating /properties/limit");
+    expect(readFileSync(root.traceLogPath, "utf8")).not.toContain("MCP argument sent as its schema's type");
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
   test("successful discovery selects the latest legacy version from an oldest-first list", async () => {
     const root = createRoot("legacy-discovery-oldest-first", LEGACY_FIXTURE, {
       legacyVersion: "2025-11-25",
@@ -2325,6 +2425,58 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await expectFixtureProcessesExited(wire);
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
+    async () => {
+      // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx
+      // negotiate the protocol again.
+      const root = createRoot("tui-invalid-params", LEGACY_FIXTURE, {
+        mode: "invalid_params",
+        legacyVersion: "2025-06-18",
+      });
+      const activeGateway = startToolGateway("Rejected arguments complete.");
+      gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 32,
+        stderrPath,
+        // /trace writes its report to TMPDIR.
+        env: { ...fixtureEnv(root, activeGateway), TMPDIR: root.root },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture with a typed argument.");
+      const cause = "arguments rejected: limit is a string, the schema wants a number";
+      await tui.waitForText(`Failed ${TOOL_NAME}: ${cause}`, 20_000);
+      await tui.waitForText("Rejected arguments complete.", 20_000);
+      // The model still gets the server's own words, which say how to fix the call.
+      expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
+
+      await tui.sendText("/trace");
+      let reports: string[] = [];
+      const deadline = Date.now() + 15_000;
+      while (reports.length === 0 && Date.now() < deadline) {
+        reports = readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"));
+        if (reports.length === 0) await Bun.sleep(50);
+      }
+      expect(reports).toHaveLength(1);
+      const report = readFileSync(join(root.root, reports[0]!), "utf8");
+      const problems = report.split("## Problems")[1]?.split("\n## ")[0] ?? "";
+      expect(problems).toContain(`cause="${cause}"`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(wire);
+    },
+    45_000,
   );
 
   test.skipIf(!tmuxAvailable())(
