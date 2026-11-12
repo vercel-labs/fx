@@ -50,6 +50,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
+const turn_capture = @import("../core/workspace/turn_capture.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_steering = @import("libfx_steering.zig");
@@ -730,6 +731,7 @@ fn callHostTool(
     defer response.deinit(state.alloc);
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
     if (response.cancelled) {
+        if (state.active_session) |*session| session.turn_cancel.store(true, .seq_cst);
         if (cancel_flag) |flag| flag.store(true, .seq_cst);
         return error.Cancelled;
     }
@@ -1366,6 +1368,7 @@ pub fn runSubagentChild(
         .context_enabled = state.context_enabled,
         .project_context = state.context_snapshot.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
+        .workspace_capture = childCaptureTarget(state),
     }, turn, message, admission, cancel);
 }
 
@@ -1941,6 +1944,12 @@ fn acpCacheWarmer(state: *server.ServerState, session: *server.ActiveSessionStat
 
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
+    session.capture_home = if (!ctx.state.workspace_capture)
+        null
+    else if (server.sessionsStore(ctx.state)) |store|
+        store.home
+    else
+        null;
     return .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
@@ -1983,6 +1992,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .record_usage = if (session.v2 != null) recordUsage else null,
         .cache_warmer = acpCacheWarmer(ctx.state, session),
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
+        .start_workspace_capture = if (comptime !turn_capture.supported) null else if (session.v2 != null and session.capture_home != null) startWorkspaceCapture else null,
+        .reach_workspace = if (comptime !turn_capture.supported) null else if (session.v2 != null and session.capture_home != null) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
             .{
@@ -2102,6 +2113,7 @@ fn takeSteeringBoundary(
 fn cancelOnHostSteeringClosed(ctx: *AcpContext) void {
     if (!ctx.saw_host_steering_open or ctx.closed_host_steering) return;
     const session = if (ctx.state.active_session) |*active| active else return;
+    session.turn_cancel.store(true, .seq_cst);
     if (session.cancel_flag.swap(true, .seq_cst)) return;
     debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=host_steering_closed", .{});
 }
@@ -2864,6 +2876,68 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
     try v2.recordUsage(usage);
 }
 
+/// Where a subagent's captures go: the store's home and the active
+/// session's folder, while captures are on.
+fn childCaptureTarget(state: *server.ServerState) ?turn_capture.Target {
+    if (comptime !turn_capture.supported) return null;
+    if (!state.workspace_capture) return null;
+    const store = server.sessionsStore(state) orelse return null;
+    const path = if (state.active_session) |*active| active.workspace_root else state.workspace_root;
+    return .{ .home = store.home, .path = path };
+}
+
+/// What a workspace capture of `session` needs, or null when captures are
+/// off or the session is not saved. A cancel that stops the turn ends a
+/// capture early; a steer that cuts the reply short does not
+/// (`ActiveSessionState.turn_cancel`).
+fn workspaceCaptureContext(session: *server.ActiveSessionState) ?turn_capture.Context {
+    const v2 = session.v2 orelse return null;
+    const home = session.capture_home orelse return null;
+    return .{ .session = v2, .home = home, .path = session.workspace_root, .alloc = std.heap.c_allocator, .cancel = &session.turn_cancel };
+}
+
+test "an ACP session's workspace captures watch its turn cancel, not the flag a steer sets" {
+    var session = server.ActiveSessionState{
+        .session_id = @constCast("session"),
+        .model = @constCast("model"),
+        .mode = "default",
+        .workspace_root = "/tmp/workspace",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+        // Only its address is taken.
+        .v2 = @ptrFromInt(@alignOf(session_adapter.Session)),
+        .capture_home = "/tmp/home",
+    };
+    const context = workspaceCaptureContext(&session).?;
+    try std.testing.expectEqual(@as(?*const std.atomic.Value(bool), &session.turn_cancel), context.cancel);
+}
+
+fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    const context = workspaceCaptureContext(session) orelse return;
+    switch (step) {
+        .begin => session.turn_capture.begin(context, fresh),
+        .capture => session.turn_capture.start(context, &session.session_write_mutex),
+    }
+}
+
+fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    const context = workspaceCaptureContext(session) orelse return;
+    session.turn_capture.reach(context, dir, tool_name, &session.session_write_mutex);
+}
+
 /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become
 /// the session's blobs before its first request (D89). A failure leaves the
 /// rest inline, with no path, as the adapter does for one image the store
@@ -3095,6 +3169,12 @@ fn persistAcpHistoryTurn(
     current_prompt_input: ?*ParsedPromptInput,
     hand_back_alloc: ?Allocator,
 ) !void {
+    // The repository as the turn left it, captured before the write lock.
+    // An earlier turn committed as the next prompt starts still holds its
+    // own token: the next turn's starts later (D98).
+    if (comptime turn_capture.supported) {
+        if (workspaceCaptureContext(session)) |context| _ = session.turn_capture.end(context, &session.session_write_mutex);
+    }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
@@ -3116,11 +3196,17 @@ fn persistAcpHistoryTurn(
     }
     if (session.v2) |v2| {
         try v2.prepareTurn(&prepared);
-        v2.commitTurn(prepared, session.session_rt.languageSnapshot()) catch |err| {
+        const capture_token = session.turn_capture.token();
+        const committed = if (capture_token) |token|
+            v2.commitTurnWithCaptures(prepared, session.session_rt.languageSnapshot(), token)
+        else
+            v2.commitTurn(prepared, session.session_rt.languageSnapshot());
+        committed catch |err| {
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
             return err;
         };
+        session.turn_capture.committed(capture_token);
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();

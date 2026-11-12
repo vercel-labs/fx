@@ -262,6 +262,9 @@ pub const StartupState = struct {
     /// Resolved `cache_warming` preference.
     cache_warming: bool = true,
     notification_turn_end: bool = false,
+    /// `experimental.workspace_capture`: capture the repository at each
+    /// turn's start and end.
+    workspace_capture: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
@@ -944,6 +947,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
+    state.workspace_capture = settings.experimental_workspace_capture orelse false;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
 }

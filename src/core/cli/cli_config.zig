@@ -449,16 +449,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",     "auto_upgrade",           "cache_warming",
-    "collapse_tool_calls",      "context",                "effort",
-    "fast_mode",                "first_call_tool_choice", "max_agent_steps",
-    "max_tool_result_bytes",    "permission_mode",        "prompt_history.enabled",
-    "provider",                 "provider_order",         "provider_strict",
-    "review_model",             "session_titles",         "slash_menu_categories",
-    "sound.attention_required", "sound.max",              "sound.turn_end",
-    "startup_scrollback",       "status_line.context",    "status_line.session",
-    "status_line.workspace",    "theme",                  "ultrafast_mode",
-    "update_channel",
+    "auto_compact_percent",           "auto_upgrade",             "cache_warming",
+    "collapse_tool_calls",            "context",                  "effort",
+    "experimental.workspace_capture", "fast_mode",                "first_call_tool_choice",
+    "max_agent_steps",                "max_tool_result_bytes",    "permission_mode",
+    "prompt_history.enabled",         "provider",                 "provider_order",
+    "provider_strict",                "review_model",             "session_titles",
+    "slash_menu_categories",          "sound.attention_required", "sound.max",
+    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
+    "status_line.session",            "status_line.workspace",    "theme",
+    "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -487,6 +487,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
     if (eql(u8, key, "effort")) return string(state.effort.label());
+    if (eql(u8, key, "experimental.workspace_capture")) return boolean(state.workspace_capture);
     if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
     if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());
     if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);

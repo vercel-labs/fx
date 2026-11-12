@@ -1936,6 +1936,121 @@ as it was sent):
     `turn_interrupted`, counts for nothing. In every other turn it takes
     the newest capture for each repository and phase.
   - **Older fx:** an fx from before D98 leaves the item out (D17).
+  - **Callers:** `fx ask`, every app instance and ACP capture the
+    repository holding the session's folder at each turn's start and end
+    while the profile setting `experimental.workspace_capture` is on
+    (`src/core/workspace/turn_capture.zig`). A subagent captures its own
+    turns into its own session, so captures of work it does after its
+    parent's turn are still its turns': through its own agent in the app,
+    through `execution.TurnContext` in `fx ask` and ACP. The libfx
+    WebAssembly builds do not capture. Before an admitted tool acts in
+    another repository, the turn takes that repository's start capture,
+    with the tool in `trigger_tool`, and its end capture closes the turn
+    with the others.
+  - **Host order:** the runtime begins the turn's token, then saves the
+    user's prompt through `append_turn_piece`, then takes the start
+    capture, all before the first request. The prompt's write opens the
+    turn for the token, so the start capture is written in it at once, and
+    a process killed during the capture, which can take seconds, keeps the
+    prompt. The end capture runs on the turn's own thread before the
+    commit. In the app that is the agent's worker, as the turn finishes and
+    before its finished prompt reaches the UI, so the UI's commit, which
+    may run late in the pacer, only writes what is held. The end capture
+    returns the turn's token and the worker puts it on the finished prompt
+    (`FinishedPrompt.capture_turn`), so the UI commits each turn with its
+    own token and never asks `TurnCapture` for one; a turn the UI commits
+    that carries no token, such as a local command's, takes no captures.
+    `fx ask`, ACP and a subagent commit on the turn's own thread right
+    after its end capture, with the current turn's token. A host commits
+    with the token only once the turn's end capture is taken.
+  - **Prompt after the end:** in the app, a prompt sent while the
+    previous answer is still drawn reaches the runtime after the worker
+    took that turn's end capture and before the UI committed it, as a
+    steering message or as an ordinary prompt, by timing. Either begins a
+    new token, takes its own start capture and later its end, as a fresh
+    turn does; a steering message inside a turn still running adds
+    nothing. The UI's late commit of the ended turn
+    uses the token its finished prompt carries, never the new one. The new token begins
+    with `beginCaptureTurnKeeping` and the ended token, so the adapter keeps
+    the ended turn's captures for that commit beside the new turn's: each
+    capture carries its token, a commit takes only its own token's
+    captures, and the write that opens a turn takes only its opener's held
+    starts. A supersede on either side, as when the new turn's stream
+    replaces the ended turn's open turn and the late commit replaces the
+    new one's, marks every capture unwritten, and each turn writes its
+    starts again in the turn it commits in. At most one ended turn waits:
+    when a second turn ends and the next prompt begins a third token
+    before the UI commits the first, the adapter keeps the second and
+    drops the first's captures with the `superseded_token` trace. The
+    first turn's commit then writes no captures, the second's and third's
+    each write their own, and no commit ever writes another turn's. A
+    turn that never took its end capture, abandoned when a fresh prompt
+    begins, is never kept, and its captures drop as before. `fx ask`, ACP
+    and a subagent commit each turn before the next begins, so nothing is
+    left ended for the next prompt to keep there.
+  - **Reached repositories:** a turn captures at most 8 repositories
+    besides the session's own. Parallel tool calls that reach different
+    repositories capture at the same time; a call that reaches one whose
+    start capture is still running waits until it is saved. A repository
+    whose worktree root is `/`, the home folder (`$HOME` or the session
+    store's home), or an ancestor of it is never captured, so a home
+    folder kept as a dotfiles repository stays out of fx's store; the
+    trace records the skip. The same rule covers the session's own
+    repository: a session whose folder lies in such a repository records
+    its start and end as `unavailable` with reason `private_root` and takes
+    no tree. A captured tree never holds fx's own folder, `~/.fx` or
+    `$FX_HOME`, when the work tree holds it: its files are left out as
+    `sensitive`. The worktree root is found as the footer's
+    branch is (`src/core/workspace/repo_root.zig`): a `.git` that is a
+    symlink or not a directory or gitdir file means no repository.
+  - **Fork:** while captures are on, a fork gives the fork's id, and each
+    copied subagent's copy, the source's capture refs
+    (`capture_store.copySessionRefs`), so retention keeps the captures the
+    fork's log names after the source's are evicted. The app copies them
+    in a `std.Io` task, so the fork never waits on git; its owner finishes
+    the task at teardown. The copy starts only once the fork is committed,
+    after the app prepares to switch to it.
+  - **First capture:** each capture stops at 2 s, but the first capture of
+    a worktree whose store or capture index is new runs until 10 s after
+    its setup begins (`first_capture_budget_ms`): it creates them and
+    writes every object the new store lacks, which a large repository
+    cannot do in 2 s. That turn may wait up to 10 s once per worktree;
+    later captures keep 2 s.
+  - **Space budget:** a capture never waits for retention's maintenance.
+    Its 2 s also bound the check of the space the captures folder takes
+    (`capture_retention.check`), which reads `captures/usage` and walks
+    only the stores that changed. Over the 5 GiB budget with maintenance
+    due, the check starts maintenance as a background `std.Io` task, one
+    per process (`turn_capture.Maintenance`), and the capture is recorded
+    `unavailable` with reason `budget` at once; a check that runs out of
+    time hands the measure to the same task and records `timeout`. Every
+    capture is refused as `budget` while that task runs, without measuring,
+    and captures are admitted again once it brings the space under the
+    target. The task holds `captures/maintenance.lock`, opens its own
+    session store, and has 30 s. `fx ask`, the app and the ACP server end
+    it as the process ends: it gets 3 s to finish, then is cancelled, stops
+    at its next step, and records no maintenance time, so the next capture
+    can start it again. A cancel that lands while maintenance reads a
+    folder or a file is handed back to the task (`std.Io.recancel`), so its
+    next git run stops too and the process ends within those 3 s. Each prune takes only
+    unreachable objects older than the moment maintenance took the store's
+    every capture lock, so a prune still running after fx dies cannot
+    delete an object a new capture wrote.
+  - **Cancel:** a cancel that stops the turn (Ctrl+C in the app or
+    `fx ask`, an approval's cancel, ACP `session/cancel` or the client's
+    closed steering, a subagent's cancel) ends a capture in flight. Each
+    host keeps it in its own flag (`WorkerRuntime.turn_cancel_requested`,
+    ACP's `turn_cancel`, `fx ask`'s interrupt, the subagent run's cancel),
+    apart from the flag a steer or a subagent's report sets to interrupt
+    the model, or an image or `$skill` sets to end the turn so it runs
+    next: a follow-up sent during a capture leaves it running. The capture runs as a `std.Io` task that the turn's thread
+    watches every 10 ms; on cancel the task is cancelled, which stops the
+    git run in flight at once (safe_git ends its process group and passes
+    the cancel on), and a capture that wrote no commit is recorded
+    `unavailable` with reason `cancelled`. A cancel that reaches the
+    capture outside a git run stops it at its next one, or at its
+    deadline. A capture begun after the cancel, such as a cancelled turn's
+    end capture, is recorded `cancelled` without running.
 
   **Why:** a capture belongs to its turn: it must survive a resume and a
   fork with it and never move the turn's streamed prefix. A start written

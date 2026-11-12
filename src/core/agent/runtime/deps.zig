@@ -194,6 +194,9 @@ pub const RefreshedGatewayCredential = struct {
 };
 
 pub const AgentRuntimeDeps = struct {
+    /// The steps of `start_workspace_capture`.
+    pub const WorkspaceCaptureStep = enum { begin, capture };
+
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -275,6 +278,20 @@ pub const AgentRuntimeDeps = struct {
     /// the caller's. An image the session cannot save keeps its bytes
     /// inline and gets no path.
     save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
+    /// Captures the repository the session works in as the turn starts,
+    /// before any request or tool, when `experimental.workspace_capture` is
+    /// on (D98, `src/core/workspace/turn_capture.zig`). The runtime calls it
+    /// twice: `.begin` takes the turn's capture token, then, once the
+    /// user's prompt is saved through `append_turn_piece`, `.capture` takes
+    /// the start capture, which can take seconds, so a kill during it keeps
+    /// the prompt. `fresh` is false for a steering message inside the turn,
+    /// which keeps the turn's capture. It never fails the turn.
+    start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
+    /// An admitted tool is about to act in `dir`: a command's working folder
+    /// or the folder of the file a mutation writes. Captures a repository the
+    /// turn had not reached yet before the action runs (D98). Never fails
+    /// the call.
+    reach_workspace: ?*const fn (ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void = null,
     /// Confirms, without writing, that this process still owns the saved
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
@@ -337,6 +354,7 @@ pub const AgentRuntimeDeps = struct {
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        if (self.reach_workspace) |reach| if (reachedDirectory(request.authority)) |dir| reach(self.ctx, dir, request.call.name);
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;
         observed_request.observer = self.observer orelse request.observer;
@@ -358,6 +376,28 @@ pub const AgentRuntimeDeps = struct {
     }
 };
 
+/// The folder an admitted action works in, from its typed authority: a
+/// command's resolved working folder, or the folder of a mutation's
+/// canonical target. Permission text is never parsed for a path (D98).
+fn reachedDirectory(authority: command_admission.ToolExecutionAuthority) ?[]const u8 {
+    return switch (authority) {
+        .run_command => |command| switch (command) {
+            .direct_only => |fingerprint| fingerprint.resolved_cwd,
+            .shell_allowed => |allowed| allowed.fingerprint.resolved_cwd,
+        },
+        .file_mutation => |mutation| std.Io.Dir.path.dirname(mutation.policy_targets.canonical_target_path),
+        .ordinary, .vision_paths => null,
+    };
+}
+
 fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
     return error.TerminalLeaseCleanupUnavailable;
+}
+
+test "a reached directory comes only from a command's or a mutation's typed authority" {
+    const fingerprint: command_admission.AdmissionFingerprint = .{ .command = "make", .resolved_cwd = "/repo/sub", .target_os = .linux };
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .direct_only = fingerprint } }).?);
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = .auto_mode } } }).?);
+    try std.testing.expect(reachedDirectory(.ordinary) == null);
+    try std.testing.expect(reachedDirectory(.{ .vision_paths = .{ .targets = &.{} } }) == null);
 }

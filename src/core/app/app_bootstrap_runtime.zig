@@ -592,6 +592,9 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             agent.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
             agent.worker.agent_turn_settings.effort = startup.effort;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                agent.session_persistence.workspace_capture = startup.workspace_capture;
+            }
             // Worker-owned memory uses the C allocator, matching worker deinit.
             try agent.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;

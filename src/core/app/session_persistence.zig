@@ -15,6 +15,7 @@ const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -894,6 +895,13 @@ pub const Persistence = struct {
     /// session closes; the new session starts with it.
     next_session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
+    /// The current turn's workspace captures (D98).
+    turn_capture: turn_capture.TurnCapture = .{},
+    /// Forks' capture copies still running or not yet reaped, off the UI
+    /// thread (D98); finished at teardown.
+    fork_copies: std.ArrayList(*turn_capture.ForkCopy) = .empty,
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_provider_override: ?model_provider.ProviderId = null,
@@ -934,7 +942,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 32) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 35) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -946,6 +954,9 @@ pub const Persistence = struct {
         storage.session_preferences = null;
         storage.next_session_preferences = null;
         storage.fast_mode_model_bound = false;
+        storage.workspace_capture = false;
+        storage.turn_capture = .{};
+        storage.fork_copies = .empty;
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_provider_override = null;
@@ -977,6 +988,26 @@ pub const Persistence = struct {
         self.deinitWithCatalog(alloc, .free);
     }
 
+    /// Copies a fork's workspace captures as a `std.Io` task, so the fork
+    /// never waits on git (D98), and frees the copies already done.
+    pub fn startForkCaptureCopy(self: *Persistence, alloc: Allocator, home: []const u8, source_id: []const u8, fork: *session_adapter.Session, copies: []const session_adapter.Session.ChildCopy) void {
+        var kept: usize = 0;
+        for (self.fork_copies.items) |copy| {
+            if (copy.done()) {
+                copy.finish();
+            } else {
+                self.fork_copies.items[kept] = copy;
+                kept += 1;
+            }
+        }
+        self.fork_copies.shrinkRetainingCapacity(kept);
+        const task = turn_capture.ForkCopy.start(home, source_id, fork, copies) orelse return;
+        self.fork_copies.append(alloc, task) catch |err| {
+            debug_trace.logf("workspace", "event=workspace_capture_fork_refs_awaited err={s}", .{@errorName(err)});
+            task.finish();
+        };
+    }
+
     /// Process exit leaves the session picker catalog to the exiting process;
     /// freeing thousands of cached sessions one by one only delays exit.
     pub fn deinitForProcessExit(self: *Persistence, alloc: Allocator) void {
@@ -1005,6 +1036,9 @@ pub const Persistence = struct {
             alloc.destroy(children);
         }
         if (self.v2) |v2| v2.close();
+        for (self.fork_copies.items) |copy| copy.finish();
+        self.fork_copies.deinit(alloc);
+        self.turn_capture.deinit();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.next_session_preferences) |*preferences| preferences.deinit(alloc);

@@ -5467,7 +5467,9 @@ test {
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/workspace_capture.zig");
     _ = @import("core/workspace/capture_store.zig");
+    _ = @import("core/agent/runtime/deps.zig");
     _ = @import("core/workspace/capture_retention.zig");
+    _ = @import("core/workspace/turn_capture.zig");
     _ = @import("core/shared/repo_path.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
@@ -5512,6 +5514,8 @@ test {
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
+    _ = @import("core/workspace/repo_root.zig");
+    _ = @import("core/workspace/statusline_identity.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/execution/process_identity.zig");

@@ -370,6 +370,50 @@ pub const Store = struct {
         return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
     }
 
+    /// Every saved session's id, children included, owned by `arena`; null
+    /// when the catalog cannot be read. Capture retention matches sessions
+    /// to their capture refs with it (D98). The catalog lists roots only,
+    /// so each session's children come from its folded state, as `peek`
+    /// reads it, down to the depth `Manager.delete` follows; a session
+    /// deleted meanwhile is skipped, and any other failure returns null.
+    pub fn sessionIds(store: *Store, arena: Allocator) ?[]const []const u8 {
+        var ids: std.ArrayList([]const u8) = .empty;
+        var cursor: ?sm.ListCursor = null;
+        while (true) {
+            var page = store.manager.list(arena, .all, cursor, 512) catch return null;
+            defer page.deinit();
+            for (page.items) |item| {
+                const id = arena.dupe(u8, item.id) catch return null;
+                ids.append(arena, id) catch return null;
+            }
+            cursor = page.next orelse break;
+        }
+        // Breadth first: each level's children follow the level before.
+        var level_start: usize = 0;
+        var depth: usize = 0;
+        while (level_start < ids.items.len and depth <= 8) : (depth += 1) {
+            const level_end = ids.items.len;
+            for (level_start..level_end) |index| {
+                var peeked = store.manager.peek(arena, ids.items[index]) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return null,
+                };
+                defer peeked.deinit(arena);
+                for (peeked.state.children.items) |child| {
+                    const id = arena.dupe(u8, child.id) catch return null;
+                    ids.append(arena, id) catch return null;
+                }
+            }
+            level_start = level_end;
+        }
+        return ids.items;
+    }
+
+    /// Whether another process has session `id` open; true when unsure.
+    pub fn sessionBusy(store: *Store, id: []const u8) bool {
+        return store.manager.isBusy(id) catch true;
+    }
+
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
@@ -6623,6 +6667,31 @@ test "a child opens under the id its parent names, and its parent folds its line
     var page = try t.store.manager.list(alloc, .all, null, 10);
     defer page.deinit();
     try testing.expectEqual(@as(usize, 1), page.items.len);
+}
+
+test "capture retention's catalog lists a child beside its parent (D98)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate this", "delegated"), types.ConversationLanguage.default());
+    const child_id = "1786460757753-kid";
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1" } }});
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Be brief."));
+        defer child.close();
+        try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+    }
+    // The session list holds the parent only; the catalog adds its child.
+    var ids_arena = std.heap.ArenaAllocator.init(alloc);
+    defer ids_arena.deinit();
+    const ids = t.store.sessionIds(ids_arena.allocator()).?;
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqualStrings(parent.id(), ids[0]);
+    try testing.expectEqualStrings(child_id, ids[1]);
 }
 
 test "the manager guards child lines, and a child without a log reopens under its id (D22, D34)" {

@@ -82,6 +82,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/shell_command/safe_git.zig", "(?:plainOutput|ready|expectOk|expectFacts)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/workspace/capture_store.zig", "(?:gitEnv|expectRestores|printOutcome|expectExcluded)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/session/session_adapter.zig", "expectLines", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/workspace/turn_capture.zig", "runGit", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
 ];
 
