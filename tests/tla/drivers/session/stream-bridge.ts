@@ -149,6 +149,7 @@ const TRACE_CFG = [
   "  Compactions = TRUE",
   "  Recovery = FALSE",
   "  Faults = FALSE",
+  "  FailedCommits = FALSE",
   '  Mutant = "none"',
   "INIT TraceInit",
   "NEXT TraceNext",
