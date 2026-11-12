@@ -1161,6 +1161,9 @@ const App = struct {
         // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
+        // The suspend restore turned theme notifications off, and the theme
+        // may have changed while fx was stopped.
+        self.terminal_input_runtime.terminal_theme_monitor.requestRearm();
     }
 
     pub fn ensurePromptCredential(self: *App, agent: *agents.Agent) !bool {
@@ -3211,6 +3214,15 @@ const App = struct {
                     @tagName(request),
                     @errorName(err),
                 });
+            };
+        }
+        if (self.terminal_input_runtime.terminal_theme_monitor.takeRearmRequest(now_ms)) {
+            debug_trace.logf("theme", "theme_notifications_rearmed", .{});
+            self.terminal.enableThemeNotifications() catch |err| {
+                debug_trace.logf("theme", "theme_notification_enable_failed err={s}", .{@errorName(err)});
+            };
+            self.terminal.requestThemeColorScheme() catch |err| {
+                debug_trace.logf("theme", "theme_color_scheme_query_failed err={s}", .{@errorName(err)});
             };
         }
     }

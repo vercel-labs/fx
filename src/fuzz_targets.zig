@@ -24,6 +24,7 @@ test {
     _ = @import("core/mcp/elicitation.zig");
     _ = @import("core/mcp/features/tools.zig");
     _ = @import("core/tooling/toolbox.zig");
+    _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/credentials.zig");

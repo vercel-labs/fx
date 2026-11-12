@@ -12,6 +12,7 @@ const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const mcp_tool_result = @import("../../mcp/tool_result.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -1528,7 +1529,10 @@ fn failureStatusDetail(
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
-    const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    // A refused call's parameters read as which fields and types, not as the
+    // start of a protocol dump; the model still gets the server's own words.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
