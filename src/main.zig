@@ -5906,11 +5906,18 @@ fn sendTerminalKey(app: *App, key: []const u8, count: usize) !void {
 fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []const u8) !void {
     const armed: ?*app_agents_runtime.ChildAgent = if (app.instances.agents_menu.close_armed) |listed| listed.agent else null;
     if (armed == expected) return;
-    std.debug.print("after {s}: a close is armed for {s}, not for {s}\n", .{
+    const alloc = std.testing.allocator;
+    const want = try std.fmt.allocPrint(alloc, "after {s}: a close is armed for {s}", .{
         step,
-        if (armed) |child| child.displayName() else "nothing",
         if (expected) |child| child.displayName() else "nothing",
     });
+    defer alloc.free(want);
+    const got = try std.fmt.allocPrint(alloc, "after {s}: a close is armed for {s}", .{
+        step,
+        if (armed) |child| child.displayName() else "nothing",
+    });
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
     return error.TestUnexpectedResult;
 }
 
