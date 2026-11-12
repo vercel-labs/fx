@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const update_target = @import("update_target.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -175,48 +176,108 @@ fn clearConnection(control: TransferControl) void {
     slot.clear();
 }
 
+/// A loopback test server whose thread accepts one connection, publishes it
+/// to `slot`, and reads from it until the slot's interrupt shuts it down.
+const InterruptedReadServer = struct {
+    server: std.Io.net.Server = undefined,
+    slot: TransferInterrupt = .{},
+    serving: testing_listener.ServerThread = .{},
+    /// Set once the thread has published its connection to `slot`, just
+    /// before it reads.
+    published: std.atomic.Value(bool) = .init(false),
+    woke_ms: std.atomic.Value(i64) = .init(0),
+
+    /// Listens on a free loopback port and starts the thread. The server
+    /// must not move until `deinit` returns.
+    fn start(self: *InterruptedReadServer) !void {
+        const zio = io_mod.getIo();
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.server = try addr.listen(zio, .{});
+        errdefer self.server.deinit(zio);
+        self.serving.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn stop(self: *InterruptedReadServer, limit_ms: u32) !void {
+        try self.serving.stop(&self.server, limit_ms);
+    }
+
+    /// Stops the thread if the test has not, then closes the listener.
+    fn deinit(self: *InterruptedReadServer) void {
+        self.stop(5_000) catch {};
+        self.server.deinit(io_mod.getIo());
+    }
+
+    fn connect(self: *InterruptedReadServer) !std.Io.net.Stream {
+        return self.server.socket.address.connect(io_mod.getIo(), .{ .mode = .stream });
+    }
+
+    fn run(self: *InterruptedReadServer) void {
+        defer self.serving.done.store(true, .seq_cst);
+        const z = io_mod.getIo();
+        const conn = (self.serving.accept(&self.server, z) catch return) orelse return;
+        defer self.serving.close(z, conn);
+        self.slot.publish(conn.socket.handle);
+        defer self.slot.clear();
+        self.published.store(true, .seq_cst);
+        var buf: [16]u8 = undefined;
+        var stream_reader = conn.reader(z, &buf);
+        // Blocks until the interrupt shuts the socket down.
+        _ = stream_reader.interface.takeByte() catch {};
+        self.woke_ms.store(io_mod.milliTimestamp(), .release);
+    }
+};
+
 test "transfer interrupt wakes a blocked socket read" {
     if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
-    const zio = io_mod.getIo();
-    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(zio, .{});
-    defer server.deinit(zio);
+    var reader: InterruptedReadServer = .{};
+    try reader.start();
+    defer reader.deinit();
+    const client = try reader.connect();
+    defer client.close(io_mod.getIo());
 
-    const Ctx = struct {
-        server: *std.Io.net.Server,
-        slot: *TransferInterrupt,
-        woke_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    };
-    var slot: TransferInterrupt = .{};
-    var ctx: Ctx = .{ .server = &server, .slot = &slot };
-    const reader = try std.Thread.spawn(.{}, struct {
-        fn run(c: *Ctx) void {
-            const z = io_mod.getIo();
-            const conn = c.server.accept(z) catch return;
-            defer conn.close(z);
-            c.slot.publish(conn.socket.handle);
-            defer c.slot.clear();
-            var buf: [16]u8 = undefined;
-            var stream_reader = conn.reader(z, &buf);
-            // Blocks until the interrupt shuts the socket down.
-            _ = stream_reader.interface.takeByte() catch {};
-            c.woke_ms.store(io_mod.milliTimestamp(), .release);
-        }
-    }.run, .{&ctx});
-
-    const client = try server.socket.address.connect(zio, .{ .mode = .stream });
-    defer client.close(zio);
-
+    // Interrupt only once the thread holds the connection, so that the
+    // interrupt reaches its read.
+    if (!testing_listener.waitFor(&reader.published, 5_000)) return error.TestConnectionNotPublished;
     const started_ms = io_mod.milliTimestamp();
-    io_mod.sleep(100 * std.time.ns_per_ms);
-    slot.interrupt();
-    reader.join();
-    const woke_ms = ctx.woke_ms.load(.acquire);
+    reader.slot.interrupt();
+    try reader.stop(5_000);
+    const woke_ms = reader.woke_ms.load(.acquire);
     try std.testing.expect(woke_ms != 0);
     try std.testing.expect(woke_ms - started_ms < 2000);
 
     // Interrupting an idle slot is a no-op.
-    slot.interrupt();
+    reader.slot.interrupt();
+}
+
+test "the interrupted read server stops when no client connects" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var reader: InterruptedReadServer = .{};
+    try reader.start();
+    defer reader.deinit();
+    // Stop it once its thread is waiting for the client that never comes.
+    io_mod.sleep(50 * std.time.ns_per_ms);
+    try reader.stop(5_000);
+    try std.testing.expectEqual(@as(i64, 0), reader.woke_ms.load(.acquire));
+}
+
+test "the interrupted read server's stop fails within its limit when no interrupt comes" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const limit_ms = 300;
+    var reader: InterruptedReadServer = .{};
+    try reader.start();
+    defer reader.deinit();
+    const client = try reader.connect();
+    defer client.close(io_mod.getIo());
+    if (!testing_listener.waitFor(&reader.published, 5_000)) return error.TestConnectionNotPublished;
+
+    // Nothing interrupts the read, so only the stop can end it.
+    const io = io_mod.getIo();
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.TestThreadStillWaiting, reader.stop(limit_ms));
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= limit_ms);
+    try std.testing.expect(elapsed_ms < limit_ms + 1_000);
+    try std.testing.expect(reader.woke_ms.load(.acquire) != 0);
 }
 
 fn fetchTextBounded(

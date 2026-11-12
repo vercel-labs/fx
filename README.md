@@ -103,7 +103,7 @@ To learn fx, read the manual as Markdown. [fx.sh/llms.txt](https://fx.sh/llms.tx
 
 To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`.
 
-To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for local health checks. Neither changes the setup.
+To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for health checks. Neither changes the setup.
 
 `fx ask` uses the user's saved permission mode, which is `auto` unless they changed it. Pass `--full-access` only when the user asks for it, because it turns off fx's permission checks.
 
