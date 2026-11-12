@@ -976,8 +976,10 @@ const App = struct {
         shutdown_trace.mark("terminal_released");
 
         // Exit never waits, not even for a sign-in refresh, which is never cut
-        // off: a preparation still running ends with the process.
+        // off: a preparation or prompt refresh still running ends with the
+        // process.
         self.auth.leaveProviderPreparationForExit();
+        self.auth.leavePromptRefreshesForExit();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);

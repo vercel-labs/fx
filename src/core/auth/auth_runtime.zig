@@ -857,24 +857,20 @@ pub const PromptCredentialRefreshPoll = union(enum) {
 };
 
 /// Refreshes the prompt's credential on its own thread. A refresh is never
-/// cut off once it starts: an issuer that rotates the refresh token has
-/// already retired the stored one, so a dropped answer would sign out every
-/// fx process that shares the login. When the prompt no longer wants the
-/// result, the thread still saves the new login and then frees the task.
+/// cut off once it starts (`oauth_transport.Request` `outlives_cancel`): an
+/// issuer that rotates the refresh token has already retired the stored one,
+/// so a dropped answer would sign out every fx process that shares the login.
+/// A prompt that stops waiting hands the task to the runtime, which keeps it
+/// until the refresh ends and saves the new login
+/// (`Runtime.cancelPromptCredentialRefresh`).
 const PromptCredentialRefreshTask = struct {
-    const State = enum(u8) { running, done, abandoned };
-
-    /// Its context must outlive the thread, which can outlive the task's owner.
     transport: oauth_transport.Provider,
     source: credentials.Source,
     expected_account_id: ?[]u8,
     thread: ?std.Thread = null,
-    state: std.atomic.Value(State) = .init(.running),
+    done: std.atomic.Value(bool) = .init(false),
     credential: ?credentials.Credential = null,
     failure: ?anyerror = null,
-
-    /// Abandoned refreshes that have finished, for tests that wait for them.
-    var abandoned_finished: std.atomic.Value(usize) = .init(0);
 
     fn start(
         transport: oauth_transport.Provider,
@@ -911,18 +907,11 @@ const PromptCredentialRefreshTask = struct {
             break :blk null;
         };
         if (self.credential == null and self.failure == null) self.failure = error.CredentialRefreshUnavailable;
-        if (self.state.cmpxchgStrong(.running, .done, .acq_rel, .acquire) == null) return;
-        // The prompt left before the refresh finished; the store already
-        // holds whatever the refresh saved.
-        debug_trace.logf("auth", "prompt credential refresh finished after its prompt left source={t} renewed={}", .{ self.source, self.credential != null });
-        if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
-        self.credential = null;
-        self.destroy();
-        _ = abandoned_finished.fetchAdd(1, .seq_cst);
+        self.done.store(true, .release);
     }
 
     fn poll(self: *const PromptCredentialRefreshTask) bool {
-        return self.state.load(.acquire) == .done;
+        return self.done.load(.acquire);
     }
 
     fn takeResult(self: *PromptCredentialRefreshTask) PromptCredentialRefreshPoll {
@@ -940,21 +929,23 @@ const PromptCredentialRefreshTask = struct {
         return result;
     }
 
-    /// Drops the task without waiting: a running refresh finishes on its
-    /// thread, which then frees the task.
+    /// Waits for the refresh to end and frees the task.
     fn deinit(self: *PromptCredentialRefreshTask) void {
-        const thread = self.thread;
+        if (self.thread) |thread| thread.join();
         self.thread = null;
-        if (self.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) {
-            // The worker owns `self` from here; only the local handle is used.
-            debug_trace.logf("auth", "prompt credential refresh left running reason=prompt_cancelled", .{});
-            if (thread) |handle| handle.detach();
-            return;
-        }
-        if (thread) |handle| handle.join();
         if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
         self.credential = null;
         self.destroy();
+    }
+
+    /// `deinit` for process exit, which never waits: a refresh still running
+    /// is left to end with the process. It holds only its own copies and a
+    /// static transport.
+    fn leaveForExit(self: *PromptCredentialRefreshTask) void {
+        if (self.poll()) return self.deinit();
+        debug_trace.logf("auth", "prompt credential refresh left running reason=process_exit source={t}", .{self.source});
+        if (self.thread) |thread| thread.detach();
+        self.thread = null;
     }
 
     fn destroy(self: *PromptCredentialRefreshTask) void {
@@ -2016,6 +2007,10 @@ pub const Runtime = struct {
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
+    /// Refreshes a prompt stopped waiting for, still running. Each still saves
+    /// the new login; finished ones are freed as the prompt refresh is used,
+    /// `deinit` waits for the rest, and process exit leaves them.
+    abandoned_prompt_refreshes: std.ArrayList(*PromptCredentialRefreshTask) = .empty,
     /// Revocations of signed-out sessions still talking to their issuer.
     remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
     team_list_task: ?*TeamListTask = null,
@@ -2065,7 +2060,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 35) {
+            if (@typeInfo(Self).@"struct".field_names.len != 36) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -2100,6 +2095,7 @@ pub const Runtime = struct {
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
+        storage.abandoned_prompt_refreshes = .empty;
         storage.remote_revocation_tasks = .empty;
         storage.team_list_task = null;
         storage.provider_preparation = null;
@@ -2115,6 +2111,9 @@ pub const Runtime = struct {
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        for (self.abandoned_prompt_refreshes.items) |task| task.deinit();
+        self.abandoned_prompt_refreshes.deinit(std.heap.c_allocator);
+        self.abandoned_prompt_refreshes = .empty;
         if (self.team_list_task) |task| {
             if (!task.done.load(.acquire)) debug_trace.logf("auth", "team list dropped reason=shutdown", .{});
             task.deinit();
@@ -3229,6 +3228,7 @@ pub const Runtime = struct {
     pub fn beginPromptCredentialRefresh(self: *Self) PromptCredentialRefreshStart {
         if (comptime host_target.is_wasm) return .not_needed;
         if (self.auth_mode == .host_managed) return .not_needed;
+        self.freeFinishedPromptRefreshes();
         if (self.prompt_credential_refresh_task != null) return .pending;
         const credential = self.selected_credential orelse return .not_needed;
         if (!credentials.sourceRefreshable(credential.source)) return .not_needed;
@@ -3250,10 +3250,42 @@ pub const Runtime = struct {
         return task.takeResult();
     }
 
+    /// The prompt no longer waits for its refresh. A refresh that still runs
+    /// is never cut off: the runtime keeps it until it ends and saves the new
+    /// login, and nothing waits for it here.
     pub fn cancelPromptCredentialRefresh(self: *Self) void {
         const task = self.prompt_credential_refresh_task orelse return;
         self.prompt_credential_refresh_task = null;
-        task.deinit();
+        self.freeFinishedPromptRefreshes();
+        if (task.poll()) return task.deinit();
+        self.abandoned_prompt_refreshes.append(std.heap.c_allocator, task) catch {
+            debug_trace.logf("auth", "prompt credential refresh awaited reason=no_memory_to_keep_it", .{});
+            return task.deinit();
+        };
+        debug_trace.logf("auth", "prompt credential refresh left running reason=prompt_cancelled", .{});
+    }
+
+    fn freeFinishedPromptRefreshes(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.abandoned_prompt_refreshes.items.len) {
+            const task = self.abandoned_prompt_refreshes.items[i];
+            if (!task.poll()) {
+                i += 1;
+                continue;
+            }
+            _ = self.abandoned_prompt_refreshes.swapRemove(i);
+            task.deinit();
+        }
+    }
+
+    /// For process exit, which never waits: prompt refreshes still running,
+    /// which are never cut off, are left to end with the process.
+    pub fn leavePromptRefreshesForExit(self: *Self) void {
+        if (self.prompt_credential_refresh_task) |task| task.leaveForExit();
+        self.prompt_credential_refresh_task = null;
+        for (self.abandoned_prompt_refreshes.items) |task| task.leaveForExit();
+        self.abandoned_prompt_refreshes.deinit(std.heap.c_allocator);
+        self.abandoned_prompt_refreshes = .empty;
     }
 
     /// Revokes a signed-out session's tokens on a worker and takes ownership
@@ -5815,18 +5847,46 @@ test "a prompt that leaves during its credential refresh lets the refresh finish
     defer home.deinit();
     try home.store("stale-token", "team-id", 1);
     var transport: HeldRefreshTransport = .{};
-    const finished_before = PromptCredentialRefreshTask.abandoned_finished.load(.seq_cst);
-
-    const task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    runtime.prompt_credential_refresh_task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
     while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+
     // The prompt leaves while the token request is on the wire. Nothing waits
-    // for the issuer, and nothing cuts the request off.
-    task.deinit();
+    // for the issuer, and nothing cuts the request off: the runtime keeps it.
+    runtime.cancelPromptCredentialRefresh();
+    try std.testing.expect(runtime.prompt_credential_refresh_task == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.abandoned_prompt_refreshes.items.len);
     try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
 
+    // A full shutdown waits for it, and the new login is saved.
     transport.release.store(true, .seq_cst);
-    while (PromptCredentialRefreshTask.abandoned_finished.load(.seq_cst) == finished_before) std.Thread.yield() catch {};
+    runtime.deinit(alloc);
     var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
     defer stored.deinit(alloc);
     try std.testing.expectEqualStrings("renewed-token", stored.token);
+}
+
+test "process exit leaves a prompt's credential refresh running instead of waiting for it" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    defer runtime.deinit(alloc);
+    runtime.prompt_credential_refresh_task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
+    while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+    runtime.cancelPromptCredentialRefresh();
+    const task = runtime.abandoned_prompt_refreshes.items[0];
+
+    runtime.leavePromptRefreshesForExit();
+    try std.testing.expectEqual(@as(usize, 0), runtime.abandoned_prompt_refreshes.items.len);
+    try std.testing.expect(!task.poll());
+
+    // The process would end here; the test lets the refresh finish and frees it.
+    transport.release.store(true, .seq_cst);
+    while (!task.poll()) std.Thread.yield() catch {};
+    task.deinit();
 }
