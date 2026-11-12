@@ -2377,10 +2377,11 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
-            self.model_cache.startWarmup(
+            self.model_cache.startWarmupWithSharedSignIn(
                 self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
                 trigger,
+                self.auth.backgroundSignIn(),
             );
         }
     }
@@ -3227,6 +3228,13 @@ const App = struct {
         }
     }
 
+    fn collectBracketedPasteFacts(self: *App) void {
+        if (!self.terminal_input_runtime.bracketed_paste_rearm.take(io_mod.milliTimestamp())) return;
+        self.terminal.enableBracketedPaste() catch |err| {
+            debug_trace.logf("input", "bracketed_paste_rearm_failed err={s}", .{@errorName(err)});
+        };
+    }
+
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
@@ -3252,6 +3260,7 @@ const App = struct {
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
 
         try self.collectThemeFacts();
+        self.collectBracketedPasteFacts();
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);

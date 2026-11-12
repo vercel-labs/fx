@@ -22,6 +22,7 @@ import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
+import { rotateFxLogin } from "./fx-login-fakes";
 import { rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -9447,3 +9448,63 @@ tmuxTest("provider preparation completes existing-key recovery for a held prompt
   expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, TIMEOUT);
+
+// Another fx process refreshed the shared login after this one loaded the
+// model list, and the gateway stopped accepting the old token. The model list
+// reads the stored login before it fetches instead of falling back to the
+// public list (tests/tla/session_title/SessionTitle.tla
+// CatalogFirstSendUsesStore).
+tmuxTest(
+  "model list uses the login another fx refreshed after launch",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-rotated-catalog-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    const tracePath = join(home, "trace.log");
+    const ROTATED_TOKEN = "rotated-login-token";
+    let accepted = LOGIN_TOKEN;
+    const publicModel = { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] };
+    gateway = startFakeGateway([], {
+      models: (request) => {
+        const authorization = request.headers.get("authorization");
+        if (authorization === null) return [publicModel];
+        if (authorization !== `Bearer ${accepted}`) {
+          return Response.json({ error: { message: "Invalid token" } }, { status: 401 });
+        }
+        return accepted === ROTATED_TOKEN
+          ? [publicModel, { id: "private/red-kite", type: "language", tags: ["tool-use"] }]
+          : [publicModel, { id: "private/blue-hornbill", type: "language", tags: ["tool-use"] }];
+      },
+    });
+    oauth = startFakeOAuth("unexpected-refresh-token");
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+      FX_TRACE_SCOPES: "auth,catalog",
+    });
+    await session.waitForComposer(TIMEOUT);
+    await waitForModelRequestCount(gateway, 1);
+    expect(gateway.modelRequests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+
+    rotateFxLogin(home, ROTATED_TOKEN);
+    accepted = ROTATED_TOKEN;
+    // The picker reloads the list only 5 s after the last load
+    // (picker_revalidate_floor_ms in src/core/app/model_cache_runtime.zig).
+    await Bun.sleep(5_500);
+    await session.sendText("/model");
+    await session.waitForPane((pane) => pane.includes("private/red-kite"), TIMEOUT);
+
+    const authorizations = gateway.modelRequests.map((request) => request.headers.get("authorization"));
+    expect(authorizations.slice(1)).toEqual([`Bearer ${ROTATED_TOKEN}`]);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+    const loads = readFileSync(tracePath, "utf8").split("\n").filter((line) =>
+      line.includes("[catalog] event=model_catalog_load ")
+    );
+    expect(loads.at(-1)).toContain("effective_access=authenticated");
+    expect(loads.at(-1)).toContain("anonymous_fallback=false");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
