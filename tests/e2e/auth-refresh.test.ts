@@ -1141,7 +1141,7 @@ test(
 // the others holding a token the gateway rejects. A 401 rotates the login
 // only when the saved token is the one the gateway rejected, or is past its
 // refresh deadline; otherwise fx retries with the login another process
-// saved (`tests/tla/auth/SharedLoginRefresh.tla` RotateOnlyRejected).
+// saved (`tests/tla/auth/SharedLoginRefresh.tla` NoRedundantRotation).
 
 const SHARED_TIMEOUT = 60_000;
 

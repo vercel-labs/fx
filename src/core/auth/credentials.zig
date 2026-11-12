@@ -1511,41 +1511,8 @@ test "a failed fx-login refresh is still reported when nothing else resolves" {
 /// the issuer rejects, which is what an expired or revoked login looks like on
 /// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
 const ExpiredFxLoginFixture = struct {
-    alloc: std.mem.Allocator,
-    tmp: std.testing.TmpDir,
-    env: *CredentialTestEnv,
-    home: []u8,
-
-    fn install(alloc: std.mem.Allocator) !ExpiredFxLoginFixture {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
-        errdefer alloc.free(home);
-
-        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "auth.json" });
-        defer alloc.free(auth_path);
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
-            .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
-        });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(
-            io_mod.getIo(),
-            "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\"," ++
-                "\"access_token\":\"access\",\"refresh_token\":\"rejected-refresh\"," ++
-                "\"expires_at_ms\":1,\"scope\":\"openid offline_access\"," ++
-                "\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}",
-        );
-
-        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
-        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home };
-    }
-
-    fn deinit(self: *ExpiredFxLoginFixture) void {
-        self.env.deinit();
-        self.alloc.free(self.home);
-        self.tmp.cleanup();
+    fn install(alloc: std.mem.Allocator) !SavedFxLoginFixture {
+        return SavedFxLoginFixture.install(alloc, "access", "rejected-refresh", 1);
     }
 };
 
@@ -1617,8 +1584,8 @@ test "the stored fx login is read as saved, without a refresh" {
     }
 }
 
-/// A HOME holding an fx login whose saved access token and expiry the test
-/// chooses, as another fx would have left it.
+/// A HOME holding an fx login whose saved tokens and expiry the test chooses,
+/// as another fx would have left it.
 const SavedFxLoginFixture = struct {
     alloc: std.mem.Allocator,
     tmp: std.testing.TmpDir,
@@ -1626,7 +1593,7 @@ const SavedFxLoginFixture = struct {
     home: []u8,
     auth_path: []u8,
 
-    fn install(alloc: std.mem.Allocator, access_token: []const u8, expires_at_ms: i64) !SavedFxLoginFixture {
+    fn install(alloc: std.mem.Allocator, access_token: []const u8, refresh_token: []const u8, expires_at_ms: i64) !SavedFxLoginFixture {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
         const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
@@ -1642,7 +1609,7 @@ const SavedFxLoginFixture = struct {
             .issuer = "https://vercel.com",
             .client_id = "client",
             .access_token = access_token,
-            .refresh_token = "saved-refresh",
+            .refresh_token = refresh_token,
             .expires_at_ms = expires_at_ms,
             .scope = "openid offline_access",
             .token_type = "Bearer",
@@ -1703,20 +1670,20 @@ fn expectReplaceRejected(fixture: *const SavedFxLoginFixture, saved: []const u8,
 const hour_ms: i64 = 60 * 60 * 1000;
 
 test "a forced fx login refresh after a 401 uses the login another fx saved" {
-    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, "saved-by-another-fx", io_mod.milliTimestamp() + hour_ms);
+    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, "saved-by-another-fx", "saved-refresh", io_mod.milliTimestamp() + hour_ms);
     defer fixture.deinit();
     try expectReplaceRejected(&fixture, "saved-by-another-fx", "rejected-access", false);
 }
 
 test "a forced fx login refresh after a 401 rotates the saved login that holds the rejected token" {
-    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, "rejected-access", io_mod.milliTimestamp() + hour_ms);
+    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, "rejected-access", "saved-refresh", io_mod.milliTimestamp() + hour_ms);
     defer fixture.deinit();
     try expectReplaceRejected(&fixture, "rejected-access", "rejected-access", true);
 }
 
 test "a forced fx login refresh after a 401 rotates a replaced login past its refresh deadline" {
     // The refresh deadline is a minute before expiry (oauth_session expiry_skew_ms).
-    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, "saved-by-another-fx", io_mod.milliTimestamp() + 30 * 1000);
+    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, "saved-by-another-fx", "saved-refresh", io_mod.milliTimestamp() + 30 * 1000);
     defer fixture.deinit();
     try expectReplaceRejected(&fixture, "saved-by-another-fx", "rejected-access", true);
 }
@@ -1750,7 +1717,7 @@ fn fuzzFxLoginReplaceRejected(_: void, smith: *std.testing.Smith) !void {
         smith.valueRangeAtMost(i64, -hour_ms, 59 * 1000)
     else
         smith.valueRangeAtMost(i64, 61 * 1000, hour_ms);
-    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, saved, io_mod.milliTimestamp() + offset_ms);
+    var fixture = try SavedFxLoginFixture.install(std.testing.allocator, saved, "saved-refresh", io_mod.milliTimestamp() + offset_ms);
     defer fixture.deinit();
     try expectReplaceRejected(&fixture, saved, rejected, expired or std.mem.eql(u8, saved, rejected));
 }

@@ -9115,11 +9115,12 @@ fn processQueuedPromptLoop(
             };
 
             // fx refreshed the login after a 401, or took the one another fx
-            // had saved, and the gateway refused that one too, so the login
-            // itself is good and signing in again cannot help. On a host that can ask, the request waits and
-            // resends with the same login as for a 5xx, showing the gateway's
-            // reason once; Esc during the wait falls through to the cancel
-            // path below. A host that cannot ask ends the turn as before.
+            // had saved, and the gateway refused that one too. A sign-in
+            // would not help, so on a host that can ask, the request waits
+            // and resends as for a 5xx, showing the gateway's reason once.
+            // The resend reloads the saved login, and its own 401 rotates
+            // it. Esc during the wait falls through to the cancel path
+            // below. A host that cannot ask ends the turn as before.
             if (response_failure) |failure| if (failure.kind == .unauthorized and auth_retry_used and
                 gatewayLogin(job.credential_source) and
                 request_recovery.canAskUser() and !config.cancel_flag.load(.seq_cst))
