@@ -3741,6 +3741,7 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
         .role = .system,
         .content = "Runtime context: after changing files, verify with focused checks for the touched paths first; avoid broad or expensive checks unless those paths or the user call for them. Tests under tests/evals can be deterministic. Keep exact verification evidence in the final summary.",
     });
+    if (input.subagents) |note| try messages.append(arena, .{ .role = .system, .content = note });
 }
 
 fn appendWorkspaceAccessContext(

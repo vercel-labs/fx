@@ -670,6 +670,12 @@ export interface FxCustomProviderModel {
   maxOutputTokens?: number;
   supportsToolUse?: boolean;
   supportsVision?: boolean;
+  /** The request field that carries the output limit. Defaults to `"max_tokens"`. */
+  outputLimitField?: "max_tokens" | "max_completion_tokens";
+  /** Fields sent in the body of every request for the model, such as `{ temperature: 0.2 }`. A field fx writes itself, such as `messages`, is refused. */
+  request?: Record<string, unknown>;
+  /** The effort levels the model offers, in order, each with the request fields that choose it, such as `{ high: { reasoning_effort: "high" } }`. A level the model does not list is not sent. */
+  reasoningEfforts?: Record<string, Record<string, unknown>>;
 }
 
 /** A server that speaks OpenAI Chat Completions, such as a local model server or a router. */
@@ -680,6 +686,12 @@ export interface FxCustomProviderDefinition {
   baseUrl: string;
   /** The models it serves, by id. */
   models?: Record<string, FxCustomProviderModel>;
+  /** Fields for every model, including one `models` does not list, where the model sets none itself. */
+  modelDefaults?: FxCustomProviderModel;
+  /** The model that names a session from its first prompt. Without it, a session keeps the title derived from the prompt. */
+  titleModel?: string;
+  /** The model that reads images for a model that cannot. Without it, the provider has no image fallback. */
+  visionModel?: string;
 }
 
 /** A custom provider's API key. */

@@ -65,6 +65,9 @@ pub const OwnedQuestionOption = struct {
 
 pub const OwnedQuestionEntry = struct {
     question: []const u8,
+    /// The question and descriptions are Markdown; see
+    /// `types.QuestionBatchEntry.markdown`.
+    markdown: bool = false,
     submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
     submission_buffer: ?[]u8 = null,
     options: std.ArrayList(OwnedQuestionOption) = .empty,
@@ -94,6 +97,7 @@ pub const OwnedQuestionEntry = struct {
 
 pub const EntryProjection = struct {
     question: []const u8,
+    question_markdown: bool = false,
     options: []const OwnedQuestionOption,
     choice_index: usize,
     freeform_buffer: []const u8,
@@ -140,6 +144,7 @@ pub const QuestionPrompt = struct {
             const entry = self.entries.items[current_index];
             break :blk .{
                 .question = entry.question,
+                .question_markdown = entry.markdown,
                 .options = entry.options.items,
                 .choice_index = entry.choice_index,
                 .freeform_buffer = entry.freeform_buffer.items,
@@ -265,6 +270,7 @@ pub const QuestionPrompt = struct {
 
             self.entries.appendAssumeCapacity(.{
                 .question = q_copy,
+                .markdown = incoming.markdown,
                 .options = opts,
                 .submission = incoming.submission,
                 .choice_index = if (incoming.submission == .input) @intCast(incoming.options.len) else 0,
@@ -277,6 +283,7 @@ pub const QuestionPrompt = struct {
         if (self.entries.items.len != entries.len) return false;
         for (self.entries.items, entries) |owned, incoming| {
             if (owned.submission != incoming.submission) return false;
+            if (owned.markdown != incoming.markdown) return false;
             const has_freeform = switch (incoming.submission) {
                 .none => append_freeform,
                 .input => true,
@@ -1181,6 +1188,30 @@ test "question prompt syncFrom is idempotent for identical payloads" {
     prompt.moveChoice(1);
 
     try syncTestQuestion(&prompt);
+    try std.testing.expectEqual(@as(u8, 1), currentChoiceIndex(&prompt));
+}
+
+test "question prompt carries the markdown mark and replaces a prompt that differs in it" {
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const plain = [_]types.QuestionBatchEntry{.{ .question = "Use **this**?", .options = &options }};
+    const markdown = [_]types.QuestionBatchEntry{.{ .question = "Use **this**?", .markdown = true, .options = &options }};
+
+    try prompt.syncFrom(std.testing.allocator, &plain);
+    try std.testing.expect(!prompt.projection().?.current_entry.?.question_markdown);
+    prompt.moveChoice(1);
+
+    try prompt.syncFrom(std.testing.allocator, &markdown);
+    try std.testing.expect(prompt.projection().?.current_entry.?.question_markdown);
+    try std.testing.expectEqual(@as(u8, 0), currentChoiceIndex(&prompt));
+
+    // The same payload again leaves the prompt as it is.
+    prompt.moveChoice(1);
+    try prompt.syncFrom(std.testing.allocator, &markdown);
     try std.testing.expectEqual(@as(u8, 1), currentChoiceIndex(&prompt));
 }
 

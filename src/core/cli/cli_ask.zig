@@ -46,6 +46,7 @@ const agent_run_flags = @import("agent_run_flags.zig");
 const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -1931,20 +1932,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             null,
     };
-    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job)) |early| return early;
-    // The ask ends once its whole tree is quiet: each report
-    // that arrives runs as the ask's next turn, as one wakes an idle main.
+    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| return early;
+    // The ask ends once its whole tree is quiet: mail that waits when a turn
+    // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
             .quiet, .stopped => break,
             .mail => {},
         }
-        const next = ctx.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
+        // The take marks the turn, so mail posted from then on joins it.
+        const turn_id = debug_trace.nextTurnId();
+        const next = ctx.worker.takeQueuedPromptForTurn(std.heap.c_allocator, turn_id) orelse continue;
         defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
+        var turn_marked = true;
+        defer if (turn_marked) ctx.worker.finishProcessing();
         try ctx.checkCancellation();
         const history = try ctx.session.snapshotHistory(alloc);
         defer types.freeHistoryTurnSlice(alloc, history);
-        ctx.active_turn_id = debug_trace.nextTurnId();
+        ctx.active_turn_id = turn_id;
         var follow = job;
         follow.turn_id = ctx.active_turn_id;
         follow.prompt = next.prompt;
@@ -1955,7 +1960,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         follow.history = history;
         follow.unversioned_history_count = ctx.session.unversionedHistoryEnd();
         debug_trace.eventf("mailbox", "ask_next_turn", .{ .turn_id = ctx.active_turn_id }, "author={s}", .{@tagName(next.author)});
-        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow)) |early| return early;
+        // runAskTurn ends the turn the take marked.
+        turn_marked = false;
+        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow, true)) |early| return early;
     }
     worker_events_drained = true;
     if (ctx.presenter) |value| try value.finish();
@@ -1969,6 +1976,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 /// skipped or unavailable.
 /// Runs one of the ask's turns. Returns the ask's result when the turn ends
 /// it early: a permission it cannot ask for, or a failure in JSON output.
+/// `marked` says the worker already marks the turn, as the take of its mail
+/// did; the turn then ends it.
 fn runAskTurn(
     ctx: *AskContext,
     alloc: Allocator,
@@ -1977,7 +1986,13 @@ fn runAskTurn(
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     config: agent_runtime.Config,
     job: worker_runtime.QueuedPrompt,
+    marked: bool,
 ) !?PromptRunResult {
+    // Mail that arrives while the turn runs joins it at its next boundary, as
+    // in the app; what the turn leaves waits and runs as the ask's next turn
+    // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
+    const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
+    defer if (processing) ctx.worker.finishProcessing();
     options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
@@ -2017,10 +2032,16 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    const provider_title_model = bundle.title_model orelse return null;
+    // A Token Pass session titles itself with a Token Pass model.
+    const title_model = if (ctx.provider == .gateway)
+        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,
@@ -2029,6 +2050,7 @@ fn maybeStartAskTitleTask(
         .gateway_team = ctx.gateway_team,
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return null;
     task.spawn() catch |err| {
@@ -2143,6 +2165,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.context_enabled,
         .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -2171,6 +2194,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        .push_session_notice = pushSessionNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .begin_route_recovery_request = beginRouteRecoveryRequest,
         .push_command_output_complete = pushCommandOutputComplete,
@@ -2201,7 +2225,7 @@ fn refreshGatewayCredential(
     source: credentials.Source,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -2215,7 +2239,8 @@ fn refreshGatewayCredential(
         expected_account_id,
     )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
-    return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = try adoptRefreshedAskCredential(ctx, alloc, &refreshed) };
 }
 
 fn adoptRefreshedAskCredential(
@@ -2322,6 +2347,20 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
+/// Takes the subagent mail that joined the running turn at a model or final
+/// boundary. An ask has no one to steer it, so a cancel always ends the
+/// turn, as it does with no hook.
+fn takeSteeringBoundary(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (kind == .cancelled) return .interrupt;
+    return ctx.worker.takeSteeringBoundaryInto(std.heap.c_allocator, arena, turn_id, kind);
+}
+
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultTransient(.{
@@ -2329,6 +2368,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }
 
@@ -3396,6 +3436,12 @@ fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try ctx.writeStderr("[notice] ");
     try ctx.writeStderr(text);
     try ctx.writeStderr("\n");
+}
+
+fn pushSessionNotice(raw_ctx: *anyopaque, text: []const u8) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!try ctx.session.claimContextNotice(ctx.alloc, text)) return;
+    try pushSystemNotice(raw_ctx, text);
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
@@ -5113,6 +5159,37 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "fx ask refuses a refreshed login on another team" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "stale-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // Another fx process saved the login on another team while this request
+    // ran; fx ask does not move a request to it.
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_456"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    try std.testing.expectError(error.CredentialAuthorityChanged, adoptRefreshedAskCredential(&ctx, alloc, &refreshed));
+    try std.testing.expectEqualStrings("stale-token", ctx.api_key);
+    try std.testing.expectEqualStrings("team_123", ctx.gateway_team.?);
 }
 
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {

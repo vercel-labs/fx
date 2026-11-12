@@ -39,6 +39,9 @@ pub const CliModelCatalogResult = union(enum) {
         /// metadata; empty otherwise. The caller frees them with `model_catalog.freeModelCatalog`.
         entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
         provenance: model_catalog.Provenance,
+        /// Owned text for one line on stderr, such as why part of the list is
+        /// missing, or null. The caller frees it.
+        notice: ?[]u8 = null,
     },
     failure: model_catalog.FailedOutcome,
 };
