@@ -338,6 +338,54 @@ pub const SignInRuntime = struct {
     /// Set once when a device code requested on the worker becomes ready, so
     /// the input loop can open the browser for it.
     browser_pending: bool = false,
+    /// The Vercel team the person used before this sign-in, owned. Only
+    /// `keepTeam` writes it, and never while a sign-in is under way, so the
+    /// worker reads it without the lock.
+    kept_team_id: ?[]u8 = null,
+    kept_team_slug: ?[]u8 = null,
+
+    /// Sets the team the next fx login starts on when its team list has it, or
+    /// none. Call it before `start`. While a sign-in is under way it changes
+    /// nothing: that sign-in keeps its team, and `start` refuses a second one.
+    pub fn keepTeam(self: *Self, alloc: Allocator, id: ?[]const u8, slug: ?[]const u8) Allocator.Error!void {
+        const id_copy = if (id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (id_copy) |value| alloc.free(value);
+        const slug_copy = if (slug) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (slug_copy) |value| alloc.free(value);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.thread != null or self.state == .polling or self.completion != null) {
+            if (id_copy) |value| alloc.free(value);
+            if (slug_copy) |value| alloc.free(value);
+            return;
+        }
+        self.clearKeptTeam(alloc);
+        self.kept_team_id = id_copy;
+        self.kept_team_slug = slug_copy;
+    }
+
+    fn clearKeptTeam(self: *Self, alloc: Allocator) void {
+        if (self.kept_team_id) |value| alloc.free(value);
+        if (self.kept_team_slug) |value| alloc.free(value);
+        self.kept_team_id = null;
+        self.kept_team_slug = null;
+    }
+
+    /// Starts a new fx login that has no team on the kept team.
+    fn applyKeptTeam(self: *const Self, alloc: Allocator, completion: *SignInCompletion) Allocator.Error!void {
+        const selection = switch (completion.*) {
+            .vercel => |*selection| selection,
+            else => return,
+        };
+        const session = if (selection.session) |*session| session else return;
+        if (session.team_id != null or session.team_slug != null) return;
+        const team = teamIn(selection.teams.items, self.kept_team_id, self.kept_team_slug) orelse return;
+        const slug = try alloc.dupe(u8, team.slug);
+        errdefer alloc.free(slug);
+        session.team_id = try alloc.dupe(u8, team.id);
+        session.team_slug = slug;
+        debug_trace.logf("auth", "sign-in starts on the team fx used", .{});
+    }
 
     /// Starts an fx login sign-in. On native hosts the issuer discovery and
     /// device-code request run on the sign-in worker, so the input loop never
@@ -446,6 +494,7 @@ pub const SignInRuntime = struct {
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
         _ = self.cancel(alloc);
+        self.clearKeptTeam(alloc);
         if (self.completion) |*selection| selection.deinit(alloc);
         self.completion = null;
         self.failure = null;
@@ -623,6 +672,10 @@ pub const SignInRuntime = struct {
             return;
         };
         defer completion.deinit(alloc);
+        self.applyKeptTeam(alloc, &completion) catch |err| {
+            self.publishFailure(err);
+            return;
+        };
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -733,7 +786,9 @@ fn completeSignIn(
     var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
-    const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
+    // The new login starts on the person's team, so the team picker selects
+    // it and closing the picker keeps it.
+    const session = try take_login_session(alloc, issuer_url, client_id, token, savedLoginTeam(alloc, teams.items), now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
@@ -783,7 +838,8 @@ pub fn runLogin(
 
     var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
-    const selected_team_index = try selectTeam(alloc, teams.items, null);
+    const saved_team = savedLoginTeam(alloc, teams.items);
+    const selected_team_index = try selectTeam(alloc, teams.items, if (saved_team) |team| team.id else null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
 
     const now_ms = io_mod.milliTimestamp();
@@ -801,6 +857,30 @@ pub fn runLogin(
         debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
         return signInPersistenceError(err);
     };
+}
+
+/// The saved fx login's team in `teams`, matched by id, else by slug. A new
+/// sign-in starts on it, so signing in again keeps the person's team instead
+/// of the first team of the list. Null when nothing is saved, the saved login
+/// has no team, or the new account has no such team.
+fn savedLoginTeam(alloc: Allocator, teams: []const Team) ?*const Team {
+    var saved = (oauth_session.load(alloc) catch |err| {
+        debug_trace.logf("auth", "saved login not read for the team choice err={s}", .{@errorName(err)});
+        return null;
+    }) orelse return null;
+    defer saved.deinit(alloc);
+    return teamIn(teams, saved.team_id, saved.team_slug);
+}
+
+/// The team in `teams` with the id `id`, else with the slug `slug`.
+fn teamIn(teams: []const Team, id: ?[]const u8, slug: ?[]const u8) ?*const Team {
+    if (id) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.id, value)) return team;
+    };
+    if (slug) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.slug, value)) return team;
+    };
+    return null;
 }
 
 fn take_login_session(
@@ -1341,9 +1421,10 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     if (teams.len == 0) return null;
     if (teams.len == 1) return 0;
 
-    const default_index = defaultTeamIndex(teams, current);
+    const current_index = currentTeamIndex(teams, current);
+    const default_index = current_index orelse 0;
     const index = if (canUseInteractiveTeamPicker())
-        selectTeamInteractive(alloc, teams, default_index) catch |err| switch (err) {
+        selectTeamInteractive(alloc, teams, default_index, current_index) catch |err| switch (err) {
             error.NotATerminal => try selectTeamByLine(alloc, teams, default_index),
             else => return err,
         }
@@ -1352,12 +1433,12 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     return index;
 }
 
-fn defaultTeamIndex(teams: []const Team, current: ?[]const u8) usize {
-    const needle = current orelse return 0;
+fn currentTeamIndex(teams: []const Team, current: ?[]const u8) ?usize {
+    const needle = current orelse return null;
     for (teams, 0..) |team, i| {
         if (std.mem.eql(u8, team.id, needle) or std.mem.eql(u8, team.slug, needle)) return i;
     }
-    return 0;
+    return null;
 }
 
 fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
@@ -1383,7 +1464,9 @@ fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize)
     }
 }
 
-fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
+/// `current_index` is the team the login already uses, labeled "(current)";
+/// null when it has none in `teams`.
+fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize, current_index: ?usize) !usize {
     var raw = try TeamPickerRawMode.enable();
     defer raw.disable();
 
@@ -1392,17 +1475,17 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
     var selected = default_index;
     var first_render = true;
-    try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+    try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
 
     while (true) {
         switch (try readTeamPickerKey()) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .down => {
                 selected = if (selected + 1 == teams.len) 0 else selected + 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .enter => return selected,
             .cancel => return LoginError.InvalidTeamSelection,
@@ -1423,7 +1506,7 @@ fn renderTeamPicker(
     alloc: Allocator,
     teams: []const Team,
     selected: usize,
-    default_index: usize,
+    current_index: ?usize,
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
@@ -1434,7 +1517,7 @@ fn renderTeamPicker(
 
     for (teams, 0..) |team, i| {
         const prefix = if (i == selected) "  › " else "    ";
-        const marker = if (i == default_index) " (current)" else "";
+        const marker = if (current_index == i) " (current)" else "";
         try writeStdoutFmt("\x1b[2K{s}{d}. {s} ({s}){s}\n", .{ prefix, i + 1, team.name, team.slug, marker });
     }
     first_render.* = false;

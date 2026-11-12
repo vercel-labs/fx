@@ -1946,6 +1946,11 @@ pub const Runtime = struct {
     team_selection: ?login_flow.TeamSelection = null,
     team_query: std.ArrayList(u8) = .empty,
     sign_in_flow: login_flow.SignInRuntime = .{},
+    /// The team of the last fx login this runtime used, owned. It outlives
+    /// the login itself, which fx retires when its refresh is refused, so a
+    /// new sign-in can start on the person's team.
+    last_fx_login_team_id: ?[]u8 = null,
+    last_fx_login_team_slug: ?[]u8 = null,
     sign_in_source: credentials.Source = .fx_login,
     sign_in_returns_to_root: bool = false,
     sign_in_code_visible: bool = false,
@@ -2007,7 +2012,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 35) {
+            if (@typeInfo(Self).@"struct".field_names.len != 37) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -2032,6 +2037,8 @@ pub const Runtime = struct {
         storage.team_selection = null;
         storage.team_query = .empty;
         storage.sign_in_flow = .{};
+        storage.last_fx_login_team_id = null;
+        storage.last_fx_login_team_slug = null;
         storage.sign_in_source = .fx_login;
         storage.sign_in_returns_to_root = false;
         storage.sign_in_code_visible = false;
@@ -2092,7 +2099,33 @@ pub const Runtime = struct {
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
+        self.forgetFxLoginTeam(alloc);
         self.* = .{};
+    }
+
+    fn forgetFxLoginTeam(self: *Self, alloc: Allocator) void {
+        if (self.last_fx_login_team_id) |value| alloc.free(value);
+        if (self.last_fx_login_team_slug) |value| alloc.free(value);
+        self.last_fx_login_team_id = null;
+        self.last_fx_login_team_slug = null;
+    }
+
+    /// Copies the selected fx login's team. A failed copy keeps the earlier
+    /// one, since it only picks which team a later sign-in starts on.
+    fn rememberFxLoginTeam(self: *Self, alloc: Allocator) void {
+        const selected = self.selected_credential orelse return;
+        if (selected.source != .fx_login or (selected.team_id == null and selected.team_slug == null)) return;
+        const id = if (selected.team_id) |value| alloc.dupe(u8, value) catch null else null;
+        const slug = if (selected.team_slug) |value| alloc.dupe(u8, value) catch null else null;
+        if ((selected.team_id != null and id == null) or (selected.team_slug != null and slug == null)) {
+            if (id) |value| alloc.free(value);
+            if (slug) |value| alloc.free(value);
+            debug_trace.logf("auth", "fx login team not remembered err=OutOfMemory", .{});
+            return;
+        }
+        self.forgetFxLoginTeam(alloc);
+        self.last_fx_login_team_id = id;
+        self.last_fx_login_team_slug = slug;
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
@@ -2704,6 +2737,12 @@ pub const Runtime = struct {
         source: credentials.Source,
     ) !bool {
         self.exitSignInStage(alloc);
+        // A new fx login starts on the team the person used; other sign-ins
+        // keep no team.
+        if (source == .fx_login)
+            try self.sign_in_flow.keepTeam(alloc, self.last_fx_login_team_id, self.last_fx_login_team_slug)
+        else
+            try self.sign_in_flow.keepTeam(alloc, null, null);
         const started = switch (source) {
             .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
             .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
@@ -3085,7 +3124,10 @@ pub const Runtime = struct {
         credential.team_slug = null;
         self.source_inventory.insert(source);
         self.unavailable_sources.remove(source);
-        if (source == .fx_login) self.fx_login_session_available = true;
+        if (source == .fx_login) {
+            self.fx_login_session_available = true;
+            self.rememberFxLoginTeam(alloc);
+        }
         if (source == .stored_key) self.stored_key_status = .not_attempted;
         return change;
     }

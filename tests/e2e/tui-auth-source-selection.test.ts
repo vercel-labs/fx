@@ -269,6 +269,17 @@ function writeSeededGrokLogin(
   chmodSync(authPath, 0o600);
 }
 
+/** Waits until `fx login` saved the login it acquired, and returns it. */
+async function waitForSavedLogin(path: string): Promise<Record<string, string | number>> {
+  const deadline = Date.now() + TIMEOUT;
+  while (true) {
+    const saved = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+    if (saved?.access_token === ACQUIRED_LOGIN_TOKEN) return saved;
+    if (Date.now() > deadline) throw new Error(`fx login saved no new login in ${path}`);
+    await Bun.sleep(25);
+  }
+}
+
 function writeSeededFxLogin(
   testHome: string,
   expiresAtMs = Date.now() + 60 * 60 * 1000,
@@ -2295,6 +2306,205 @@ tmuxTest(
   },
   60_000,
 );
+
+tmuxTest(
+  "a sign-in during a request starts on the team of the saved login",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-keeps-team-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    // The first answer says the login expired; after the sign-in, only the
+    // saved team is accepted.
+    gateway = startDynamicFakeGateway(() => {
+      const requests = gateway!.requests;
+      const team = requests[requests.length - 1]?.headers.get("x-vercel-ai-gateway-team");
+      if (requests.length > 1 && team === "team_456") return fakeGatewayFinalText("KEPT_TEAM_RESPONSE");
+      return new Response(JSON.stringify({ error: { message: requests.length === 1 ? "token expired" : "not allowed for this team" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ],
+    });
+    // The saved login is on the second team of the list.
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_456");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer on my usual team.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("› Other Team", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("KEPT_TEAM_RESPONSE", TIMEOUT);
+    const signedIn = await session.captureFullScrollback();
+    expect(signedIn).toContain("Using Vercel team Other Team (other-team).");
+    expect(gateway.requests[gateway.requests.length - 1]!.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  90_000,
+);
+
+tmuxTest(
+  "closing the team choice after a sign-in keeps the team of the saved login",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-closed-keeps-team-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_456");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after I sign in again.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Vercel team · Search:"), TIMEOUT);
+    // The new sign-in is saved with the team the person had.
+    const authPath = join(home, ".fx", "auth.json");
+    const deadline = Date.now() + TIMEOUT;
+    let saved = JSON.parse(readFileSync(authPath, "utf8"));
+    while (saved.access_token !== ACQUIRED_LOGIN_TOKEN && Date.now() < deadline) {
+      await Bun.sleep(25);
+      saved = JSON.parse(readFileSync(authPath, "utf8"));
+    }
+    expect(saved.access_token).toBe(ACQUIRED_LOGIN_TOKEN);
+    expect(saved.team_id).toBe("team_456");
+    expect(saved.team_slug).toBe("other-team");
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a sign-in whose account lacks the saved team starts on the first team and saves none",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-other-account-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ],
+    });
+    // The saved login's team is on another account.
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_999");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after I sign in to another account.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("› Vercel Labs", TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Vercel team · Search:"), TIMEOUT);
+    const authPath = join(home, ".fx", "auth.json");
+    const deadline = Date.now() + TIMEOUT;
+    let saved = JSON.parse(readFileSync(authPath, "utf8"));
+    while (saved.access_token !== ACQUIRED_LOGIN_TOKEN && Date.now() < deadline) {
+      await Bun.sleep(25);
+      saved = JSON.parse(readFileSync(authPath, "utf8"));
+    }
+    expect(saved.access_token).toBe(ACQUIRED_LOGIN_TOKEN);
+    expect(saved.team_id ?? null).toBeNull();
+    expect(saved.team_slug ?? null).toBeNull();
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "fx login marks the team of the saved login as current and keeps it on Enter",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-keeps-team-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ] });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_456");
+    // The saved login names its team by slug only.
+    const authPath = join(home, ".fx", "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    delete auth.team_id;
+    auth.team_slug = "other-team";
+    writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    }, undefined, undefined, ["login"]);
+    await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+    const picker = await session.waitForPane((pane) => pane.includes("› 2. Other Team (other-team) (current)"), TIMEOUT);
+    expect(picker).not.toContain("Vercel Labs (vercel-labs) (current)");
+    await session.sendKeys("Enter");
+    const saved = await waitForSavedLogin(authPath);
+    expect(saved.team_id).toBe("team_456");
+    expect(saved.team_slug).toBe("other-team");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+for (const [label, savedTeam] of [
+  ["with no saved login", undefined],
+  ["when the saved team is not in the list", "team_999"],
+] as const) {
+  tmuxTest(
+    `fx login ${label} starts on the first team and marks none as current`,
+    async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-login-first-team-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([]);
+      oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ] });
+      if (savedTeam) writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, savedTeam);
+
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        AI_GATEWAY_API_KEY: undefined,
+      }, undefined, undefined, ["login"]);
+      await session.waitForText("Select a Vercel team for AI Gateway", TIMEOUT);
+      const picker = await session.waitForPane((pane) => pane.includes("› 1. Vercel Labs (vercel-labs)"), TIMEOUT);
+      expect(picker).not.toContain("(current)");
+      await session.sendKeys("Enter");
+      const saved = await waitForSavedLogin(join(home, ".fx", "auth.json"));
+      expect(saved.team_id).toBe("team_123");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+}
 
 tmuxTest(
   "an expired login during a request opens sign-in and finishes the request",
