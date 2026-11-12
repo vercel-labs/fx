@@ -383,6 +383,28 @@ describe("toolbox", () => {
     expectEveryRequestExtendsThePrevious(raws);
   }, 40_000);
 
+  // The gateway's depth limit doesn't count brackets inside a string, so the
+  // text itself must not decode deeper than tool input may be.
+  test("a toolbox run whose arguments are JSON text nested too deep is refused and fx keeps running", async () => {
+    const root = createRoot();
+    const deep = "{\"a\":".repeat(300) + "1" + "}".repeat(300);
+    const active = start([
+      fakeGatewayToolCall("run_deep", "toolbox", { run: MCP_TOOL, arguments: deep }),
+      fakeGatewayFinalText("TOOLBOX_DEEP_TEXT_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Echo."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOOLBOX_DEEP_TEXT_DONE");
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(2);
+    expect(toolResultText(body(raws[1]!), "run_deep")).toContain("toolbox arguments must be an object");
+    expect(existsSync(root.wireLogPath) ? wireCalls(root.wireLogPath) : []).toEqual([]);
+  }, 40_000);
+
   test("a deny rule on the real tool stops a toolbox run whose arguments are JSON text", async () => {
     const root = createRoot();
     writeFileSync(

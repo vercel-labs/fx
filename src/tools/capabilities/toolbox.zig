@@ -626,6 +626,26 @@ test "toolbox takes exactly one of open, run, or search" {
     }
 }
 
+test "toolbox refuses a run's arguments written as JSON text nested too deep" {
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"run\":\"mcp_fixture_echo\",\"arguments\":\"");
+    for (0..300) |_| try json.writer.writeAll("{\\\"a\\\":");
+    try json.writer.writeAll("1");
+    for (0..300) |_| try json.writer.writeAll("}");
+    try json.writer.writeAll("\"}");
+    switch (try decodeForTest(json.written())) {
+        .input => |input| {
+            input.deinit(std.testing.allocator);
+            return error.TestExpectedFailure;
+        },
+        .failure => |reason| {
+            defer std.testing.allocator.free(reason);
+            try std.testing.expectEqualStrings("toolbox arguments must be an object", reason);
+        },
+    }
+}
+
 test "toolbox keeps a run's arguments as JSON and defaults them to an empty object" {
     const decoded = try decodeForTest("{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"text\":\"hello\"}}");
     const input = switch (decoded) {

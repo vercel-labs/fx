@@ -188,6 +188,15 @@ test "a run's arguments written as JSON text are carried as their object, and ot
         const call = try std.mem.concat(arena, u8, &.{ "{\"run\":\"mcp_fixture_echo\",\"arguments\":", arguments, "}" });
         try std.testing.expect(try carriedCall(arena, tool_name, call) == null);
     }
+
+    // Text nested past what Stringify can write back is refused, not carried.
+    var deep: std.Io.Writer.Allocating = .init(arena);
+    try deep.writer.writeAll("{\"run\":\"mcp_fixture_echo\",\"arguments\":\"");
+    for (0..300) |_| try deep.writer.writeAll("{\\\"a\\\":");
+    try deep.writer.writeAll("1");
+    for (0..300) |_| try deep.writer.writeAll("}");
+    try deep.writer.writeAll("\"}");
+    try std.testing.expect(try carriedCall(arena, tool_name, deep.written()) == null);
 }
 
 test "only a call that is just a run is carried, so any other reaches the tool's decode" {
