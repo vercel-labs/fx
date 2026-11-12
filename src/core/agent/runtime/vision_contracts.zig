@@ -495,32 +495,38 @@ fn imageIdLessThan(_: void, lhs: types.ImageAttachment, rhs: types.ImageAttachme
     return lhs.id < rhs.id;
 }
 
-/// `message`'s content followed by the reference list of the images it carries,
-/// or null when it carries none. The list names the catalog's entries for those
-/// images, in ID order, and leaves out an image the catalog does not authorize.
-/// `catalog` must be sorted by ID. Returned storage belongs to `alloc`.
-fn withOwnImageReferences(
+/// Appends to `out` the catalog's entries for `images`, leaving out an image the
+/// catalog does not authorize. `catalog` must be sorted by ID.
+fn appendCatalogEntries(
     alloc: Allocator,
-    message: types.ChatMessage,
+    out: *std.ArrayList(types.ImageAttachment),
     catalog: []const types.ImageAttachment,
-) !?[]u8 {
-    var carried: std.ArrayList(types.ImageAttachment) = .empty;
-    defer carried.deinit(alloc);
-    for (message.images) |image| {
+    images: []const types.ImageAttachment,
+) !void {
+    for (images) |image| {
         const index = image_attachments.findImageIndexByIdSorted(catalog, image.id) orelse continue;
-        try carried.append(alloc, catalog[index]);
+        try out.append(alloc, catalog[index]);
     }
-    if (carried.items.len == 0) return null;
-    sort_utils.sort(types.ImageAttachment, carried.items, {}, imageIdLessThan);
+}
+
+/// `content` followed by the reference list of `entries`, in ID order with each
+/// ID once, or null when `entries` is empty. Sorts `entries` in place. Returned
+/// storage belongs to `alloc`.
+fn withSortedReferences(
+    alloc: Allocator,
+    content: []const u8,
+    entries: []types.ImageAttachment,
+) !?[]u8 {
+    if (entries.len == 0) return null;
+    sort_utils.sort(types.ImageAttachment, entries, {}, imageIdLessThan);
     var unique: usize = 0;
-    for (carried.items) |image| {
-        if (unique > 0 and carried.items[unique - 1].id == image.id) continue;
-        carried.items[unique] = image;
+    for (entries) |image| {
+        if (unique > 0 and entries[unique - 1].id == image.id) continue;
+        entries[unique] = image;
         unique += 1;
     }
-    const references = try project_image_references(alloc, carried.items[0..unique]);
+    const references = try project_image_references(alloc, entries[0..unique]);
     defer alloc.free(references);
-    const content = message.content orelse "";
     if (content.len == 0) return try alloc.dupe(u8, references);
     return try alloc.print("{s}\n\n{s}", .{ content, references });
 }
@@ -530,9 +536,10 @@ fn withOwnImageReferences(
 /// user message of the turn that attached it, so a later request repeats the
 /// message as the request of its own turn sent it: the provider's prompt cache
 /// still covers it, and the request grows by one line per image, not by every
-/// image on every turn. The catalog holds the images of the turns the request
-/// carries, since a compacted turn's images leave it, so the lists together name
-/// every authorized ID. Returned storage belongs to `alloc`.
+/// image on every turn. Every authorized stable ID is named: an authorized image
+/// that no earlier turn's message carries, such as one a session keeps access to
+/// after its turn left the request, is listed on the current message beside the
+/// current turn's own images. Returned storage belongs to `alloc`.
 pub noinline fn project_text_only_messages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
@@ -551,13 +558,29 @@ pub noinline fn project_text_only_messages(
         return error.MissingUserMessage;
     }
     if (!image_attachments.imageAttachmentsSortedById(catalog)) return error.InvalidImageCatalog;
+
+    var entries: std.ArrayList(types.ImageAttachment) = .empty;
+    defer entries.deinit(alloc);
+    // The IDs a message of the request lists, so the current message does not.
+    var listed: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer listed.deinit(alloc);
     for (messages[0..current_user_message_index], 0..) |message, index| {
         if (!isTurnUserMessage(message)) continue;
-        if (try withOwnImageReferences(alloc, message, catalog)) |content| projected[index].content = content;
+        entries.clearRetainingCapacity();
+        try appendCatalogEntries(alloc, &entries, catalog, message.images);
+        for (entries.items) |image| try listed.put(alloc, image.id, {});
+        if (try withSortedReferences(alloc, message.content orelse "", entries.items)) |content| {
+            projected[index].content = content;
+        }
     }
-    if (try withOwnImageReferences(alloc, messages[current_user_message_index], catalog)) |content| {
-        projected[current_user_message_index].content = content;
+    const current = &projected[current_user_message_index];
+    entries.clearRetainingCapacity();
+    try appendCatalogEntries(alloc, &entries, catalog, messages[current_user_message_index].images);
+    for (entries.items) |image| try listed.put(alloc, image.id, {});
+    for (catalog) |image| {
+        if (!listed.contains(image.id)) try entries.append(alloc, image);
     }
+    if (try withSortedReferences(alloc, current.content orelse "", entries.items)) |content| current.content = content;
     return projected;
 }
 
@@ -1699,6 +1722,45 @@ test "text-only projection grows by the lines of the images, not by the turns af
         longer_bytes += content.len;
     }
     try std.testing.expectEqual(shorter_bytes + "ok".len + "and then?".len, longer_bytes);
+}
+
+test "text-only projection lists an authorized image no message carries on the current message" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const catalog = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/tmp/one.png"), .media_type = @constCast("image/png") },
+        .{ .id = 7, .path = @constCast("/tmp/seven.png"), .media_type = @constCast("image/png") },
+        .{ .id = 9, .path = @constCast("/tmp/nine.png"), .media_type = @constCast("image/png") },
+    };
+    // No message carries image 7, as when a session keeps access to an image
+    // after the turn that attached it has left the request.
+    const history = [_]types.ChatMessage{
+        .{ .role = .user, .content = "first", .images = catalog[0..1], .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a1" },
+    };
+
+    // A current message with no image of its own names the image no message
+    // carries, and not image 1, which the earlier message already lists.
+    const bare = history ++ [_]types.ChatMessage{.{ .role = .user, .content = "again" }};
+    const bare_projected = try project_text_only_messages(arena, &bare, 2, catalog[0..2]);
+    try std.testing.expectEqualStrings("first\n\n<available_images>\n[Image #1]\n</available_images>", bare_projected[0].content.?);
+    try std.testing.expectEqualStrings("again\n\n<available_images>\n[Image #7]\n</available_images>", bare_projected[2].content.?);
+
+    // With an image of its own, the current message lists both, once each, in ID order.
+    const own = history ++ [_]types.ChatMessage{.{ .role = .user, .content = "and this", .images = catalog[2..3] }};
+    const own_projected = try project_text_only_messages(arena, &own, 2, &catalog);
+    try std.testing.expectEqualStrings("and this\n\n<available_images>\n[Image #7]\n[Image #9]\n</available_images>", own_projected[2].content.?);
+    for ([_][]const u8{ "[Image #1]", "[Image #7]", "[Image #9]" }) |name| {
+        var found: usize = 0;
+        for (own_projected) |chat_message| found += std.mem.count(u8, chat_message.content orelse "", name);
+        try std.testing.expectEqual(@as(usize, 1), found);
+    }
+
+    // With no catalog nothing is listed and the messages stay as they were.
+    const none = try project_text_only_messages(arena, &bare, 2, &.{});
+    try std.testing.expectEqualStrings("again", none[2].content.?);
+    try std.testing.expectEqualStrings("first", none[0].content.?);
 }
 
 test "native message projection retains only the current turn structured rejection" {
