@@ -1134,6 +1134,95 @@ test "a reload keeps a kept server's list and the bindings made from it, until a
     try testing.expect(c.hasTool("mcp_late_echo", .unrestricted));
 }
 
+test "a reload beside a call that is out and a reader of the access view ends only the dropped server's call" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const kept: mcp_contract.McpServerConfig = .{ .name = "kept", .command = f.server };
+    const gone: mcp_contract.McpServerConfig = .{ .name = "gone", .command = f.server };
+    const late: mcp_contract.McpServerConfig = .{ .name = "late", .command = f.server };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &.{ kept, gone }, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A subagent's admission: the view it was given.
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
+    defer view.deinit(testing.allocator);
+    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+
+    // Its calls, one on each server, which never answer.
+    const Caller = struct {
+        catalog: *Catalog,
+        tool: []const u8,
+        access: Access,
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            _ = self.catalog.callTool(scratch.allocator(), self.tool, "{\"text\":\"slow\"}", 4096, .{
+                .access = self.access,
+                .cancel_flag = &self.cancel,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    // What the host's authority resolver reads for each tool call a subagent makes.
+    const Reader = struct {
+        catalog: *Catalog,
+        stop: std.atomic.Value(bool) = .init(false),
+        reads: std.atomic.Value(usize) = .init(0),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                var seen = self.catalog.snapshotAccessView(testing.allocator, "child", "parent", .{}) catch return;
+                seen.deinit(testing.allocator);
+                const names = self.catalog.snapshotToolNames(testing.allocator, .{}) catch return;
+                for (names) |name| testing.allocator.free(name);
+                testing.allocator.free(names);
+                _ = self.reads.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var kept_call: Caller = .{ .catalog = &c, .tool = "mcp_kept_echo", .access = child };
+    var gone_call: Caller = .{ .catalog = &c, .tool = "mcp_gone_echo", .access = child };
+    var reader: Reader = .{ .catalog = &c };
+    const kept_thread = try std.Thread.spawn(.{}, Caller.run, .{&kept_call});
+    const gone_thread = try std.Thread.spawn(.{}, Caller.run, .{&gone_call});
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    std.Io.sleep(testing.io, .fromMilliseconds(300), .awake) catch {};
+
+    // One server goes and one comes, as a session's reload with a working subagent does.
+    const generation = c.currentGeneration();
+    try c.reload(try r.reload(&.{ kept, late }, &f.inherited));
+    gone_thread.join();
+    try testing.expectEqual(@as(?anyerror, error.Cancelled), gone_call.err);
+
+    // The kept server's call is still out, and the reader read on through the reload.
+    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    try testing.expect(!kept_call.done.load(.acquire));
+    reader.stop.store(true, .release);
+    reader_thread.join();
+    try testing.expect(reader.reads.load(.monotonic) > 0);
+
+    // A server went, so the view the subagent was given holds no longer, and its next call is refused.
+    try testing.expect(generation != c.currentGeneration());
+    try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_kept_echo", "{}", 4096, .{ .access = child }));
+    kept_call.cancel.store(true, .release);
+    kept_thread.join();
+    try testing.expectEqual(@as(?anyerror, error.Cancelled), kept_call.err);
+}
+
 test "a search says why a server it names has no tools, and calls that end say how" {
     var f: Fixture = undefined;
     try f.init();

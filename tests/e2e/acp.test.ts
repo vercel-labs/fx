@@ -9950,6 +9950,354 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  // A session/load or session/resume of the session that is already active
+  // reloads it. Its working subagents go on, and their reports arrive as they
+  // do after a session/cancel: as the session's next turns.
+  const reloadChildPrompt = "Remain active until the session is reloaded.";
+  const reloadCallId = "acp_reload_child";
+
+  /** The outcomes of the work a session's log records as finished, in order. */
+  const reloadChildOutcomes = (home: string, id: string): string[] =>
+    (logLines(home, id) as any[]).filter((line) => line.kind === "child_finished").map((line) => line.outcome);
+
+  for (const via of ["session/load", "session/resume"] as const) {
+    test(
+      `ACP ${via} of the active session keeps a working subagent, whose report arrives once it ends`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-reload-child-");
+        const heldChild = deferred<Response>();
+        const gateway = startDynamicFakeGateway((body) => {
+          if (!body.includes('"name":"subagent"')) return heldChild.promise;
+          if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_REPORT_SEEN");
+          if (acpLatestPromptText(body).includes("Confirm the reloaded session")) return finalText("ACP_RELOAD_FOLLOWUP_OK");
+          if (body.includes(reloadCallId)) return finalText("ACP_RELOAD_PARENT_DONE");
+          return fakeGatewayToolCall(reloadCallId, "subagent", {
+            request: { action: "message", agent: "waiter", message: reloadChildPrompt },
+          });
+        });
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          const sessionId = await startAutoSession(client, true);
+          sendPrompt(client, 7301, "Start the subagent that outlives the reload.");
+          // The parent's call, its turn after the receipt, and the held child.
+          await waitForCondition("the parent's finished turn and the held child", () => gateway.requests.length === 3, TIMEOUT);
+
+          // The reload names the client's hooks again, as a client that reloads does.
+          client.send({ jsonrpc: "2.0", id: 7302, method: via, params: { sessionId, mcpServers: [], _meta: { fx: { hooks: { captureContent: true } } } } });
+          const reloaded = await readUntilResponses(client, [7301, 7302], TIMEOUT);
+          expect(reloaded.responses.get(7302).error).toBeUndefined();
+          // The reload ends the parent's wait, as a cancel does, and not the child's work.
+          expect(reloaded.responses.get(7301).result.stopReason).toBe("cancelled");
+
+          heldChild.resolve(finalText("late child completion"));
+          await waitForCondition("the child's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+          expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
+
+          const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
+          expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+          const bodies = gateway.requests.map((request) => request.body);
+          // Nothing says fx stopped the child, and its report arrives once.
+          expect(bodies.some((body) => body.includes("fx stopped before it finished"))).toBe(false);
+          expect(bodies.filter((body) => acpLatestUserIsReport(body))).toHaveLength(1);
+          expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_FOLLOWUP_OK");
+          expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_REPORT_SEEN");
+          // The report completes the call that sent the work.
+          expect(JSON.stringify(reportUpdatesFor(followUp.messages, reloadCallId).at(-1))).toContain("late child completion");
+          const phases = client.hookEvents.filter((event) => event.type === "delegation" && event.data.callId === reloadCallId).map((event) => event.data.phase);
+          expect(phases).toContain("completed");
+          expect(phases).not.toContain("failed");
+          expect(phases).not.toContain("cancelled");
+          expect(client.stderr).toBe("");
+        } finally {
+          heldChild.resolve(finalText("held child cleanup"));
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "ACP session/load of the active session leaves an idle subagent usable with its conversation, and the turn's list names it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-reload-idle-");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          return finalText(body.includes("RELOAD_SECOND_TASK") ? "RELOAD_CHILD_SECOND_ANSWER" : "RELOAD_CHILD_FIRST_ANSWER");
+        }
+        if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_IDLE_REPORT_SEEN");
+        if (acpLatestPromptText(body).includes("Ask the waiter again")) {
+          return fakeGatewayToolCall("reload_second_call", "subagent", {
+            request: { action: "message", agent: "waiter", message: "RELOAD_SECOND_TASK" },
+          });
+        }
+        if (body.includes("reload_second_call")) return finalText("ACP_RELOAD_SECOND_DONE");
+        if (body.includes("reload_first_call")) return finalText("ACP_RELOAD_FIRST_DONE");
+        return fakeGatewayToolCall("reload_first_call", "subagent", {
+          request: { action: "message", agent: "waiter", message: "RELOAD_FIRST_TASK" },
+        });
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client, true);
+        const first = await runPrompt(client, "Start the waiter.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(first)).toContain("ACP_RELOAD_IDLE_REPORT_SEEN");
+
+        // No subagent works, so the reload takes the session's MCP host as it always has.
+        const loaded = await client.request("session/load", { sessionId, mcpServers: [] }, 7401) as any;
+        expect(loaded.error).toBeUndefined();
+
+        const base = gateway.requests.length;
+        const second = await runPrompt(client, "Ask the waiter again.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        const bodies = gateway.requests.slice(base).map((request) => request.body);
+        // The turn's list of subagents still names the waiter, idle.
+        expect(acpPromptText(bodies[0]!)).toContain("- waiter: idle");
+        // The waiter answers its second message with its first exchange in its conversation.
+        const childBody = bodies.find((body) => !body.includes('"name":"subagent"') && body.includes("RELOAD_SECOND_TASK"));
+        expect(childBody).toBeDefined();
+        expect(acpPromptText(childBody!)).toContain("RELOAD_CHILD_FIRST_ANSWER");
+        expect(JSON.stringify(second)).toContain("ACP_RELOAD_IDLE_REPORT_SEEN");
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok", "ok"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/load leaves a subagent that waits for an approval as session/cancel does",
+    async () => {
+      // A subagent's question never goes to the client: it waits for an approval
+      // that only the terminal app's menu gives, and neither a cancel nor a
+      // reload ends that wait.
+      const seen: Record<string, { outcomesBefore: string[]; note: string; stopReason: string }> = {};
+      for (const via of ["session/cancel", "session/load"] as const) {
+        const root = createIsolatedRoot("fx-acp-reload-approval-");
+        const target = join(root.external, "child-write.txt");
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
+        );
+        const gateway = startDynamicFakeGateway((body) => {
+          // The writer's one request: its write waits for an approval.
+          if (!body.includes('"name":"subagent"')) return fileToolCall("child_write", target, "blocked\n");
+          if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_APPROVAL_REPORT_SEEN");
+          if (acpLatestPromptText(body).includes("Report the writer's state")) return finalText("ACP_RELOAD_APPROVAL_NOTED");
+          if (body.includes("reload_approval_call")) return finalText("ACP_RELOAD_APPROVAL_PARENT_DONE");
+          return fakeGatewayToolCall("reload_approval_call", "subagent", {
+            request: { action: "message", agent: "writer", message: "Write the file." },
+          });
+        });
+        let acp: AcpClient | null = null;
+        try {
+          acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          const sessionId = await startAutoSession(acp, true);
+          sendPrompt(acp, 7501, "Start the writing subagent.");
+          await waitForCondition("the parent's finished turn and the writer's request", () => gateway.requests.length === 3, TIMEOUT);
+          await waitForCondition("the writer's wait for an approval", () => acp!.hookEvents.some((event) => event.type === "permission.start"), TIMEOUT);
+
+          acp.send(via === "session/cancel"
+            ? { jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} }
+            : { jsonrpc: "2.0", id: 7502, method: "session/load", params: { sessionId, mcpServers: [] } });
+          const stopped = await readUntilResponses(acp, [7501, 7502], TIMEOUT);
+          expect(stopped.responses.get(7501).result.stopReason).toBe("cancelled");
+          expect(stopped.messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
+          const outcomesBefore = reloadChildOutcomes(root.home, sessionId);
+
+          // The next prompt's list names the writer as it is, and the user can still cancel the wait.
+          const base = gateway.requests.length;
+          sendPrompt(acp, 7503, "Report the writer's state.");
+          await waitForCondition("the next prompt's first request", () => gateway.requests.length > base, TIMEOUT);
+          const note = acpLatestPromptText(gateway.requests[base]!.body).split("\n").find((line) => line.includes("- writer:")) ?? "";
+          acp.send({ jsonrpc: "2.0", id: 7504, method: "session/cancel", params: {} });
+          const ended = await readUntilResponses(acp, [7503, 7504], TIMEOUT);
+          expect(existsSync(target)).toBe(false);
+          seen[via] = { outcomesBefore, note, stopReason: ended.responses.get(7503).result.stopReason };
+          expect(acp.stderr).toBe("");
+        } finally {
+          await acp?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+      // A reload leaves the writer as a cancel does: still waiting, with nothing finished.
+      expect(seen["session/cancel"]!.outcomesBefore).toEqual([]);
+      expect(seen["session/cancel"]!.note).toContain("waiting for an approval");
+      expect(seen["session/load"]).toEqual(seen["session/cancel"]!);
+    },
+    TIMEOUT * 2,
+  );
+
+  /** An MCP fixture server named `name`, which holds each call until `release` exists when `hold` is set. */
+  function reloadMcpServer(root: { root: string }, name: string, hold?: { started: string; release: string }) {
+    return {
+      name,
+      command: process.execPath,
+      args: [MCP_STDIO_FIXTURE],
+      env: [
+        { name: "FX_MCP_PID_PATH", value: join(root.root, `${name}.pid`) },
+        ...(hold ? [
+          { name: "FX_MCP_CALL_STARTED_PATH", value: hold.started },
+          { name: "FX_MCP_CALL_RELEASE_PATH", value: hold.release },
+        ] : []),
+      ],
+    };
+  }
+
+  /** The gateway for a subagent that calls MCP tools in turn: `calls` are its tool calls by id, then it ends. */
+  function reloadMcpGateway(calls: Array<[string, string]>) {
+    return startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // The child's next call is the first one whose result it has not read yet.
+        const next = calls.find(([id]) => !body.includes(`"toolCallId":"${id}"`));
+        return next ? fakeGatewayToolCall(next[0], "toolbox", { run: next[1], arguments: { text: next[0] } }) : finalText("RELOAD_MCP_CHILD_DONE");
+      }
+      if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_MCP_REPORT_SEEN");
+      if (acpLatestPromptText(body).includes("Confirm the reloaded session")) return finalText("ACP_RELOAD_MCP_FOLLOWUP_OK");
+      if (body.includes(reloadCallId)) return finalText("ACP_RELOAD_MCP_PARENT_DONE");
+      return fakeGatewayToolCall(reloadCallId, "subagent", {
+        request: { action: "message", agent: "caller", message: "Call the MCP tools." },
+      });
+    });
+  }
+
+  /** The text of the result a subagent was given for its call `id`, from the last request it sent. */
+  const reloadMcpResult = (gateway: ReturnType<typeof startFakeGateway>, id: string): string => {
+    const last = gateway.requests.map((request) => request.body)
+      .filter((body) => !body.includes('"name":"subagent"') && body.includes(`"toolCallId":"${id}"`)).at(-1);
+    expect(last).toBeDefined();
+    return acpToolResultText(last!, id);
+  };
+
+  test(
+    "ACP session/load takes the same MCP servers in place while a subagent's call is out, and the call goes on",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-reload-mcp-same-");
+      const hold = { started: join(root.root, "call-started"), release: join(root.root, "call-release") };
+      const tracePath = join(root.root, "trace.log");
+      const server = reloadMcpServer(root, "fixture", hold);
+      const gateway = reloadMcpGateway([["child_mcp_held", MCP_TOOL_NAME], ["child_mcp_after", MCP_TOOL_NAME]]);
+      let pid = 0;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server], _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+
+        sendPrompt(client, 7601, "Start the subagent that calls MCP tools.");
+        // The subagent's call is out at the server, held.
+        await waitForPath(hold.started, TIMEOUT);
+        pid = Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim());
+
+        client.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [server] } });
+        const reloaded = await readUntilResponses(client, [7601, 7602], TIMEOUT);
+        expect(reloaded.responses.get(7602).error).toBeUndefined();
+        expect(reloaded.responses.get(7601).result.stopReason).toBe("cancelled");
+        // The same server list restarts nothing, and the host stayed where it was.
+        expect(Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim())).toBe(pid);
+        expect(processAlive(pid)).toBe(true);
+        expect(readFileSync(tracePath, "utf8")).toContain("event=reload_mcp_in_place");
+
+        // The held call ends, and the subagent calls the same tool again: its authority is as it was.
+        writeFileSync(hold.release, "");
+        await waitForCondition("the subagent's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
+        expect(reloadMcpResult(gateway, "child_mcp_held")).toContain("MODERN_MCP_TOOL_RESULT");
+        expect(reloadMcpResult(gateway, "child_mcp_after")).toContain("MODERN_MCP_TOOL_RESULT");
+        expect(Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim())).toBe(pid);
+
+        const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
+        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_MCP_REPORT_SEEN");
+        expect(client.stderr).toBe("");
+      } finally {
+        writeFileSync(hold.release, "");
+        await client?.close();
+        gateway.stop();
+        if (pid && processAlive(pid)) process.kill(pid, "SIGKILL");
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP session/load with changed MCP servers ends a subagent's call on a removed server cancelled, and later calls meet its stale authority",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-reload-mcp-changed-");
+      const hold = { started: join(root.root, "call-started"), release: join(root.root, "call-release") };
+      const tracePath = join(root.root, "trace.log");
+      const removed = reloadMcpServer(root, "fixture", hold);
+      const kept = reloadMcpServer(root, "keep");
+      const added = reloadMcpServer(root, "extra");
+      const gateway = reloadMcpGateway([
+        ["child_mcp_held", MCP_TOOL_NAME],
+        ["child_mcp_keep", "mcp_keep_echo"],
+        ["child_mcp_extra", "mcp_extra_echo"],
+      ]);
+      let pid = 0;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [removed, kept], _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+
+        sendPrompt(client, 7611, "Start the subagent that calls MCP tools.");
+        await waitForPath(hold.started, TIMEOUT);
+        pid = Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim());
+
+        // One server goes and one comes.
+        client.send({ jsonrpc: "2.0", id: 7612, method: "session/load", params: { sessionId, mcpServers: [kept, added] } });
+        const reloaded = await readUntilResponses(client, [7611, 7612], TIMEOUT);
+        expect(reloaded.responses.get(7612).error).toBeUndefined();
+        expect(reloaded.responses.get(7611).result.stopReason).toBe("cancelled");
+        expect(readFileSync(tracePath, "utf8")).toContain("event=reload_mcp_in_place");
+
+        // The removed server stops, and the call it held ends cancelled, as the engine says.
+        await waitForCondition("the removed server to stop", () => !processAlive(pid), TIMEOUT);
+        await waitForCondition("the subagent's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
+        expect(reloadMcpResult(gateway, "child_mcp_held")).toContain('"error":"Cancelled"');
+        // Its later calls, to the kept server and the added one, meet the authority it was admitted with:
+        // a server went, so the tools it was shown no longer hold, and neither call reaches a server.
+        for (const name of ["keep", "extra"]) {
+          expect(reloadMcpResult(gateway, `child_mcp_${name}`)).toBe(`No tool named mcp_${name}_echo is in the toolbox. Use toolbox search to find it.`);
+        }
+        expect(existsSync(join(root.root, "extra.pid"))).toBe(false);
+
+        const followUp = await runPrompt(client, "Confirm the reloaded session is usable.", TIMEOUT);
+        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(followUp)).toContain("ACP_RELOAD_MCP_REPORT_SEEN");
+        expect(client.stderr).toBe("");
+      } finally {
+        writeFileSync(hold.release, "");
+        await client?.close();
+        gateway.stop();
+        if (pid && processAlive(pid)) process.kill(pid, "SIGKILL");
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
   test(
     "ACP cancellation ends the wait for subagent reports, and a late report follows the next prompt",
     async () => {

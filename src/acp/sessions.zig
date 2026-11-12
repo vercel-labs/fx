@@ -847,17 +847,42 @@ fn handleRestoreSession(
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             server.cancelAndReapActivePrompt(state);
-            server.disableSubagentHost(state);
-            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+            // The session stays open, so its subagent host and the children
+            // it runs stay too: a child that works goes on, and its report
+            // reaches the session as the next turn, as after `session/cancel`
+            // (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren
+            // only needs the parent open while a child runs).
+            //
+            // What the reload may not do to a working child is destroy the
+            // MCP host its tool context holds. So a session with no working
+            // subagent swaps its host for the new one, as it always has, and
+            // a session with one keeps its host and takes the new servers in
+            // place (`Host.reload`): a server whose config is the same keeps
+            // running with its calls, and a removed or changed one stops and
+            // ends its calls cancelled.
             const previous_host = active.mcp_host;
-            active.mcp_host = session_host;
-            session_host_owned = false;
+            const subagents_working = if (state.subagent_host) |subagents| !subagents.quiet() else false;
+            const in_place = subagents_working and previous_host != null;
+            if (in_place) {
+                debug_trace.logf("acp", "event=reload_mcp_in_place session={s} reason=subagents_working", .{active.session_id});
+                mcp_servers.reloadHost(alloc, previous_host.?, &mcp_configs) catch |err| {
+                    debug_trace.logf("acp", "event=reload_mcp_in_place_failed session={s} err={s}", .{ active.session_id, @errorName(err) });
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "MCP servers could not be reloaded",
+                    });
+                };
+            }
+            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+            if (!in_place) {
+                active.mcp_host = session_host;
+                session_host_owned = false;
+            }
             const start = server.loadStartingMode(state, alloc);
             active.mode = start.id;
             active.permission_mode = start.permission_mode;
             state.subagent_authority_mutex.unlock(io_mod.getIo());
-            if (previous_host) |h| h.stop();
-            server.enableSubagentHost(state);
+            if (!in_place) if (previous_host) |h| h.stop();
             // One map, so a recovered read can name a call from an earlier turn.
             var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
             defer sources.deinit(alloc);
@@ -3284,6 +3309,70 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
+}
+
+test "ACP load of the active session keeps its subagent host and the session it appends to" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const active = &state.active_session.?;
+    _ = server.applySessionMode(state.cfg.mode_registry, active, "review");
+    const subagents = state.subagent_host.?;
+    const children = state.subagent_v2_children.?;
+    const parent = active.v2.?;
+
+    for ([_]struct { method: []const u8, handler: *const fn (*server.ServerState, Allocator, *jsonrpc.Message) anyerror!void }{
+        .{ .method = "session/load", .handler = handleLoadSession },
+        .{ .method = "session/resume", .handler = handleResumeSession },
+    }, 0..) |request, index| {
+        var params: std.Io.Writer.Allocating = .init(arena);
+        defer params.deinit();
+        try params.writer.writeAll("{\"sessionId\":");
+        try writeJsonStr(active.session_id, &params.writer);
+        try params.writer.writeAll(",\"mcpServers\":[]}");
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 2) },
+            .method = request.method,
+            .params_raw = params.writer.buffered(),
+        };
+        try request.handler(&state, arena, &msg);
+
+        // The host, its children, and the session they append to are the ones that were there.
+        try std.testing.expect(state.subagent_host.? == subagents);
+        try std.testing.expect(state.subagent_v2_children.? == children);
+        try std.testing.expect(state.active_session.?.v2.? == parent);
+        // What a reload always did still happens: the mode starts over.
+        try std.testing.expectEqualStrings(
+            test_session_mode_registry.default_mode_id,
+            state.active_session.?.mode,
+        );
+        _ = server.applySessionMode(state.cfg.mode_registry, &state.active_session.?, "review");
+    }
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {
