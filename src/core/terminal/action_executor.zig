@@ -11,6 +11,11 @@ pub const Context = struct {
     lifecycle_allocator: Allocator,
     runtime: *client.Runtime,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// When set, a request still pending `yield_grace_ms` after it starts is
+    /// cancelled and ends `.cancelled`, as `cancel_flag` would end it. Only
+    /// read-only waits pass it: cancelling one leaves the session running.
+    yield_flag: ?*const std.atomic.Value(bool) = null,
+    yield_grace_ms: i64 = 0,
 };
 
 pub fn execute(
@@ -38,6 +43,7 @@ pub fn execute(
         } });
     };
     var cancellation_sent = false;
+    const started_ms = io_mod.milliTimestamp();
     while (true) {
         if (ctx.runtime.takeCompletionFor(correlation_id)) |completion_value| {
             var completion = completion_value;
@@ -66,8 +72,18 @@ pub fn execute(
                 }
             }
         }
+        if (!cancellation_sent and yieldDue(ctx, started_ms, io_mod.milliTimestamp())) {
+            _ = ctx.runtime.cancel(correlation_id);
+            cancellation_sent = true;
+        }
         io_mod.sleep(2 * std.time.ns_per_ms);
     }
+}
+
+fn yieldDue(ctx: Context, started_ms: i64, now_ms: i64) bool {
+    const flag = ctx.yield_flag orelse return false;
+    if (!flag.load(.acquire)) return false;
+    return now_ms - started_ms >= ctx.yield_grace_ms;
 }
 
 fn disconnectedActionIsRetryable(action: contracts.Action) bool {
@@ -99,6 +115,23 @@ fn mapAdmissionError(err: client.AdmissionError) contracts.StructuredErrorCode {
         error.RuntimeStopping => .cancelled,
         else => .invalid_request,
     };
+}
+
+test "a yield is due only once its flag is set and the grace time has passed" {
+    var flag = std.atomic.Value(bool).init(false);
+    var ctx = Context{
+        .alloc = std.testing.allocator,
+        .lifecycle_allocator = std.testing.allocator,
+        .runtime = undefined,
+        .yield_flag = &flag,
+        .yield_grace_ms = 250,
+    };
+    try std.testing.expect(!yieldDue(ctx, 1_000, 2_000));
+    flag.store(true, .release);
+    try std.testing.expect(!yieldDue(ctx, 1_000, 1_249));
+    try std.testing.expect(yieldDue(ctx, 1_000, 1_250));
+    ctx.yield_flag = null;
+    try std.testing.expect(!yieldDue(ctx, 1_000, 2_000));
 }
 
 test "disconnect retryability excludes actions that may already have effects" {

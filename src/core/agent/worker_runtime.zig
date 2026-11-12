@@ -631,6 +631,13 @@ pub const WorkerRuntime = struct {
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
+    /// Set while steering waits for the active turn behind a running tool.
+    /// A shell call that sees it stops waiting for its command and returns
+    /// the command running, under the same `session_id`, so the turn reaches
+    /// its next steering boundary without stopping the command. Cleared when
+    /// the turn takes its steering and when a turn starts or ends. Written
+    /// under `worker_mutex`; tools read it without the lock.
+    tool_yield_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     direct_steering_closed: bool = false,
     /// Set by `nudgeWaiter` and cleared by `waitForPostOrNudge`, so a nudge
     /// sent before the wait starts still ends it. Guarded by `worker_mutex`.
@@ -1103,7 +1110,18 @@ pub const WorkerRuntime = struct {
         var queued = prompt;
         queued.delivery = .{ .active_turn = self.active_turn_id };
         try self.enqueuePromptLocked(alloc, queued);
+        self.requestToolYieldForLocked(queued);
         return true;
+    }
+
+    /// Asks a running shell command to return running, under its session,
+    /// when `queued` is steering that would otherwise wait behind it.
+    fn requestToolYieldForLocked(self: *WorkerRuntime, queued: QueuedPrompt) void {
+        if (queued.delivery.activeTurnId() != self.active_turn_id) return;
+        if (!yieldsRunningTools(queued)) return;
+        if (!self.hasActiveToolBoundaryLocked() or self.compactionInFlightLocked()) return;
+        self.tool_yield_requested.store(true, .seq_cst);
+        debug_trace.eventf("worker", "steering_tool_yield_requested", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} author={s} active_tools={d}", .{ queued.turn_id, @tagName(queued.author), self.active_tool_calls.count() });
     }
 
     /// Posts a message from another agent. It joins the running turn when
@@ -1237,6 +1255,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = turn_id }, "worker={x} mail={s} remaining={d} marked=true", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
         return prompt;
     }
@@ -1403,6 +1422,7 @@ pub const WorkerRuntime = struct {
         {
             queued.delivery = .{ .active_turn = self.active_turn_id };
             interrupt_after_admission = !self.hasSteeringWaitBoundaryLocked();
+            if (!interrupt_after_admission) self.requestToolYieldForLocked(queued);
         } else if (steer_if_active and older_waits and sameTurnSteeringEligible(queued)) {
             queued.delivery = .continuation;
             debug_trace.eventf("worker", "steering_behind_waiting", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} queue_depth={d}", .{ queued.turn_id, self.queuedWorkCountLocked() });
@@ -1427,6 +1447,19 @@ pub const WorkerRuntime = struct {
     /// draws it as a message the user typed.
     fn previewsAsSteering(prompt: QueuedPrompt) bool {
         return prompt.delivery.isSteering() and prompt.author != .child;
+    }
+
+    /// Whether steering `prompt` moves a running shell command to the
+    /// background so the turn takes it at once. The user's and a parent
+    /// agent's steering do; a subagent's report waits for the tool, so a
+    /// stream of reports does not detach every command main runs.
+    fn yieldsRunningTools(prompt: QueuedPrompt) bool {
+        return prompt.author != .child;
+    }
+
+    /// Clears a pending tool yield; the caller holds `worker_mutex`.
+    fn clearToolYieldLocked(self: *WorkerRuntime) void {
+        self.tool_yield_requested.store(false, .seq_cst);
     }
 
     fn sameTurnSteeringEligible(prompt: QueuedPrompt) bool {
@@ -1542,10 +1575,12 @@ pub const WorkerRuntime = struct {
                 for (self.queued_prompts.items) |prompt| {
                     if (prompt.delivery.activeTurnId() == turn_id and !sameTurnSteeringEligible(prompt)) {
                         self.handed_off_turn_id = turn_id;
+                        self.clearToolYieldLocked();
                         return .handoff;
                     }
                 }
                 const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
+                if (messages.len != 0) self.clearToolYieldLocked();
                 if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
                 debug_trace.eventf("worker", "steering_taken", .{ .turn_id = turn_id }, "worker={x} kind={s} count={d} closed={}", .{ @intFromPtr(self), @tagName(kind), messages.len, self.direct_steering_closed });
                 return if (messages.len == 0)
@@ -1888,6 +1923,11 @@ pub const WorkerRuntime = struct {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
             self.queued_history = &.{};
         }
+        // A tool yield stands only for steering that still waits for the turn.
+        const yield_still_wanted = for (self.queued_prompts.items) |queued| {
+            if (queued.delivery.activeTurnId() == self.active_turn_id and yieldsRunningTools(queued)) break true;
+        } else false;
+        if (!yield_still_wanted) self.clearToolYieldLocked();
         const turn_id = prompt.turn_id;
         const remaining = self.queuedWorkCountLocked();
         freeQueuedPrompt(alloc, prompt);
@@ -2006,6 +2046,7 @@ pub const WorkerRuntime = struct {
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
+            self.clearToolYieldLocked();
             self.active_context_compaction = true;
             if (task.operation_id) |id| self.compaction_presentation.running(id, .preparation);
             debug_trace.eventf(
@@ -2074,6 +2115,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         if (typedByUser(job)) self.noteTypedLocked(alloc, job.turn_id, job.prompt);
         // The last turn's final boundary closed it to messages; this one
         // starts open, as a direct turn does.
@@ -2124,6 +2166,7 @@ pub const WorkerRuntime = struct {
         self.steering_cancel_turn_id = null;
         self.clearActiveToolCallsLocked();
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         self.active_context_compaction = false;
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
@@ -2141,6 +2184,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         debug_trace.eventf("worker", "processing_begun", .{ .turn_id = turn_id }, "worker={x} queued={d}", .{ @intFromPtr(self), self.queued_prompts.items.len });
         return true;
     }
@@ -5290,6 +5334,77 @@ test "tool lifecycle decides whether interactive steering interrupts immediately
     } } });
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
     try std.testing.expect(runtime.isCancelRequested());
+}
+
+test "steering behind a running tool asks the tool to yield instead of cancelling" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_shell" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } } });
+
+    // A subagent's report waits for the tool and does not detach it.
+    var report = try makePrompt(alloc, "child report", "model");
+    report.author = .child;
+    try runtime.admitInteractivePrompt(alloc, report);
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "look at the config instead", "model"));
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    // The yield stands until the turn takes its steering.
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .terminal = .{
+        .id = .{ .turn_id = 41, .call_id = "call_shell" },
+        .outcome = .{ .kind = .completed, .summary = "completed" },
+    } } });
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .model));
+    defer freeSteeringMessages(alloc, guidance);
+    try std.testing.expectEqual(@as(usize, 2), guidance.len);
+    try std.testing.expectEqualStrings("look at the config instead", guidance[1].text);
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+
+    // With no tool running, steering interrupts the model and asks no yield.
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+}
+
+test "steering during a tool-producing step asks the coming tool to yield" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+        .turn_id = 41,
+        .step_id = 7,
+        .phase = .running,
+    } });
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer before the tool starts", "model"));
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    // Taking the steer back for editing leaves nothing to yield for.
+    const retracted = (try runtime.popQueuedSteerForEdit(alloc)).?;
+    defer alloc.free(retracted);
+    try std.testing.expectEqualStrings("steer before the tool starts", retracted);
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer again", "model"));
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    runtime.finishProcessing();
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
 }
 
 test "subagent wait phase preserves steering control and existing tool boundaries" {
