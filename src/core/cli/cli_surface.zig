@@ -1246,7 +1246,9 @@ fn activateProviderSelectionFallible(
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
-        try writeProviderActivationError(alloc, deps, caller, "could not load settings");
+        const message = try config_runtime.configuredProviderMessage(alloc, err);
+        defer if (message) |text| alloc.free(text);
+        try writeProviderActivationError(alloc, deps, caller, message orelse "could not load settings");
         debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
         return false;
     };
@@ -1262,7 +1264,7 @@ fn activateProviderSelectionFallible(
                 // exits as a usage error.
                 return error.UnknownConfiguredProvider;
             },
-            error.ConfiguredProviderChanged => return err,
+            error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => return err,
         };
         const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
@@ -1977,6 +1979,12 @@ fn runNonInteractiveWithDeps(
             defer collections.freeStringList(alloc, &ids);
             var entries = loaded.entries;
             defer model_catalog.freeModelCatalog(alloc, &entries);
+            defer if (loaded.notice) |notice| alloc.free(notice);
+            if (loaded.notice) |notice| {
+                try writeStderr(deps, "fx models: ");
+                try writeStderr(deps, notice);
+                try writeStderr(deps, "\n");
+            }
             const details = try modelDetails(
                 alloc,
                 ids.items,

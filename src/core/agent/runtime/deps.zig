@@ -290,6 +290,11 @@ pub const AgentRuntimeDeps = struct {
     /// Source-limit notices use a session-scoped deduplicating path when the
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
+    /// A notice the person should see once in a live session, however many
+    /// turns repeat its cause. The host shows it where they read the
+    /// transcript and drops a text it has already shown. Null: the host has
+    /// no session to remember it in, and the notice is not shown.
+    push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's

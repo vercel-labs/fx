@@ -1426,7 +1426,7 @@ pub const ModelListSnapshot = struct {
     }
 
     fn catalogExplanation(self: ModelListSnapshot) ?[]const u8 {
-        if (self.provider == .configured) return "Models from profile settings; explicit model IDs do not require catalog discovery.";
+        if (self.provider == .configured) return "Models from settings and, with fetch_models, the server; explicit model IDs need no catalog.";
         if (!self.private_models_hidden) return null;
         const reason = self.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {

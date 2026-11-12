@@ -1253,7 +1253,8 @@ fn maybeStartAcpTitleTask(
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
@@ -1999,6 +2000,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        // The same path: once per session, as a notice where the client shows them.
+        .push_session_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,

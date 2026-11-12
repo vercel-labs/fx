@@ -5360,6 +5360,7 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/function_tools.zig");
     _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

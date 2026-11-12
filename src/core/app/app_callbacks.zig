@@ -363,6 +363,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_system_notice = agentPushSystemNotice,
                 .push_interactive_notice = agentPushInteractiveNotice,
                 .push_context_notice = agentPushContextNotice,
+                .push_session_notice = agentPushSessionNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
                 .push_command_output_complete = agentPushCommandOutputComplete,
@@ -1316,6 +1317,19 @@ pub fn Bindings(comptime App: type) type {
                 .tone = .warning,
                 .body = body,
                 .visibility = .full_only,
+            });
+        }
+
+        fn agentPushSessionNotice(ctx: *anyopaque, text: []const u8) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
+                if (!try agent.session.claimContextNotice(std.heap.c_allocator, text)) return;
+            }
+            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
+                .topic = "effort",
+                .tone = .neutral,
+                .body = text,
             });
         }
 
