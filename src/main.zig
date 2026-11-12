@@ -5538,6 +5538,9 @@ test {
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/subagent/reports.zig");
+    _ = @import("core/subagent/model_contract.zig");
+    _ = @import("core/subagent/refusal.zig");
+    _ = @import("tools/agent/subagent.zig");
     _ = @import("core/shared/agent_frame.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");

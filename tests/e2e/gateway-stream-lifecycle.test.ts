@@ -10346,6 +10346,64 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  // A refused call reaches main as its code with one sentence that says what
+  // happened and what to try next. Main starts `worker`, which the gateway
+  // holds, then sends it instructions while it works, and stops a name no
+  // subagent bears. The body main reads is pinned whole.
+  test("a refused subagent call tells main what to do next in the result it reads", async () => {
+    const root = createFixtureRoot("subagent-refusals");
+    const task = "Reply exactly REFUSAL_WORKER_DONE without using tools.";
+    let releaseWorker: () => void = () => {};
+    const workerHeld = new Promise<void>((resolve) => { releaseWorker = resolve; });
+    const results: Record<string, string> = {};
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        if (body.includes(task)) {
+          await workerHeld;
+          return fakeGatewayFinalText("REFUSAL_WORKER_DONE");
+        }
+        return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
+      }
+      for (const id of ["refusal_start", "refusal_busy", "refusal_stop"]) {
+        if (id in results) continue;
+        const text = toolResultAnywhere(body, id);
+        if (text !== null) results[id] = text;
+      }
+      if (!("refusal_start" in results)) {
+        return fakeGatewayToolCall("refusal_start", "subagent", { request: { action: "message", agent: "worker", message: task } });
+      }
+      if (!("refusal_busy" in results)) {
+        return fakeGatewayToolCall("refusal_busy", "subagent", { request: { action: "message", agent: "worker", instructions: "Answer in French.", message: "Reply exactly REFUSAL_AGAIN." } });
+      }
+      if (!("refusal_stop" in results)) {
+        return fakeGatewayToolCall("refusal_stop", "subagent", { request: { action: "stop", agent: "ghost" } });
+      }
+      // The worker may finish now, so the ask can end once its report is read.
+      releaseWorker();
+      return fakeGatewayFinalText("REFUSALS_READ");
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Provoke two refusals."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        timeoutMs: 30_000,
+      });
+      releaseWorker();
+      expect(run.code).toBe(0);
+      expect(results.refusal_busy).toBe(
+        '{"ok":false,"result":"The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.","error_code":"child_busy"}',
+      );
+      expect(results.refusal_stop).toBe(
+        '{"ok":false,"result":"No open subagent is named \\"ghost\\". Open subagents: worker.","error_code":"child_unavailable"}',
+      );
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      releaseWorker();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   // In fx ask a report that arrives while main's turn runs joins that turn at
   // its next step, as it does in the app, so main reads it before it answers.
   // wait says so, and no turn starts for the report.

@@ -35,6 +35,7 @@ const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
+const subagent_refusal = @import("../subagent/refusal.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
@@ -2713,6 +2714,13 @@ fn subagentProviderFailure(
     return .{ .status = .failure, .body = body };
 }
 
+fn subagentProviderRefusal(
+    alloc: Allocator,
+    why: subagent_refusal.Refusal,
+) Allocator.Error!subagent_tool_provider.Result {
+    return .{ .status = .failure, .body = try why.body(alloc) };
+}
+
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
@@ -2722,9 +2730,9 @@ fn executeSubagentProvider(
     const state: *SubagentProviderState = @ptrCast(@alignCast(raw_context.?));
     const ctx = state.runtime;
     const host = ctx.subagent_host orelse
-        return subagentProviderFailure(arena, "host_unavailable");
+        return subagentProviderRefusal(arena, .host_unavailable);
     const caller_id = ctx.subagent_caller_id orelse
-        return subagentProviderFailure(arena, "caller_unavailable");
+        return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
