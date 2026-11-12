@@ -5061,7 +5061,7 @@ test.skipIf(!tmuxAvailable())(
 
     function expectDeferredPresentation(scrollback: string): void {
       // The failure control ran last, and the deferred call does not count.
-      expect(scrollback).toContain("● Ran 2 shell commands ✗");
+      expect(scrollback).toContain("● Ran commands, read a file ✗");
       expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
       // The hold for project instructions gets no row in the compact view.

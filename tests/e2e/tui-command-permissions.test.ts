@@ -1230,7 +1230,7 @@ describe("effect-aware command permissions", () => {
 
       // The last command failed, so the group ends in ✗, and its reason line
       // shows one line of the error while the full output stays in Ctrl-O.
-      const header = "● Ran 3 shell commands ✗";
+      const header = "● Ran commands ✗";
       await activeSession.waitForText(header, TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
       expect(completed).toContain("✗ exit 7 · FXC110_FAILED_STDERR");

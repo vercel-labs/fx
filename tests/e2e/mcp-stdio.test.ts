@@ -1114,10 +1114,11 @@ describe("modern MCP stdio compatibility", () => {
         { text: "later" },
       ]);
 
-      // Each turn's tool group counts its MCP call as one, never as a command.
+      // Each turn's tool group names its MCP call as MCP work, never as a
+      // command.
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain("1 MCP call");
-      expect(scrollback).not.toMatch(/\b\d+ commands?\b/);
+      expect(scrollback).toContain("● Used an MCP tool");
+      expect(scrollback).not.toMatch(/\b\d+ commands?\b|\b[Rr]an (a )?commands?\b/);
       expect(scrollback).not.toContain("not selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -4484,7 +4485,7 @@ describe("fx mcp call", () => {
       await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The rows a direct call of the tool gets, in the command's group.
-      expect(scrollback).toContain("● Ran 1 shell command ✓");
+      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
       expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
       expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
       expect(scrollback).not.toContain("Running MCP");

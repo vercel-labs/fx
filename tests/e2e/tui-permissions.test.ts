@@ -1464,17 +1464,17 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
 
       await session.sendText("Edit the long path fixture twice.");
+      // The header says what the group did; each row keeps its file and
+      // counts.
       await session.waitForPane(
         (pane) =>
           pane.includes("long path edits complete") &&
-          /^● Edited packages\/\S*… \+2 -2$/m.test(pane),
+          /^● Edited a file$/m.test(pane),
         TIMEOUT,
       );
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
 
       const grid = await session.capturePaneGrid();
-      const header = grid.find((line) => line.startsWith("● Edited packages/"));
-      expect([...(header ?? "").trimEnd()].length).toBeLessThanOrEqual(width);
       const rows = grid.filter((line) => /^[├└] Edited packages\//.test(line));
       expect(rows).toHaveLength(2);
       for (const row of rows) {
@@ -1483,11 +1483,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       }
 
       const escapes = await session.capturePaneEscapes();
-      const styledLines = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
-      // The header keeps the group's counts and their colors after its clipped path.
-      expect(styledLines[0]).toContain("\x1b[38;5;71m+2");
-      expect(styledLines[0]).toContain("\x1b[38;5;167m-2");
-      const styledRows = styledLines.slice(1);
+      // Each row keeps its counts and their colors after its clipped path.
+      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
       expect(styledRows).toHaveLength(2);
       for (const row of styledRows) {
         expect(row).toContain("\x1b[38;5;71m+1");

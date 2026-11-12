@@ -12584,7 +12584,7 @@ test "current compact projection groups tool rows without mutating entries" {
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead 1 file · 1 failed\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file · 1 failed\x1b[0m\n" ++
             "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
             "\x1b[38;5;245m└ Edit failed\x1b[0m",
     ) != null);
@@ -15419,7 +15419,7 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}Read 3 files\x1b[0m",
+        "{s}●\x1b[0m {s}Read files\x1b[0m",
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);

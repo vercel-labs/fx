@@ -3178,8 +3178,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(13);
       // Both reads render inside one uninterrupted tool group now that the
       // turn no longer pauses between them.
-      expect(scrollback).toContain("├ Read before.txt");
-      expect(scrollback).toContain("└ Read after.txt");
+      expect(scrollback).toContain("└ Read before.txt, after.txt");
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -5843,8 +5842,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(line_index).toBeGreaterThan(previous_index);
         previous_index = line_index;
       }
-      expect(scrollback).toContain("├ Read one.txt");
-      expect(scrollback).toContain("└ Read two.txt");
+      // Both reads share one row that names each file.
+      expect(scrollback).toContain("└ Read one.txt, two.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -6555,7 +6554,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
       // The failed call is not a command, so the header keeps the command's
       // mark and counts the failure on its own, and its reason shows below it.
-      const header = "● Ran 1 shell command ✓ · 1 failed";
+      const header = "● Ran a command ✓ · 1 failed";
       const failedRow = `├ Failed ${unsupportedToolName}`;
       const reasonRow = `│ ✗ Unsupported tool: ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
@@ -7017,7 +7016,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● Started 3 subagents · 1 failed");
+        expect(compact).toContain("● Started subagents, read a file · 1 failed");
         expect(compact).toContain("Couldn't message Invalid Agent");
         expect(compact).not.toContain("Messaged Invalid Agent");
         expect(compact).not.toContain("Check failure visibility");
@@ -7053,7 +7052,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● Started 3 subagents · 1 failed");
+        expect(resumed).toContain("● Started subagents, read a file · 1 failed");
         expect(resumed).toContain("Couldn't message Invalid Agent");
         expect(resumed).toContain("Messaged helper");
         expect(resumed).toContain("Messaged checker");
@@ -7271,7 +7270,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
 
       const compact = await session.captureFullScrollback();
-      expect(compact).toContain("● Ran 3 shell commands ✓");
+      expect(compact).toContain("● Ran commands ✓");
       // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
       // The three commands share one row by their steps; Ctrl+O shows each.
       expect(compact).toContain("└ Ran printf, pwd\n");
@@ -7279,7 +7278,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(compact).not.toContain(`Ran ${firstCommand}`);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● Ran 3 shell commands ✓", TIMEOUT);
+      await session.waitForText("● Ran commands ✓", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
@@ -7326,7 +7325,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● Ran 3 shell commands ✓", TIMEOUT);
+      await session.waitForText("● Ran commands ✓", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -7342,7 +7341,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● Ran 3 shell commands ✓");
+      expect(resumed).toContain("● Ran commands ✓");
       expect(resumed).toContain("└ Ran printf, pwd\n");
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);

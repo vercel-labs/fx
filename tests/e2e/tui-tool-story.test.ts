@@ -88,6 +88,22 @@ const SEARCHES: StoryStep[] = [
   { at: 3, text: "Two files use createWindow." },
 ];
 
+const EXPLORE: StoryStep[] = [
+  {
+    at: 0,
+    text: "I will read the window code and look for its callers.",
+    calls: [
+      { name: "read_file", input: { path: "desktop/src/window.ts", start_line: 1, line_count: 5 } },
+      { name: "grep_files", input: { pattern: "createWindow", path: "desktop/src" } },
+      { name: "read_file", input: { path: "desktop/src/main.ts" } },
+      { name: "read_file", input: { path: "desktop/src/window.ts", start_line: 6, line_count: 5 } },
+      { name: "grep_files", input: { pattern: "BrowserWindow", path: "desktop/src" } },
+      sh("sh check.sh status"),
+    ],
+  },
+  { at: 6, text: "createWindow builds the main window." },
+];
+
 const HOSTILE: StoryStep[] = [
   { at: 0, text: "I will run the script.", calls: [sh("sh hostile.sh")] },
   { at: 1, text: "The script failed." },
@@ -171,7 +187,7 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
 
-    const checks = group(lines, "● Ran 3 shell commands ✗");
+    const checks = group(lines, "● Ran commands ✗");
     // The two passing checks share a row by their step; the failure keeps
     // its own.
     expect(treeRows(checks)).toEqual([
@@ -180,7 +196,8 @@ test.skipIf(!tmuxAvailable())(
     ]);
     expect(checks).toContain("  ✗ exit 2 · src/main.ts:14:15 - error TS2554: Expected 1 arguments, but got 3.");
 
-    const fix = group(lines, "● Edited desktop/src/main.ts +1 -1 ✓");
+    // Edits come first; the other kinds tie, and the fourth is "more".
+    const fix = group(lines, "● Edited a file, ran a command, read a file, and more ✓");
     const fixRows = treeRows(fix);
     expect(fixRows).toHaveLength(4);
     expect(fixRows[0]).toStartWith("├ Searched");
@@ -204,8 +221,8 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("Fixed the build.", TIMEOUT);
     const resumedLines = paneLines(await resumed.waitForComposer(TIMEOUT));
-    expect(group(resumedLines, "● Ran 3 shell commands ✗")).toEqual(checks);
-    expect(group(resumedLines, "● Edited desktop/src/main.ts +1 -1 ✓")).toEqual(fix);
+    expect(group(resumedLines, "● Ran commands ✗")).toEqual(checks);
+    expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
   },
   TIMEOUT * 3,
 );
@@ -219,8 +236,9 @@ test.skipIf(!tmuxAvailable())(
       settings: { collapse_tool_calls: true },
     });
     const lines = paneLines(pane);
-    expect(lines).toContain("● Ran 3 shell commands ✗");
-    expect(lines).toContain("● Edited desktop/src/main.ts +1 -1 ✓");
+    expect(lines).toContain("● Ran commands ✗");
+    // With no rows to show them, the header keeps the edit's counts.
+    expect(lines).toContain("● Edited a file +1 -1, ran a command, read a file, and more ✓");
     expect(lines.filter((line) => line.startsWith("├ ") || line.startsWith("└ "))).toEqual([]);
   },
   TIMEOUT * 2,
@@ -255,8 +273,8 @@ test.skipIf(!tmuxAvailable())(
       finalText: "Two files use createWindow.",
     });
     const lines = paneLines(pane);
-    // The header counts patterns, not calls.
-    expect(treeRows(group(lines, "● Searched for 2 patterns"))).toEqual([
+    // The row names both folders the pattern was searched in.
+    expect(treeRows(group(lines, "● Searched"))).toEqual([
       "├ Searched createWindow in src, desktop",
       "└ Matched *.ts",
     ]);
@@ -264,6 +282,30 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("C-o");
     const full = await session.waitForText("esc close", TIMEOUT);
     expect(full.split("Searched createWindow").length - 1).toBeGreaterThanOrEqual(2);
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "reads and searches share a row each, and the header says what the group did",
+  async () => {
+    const { session, pane } = await runStory(EXPLORE, {
+      prompt: "how is the main window made?",
+      finalText: "createWindow builds the main window.",
+    });
+    const lines = paneLines(pane);
+    // Each file and pattern shows once, though other calls came between
+    // them, and the header names the kinds of work with no counts.
+    expect(treeRows(group(lines, "● Read files, searched, ran a command ✓"))).toEqual([
+      "├ Read window.ts, main.ts",
+      "├ Searched createWindow, BrowserWindow",
+      "└ Ran sh check.sh status",
+    ]);
+
+    // Ctrl+O still shows each call.
+    await session.sendKeys("C-o");
+    const full = await session.waitForText("esc close", TIMEOUT);
+    expect(full.split("desktop/src/window.ts").length - 1).toBeGreaterThanOrEqual(2);
   },
   TIMEOUT * 2,
 );
@@ -278,7 +320,7 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // The two waits share one row; the status keeps its own.
-    const rows = treeRows(group(lines, "● Started 2 subagents"));
+    const rows = treeRows(group(lines, "● Started subagents"));
     expect(rows).toHaveLength(4);
     // Each row names the action and the subagent, with no message; Ctrl+O
     // shows the message.
