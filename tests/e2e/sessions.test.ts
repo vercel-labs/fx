@@ -3064,6 +3064,177 @@ test("a named subagent keeps its id, history and instructions across fx ask runs
   }
 }, TIMEOUT * 3);
 
+/// Saves agent profile `name` the way a repository does, in its `.fx/agents`.
+function writeRepositoryProfile(repository: string, name: string, profile: object) {
+  const dir = join(repository, ".fx", "agents", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
+}
+
+/// `fx ask` run in `cwd`, such as another repository than the fixture's.
+function askIn(fixture: Fixture, gateway: any, cwd: string, args: string[]) {
+  return runFx(["ask", "--json", "--auto", ...args], { cwd, env: env(fixture, gateway), timeoutMs: TIMEOUT });
+}
+
+/// The tools a request offered the model, by name.
+const offeredTools = (body: string): string[] => (JSON.parse(body).tools ?? []).map((tool: { name: string }) => tool.name);
+
+/// Writes parent session `id`'s log again with `edit` applied to the data of each
+/// of its `child_spawned` lines, each line sealed with its CRC32C again. A
+/// snapshot would keep the old data, so the log must have none.
+function rewriteSpawnData(fixture: Fixture, id: string, edit: (data: Record<string, unknown>) => void) {
+  const path = join(storeRoot(fixture.home), id, "log.jsonl");
+  const marker = ',"crc":"';
+  const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+  const sealed = lines.map((text) => {
+    const line = JSON.parse(text.slice(0, text.lastIndexOf(marker)) + "}");
+    expect(line.kind).not.toBe("snapshot");
+    if (line.kind !== "child_spawned") return text + "\n";
+    const data = typeof line.data === "string" ? JSON.parse(line.data) : line.data;
+    edit(data);
+    line.data = data;
+    const head = JSON.stringify(line).slice(0, -1);
+    return `${head}${marker}${crc32c(Buffer.from(head)).toString(16).padStart(8, "0")}"}\n`;
+  });
+  writeFileSync(path, sealed.join(""));
+}
+
+/// A request's latest user message, as text.
+const latestUserMessage = (body: string): string =>
+  JSON.stringify(JSON.parse(body).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+
+/// A parent that starts the child `reviewer` in profile `reviewer` in its first
+/// round and sends it a second message in its next. Each request the child
+/// makes is kept in `childBodies`, and the text of each report the parent
+/// reads in `reports`.
+function reviewerGateway(round: { n: 1 | 2 }, childBodies: string[], reports: string[]) {
+  return startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) {
+      childBodies.push(body);
+      return fakeGatewayFinalText(`REVIEW_${childBodies.length}`);
+    }
+    if (isReportTurn(body)) {
+      reports.push(latestUserMessage(body));
+      return fakeGatewayFinalText(`REPORT_READ_${round.n}`);
+    }
+    const call = `delegate-${round.n}`;
+    if (body.includes(call)) return fakeGatewayFinalText(`DONE_${round.n}`);
+    return round.n === 1
+      ? fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", profile: "reviewer" } })
+      : fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
+  }, { classifierDecision: "clear" });
+}
+
+test("a subagent keeps the tools its profile gave it when its session is resumed in another repository", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-moved-");
+  const other = join(fixture.root, "other");
+  mkdirSync(other);
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] });
+  // The other repository has a profile of the same name that gives other tools.
+  writeRepositoryProfile(other, "reviewer", { description: "Searches files", tools: ["glob_files"] });
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, []);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    round.n = 2;
+    const second = await askIn(fixture, gateway, other, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    expect(childBodies).toHaveLength(2);
+    expect(offeredTools(childBodies[0]!)).toContain("read_file");
+    expect(offeredTools(childBodies[0]!)).not.toContain("glob_files");
+    // The child still has what it started with, not what the other repository's
+    // profile of its name gives.
+    expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
+    expect(childBodies[1]).toContain("Review round one.");
+    // The parent's log keeps what the profile set, on each of the child's spawns.
+    const lines = childLines(fixture.home, id).filter((line) => line.kind === "child_spawned");
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line.data.profile).toBe("reviewer");
+      expect(line.data.started_with).toEqual({ v: 1, from: "project", tools: ["read_file"] });
+    }
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a subagent still runs after its session is resumed where its profile does not exist", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-gone-");
+  const other = join(fixture.root, "other");
+  mkdirSync(other);
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] });
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, []);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    // The profile is gone from where the session is resumed.
+    rmSync(join(fixture.workspace, ".fx"), { recursive: true, force: true });
+    round.n = 2;
+    const second = await askIn(fixture, gateway, other, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    expect(childBodies).toHaveLength(2);
+    expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
+    expect(offeredTools(childBodies[1]!)).toContain("read_file");
+    const finished = childLines(fixture.home, id).filter((line) => line.kind === "child_finished");
+    expect(finished.map((line) => line.outcome)).toEqual(["ok", "ok"]);
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a subagent an earlier fx saved with only its profile's name fails with the profile named when the profile is gone", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-name-only-");
+  const other = join(fixture.root, "other");
+  mkdirSync(other);
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] });
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const reports: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, reports);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    // An earlier fx saved the profile's name and nothing else of it.
+    rewriteSpawnData(fixture, id, (data) => {
+      delete data.started_with;
+    });
+    expect(childLines(fixture.home, id)[0].data.profile).toBe("reviewer");
+    expect(childLines(fixture.home, id)[0].data.started_with).toBeUndefined();
+    rmSync(join(fixture.workspace, ".fx"), { recursive: true, force: true });
+    round.n = 2;
+    const second = await askIn(fixture, gateway, other, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    // The child never reached the model, and its parent is told which profile
+    // it could not load.
+    expect(childBodies).toHaveLength(1);
+    expect(reports).toHaveLength(2);
+    expect(reports[1]).toContain("profile_unavailable");
+    expect(reports[1]).toContain("no profile named 'reviewer'");
+    expect(reports[1]).not.toContain("AdmissionFailed");
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("a crash while a named subagent works records it interrupted, and its next message runs under its id with nothing of the lost work", async () => {
   const fixture = createFixture("fx-v2-subagent-lost-");
   let held: () => void = () => {};

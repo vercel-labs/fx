@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 pub const max_name_bytes = 64;
 pub const max_settings_bytes = 64 * 1024;
 pub const max_prompt_bytes = 256 * 1024;
-const max_list_entry_bytes = 256;
+pub const max_list_entry_bytes = 256;
 
 pub const settings_file_name = "profile.json";
 pub const prompt_file_name = "prompt.md";

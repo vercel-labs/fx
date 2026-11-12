@@ -7,6 +7,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const profiles = @import("../profiles/profiles.zig");
+const started_with_mod = @import("../profiles/started_with.zig");
 const tool_placement = @import("../config/tool_placement.zig");
 const toolbox = @import("../tooling/toolbox.zig");
 const io_mod = @import("../shared/io.zig");
@@ -225,9 +226,11 @@ pub const Snapshot = struct {
     }
 };
 
-/// The profile each child started in, loaded the first time the child's
-/// authority is resolved and kept for the life of the process, so a running
-/// child keeps it whatever is saved later. Profiles resolve from the fx home
+/// The profile each child started in, kept for the life of the process, so a
+/// running child keeps it whatever is saved later. A child saved with what its
+/// profile set (`started_with`) takes that, whatever the profile files say now;
+/// only the profile's prompt is read again, by name. A child saved with only a
+/// name loads it the first time its authority is resolved, from the fx home
 /// and the current directory, as `fx --profile` does.
 pub const ProfileCache = struct {
     alloc: Allocator,
@@ -236,11 +239,14 @@ pub const ProfileCache = struct {
     mutex: std.Io.Mutex = .init,
     /// Keyed by child id, owned. Entries live until `deinit`.
     entries: std.array_hash_map.String(*profiles.Held) = .empty,
+    /// Why the profile of a child could not be loaded the last time it was
+    /// tried, keyed by child id, owned. A later load that works removes it.
+    failures: std.array_hash_map.String([]u8) = .empty,
 
-    /// The profile `child_id` runs in, loading `name` the first time. A
-    /// profile that cannot be loaded fails closed: the child gets no
-    /// authority at all rather than more than its profile gives.
-    pub fn get(self: *ProfileCache, child_id: []const u8, name: []const u8) Error!*const profiles.Profile {
+    /// The profile `child_id` runs in, taking `saved` or else loading `name`
+    /// the first time. A profile that cannot be loaded fails closed: the child
+    /// gets no authority at all rather than more than its profile gives.
+    pub fn get(self: *ProfileCache, child_id: []const u8, name: []const u8, saved: ?started_with_mod.StartedWith) Error!*const profiles.Profile {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.entries.get(child_id)) |held| return &held.profile;
@@ -251,21 +257,99 @@ pub const ProfileCache = struct {
         defer if (process_root) |root| self.alloc.free(root);
         const home = if (self.roots) |roots| roots.home else io_mod.homeDir();
         const workspace_root = if (self.roots) |roots| roots.workspace_root else process_root;
-        var failure: ?[]u8 = null;
-        defer if (failure) |message| self.alloc.free(message);
-        held.replace(self.alloc, home, workspace_root, name, "", &failure) catch |err| {
-            debug_trace.eventf("profile", "profile_failed", .{}, "child={s} name={s} reason={s}", .{
-                child_id,
-                name,
-                failure orelse @errorName(err),
-            });
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.HostAuthorityUnavailable;
-        };
+        if (saved) |facts| {
+            try self.restore(held, child_id, home, workspace_root, name, facts);
+        } else {
+            var failure: ?[]u8 = null;
+            defer if (failure) |message| self.alloc.free(message);
+            held.replace(self.alloc, home, workspace_root, name, "", &failure) catch |err| {
+                const reason = failure orelse @errorName(err);
+                debug_trace.eventf("profile", "profile_failed", .{}, "child={s} name={s} reason={s}", .{ child_id, name, reason });
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                self.noteFailure(child_id, reason);
+                return error.HostAuthorityUnavailable;
+            };
+            debug_trace.eventf("profile", "profile_reloaded", .{}, "child={s} name={s} source={s} reason=no_saved_copy", .{ child_id, name, @tagName(held.profile.source) });
+            self.clearFailure(child_id);
+        }
         errdefer held.deinit();
         const key = try self.alloc.dupe(u8, child_id);
         errdefer self.alloc.free(key);
         try self.entries.put(self.alloc, key, held);
         return &held.profile;
+    }
+
+    /// Builds into `held` the profile `saved` describes for `name`. Its prompt
+    /// is not saved: it is read again by name, and only from a profile of the
+    /// same kind as the saved one, so a repository's prompt never joins a
+    /// child that started in a profile of the user's own. Without one, the
+    /// child has no profile prompt.
+    fn restore(
+        self: *ProfileCache,
+        held: *profiles.Held,
+        child_id: []const u8,
+        home: ?[]const u8,
+        workspace_root: ?[]const u8,
+        name: []const u8,
+        saved: started_with_mod.StartedWith,
+    ) Allocator.Error!void {
+        var next = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer next.deinit();
+        const arena = next.allocator();
+        const facts = try started_with_mod.dupe(arena, saved);
+        var profile = started_with_mod.toProfile(facts, try arena.dupe(u8, name));
+        var prompt: []const u8 = "none";
+        if (saved.source != .builtin) {
+            const roots = try profiles.Roots.init(arena, home, workspace_root);
+            var failure: ?[]const u8 = null;
+            if (profiles.load(arena, roots, name, &failure)) |loaded| {
+                if (loaded.source == saved.source) {
+                    profile.prompt = loaded.prompt;
+                    profile.prompt_mode = loaded.prompt_mode;
+                    prompt = "read";
+                } else prompt = "other_source";
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => prompt = "not_loaded",
+            }
+        }
+        held.* = .{ .arena = next, .profile = profile };
+        self.clearFailure(child_id);
+        debug_trace.eventf("profile", "profile_restored", .{}, "child={s} name={s} source={s} prompt={s}", .{ child_id, name, @tagName(saved.source), prompt });
+    }
+
+    /// Under the mutex.
+    fn noteFailure(self: *ProfileCache, child_id: []const u8, message: []const u8) void {
+        const text = self.alloc.dupe(u8, message) catch return;
+        if (self.failures.getPtr(child_id)) |known| {
+            self.alloc.free(known.*);
+            known.* = text;
+            return;
+        }
+        const key = self.alloc.dupe(u8, child_id) catch {
+            self.alloc.free(text);
+            return;
+        };
+        self.failures.put(self.alloc, key, text) catch {
+            self.alloc.free(key);
+            self.alloc.free(text);
+        };
+    }
+
+    /// Under the mutex.
+    fn clearFailure(self: *ProfileCache, child_id: []const u8) void {
+        const removed = self.failures.fetchSwapRemove(child_id) orelse return;
+        self.alloc.free(removed.key);
+        self.alloc.free(removed.value);
+    }
+
+    /// Why the profile of `child_id` could not be loaded, if the last try
+    /// failed, in `alloc`, which names the profile.
+    pub fn failureOf(self: *ProfileCache, alloc: Allocator, child_id: []const u8) Allocator.Error!?[]u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const message = self.failures.get(child_id) orelse return null;
+        return try alloc.dupe(u8, message);
     }
 
     /// The profile `child_id` was given, if its authority was resolved.
@@ -284,6 +368,12 @@ pub const ProfileCache = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.entries.deinit(self.alloc);
+        var failed = self.failures.iterator();
+        while (failed.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.failures.deinit(self.alloc);
         self.* = undefined;
     }
 };
@@ -353,15 +443,24 @@ pub const Resolver = struct {
         // Without its parent's mode it keeps the one its work was sent
         // under, or ask with no work.
         const sent: types.PermissionMode = if (child.active) |work| work.permission_mode else .ask;
-        return self.modeFor(child_id, try self.profileOf(child_id, child.profile), parent_mode orelse sent);
+        return self.modeFor(child_id, try self.profileOf(child_id, child.*), parent_mode orelse sent);
     }
 
-    /// The profile child `child_id` runs in, loaded the first time. A
-    /// child with a profile and no cache gets no authority.
-    fn profileOf(self: *Resolver, child_id: []const u8, name: ?[]const u8) Error!?*const profiles.Profile {
-        const value = name orelse return null;
+    /// The profile child `child` runs in, from what it saved or else loaded by
+    /// its name the first time. A child with a profile and no cache gets no
+    /// authority.
+    fn profileOf(self: *Resolver, child_id: []const u8, child: child_state.Child) Error!?*const profiles.Profile {
+        const name = child.profile orelse return null;
         const cache = self.profiles orelse return error.HostAuthorityUnavailable;
-        return try cache.get(child_id, value);
+        return try cache.get(child_id, name, child.started_with);
+    }
+
+    /// Why the profile of child `child_id` could not be loaded the last time
+    /// its authority was resolved, in `alloc`, or null when it could, or the
+    /// child has none. The message names the profile.
+    pub fn profileFailure(self: *Resolver, alloc: Allocator, child_id: []const u8) Allocator.Error!?[]u8 {
+        const cache = self.profiles orelse return null;
+        return cache.failureOf(alloc, child_id);
     }
 
     /// Child `child_id`'s mode, given the one it would otherwise follow:
@@ -423,7 +522,7 @@ pub const Resolver = struct {
             // Work replaced since the first read is no longer this run's. A
             // user's turn belongs to no work.
             if (basis == .work and child.work_generation != work_generation) return error.ChildNotAttached;
-            const profile = try self.profileOf(child_id, child.profile);
+            const profile = try self.profileOf(child_id, child.*);
             break :blk .{
                 .generation = registry.generation,
                 // It follows its parent's current mode, and keeps the one its
@@ -1321,4 +1420,327 @@ test "a child whose profile lists a tool kept behind toolbox keeps toolbox to re
     defer freeStrings(alloc, all);
     try std.testing.expectEqual(@as(usize, 4), all.len);
     for (all) |name| try std.testing.expect(!std.mem.eql(u8, name, "subagent"));
+}
+
+/// A host whose tools, MCP servers, and mode the tests change while children
+/// run, to tell what a child follows live from what it keeps.
+const LiveHost = struct {
+    parent_mode: ?types.PermissionMode = .ask,
+    own_mode: ?types.PermissionMode = null,
+    tools: []const []const u8 = &.{ "read_file", "write_file", "subagent" },
+    integrations: []const []const u8 = &.{ "github_issue", "slack_post" },
+
+    fn resolver(self: *LiveHost, children: *child_state.V2Children, root_id: []const u8, cache: *ProfileCache) Resolver {
+        return .{
+            .children = children,
+            .root_id = root_id,
+            .host = .{
+                .context = self,
+                .resolve_fn = resolve,
+                .parent_permission_mode_fn = parentMode,
+                .child_permission_mode_fn = ownMode,
+                .base_fn = resolve,
+            },
+            .profiles = cache,
+        };
+    }
+
+    fn resolve(raw: ?*anyopaque, alloc: Allocator, root_id: []const u8) HostResolveError!HostAuthority {
+        const self: *const LiveHost = @ptrCast(@alignCast(raw.?));
+        var servers = [_]mcp_access.ServerIdentity{
+            .{ .name = @constCast("github"), .source = .profile, .scope = .profile, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 },
+            .{ .name = @constCast("slack"), .source = .profile, .scope = .profile, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 },
+        };
+        var tools = [_]mcp_access.ToolIdentity{
+            .{ .name = @constCast("github_issue"), .server_name = @constCast("github") },
+            .{ .name = @constCast("slack_post"), .server_name = @constCast("slack") },
+        };
+        const view = mcp_access.View{
+            .runtime_generation = 1,
+            .owner_id = @constCast(root_id),
+            .parent_id = @constCast(root_id),
+            .servers = &servers,
+            .tools = &tools,
+        };
+        return HostAuthority.captureWithPermissionStateAndMcpView(alloc, self.tools, self.integrations, .{}, &.{}, .{}, &view) catch
+            return error.OutOfMemory;
+    }
+
+    fn parentMode(raw: ?*anyopaque, _: Allocator, _: []const u8) ?types.PermissionMode {
+        const self: *const LiveHost = @ptrCast(@alignCast(raw.?));
+        return self.parent_mode;
+    }
+
+    fn ownMode(raw: ?*anyopaque, _: []const u8) ?types.PermissionMode {
+        const self: *const LiveHost = @ptrCast(@alignCast(raw.?));
+        return self.own_mode;
+    }
+};
+
+fn writeTestFile(dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) !void {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| try dir.createDirPath(io_mod.getIo(), parent);
+    var file = try dir.createFile(io_mod.getIo(), sub_path, .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), bytes);
+}
+
+/// What the profile `name` in `roots` set, as a child that starts in it saves.
+fn startedIn(arena: Allocator, roots: profiles.Roots, name: []const u8) !started_with_mod.StartedWith {
+    var failure: ?[]const u8 = null;
+    const loaded = try profiles.load(arena, roots, name, &failure);
+    return started_with_mod.of(&loaded);
+}
+
+test "a child keeps what its profile set when the session is resumed in another repository, or where the profile is gone" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Repository A's `reviewer` reads files and uses GitHub; B's writes files and
+    // uses Slack; C has none.
+    try writeTestFile(tmp.dir, "a/.fx/agents/reviewer/profile.json", "{\"description\": \"Reads\", \"tools\": [\"read_file\"], \"mcp_servers\": [\"github\"]}");
+    try writeTestFile(tmp.dir, "a/.fx/agents/reviewer/prompt.md", "Review only.");
+    try writeTestFile(tmp.dir, "b/.fx/agents/reviewer/profile.json", "{\"description\": \"Writes\", \"tools\": [\"write_file\"], \"mcp_servers\": [\"slack\"]}");
+    try writeTestFile(tmp.dir, "b/.fx/agents/reviewer/prompt.md", "Write freely.");
+    try tmp.dir.createDirPath(io_mod.getIo(), "c");
+    const repo_a = try io_mod.dirRealpathAlloc(arena, tmp.dir, "a");
+    const repo_b = try io_mod.dirRealpathAlloc(arena, tmp.dir, "b");
+    const repo_c = try io_mod.dirRealpathAlloc(arena, tmp.dir, "c");
+
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var work = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-1"), .message = try alloc.dupe(u8, "review"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer work.deinit(alloc);
+    // `saved` started in A and kept what it set. `named` is as an earlier fx
+    // saved it, with only the profile's name.
+    try registry.appendOneOff(alloc, "saved", work);
+    try registry.setProfile(alloc, "saved", "reviewer");
+    try registry.setStartedWith(alloc, "saved", try startedIn(arena, try profiles.Roots.init(arena, null, repo_a), "reviewer"));
+    try registry.appendOneOff(alloc, "named", work);
+    try registry.setProfile(alloc, "named", "reviewer");
+    try store.save(alloc, registry);
+
+    var host: LiveHost = .{};
+    // Each process starts with an empty cache, and finds the profile files
+    // where it runs.
+    const where = [_]struct { repo: []const u8, saved_tools: []const u8, saved_server: []const u8, named_tools: ?[]const u8, named_prompt: []const u8 }{
+        .{ .repo = repo_a, .saved_tools = "read_file", .saved_server = "github_issue", .named_tools = "read_file", .named_prompt = "Review only." },
+        .{ .repo = repo_b, .saved_tools = "read_file", .saved_server = "github_issue", .named_tools = "write_file", .named_prompt = "Write freely." },
+        .{ .repo = repo_c, .saved_tools = "read_file", .saved_server = "github_issue", .named_tools = null, .named_prompt = "" },
+    };
+    for (where) |place| {
+        var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = null, .workspace_root = place.repo } };
+        defer cache.deinit();
+        var resolver = host.resolver(&parent.children, parent.parent.id(), &cache);
+
+        var saved = try resolver.resolve(alloc, "saved");
+        defer saved.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), saved.tools.len);
+        try std.testing.expectEqualStrings(place.saved_tools, saved.tools[0]);
+        try std.testing.expectEqual(@as(usize, 1), saved.integrations.len);
+        try std.testing.expectEqualStrings(place.saved_server, saved.integrations[0]);
+        try std.testing.expectEqual(@as(usize, 1), saved.mcp_view.?.servers.len);
+        try std.testing.expectEqualStrings("github", saved.mcp_view.?.servers[0].name);
+        try std.testing.expect((try resolver.profileFailure(alloc, "saved")) == null);
+        // Only the prompt is read again, by name, so it is the one of the place
+        // it runs in, or none where no profile has the name.
+        const kept = cache.find("saved").?;
+        const own_prompt = if (std.mem.eql(u8, place.repo, repo_a)) "Review only." else if (std.mem.eql(u8, place.repo, repo_b)) "Write freely." else "";
+        try std.testing.expectEqualStrings(own_prompt, kept.prompt);
+
+        // A child saved with only a name loads it where it runs, as before.
+        if (place.named_tools) |expected| {
+            var named = try resolver.resolve(alloc, "named");
+            defer named.deinit(alloc);
+            try std.testing.expectEqualStrings(expected, named.tools[0]);
+            try std.testing.expectEqualStrings(place.named_prompt, cache.find("named").?.prompt);
+            try std.testing.expect((try resolver.profileFailure(alloc, "named")) == null);
+        } else {
+            // Where there is none, it fails, and says which profile and why.
+            try std.testing.expectError(error.HostAuthorityUnavailable, resolver.resolve(alloc, "named"));
+            const message = (try resolver.profileFailure(alloc, "named")).?;
+            defer alloc.free(message);
+            try std.testing.expect(std.mem.startsWith(u8, message, "no profile named 'reviewer'"));
+            try std.testing.expect(cache.find("named") == null);
+        }
+    }
+}
+
+test "what a profile left unset follows the parent live, and a mode chosen on the child's screen wins over the saved one" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var work = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-1"), .message = try alloc.dupe(u8, "review"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer work.deinit(alloc);
+    const home_set: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .yolo, .tools = &.{"read_file"} };
+    // `loose` set a mode and tools. `tools_only` set tools. `servers_only`
+    // set MCP servers. `nothing` is fx's own `agent`.
+    try registry.appendOneOff(alloc, "loose", work);
+    try registry.setProfile(alloc, "loose", "loose");
+    try registry.setStartedWith(alloc, "loose", home_set);
+    try registry.appendOneOff(alloc, "tools-only", work);
+    try registry.setProfile(alloc, "tools-only", "tools-only");
+    try registry.setStartedWith(alloc, "tools-only", .{ .source = .project, .tools = &.{"read_file"} });
+    try registry.appendOneOff(alloc, "servers-only", work);
+    try registry.setProfile(alloc, "servers-only", "servers-only");
+    try registry.setStartedWith(alloc, "servers-only", .{ .source = .home, .mcp_servers = &.{"github"} });
+    try registry.appendOneOff(alloc, "nothing", work);
+    try registry.setProfile(alloc, "nothing", "agent");
+    try registry.setStartedWith(alloc, "nothing", .{ .source = .builtin });
+    try store.save(alloc, registry);
+
+    // The files say something else now: the profile of the same name was
+    // edited, to tighten its mode among other things.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "home/.fx/agents/loose/profile.json", "{\"description\": \"Edited\", \"permission_mode\": \"ask\", \"tools\": [\"write_file\"]}");
+    const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+
+    var host: LiveHost = .{};
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
+    defer cache.deinit();
+    var resolver = host.resolver(&parent.children, parent.parent.id(), &cache);
+
+    var loose = try resolver.resolve(alloc, "loose");
+    defer loose.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.yolo, loose.permission_mode);
+    try std.testing.expectEqualStrings("read_file", loose.tools[0]);
+    // What it did not set is the parent's: its servers.
+    try std.testing.expectEqual(@as(usize, 2), loose.integrations.len);
+
+    // The parent changes its mode, its tools, and its servers.
+    host.parent_mode = .auto;
+    host.tools = &.{ "read_file", "write_file", "shell", "subagent" };
+    host.integrations = &.{"slack_post"};
+
+    // A mode the profile set stays, whatever the parent does.
+    var loose_after = try resolver.resolve(alloc, "loose");
+    defer loose_after.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.yolo, loose_after.permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.yolo, try resolver.currentMode(alloc, "loose"));
+    try std.testing.expectEqual(@as(usize, 1), loose_after.integrations.len);
+    try std.testing.expectEqualStrings("slack_post", loose_after.integrations[0]);
+
+    // What a profile set only partly follows the parent for the rest.
+    var tools_only = try resolver.resolve(alloc, "tools-only");
+    defer tools_only.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tools_only.tools.len);
+    try std.testing.expectEqual(types.PermissionMode.auto, tools_only.permission_mode);
+    try std.testing.expectEqual(@as(usize, 1), tools_only.integrations.len);
+    try std.testing.expectEqualStrings("slack_post", tools_only.integrations[0]);
+
+    // Its servers are the profile's, but the servers that exist are the host's.
+    var servers_only = try resolver.resolve(alloc, "servers-only");
+    defer servers_only.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), servers_only.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), servers_only.integrations.len);
+    host.integrations = &.{ "github_issue", "slack_post" };
+    var servers_back = try resolver.resolve(alloc, "servers-only");
+    defer servers_back.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), servers_back.integrations.len);
+    try std.testing.expectEqualStrings("github_issue", servers_back.integrations[0]);
+
+    // A profile of fx's own sets nothing, so the child is a copy of its parent.
+    var nothing = try resolver.resolve(alloc, "nothing");
+    defer nothing.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), nothing.tools.len);
+    try std.testing.expectEqual(types.PermissionMode.auto, nothing.permission_mode);
+
+    // A mode chosen on the child's own screen wins over the saved one, for
+    // its work and for a turn the user types.
+    host.own_mode = .ask;
+    var own = try resolver.resolve(alloc, "loose");
+    defer own.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.ask, own.permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.ask, try resolver.currentMode(alloc, "loose"));
+    var typed = try resolver.resolveForUser(alloc, "loose", .auto);
+    defer typed.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.ask, typed.permission_mode);
+    // Its tools are still the saved ones.
+    try std.testing.expectEqual(@as(usize, 1), own.tools.len);
+    try std.testing.expectEqualStrings("read_file", own.tools[0]);
+}
+
+test "a saved profile takes a prompt by name only from a profile of the kind it started in" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The user's own `reviewer` has a prompt, and so does the repository's, whose
+    // `agent` also replaces fx's own with a prompt.
+    try writeTestFile(tmp.dir, "home/.fx/agents/reviewer/profile.json", "{\"description\": \"Mine\"}");
+    try writeTestFile(tmp.dir, "home/.fx/agents/reviewer/prompt.md", "Mine.");
+    try writeTestFile(tmp.dir, "repo/.fx/agents/reviewer/profile.json", "{\"description\": \"Theirs\"}");
+    try writeTestFile(tmp.dir, "repo/.fx/agents/reviewer/prompt.md", "Theirs.");
+    try writeTestFile(tmp.dir, "repo/.fx/agents/agent/profile.json", "{\"description\": \"Theirs\", \"prompt\": \"replace\"}");
+    try writeTestFile(tmp.dir, "repo/.fx/agents/agent/prompt.md", "Theirs replaces fx's own.");
+    try writeTestFile(tmp.dir, "repo/.fx/agents/only-repo/profile.json", "{\"description\": \"Theirs\"}");
+    try writeTestFile(tmp.dir, "repo/.fx/agents/only-repo/prompt.md", "Only theirs.");
+    const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const repo = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo");
+
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = repo } };
+    defer cache.deinit();
+    // Started in the user's own profile: the user's prompt, by name.
+    const mine = try cache.get("mine", "reviewer", .{ .source = .home });
+    try std.testing.expectEqualStrings("Mine.", mine.prompt);
+    // Started in a repository's profile of the same name, which the user's now
+    // hides: no prompt joins it, as the user's profile is not that one.
+    const theirs = try cache.get("theirs", "reviewer", .{ .source = .project });
+    try std.testing.expectEqualStrings("", theirs.prompt);
+    // Where the name is only the repository's, it is read.
+    const only = try cache.get("only", "only-repo", .{ .source = .project });
+    try std.testing.expectEqualStrings("Only theirs.", only.prompt);
+    // fx's own `agent` has no prompt, whatever a repository saves under its name.
+    const builtin_agent = try cache.get("builtin", "agent", .{ .source = .builtin });
+    try std.testing.expectEqualStrings("", builtin_agent.prompt);
+    try std.testing.expect(!profiles.setsTools(builtin_agent) and !profiles.setsMcpServers(builtin_agent));
+    // A profile that is nowhere is no error for a child that saved it.
+    const gone = try cache.get("gone", "nowhere", .{ .source = .home, .tools = &.{"read_file"} });
+    try std.testing.expectEqualStrings("", gone.prompt);
+    try std.testing.expect(profiles.setsTools(gone));
+}
+
+test "a profile that could not be loaded keeps its message until a load works" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "home/.fx/agents/broken/profile.json", "{not json");
+    const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
+    defer cache.deinit();
+
+    try std.testing.expectError(error.HostAuthorityUnavailable, cache.get("kid", "broken", null));
+    const first = (try cache.failureOf(alloc, "kid")).?;
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.find(u8, first, "profile 'broken'") != null);
+    // A second try replaces the message rather than adding to it.
+    try std.testing.expectError(error.HostAuthorityUnavailable, cache.get("kid", "missing", null));
+    const second = (try cache.failureOf(alloc, "kid")).?;
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.startsWith(u8, second, "no profile named 'missing'"));
+    try std.testing.expect((try cache.failureOf(alloc, "other")) == null);
+
+    // A load that works removes it.
+    try writeTestFile(tmp.dir, "home/.fx/agents/broken/profile.json", "{\"description\": \"Fixed\"}");
+    _ = try cache.get("kid", "broken", null);
+    try std.testing.expect((try cache.failureOf(alloc, "kid")) == null);
 }

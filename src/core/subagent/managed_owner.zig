@@ -1005,7 +1005,7 @@ fn runOne(slot: *Slot) OneOutcome {
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
-    } else failedOutcome(work_id, "admission", err);
+    } else admissionFailure(owner, work_id, slot.child_id, err);
     @import("../shared/debug_trace.zig").logf(
         "subagent",
         "child turn admitted child_id={s} work_id={s} provider={s} model={s} effort={s}",
@@ -1356,12 +1356,45 @@ fn fallbackOutcome(alloc: Allocator, work_id: []const u8, outcome: child_state.O
     };
 }
 
+/// The outcome of a work whose admission could not be captured. When the child's
+/// profile could not be loaded, the failure says so and names the profile, so
+/// its parent can close the child and start it again; otherwise it names only
+/// the stage.
+fn admissionFailure(owner: *Owner, work_id: []u8, child_id: []const u8, err: anyerror) OneOutcome {
+    const found = owner.authority_resolver.profileFailure(owner.alloc, child_id) catch null;
+    const message = found orelse return failedOutcome(work_id, "admission", err);
+    defer owner.alloc.free(message);
+    return .{
+        .work_id = work_id,
+        .outcome = .failed,
+        .failure = execution.failureDiagnosticValue("profile_unavailable", message),
+    };
+}
+
 fn failedOutcome(work_id: []u8, stage: []const u8, err: anyerror) OneOutcome {
     return .{
         .work_id = work_id,
         .outcome = .failed,
         .failure = execution.failureDiagnosticValue(stage, @errorName(err)),
     };
+}
+
+test "an admission that failed for the child's profile names the profile, and any other names only its stage" {
+    const alloc = std.testing.allocator;
+    var cache: authority.ProfileCache = .{ .alloc = alloc, .roots = .{ .home = null, .workspace_root = null } };
+    defer cache.deinit();
+    try std.testing.expectError(error.HostAuthorityUnavailable, cache.get("kid", "reviewer", null));
+    var resolver: authority.Resolver = .{ .children = undefined, .host = undefined, .profiles = &cache };
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = &resolver, .approvals = undefined };
+
+    const named = admissionFailure(&owner, try alloc.dupe(u8, "work-1"), "kid", error.AdmissionFailed);
+    defer named.deinit(alloc);
+    try std.testing.expectEqual(child_state.Outcome.failed, named.outcome);
+    try std.testing.expect(std.mem.startsWith(u8, named.failure.?.view(), "profile_unavailable: no profile named 'reviewer'"));
+
+    const plain = admissionFailure(&owner, try alloc.dupe(u8, "work-2"), "other", error.AdmissionFailed);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("admission: AdmissionFailed", plain.failure.?.view());
 }
 
 fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {

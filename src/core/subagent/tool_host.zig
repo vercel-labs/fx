@@ -20,6 +20,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const io_mod = @import("../shared/io.zig");
 const profiles = @import("../profiles/profiles.zig");
+const started_with_mod = @import("../profiles/started_with.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -524,11 +525,15 @@ pub const Runtime = struct {
         defer profile_arena.deinit();
         var profiled = options;
         var model_override = request.override();
+        // What the profile set, which a new child keeps (`child_state.Child`).
+        var started_with: ?started_with_mod.StartedWith = null;
         if (model_override.profile) |name| {
             const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
                 .rejected => |failure| return self.encodeManaged(alloc, failure),
                 .loaded => |value| value,
             };
+            // `main` sets nothing and nothing can replace it, so it saves nothing.
+            if (!std.mem.eql(u8, profile.name, profiles.main_name)) started_with = started_with_mod.of(&profile);
             if (model_override.model == null) model_override.model = profile.model;
             if (model_override.effort == null) {
                 if (profile.effort) |effort| profiled.defaults.effort = effort;
@@ -561,7 +566,7 @@ pub const Runtime = struct {
         // A second pass runs only when the child went idle while this
         // message waited for the admission lock (the `.feedback` arm).
         admit: for (0..2) |pass| {
-            var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model);
+            var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model, started_with);
             defer admitted.deinit(admission_alloc);
             switch (admitted) {
                 .feedback => |target| {
@@ -2150,13 +2155,14 @@ pub const Runtime = struct {
         operation_id: []const u8,
         options: ExecuteOptions,
         resolved_model: ?[]const u8,
+        started_with: ?started_with_mod.StartedWith,
     ) !ManagedAdmission {
         // A running registry entry must not be exposed before its Slot exists.
         // Release the registry lock before taking the managed-owner lock.
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
-        var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model);
+        var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model, started_with);
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
             const child_id = admitted.ready.child_id;
@@ -2181,6 +2187,7 @@ pub const Runtime = struct {
         operation_id: []const u8,
         options: ExecuteOptions,
         resolved_model: ?[]const u8,
+        started_with: ?started_with_mod.StartedWith,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
         const defaults = effectiveDefaults(options.defaults, request.override(), resolved_model);
@@ -2308,6 +2315,7 @@ pub const Runtime = struct {
                 // Without one named it runs in fx's own main, which sets
                 // nothing, so it has what its parent has.
                 try registry.setProfile(alloc, child_id, request.override().profile orelse profiles.main_name);
+                if (started_with) |started| try recordStartedWith(alloc, &registry, child_id, request.override().profile.?, started);
                 // What it is for, in its parent's list of subagents.
                 if (try child_state.purposeOf(alloc, message.instructions, message.message)) |purpose| {
                     defer alloc.free(purpose);
@@ -2323,6 +2331,20 @@ pub const Runtime = struct {
                 );
             },
         }
+    }
+
+    /// Saves what the profile a new child started in set with the child, unless
+    /// it would not fit in a spawn line's data. Then the child saves none, reads
+    /// its profile by name as a child from before this did, and a trace line
+    /// names the child, the profile, and the size.
+    fn recordStartedWith(alloc: Allocator, registry: *child_state.Registry, child_id: []const u8, profile_name: []const u8, started: started_with_mod.StartedWith) !void {
+        const encoded = try started_with_mod.encode(alloc, started);
+        defer alloc.free(encoded);
+        if (!started_with_mod.fits(encoded)) {
+            debug_trace.logf("subagent", "saved profile skipped child={s} profile={s} bytes={d} limit={d}; its profile is read by name", .{ child_id, profile_name, encoded.len, started_with_mod.max_bytes });
+            return;
+        }
+        try registry.setStartedWith(alloc, child_id, started);
     }
 
     fn ensureManagedChildSession(
@@ -3373,6 +3395,46 @@ test "a new subagent starts in the main profile unless its message names one, an
     try std.testing.expectEqualStrings("main", listing[0].profile);
     try std.testing.expectEqualStrings("copier", listing[1].name);
     try std.testing.expectEqualStrings("agent", listing[1].profile);
+
+    // A child that started in no profile has nothing of one to keep, and one in
+    // a profile keeps what it set, which for fx's own `agent` is nothing but
+    // where it came from.
+    var registry = try parent.stateStore().load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expect(registry.findPersistent("reviewer").?.started_with == null);
+    try std.testing.expectEqual(profiles.Source.builtin, registry.findPersistent("copier").?.started_with.?.source);
+}
+
+test "a new subagent saves what its profile set, unless that would not fit in a spawn line" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var first = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-1"), .message = try alloc.dupe(u8, "look"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer first.deinit(alloc);
+    try registry.appendPersistent(alloc, "kid-fits", "fits", "", first);
+    try registry.setProfile(alloc, "kid-fits", "reviewer");
+    try Runtime.recordStartedWith(alloc, &registry, "kid-fits", "reviewer", .{ .source = .home, .permission_mode = .auto, .tools = &.{ "read_file", "!shell" }, .mcp_servers = &.{"github"} });
+    const kept = registry.findById("kid-fits").?.started_with.?;
+    try std.testing.expectEqual(types.PermissionMode.auto, kept.permission_mode.?);
+    try std.testing.expectEqual(@as(usize, 2), kept.tools.?.len);
+
+    // Forty names of 90 bytes do not fit. The child saves none and reads its
+    // profile by name, as a child from before this did, and a profile that
+    // works today still starts a subagent.
+    var second = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-2"), .message = try alloc.dupe(u8, "look"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer second.deinit(alloc);
+    try registry.appendPersistent(alloc, "kid-big", "big", "", second);
+    try registry.setProfile(alloc, "kid-big", "wide");
+    const text_utils = @import("../shared/text_utils.zig");
+    var names: [40][]const u8 = undefined;
+    for (&names, 0..) |*slot, index| slot.* = try alloc.print("{s}{d}", .{ text_utils.repeat("t", 90), index });
+    defer for (names) |name| alloc.free(name);
+    try Runtime.recordStartedWith(alloc, &registry, "kid-big", "wide", .{ .source = .home, .tools = &names });
+    try std.testing.expect(registry.findById("kid-big").?.started_with == null);
+    try std.testing.expectEqualStrings("wide", registry.findById("kid-big").?.profile.?);
 }
 
 test "wait returns at once when nothing works, and when a report arrives" {
