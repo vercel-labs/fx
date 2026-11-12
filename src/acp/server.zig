@@ -752,6 +752,43 @@ fn closeActiveSession(state: *ServerState) !void {
     destroyActiveSession(state);
 }
 
+/// The client leaves the active session for another, or closes it: its
+/// subagents stop as cancelled and owe no report, and nothing they posted for
+/// it stays for the session that follows (D41, D97; the app does the same in
+/// `stopSubagentsForSwitch`). The tree closes first, so no work the stop ends
+/// owes a report, and the host is joined before the queue is dropped, so
+/// nothing posts after it. A quit leaves reports owed, and a reload of the
+/// same session keeps its queue, so neither calls this. Call it before
+/// `releaseActiveSession` or `closeActiveSession`.
+pub fn stopSubagentsForSwitch(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (state.subagent_host) |host| host.closeTree();
+    disableSubagentHost(state);
+    dropQueuedReports(state, active.session_id);
+}
+
+/// Drops the reports and messages `postAcpReport` queued for `session_id`
+/// that no prompt took. A report that was owed stays owed in the session's
+/// log, which posts it again when the session reopens.
+fn dropQueuedReports(state: *ServerState, session_id: []const u8) void {
+    const alloc = std.heap.c_allocator;
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    var index: usize = 0;
+    while (state.worker.takeQueuedPrompt(alloc)) |queued| : (index += 1) {
+        defer worker_runtime.freeQueuedPrompt(alloc, queued);
+        const call: ?*const ReportCall = if (index < state.report_calls.items.len) &state.report_calls.items[index] else null;
+        debug_trace.logf("acp", "event=subagent_mail_dropped session={s} kind={s} child={s} work={s} reason=session_switch", .{
+            session_id,
+            @tagName(queued.mail),
+            if (call) |value| value.child_id else "",
+            if (call) |value| value.work_id else "",
+        });
+    }
+    for (state.report_calls.items) |*call| call.deinit(alloc);
+    state.report_calls.clearRetainingCapacity();
+}
+
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
@@ -3542,6 +3579,7 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
     }
 
     cancelAndReapActivePrompt(state);
+    stopSubagentsForSwitch(state);
     closeActiveSession(state) catch |err| {
         debug_trace.logf(
             "session",

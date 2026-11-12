@@ -29,7 +29,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
-import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
+import { childLines, childWork, copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
 import { bearer, rotateFxLogin, startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   canonicalSubagentIdForStore,
@@ -9978,6 +9978,174 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         heldChild.resolve(finalText("late child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // A switch to another session stops the session's subagents as cancelled,
+  // owing no report, and what they posted before it stays with the old
+  // session (D41, D97).
+  const switchHooks = { _meta: { fx: { hooks: { captureContent: true } } } };
+  const switchChildPrompt = "Remain active until the session is switched away.";
+  const switchCallId = "acp_switch_child";
+
+  /** A gateway whose subagent holds its first request until `held` is resolved. */
+  const switchRoute = (held: { promise: Promise<Response> }) => (body: string) => {
+    if (!body.includes('"name":"subagent"')) return held.promise;
+    const text = acpPromptText(body);
+    if (text.includes("Confirm the first session")) return finalText("ACP_FIRST_SESSION_OK");
+    if (text.includes("Answer in the next session")) return finalText("ACP_NEXT_SESSION_OK");
+    if (acpLatestUserIsReport(body)) return finalText("ACP_REPORT_SEEN");
+    if (text.includes("Prepare a session to load")) return finalText("ACP_PREPARED_OK");
+    if (body.includes(switchCallId)) return finalText("ACP_PARENT_TURN_DONE");
+    return fakeGatewayToolCall(switchCallId, "subagent", {
+      request: { action: "message", agent: "waiter", message: switchChildPrompt },
+    });
+  };
+
+  /** Starts a subagent in the active session, then cancels the prompt that waits for it. */
+  async function startHeldChild(gateway: ReturnType<typeof startFakeGateway>): Promise<void> {
+    const base = gateway.requests.length;
+    sendPrompt(client!, 7101, "Start the long subagent.");
+    // The parent's call, its turn after the receipt, and the held child.
+    await waitForCondition("the parent's finished turn and the held child", () => gateway.requests.length >= base + 3, TIMEOUT);
+    client!.send({ jsonrpc: "2.0", id: 7102, method: "session/cancel", params: {} });
+    const stopped = await readUntilResponses(client!, [7101, 7102], TIMEOUT);
+    expect(stopped.responses.get(7101).result.stopReason).toBe("cancelled");
+    // The cancel ends the parent's wait, not the child's work.
+    expect(client!.hookEvents.filter((event) => event.type === "delegation").map((event) => event.data.phase)).toEqual(["dispatched"]);
+  }
+
+  for (const via of ["session/new", "session/load", "session/close"] as const) {
+    test(
+      `ACP ${via} away from a working subagent sends none of its report to the next session`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-subagent-switch-");
+        const tracePath = join(root.root, "trace.log");
+        const heldChild = deferred<Response>();
+        const gateway = startDynamicFakeGateway(switchRoute(heldChild));
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          let savedId = "";
+          if (via === "session/load") {
+            // A saved session to switch to.
+            const prepared = await client.request("session/new", { mcpServers: [] }, 2) as any;
+            savedId = prepared.result.sessionId;
+            const run = await runPrompt(client, "Prepare a session to load.", TIMEOUT);
+            expect(run.promptResult.result.stopReason).toBe("end_turn");
+          }
+          const first = await client.request("session/new", { mcpServers: [], ...switchHooks }, 3) as any;
+          const firstId: string = first.result.sessionId;
+          await client.request("session/set_mode", { modeId: "auto" }, 4);
+          await startHeldChild(gateway);
+
+          if (via === "session/new") {
+            await client.request("session/new", { mcpServers: [], ...switchHooks }, 5);
+          } else if (via === "session/load") {
+            await client.request("session/load", { sessionId: savedId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 5);
+          } else {
+            await client.request("session/close", { sessionId: firstId }, 5);
+            await client.request("session/new", { mcpServers: [], ...switchHooks }, 6);
+          }
+          const nextBase = gateway.requests.length;
+          const next = await runPrompt(client, "Answer in the next session.", TIMEOUT);
+          expect(next.promptResult.result.stopReason).toBe("end_turn");
+          expect(JSON.stringify(next.messages)).toContain("ACP_NEXT_SESSION_OK");
+          // The next session asks the model once: no turn for the old session's report.
+          const nextBodies = gateway.requests.slice(nextBase).map((request) => request.body);
+          expect(nextBodies.some((body) => body.includes("Subagent report"))).toBe(false);
+          expect(nextBodies.some((body) => body.includes("fx stopped before it finished"))).toBe(false);
+          expect(nextBodies).toHaveLength(1);
+          // It sent no update for the old call, and no hook event for the old child's end.
+          expect(JSON.stringify(next.messages)).not.toContain(switchCallId);
+          expect(client.hookEvents.filter((event) => event.type === "delegation").map((event) => event.data.phase)).toEqual(["dispatched"]);
+
+          // The switch ended the old session's work as cancelled, owing no report.
+          const finishes = childLines(root.home, firstId).filter((line) => line.kind === "child_finished");
+          expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
+          expect(finishes[0].data?.report).toBeUndefined();
+          // A stopped child posted nothing, so the switch had no mail to drop.
+          expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").not.toContain("subagent_mail_dropped");
+
+          // Reopened, the old session posts nothing for it, and its model reads that the work was cancelled.
+          const reopenBase = gateway.requests.length;
+          await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 7);
+          const reopened = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
+          expect(reopened.promptResult.result.stopReason).toBe("end_turn");
+          const reopenedBodies = gateway.requests.slice(reopenBase).map((request) => request.body);
+          expect(reopenedBodies.some((body) => body.includes("Subagent report"))).toBe(false);
+          expect(reopenedBodies).toHaveLength(1);
+          expect(acpPromptText(reopenedBodies[0]!)).toContain(`- waiter: idle, last work cancelled. For: ${switchChildPrompt}`);
+          expect(client.stderr).toBe("");
+        } finally {
+          heldChild.resolve(finalText("held child cleanup"));
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "ACP session/new drops a report queued for the old session, and reopening that session delivers it once",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-switch-queued-");
+      const tracePath = join(root.root, "trace.log");
+      const heldChild = deferred<Response>();
+      const gateway = startDynamicFakeGateway(switchRoute(heldChild));
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const first = await client.request("session/new", { mcpServers: [], ...switchHooks }, 2) as any;
+        const firstId: string = first.result.sessionId;
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        await startHeldChild(gateway);
+
+        // The child ends while no prompt waits, so its report is queued for the old session.
+        heldChild.resolve(finalText("late child completion"));
+        await waitForCondition("the child's work to be recorded done", () => childWork(root.home, firstId).outcome === "ok", TIMEOUT);
+
+        await client.request("session/new", { mcpServers: [], ...switchHooks }, 4);
+        const nextBase = gateway.requests.length;
+        const next = await runPrompt(client, "Answer in the next session.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        const nextBodies = gateway.requests.slice(nextBase).map((request) => request.body);
+        expect(nextBodies.some((body) => body.includes("Subagent report"))).toBe(false);
+        expect(nextBodies).toHaveLength(1);
+        expect(JSON.stringify(next.messages)).not.toContain(switchCallId);
+        expect(client.hookEvents.filter((event) => event.type === "delegation").map((event) => event.data.phase)).toEqual(["dispatched"]);
+        // The trace names what the switch dropped, and why.
+        const work = childWork(root.home, firstId);
+        const dropped = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("subagent_mail_dropped"));
+        expect(dropped).toHaveLength(1);
+        expect(dropped[0]).toContain(`session=${firstId} kind=report child=${work.child} work=${work.work} reason=session_switch`);
+
+        // The old session's log still owes the report, so reopening it delivers it, once.
+        const reopenBase = gateway.requests.length;
+        await client.request("session/load", { sessionId: firstId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 5);
+        const reopened = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
+        expect(reopened.promptResult.result.stopReason).toBe("end_turn");
+        const reopenedBodies = gateway.requests.slice(reopenBase).map((request) => request.body);
+        // The user's prompt, then one turn for the report.
+        expect(reopenedBodies).toHaveLength(2);
+        expect(reopenedBodies.filter(acpLatestUserIsReport)).toHaveLength(1);
+        expect(reopenedBodies[1]).toContain("late child completion");
+        expect(client.stderr).toBe("");
+      } finally {
+        heldChild.resolve(finalText("held child cleanup"));
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

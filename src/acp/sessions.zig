@@ -1249,6 +1249,7 @@ fn restoredToolIdentities(
 }
 
 fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {
+    server.stopSubagentsForSwitch(state);
     try server.releaseActiveSession(state);
     const client_system_prompt: []u8 = activation.client_system_prompt orelse &.{};
     if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
@@ -3284,6 +3285,54 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
+}
+
+test "a switch away from a session drops the reports its host queued and closes its host" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const subagents = state.subagent_host.?;
+    // A report and a message the host posted that no prompt took.
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
+    try subagents.report_sink.?.post(subagents, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "child-1", .text = "found it" } });
+    try std.testing.expectEqual(@as(usize, 2), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 2), state.report_calls.items.len);
+
+    server.stopSubagentsForSwitch(&state);
+    try std.testing.expect(state.subagent_host == null);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
+    // The session stays until the switch releases it.
+    try std.testing.expect(state.active_session != null);
+    // With no session to leave, a second call has nothing to do.
+    try server.releaseActiveSession(&state);
+    server.stopSubagentsForSwitch(&state);
+    try std.testing.expect(state.active_session == null);
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {
