@@ -29,6 +29,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
@@ -96,6 +97,8 @@ fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
         else => .unavailable,
     };
 }
@@ -1718,7 +1721,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "session",
                         .tone = .@"error",
-                        .body = "Unable to resume selected session.",
+                        .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
@@ -6208,6 +6211,12 @@ test "app_input_runtime Enter consumes an active session picker on target failur
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, picker.selection_failure.?);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "unable to resume") == null);
+}
+
+test "a resume refused for a changed or removed custom connection says which" {
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_changed, classifyResumeFailure(error.ConfiguredProviderChanged));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.connection_removed, classifyResumeFailure(error.ConfiguredProviderRemoved));
+    try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, classifyResumeFailure(error.UnknownConfiguredProvider));
 }
 
 test "app_input_runtime reports resume failure after picker transition" {

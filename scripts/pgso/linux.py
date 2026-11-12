@@ -46,7 +46,6 @@ STARTUP_SCENARIOS = (
     "direct-help",
     "direct-version",
     "direct-status",
-    "direct-doctor",
     "direct-sessions",
 )
 ZIG_CC_LINK_FLAGS = ("-Wl,--gc-sections",)

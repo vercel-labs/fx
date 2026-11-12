@@ -114,12 +114,19 @@ function toolCall(id: string, tool: string, input: object): Response {
   ]);
 }
 
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+// Each user message's text, without the runtime context updates fx adds.
 function userTexts(body: string): string[] {
   const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
   return (request.prompt ?? []).filter((message) => message.role === "user").map((message) => {
-    if (typeof message.content === "string") return message.content;
+    if (typeof message.content === "string") return withoutContextUpdates(message.content);
     if (!Array.isArray(message.content)) return "";
-    return message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("");
+    return withoutContextUpdates(message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join(""));
   });
 }
 
@@ -1530,7 +1537,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(over).not.toContain("Apply this change?");
         // Its row names the profile it runs in, and says it waits for the
         // approval main shows for it.
-        expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}writer {2,}\S/m);
+        expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}\S+ {2,}writer\s*$/m);
         expect(over).toMatch(/^ {2}\u2514 writer .*needs approval/m);
         // A digit goes in the list's search box, so it can't answer the
         // prompt under it. Esc clears the search, then closes the list.
@@ -2105,7 +2112,56 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "the agent list shows each agent's title, state, profile, and model in columns, and main's footer counts the subagents working",
+    "the agent list puts subagents that wait for the user first, then working ones, then idle ones, and names only a profile other than main",
+    async () => {
+      const busy = held();
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            const asked = (marker: string) => userTexts(body).some((text) => text.includes(marker));
+            if (asked("ORDER_BUSY")) {
+              await busy.promise;
+              return text("busy_done", "ORDER_BUSY_DONE");
+            }
+            if (asked("ORDER_STUCK")) return refused();
+            return text("idle_done", "ORDER_IDLE_DONE");
+          }
+          if (!body.includes('"main_idle"')) return toolCall("main_idle", "subagent", { request: { action: "message", agent: "idler", message: "ORDER_IDLE look" } });
+          if (!body.includes('"main_busy"')) return toolCall("main_busy", "subagent", { request: { action: "message", agent: "busy", message: "ORDER_BUSY write", profile: "notes" } });
+          if (!body.includes('"main_one"')) return toolCall("main_one", "subagent", { request: { action: "message", agent: "stuck1", message: "ORDER_STUCK one" } });
+          if (!body.includes('"main_two"')) return toolCall("main_two", "subagent", { request: { action: "message", agent: "stuck2", message: "ORDER_STUCK two" } });
+          return text("main_done", "ORDER_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER order them");
+          // Two subagents wait for the user, and the footer counts them.
+          await session.waitForPane((pane) => pane.includes("2 agents require attention \u00b7 main \u2193"), 30_000);
+          await session.sendKeys("Down");
+          const list = await session.waitForPane((pane) =>
+            subagentRow("idler", "idle").test(pane) && subagentRow("stuck2", "needs you").test(pane), 10_000);
+          // They started idler, busy, stuck1, stuck2; the list puts the two
+          // waiting for the user first, then the working one, then the idle one.
+          expectRowOrder(list, mainRow(), subagentRow("stuck1"), subagentRow("stuck2"), subagentRow("busy"), subagentRow("idler"));
+          // Only busy runs in a profile other than main, and its row names it
+          // after its model.
+          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
+          expect(list).toMatch(/^ {2}\u2514 idler {2,}.* {2,}idle {2,}\S+\s*$/m);
+          expect(list).not.toMatch(/ {2}main\s*$/m);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        }, (home) => {
+          const folder = join(home, ".fx", "agents", "notes");
+          mkdirSync(folder, { recursive: true });
+          writeFileSync(join(folder, "profile.json"), JSON.stringify({ description: "Writes notes" }));
+        });
+      } finally {
+        busy.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the agent list shows each agent's title, state, and model in columns, and main's footer counts the subagents working",
     async () => {
       const reviewer = held();
       let childCalls = 0;
@@ -2137,8 +2193,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForPane((pane) => waitRow.test(pane), 5_000);
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
-        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}main {2,}\S/m.test(pane), 15_000);
-        expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}main {2,}\S/m);
+        // The model follows the state; the main profile goes unnamed.
+        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}\S+\s*$/m.test(pane), 15_000);
+        expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain("Agents 2");
         // Main's row stays first and selected, above a working child.
         expectRowOrder(list, mainRow(), subagentRow("reviewer"));

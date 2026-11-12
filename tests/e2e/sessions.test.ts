@@ -1746,10 +1746,17 @@ function answeredCall(body: string): string | undefined {
   return (last.content ?? []).find((part: any) => part.type === "tool-result")?.toolCallId;
 }
 
-/// The text of a request's newest user message.
+/** `text` without the runtime context updates fx adds to the end of a user
+ * message, such as main's list of subagents, which quotes each one's task. */
+function withoutContextUpdates(text: string): string {
+  return text.replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+/// The text of a request's newest user message, without the runtime context
+/// updates fx adds.
 function latestUserText(body: string): string {
   const latest = (JSON.parse(body).prompt ?? []).filter((item: any) => item.role === "user").at(-1)?.content ?? "";
-  return typeof latest === "string" ? latest : JSON.stringify(latest);
+  return withoutContextUpdates(typeof latest === "string" ? latest : JSON.stringify(latest));
 }
 
 function delegate(call: string, agent: string, message: string) {
@@ -4072,23 +4079,31 @@ test("doctor reports a damaged session and removes only old terminal and side fo
     // An old folder whose session exists is never an orphan.
     utimesSync(keptTerminal, twoDaysAgo, twoDaysAgo);
 
-    const result = await command(fixture, gateway, ["doctor", "--json"]);
-    expect(result.code).toBe(0);
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+    // Without --fix, doctor names the old folders and removes nothing.
+    const looked = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    expect(named(looked, "session")).toEqual([
+      `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
+      "warn: 2 old terminal or side folder(s) whose session is gone can be removed",
+    ]);
+    expect(existsSync(old)).toBe(true);
+    expect(existsSync(oldTerminal)).toBe(true);
+
+    const result = await command(fixture, gateway, ["doctor", "--json", "--fix"]);
     const checks: any[] = JSON.parse(result.stdout).checks;
-    const named = (name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
-    expect(named("state")).toEqual(["ok: sessions ready"]);
-    expect(named("session")).toEqual([
+    expect(named(checks, "state")).toEqual(["ok: sessions ready"]);
+    expect(named(checks, "session")).toEqual([
       `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
       "ok: removed 2 terminal or side folder(s) whose session is gone",
     ]);
-    expect(named("sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
+    expect(named(checks, "sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
     expect(existsSync(old)).toBe(false);
     expect(existsSync(oldTerminal)).toBe(false);
     expect(existsSync(young)).toBe(true);
     expect(existsSync(keptTerminal)).toBe(true);
     // Doctor reports damage and repairs nothing.
     expect(readFileSync(path)).toEqual(before);
-    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json", "--fix"])).stdout).checks;
     expect(again.filter((check: any) => check.detail.includes("removed"))).toEqual([]);
 
   } finally {
@@ -4459,7 +4474,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
   writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
   const gateway = startDynamicFakeGateway((raw) => {
     const body = JSON.parse(raw);
-    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
     if (latest.includes("STEERING_CHILD")) {
       childRequests++;
       return held.response;

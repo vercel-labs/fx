@@ -706,6 +706,50 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a Token Pass session is reviewed by a Token Pass model unless review_model names another",
+    async () => {
+      for (const reviewModel of [undefined, "openai/gpt-6-sol"]) {
+        const root = createIsolatedRoot();
+        const marker = join(root.root, "deployment-ran");
+        const bin = installRecorder(root, "vercel", marker);
+        const deployCommand = `${join(bin, "vercel")} deploy --prod`;
+        const gateway = startGateway(
+          [
+            userCommandCall(deployCommand, "token_pass_deploy"),
+            fakeGatewayFinalText("deployment completed"),
+          ],
+          [fakeGatewayPermissionDecision("clear", "token_pass_deploy_clear")],
+        );
+
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", "Deploy the site."],
+          {
+            cwd: root.workspace,
+            env: {
+              ...gatewayEnv(root, gateway),
+              FX_MODEL: "zai/glm-5.3",
+              FX_REVIEW_MODEL: reviewModel,
+              PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(
+          gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+        ).toBe(reviewModel ?? "deepseek/deepseek-v4.1-flash");
+        if (reviewModel === undefined) {
+          expect(JSON.parse(gateway.classifierRequests[0]!.body).providerOptions).toBeUndefined();
+        }
+        expect(existsSync(marker)).toBe(true);
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "clean TTY reads require shell review before execution",
     async () => {
       const root = createIsolatedRoot();
