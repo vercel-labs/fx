@@ -8837,7 +8837,9 @@ test "processQueuedPrompt resends a login the gateway refuses after a refresh th
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after", "token-after", "token-after" };
+    // Each 401's reload finds the refused token still stored, so fx forces
+    // a refresh, and the refresh works.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after", "token-after", "token-after", "token-after", "token-after" };
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
     var config = fixture.config();
@@ -8853,9 +8855,10 @@ test "processQueuedPrompt resends a login the gateway refuses after a refresh th
     // No sign-in: the login just refreshed is good.
     try std.testing.expect(needUserText(&hooks) == null);
     try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
-    // Each resend reads the stored login again, and its 401 gets a forced
-    // refresh of its own, so the login is checked again on every resend.
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
+    // Each resend reads the stored login again, and its 401 reads it once
+    // more and forces a refresh of its own while the store still holds the
+    // refused token, so the login is checked again on every resend.
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force, .reload, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
     // The reason shows once, not once per resend.
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "refused for now") != null);
@@ -8875,9 +8878,10 @@ test "processQueuedPrompt waits for a sign-in when a refused login's refresh sto
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
-    // The first forced refresh works; the refresh token is revoked before
-    // the resend, so the second finds nothing.
+    // Each 401's reload finds the refused token still stored. The first
+    // forced refresh works; the refresh token is revoked before the resend,
+    // so the second finds nothing.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after", "token-after", "token-after", "token-after" };
     hooks.credential_refresh_force_successes = 1;
     var fixture = PromptFixture{};
     var continue_flag: std.atomic.Value(bool) = .init(false);
