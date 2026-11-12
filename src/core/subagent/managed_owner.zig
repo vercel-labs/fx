@@ -136,6 +136,9 @@ pub const WorkEnd = struct {
     /// the child's next work.
     /// Borrowed for the call.
     leftovers: []const child_state.ActiveWork = &.{},
+    /// Why the work never began, for one that failed because its slot could
+    /// not start: its report says the message never ran.
+    start_failure: ?[]const u8 = null,
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with
@@ -355,6 +358,7 @@ pub const Owner = struct {
                 errdefer self.alloc.free(slot.child_id);
                 try self.slots.append(self.alloc, slot);
                 errdefer _ = self.slots.pop();
+                if (start_test_controls.spawnFails()) return error.ThreadSpawnFailed;
                 slot.thread = std.Thread.spawn(.{}, slotMain, .{slot}) catch
                     return error.ThreadSpawnFailed;
                 return .started;
@@ -469,6 +473,74 @@ pub const Owner = struct {
             if (outcome == .cancelled and started_by == .user) .user_stop else null;
         const end: child_state.EndFacts = .{ .started_by = started_by, .cause = cause };
         return .{ .report_owed = self.finish(child_id, work_id, outcome, null, stopped_by == .parent, end).report_owed, .end = end };
+    }
+
+    /// A work no slot began, ended.
+    pub const UnstartedEnd = struct {
+        work_id: []u8,
+        report_owed: bool,
+        end: child_state.EndFacts,
+
+        pub fn deinit(self: UnstartedEnd, alloc: Allocator) void {
+            alloc.free(self.work_id);
+        }
+    };
+
+    /// Ends the active work of `child_id`, which no slot began because its
+    /// start failed with `err`. The work is failed, naming the start, and the
+    /// child is idle again, so its next message starts a work as any idle
+    /// child's does; without this the registry keeps the work running with no
+    /// slot, and every message to the child meets `state_unavailable`.
+    /// `owes_report` says whether its end may owe the parent a report: a
+    /// work whose own call fails with the cause owes none, while a message
+    /// the parent was told was queued owes one under the child's rule.
+    /// `expected_work_id`, when given, must be the active work. Null when
+    /// the registry could not be read or written: the child stays marked
+    /// running until it is closed or fx restarts, and the trace names the
+    /// work.
+    pub fn endUnstarted(
+        self: *Owner,
+        child_id: []const u8,
+        expected_work_id: ?[]const u8,
+        err: anyerror,
+        owes_report: bool,
+    ) ?UnstartedEnd {
+        var lock = self.state_store.acquireLock();
+        defer lock.release();
+        var registry = self.state_store.load(self.alloc) catch |load_err| {
+            unstartedFailure(child_id, expected_work_id, "state_load", load_err);
+            return null;
+        };
+        defer registry.deinit(self.alloc);
+        const child = registry.findById(child_id) orelse {
+            unstartedFailure(child_id, expected_work_id, "child_missing", error.ChildUnavailable);
+            return null;
+        };
+        const active = child.active orelse {
+            unstartedFailure(child_id, expected_work_id, "no_active_work", error.StaleWork);
+            return null;
+        };
+        if (expected_work_id) |expected| if (!std.mem.eql(u8, expected, active.id)) {
+            unstartedFailure(child_id, expected_work_id, "other_active_work", error.StaleWork);
+            return null;
+        };
+        const work_id = self.alloc.dupe(u8, active.id) catch |alloc_err| {
+            unstartedFailure(child_id, expected_work_id orelse active.id, "work_id", alloc_err);
+            return null;
+        };
+        const owed = owes_report and !self.tree_closed and reports.reportable(child.report_rule, active.started_by, .failed, false);
+        const end: child_state.EndFacts = if (owed) .{ .started_by = active.started_by } else .{};
+        registry.finishWithReport(self.alloc, child_id, work_id, .failed, execution.failureDiagnosticValue("start_failed", @errorName(err)), owed, end) catch |finish_err| {
+            unstartedFailure(child_id, work_id, "state_finish", finish_err);
+            self.alloc.free(work_id);
+            return null;
+        };
+        self.state_store.save(self.alloc, registry) catch |save_err| {
+            unstartedFailure(child_id, work_id, "state_save", save_err);
+            self.alloc.free(work_id);
+            return null;
+        };
+        return .{ .work_id = work_id, .report_owed = owed, .end = end };
     }
 
     /// The user stopped the child's running turn on its screen, which its
@@ -1402,6 +1474,16 @@ fn failedOutcome(work_id: []u8, stage: []const u8, err: anyerror) OneOutcome {
         .outcome = .failed,
         .failure = execution.failureDiagnosticValue(stage, @errorName(err)),
     };
+}
+
+/// A work whose start failed could not be ended in the registry, which keeps
+/// it running with no slot behind it.
+fn unstartedFailure(child_id: []const u8, work_id: ?[]const u8, stage: []const u8, err: anyerror) void {
+    debug_trace.logf(
+        "subagent",
+        "failed start could not be ended child_id={s} work_id={s} stage={s} err={s}: the registry keeps the work running and the child takes no message until it is closed or fx restarts",
+        .{ child_id, work_id orelse "unknown", stage, @errorName(err) },
+    );
 }
 
 fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {

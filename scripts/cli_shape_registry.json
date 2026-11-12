@@ -293,6 +293,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_START_FAIL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_START_HELD": {
       "job": "test",
       "stability": "internal"

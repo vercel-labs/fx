@@ -14051,3 +14051,62 @@ test("fx told to quit while a message waits for a subagent's start exits at once
   expect(run.stderr).not.toContain("panic");
   expect(run.exit).toBe(143);
 }, 90_000);
+
+// Main messages subagent `reviewer`, and the start control
+// (src/core/subagent/start_test_controls.zig, FX_TEST_SUBAGENT_START_FAIL)
+// fails that first start after its work is saved. fx answers that the start
+// failed and the subagent is idle; main then sends the message again, which
+// starts a work, and its report ends the ask.
+test("a subagent whose start failed is idle and takes the next message", async () => {
+  const root = createFixtureRoot("subagent-start-failed");
+  const tracePath = join(root.root, "trace.log");
+  const state = { firstAnswer: "", secondAnswer: "", firstRan: false, nextRequests: 0 };
+  const gateway = startDynamicFakeGateway((raw) => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STARTFAIL_REPORT_SEEN");
+    if (raw.includes("startfail-second")) {
+      state.secondAnswer = toolResultText(raw, "startfail-second");
+      return fakeGatewayFinalText("STARTFAIL_MAIN_SENT");
+    }
+    if (raw.includes("startfail-first")) {
+      state.firstAnswer = toolResultText(raw, "startfail-first");
+      return fakeGatewayToolCall("startfail-second", "subagent", { request: { action: "message", agent: "reviewer", message: "STARTFAIL_NEXT" } });
+    }
+    if (latest.includes("STARTFAIL_NEXT")) {
+      state.nextRequests++;
+      return fakeGatewayFinalText("STARTFAIL_CHILD_DONE");
+    }
+    if (latest.includes("STARTFAIL_FIRST")) {
+      state.firstRan = true;
+      return fakeGatewayFinalText("STARTFAIL_FIRST_RAN");
+    }
+    return fakeGatewayToolCall("startfail-first", "subagent", { request: { action: "message", agent: "reviewer", message: "STARTFAIL_FIRST" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Message the reviewer, and again if it did not start."], {
+      cwd: root.workspace,
+      env: { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0", FX_TRACE_SCOPES: "mailbox,subagent,tool", FX_TEST_SUBAGENT_START_FAIL: "1" },
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    // The first answer says the start failed, and that the subagent is idle.
+    expect(state.firstAnswer).toContain("start_failed");
+    expect(state.firstAnswer).toContain("reviewer did not start: fx could not start a thread for it. Your message did not run. reviewer is idle");
+    // The second message started a work that ran; the first never did.
+    expect(state.secondAnswer).toContain("Sent to reviewer");
+    expect(state.firstRan).toBe(false);
+    expect(state.nextRequests).toBe(1);
+    expect(parseAskJson(result.stdout).output).toContain("STARTFAIL_REPORT_SEEN");
+    expect(readFileSync(tracePath, "utf8")).toContain("event=start_failed");
+    // The parent's log ends the first work as failed and the second as ok.
+    const parentId = rootSessionIds(root.home)[0]!;
+    const finished = childLines(root.home, parentId).filter((line) => line.kind === "child_finished");
+    expect(finished.map((line) => line.outcome)).toEqual(["failed", "ok"]);
+    expect(JSON.stringify(finished[0].data)).toContain("start_failed: ThreadSpawnFailed");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 90_000);
