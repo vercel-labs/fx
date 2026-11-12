@@ -406,7 +406,7 @@ pub fn Bindings(comptime App: type) type {
             source: credentials.Source,
             mode: auth_runtime.CredentialRefreshMode,
             expected_account_id: ?[]const u8,
-        ) !?[]u8 {
+        ) !?agent_runtime.RefreshedGatewayCredential {
             const agent: *AppAgent = @ptrCast(@alignCast(raw_ctx));
             const app = appOf(agent);
             if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -428,11 +428,22 @@ pub fn Bindings(comptime App: type) type {
 
             const worker_token = try alloc.dupe(u8, refreshed.token);
             errdefer secret.zeroAndFree(alloc, worker_token);
+            // The login matches the app's current choice, which can be a team
+            // the user picked after the request started, so the request sends
+            // this team from now on.
+            const worker_team = if (refreshed.gatewayTeam()) |team| try alloc.dupe(u8, team) else null;
+            errdefer if (worker_team) |team| alloc.free(team);
+            const worker_team_label = if (refreshed.team_slug) |slug| try alloc.dupe(u8, slug) else null;
+            errdefer if (worker_team_label) |label| alloc.free(label);
             try app_worker_runtime.Runtime(App).pushOwnedEvent(app, agent, .{
                 .credential_refreshed = refreshed,
             });
             owns_refreshed = false;
-            return worker_token;
+            return .{
+                .token = worker_token,
+                .gateway_team = worker_team,
+                .gateway_team_label = worker_team_label,
+            };
         }
 
         /// Resolves models for `agent`, under its own turn settings.
