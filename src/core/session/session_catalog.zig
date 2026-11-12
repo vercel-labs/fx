@@ -21,6 +21,10 @@ pub const LoadState = enum {
 pub const ResumeFailure = enum {
     open_elsewhere,
     being_updated,
+    /// The session's custom connection changed or was removed in settings
+    /// (`config_runtime.sessionConnectionNotice`).
+    connection_changed,
+    connection_removed,
     unavailable,
 };
 

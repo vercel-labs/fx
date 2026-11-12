@@ -10,6 +10,7 @@
     {"name": "agents_menu_selection", "module": "fx", "test": "the agent list's highlight and the agent on screen hold for fuzzed steps", "iterations": 20000},
     {"name": "queue_placement", "module": "fx", "test": "queue placement delivers each message once and in order on fuzzed sequences", "iterations": 200000},
     {"name": "pending_reports", "module": "fx", "test": "pending reports keep their laws on fuzzed report lines", "iterations": 500000},
+    {"name": "subagent_purpose", "module": "fx", "test": "a purpose stays one short line of whole characters for fuzzed text", "iterations": 2000000},
     {"name": "profile_parse", "module": "fx", "test": "profile parsing stays bounded on fuzzed settings and prompts", "iterations": 1000000},
     {"name": "image_dimensions", "module": "fx", "test": "image dimension parsing stays bounded on arbitrary bytes", "iterations": 5000000},
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},
@@ -44,6 +45,8 @@
     {"name": "vercel_stream", "module": "fx", "test": "Gateway streams give the same result however they are cut into events and reads", "iterations": 460000},
     {"name": "gateway_event_class", "module": "fx", "test": "a Gateway event that is not JSON is resent, a too-deep or duplicate-key one ends the turn, however its bytes arrive", "iterations": 400000},
     {"name": "chat_completions_stream", "module": "fx", "test": "chat completions streams give the same result however they are cut into events and reads", "iterations": 120000},
+    {"name": "configured_provider_definition", "module": "fx", "test": "configured provider settings parse or are refused on fuzzed bytes", "iterations": 400000},
+    {"name": "configured_request_fragments", "module": "fx", "test": "a model's request fields and effort levels reach the body as valid JSON on fuzzed settings", "iterations": 400000},
     {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "transcript_paint", "module": "fx", "test": "transcript painting keeps the shadow terminal in step with the screen", "iterations": 8000},
     {"name": "markdown_lists", "module": "fx", "test": "Markdown lists render the same however assistant text is split", "iterations": 900000},
@@ -62,6 +65,7 @@
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
     {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000},
     {"name": "network_error_message", "module": "fx", "test": "fuzzed gateway error messages stay one bounded line of UTF-8", "iterations": 2000000},
-    {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000}
+    {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000},
+    {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000}
   ]
 }

@@ -10,6 +10,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -1244,10 +1245,16 @@ fn maybeStartAcpTitleTask(
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
-    const title_model = bundle.title_model orelse return;
+    const provider_title_model = bundle.title_model orelse return;
+    // A Token Pass session titles itself with a Token Pass model.
+    const title_model = if (session.provider == .gateway)
+        token_pass.modelForSideCall(.title, session.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
@@ -1993,6 +2000,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        // The same path: once per session, as a notice where the client shows them.
+        .push_session_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
@@ -2165,15 +2174,18 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
-    return server.refreshModelCredential(
+    // The server refuses a team change during a request, so the request
+    // keeps its team.
+    const token = (try server.refreshModelCredential(
         @ptrCast(ctx.state),
         alloc,
         source,
         mode,
         expected_account_id,
-    );
+    )) orelse return null;
+    return .{ .token = token };
 }
 
 /// The prompt's session while it is still the active one.
@@ -2316,6 +2328,9 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
+        // ACP's turns have no id here, so its list is read afresh at each
+        // step; its reports never join a turn, so a change shows at once.
+        .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
     }, arena, messages);
 }
 

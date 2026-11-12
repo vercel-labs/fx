@@ -2070,9 +2070,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         // The open agent list takes the footer from the shown agent's
-        // approval or question, so the list stays visible while the agent on
-        // screen is waiting. The prompt itself is untouched and returns when
-        // the list closes.
+        // approval or question, so the list stays visible while it previews
+        // an agent that is waiting. The prompt itself is untouched and returns
+        // when the list closes.
         fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.approval_prompt.projection();
