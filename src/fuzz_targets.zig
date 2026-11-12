@@ -36,6 +36,7 @@ test {
     _ = @import("core/profiles/profiles.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
+    _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/fuzzy_match.zig");
     _ = @import("core/shared/types.zig");

@@ -5465,6 +5465,7 @@ test {
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("core/shared/repo_path.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
     _ = @import("core/indexer/indexer.zig");

@@ -3,9 +3,11 @@
 # expected verdict.
 #
 # GitAdmission (src/core/shell_command/safe_git.zig): how an agent git command
-# is planned, admitted, and run in every permission mode and shell environment.
-# git-admission.cfg must pass; git-admission-mutation.cfg plants a bug that
-# HoldSafety must catch.
+# is planned, admitted, and run in every permission mode and shell environment,
+# and how a workspace capture writes into fx's own store. git-admission.cfg must
+# pass; git-admission-mutation.cfg plants a bug that HoldSafety must catch, and
+# the git-admission-capture-*-mutation.cfg files plant a store route that reads
+# the repository, which CaptureNeverFires and CaptureLeavesUserIndex must catch.
 #
 # ShellContract: one model turn through the shell tool, for the design fx
 # implements ("current") and a redesign ("proposed"). proposed.cfg and
@@ -33,6 +35,8 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<'EOF'
 GitAdmission git-admission - -deadlock
 GitAdmission git-admission-mutation HoldSafety -deadlock
+GitAdmission git-admission-capture-mutation CaptureNeverFires -deadlock
+GitAdmission git-admission-capture-index-mutation CaptureLeavesUserIndex -deadlock
 ShellContract proposed -
 ShellContract current-holds -
 ShellContract current-completeness Completeness
