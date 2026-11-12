@@ -6,6 +6,20 @@ import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 // The TUI reports a custom connection's wrong settings the way `fx ask` does:
 // the file, the setting's path, and what to do
 // (`tests/e2e/configured-providers.test.ts` covers the other surfaces).
+// fx exits before it draws, so this reads the whole scrollback for its
+// message. The exit status comes from the pane's wrapper, which records it as
+// fx exits: tmux can leave a pane whose process exits this early unreaped, and
+// so not dead, for many seconds.
+async function waitForExit(tui: TmuxSession, message: string): Promise<string> {
+  const deadline = Date.now() + 15000;
+  let screen = "";
+  while (Date.now() < deadline && !(screen.includes(message) && tui.recordedExitStatus() !== null)) {
+    await Bun.sleep(100);
+    screen = await tui.captureFullScrollback();
+  }
+  return screen;
+}
+
 describe("TUI custom connection errors", () => {
   test.skipIf(!tmuxAvailable())("startup with a refused setting names the setting and what to do", async () => {
     const f = fixture();
@@ -15,17 +29,9 @@ describe("TUI custom connection errors", () => {
       models["local-model"].request = { messages: [] };
       f.save();
       tui = await TmuxSession.create({ cwd: f.workspace, env: f.env, width: 160, height: 20, remainOnExit: true });
-      // fx exits before it draws; tmux's own exit line then scrolls the
-      // message above the visible screen, so read the whole scrollback.
       const message = "fx: ~/.fx/settings.json: providers.local.model_metadata.local-model.request.messages: fx writes this field itself; remove it";
-      const deadline = Date.now() + 15000;
-      let screen = "";
-      while (Date.now() < deadline && !(screen.includes(message) && screen.includes("Pane is dead"))) {
-        await Bun.sleep(100);
-        screen = await tui.captureFullScrollback();
-      }
-      expect(screen).toContain(message);
-      expect(screen).toContain("Pane is dead (status 1");
+      expect(await waitForExit(tui, message)).toContain(message);
+      expect(tui.recordedExitStatus()).toBe(1);
       expect(f.requests).toHaveLength(0);
     } finally {
       await tui?.kill();
@@ -70,14 +76,8 @@ describe("TUI custom connection errors", () => {
       edit(f);
       f.save();
       tui = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${session}`, cwd: f.workspace, env: f.env, width: 200, height: 20, remainOnExit: true });
-      const deadline = Date.now() + 15000;
-      let screen = "";
-      while (Date.now() < deadline && !(screen.includes(message) && screen.includes("Pane is dead"))) {
-        await Bun.sleep(100);
-        screen = await tui.captureFullScrollback();
-      }
-      expect(screen).toContain(message);
-      expect(screen).toContain("Pane is dead (status 1");
+      expect(await waitForExit(tui, message)).toContain(message);
+      expect(tui.recordedExitStatus()).toBe(1);
       expect(f.requests).toHaveLength(1);
     } finally {
       await tui?.kill();
