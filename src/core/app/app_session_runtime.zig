@@ -1411,6 +1411,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionWarmup(app: *App) void {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+            // The subagents the session started before count at once, so the
+            // footer offers the list before it is first opened.
+            if (comptime @hasField(App, "child_agents")) @import("app_agents_runtime.zig").Runtime(App).listRestoredSubagents(app);
         }
 
         pub fn resumeSelectedSession(app: *App, agent: *AppAgent) !bool {

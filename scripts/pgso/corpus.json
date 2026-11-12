@@ -61,7 +61,8 @@
       "cwd": ".",
       "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "timeout_seconds": 60,
-      "requires_tmux": false
+      "requires_tmux": false,
+      "expected_exit": 1
     },
     {
       "name": "direct-sessions",
@@ -128,6 +129,7 @@
     {"name": "verify-tui-input-line-delete", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-line-delete.test.ts"], "test_file": "tui-input-line-delete.test.ts"},
     {"name": "verify-tui-input-navigation", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-navigation.test.ts"], "test_file": "tui-input-navigation.test.ts"},
     {"name": "verify-tui-host-switch", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-switch.test.ts"], "test_file": "tui-host-switch.test.ts"},
+    {"name": "verify-tui-mcp-http-many-servers", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-mcp-http-many-servers.test.ts"], "test_file": "tui-mcp-http-many-servers.test.ts"},
     {"name": "verify-tui-render-replay", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-replay.test.ts"], "test_file": "tui-render-replay.test.ts"},
     {"name": "verify-tui-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume.test.ts"], "test_file": "tui-resume.test.ts"},
     {"name": "verify-tui-slash-commands", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-commands.test.ts"], "test_file": "tui-slash-commands.test.ts"},
@@ -137,6 +139,7 @@
     {"name": "verify-ultrafast-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./ultrafast-fake-gateway.test.ts"], "test_file": "ultrafast-fake-gateway.test.ts"},
     {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
-    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"}
+    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
+    {"name": "verify-doctor", "argv": ["bun", "test", "--max-concurrency", "1", "./doctor.test.ts"], "test_file": "doctor.test.ts"}
   ]
 }

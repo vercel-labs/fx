@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
   AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
@@ -217,7 +217,7 @@ test("fx killed while a compaction's write holds its records resumes the session
   const f = compactionRaceFixture("compaction-commit-kill");
   try {
     const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", RACE_PROMPT], {
-      cwd: f.root.workspace, env: { ...process.env, ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      cwd: f.root.workspace, env: { ...envWithoutFxHome(), ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });
     expect(await f.waitFor(() => existsSync(`${f.heldMarker}.1`), 40_000)).toBe(true);
     // fx dies while the compaction's write holds its records: neither the
@@ -242,7 +242,7 @@ test("fx killed while a compaction's write holds its records resumes the session
 test("fx told to quit while a compaction's write is held and a subagent's waits behind it exits without a panic", async () => {
   const f = compactionRaceFixture("compaction-commit-term");
   const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", RACE_PROMPT], {
-    cwd: f.root.workspace, env: { ...process.env, ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    cwd: f.root.workspace, env: { ...envWithoutFxHome(), ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
   const stderr = new Response(proc.stderr).text();
   try {
@@ -6379,6 +6379,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
           timeoutMs: 20_000,
+          processSnapshot: true,
         },
       );
       if (result.code !== 0) {
@@ -7033,7 +7034,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       ], {
         cwd: root.workspace,
         env: {
-          ...process.env,
+          ...envWithoutFxHome(),
           ...fixtureEnv(root, gateway, tracePath),
           FX_AUTO_UPGRADE: "0",
         },
@@ -7125,7 +7126,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     ], {
       cwd: root.workspace,
       env: {
-        ...process.env,
+        ...envWithoutFxHome(),
         ...fixtureEnv(root, gateway, tracePath),
         FX_AUTO_UPGRADE: "0",
       },
