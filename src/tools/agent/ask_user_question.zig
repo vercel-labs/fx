@@ -2,6 +2,7 @@ const std = @import("std");
 const observation = @import("../../core/agent/runtime/observation.zig");
 const question_answer = @import("../../core/agent/question_answer.zig");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
+const display_width = @import("../../core/shared/display_width.zig");
 const core_types = @import("../../core/shared/types.zig");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
@@ -288,27 +289,23 @@ fn dupeLabelText(arena: Allocator, text: []const u8) Allocator.Error![]const u8 
 }
 
 /// A question keeps its lines. It is Markdown, which the prompt renders as
-/// the transcript renders a reply. Each line is made safe as a label is.
+/// the transcript renders a reply.
 fn dupeQuestionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    // A carriage return ends a line with or without a line feed after it.
-    var lines: std.ArrayList(u8) = .empty;
-    try lines.ensureTotalCapacity(arena, text.len);
-    for (text, 0..) |byte, index| {
-        if (byte != '\r') {
-            lines.appendAssumeCapacity(byte);
-        } else if (index + 1 >= text.len or text[index + 1] != '\n') {
-            lines.appendAssumeCapacity('\n');
-        }
-    }
-
     var out: std.ArrayList(u8) = .empty;
-    try appendTerminalSafeLines(arena, &out, lines.items);
-    return out.items;
+    var rest = text;
+    while (true) {
+        const end = std.mem.findAny(u8, rest, "\r\n") orelse rest.len;
+        try appendMarkdownLine(arena, &out, rest[0..end]);
+        if (end == rest.len) return out.items;
+        try out.append(arena, '\n');
+        // A carriage return ends a line with or without a line feed after it.
+        const crlf = rest[end] == '\r' and end + 1 < rest.len and rest[end + 1] == '\n';
+        rest = rest[end + @as(usize, if (crlf) 2 else 1) ..];
+    }
 }
 
 /// A description keeps its lines and is Markdown, as the question is.
-/// Blank lines are dropped so an option's rows stay together, and each line
-/// is made safe as a label is.
+/// Blank lines are dropped so an option's rows stay together.
 fn dupeDescriptionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.tokenizeAny(u8, text, "\r\n");
@@ -317,31 +314,39 @@ fn dupeDescriptionMarkdown(arena: Allocator, text: []const u8) Allocator.Error![
         const line = std.mem.trimEnd(u8, raw_line, " \t");
         if (line.len == 0) continue;
         if (out.items.len > 0) try out.append(arena, '\n');
-        try appendTerminalSafeLines(arena, &out, line);
+        try appendMarkdownLine(arena, &out, line);
     }
     return out.items;
 }
 
-/// Appends `text` with its line breaks and tabs kept. Everything between
-/// them gets the escapes a label gets: control bytes, invalid UTF-8, and
-/// non-printing code points such as bidi overrides and zero-width characters
-/// become visible text, so model text cannot drive the terminal or show a
-/// question other than the one it holds.
-fn appendTerminalSafeLines(
+/// Markdown reads a tab as the columns up to the next multiple of four.
+const markdown_tab_stop = 4;
+
+/// Appends one line of Markdown that holds only what the prompt can measure
+/// and draw. Control bytes, invalid UTF-8, and non-printing code points such
+/// as bidi overrides and zero-width characters become the visible escapes a
+/// label gets, so model text cannot drive the terminal or show a question
+/// other than the one it holds. Each tab becomes the spaces up to its tab
+/// stop: a terminal draws a tab up to eight cells wide and the prompt
+/// measures none, so a row with one would not fit where it is drawn.
+fn appendMarkdownLine(
     arena: Allocator,
     out: *std.ArrayList(u8),
-    text: []const u8,
+    line: []const u8,
 ) Allocator.Error!void {
-    var start: usize = 0;
-    while (true) {
-        const end = std.mem.findAnyPos(u8, text, start, "\n\t") orelse text.len;
-        if (end > start) {
-            const encoded = try text_utils.encodeTerminalSafe(arena, text[start..end], std.math.maxInt(usize));
-            try out.appendSlice(arena, encoded.bytes);
+    var column: usize = 0;
+    var pieces = std.mem.splitScalar(u8, line, '\t');
+    var first = true;
+    while (pieces.next()) |piece| {
+        if (!first) {
+            const spaces = markdown_tab_stop - column % markdown_tab_stop;
+            try out.appendNTimes(arena, ' ', spaces);
+            column += spaces;
         }
-        if (end == text.len) return;
-        try out.append(arena, text[end]);
-        start = end + 1;
+        first = false;
+        const piece_start = out.items.len;
+        try text_utils.appendTerminalSafeLine(arena, out, piece);
+        column += display_width.visibleWidth(out.items[piece_start..]);
     }
 }
 
@@ -439,7 +444,7 @@ const TerminalSafeRequester = struct {
             entries[0].options.len == 2 and
             std.mem.eql(u8, entries[0].options[0].label, "Alpha Fake") and
             entries[0].options[0].description != null and
-            std.mem.eql(u8, entries[0].options[0].description.?, "Desc\tGap") and
+            std.mem.eql(u8, entries[0].options[0].description.?, "Desc    Gap") and
             std.mem.eql(u8, entries[0].options[1].label, "\\x1b[31mRed\\x1b[0m"))
         {
             self.saw_terminal_safe = true;
@@ -688,11 +693,11 @@ test "ask_user_question keeps the lines of a question and a description" {
 
     try std.testing.expect(requester.markdown);
     try std.testing.expectEqualStrings(
-        "Two ways to migrate:\n\n- **online**\n- `offline`\n\n```sh\n\tfx migrate\n```\n\nWhich one?",
+        "Two ways to migrate:\n\n- **online**\n- `offline`\n\n```sh\n    fx migrate\n```\n\nWhich one?",
         requester.question,
     );
     try std.testing.expectEqualStrings("Online now", requester.labels[0]);
-    try std.testing.expectEqualStrings("No downtime.\n  Takes two\thours.\nSlow writes.", requester.descriptions[0]);
+    try std.testing.expectEqualStrings("No downtime.\n  Takes two hours.\nSlow writes.", requester.descriptions[0]);
     try std.testing.expectEqualStrings("", requester.descriptions[1]);
     try std.testing.expectEqualStrings("One line.", requester.descriptions[2]);
 
@@ -735,7 +740,7 @@ test "ask_user_question shows control bytes on every line of a question and a de
 }
 
 fn expectEveryLineTerminalSafe(text: []const u8) !void {
-    var lines = std.mem.tokenizeAny(u8, text, "\n\t");
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| try std.testing.expect(text_utils.isTerminalSafe(line));
 }
 
@@ -748,7 +753,7 @@ test "ask_user_question shows bidi overrides and zero-width characters as text" 
     // U+202E reverses the text after it, U+2028 is a line separator, U+200B
     // and U+2060 are invisible, and U+FEFF is a byte order mark.
     const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
-        .question = "Pay \u{202e}eteled\u{202c} now?\nSecond\u{2028}line with zero\u{200b}width\tand\u{feff} a mark",
+        .question = "Pay \u{202e}eteled\u{202c} now?\nSecond\u{2028}line with zero\u{200b}width and\u{feff} a mark",
         .options = .{
             .{ .label = "Ok\u{202e}", .description = "keeps \u{202e}reversed\u{202c} text\n- item\u{2060} two\u{200f}" },
             .{ .label = "No" },
@@ -762,7 +767,7 @@ test "ask_user_question shows bidi overrides and zero-width characters as text" 
     defer alloc.free(output);
 
     try std.testing.expectEqualStrings(
-        "Pay \\u{202e}eteled\\u{202c} now?\nSecond\\u{2028}line with zero\\u{200b}width\tand\\u{feff} a mark",
+        "Pay \\u{202e}eteled\\u{202c} now?\nSecond\\u{2028}line with zero\\u{200b}width and\\u{feff} a mark",
         requester.question,
     );
     try std.testing.expectEqualStrings(
@@ -781,6 +786,41 @@ test "ask_user_question shows bidi overrides and zero-width characters as text" 
     const result = parsed.value.array.items[0].object;
     try std.testing.expectEqualStrings(requester.question, result.get("question").?.string);
     try std.testing.expectEqualStrings("Ok\\u{202e}", result.get("answer").?.string);
+}
+
+test "ask_user_question writes each tab as the spaces up to its tab stop" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var requester = MultilineRequester{ .arena = arena_state.allocator() };
+
+    // A tab nests a list item and indents code, so its columns stay. A tab
+    // after an escape or a wide character counts the cells before it.
+    const args = try std.json.Stringify.valueAlloc(arena_state.allocator(), .{ .questions = .{.{
+        .question = "a\tb\n- item\n\t- nested\n```go\nfunc main() {\n\tif ok {\n\t\treturn\n\t}\n}\n```\n| x\ty |\n\u{65e5}\u{672c}\t\u{8a9e}\n[^n]: A\tB\tC",
+        .options = .{
+            .{ .label = "Go\tnow", .description = "run\x07\tnow\n- one\n\t- two\n\t\t\n[^d]: A\tB" },
+            .{ .label = "No" },
+        },
+    }} }, .{});
+    const output = try executeWithRequester(alloc, args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = MultilineRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expectEqualStrings(
+        "a   b\n- item\n    - nested\n```go\nfunc main() {\n    if ok {\n        return\n    }\n}\n```\n| x y |\n\u{65e5}\u{672c}    \u{8a9e}\n[^n]: A B   C",
+        requester.question,
+    );
+    try std.testing.expectEqualStrings("run\\x07 now\n- one\n    - two\n[^d]: A B", requester.descriptions[0]);
+    try std.testing.expectEqualStrings("Go now", requester.labels[0]);
+    for ([_][]const u8{ requester.question, requester.descriptions[0], requester.labels[0], output }) |text| {
+        try std.testing.expect(std.mem.findScalar(u8, text, '\t') == null);
+    }
+    try expectEveryLineTerminalSafe(requester.question);
+    try expectEveryLineTerminalSafe(requester.descriptions[0]);
 }
 
 const batch_option_count = 6;
