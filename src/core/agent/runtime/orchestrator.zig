@@ -5118,6 +5118,25 @@ fn hasProviderExecutedCall(tool_calls: []const types.ToolCall) bool {
     return false;
 }
 
+/// What a tool row says ended a start fx never ran, from the failure that
+/// ended the start's attempt. A reply that ended early counts as a dropped
+/// connection, as the recovery status says (`request_recovery.failureKind`).
+fn unexecutedStartReason(cause: types.ModelRecoveryCause) runtime_tool_presentation.UnexecutedStartReason {
+    return switch (cause) {
+        .network_interrupted,
+        .connectivity_lost,
+        .response_interrupted,
+        .provider_stream_timeout,
+        => .connection_interrupted,
+        .provider_unavailable,
+        .rate_limited,
+        .authentication,
+        .request_limit_reached,
+        .compaction_prepared,
+        => .reply_failed,
+    };
+}
+
 noinline fn settle_deferred_tool_starts(
     deps: *const AgentRuntimeDeps,
     stream_ctx: *runtime_assistant_stream.StreamChunkContext,
@@ -5139,6 +5158,7 @@ noinline fn settle_deferred_tool_starts(
             arena,
             turn_id,
             &.{},
+            .stopped,
         );
     settlement catch |err| {
         debug_trace.logf(
@@ -5369,6 +5389,7 @@ fn finishUncertainToolReview(
         arena,
         finalization.turn_id,
         &.{},
+        .stopped,
     );
     try request.replaceStatus(.{
         .kind = .unsafe_tool_start,
@@ -8590,6 +8611,7 @@ fn processQueuedPromptLoop(
                     preserved_tool_evidence = failure_tool_evidence;
                     recovery_strategy = next_strategy;
                     recovery_cause = failure_cause;
+                    stream_ctx.provisional_statuses.noteUnexecutedStarts(unexecutedStartReason(failure_cause));
                     if (recovery_strategy == .regenerate_tool) {
                         recovery_has_unexecuted_tool_start = true;
                     }
@@ -8637,6 +8659,7 @@ fn processQueuedPromptLoop(
                         arena,
                         turn_id,
                         &.{},
+                        if (network_failure != null) unexecutedStartReason(failure_cause) else .stopped,
                     );
                 }
                 if (std.mem.trim(u8, failed_assistant_source, " \t\r\n").len > 0) {
@@ -9240,6 +9263,7 @@ fn processQueuedPromptLoop(
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
+                        stream_ctx.provisional_statuses.noteUnexecutedStarts(unexecutedStartReason(cause));
                         if (recovery_strategy == .regenerate_tool) {
                             recovery_has_unexecuted_tool_start = true;
                         }
@@ -9550,6 +9574,7 @@ fn processQueuedPromptLoop(
                 arena,
                 turn_id,
                 completion.tool_calls,
+                .stopped,
             );
             recovery_has_unexecuted_tool_start = false;
         }

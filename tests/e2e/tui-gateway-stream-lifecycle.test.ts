@@ -1619,6 +1619,28 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("a provider error after a streamed tool start names the failed reply on the tool row", async () => {
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-reply-failed-row-",
+      [
+        // Gemini ends a reply this way with MALFORMED_FUNCTION_CALL.
+        () => fakeGatewaySse([
+          { type: "tool-input-start", id: "failed-read", toolName: "read_file" },
+          { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+        ]),
+        () => fakeGatewayFinalText("AFTER_FAILED_REPLY"),
+      ],
+    );
+    await session!.sendText("Read the notes after a failed reply.");
+    await session!.waitForText("AFTER_FAILED_REPLY", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+    const scrollback = await session!.captureFullScrollback();
+    expect(scrollback).toContain("Reply failed before");
+    expect(scrollback).not.toContain("Connection interrupted before");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test("a reply whose limit ran out before a cut-off tool call is resent and the turn finishes", async () => {
     const sentinel = "cut-call-ran.txt";
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
