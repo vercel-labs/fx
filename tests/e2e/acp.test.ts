@@ -10116,7 +10116,8 @@ describe("acp: model-independent", () => {
           const base = gateway.requests.length;
           sendPrompt(acp, 7503, "Report the writer's state.");
           await waitForCondition("the next prompt's first request", () => gateway.requests.length > base, TIMEOUT);
-          const note = acpLatestPromptText(gateway.requests[base]!.body).split("\n").find((line) => line.includes("- writer:")) ?? "";
+          // Wherever the request puts the turn's list of subagents, it holds the writer's line.
+          const note = JSON.stringify(acpGatewayRequest(gateway.requests[base]!.body)).match(/- writer: [^\\"]*/)?.[0] ?? "";
           acp.send({ jsonrpc: "2.0", id: 7504, method: "session/cancel", params: {} });
           const ended = await readUntilResponses(acp, [7503, 7504], TIMEOUT);
           expect(existsSync(target)).toBe(false);
@@ -10128,10 +10129,15 @@ describe("acp: model-independent", () => {
           rmSync(root.root, { recursive: true, force: true });
         }
       }
-      // A reload leaves the writer as a cancel does: still waiting, with nothing finished.
+      // A reload leaves the writer as a cancel does: nothing finished, and the list names it as still
+      // going. (The hook that says it asks comes just before its phase turns to waiting for an approval,
+      // so the list may still say working.)
+      const going = /^- writer: (working|waiting for an approval)\. For: Write the file\.$/;
       expect(seen["session/cancel"]!.outcomesBefore).toEqual([]);
-      expect(seen["session/cancel"]!.note).toContain("waiting for an approval");
-      expect(seen["session/load"]).toEqual(seen["session/cancel"]!);
+      expect(seen["session/cancel"]!.note).toMatch(going);
+      expect(seen["session/load"]!.outcomesBefore).toEqual([]);
+      expect(seen["session/load"]!.note).toMatch(going);
+      expect(seen["session/load"]!.stopReason).toBe(seen["session/cancel"]!.stopReason);
     },
     TIMEOUT * 2,
   );
