@@ -148,6 +148,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const local_time = @import("../shared/local_time.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const mcp_tool_result = @import("../mcp/tool_result.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -168,9 +169,6 @@ const network_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
-/// The last millisecond of year 9999. ISO 8601 writes a later year with more
-/// than four digits, and `formatUtc` overflows on a year past 65535.
-const max_time_ms: i64 = 253_402_300_799_999;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
 
@@ -270,7 +268,9 @@ const Records = struct {
     /// unknown or outside the years 1970 to 9999. A time can come from a file
     /// on disk, such as the last-shutdown report, so it is checked here.
     fn time(self: *Records, comptime name: []const u8, ms: i64) !void {
-        if (ms <= 0 or ms > max_time_ms) return;
+        // ISO 8601 writes a year past 9999 with more than four digits, and
+        // `formatUtc` overflows on a year past 65535.
+        if (ms <= 0 or ms > local_time.max_timestamp_ms) return;
         var buf: [40]u8 = undefined;
         try self.text(name, try formatUtc(&buf, ms));
         try self.number(name ++ "_ms", ms);
