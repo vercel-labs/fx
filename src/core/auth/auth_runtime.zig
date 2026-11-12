@@ -3485,19 +3485,64 @@ fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
 }
 
 fn displayTeam(credential: credentials.Credential) ?[]const u8 {
-    return credential.team_slug orelse credential.team_id;
+    return types.displayGatewayTeam(credential.team_slug, credential.team_id);
 }
 
+/// Takes the field `displayTeam` names out of `credential`, which keeps the
+/// other for its own `deinit`. Null when neither is a valid team name.
 fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 {
-    if (credential.team_slug) |team| {
+    const shown = displayTeam(credential.*) orelse return null;
+    if (credential.team_slug) |slug| if (slug.ptr == shown.ptr) {
         credential.team_slug = null;
         if (credential.team_id) |id| alloc.free(id);
         credential.team_id = null;
-        return team;
-    }
-    const team = credential.team_id;
+        return slug;
+    };
+    const id = credential.team_id.?;
     credential.team_id = null;
-    return team;
+    return id;
+}
+
+test "the status view names a login's team only by a valid team name" {
+    const alloc = std.testing.allocator;
+    // A saved login's slug is not checked when it loads.
+    var bad_slug = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .team_slug = try alloc.dupe(u8, "\x1b]2;title\x07"),
+    };
+    defer bad_slug.deinit(alloc);
+    try std.testing.expectEqualStrings("team_123", displayTeam(bad_slug).?);
+    const taken_id = takeDisplayTeam(alloc, &bad_slug).?;
+    defer alloc.free(taken_id);
+    try std.testing.expectEqualStrings("team_123", taken_id);
+    try std.testing.expect(bad_slug.team_id == null);
+
+    var good_slug = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .team_slug = try alloc.dupe(u8, "vercel-labs"),
+    };
+    defer good_slug.deinit(alloc);
+    try std.testing.expectEqualStrings("vercel-labs", displayTeam(good_slug).?);
+    const taken_slug = takeDisplayTeam(alloc, &good_slug).?;
+    defer alloc.free(taken_slug);
+    try std.testing.expectEqualStrings("vercel-labs", taken_slug);
+    try std.testing.expect(good_slug.team_slug == null and good_slug.team_id == null);
+
+    var neither = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team 123"),
+        .team_slug = try alloc.dupe(u8, "\xe2\x80\xaeslug"),
+    };
+    defer neither.deinit(alloc);
+    try std.testing.expect(displayTeam(neither) == null);
+    try std.testing.expect(takeDisplayTeam(alloc, &neither) == null);
+    // Nothing was taken, so the credential still frees both.
+    try std.testing.expect(neither.team_slug != null and neither.team_id != null);
 }
 
 fn gatewaySourceCount(sources: SourceSet) usize {

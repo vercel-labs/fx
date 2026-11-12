@@ -2119,8 +2119,9 @@ pub fn validGatewayTeam(team: []const u8) bool {
 
 /// The name fx shows for a Vercel team: the slug when it is a valid team
 /// name, else the id when it is, else none. A saved login's slug is not
-/// checked when it loads, so a team name meant for the terminal goes through
-/// here.
+/// checked when it loads, so the refused-login notice, the status view's team
+/// (`displayTeam` in `auth_runtime.zig`), and the usage label name a team
+/// through here.
 pub fn displayGatewayTeam(slug: ?[]const u8, id: ?[]const u8) ?[]const u8 {
     if (slug) |value| if (validGatewayTeam(value)) return value;
     if (id) |value| if (validGatewayTeam(value)) return value;
