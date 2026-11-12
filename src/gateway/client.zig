@@ -11820,7 +11820,9 @@ const UnpooledOpenFixture = struct {
         const zio = io_mod.getIo();
         var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
-        var stream = try self.server.accept(zio);
+        // A connection that is gone before the accept still arrived, and is
+        // no longer open.
+        var stream = (try testing_listener.acceptIfWaiting(&self.server, zio)) orelse return .closed;
         defer stream.close(zio);
         // The close fx already made can reach this end a moment after the
         // accept; a connection fx left open never reads end of stream.
