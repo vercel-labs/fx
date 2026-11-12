@@ -26,6 +26,9 @@ pub const auth_file_name = profile_paths.auth_file_name;
 /// id and slug only, never a token.
 pub const kept_team_file_name = "vercel-team.json";
 const max_kept_team_file_bytes = 1024;
+
+/// What `Mutation.keepTeam` did with the kept team.
+pub const KeptTeamChange = enum { kept, forgotten, unchanged };
 const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
@@ -465,18 +468,21 @@ const NativeMutation = struct {
 
     /// Keeps the team of a login fx is about to retire, so a later sign-in
     /// starts on it. A login without a valid team forgets the kept one.
-    pub fn keepTeam(self: *Mutation, alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !void {
-        const text = (try stringifyKeptTeam(alloc, team_id, team_slug)) orelse return self.forgetTeam();
+    pub fn keepTeam(self: *Mutation, alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !KeptTeamChange {
+        const text = (try stringifyKeptTeam(alloc, team_id, team_slug)) orelse
+            return if (try self.forgetTeam()) .forgotten else .unchanged;
         defer alloc.free(text);
         try io_mod.durableReplaceVerified(alloc, &self.fx_dir, kept_team_file_name, text);
+        return .kept;
     }
 
-    /// Forgets the kept team, as a sign-out does.
-    pub fn forgetTeam(self: *Mutation) !void {
+    /// Forgets the kept team, as a sign-out does. True when there was one.
+    pub fn forgetTeam(self: *Mutation) !bool {
         self.fx_dir.dir.deleteFile(io_mod.getIo(), kept_team_file_name) catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound => return false,
             else => return err,
         };
+        return true;
     }
 
     pub fn delete(self: *Mutation, alloc: Allocator) !DeleteResult {
@@ -623,9 +629,13 @@ const HostMutation = struct {
 
     /// A host keeps no files, so a sign-in there starts only on the saved
     /// login's team.
-    pub fn keepTeam(_: *HostMutation, _: Allocator, _: ?[]const u8, _: ?[]const u8) !void {}
+    pub fn keepTeam(_: *HostMutation, _: Allocator, _: ?[]const u8, _: ?[]const u8) !KeptTeamChange {
+        return .unchanged;
+    }
 
-    pub fn forgetTeam(_: *HostMutation) !void {}
+    pub fn forgetTeam(_: *HostMutation) !bool {
+        return false;
+    }
 
     pub fn delete(self: *HostMutation, _: Allocator) !DeleteResult {
         const expected = if (self.exists) self.revision[0..self.revision_len] else null;
@@ -1010,7 +1020,7 @@ fn readKeptTeam(alloc: Allocator) !?KeptTeam {
 
 /// Reads a kept-team file. Every value must be a valid team name and at least
 /// one must be set; anything else is `error.InvalidKeptTeam`.
-pub fn parseKeptTeam(alloc: Allocator, bytes: []const u8) !KeptTeam {
+fn parseKeptTeam(alloc: Allocator, bytes: []const u8) !KeptTeam {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidKeptTeam,

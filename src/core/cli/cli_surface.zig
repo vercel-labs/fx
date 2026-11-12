@@ -1210,14 +1210,17 @@ fn activateProviderSelection(
     };
 }
 
+/// `FX_TRACE` and `FX_TRACE_LOG` keep a trace for the auth commands too, such
+/// as why a sign-in starts on the first team or whether a sign-out forgot the
+/// kept team. Without a working directory the command goes on without one.
+fn configureAuthCommandTrace(alloc: Allocator) void {
+    const workspace_root = io_mod.realpathAlloc(alloc, ".") catch return;
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+}
+
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
-    // `FX_TRACE` and `FX_TRACE_LOG` keep a trace here too, such as why a
-    // sign-in starts on the first team. Without a working directory, the
-    // login goes on without a trace.
-    if (io_mod.realpathAlloc(alloc, ".")) |workspace_root| {
-        defer alloc.free(workspace_root);
-        debug_trace.configureFromEnv(alloc, workspace_root);
-    } else |_| {}
+    configureAuthCommandTrace(alloc);
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
@@ -1666,6 +1669,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
@@ -1765,6 +1769,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
             login_flow.runTeams(
                 alloc,

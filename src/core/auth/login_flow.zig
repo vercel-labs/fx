@@ -338,6 +338,7 @@ pub const SignInRuntime = struct {
     /// Set once when a device code requested on the worker becomes ready, so
     /// the input loop can open the browser for it.
     browser_pending: bool = false,
+
     /// Starts an fx login sign-in. On native hosts the issuer discovery and
     /// device-code request run on the sign-in worker, so the input loop never
     /// waits on them; `snapshot().preparing` holds until the code arrives.
@@ -991,9 +992,11 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
             .local_cleanup_failed = true,
         };
         // Signing out forgets the team fx kept for the next sign-in.
-        mutation.forgetTeam() catch |err| {
+        if (mutation.forgetTeam()) |forgotten| {
+            if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=logout", .{});
+        } else |err| {
             debug_trace.logf("auth", "kept team not forgotten err={s}", .{@errorName(err)});
-        };
+        }
         break :blk deleted;
     };
     return .{

@@ -939,9 +939,13 @@ fn retire_fx_session(
 ) !void {
     // A later sign-in, in this fx process or another, starts on this login's
     // team. Not keeping it only changes which team that sign-in starts on.
-    mutation.keepTeam(alloc, session.team_id, session.team_slug) catch |err| {
+    if (mutation.keepTeam(alloc, session.team_id, session.team_slug)) |change| switch (change) {
+        .kept => debug_trace.logf("auth", "retired fx login team kept", .{}),
+        .forgotten => debug_trace.logf("auth", "kept team forgotten reason=retired_login_has_no_team", .{}),
+        .unchanged => {},
+    } else |err| {
         debug_trace.logf("auth", "retired fx login team not kept err={s}", .{@errorName(err)});
-    };
+    }
     const result = mutation.delete(alloc) catch return error.OAuthSessionCleanupUncertain;
     if (result.local_cleanup_failed) return error.OAuthSessionCleanupUncertain;
 }
