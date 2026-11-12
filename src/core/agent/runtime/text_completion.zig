@@ -15,6 +15,9 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const types = @import("../../shared/types.zig");
 const io_mod = @import("../../shared/io.zig");
+const secret = @import("../../auth/secret.zig");
+const runtime_deps = @import("deps.zig");
+const credential_renewal = @import("credential_renewal.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -62,8 +65,9 @@ pub const Outcome = union(enum) {
     /// Allocated with the caller's allocator.
     text: []u8,
     /// No usable text. `detail` names the cause in `key=value` form, safe to
-    /// trace; allocated with the caller's allocator.
-    failed: struct { reason: Reason, detail: []u8 },
+    /// trace; allocated with the caller's allocator. `unauthorized` when the
+    /// provider rejected the credential with 401.
+    failed: struct { reason: Reason, detail: []u8, unauthorized: bool = false },
 };
 
 pub const Error = error{ Cancelled, OutOfMemory };
@@ -152,11 +156,16 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         .failed => |failure| {
             // Provider error bodies are third-party text: mask secrets and
             // neutralize control bytes before the detail reaches /trace.
-            const masked = text_utils.maskSecrets(alloc, failure.detail orelse "") catch return error.OutOfMemory;
-            defer alloc.free(masked);
+            const detail = failure.detail orelse "";
+            const masked = text_utils.maskSecrets(alloc, detail) catch return error.OutOfMemory;
+            // `maskSecrets` returns `detail` itself when it masks nothing, and
+            // `streamed` frees that.
+            defer if (masked.ptr != detail.ptr) alloc.free(masked);
             var detail_buf: [512]u8 = undefined;
             const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked), 240);
-            return failed(alloc, .provider, "kind={s} detail={s}", .{ @tagName(failure.kind), safe_detail });
+            var outcome = try failed(alloc, .provider, "kind={s} detail={s}", .{ @tagName(failure.kind), safe_detail });
+            outcome.failed.unauthorized = failure.kind == .unauthorized;
+            return outcome;
         },
         .completed => |completed| completed.completion,
     };
@@ -237,6 +246,18 @@ pub const CompactorCaller = struct {
     conversation: ?agent_stream_provider.RequestData = null,
     /// Takes each request's record once it settles, for Ctrl+O.
     model_calls: ?model_call_record.Sink = null,
+    /// Renews the credential once after the provider rejects it with 401, as
+    /// an agent turn does (`credential_renewal.renewRejected`). Null when the
+    /// caller cannot renew it. Must outlive the compaction.
+    renewal_deps: ?*const runtime_deps.AgentRuntimeDeps = null,
+    /// The renewed credential `api_key` points to once renewed; `deinit` frees it.
+    renewed_api_key: ?[]u8 = null,
+    renewal_tried: bool = false,
+
+    pub fn deinit(self: *CompactorCaller) void {
+        if (self.renewed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+        self.renewed_api_key = null;
+    }
 
     /// Borrows `self`, which must outlive the compaction.
     pub fn caller(self: *CompactorCaller) compactor.ModelCaller {
@@ -253,6 +274,64 @@ pub const CompactorCaller = struct {
     fn capabilities(context: *anyopaque, model: []const u8) model_capabilities.Capabilities {
         const self: *CompactorCaller = @ptrCast(@alignCast(context));
         return self.capabilities_fn(self.capabilities_context, model);
+    }
+
+    fn completeCall(
+        self: *CompactorCaller,
+        alloc: Allocator,
+        call: compactor.Call,
+        conversation: ?agent_stream_provider.RequestData,
+        options: model_capabilities.ResolvedProviderOptions,
+        usage: *types.Usage,
+    ) Error!Outcome {
+        const own = std.mem.eql(u8, call.model, self.model);
+        return complete(alloc, .{
+            .observer = self.observer,
+            .purpose = .compaction,
+            .stream_provider = self.stream_provider,
+            .cooperative_pulse = self.cooperative_transport_pulse,
+            .credential = if (self.credential_source == .host_managed) .host_managed else .{ .direct = .{
+                .secret_bytes = self.api_key,
+                .source = self.credential_source,
+                .account_id = self.account_id,
+                .tenant_context = self.gateway_team,
+            } },
+            .session_id = self.session_id,
+            .model = call.model,
+            .retry_count = self.retry_count,
+            .cancel_flag = call.cancel_flag,
+            .provider_options = options,
+            .max_output_tokens = if (own) self.max_output_tokens else model_capabilities.requestOutputTokens(self.capabilities_fn(self.capabilities_context, call.model)),
+            .max_bytes = call.max_bytes,
+            .trace_ctx = call.trace_ctx,
+            .system = call.system,
+            .user = call.user,
+            .conversation = conversation,
+            .usage_out = usage,
+            .model_calls = self.model_calls,
+        });
+    }
+
+    /// After a 401: the stored credential, or a forced refresh while the store
+    /// still holds the rejected one. Once per compaction. Returns whether the
+    /// call can be sent again.
+    fn renewCredential(self: *CompactorCaller, trace_ctx: debug_trace.TraceContext) Error!bool {
+        const deps = self.renewal_deps orelse return false;
+        if (self.renewal_tried) return false;
+        self.renewal_tried = true;
+        const alloc = std.heap.c_allocator;
+        const rejected = try alloc.dupe(u8, self.api_key);
+        defer secret.zeroAndFree(alloc, rejected);
+        const renewal = try credential_renewal.renewRejected(deps, alloc, .{ .source = self.credential_source, .account_id = self.account_id }, rejected, trace_ctx);
+        const credential = renewal.credential orelse return false;
+        if (!renewal.resend) {
+            secret.zeroAndFree(alloc, credential);
+            return false;
+        }
+        if (self.renewed_api_key) |old| secret.zeroAndFree(alloc, old);
+        self.renewed_api_key = credential;
+        self.api_key = credential;
+        return true;
     }
 
     fn send(context: *anyopaque, alloc: Allocator, call: compactor.Call) compactor.CallError!compactor.Reply {
@@ -277,31 +356,14 @@ pub const CompactorCaller = struct {
         if (conversation == null) options.reasoning = call.reasoning;
         options.ultrafast = false;
         var usage: types.Usage = .{};
-        const outcome = try complete(alloc, .{
-            .observer = self.observer,
-            .purpose = .compaction,
-            .stream_provider = self.stream_provider,
-            .cooperative_pulse = self.cooperative_transport_pulse,
-            .credential = if (self.credential_source == .host_managed) .host_managed else .{ .direct = .{
-                .secret_bytes = self.api_key,
-                .source = self.credential_source,
-                .account_id = self.account_id,
-                .tenant_context = self.gateway_team,
-            } },
-            .session_id = self.session_id,
-            .model = call.model,
-            .retry_count = self.retry_count,
-            .cancel_flag = call.cancel_flag,
-            .provider_options = options,
-            .max_output_tokens = if (own) self.max_output_tokens else model_capabilities.requestOutputTokens(self.capabilities_fn(self.capabilities_context, call.model)),
-            .max_bytes = call.max_bytes,
-            .trace_ctx = call.trace_ctx,
-            .system = call.system,
-            .user = call.user,
-            .conversation = conversation,
-            .usage_out = &usage,
-            .model_calls = self.model_calls,
-        });
+        var outcome = try self.completeCall(alloc, call, conversation, options, &usage);
+        // Another fx process may have renewed the sign-in since the compaction
+        // read it: one more send with the renewed credential.
+        if (outcome == .failed and outcome.failed.unauthorized and try self.renewCredential(call.trace_ctx)) {
+            alloc.free(outcome.failed.detail);
+            usage = .{};
+            outcome = try self.completeCall(alloc, call, conversation, options, &usage);
+        }
         compactor.traceLog(false, "compaction model call model={s} after_conversation={} input_tokens={any} cache_read_tokens={any} cache_write_tokens={any} output_tokens={any}", .{
             call.model,               call.after_conversation, usage.input_tokens, usage.cache_read_tokens,
             usage.cache_write_tokens, usage.output_tokens,
@@ -464,4 +526,116 @@ test "a compactor request carries host-managed authority without secret bytes an
         try testing.expect(fake.secret == null);
         try testing.expectEqual(calls, pulse.calls);
     }
+}
+
+test "a compaction request rejected with 401 is sent once more with the sign-in renewed as for an agent turn" {
+    const testing = std.testing;
+    const support = @import("tests/support.zig");
+    const Fake = struct {
+        sends: usize = 0,
+        last_key: [32]u8 = undefined,
+        last_key_len: usize = 0,
+        reject_all: bool = false,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            const key = request.credential.secret().?;
+            @memcpy(self.last_key[0..key.len], key);
+            self.last_key_len = key.len;
+            self.sends += 1;
+            if (self.reject_all or std.mem.eql(u8, key, "launch-key")) return .{ .failed = .{
+                .kind = .unauthorized,
+                .http_status = .unauthorized,
+                .detail = try alloc.dupe(u8, "{\"error\":\"expired\"}"),
+                .ownership = .owned,
+            } };
+            return .{ .completed = .{
+                .completion = .{ .content = try alloc.dupe(u8, "notes"), .finish_reason = .stop },
+                .ownership = .owned,
+            } };
+        }
+
+        fn lastKey(self: *const @This()) []const u8 {
+            return self.last_key[0..self.last_key_len];
+        }
+
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+    const Case = struct {
+        tokens: []const []const u8,
+        modes: []const runtime_deps.CredentialRefreshMode,
+        sends: usize,
+        renewed: ?[]const u8,
+    };
+    const cases = [_]Case{
+        // Another fx renewed the sign-in: its stored token, and no refresh.
+        .{ .tokens = &.{"stored-key"}, .modes = &.{.reload}, .sends = 2, .renewed = "stored-key" },
+        // The store still holds the rejected token: one forced refresh.
+        .{ .tokens = &.{ "launch-key", "forced-key" }, .modes = &.{ .reload, .force }, .sends = 2, .renewed = "forced-key" },
+        // Nothing to renew to: the 401 stands after one send.
+        .{ .tokens = &.{}, .modes = &.{.reload}, .sends = 1, .renewed = null },
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    const call: compactor.Call = .{ .model = "m", .reasoning = types.ReasoningEffort.literal("none"), .system = "s", .user = "u", .max_bytes = 1024, .cancel_flag = &cancel, .trace_ctx = .{} };
+    for (cases) |case| {
+        var fake: Fake = .{};
+        var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = case.tokens;
+        const deps = hooks.deps();
+        var summary_model: CompactorCaller = .{
+            .stream_provider = .{ .context = &fake, .stream_fn = Fake.stream },
+            .provider = .gateway,
+            .model = "m",
+            .api_key = "launch-key",
+            .credential_source = .fx_login,
+            .retry_count = 0,
+            .capabilities_context = &fake,
+            .capabilities_fn = Fake.capabilities,
+            .renewal_deps = &deps,
+        };
+        defer summary_model.deinit();
+        const caller = summary_model.caller();
+
+        const reply = try caller.vtable.send(caller.context, testing.allocator, call);
+        try testing.expectEqual(case.sends, fake.sends);
+        try testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, case.modes, hooks.credential_refresh_modes.items);
+        if (case.renewed) |key| {
+            defer testing.allocator.free(reply.text);
+            try testing.expectEqualStrings("notes", reply.text);
+            try testing.expectEqualStrings(key, fake.lastKey());
+        } else {
+            defer testing.allocator.free(reply.failed.detail);
+            try testing.expect(reply.failed.reason == .provider);
+        }
+    }
+
+    // A compaction renews once: a later 401 is not renewed again.
+    var fake: Fake = .{ .reject_all = true };
+    var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "stored-key", "another-key" };
+    const deps = hooks.deps();
+    var summary_model: CompactorCaller = .{
+        .stream_provider = .{ .context = &fake, .stream_fn = Fake.stream },
+        .provider = .gateway,
+        .model = "m",
+        .api_key = "launch-key",
+        .credential_source = .fx_login,
+        .retry_count = 0,
+        .capabilities_context = &fake,
+        .capabilities_fn = Fake.capabilities,
+        .renewal_deps = &deps,
+    };
+    defer summary_model.deinit();
+    const caller = summary_model.caller();
+    for (0..2) |_| {
+        const reply = try caller.vtable.send(caller.context, testing.allocator, call);
+        testing.allocator.free(reply.failed.detail);
+    }
+    try testing.expectEqual(@as(usize, 3), fake.sends);
+    try testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{.reload}, hooks.credential_refresh_modes.items);
 }

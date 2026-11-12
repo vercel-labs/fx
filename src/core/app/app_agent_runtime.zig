@@ -1312,7 +1312,11 @@ pub fn Runtime(comptime App: type) type {
                 .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
+                // A sign-in another fx process renewed since `/compact`
+                // started gets one more send, as an agent turn does.
+                .renewal_deps = &deps,
             };
+            defer summary_model.deinit();
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
                 .activity_origin = .manual,
