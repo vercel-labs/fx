@@ -193,12 +193,14 @@ function highlightsAfter(current: Shell, key: RegExp): string[] {
   });
 }
 
-/// Waits for the `/effort` menu after `/effort` and Enter. CI keeps no tape
-/// or trace, so when the menu does not open this prints what fx read and what
-/// its input code did, then fails as the wait failed.
-async function waitForEffortMenu(current: Shell): Promise<void> {
+type Traced = { session: TmuxSession; tape: string; trace: string };
+
+/// Waits for `text` in the `/effort` menu after `/effort` and Enter. CI keeps
+/// no tape or trace, so when the menu does not show it this prints what fx
+/// read and what its input code did, then fails as the wait failed.
+async function waitForEffortMenu(current: Traced, text = "Effort 5"): Promise<void> {
   try {
-    await current.session.waitForText("Effort 5", 5_000);
+    await current.session.waitForText(text, 5_000);
   } catch (error) {
     console.error(effortMenuDiagnostics(current));
     throw error;
@@ -208,7 +210,7 @@ async function waitForEffortMenu(current: Shell): Promise<void> {
 /// Each read fx made from the terminal, with its time in milliseconds since
 /// the epoch, and fx's last input trace lines, which carry the same clock and
 /// say whether Enter reached the submit step.
-function effortMenuDiagnostics(current: Shell): string {
+function effortMenuDiagnostics(current: Traced): string {
   const lines = ["The /effort menu did not open. Input fx read, oldest first:"];
   try {
     // The tape header holds its start time after the magic, columns, and rows.
@@ -280,7 +282,7 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   // Opened again, the menu marks and highlights the level now in use. Esc
   // closes it without a change.
   await session.sendText("/effort");
-  await session.waitForText("high     current", 5_000);
+  await waitForEffortMenu(current, "high     current");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
   // A typed character closes the menu and lands in the composer.
@@ -496,6 +498,7 @@ async function launchCustom(levels: Record<string, Record<string, unknown>>, set
   Object.assign(f.settings, settings);
   f.save();
   const tape = join(f.home, "session.fxtape");
+  const trace = join(f.home, "trace.log");
   const stderrPath = join(f.home, "stderr.log");
   const session = await TmuxSession.create({
     cwd: f.workspace,
@@ -503,10 +506,18 @@ async function launchCustom(levels: Record<string, Record<string, unknown>>, set
     isolated: true,
     width: 80,
     height: 24,
-    env: { ...f.env, FX_DISABLE_KEYCHAIN: "1", FX_PERMISSION_MODE: "auto", FX_RECORD: tape, FX_RECORD_INPUT: "1" },
+    env: {
+      ...f.env,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_PERMISSION_MODE: "auto",
+      FX_RECORD: tape,
+      FX_RECORD_INPUT: "1",
+      FX_TRACE_LOG: trace,
+      FX_TRACE_SCOPES: "input",
+    },
   });
   await session.waitForComposer(10_000);
-  return { f, session, tape, stderrPath, root: f.home };
+  return { f, session, tape, trace, stderrPath, root: f.home };
 }
 
 test.skipIf(!tmuxAvailable())("on a custom connection, /effort lists the levels the model's settings declare, in their order, and the request carries the chosen one's fields", async () => {
@@ -514,7 +525,7 @@ test.skipIf(!tmuxAvailable())("on a custom connection, /effort lists the levels 
   const { session, f } = current;
   try {
     await session.sendText("/effort");
-    await session.waitForText("Effort 3", 5_000);
+    await waitForEffortMenu(current, "Effort 3");
     // default, high, low: Down twice reaches low.
     await press(session, "Down");
     await press(session, "Down");
