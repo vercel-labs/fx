@@ -20,6 +20,8 @@
 #   open-first     the list opens on its first row                   OpensOnScreen
 #   row            the highlight stays on its row, not its agent     SelectionKept
 #   stale-sel      the highlight stays on an agent that closed       SelListed
+#   run-closes     a run of a close key that edited the search goes
+#                  on to arm and close a row (fx before the run)     RunNeverCloses
 #
 # tests/tla/drivers/agents_menu/ runs the built zig-out/bin/fx along the model:
 # binary-to-spec.ts has TLC check seeded key sequences the binary ran
@@ -49,4 +51,5 @@ MCAgentsMenu agents-menu-mutation-enter-noop EnterShowsSelection
 MCAgentsMenu agents-menu-mutation-open-first OpensOnScreen
 MCAgentsMenu agents-menu-mutation-row SelectionKept
 MCAgentsMenu agents-menu-mutation-stale-sel SelListed
+MCAgentsMenu agents-menu-mutation-run-closes RunNeverCloses
 VERDICTS

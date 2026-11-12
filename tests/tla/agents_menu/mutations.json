@@ -10,6 +10,7 @@
     {"name": "enter_noop", "config": "agents-menu-mutation-enter-noop", "rule": "EnterShowsSelection", "bug": "Enter closes the list without showing the highlighted row"},
     {"name": "open_first", "config": "agents-menu-mutation-open-first", "rule": "OpensOnScreen", "bug": "the list opens on its first row instead of the agent on screen"},
     {"name": "row", "config": "agents-menu-mutation-row", "rule": "SelectionKept", "bug": "the highlight stays on its row, not its agent, when the rows change"},
-    {"name": "stale_sel", "config": "agents-menu-mutation-stale-sel", "rule": "SelListed", "bug": "the highlight stays on an agent that closed"}
+    {"name": "stale_sel", "config": "agents-menu-mutation-stale-sel", "rule": "SelListed", "bug": "the highlight stays on an agent that closed"},
+    {"name": "run_closes", "config": "agents-menu-mutation-run-closes", "rule": "RunNeverCloses", "bug": "a run of Backspace or Delete presses that edited the search goes on, once the search is empty, to arm and close the highlighted row, as fx did before the run"}
   ]
 }

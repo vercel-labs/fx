@@ -2479,6 +2479,213 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Main has started two subagents: `worker`, whose turn the test holds, so it
+  // works until the test ends, and `scribe`, which answered at once and is
+  // idle. The list shows them under main in that order. `run` gets the
+  // trace log's text, read fresh on each call.
+  async function withWorkerAndScribe(run: (session: TmuxSession, trace: () => string) => Promise<void>) {
+    const worker = held();
+    let workerCalls = 0;
+    let tracePath = "";
+    const env: Record<string, string> = {};
+    try {
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (userTexts(body).some((value) => value.includes("RUN_WORKER"))) {
+            workerCalls += 1;
+            await worker.promise;
+            return text("worker_done", "RUN_WORKER_DONE");
+          }
+          return text("scribe_done", "RUN_SCRIBE_DONE");
+        }
+        if (!body.includes('"main_worker"')) {
+          return toolCall("main_worker", "subagent", { request: { action: "message", agent: "worker", message: "RUN_WORKER wait for me" } });
+        }
+        if (!body.includes('"main_scribe"')) {
+          return toolCall("main_scribe", "subagent", { request: { action: "message", agent: "scribe", message: "RUN_SCRIBE note it" } });
+        }
+        return text("main_done", "RUN_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start the team");
+        await session.waitForText("RUN_MAIN_DONE", 30_000);
+        await session.waitForComposer(15_000);
+        await until("the worker's turn", () => workerCalls >= 1);
+        await run(session, () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : ""));
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    } finally {
+      worker.release();
+    }
+  }
+
+  // `key` sent `count` times in one write, as a held key repeats it: fx reads
+  // them one after the other with nothing between.
+  const held_key = (key: string, count: number) => Array.from({ length: count }, () => key).join(" ");
+
+  // How many times the trace log shows `event`.
+  const eventCount = (trace: string, event: string) => trace.split("\n").filter((line) => line.includes(`event=${event} `)).length;
+
+  // The previewed worker is mid-turn, and its "Thinking (Ns)" line blinks its
+  // bullet and counts seconds, so two captures never match with it in.
+  const withoutThinkingTimer = (pane: string) => pane.replace(/^[ •]*Thinking \(\d+s\)$/gm, "Thinking");
+
+  // The pane once it has held still for 300 ms, so every key sent before is
+  // handled.
+  async function paneAtRest(session: TmuxSession, ms = 15_000): Promise<string> {
+    const deadline = Date.now() + ms;
+    let last = await session.capturePane();
+    let previous = last;
+    while (Date.now() < deadline) {
+      await Bun.sleep(300);
+      const now = await session.capturePane();
+      if (withoutThinkingTimer(now) === withoutThinkingTimer(last)) return now;
+      previous = last;
+      last = now;
+    }
+    const before = previous.split("\n");
+    const changed = last.split("\n").map((line, index) => (line === before[index] ? "" : `\n  - ${before[index]}\n  + ${line}`)).join("");
+    throw new Error(`the pane never held still; the last two captures differ in:${changed}\n${last}`);
+  }
+
+  // Opens the list and types a search that only `worker` matches, so the list
+  // shows it, working, as the only row.
+  async function searchForWorker(session: TmuxSession) {
+    await session.sendKeys("C-x");
+    await session.waitForText(LIST_HINT, 10_000);
+    await session.sendLiteral("wor");
+    const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "wor")
+      && subagentRow("worker", "working").test(pane), 10_000);
+    expect(found).toContain("esc clear");
+    expect(found).not.toContain("delete close");
+  }
+
+  test(
+    "a held Backspace that empties the agent list's search goes on to nothing: no close is armed, and the highlighted agent stays open and working",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        // Three presses empty the search and four more follow, as a held key
+        // repeats, with no other key between.
+        await session.sendKeys(held_key("BSpace", 7));
+        // fx logs each press it leaves alone; before this change nothing did,
+        // and the fourth press armed the close instead.
+        await until("the held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "wor")).toBe(false);
+        expect(after).toContain("Agents 3");
+        expectRowOrder(after, mainRow(), subagentRow("worker", "working"), subagentRow("scribe", "idle"));
+        // Nothing is armed: the hint offers the close again, not its warning.
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after a Backspace run emptied the agent list's search, another key ends it, and two Backspaces on the next row arm and close it",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        await session.sendKeys(held_key("BSpace", 3));
+        await paneAtRest(session);
+        // Down moves to scribe, a key other than Backspace: the run is over.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "scribe");
+        await session.sendKeys(held_key("BSpace", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("scribe").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("worker", "working"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "on a list nothing was searched in, Backspace pressed twice in a row arms and closes the highlighted subagent, as it always has",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "worker");
+        await session.sendKeys(held_key("BSpace", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("scribe", "idle"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "forward Delete after a Backspace run emptied the agent list's search arms and closes as it does on any list, since it is another key",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        await session.sendKeys(held_key("BSpace", 3));
+        await paneAtRest(session);
+        await session.sendKeys("DC");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("DC");
+        const closed = await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("scribe", "idle"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a held forward Delete that empties the agent list's search from its start goes on to nothing either, and another key ends the run",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        // Left puts the cursor at the start of the search, where Delete takes
+        // the text away letter by letter: three presses empty it, four more
+        // follow.
+        await session.sendKeys(held_key("Left", 3));
+        await session.sendKeys(held_key("DC", 7));
+        await until("the held Delete to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "wor")).toBe(false);
+        expect(after).toContain("Agents 3");
+        expectRowOrder(after, mainRow(), subagentRow("worker", "working"), subagentRow("scribe", "idle"));
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+
+        // Down is another key, so Delete twice closes scribe.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "scribe");
+        await session.sendKeys(held_key("DC", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("scribe").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("worker", "working"));
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "after the user closes an idle subagent, main's next message to its name says the new one starts with no history",
     async () => {
