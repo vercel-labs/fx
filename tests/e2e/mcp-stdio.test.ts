@@ -21,6 +21,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -80,6 +81,7 @@ type RootOptions = {
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "invalid_params"
     | "image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
@@ -2423,6 +2425,53 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await expectFixtureProcessesExited(wire);
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
+    async () => {
+      // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx
+      // negotiate the protocol again.
+      const root = createRoot("tui-invalid-params", LEGACY_FIXTURE, {
+        mode: "invalid_params",
+        legacyVersion: "2025-06-18",
+      });
+      const activeGateway = startToolGateway("Rejected arguments complete.");
+      gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 32,
+        stderrPath,
+        // /trace writes its report to TMPDIR.
+        env: { ...fixtureEnv(root, activeGateway), TMPDIR: root.root },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture with a typed argument.");
+      const cause = "arguments rejected: limit is a string, the schema wants a number";
+      await tui.waitForText(`Failed ${TOOL_NAME}: ${cause}`, 20_000);
+      await tui.waitForText("Rejected arguments complete.", 20_000);
+      // The model still gets the server's own words, which say how to fix the call.
+      expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
+
+      await tui.sendText("/trace");
+      const report = await waitForNewTraceReport(root.root);
+      expect(traceReportNames(root.root)).toHaveLength(1);
+      const problemCalls = report.problems("tool_call").map((problem) => problem.call as Record<string, unknown>);
+      expect(problemCalls.filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(report.all("tool_call").filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(wire);
+    },
+    45_000,
   );
 
   test.skipIf(!tmuxAvailable())(

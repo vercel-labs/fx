@@ -14,6 +14,8 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -898,11 +900,13 @@ fn sameCredentialState(left: oauth_session.Session, right: oauth_session.Session
 pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
 ) !LogoutResult {
     var local = try logoutLocally(alloc);
     defer if (local.session) |*session| session.deinit(alloc);
     var result = local.result;
     if (local.session) |session| {
+        if (before_revocation) |notice| notice.run(notice.context);
         revokeLoggedOutSession(alloc, transport, session) catch {
             result.remote_revocation_failed = true;
         };
@@ -1310,8 +1314,17 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
         const id = entry.object.get("id") orelse continue;
         const slug = entry.object.get("slug") orelse continue;
         if (id != .string or slug != .string) continue;
+        // fx sends the id or the slug as the team and saves the slug, so a
+        // team whose id or slug it could not send is left out.
+        if (!types.validGatewayTeam(id.string) or !types.validGatewayTeam(slug.string)) {
+            debug_trace.logf("auth", "team list entry skipped reason=invalid_team_id_or_slug", .{});
+            continue;
+        }
+        // The picker and the team notices show the name, so a name that
+        // would not draw as it is shows as the slug.
         const name_value = entry.object.get("name");
-        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0)
+        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0 and
+            text_utils.isTerminalSafe(name_value.?.string))
             name_value.?.string
         else
             slug.string;
@@ -1566,6 +1579,43 @@ fn dupeTeam(alloc: Allocator, source_id: []const u8, source_slug: []const u8, so
         .slug = slug,
         .name = name,
     };
+}
+
+test "parseTeams keeps only teams fx can use, under a name that is safe for the terminal" {
+    const alloc = std.testing.allocator;
+    var teams = try parseTeams(alloc,
+        \\{"teams":[
+        \\{"id":"team_1","slug":"one","name":"One"},
+        \\{"id":"team_2","slug":"\u001b[2Jtwo","name":"Two"},
+        \\{"id":"team 3","slug":"three","name":"Three"},
+        \\{"id":"team_4","slug":"four","name":"\u001b]2;title\u0007Four"},
+        \\{"id":"team_5","slug":"five","name":"\u202eFive"},
+        \\{"id":"team_6","slug":"six","name":"Équipe Café"},
+        \\{"id":"team_7","slug":"seven","name":""}
+        \\]}
+    );
+    defer freeTeams(alloc, &teams);
+    const expected = [_][3][]const u8{
+        .{ "team_1", "one", "One" },
+        .{ "team_4", "four", "four" },
+        .{ "team_5", "five", "five" },
+        .{ "team_6", "six", "Équipe Café" },
+        .{ "team_7", "seven", "seven" },
+    };
+    try std.testing.expectEqual(expected.len, teams.items.len);
+    for (expected, teams.items) |want, team| {
+        try std.testing.expectEqualStrings(want[0], team.id);
+        try std.testing.expectEqualStrings(want[1], team.slug);
+        try std.testing.expectEqualStrings(want[2], team.name);
+    }
+
+    // A list with no usable team is an empty list, as for an account with
+    // no teams.
+    var none = try parseTeams(alloc,
+        \\{"teams":[{"id":"team x","slug":"x","name":"X"},{"id":"team_y","slug":"y\u0007","name":"Y"}]}
+    );
+    defer freeTeams(alloc, &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
 }
 
 fn check_parse_teams_allocation_failures(alloc: Allocator) !void {

@@ -397,6 +397,107 @@ pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     return configured_provider.Registry.parse(alloc, definitions);
 }
 
+/// What to do when a saved session's custom connection changed or was
+/// removed after the session was saved (`model_provider.ProviderId.bind`).
+/// Its history may go only to that connection, so nothing is sent
+/// (`tests/tla/configured_provider/ConfiguredResume.tla`).
+pub fn sessionConnectionNotice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ConfiguredProviderChanged => profile_paths.displayText("This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session."),
+        error.ConfiguredProviderRemoved => profile_paths.displayText("This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session."),
+        else => null,
+    };
+}
+
+/// fx's words for an error a custom connection's settings caused: the file,
+/// the setting's path, and what to do, the header whose environment variable
+/// cannot be sent, or a saved session's changed or removed connection. Null
+/// for any other error, and when the settings no longer show it. Reads the
+/// settings again, so call it only on a failure. Caller owns the message.
+pub fn configuredProviderMessage(alloc: Allocator, err: anyerror) Allocator.Error!?[]u8 {
+    if (sessionConnectionNotice(err)) |notice| return try alloc.dupe(u8, notice);
+    if (configured_provider.failure_advice(err)) |advice| {
+        var at: configured_provider.FailurePath = .{};
+        const refusal = (try refusedProviderSetting(alloc, &at)) orelse return null;
+        if (refusal.err != err) return null;
+        return try alloc.print("{s}: providers.{s}: {s}", .{ profile_paths.displayText("~/.fx/settings.json"), at.text(), advice });
+    }
+    if (err == error.MissingConfiguredProviderHeader or err == error.InvalidConfiguredProviderHeader) return headerVariableMessage(alloc);
+    return null;
+}
+
+const ProviderRefusal = struct { err: anyerror };
+
+/// The error the profile's providers fail to parse with, leaving in `at` where
+/// the refused setting is; null when they parse or cannot be read.
+fn refusedProviderSetting(alloc: Allocator, at: *configured_provider.FailurePath) Allocator.Error!?ProviderRefusal {
+    var paths = discoverPaths(alloc, ".") catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer paths.deinit(alloc);
+    const bytes = (readOptionalUserSettingsFile(alloc, paths) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null) orelse return null;
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const providers = parsed.value.object.get("providers") orelse return null;
+    var registry = configured_provider.Registry.parse_located(alloc, providers, at) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .err = err },
+    };
+    registry.deinit(alloc);
+    return null;
+}
+
+/// Names each header whose environment variable cannot be sent, by the rule
+/// the transport applies (`configured_provider.header_value`), with its
+/// connection: the error doesn't say which connection's request failed, so
+/// a message about one header must not stand for another's.
+fn headerVariableMessage(alloc: Allocator) Allocator.Error!?[]u8 {
+    var registry = loadConfiguredProviders(alloc) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer registry.deinit(alloc);
+    var listed: std.ArrayList(u8) = .empty;
+    defer listed.deinit(alloc);
+    var only: ?[]u8 = null;
+    defer if (only) |message| alloc.free(message);
+    var count: usize = 0;
+    for (registry.definitions) |definition| {
+        for (definition.headers) |header| {
+            const state = configured_provider.header_value(io_mod.getenv(header.env));
+            if (state == .usable) continue;
+            count += 1;
+            if (count == 1) only = try alloc.print("the header {s} of connection {s} reads {s}, {s}", .{ header.name, definition.id, header.env, headerProblem(state, true) });
+            if (count > max_listed_headers) continue;
+            if (count > 1) try listed.appendSlice(alloc, "; ");
+            try listed.print(alloc, "{s} of connection {s} reads {s}, {s}", .{ header.name, definition.id, header.env, headerProblem(state, false) });
+        }
+    }
+    if (count == 0) return null;
+    if (count == 1) {
+        defer only = null;
+        return only.?;
+    }
+    const advice = profile_paths.displayText("Set or fix each variable, or remove its header from ~/.fx/settings.json");
+    const unlisted = count -| max_listed_headers;
+    if (unlisted == 0) return try alloc.print("{d} headers can't be sent: {s}. {s}", .{ count, listed.items, advice });
+    return try alloc.print("{d} headers can't be sent: {s} ({d} more). {s}", .{ count, listed.items, unlisted, advice });
+}
+
+const max_listed_headers = 3;
+
+/// Why a header's variable can't be sent; with `fix`, also what to do.
+fn headerProblem(state: configured_provider.HeaderValue, fix: bool) []const u8 {
+    return switch (state) {
+        .usable => "which can be sent",
+        .unset => if (fix) profile_paths.displayText("which is not set; set it, or remove the header from ~/.fx/settings.json") else "which is not set",
+        .empty => if (fix) profile_paths.displayText("which is empty; set it, or remove the header from ~/.fx/settings.json") else "which is empty",
+        .too_long => if (fix)
+            std.fmt.comptimePrint("whose value is longer than {d} bytes; shorten it", .{configured_provider.max_header_value_bytes})
+        else
+            std.fmt.comptimePrint("whose value is longer than {d} bytes", .{configured_provider.max_header_value_bytes}),
+        .unsendable => if (fix) "whose value has a character a header can't carry; fix the variable" else "whose value has a character a header can't carry",
+    };
+}
+
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
     var paths = try discoverPaths(alloc, workspace_root);
     defer paths.deinit(alloc);

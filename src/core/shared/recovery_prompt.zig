@@ -2,7 +2,9 @@
 //! you just did." after silent tool steps, a request to continue after a reply
 //! with no text and no tool call (`src/core/agent/runtime/orchestrator.zig`
 //! `appendContinuationPrompt`), and the request to go on from the last tool
-//! result after a model refuses to continue an assistant message.
+//! result after a model refuses to continue an assistant message; and review
+//! mode's request to look over the changes just made
+//! (`src/core/agent/runtime/tool_batch.zig` `appendReviewContinuationSuffix`).
 //!
 //! A turn saves each one in its steering list at the boundary where it sent
 //! it, so the next turn's request starts with every message the last request

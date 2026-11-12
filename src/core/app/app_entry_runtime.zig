@@ -554,6 +554,11 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
 /// An error that ended the interactive session, in plain words
 /// (`types.plainErrorText`) unless fx has a message of its own for it.
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        return std.mem.print(buffer, "fx: {s}\n", .{message});
+    }
     var words: [128]u8 = undefined;
     const message = config_runtime.modelNotSelectedMessage(err) orelse
         mcp_verbs.profileConfigNotice(err) orelse
@@ -588,7 +593,7 @@ fn recordingStartMessage(err: anyerror) []const u8 {
 /// The raw error name goes only to the trace.
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
     debug_trace.logf("core", "interactive error err={s}", .{@errorName(err)});
-    var buffer: [256]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     const message = deps.format_unexpected_error(&buffer, err) catch return;
     deps.write_stderr(deps.stderr_ctx, message) catch {};
 }
@@ -616,6 +621,14 @@ fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
 /// (`types.plainErrorText`). The raw name goes only to the trace.
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     debug_trace.logf("core", "command error err={s}", .{@errorName(err)});
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        writeStderr(deps, "fx: ");
+        writeStderr(deps, message);
+        writeStderr(deps, "\n");
+        return;
+    }
     var words: [128]u8 = undefined;
     writeStderr(deps, "fx: ");
     writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words));

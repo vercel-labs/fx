@@ -18,6 +18,7 @@ import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   hasEmptyComposer,
   heldFakeGatewayFinalText,
@@ -2700,7 +2701,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("xAI");
       expect(pane).not.toContain("Z.AI");
       expect(pane).toContain(currentModel);
-      expect(pane).toContain("1M context · 32K output · Fast mode");
+      expect(pane).toContain("1M context   32K output   Fast mode");
       expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
       const headerRow = grid.findIndex((line) => line.includes("Models 4"));
       const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
@@ -2710,12 +2711,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       const currentRow = grid[firstModelRow + 1]!;
       const openaiRow = grid[firstModelRow]!;
-      const currentFactsColumn = currentRow.indexOf("1M context");
-      const openaiFactsColumn = openaiRow.indexOf("400K context");
+      // Facts start three cells after the longest id, and numbers align on
+      // the right, so every `context` label shares one column.
+      const currentFactsColumn = currentRow.indexOf(" context");
+      const openaiFactsColumn = openaiRow.indexOf(" context");
       const currentNameEnd = currentRow.indexOf(currentModel) + currentModel.length;
       expect(firstModelRow).toBe(headerRow + 2);
       expect(statusRow).toBe(lastModelRow + 2);
-      expect(currentFactsColumn - currentNameEnd).toBe(2);
+      expect(openaiRow.indexOf("400K context") - currentNameEnd).toBe(3);
       expect(openaiFactsColumn).toBe(currentFactsColumn);
       expect(pane).not.toContain("Authenticated model catalog loaded.");
       expect(pane).not.toContain("Current");
@@ -3266,6 +3269,387 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       } finally {
         held.dispose();
       }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker keeps Token Pass models on Token Pass credit",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const tokenPassModel = "zai/glm-5.3";
+      const fastModel = "provider/fast-model";
+      const plainModel = "provider/plain-model";
+      const covers = "Token Pass covers this model: https://vercel.com/docs/ai-gateway/token-pass";
+      const fastWarning = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.";
+      const creditsRequests: string[] = [];
+      gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "TOKEN_PASS_REPLY" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+            providerMetadata: {
+              gateway: { routing: { resolvedProvider: "token-pass", finalProvider: "token-pass" } },
+            },
+          },
+        ]),
+        Response.json(
+          { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
+          { status: 403 },
+        ),
+      ], {
+        models: [
+          {
+            id: tokenPassModel,
+            type: "language",
+            released: 300,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 200_000,
+          },
+          {
+            id: fastModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 128_000,
+          },
+          {
+            id: plainModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+        usage: (url) => {
+          if (url.pathname !== "/coding-agent/v1/credits") return null;
+          creditsRequests.push(url.pathname);
+          // A reply from before the Gateway reported Token Pass credit.
+          return Response.json({ balance: "12.50", total_used: "1.25" });
+        },
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-token-pass-picker-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+          FX_MODEL: plainModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      const readSettings = () =>
+        JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { fast_mode?: boolean };
+      const scrollbackCount = async (text: string) =>
+        (await session!.captureFullScrollback()).split(text).length - 1;
+      const waitForScrollbackCount = async (text: string, count: number) => {
+        const deadline = Date.now() + 5_000;
+        let seen = await scrollbackCount(text);
+        while (seen !== count && Date.now() < deadline) {
+          await Bun.sleep(50);
+          seen = await scrollbackCount(text);
+        }
+        expect(seen).toBe(count);
+      };
+      // Opens the menu on `query` and walks every stage with Enter, or types
+      // `speed` at the speed stage.
+      const pickModel = async (query: string, model: string, stages: "effort" | "speed", speed?: string) => {
+        await session!.sendKeys("C-p");
+        await waitForModelsMenu(session!, 3);
+        await session!.sendLiteralText(query);
+        await session!.waitForPane(
+          (pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(model)),
+          5_000,
+        );
+        await session!.sendKeys("Enter");
+        if (stages === "effort") {
+          await session!.waitForPane(
+            (pane) => composerContains(pane, `/model ${model}`) && pane.includes("high"),
+            5_000,
+          );
+          await session!.sendKeys("Enter");
+        }
+        await session!.waitForPane((pane) => pane.includes("normal") && pane.includes("fast"), 5_000);
+        if (speed) await session!.sendLiteralText(speed);
+        await session!.sendKeys("Enter");
+      };
+
+      // The menu lists the Token Pass model under its own heading, so its
+      // row leaves the tag out, and the facts line up in columns.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 3);
+      const row = (model: string) => menu.find((line) => line.includes(model)) ?? "";
+      expect(menu.some((line) => /^\s*Token Pass\s+1\s*$/.test(line))).toBe(true);
+      expect(menu.some((line) => /^\s*All Models\s+2\s*$/.test(line))).toBe(true);
+      expect(row(tokenPassModel)).toContain("200K context   Fast mode");
+      expect(row(tokenPassModel)).not.toContain("Token Pass");
+      expect(row(fastModel)).toContain("128K context   Fast mode");
+      expect(row(fastModel)).not.toContain("Token Pass");
+      expect(row(plainModel)).not.toContain("Token Pass");
+      expect(row(plainModel).indexOf(" context")).toBe(row(tokenPassModel).indexOf(" context"));
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      // A Token Pass model starts its speed stage on normal speed, and names
+      // Token Pass while fx has not seen this team use it.
+      await pickModel("glm", tokenPassModel, "effort");
+      await session.waitForText(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 5_000);
+      await session.waitForText(covers, 5_000);
+      expect(readSettings().fast_mode).toBe(false);
+
+      // Other models still start on Fast.
+      await pickModel("fast-model", fastModel, "speed");
+      await session.waitForPane(
+        (pane) => pane.split("\n").some((line) => line.includes(`Switched to ${fastModel}`) && line.includes("speed: fast")),
+        5_000,
+      );
+      expect(readSettings().fast_mode).toBe(true);
+
+      // Fast is still a choice for a Token Pass model, with a warning, and
+      // the speed stage starts on normal even with Fast mode on.
+      await pickModel("glm", tokenPassModel, "effort", "fast");
+      await session.waitForText(`Switched to ${tokenPassModel} (effort: default, speed: fast)`, 5_000);
+      await session.waitForText(fastWarning, 5_000);
+      expect(await scrollbackCount(covers)).toBe(1);
+
+      await session.sendText("/fast off");
+      const deadline = Date.now() + 5_000;
+      while (readSettings().fast_mode !== false && Date.now() < deadline) await Bun.sleep(50);
+      expect(readSettings().fast_mode).toBe(false);
+      await session.sendText("/fast on");
+      await waitForScrollbackCount(fastWarning, 2);
+      await session.sendText("/fast off");
+
+      // A response Token Pass served shows the team has it: the next switch
+      // does not name Token Pass again, and /credits points at its balance.
+      await session.sendText("Use Token Pass.");
+      await session.waitForText("TOKEN_PASS_REPLY", 10_000);
+      // The session's title comes from a Token Pass model too.
+      const titleDeadline = Date.now() + 5_000;
+      while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
+      expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
+        .toEqual(["zai/glm-5.3-flash"]);
+      await pickModel("glm", tokenPassModel, "effort");
+      await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 2);
+      expect(await scrollbackCount(covers)).toBe(1);
+
+      // This reply does not mention Token Pass, so /credits points at the
+      // dashboard tab instead.
+      await session.sendText("/credits");
+      await session.waitForText("Token Pass credit is a separate balance.", 10_000);
+      expect(creditsRequests).toHaveLength(1);
+
+      // AI Gateway denies a request because the team has no active Token
+      // Pass: fx forgets that it has one, so the next switch names it again.
+      await session.sendText("Use Token Pass again.");
+      await session.waitForText("requires an active Vercel Token Pass", 10_000);
+      // The turn waits on the rejection until the user presses Esc.
+      await session.waitForText("press Esc", 5_000);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("press Esc"), 5_000);
+      await session.sendKeys("C-u");
+      await pickModel("glm", tokenPassModel, "effort");
+      await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 3);
+      await waitForScrollbackCount(covers, 2);
+
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "/credits shows the Token Pass balance and marks the team as having Token Pass",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const tokenPassModel = "zai/glm-5.3-flash";
+      let creditsReplies = 0;
+      gateway = startFakeGateway([], {
+        models: [
+          { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+        ],
+        usage: (url) => {
+          if (url.pathname !== "/coding-agent/v1/credits") return null;
+          creditsReplies += 1;
+          // The second reply says the team no longer has an active Token Pass.
+          return Response.json({
+            balance: "12.50",
+            total_used: "1.25",
+            token_pass: creditsReplies === 1 ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
+          });
+        },
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-token-pass-credits-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+          FX_MODEL: "provider/plain-model",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/credits");
+      await session.waitForText("token_pass_remaining=79.92906", 10_000);
+      await session.waitForText("token_pass_resets_at=2026-12-05T08:00:00.000Z", 5_000);
+
+      // Token Pass models lead the default list, ahead of the newer model.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 2);
+      const rows = menu.filter((line) => !isComposerLine(line) && (line.includes(tokenPassModel) || line.includes("provider/plain-model")));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toContain(tokenPassModel);
+      expect(rows[1]).toContain("provider/plain-model");
+
+      // fx now knows the team has Token Pass, so a switch to a Token Pass
+      // model does not point at the Token Pass docs.
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${tokenPassModel}`, 5_000);
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass covers this model");
+
+      // `token_pass: null` means the team has no active Token Pass, so fx
+      // forgets it and the next switch names Token Pass again.
+      await session.sendText("/credits");
+      await session.waitForPane(() => creditsReplies === 2, 10_000);
+      await session.waitForPane((pane) => (pane.match(/balance=12\.50/g) ?? []).length >= 2, 10_000);
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("Token Pass covers this model", 5_000);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker lines facts up in columns and drops whole columns on a narrow or short terminal",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      // `key` is a part of each id that survives the id's middle ellipsis.
+      const models = [
+        { id: "moonshotai/kimi-k3", key: "kimi-k3", context: 1_000_000, output: 131_072, fast: true },
+        { id: "zai/glm-5.3-flash", key: "glm-5.3-flash", context: 1_000_000, output: 131_000, fast: false },
+        { id: "openai/gpt-6.1-terra", key: "gpt-6.1-terra", context: 1_050_000, output: 128_000, fast: true },
+        { id: "amazon/nova-pro", key: "nova-pro", context: 300_000, output: 8_192, fast: false },
+        { id: "anthropic/claude-opus-5.5-fast", key: "5.5-fast", context: 1_000_000, output: 128_000, fast: false },
+      ];
+      gateway = startFakeGateway([], {
+        models: models.map((model, index) => ({
+          id: model.id,
+          type: "language",
+          released: 500 - index,
+          tags: ["tool-use"],
+          context_window: model.context,
+          max_tokens: model.output,
+          ...(model.fast ? { fast_options: [{ type: "toggle" }] } : {}),
+        })),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-columns-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: "amazon/nova-pro",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      const row = (lines: string[], key: string) => lines.find((line) => !isComposerLine(line) && line.includes(key)) ?? "";
+      const columnsOf = (lines: string[], label: string) => models.map((model) => row(lines, model.key).indexOf(label));
+      const expectOneColumn = (lines: string[], label: string) => {
+        const columns = columnsOf(lines, label);
+        expect(columns.every((column) => column > 0)).toBe(true);
+        expect(new Set(columns).size).toBe(1);
+      };
+
+      // Wide: the headings, the cells as the design shows them, and every
+      // label in one column whatever the number before it.
+      await session.sendKeys("C-p");
+      let menu = await waitForModelsMenu(session, 5);
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      expect(menu.some((line) => /^\s*All Models\s+3\s*$/.test(line))).toBe(true);
+      expect(row(menu, "kimi-k3")).toContain("   1M context   128K output   Fast mode");
+      expect(row(menu, "kimi-k3")).not.toContain("Token Pass");
+      expect(row(menu, "gpt-6.1-terra")).toContain("1.05M context   128K output   Fast mode");
+      expect(row(menu, "nova-pro")).toContain("300K context     8K output");
+      expect(row(menu, "5.5-fast")).toContain("1M context   128K output   Fast");
+      expectOneColumn(menu, " context");
+      expectOneColumn(menu, " output");
+      expect(new Set([row(menu, "kimi-k3").indexOf("Fast mode"), row(menu, "5.5-fast").indexOf("Fast", row(menu, "5.5-fast").indexOf(" output"))]).size).toBe(1);
+
+      // Narrow: the speed column goes first, then the output column, and the
+      // columns that stay still line up.
+      await session.resizeWindow(56, 32);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes(" output") && !pane.includes("Fast mode"), 5_000);
+      menu = await session.capturePaneGrid();
+      expectOneColumn(menu, " context");
+      expectOneColumn(menu, " output");
+      expect(menu.every((line) => line.length <= 56)).toBe(true);
+
+      await session.resizeWindow(44, 32);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes(" context") && !pane.includes(" output"), 5_000);
+      menu = await session.capturePaneGrid();
+      expectOneColumn(menu, " context");
+
+      // Short: with only a few rows the menu still shows the selected model
+      // and marks it as Token Pass, by heading or by tag.
+      await session.resizeWindow(56, 12);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes("kimi-k3"), 5_000);
+      menu = await session.capturePaneGrid();
+      expect(menu.length).toBeLessThanOrEqual(12);
+      expect(menu.some((line) => line.includes("Token Pass"))).toBe(true);
+      expect(row(menu, "kimi-k3")).not.toBe("");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
     },
     TEST_TIMEOUT,
   );

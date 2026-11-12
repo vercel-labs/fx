@@ -16,7 +16,8 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
-const json_depth = @import("json_depth.zig");
+const request_deadlines = @import("request_deadlines.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
 const open_job = @import("open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -72,7 +73,6 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         err == error.NoAddressReturned or
         err == error.DetectingNetworkConfigurationFailed or
         err == error.AddressUnavailable or
-        err == error.ConnectionPending or
         err == error.ConnectionRefused or
         err == error.HostUnreachable or
         err == error.NetworkUnreachable or
@@ -90,7 +90,9 @@ fn isUnreadableReply(err: anyerror) bool {
     return err == error.MalformedGatewaySseEvent or
         err == error.MalformedOpenAICodexSseEvent or
         err == error.MalformedXaiGrokSseEvent or
-        err == error.MalformedChatCompletionsChunk;
+        err == error.MalformedChatCompletionsChunk or
+        err == error.MalformedResponsesEvent or
+        err == error.MalformedMessagesEvent;
 }
 
 fn connectedIoFailure(
@@ -142,7 +144,6 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.NoAddressReturned, .cause = .connectivity_lost },
         .{ .err = error.DetectingNetworkConfigurationFailed, .cause = .connectivity_lost },
         .{ .err = error.AddressUnavailable, .cause = .connectivity_lost },
-        .{ .err = error.ConnectionPending },
         .{ .err = error.ConnectionRefused, .cause = .connectivity_lost },
         .{ .err = error.ConnectionResetByPeer },
         .{ .err = error.ConnectionTimedOut, .cause = .connectivity_lost },
@@ -1158,9 +1159,24 @@ const ConnectedRequestWatch = struct {
         if (self.phase.load(.seq_cst) != .streaming) return false;
         const last = self.last_progress_ms.load(.seq_cst);
         if (last == 0) return false;
-        const now_ms: i64 = @intCast(@divFloor(now.raw.toNanoseconds(), std.time.ns_per_ms));
-        const elapsed = now_ms - last;
-        return elapsed >= self.timing.stall_timeout_ms;
+        const since: u64 = @intCast(@max(last, 0));
+        const deadlines: request_deadlines.Deadlines = .{
+            .bounds = .{ .stall_ms = boundMs(self.timing.stall_timeout_ms) },
+            .wait = .streaming,
+            .wait_started_ms = since,
+            .last_bytes_ms = since,
+        };
+        return deadlines.expired(awakeMs(now)) != null;
+    }
+
+    /// A timing value as a bound: the largest value means no bound.
+    fn boundMs(timeout_ms: i64) u64 {
+        if (timeout_ms == std.math.maxInt(i64)) return request_deadlines.never;
+        return @intCast(@max(timeout_ms, 0));
+    }
+
+    fn awakeMs(now: std.Io.Clock.Timestamp) u64 {
+        return @intCast(@max(@divFloor(now.raw.toNanoseconds(), std.time.ns_per_ms), 0));
     }
 
     fn win_stall_timeout(self: *ConnectedRequestWatch) bool {
@@ -1184,11 +1200,16 @@ const ConnectedRequestWatch = struct {
             return false;
         }
         if (self.phase.load(.seq_cst) != .awaiting_head) return false;
-        return !std.Io.Clock.Timestamp.compare(
-            now,
-            .lt,
-            self.response_head_deadline,
-        );
+        // The wait began `timeout_ms` before its deadline.
+        const bound_ms = boundMs(self.timing.timeout_ms);
+        const armed_ms = awakeMs(self.response_head_deadline) -| bound_ms;
+        const deadlines: request_deadlines.Deadlines = .{
+            .bounds = .{ .first_response_ms = bound_ms },
+            .wait = .awaiting_head,
+            .wait_started_ms = armed_ms,
+            .last_bytes_ms = armed_ms,
+        };
+        return deadlines.expired(awakeMs(now)) != null;
     }
 
     fn is_active(phase: Phase) bool {
@@ -11470,6 +11491,8 @@ test "an unreadable stream event from any provider is an unreadable reply" {
         error.MalformedOpenAICodexSseEvent,
         error.MalformedXaiGrokSseEvent,
         error.MalformedChatCompletionsChunk,
+        error.MalformedResponsesEvent,
+        error.MalformedMessagesEvent,
     }) |err| {
         const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
         try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
@@ -11822,7 +11845,9 @@ const UnpooledOpenFixture = struct {
         const zio = io_mod.getIo();
         var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
-        var stream = try self.server.accept(zio);
+        // A connection that is gone before the accept still arrived, and is
+        // no longer open.
+        var stream = (try testing_listener.acceptIfWaiting(&self.server, zio)) orelse return .closed;
         defer stream.close(zio);
         // The close fx already made can reach this end a moment after the
         // accept; a connection fx left open never reads end of stream.

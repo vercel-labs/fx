@@ -675,7 +675,8 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -687,6 +688,7 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
@@ -715,7 +717,8 @@ fn refreshGatewayCredential(
     context.config.tool_context.credential_source = current.source;
     context.config.tool_context.account_id = current.accountId();
     context.config.tool_context.gateway_team = current.gatewayTeam();
-    return worker_token;
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = worker_token };
 }
 
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
