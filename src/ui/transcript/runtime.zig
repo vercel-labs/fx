@@ -348,6 +348,11 @@ const TranscriptRecoveryReceipt = struct {
     remaining_semantic_rows: u32 = 0,
     // Only this remaining semantic suffix may advance the current projection.
     remaining_semantic_progress_rows: u32 = 0,
+    // Semantic rows the receipt owed that no frame wrote. The store reconciles
+    // a source rewrite into the receipt before the next frame and zeroes the
+    // rows above, and a frame can accept fewer rows than are owed. The stable
+    // anchor such a receipt commits needs a catch-up flag for them.
+    dropped_semantic_rows: u32 = 0,
     remaining_unplanned_scroll_rows: u16 = 0,
     attempt_cols: u16 = 0,
     attempt_resize_history_row_delta: ?i32 = null,
@@ -8347,6 +8352,7 @@ pub const TranscriptRuntime = struct {
                     "action=rebase_recovery reason={s} old_bytes={d} new_bytes={d} view={d} history={d} dropped_rows={d} append_committed={}",
                     .{ reason, receipt.flow.len, rendered_flow.len, receipt.accepted_visual_offset, receipt.accepted_history_visual_offset, receipt.remaining_semantic_rows, receipt.document_append_committed },
                 );
+                receipt.dropped_semantic_rows +|= receipt.remaining_semantic_rows;
                 receipt.remaining_semantic_rows = 0;
                 receipt.remaining_semantic_progress_rows = 0;
                 receipt.projection_rebase_pending = true;
@@ -9404,6 +9410,36 @@ pub const TranscriptRuntime = struct {
                         target.usePreparedProjection(prepared);
                     }
                 }
+                // A receipt can commit stable with rows it owed still unwritten:
+                // a source rewrite zeroed its debt before this frame
+                // (`dropped_semantic_rows`), or the frame accepts fewer rows than
+                // are owed. The anchor must say so, because a frame that releases
+                // only the rows leaving the screen top never replays them and they
+                // stay missing from native scrollback. A resize owns its own debt,
+                // and its history offsets count rows at another width, so only a
+                // same-geometry receipt without reflow debt counts. A receipt that
+                // never owed rows (an invalid origin) has nothing to flag.
+                if (receipt.remaining_semantic_rows +| receipt.dropped_semantic_rows >
+                    accepted_semantic_rows and
+                    receipt.remaining_resize_reflow_rows == 0 and
+                    receipt.attempt_cols == self.layout.cols and
+                    self.resize_history_row_delta == null and
+                    !target.normal_buffer_recovery_pending and
+                    target.history_visual_offset < target.visual_offset)
+                {
+                    target.history_catchup_pending = true;
+                    debug_trace.logf(
+                        "scroll",
+                        "transcript_history_debt_flagged owed_rows={d} history={d} viewport={d} receipt_remaining_rows={d} receipt_dropped_rows={d}",
+                        .{
+                            target.visual_offset - target.history_visual_offset,
+                            target.history_visual_offset,
+                            target.visual_offset,
+                            receipt.remaining_semantic_rows,
+                            receipt.dropped_semantic_rows,
+                        },
+                    );
+                }
             },
             .invalid => if (semanticProgressNeedsStaging(
                 target,
@@ -10444,35 +10480,6 @@ pub const TranscriptRuntime = struct {
         target.history_visual_offset = planned_history.visual_offset;
         target.normal_buffer_recovery_pending =
             planned_history.normal_buffer_recovery_pending;
-        // A recovering frame can commit stable without writing rows its
-        // receipt owed: a source rewrite, or a rebase that owes nothing,
-        // drops that debt. The anchor must say the rows are owed, because a
-        // frame that releases only the rows leaving the screen top never
-        // replays them and they stay missing from native scrollback. A resize
-        // owns its own debt, and its history offsets count rows at another
-        // width, so only a same-geometry recovery without reflow debt counts.
-        switch (self.transcript_commit_state) {
-            .recovering => |receipt| if (receipt.remaining_semantic_rows > resolved.accepted.semantic_rows and
-                receipt.remaining_resize_reflow_rows == 0 and
-                receipt.attempt_cols == self.layout.cols and
-                self.resize_history_row_delta == null and
-                !target.normal_buffer_recovery_pending and
-                target.history_visual_offset < target.visual_offset)
-            {
-                target.history_catchup_pending = true;
-                debug_trace.logf(
-                    "scroll",
-                    "transcript_history_debt_flagged owed_rows={d} history={d} viewport={d} dropped_receipt_rows={d}",
-                    .{
-                        target.visual_offset - target.history_visual_offset,
-                        target.history_visual_offset,
-                        target.visual_offset,
-                        receipt.remaining_semantic_rows - resolved.accepted.semantic_rows,
-                    },
-                );
-            },
-            .invalid, .stable => {},
-        }
         var materialized = resolveMaterializedEndpoint(
             target,
             source_endpoint_cursor_row,
@@ -10834,6 +10841,15 @@ pub const TranscriptRuntime = struct {
                 },
                 .invalid, .stable => {},
             }
+            // Rows the previous receipt owed that this frame neither accepted nor
+            // still owes were dropped; the next receipt keeps count of them.
+            const dropped_semantic_rows: u32 = switch (previous_state) {
+                .recovering => |receipt| receipt.dropped_semantic_rows +|
+                    (receipt.remaining_semantic_rows -|
+                        commit.accepted.semantic_rows -|
+                        commit.remaining_semantic_rows),
+                .invalid, .stable => 0,
+            };
             self.transcript_commit_state = .{ .recovering = .{
                 .accepted_visual_offset = recovery.accepted_visual_offset,
                 .accepted_history_visual_offset = recovery.accepted_history_visual_offset,
@@ -10845,6 +10861,7 @@ pub const TranscriptRuntime = struct {
                 .remaining_resize_reflow_rows = commit.remaining_resize_reflow_rows,
                 .remaining_semantic_rows = commit.remaining_semantic_rows,
                 .remaining_semantic_progress_rows = commit.remaining_semantic_progress_rows,
+                .dropped_semantic_rows = dropped_semantic_rows,
                 .remaining_unplanned_scroll_rows = commit.remaining_unplanned_scroll_rows,
                 .attempt_cols = transition.target_layout.terminal_cols,
                 .attempt_resize_history_row_delta = self.resize_history_row_delta,

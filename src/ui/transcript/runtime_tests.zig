@@ -15087,8 +15087,10 @@ test "recovered frame that leaves history behind the viewport flags the debt" {
     defer runtime.deinit(alloc);
     try leaveRecoveringReceiptForTest(&runtime, alloc);
 
-    // A source rewrite drops the receipt's debt, so the frame commits stable
-    // with the four rows it never wrote still above the viewport.
+    // The frame's source no longer extends the receipt's flow, so its plan
+    // drops the receipt's four rows (the store's own rewrite path is covered
+    // by the tests below) and it commits stable with them still above the
+    // viewport.
     try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
     const anchor = runtime.transcript_commit_state.stable;
     try std.testing.expectEqual(@as(u32, 8), anchor.history_visual_offset);
@@ -15150,6 +15152,176 @@ test "recovered frame that leaves no debt is not flagged" {
     const anchor = runtime.transcript_commit_state.stable;
     try std.testing.expectEqual(anchor.visual_offset, anchor.history_visual_offset);
     try std.testing.expect(!anchor.history_catchup_pending);
+}
+
+fn reconcileRecoveredRewriteForTest(
+    runtime: *TranscriptRuntime,
+    mode: transcript_store.TranscriptSourceRewriteMode,
+) void {
+    runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+        recovered_rewrite_flow,
+        false,
+        "test source rewrite",
+        mode,
+    );
+}
+
+fn expectRecoveringDebtDroppedForTest(runtime: *const TranscriptRuntime) !void {
+    // The store zeroed the receipt's debt before any frame saw the rewrite.
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 0), receipt.remaining_semantic_rows);
+    try std.testing.expect(receipt.projection_rebase_pending);
+}
+
+fn expectFlaggedDebtIsReplayedForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 8), anchor.history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 12), anchor.visual_offset);
+    try std.testing.expect(anchor.history_catchup_pending);
+
+    var source = try testSource(alloc, recovered_growth_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(runtime, prepared.selection);
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    try std.testing.expect(!transition.document_append.isEmpty());
+    try std.testing.expectEqual(transition.visual_offset, transition.history_visual_offset);
+}
+
+test "source rewrite through the store keeps the rows it dropped owed" {
+    const alloc = std.testing.allocator;
+    const modes = [_]transcript_store.TranscriptSourceRewriteMode{ .strict, .preserve_same_epoch };
+    for (modes) |mode| {
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(20, 8, 4),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        try leaveRecoveringReceiptForTest(&runtime, alloc);
+        reconcileRecoveredRewriteForTest(&runtime, mode);
+        try expectRecoveringDebtDroppedForTest(&runtime);
+
+        try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+        try expectFlaggedDebtIsReplayedForTest(&runtime, alloc);
+    }
+}
+
+test "a second source rewrite over the zeroed receipt keeps the dropped rows owed" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+    // The receipt now owes nothing, so the second rewrite returns early and
+    // must not forget what the first one dropped.
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+    try expectRecoveringDebtDroppedForTest(&runtime);
+
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    try expectFlaggedDebtIsReplayedForTest(&runtime, alloc);
+}
+
+test "a rewritten frame that is itself a partial write keeps the dropped rows owed" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    reconcileRecoveredRewriteForTest(&runtime, .strict);
+
+    var rewritten = try testSource(alloc, recovered_rewrite_flow, runtime.layout.cols);
+    defer rewritten.deinit(alloc);
+    var rewritten_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &rewritten);
+    defer rewritten_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(&runtime, alloc, &rewritten, &rewritten_prepared);
+    try expectRecoveringDebtDroppedForTest(&runtime);
+
+    // The next frame commits stable, and the count survived the receipt that
+    // was rebuilt in between.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    try expectFlaggedDebtIsReplayedForTest(&runtime, alloc);
+}
+
+test "a source rewrite over a receipt that owed nothing flags nothing" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    // An invalid origin recovers with nothing owed: the rows above the
+    // viewport were never this runtime's to write.
+    var first = try testSource(alloc, recovered_base_flow, runtime.layout.cols);
+    defer first.deinit(alloc);
+    var first_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &first);
+    defer first_prepared.deinit(alloc);
+    try commitPreparedPartiallyForTest(&runtime, alloc, &first, &first_prepared);
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 0), receipt.remaining_semantic_rows);
+
+    runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+        recovered_rewrite_flow,
+        false,
+        "test source rewrite",
+        .strict,
+    );
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_rewrite_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expect(anchor.history_visual_offset < anchor.visual_offset);
+    try std.testing.expect(!anchor.history_catchup_pending);
+}
+
+test "invalidating a receipt that holds a publication keeps its owed rows flagged" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try leaveRecoveringReceiptForTest(&runtime, alloc);
+    // Only a published projection makes the invalidation defer instead of
+    // resetting the anchor, so the receipt gets one.
+    runtime.transcript_commit_state.recovering.retention_identity.publication_entries =
+        try alloc.dupe(u32, &.{1});
+    runtime.committed_frame_layout.terminal_cols = 20;
+    runtime.committed_frame_layout.terminal_rows = 8;
+    runtime.invalidateTranscriptAnchor("test invalidation");
+
+    // The invalidation rebases the receipt but keeps the four rows it owes.
+    const receipt = runtime.transcript_commit_state.recovering;
+    try std.testing.expectEqual(@as(u32, 4), receipt.remaining_semantic_rows);
+    try std.testing.expect(receipt.projection_rebase_pending);
+
+    // The anchor it commits keeps them owed through the restore and catch-up
+    // flags, so no gap stays behind.
+    try commitRecoveredFrameForTest(&runtime, alloc, recovered_grown_flow);
+    const anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expect(anchor.normal_buffer_recovery_pending);
+    try std.testing.expect(anchor.history_catchup_pending);
 }
 
 test "partial finality release bounds append before staging withheld viewport" {
