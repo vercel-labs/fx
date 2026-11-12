@@ -2117,6 +2117,56 @@ pub fn validGatewayTeam(team: []const u8) bool {
     return true;
 }
 
+/// The name fx shows for a Vercel team: the slug when it is a valid team
+/// name, else the id when it is, else none. A saved login's slug is not
+/// checked when it loads, so a team name meant for the terminal goes through
+/// here.
+pub fn displayGatewayTeam(slug: ?[]const u8, id: ?[]const u8) ?[]const u8 {
+    if (slug) |value| if (validGatewayTeam(value)) return value;
+    if (id) |value| if (validGatewayTeam(value)) return value;
+    return null;
+}
+
+test "displayGatewayTeam shows only a valid team name" {
+    try std.testing.expectEqualStrings("vercel-labs", displayGatewayTeam("vercel-labs", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\x1b]2;title\x07\x1b[2J", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(null, "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\xe2\x80\xaeslug", "team_123").?);
+    try std.testing.expect(displayGatewayTeam("bad slug", "team a") == null);
+    try std.testing.expect(displayGatewayTeam(null, null) == null);
+    const longest = text_utils.repeat("a", 128);
+    try std.testing.expectEqualStrings(longest, displayGatewayTeam(longest, "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(text_utils.repeat("a", 129), "team_123").?);
+}
+
+fn fuzzDisplayGatewayTeam(_: void, smith: *std.testing.Smith) anyerror!void {
+    var slug_buffer: [192]u8 = undefined;
+    const slug_len: usize = @intCast(smith.slice(&slug_buffer));
+    var id_buffer: [192]u8 = undefined;
+    const id_len: usize = @intCast(smith.slice(&id_buffer));
+    const slug = slug_buffer[0..slug_len];
+    const id = id_buffer[0..id_len];
+    const shown = displayGatewayTeam(slug, id) orelse {
+        try std.testing.expect(!validGatewayTeam(slug) and !validGatewayTeam(id));
+        return;
+    };
+    try std.testing.expect(validGatewayTeam(shown));
+    try std.testing.expect(shown.ptr == slug.ptr or shown.ptr == id.ptr);
+    for (shown) |byte| try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
+}
+
+test "fuzzed team slugs and ids show only a valid team name" {
+    try std.testing.fuzz({}, fuzzDisplayGatewayTeam, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "vercel-labs",
+            "",
+            "\x1b]2;title\x07\x1b[2J",
+            "\xe2\x80\xaeslug",
+        }) ++ @import("fuzz_corpus").gateway_team_display.*),
+    });
+}
+
 pub fn validCredentialAccountId(account_id: []const u8) bool {
     if (account_id.len == 0 or account_id.len > 1024) return false;
     for (account_id) |byte| {

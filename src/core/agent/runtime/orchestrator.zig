@@ -4665,12 +4665,17 @@ fn pushWaitingHttpFailureReason(
 /// fails on every resend, and the user cannot switch teams while the request
 /// waits.
 fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: QueuedPrompt) !void {
-    const team = job.gateway_team_label orelse job.gateway_team orelse return;
-    const message = try std.fmt.allocPrint(
-        arena,
-        "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
-        .{team},
-    );
+    if (job.gateway_team_label == null and job.gateway_team == null) return;
+    // A saved login's slug is not checked when it loads, so only a valid team
+    // name reaches the terminal.
+    const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
+        try std.fmt.allocPrint(
+            arena,
+            "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+            .{team},
+        )
+    else
+        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.";
     if (deps.push_interactive_notice) |push| {
         try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
     } else {

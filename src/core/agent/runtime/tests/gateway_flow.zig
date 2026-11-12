@@ -8959,6 +8959,73 @@ test "processQueuedPrompt names a refused login's team by its id when the login 
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt names a refused login's team by its id when its slug is not a team name" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team_a".*;
+    // A saved login's slug is not checked when it loads.
+    var label = "\x1b]2;title\x07\x1b[2J".*;
+    job.gateway_team = &team;
+    job.gateway_team_label = &label;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "fx sent this request for the Vercel team team_a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        hooks.system_notices.items[1],
+    );
+}
+
+test "processQueuedPrompt names no team for a refused login whose slug and id are not team names" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"not allowed for this team\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+    var team = "team a\x07".*;
+    var label = "\xe2\x80\xaeslug".*;
+    job.gateway_team = &team;
+    job.gateway_team_label = &label;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        hooks.system_notices.items[1],
+    );
+}
+
 test "processQueuedPrompt sends each of many refused resends with the team its reload returned" {
     const alloc = std.testing.allocator;
     const rounds = 100;

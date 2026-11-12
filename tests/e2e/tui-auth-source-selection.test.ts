@@ -2539,6 +2539,42 @@ tmuxTest(
 );
 
 tmuxTest(
+  "a refused login whose saved team slug has control characters names the team id and keeps fx running",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-refused-team-bad-slug-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "not allowed for this team" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+    // fx does not check a saved login's team slug when it loads it.
+    const authPath = join(home, ".fx", "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    auth.team_slug = "\u001b]2;SLUG_TITLE\u0007\u001b[2J\u202eSLUG_TEXT";
+    writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer with the team fx has.");
+    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    await session.waitForText("for the Vercel team team_123.", TIMEOUT);
+    const refused = await session.captureFullScrollback();
+    expect(refused).not.toContain("SLUG_TITLE");
+    expect(refused).not.toContain("SLUG_TEXT");
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "Esc while a refused login waits ends the request",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-refused-login-esc-"));
