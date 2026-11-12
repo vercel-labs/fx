@@ -32,6 +32,19 @@ pub fn snapshotCompactionEvents(out: []CompactionEvent) usize {
     return compactor.snapshotTrace(out);
 }
 
+pub const failed_compaction_event_capacity = compactor.trace_failure_capacity;
+
+/// Copies the kept failed compaction events, oldest first. Later events never
+/// remove them; only newer failures and a session reset do.
+pub fn snapshotFailedCompactionEvents(out: []CompactionEvent) usize {
+    return compactor.snapshotTraceFailures(out);
+}
+
+/// Failed compaction events this session, including any no longer kept.
+pub fn compactionFailureCount() u64 {
+    return compactor.traceFailureCount();
+}
+
 pub fn recordRenderEvent(kind: render_metrics.Kind, comptime fmt: []const u8, args: anytype) void {
     render_metrics.record(kind, fmt, args);
 }
@@ -46,6 +59,14 @@ pub fn recordNetworkCall(call: NetworkCall) void {
 
 pub fn snapshotNetworkCalls(out: []NetworkCall) usize {
     return network_metrics.snapshot(out);
+}
+
+pub const failed_network_call_capacity = network_metrics.failure_ring_capacity;
+
+/// Copies the kept failed network calls, oldest first. Later successful calls
+/// never remove them; only newer failures and a session reset do.
+pub fn snapshotFailedNetworkCalls(out: []NetworkCall) usize {
+    return network_metrics.snapshotFailures(out);
 }
 
 pub fn networkLifetimeStats() NetworkLifetimeStats {
@@ -68,6 +89,19 @@ pub fn recordModelCatalogEvent(failed: bool, kind: model_catalog_metrics.Kind, c
 
 pub fn snapshotModelCatalogEvents(out: []ModelCatalogEvent) usize {
     return model_catalog_metrics.snapshot(out);
+}
+
+pub const failed_model_catalog_event_capacity = model_catalog_metrics.failure_ring_capacity;
+
+/// Copies the kept failed model catalog events, oldest first. Later events
+/// never remove them; only newer failures and a session reset do.
+pub fn snapshotFailedModelCatalogEvents(out: []ModelCatalogEvent) usize {
+    return model_catalog_metrics.snapshotFailures(out);
+}
+
+/// Failed model catalog events this session, including any no longer kept.
+pub fn modelCatalogFailureCount() u64 {
+    return model_catalog_metrics.failureCount();
 }
 
 pub fn recordToolCallResult(input: ToolCallRecord) void {

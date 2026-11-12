@@ -274,6 +274,27 @@ fn append_steering_guidance(
     }
 }
 
+/// Adds the notes that join the turn at a step boundary: the notes the last
+/// step's gate queued, and a changed runtime context. The saved turn restores a
+/// boundary's notes before its steering (D93), so they join before the steering
+/// the last step ended with, such as a continuation prompt or the nudge, not
+/// after it (`boundaryNotesStart`). The turn's messages a compaction already
+/// took out of the request stay where they are.
+fn insertBoundaryNotes(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    compacted_suffix_len: usize,
+    notes: []const ChatMessage,
+) Allocator.Error!void {
+    if (notes.len == 0) return;
+    const start = runtime_execution_memory.boundaryNotesStart(within_turn_suffix.items);
+    const at = @max(start, @min(compacted_suffix_len, within_turn_suffix.items.len));
+    if (at < within_turn_suffix.items.len) {
+        debug_trace.logf("context", "boundary notes join before steering notes={d} index={d} messages={d}", .{ notes.len, at, within_turn_suffix.items.len });
+    }
+    try within_turn_suffix.insertSlice(arena, at, notes);
+}
+
 fn append_pending_steering_after_assistant(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2572,6 +2593,7 @@ fn toolboxRunSubject(
     if (!std.mem.eql(u8, call.name, toolbox.tool_name) or call.argument_integrity != .valid) return null;
     const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return null;
     if (std.mem.eql(u8, run.name, toolbox.tool_name)) return null;
+    if (run.arguments_from_text) debug_trace.logf("toolbox", "run arguments read from JSON text call={s} tool={s}", .{ call.id, run.name });
     var subject = call;
     subject.name = run.name;
     subject.arguments_json = run.arguments_json;
@@ -3715,6 +3737,27 @@ noinline fn effectiveRecoveryToolEvidence(
 ) resend_strategy.ToolEvidence {
     const observed = recoveryToolEvidence(completion, stream_ctx);
     return if (observed == .none) preserved else observed;
+}
+
+/// The tool evidence a settled attempt leaves. fx runs a completion's local
+/// calls only when it settles as completed, so an attempt that broke off or
+/// ended in a provider error never ran them. A completed attempt keeps
+/// `effectiveRecoveryToolEvidence`: its calls run next, and one may start
+/// before fx saves its intent. A call the provider runs itself may have run
+/// either way.
+fn settledAttemptToolEvidence(
+    preserved: resend_strategy.ToolEvidence,
+    completion: types.ModelCompletion,
+    disposition: types.ProviderCompletionDisposition,
+    stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
+) resend_strategy.ToolEvidence {
+    const evidence = effectiveRecoveryToolEvidence(preserved, completion, stream_ctx);
+    if (disposition != .interrupted and disposition != .provider_failure) return evidence;
+    if (evidence != .uncertain or completion.tool_calls.len == 0) return evidence;
+    if (stream_ctx.saw_provider_tool_start or hasProviderExecutedCall(completion.tool_calls)) {
+        return .uncertain;
+    }
+    return .proven_unexecuted;
 }
 
 fn restoredRecoveryToolEvidence(
@@ -7732,9 +7775,10 @@ fn processQueuedPromptLoop(
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         // The notes the last step's gate queued follow that step's results and
-        // come before any steering at this boundary (D93).
+        // come before any steering at this boundary (D93), including the
+        // steering the last step ended with.
         if (pending_context_notes.items.len > 0) {
-            try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
+            try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, pending_context_notes.items);
             pending_context_notes.clearRetainingCapacity();
         }
         current_step_index = step + 1;
@@ -7776,7 +7820,8 @@ fn processQueuedPromptLoop(
             debug_trace.logf("context", "runtime context captured step={d} messages={d}", .{ current_step_index, runtime_context.messages().len });
         }
         if (runtime_update) |note| {
-            try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
+            const update = [_]ChatMessage{.{ .role = .system, .content = note, .context_note = true }};
+            try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, &update);
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
         const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
@@ -9037,9 +9082,10 @@ fn processQueuedPromptLoop(
                     false,
                     recovery_cause,
                     recovery_strategy,
-                    effectiveRecoveryToolEvidence(
+                    settledAttemptToolEvidence(
                         preserved_tool_evidence,
                         response_completion,
+                        settled_disposition,
                         &stream_ctx,
                     ),
                     step_ctx,
@@ -9376,9 +9422,10 @@ fn processQueuedPromptLoop(
                     );
                 }
                 if (retries) {
-                    const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                    const failure_tool_evidence = settledAttemptToolEvidence(
                         preserved_tool_evidence,
                         attempt_completion,
+                        attempt_disposition,
                         &stream_ctx,
                     );
                     _ = try request_recovery.failed(.{ .kind = failure_kind.? });

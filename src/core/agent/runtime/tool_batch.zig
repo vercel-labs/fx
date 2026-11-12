@@ -534,6 +534,9 @@ pub fn appendOrdinaryExecutedResult(
     );
 }
 
+/// After a step that wrote files, asks the model to look over its changes. It
+/// is fx's own message, `recovery_prompt`, so a save of the turn keeps it where
+/// the request carried it and the next request starts with this one.
 pub fn appendReviewContinuationSuffix(
     review_enabled: bool,
     arena: Allocator,
@@ -542,7 +545,7 @@ pub fn appendReviewContinuationSuffix(
 ) !void {
     if (review_enabled and batch.step_had_writes) {
         const review_prompt = "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.";
-        try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt });
+        try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt, .recovery_prompt = true });
     }
 }
 

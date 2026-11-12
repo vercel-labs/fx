@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "0.0.16";
+pub const version = "0.0.17";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -5361,7 +5361,7 @@ test {
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
-    _ = @import("gateway/json_depth.zig");
+    _ = @import("core/shared/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("acp/server.zig");
@@ -5578,6 +5578,7 @@ test {
     _ = @import("core/tooling/web_search_runtime.zig");
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
+    _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");

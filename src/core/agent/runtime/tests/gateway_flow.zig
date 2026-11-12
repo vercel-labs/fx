@@ -6,6 +6,7 @@ const builtin_context = @import("../../../../builtins/context.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
 const types = @import("../../../shared/types.zig");
 const token_estimate = @import("../../../shared/token_estimate.zig");
+const recovery_prompt = @import("../../../shared/recovery_prompt.zig");
 const result_store = @import("../../../session/result_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
@@ -6125,7 +6126,7 @@ test "processQueuedPrompt empty history recovery preserves validation and source
     }
 }
 
-test "processQueuedPrompt reconciles provider error before tool execution" {
+test "processQueuedPrompt regenerates a local tool call that a provider error left unexecuted" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -6148,10 +6149,36 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
+}
+
+test "processQueuedPrompt runs the resend's tool call after a provider error left a local call unexecuted" {
+    const alloc = std.testing.allocator;
+    const failed = [_]ToolCall{toolCall("call_read_failed", "read_file", "{\"path\":\"a\"}")};
+    const resent = [_]ToolCall{toolCall("call_read_resent", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &failed, .finish_reason = .provider_error },
+        .{ .tool_calls = &resent },
+        .{ .content = "Read after the resend" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt stops for review when uncertain tool reconciliation returns another tool" {
@@ -6448,10 +6475,39 @@ test "processQueuedPrompt preserves the provider-executed subset of mixed failed
     );
 }
 
-test "processQueuedPrompt Esc while an uncertain tool request waits ends the turn without running it" {
+test "processQueuedPrompt reconciles local calls when the failed stream also started a provider tool" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("provider_search", "web_search", "{}")};
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .tool_calls = &calls, .finish_reason = .provider_error },
+        .{ .content = "Reconciled without tools" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The provider may have run its search, so the local call does not make
+    // the attempt unexecuted: the resend reconciles with tools off.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "Reconcile the available tool evidence");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(
+        session_codec.RecoveryToolState.uncertain,
+        hooks.recovery_checkpoints.items[1].tool_state,
+    );
+}
+
+test "processQueuedPrompt Esc while a resend after an unexecuted tool call waits ends the turn without running it" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
-        toolCall("uncertain_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
+        toolCall("unexecuted_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls, .finish_reason = .provider_error },
@@ -6476,7 +6532,7 @@ test "processQueuedPrompt Esc while an uncertain tool request waits ends the tur
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
-    try std.testing.expectEqual(session_codec.RecoveryToolState.uncertain, checkpoint.tool_state);
+    try std.testing.expectEqual(session_codec.RecoveryToolState.proven_unexecuted, checkpoint.tool_state);
     // Saving the cancelled turn as interrupted ends its checkpoint, so no
     // separate clear ends the turn a second time.
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
@@ -9796,6 +9852,183 @@ test "completed assistant provider replay survives turn materialization" {
     defer messages.deinit(alloc);
     try session_runtime.appendHistoryChatMessages(alloc, &messages, hooks.history_turns.items);
     try std.testing.expectEqualStrings(state, messages.items[messages.items.len - 1].provider_replay.?.parts_json);
+}
+
+/// What a two-turn check scripts around the boundary under test: whether review
+/// mode is on, and the runtime context the first turn reads at each step, so a
+/// later step sees it change. The second turn reads the last of them.
+const BoundaryScript = struct {
+    review: bool = false,
+    runtime_contexts: []const []const u8 = &.{},
+};
+
+/// Runs a turn on `completions`, whose request number `last_request` ends it
+/// and carries `needle`. Then runs a second turn over the history the first
+/// saved, and fails unless the second turn's first request opens with all of
+/// that request, message by message: the provider's prompt cache still covers
+/// it. Unlike `expectNextTurnExtendsLastRequest`, the first turn can run with
+/// review mode on and a runtime context that changes between its steps.
+fn expectNextTurnExtendsBoundaryRequest(
+    script: BoundaryScript,
+    completions: []const FakeCompletion,
+    last_request: usize,
+    needle: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.runtime_context_texts = script.runtime_contexts;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.review_enabled = script.review;
+    var job = fixture.job();
+    job.model = @constCast(unmarked_model);
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(last_request + 1, gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, last_request, needle);
+
+    const next_completions = [_]FakeCompletion{.{ .content = "Second answer" }};
+    var next_gateway = FakeGateway.init(alloc, &next_completions);
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    if (script.runtime_contexts.len > 0) next_hooks.runtime_context_text = script.runtime_contexts[script.runtime_contexts.len - 1];
+    var next_fixture = PromptFixture{};
+    var next_job = next_fixture.job();
+    next_job.model = @constCast(unmarked_model);
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(&next_gateway, &next_hooks, next_fixture.config(), next_job);
+
+    try std.testing.expectEqual(@as(usize, 1), next_gateway.request_bodies.items.len);
+    try test_support.expectPromptExtends(
+        gateway.request_bodies.items[last_request],
+        next_gateway.request_bodies.items[0],
+    );
+}
+
+const review_prompt = "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.";
+const two_runtime_contexts = [_][]const u8{ "runtime context one", "runtime context two" };
+
+// No host turns review mode on today (`review_enabled` is false in
+// `app_agent_runtime.zig`), so only a flow test reaches this message.
+test "the next turn extends the request that carried review mode's message" {
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Reviewed" },
+    };
+    try expectNextTurnExtendsBoundaryRequest(.{ .review = true }, &completions, 1, review_prompt);
+}
+
+test "review mode's message is saved as fx's own steering, not dropped and not the user's words" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Reviewed" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.review_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings(review_prompt, recovery_prompt.fromSaved(saved.steering[0].text).?);
+}
+
+test "review mode asks for no review after a step that wrote nothing" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Read it" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.review_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 1, review_prompt);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items[0].assistant.execution.steering.len);
+}
+
+test "the next turn extends a request that carried review mode's message and a changed runtime context" {
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Reviewed" },
+    };
+    try expectNextTurnExtendsBoundaryRequest(
+        .{ .review = true, .runtime_contexts = &two_runtime_contexts },
+        &completions,
+        1,
+        "runtime context two",
+    );
+}
+
+test "the next turn extends the request that carried a changed runtime context after the empty-reply nudge" {
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &two_runtime_contexts }, &completions, 1, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried a changed runtime context after a tool step and the nudge" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    const contexts = [_][]const u8{ "runtime context one", "runtime context one", "runtime context two" };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &contexts }, &completions, 2, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried a changed runtime context after the continuation" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n" },
+        .{ .content = "Summary" },
+    };
+    const contexts = [_][]const u8{ "runtime context one", "runtime context one", "runtime context one", "runtime context two" };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &contexts }, &completions, 3, continuation_prompt);
+}
+
+test "the next turn extends the request that carried a changed runtime context after the assistant-prefill recovery" {
+    const calls = [_]ToolCall{toolCall("call_bad_prefill", "read_file", "{\"path\":\"a\",}")};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered after malformed call" },
+    };
+    const contexts = [_][]const u8{ "runtime context one", "runtime context one", "runtime context two" };
+    try expectNextTurnExtendsBoundaryRequest(.{ .runtime_contexts = &contexts }, &completions, 2, "Continue from the preceding tool result.");
 }
 
 test "tool presentation groups span silent steps and split on visible assistant prose" {

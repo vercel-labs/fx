@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
@@ -98,6 +99,71 @@ function unusedCallbackPort(): number {
   const port = listener.port;
   listener.stop(true);
   return port;
+}
+
+/** What `readLoginAddress` needs of a child made with `Bun.spawn` and three pipes. */
+type LoginChild = {
+  readonly exited: Promise<number>;
+  readonly signalCode: string | null;
+  readonly stderr: ReadableStream<Uint8Array>;
+  kill(): void;
+};
+
+const timedOut = Symbol("timed out");
+/** How long a child that closed its stdout is given to exit. */
+const exitGraceMs = 2_000;
+
+/** `work`, or `timedOut` once `ms` have passed; the timer never outlives the wait. */
+async function raceDeadline<T>(work: Promise<T>, ms: number): Promise<T | typeof timedOut> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<typeof timedOut>((resolve) => { timer = setTimeout(() => resolve(timedOut), Math.max(ms, 0)); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Reads `reader`, the stdout of `child`, until the whole line holding the sign-in address has arrived (a long
+ * address can arrive in pieces), and returns the address with everything read so far. When stdout ends or
+ * `timeoutMs` passes first, it stops `child` and throws how it ended, what both streams held, and its trace at
+ * `tracePath`, so a failure says why there was no address.
+ */
+async function readLoginAddress(
+  child: LoginChild,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  tracePath: string,
+  timeoutMs = 15_000,
+): Promise<{ address: string; stdout: string }> {
+  const started = performance.now();
+  const decoder = new TextDecoder();
+  let stdout = "";
+  for (;;) {
+    const line = /^[^\n]*\/authorize\?[^\n]*(?=\n)/m.exec(stdout);
+    if (line) return { address: line[0].trim(), stdout };
+    const chunk = await raceDeadline(reader.read(), timeoutMs - (performance.now() - started));
+    if (chunk !== timedOut && !chunk.done) {
+      stdout += decoder.decode(chunk.value, { stream: true });
+      continue;
+    }
+    // A child that closed its stdout may still be running; give it a moment, then stop it so its stderr ends.
+    const exit = chunk === timedOut ? timedOut : await raceDeadline(child.exited, exitGraceMs);
+    if (exit === timedOut) child.kill();
+    const code = await child.exited;
+    const stderr = await new Response(child.stderr).text();
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8").trim() : "";
+    const how = exit !== timedOut
+      ? (child.signalCode ? `it was killed by ${child.signalCode}` : `it exited with code ${code}`)
+      : chunk === timedOut
+        ? `it was still running after ${timeoutMs} ms, so it was stopped`
+        : `it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`;
+    throw new Error([
+      `fx mcp login printed no sign-in address, after ${Math.round(performance.now() - started)} ms: ${how}`,
+      `stdout: ${JSON.stringify(stdout)}`,
+      `stderr: ${JSON.stringify(stderr)}`,
+      `trace: ${trace === "" ? "(empty)" : trace}`,
+    ].join("\n"));
+  }
 }
 
 afterEach(async () => {
@@ -1034,19 +1100,11 @@ describe("MCP login", () => {
       stderr: "pipe",
     });
     const reader = child.stdout.getReader();
-    let stdout = "";
     const decoder = new TextDecoder();
-    const deadline = Date.now() + 15_000;
-    // Wait for the whole line: a long address can arrive in pieces.
-    while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      stdout += decoder.decode(value);
-    }
-    const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-    expect(address).toBeDefined();
+    const { address, stdout: printed } = await readLoginAddress(child, reader, root.trace);
+    let stdout = printed;
     // The user approves in some other browser, which ends on the loopback address.
-    const approved = await fetch(address!, { redirect: "manual" });
+    const approved = await fetch(address, { redirect: "manual" });
     const back = approved.headers.get("location")!;
     expect(new URL(back).hostname).toBe("127.0.0.1");
     child.stdin.write(`${back}\n`);
@@ -1078,24 +1136,17 @@ describe("MCP login", () => {
     let silent: Awaited<ReturnType<typeof Bun.connect>> | undefined;
     try {
       const reader = child.stdout.getReader();
-      let stdout = "";
       const decoder = new TextDecoder();
-      const deadline = Date.now() + 15_000;
-      while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        stdout += decoder.decode(value);
-      }
-      const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-      expect(address).toBeDefined();
-      const port = Number(new URL(new URL(address!).searchParams.get("redirect_uri")!).port);
+      const { address, stdout: printed } = await readLoginAddress(child, reader, root.trace);
+      let stdout = printed;
+      const port = Number(new URL(new URL(address).searchParams.get("redirect_uri")!).port);
       // A return with a state fx never made, from anything that can reach the
       // port: a 404, and the sign-in goes on.
       const stray = await fetch(`http://127.0.0.1:${port}/callback?code=stray&state=not-the-state-fx-made`, { signal: AbortSignal.timeout(5_000) });
       expect(stray.status).toBe(404);
       // A connection that sends nothing, as a browser's spare one does.
       silent = await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } });
-      const approved = await fetch(address!, { redirect: "manual" });
+      const approved = await fetch(address, { redirect: "manual" });
       const back = approved.headers.get("location")!;
       const page = await fetch(back, { signal: AbortSignal.timeout(5_000) });
       expect(page.status).toBe(200);
@@ -1131,19 +1182,8 @@ describe("MCP login", () => {
       stderr: "pipe",
     });
     try {
-      const reader = child.stdout.getReader();
-      let stdout = "";
-      const decoder = new TextDecoder();
-      const deadline = Date.now() + 15_000;
-      // Wait for the whole line: a long address can arrive in pieces.
-      while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        stdout += decoder.decode(value);
-      }
-      const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-      expect(address).toBeDefined();
-      const scopes = (new URL(address!).searchParams.get("scope") ?? "").split(" ");
+      const { address } = await readLoginAddress(child, child.stdout.getReader(), root.trace);
+      const scopes = (new URL(address).searchParams.get("scope") ?? "").split(" ");
       expect(scopes).toContain("custom.scope");
       expect(scopes).toContain("other.scope");
     } finally {
@@ -1251,18 +1291,9 @@ describe("MCP login", () => {
       stderr: "pipe",
     });
     const reader = child.stdout.getReader();
-    let stdout = "";
-    const decoder = new TextDecoder();
-    const deadline = Date.now() + 15_000;
-    while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      stdout += decoder.decode(value);
-    }
-    const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
-    expect(address).toBeDefined();
+    const { address } = await readLoginAddress(child, reader, root.trace);
     // The user says no; the browser ends on the loopback address with the refusal.
-    const approved = await fetch(address!, { redirect: "manual" });
+    const approved = await fetch(address, { redirect: "manual" });
     const back = new URL(approved.headers.get("location")!);
     back.searchParams.delete("code");
     back.searchParams.set("error", "access_denied");
@@ -1276,6 +1307,68 @@ describe("MCP login", () => {
     expect(await new Response(child.stderr).text()).toBe("Couldn't sign in to fixture: the sign-in page returned an error (access_denied).\n");
     expect(auth.tokenExchanges).toBe(0);
   }, 40_000);
+
+  // What `readLoginAddress` throws when the login never prints its address.
+  const endOf = (waiting: Promise<unknown>) => waiting.then(() => "", (error: Error) => error.message);
+  const stub = (script: string) => Bun.spawn(["sh", "-c", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+
+  test("fx mcp login that ends before it prints its address is reported with its exit code and stderr", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    // A server that isn't configured: fx says so on stderr and exits 1, with nothing on stdout.
+    const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "nosuchserver"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const message = await endOf(readLoginAddress(child, child.stdout.getReader(), root.trace));
+    expect(message).toContain("fx mcp login printed no sign-in address");
+    expect(message).toContain("it exited with code 1");
+    expect(message).toContain('stderr: "No MCP server named nosuchserver.');
+  }, 20_000);
+
+  test("a login that is killed before it prints its address is reported with the signal and what both streams held", async () => {
+    // Killed by a signal after a line on each stream.
+    const killed = stub("echo starting; echo 'about to die' >&2; kill -9 $$");
+    const message = await endOf(readLoginAddress(killed, killed.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain("it was killed by SIGKILL");
+    expect(message).toContain('stdout: "starting\\n"');
+    expect(message).toContain('stderr: "about to die\\n"');
+  }, 20_000);
+
+  test("a login that lingers with its stdout closed before it prints its address is stopped after a moment and reported as such", async () => {
+    // Stdout closed, the process still alive: it is given a moment to exit, then stopped.
+    const lingering = stub("exec >&-; exec sleep 30");
+    const message = await endOf(readLoginAddress(lingering, lingering.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain(`it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`);
+    expect(await lingering.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login that stays silent past the deadline before it prints its address is stopped at the deadline and reported as such", async () => {
+    // Alive and silent: the deadline ends the wait, and the child is stopped.
+    const silent = stub("exec sleep 30");
+    const started = performance.now();
+    const message = await endOf(readLoginAddress(silent, silent.stdout.getReader(), "/nonexistent/trace.log", 300));
+    expect(message).toContain("it was still running after 300 ms, so it was stopped");
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(await silent.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login address that arrives in pieces is read whole", async () => {
+    // The first piece ends inside the address, after the `?`, so the line holding it is not complete yet.
+    const child = stub("printf 'Open this address:\\n  http://127.0.0.1:1/authorize?sta'; sleep 0.3; printf 'te=s\\nThen paste it here\\n'; exec sleep 30");
+    try {
+      const { address, stdout } = await readLoginAddress(child, child.stdout.getReader(), "/nonexistent/trace.log");
+      expect(address).toBe("http://127.0.0.1:1/authorize?state=s");
+      expect(stdout).toStartWith("Open this address:\n");
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  }, 20_000);
 
   test.skipIf(!tmuxAvailable())("/mcp login signs in in the background and says when it's done", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -1396,20 +1489,10 @@ describe("MCP login", () => {
     const traceDir = join(root.home, "tmp");
     mkdirSync(traceDir, { recursive: true });
     // /trace writes a report to $TMPDIR; read the newest once it is complete.
-    const captureTrace = async (): Promise<string> => {
-      const reports = () => readdirSync(traceDir).filter(name => name.startsWith("fx-trace-") && name.endsWith(".md")).sort();
-      const before = new Set(reports());
+    const captureTrace = async (): Promise<TraceReport> => {
+      const before = new Set(traceReportNames(traceDir));
       await tui!.sendText("/trace");
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline) {
-        const fresh = reports().filter(name => !before.has(name));
-        if (fresh.length > 0) {
-          const content = readFileSync(join(traceDir, fresh[fresh.length - 1]), "utf8");
-          if (content.includes("## Transcript Timeline")) return content;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      throw new Error("trace report was not written");
+      return waitForNewTraceReport(traceDir, before);
     };
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -1431,9 +1514,9 @@ describe("MCP login", () => {
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     const waiting = await captureTrace();
-    expect(waiting).toContain("- mcp server needs login name=fixture");
-    expect(waiting).toMatch(/- fixture state=\w+ transport=http tools=0 signed_in=false needs_login=true/);
-    expect(waiting).not.toContain("mcp_servers: runtime not loaded");
+    expect(waiting.problems("mcp_server").find((problem) => problem.name === "fixture")?.issue).toBe("needs_login");
+    expect(waiting.one("runtime_context").mcp_servers).toBe(1);
+    expect(waiting.one("mcp_server")).toMatchObject({ name: "fixture", transport: "http", tools: 0, signed_in: false, needs_login: true });
 
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  1", 10_000);
@@ -1455,8 +1538,11 @@ describe("MCP login", () => {
     await tui.waitForPane((pane) => !pane.includes("Signed in to fixture."), 10_000);
     expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
     const ready = await captureTrace();
-    expect(ready).toMatch(/- fixture state=ready transport=http tools=\d+ signed_in=true needs_login=false\n(?! {4}error:)/);
-    expect(ready).not.toContain("- mcp server needs login name=fixture");
+    const server = ready.one("mcp_server");
+    expect(server).toMatchObject({ name: "fixture", state: "ready", transport: "http", signed_in: true, needs_login: false });
+    expect(server.tools).toEqual(expect.any(Number));
+    expect(server.error).toBeUndefined();
+    expect(ready.problems("mcp_server")).toEqual([]);
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 

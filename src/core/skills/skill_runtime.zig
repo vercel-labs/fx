@@ -4996,6 +4996,11 @@ test "skill discovery decodes supported descriptions and isolates malformed neig
     );
     try writeTempFile(
         &tmp,
+        "root/plain/SKILL.md",
+        "---\nname: plain\ndescription:\n  React composition patterns that scale.\n  Use when building components.\nlicense: MIT\n---\nbody\n",
+    );
+    try writeTempFile(
+        &tmp,
         "root/bad/SKILL.md",
         "---\nname: bad\ndescription: >\n   first\n  smaller indent\n---\nbody\n",
     );
@@ -5005,7 +5010,11 @@ test "skill discovery decodes supported descriptions and isolates malformed neig
 
     var discovery = try loadVisibleSkills(alloc, null, null, root, test_managed_root_policy);
     defer discovery.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 4), discovery.skills.len);
+    try std.testing.expectEqualStrings(
+        "React composition patterns that scale. Use when building components.",
+        findSkillByName(discovery.skills, "plain").?.description,
+    );
     try std.testing.expectEqualStrings(
         "keeps  internal   spaces",
         findSkillByName(discovery.skills, "inline").?.description,

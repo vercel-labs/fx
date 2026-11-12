@@ -17,6 +17,7 @@ import {
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
@@ -2396,23 +2397,19 @@ tmuxTest(
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(0);
 
     // The trace's network record names the gateway's reason, without the token.
-    const reports = () => readdirSync(traceDir).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
+    const before = new Set(traceReportNames(traceDir));
     await session.sendText("/trace");
-    let report = "";
-    const deadline = Date.now() + 15_000;
-    while (!report.includes("## Transcript Timeline") && Date.now() < deadline) {
-      const written = reports();
-      if (written.length > 0) report = readFileSync(join(traceDir, written[written.length - 1]!), "utf8");
-      else await Bun.sleep(100);
+    const report = await waitForNewTraceReport(traceDir, before);
+    const refusedCalls = [
+      ...report.all("network_call"),
+      ...report.problems("network_call").map((problem) => problem.call as { status?: number }),
+    ].filter((call) => call.status === 401) as Array<{ gateway_error?: string }>;
+    expect(refusedCalls.length).toBeGreaterThan(1);
+    for (const call of refusedCalls) {
+      expect(String(call.gateway_error)).toContain("GATEWAY_REFUSED_FOR_TEST");
     }
-    const refusedCalls = report.split("\n").filter((line) => line.includes("status=401"));
-    expect(refusedCalls.length).toBeGreaterThan(0);
-    for (const line of refusedCalls) {
-      expect(line).toContain('error="');
-      expect(line).toContain("GATEWAY_REFUSED_FOR_TEST");
-      expect(line).not.toContain(LOGIN_TOKEN);
-      expect(line).not.toContain(ACQUIRED_LOGIN_TOKEN);
-    }
+    expect(report.text).not.toContain(LOGIN_TOKEN);
+    expect(report.text).not.toContain(ACQUIRED_LOGIN_TOKEN);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
