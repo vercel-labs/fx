@@ -13896,7 +13896,9 @@ function relayContext(result: { code: number | null; stdout: string; stderr: str
 test("a quiet subagent command wakes main's wait once, and status names the call", async () => {
   const root = createFixtureRoot("quiet-relay");
   const tracePath = join(root.root, "trace.log");
-  const command = "sh -c 'printf QUIET-RELAY-READY; exec sleep 600'";
+  // The secret must reach neither main's note nor its status.
+  const secret = "qrelayfixturevalue";
+  const command = `OPENAI_API_KEY=${secret} sh -c 'printf QUIET-RELAY-READY; exec sleep 600'`;
   const failures: string[] = [];
   const state = { status: "", waitResult: "", relayTurns: [] as string[], relaysAtEnd: -1, childWaits: 0 };
   const fail = (why: string): Response => {
@@ -13977,7 +13979,8 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     const context = relayContext(result, tracePath);
     // Main's wait woke while the subagent still waited on its command, and
     // status names that call and how long it has run.
-    expect(state.status, context).toMatch(/worker: working, in Waiting for sh -c .*QUIET-RELAY-READY.* for \d+s/);
+    expect(state.status, context).toMatch(/worker: working, in Waiting for OPENAI_API_KEY=\[redacted\] sh -c .*QUIET-RELAY-READY.* for \d+s/);
+    expect(state.status).not.toContain(secret);
     // The note joins main's running turn, and the wait says it follows.
     expect(state.waitResult, context).toContain("A report or message arrived. It follows this result.");
     expect(failures, context).toEqual([]);
@@ -13986,6 +13989,7 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     expect(state.relayTurns.length, context).toBe(1);
     expect(state.relayTurns[0]).toContain('"agent":"worker"');
     expect(state.relayTurns[0]).toContain("QUIET-RELAY-READY");
+    expect(state.relayTurns[0]).not.toContain(secret);
     // The second notice in the same spell was not relayed.
     expect(state.childWaits).toBe(1);
     expect(state.relaysAtEnd, context).toBe(1);

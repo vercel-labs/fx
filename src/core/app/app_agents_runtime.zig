@@ -2198,9 +2198,6 @@ pub fn Runtime(comptime App: type) type {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
-        /// What agent `target`, null for the first instance, waits for or
-        /// does. A subagent whose approval or question its instance's screen
-        /// shows for it still waits on it.
         const RowActivity = struct { call: []const u8 = "", state: ?[]const u8 = null };
 
         /// A working subagent's current call and its state with that call's
@@ -2215,10 +2212,13 @@ pub fn Runtime(comptime App: type) type {
             @memcpy(buf[0..label.len], label);
             var writer = std.Io.Writer.fixed(buf[label.len..]);
             writer.print("{s} ", .{state.label()}) catch return .{ .call = buf[0..label.len] };
-            live_metrics.writeDuration(&writer, call.runningMs(now_ms)) catch return .{ .call = buf[0..label.len] };
+            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return .{ .call = buf[0..label.len] };
             return .{ .call = buf[0..label.len], .state = writer.buffered() };
         }
 
+        /// What agent `target`, null for the first instance, waits for or
+        /// does. A subagent whose approval or question its instance's screen
+        /// shows for it still waits on it.
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;

@@ -8,6 +8,9 @@ const max_call_id_bytes = 128;
 /// The most bytes of a raw label read before encoding it; a longer one is cut
 /// there and shown with an ellipsis.
 const max_raw_label_bytes = 512;
+/// The most bytes of a raw label searched for secrets before the cut, so a
+/// cut never shows the start of a secret too short to be found.
+const max_masked_label_bytes = 4096;
 const ellipsis = "\u{2026}";
 
 /// What a subagent's running turn reports to its parent while it runs: its
@@ -89,54 +92,47 @@ pub const Call = struct {
     }
 };
 
-/// Writes a running or quiet time the way status, the relayed note, and the
-/// agent list show it: `45s`, `4m12s`, or `1h3m`.
-pub fn writeDuration(writer: *std.Io.Writer, ms: u64) std.Io.Writer.Error!void {
-    const seconds = ms / std.time.ms_per_s;
-    if (seconds < 60) return writer.print("{d}s", .{seconds});
-    if (seconds < 60 * 60) return writer.print("{d}m{d}s", .{ seconds / 60, seconds % 60 });
-    return writer.print("{d}h{d}m", .{ seconds / 3600, (seconds % 3600) / 60 });
-}
-
-test "durations read in seconds, then minutes, then hours" {
-    var buffer: [32]u8 = undefined;
-    const cases = [_]struct { ms: u64, text: []const u8 }{
-        .{ .ms = 0, .text = "0s" },
-        .{ .ms = 1_999, .text = "1s" },
-        .{ .ms = 59_999, .text = "59s" },
-        .{ .ms = 60_000, .text = "1m0s" },
-        .{ .ms = 252_000, .text = "4m12s" },
-        .{ .ms = 3_599_999, .text = "59m59s" },
-        .{ .ms = 3_600_000, .text = "1h0m" },
-        .{ .ms = 3_780_000, .text = "1h3m" },
-    };
-    for (cases) |case| {
-        var writer = std.Io.Writer.fixed(&buffer);
-        try writeDuration(&writer, case.ms);
-        try std.testing.expectEqualStrings(case.text, writer.buffered());
-    }
-}
-
 /// Writes `raw` into `out` as one terminal-safe line of at most
-/// `max_label_bytes`: whitespace runs become one space, control bytes and
-/// invalid UTF-8 get visible escapes, and a cut label ends in an ellipsis.
-/// Returns the length written.
+/// `max_label_bytes`: secrets are masked as tool-call arguments are
+/// (`text_utils.maskSecrets`), whitespace runs become one space, control
+/// bytes and invalid UTF-8 get visible escapes, and a cut label ends in an
+/// ellipsis. The label reaches another agent's model through status and the
+/// quiet note, and the user's agent list. Returns the length written.
 pub fn storeLabel(out: *[max_label_bytes]u8, raw: []const u8) usize {
-    const head = text_utils.utf8PrefixByBytes(raw, max_raw_label_bytes);
-    var scratch: [4 * max_raw_label_bytes]u8 = undefined;
+    var scratch: [6 * max_masked_label_bytes]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&scratch);
-    const encoded = text_utils.encodeTerminalSafeInline(fixed.allocator(), head, max_label_bytes - ellipsis.len) catch {
-        const fallback = "tool call";
-        @memcpy(out[0..fallback.len], fallback);
-        return fallback.len;
-    };
+    const alloc = fixed.allocator();
+    const searched = text_utils.utf8PrefixByBytes(raw, max_masked_label_bytes);
+    const masked = text_utils.maskSecrets(alloc, searched) catch return storeFallback(out);
+    const head = text_utils.utf8PrefixByBytes(masked, max_raw_label_bytes);
+    const encoded = text_utils.encodeTerminalSafeInline(alloc, head, max_label_bytes - ellipsis.len) catch return storeFallback(out);
     var len = encoded.bytes.len;
     @memcpy(out[0..len], encoded.bytes);
-    if (encoded.truncated or head.len < raw.len) {
+    if (encoded.truncated or head.len < masked.len or searched.len < raw.len) {
         @memcpy(out[len..][0..ellipsis.len], ellipsis);
         len += ellipsis.len;
     }
     return len;
+}
+
+fn storeFallback(out: *[max_label_bytes]u8) usize {
+    const fallback = "tool call";
+    @memcpy(out[0..fallback.len], fallback);
+    return fallback.len;
+}
+
+test "a call's label masks secrets, also ones a cut would split" {
+    var out: [max_label_bytes]u8 = undefined;
+    const label = out[0..storeLabel(&out, "Running OPENAI_API_KEY=qrelayfixturevalue npm test")];
+    try std.testing.expect(std.mem.find(u8, label, "qrelayfixturevalue") == null);
+    try std.testing.expect(std.mem.find(u8, label, "[redacted]") != null);
+    // A token across the label's cut is masked whole before the cut. Cut
+    // first, the 15 bytes of it that would show, "Bearer qrelayfi", are too
+    // short to be found as a token.
+    const pad: [133]u8 = @splat('x');
+    const late = out[0..storeLabel(&out, "Running " ++ pad ++ " Bearer qrelayfixturetoken")];
+    try std.testing.expect(std.mem.find(u8, late, "qrelay") == null);
+    try std.testing.expect(std.mem.endsWith(u8, late, "[redacted]"));
 }
 
 test "a call's label stays one line, terminal-safe, and bounded" {

@@ -12,6 +12,7 @@ const managed_owner = @import("managed_owner.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const live_metrics = @import("live_metrics.zig");
+const activity_status = @import("../output/activity_status.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
@@ -79,7 +80,7 @@ fn unavailableChildRun(
 /// parent reads it. `command` is already one terminal-safe line.
 fn quietNoteText(writer: *std.Io.Writer, command: []const u8, quiet_ms: u64) std.Io.Writer.Error!void {
     try writer.print("fx: my command `{s}` has had no output for ", .{command});
-    try live_metrics.writeDuration(writer, quiet_ms);
+    try activity_status.writeElapsed(writer, @intCast(quiet_ms / std.time.ms_per_s));
     try writer.writeAll(". It may still be working, or it may be hung. Message me to check on it, or stop me.");
 }
 
@@ -1712,7 +1713,7 @@ pub const Runtime = struct {
             if (self.isBusyLocked(child.id)) for (calls) |entry| {
                 if (!std.mem.eql(u8, entry.child_id, child.id)) continue;
                 try out.writer.print(", in {s} for ", .{entry.call.label()});
-                try live_metrics.writeDuration(&out.writer, entry.call.runningMs(now_ms));
+                try activity_status.writeElapsed(&out.writer, @intCast(entry.call.runningMs(now_ms) / std.time.ms_per_s));
                 break;
             };
             if (waiting > 0) try out.writer.print(", {d} waiting message{s}", .{ waiting, if (waiting == 1) "" else "s" });

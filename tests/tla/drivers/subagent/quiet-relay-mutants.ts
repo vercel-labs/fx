@@ -75,6 +75,12 @@ const mutants: Mutant[] = [
     to: "head, max_label_bytes)",
   },
   {
+    name: "label-shows-secrets",
+    file: "src/core/subagent/live_metrics.zig",
+    from: "const masked = text_utils.maskSecrets(alloc, searched) catch return storeFallback(out);",
+    to: "const masked = searched;",
+  },
+  {
     name: "row-hides-call",
     file: "src/ui/footer/agents_menu_presentation.zig",
     from: "    if (row.activity.len > 0) return row.activity;\n",
@@ -84,6 +90,8 @@ const mutants: Mutant[] = [
 
 const unitFilters = [
   "call label",
+  "masks secrets",
+  "a call's label stays one line",
   "a call ends only itself",
   "durations read",
   "the quiet note names",

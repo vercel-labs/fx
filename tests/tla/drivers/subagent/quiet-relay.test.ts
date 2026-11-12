@@ -71,6 +71,22 @@ function latestUser(body: string): string {
   return contentText(prompt(body).filter((message) => message.role === "user").at(-1)?.content ?? "");
 }
 
+const isNote = (text: string) => text.includes(MESSAGE_HEADER) && text.includes("no output for");
+
+/** How many of fx's quiet notes from each subagent main's prompt holds. Notes
+ * can join main's running turn, so one request can carry several. */
+function notesIn(body: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const message of prompt(body)) {
+    if (message.role !== "user") continue;
+    const text = contentText(message.content);
+    if (!isNote(text)) continue;
+    const sub = /"agent":"([^"]+)"/.exec(text)?.[1] ?? "?";
+    counts.set(sub, (counts.get(sub) ?? 0) + 1);
+  }
+  return counts;
+}
+
 /** The output of call `id`'s result after the latest user message, if any. */
 function currentResult(body: string, id: string): string | null {
   const messages = prompt(body);
@@ -118,7 +134,6 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const earlyNotes = new Map<string, number>();
   const sentAt = new Map<string, number>();
   const closed = new Set<string>();
-  const seenNoteTurns = new Set<string>();
   let messaged = 0;
 
   const note = (sub: string) => {
@@ -201,15 +216,14 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   };
 
   const mainStep = async (body: string): Promise<Response> => {
+    // Main's prompt keeps every note it was given; record each new one once.
+    for (const [sub, count] of notesIn(body)) {
+      while ((notesPer.get(sub) ?? 0) < count) note(sub);
+    }
     const latest = latestUser(body);
     if (latest.includes(REPORT_HEADER)) return final("QRW_REPORT_SEEN");
-    if (latest.includes(MESSAGE_HEADER) && latest.includes("no output for")) {
+    if (isNote(latest)) {
       const sub = /"agent":"([^"]+)"/.exec(latest)?.[1] ?? "?";
-      const key = `${prompt(body).filter((message) => message.role === "user").length}:${sub}`;
-      if (!seenNoteTurns.has(key)) {
-        seenNoteTurns.add(key);
-        note(sub);
-      }
       if (walk.closeAfterNote === sub && !closed.has(sub) && !hasResult(body, `close-${sub}`)) {
         return call(`close-${sub}`, "subagent", { action: "close", agent: sub });
       }
