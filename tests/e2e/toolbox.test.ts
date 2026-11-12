@@ -351,6 +351,100 @@ describe("toolbox", () => {
     expectEveryRequestExtendsThePrevious(raws);
   }, 40_000);
 
+  // Some models write a run's arguments as JSON text instead of an object.
+  test("a toolbox run whose arguments the model wrote as JSON text reaches the MCP tool as their object", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "trace.log");
+    const active = start([
+      fakeGatewayToolCall("run_text", "toolbox", { run: MCP_TOOL, arguments: JSON.stringify({ text: "hello" }) }),
+      fakeGatewayFinalText("TOOLBOX_TEXT_ARGUMENTS_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the fixture echo tool."], {
+      cwd: root.workspace,
+      env: { ...env(root, active), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "toolbox" },
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOOLBOX_TEXT_ARGUMENTS_DONE");
+
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(2);
+    expect(toolResultText(body(raws[1]!), "run_text")).toContain(MCP_RESULT);
+    expect(toolResultName(body(raws[1]!), "run_text")).toBe("toolbox");
+
+    const calls = wireCalls(root.wireLogPath);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.message.params.name).toBe("echo");
+    expect(calls[0]!.message.params.arguments).toEqual({ text: "hello" });
+
+    const json = JSON.parse(result.stdout);
+    expect((json.tool_calls as Array<{ name: string }>).map((call) => call.name)).toContain(MCP_TOOL);
+    expect(readFileSync(tracePath, "utf8")).toContain(`run arguments read from JSON text call=run_text tool=${MCP_TOOL}`);
+    expectEveryRequestExtendsThePrevious(raws);
+  }, 40_000);
+
+  // The gateway's depth limit doesn't count brackets inside a string, so the
+  // text itself must not decode deeper than tool input may be.
+  test("a toolbox run whose arguments are JSON text nested too deep is refused and fx keeps running", async () => {
+    const root = createRoot();
+    const deep = "{\"a\":".repeat(300) + "1" + "}".repeat(300);
+    const active = start([
+      fakeGatewayToolCall("run_deep", "toolbox", { run: MCP_TOOL, arguments: deep }),
+      fakeGatewayFinalText("TOOLBOX_DEEP_TEXT_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Echo."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOOLBOX_DEEP_TEXT_DONE");
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(2);
+    expect(toolResultText(body(raws[1]!), "run_deep")).toContain("toolbox arguments must be an object");
+    expect(existsSync(root.wireLogPath) ? wireCalls(root.wireLogPath) : []).toEqual([]);
+  }, 40_000);
+
+  test("a deny rule on the real tool stops a toolbox run whose arguments are JSON text", async () => {
+    const root = createRoot();
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { install_skill: "deny", [MCP_TOOL]: "deny" } }),
+    );
+    const source = join(root.root, "source", "denied-skill");
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, "SKILL.md"), "---\nname: denied-skill\ndescription: never installed\n---\n\nBody.\n");
+    const active = start([
+      fakeGatewayToolCall("run_builtin_text", "toolbox", {
+        run: "install_skill",
+        arguments: JSON.stringify({ source: join(root.root, "source") }),
+      }),
+      fakeGatewayToolCall("run_mcp_text", "toolbox", { run: MCP_TOOL, arguments: JSON.stringify({ text: "hello" }) }),
+      fakeGatewayFinalText("TOOLBOX_TEXT_DENIED_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Install the skill and echo hello."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(3);
+    const builtin = toolResultText(body(raws[1]!), "run_builtin_text");
+    const mcp = toolResultText(body(raws[2]!), "run_mcp_text");
+    // fx reads the text, so the built-in's own rule decides its run, and
+    // neither run is refused for its arguments' type. A denied MCP tool is
+    // left out of the toolbox, so its run never reaches the server.
+    expect(builtin).toContain("tool_permission_denied");
+    expect(builtin).toContain("denied by configured policy");
+    expect(builtin).not.toContain("must be an object");
+    expect(mcp).not.toContain("must be an object");
+    expect(mcp).not.toContain(MCP_RESULT);
+    expect(existsSync(join(root.home, ".fx", "skills", "denied-skill"))).toBe(false);
+    expect(existsSync(root.wireLogPath) ? wireCalls(root.wireLogPath) : []).toEqual([]);
+    expectEveryRequestExtendsThePrevious(raws);
+  }, 40_000);
+
   test("rules for skill and capability_search decide toolbox open and search", async () => {
     const root = createRoot();
     writeFileSync(

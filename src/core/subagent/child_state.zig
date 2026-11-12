@@ -160,10 +160,17 @@ pub const Child = struct {
     /// The agent profile the child started in, or null for fx's `agent`.
     /// Fixed when the child is created. Owned.
     profile: ?[]u8 = null,
+    /// What the child is for, as its parent sees it in its list of
+    /// subagents: a short line from its first instructions or task
+    /// (`purposeOf`). Fixed when the child is created, and
+    /// recorded on each spawn line, so it survives a restart. Null for a
+    /// child from before it. Owned.
+    purpose: ?[]u8 = null,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.profile) |name| alloc.free(name);
+        if (self.purpose) |text| alloc.free(text);
         switch (self.kind) {
             .one_off => {},
             .persistent => |*persistent| persistent.deinit(alloc),
@@ -188,11 +195,14 @@ pub const Child = struct {
         errdefer if (active) |*value| value.deinit(alloc);
         const profile = if (self.profile) |name| try alloc.dupe(u8, name) else null;
         errdefer if (profile) |name| alloc.free(name);
+        const purpose = if (self.purpose) |text| try alloc.dupe(u8, text) else null;
+        errdefer if (purpose) |text| alloc.free(text);
         return .{
             .id = id,
             .kind = kind,
             .phase = self.phase,
             .profile = profile,
+            .purpose = purpose,
             .work_generation = self.work_generation,
             .active = active,
             .last_work_id = if (self.last_work_id) |value| try alloc.dupe(u8, value) else null,
@@ -270,6 +280,14 @@ pub const Registry = struct {
         const child = self.findById(child_id) orelse return error.InvalidState;
         if (child.profile != null) return error.InvalidState;
         child.profile = try alloc.dupe(u8, name);
+    }
+
+    /// Records what a new child is for. A child keeps it for life.
+    pub fn setPurpose(self: *Registry, alloc: Allocator, child_id: []const u8, text: []const u8) !void {
+        const child = self.findById(child_id) orelse return error.InvalidState;
+        if (child.purpose != null) return error.InvalidState;
+        if (text.len == 0) return;
+        child.purpose = try alloc.dupe(u8, text);
     }
 
     pub fn setReportRule(self: *Registry, child_id: []const u8, rule: reports.Rule) !void {
@@ -748,18 +766,130 @@ const SpawnData = struct {
     /// Who started a work its parent didn't: `user` or `child`. Crash
     /// repair's finish carries no fx data, so its report reads this.
     by: ?[]const u8 = null,
+    /// What the child is for (`Child.purpose`). Older fx never writes it
+    /// and skips it.
+    purpose: ?[]const u8 = null,
 };
 
 /// A spawn line's data. `rule` is null only for a converted v1 session,
 /// whose works owe no report, and then the line is written as before
 /// report rules existed.
-fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy) ![]const u8 {
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy, purpose: ?[]const u8) ![]const u8 {
     return stringifyAlloc(arena, SpawnData{
         .agent = agent,
         .fingerprint = fingerprint,
         .profile = profile,
         .report = if (rule) |value| @tagName(value) else null,
         .by = if (by == .parent) null else @tagName(by),
+        .purpose = purpose,
+    });
+}
+
+/// The longest purpose a child keeps, its ellipsis included.
+pub const purpose_max_bytes: usize = 100;
+const purpose_ellipsis = "…";
+
+const PurposeCut = struct {
+    line: []const u8,
+    /// The line was longer and lost its end; an ellipsis follows it.
+    cut: bool = false,
+};
+
+/// Pure: the part of `text` that says what a child is for: its first line
+/// with anything on it, ended at any control character and trimmed. A line
+/// longer than `purpose_max_bytes` is cut on a character boundary, with
+/// room left for an ellipsis. Text that is not UTF-8 gives nothing.
+fn purposeCut(text: []const u8) PurposeCut {
+    var start: usize = 0;
+    while (start < text.len) {
+        var end = start;
+        while (end < text.len and !purposeControl(text[end])) end += 1;
+        const line = std.mem.trim(u8, text[start..end], " ");
+        if (line.len > 0) {
+            if (!std.unicode.utf8ValidateSlice(line)) return .{ .line = "" };
+            if (line.len <= purpose_max_bytes) return .{ .line = line };
+            const cut = text_utils.utf8BackwardBoundary(line, purpose_max_bytes - purpose_ellipsis.len);
+            return .{ .line = std.mem.trimEnd(u8, line[0..cut], " "), .cut = true };
+        }
+        start = end + 1;
+    }
+    return .{ .line = "" };
+}
+
+fn purposeControl(byte: u8) bool {
+    return byte < 0x20 or byte == 0x7f;
+}
+
+/// Pure: whether `text`, read back from a log, is a purpose fx writes: one
+/// that `purposeCut` keeps exactly, so it is one short line of whole
+/// characters with no control character. A cut purpose's ellipsis keeps it.
+fn savedPurpose(text: []const u8) bool {
+    return text.len > 0 and std.mem.eql(u8, purposeCut(text).line, text);
+}
+
+/// What a new child is for: the first line of the instructions its parent
+/// gave it, or else of its first task (`purposeCut`). Null when neither has
+/// one. Caller owns the result.
+pub fn purposeOf(alloc: Allocator, instructions: ?[]const u8, task: []const u8) !?[]u8 {
+    const given = purposeCut(instructions orelse "");
+    const chosen = if (given.line.len > 0) given else purposeCut(task);
+    if (chosen.line.len == 0) return null;
+    if (!chosen.cut) return try alloc.dupe(u8, chosen.line);
+    return try std.mem.concat(alloc, u8, &.{ chosen.line, purpose_ellipsis });
+}
+
+test "a purpose is the first line with anything on it, cut on a character boundary" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings("Review src/stats.js.", purposeCut("\n  \nReview src/stats.js.  \nThen report.").line);
+    try std.testing.expectEqualStrings("Build", purposeCut("Build\tthe fix").line);
+    try std.testing.expectEqualStrings("", purposeCut(" \n\r\n").line);
+    try std.testing.expectEqualStrings("", purposeCut("bad \xff byte").line);
+    const long = text_utils.repeat("é", 60);
+    const cut = purposeCut(long);
+    try std.testing.expect(cut.cut);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut.line));
+    try std.testing.expect(cut.line.len <= purpose_max_bytes - purpose_ellipsis.len);
+
+    const from_instructions = (try purposeOf(alloc, "You build the parser fix.\nUse small commits.", "Build it.")).?;
+    defer alloc.free(from_instructions);
+    try std.testing.expectEqualStrings("You build the parser fix.", from_instructions);
+    const from_task = (try purposeOf(alloc, "  ", "Review src/stats.js and report every bug.\nMore.")).?;
+    defer alloc.free(from_task);
+    try std.testing.expectEqualStrings("Review src/stats.js and report every bug.", from_task);
+    const ellipsed = (try purposeOf(alloc, null, text_utils.repeat("x", 150))).?;
+    defer alloc.free(ellipsed);
+    try std.testing.expectEqualStrings(text_utils.repeat("x", 97) ++ "…", ellipsed);
+    try std.testing.expect(try purposeOf(alloc, null, "\n") == null);
+}
+
+fn fuzzPurpose(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    const cut = purposeCut(text);
+    // One line of whole characters, no longer than its cap, taken from the
+    // text as it was.
+    try std.testing.expect(cut.line.len <= purpose_max_bytes);
+    if (cut.cut) try std.testing.expect(cut.line.len <= purpose_max_bytes - purpose_ellipsis.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut.line));
+    for (cut.line) |byte| try std.testing.expect(!purposeControl(byte));
+    if (cut.line.len > 0) try std.testing.expect(std.mem.find(u8, text, cut.line) != null);
+    const owned = try purposeOf(std.testing.allocator, null, text);
+    defer if (owned) |value| std.testing.allocator.free(value);
+    if (owned) |value| {
+        try std.testing.expect(value.len <= purpose_max_bytes);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(value));
+    } else try std.testing.expectEqual(@as(usize, 0), cut.line.len);
+}
+
+test "a purpose stays one short line of whole characters for fuzzed text" {
+    try std.testing.fuzz({}, fuzzPurpose, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "Review src/stats.js and report every bug.\nMore.",
+            "\n\n   \t\x1b[31mred\x1b[0m",
+            text_utils.repeat("é", 70),
+            text_utils.repeat("\xf0\x9f\x98\x80", 40),
+            "bad \xc3 byte",
+        }) ++ @import("fuzz_corpus").subagent_purpose.*),
     });
 }
 
@@ -858,7 +988,7 @@ fn closeLines(arena: Allocator, child: Child, work_id: []const u8) ![2]session_a
         .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent),
+            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent, null),
         } },
         .{ .finished = .{ .child = child.id, .work_id = work_id, .outcome = .ok, .data = "{\"closed\":true}" } },
     };
@@ -1025,10 +1155,10 @@ test "a spawn saves who started a work its parent didn't" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     for ([_]reports.StartedBy{ .user, .child, .parent }) |by| {
-        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by)));
+        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by, null)));
     }
     // The parent's own work names no one in `by`.
-    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent), "\"by\":\"") == null);
+    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null), "\"by\":\"") == null);
     // An older fx's line, a value this fx doesn't know, and no data read as the parent's.
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"fingerprint\":\"ab\",\"report\":\"final\"}"));
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"by\":\"robot\"}"));
@@ -1098,10 +1228,16 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     };
     if (spawn.profile) |name| if (!profiles.validName(name)) return error.InvalidState;
     const profile = if (spawn.profile) |name| try alloc.dupe(u8, name) else null;
+    errdefer if (profile) |name| alloc.free(name);
+    // A purpose is one line that `purposeCut` keeps as it is; one fx would
+    // not have written, such as a long one or one with a line break or an
+    // escape, is not fx's, and the child keeps none.
+    const purpose = if (spawn.purpose) |text| if (savedPurpose(text)) try alloc.dupe(u8, text) else null else null;
     return .{
         .id = id,
         .kind = kind,
         .profile = profile,
+        .purpose = purpose,
         .phase = switch (last_outcome) {
             .interrupted, .lost => .interrupted,
             .completed, .failed, .cancelled => switch (kind) {
@@ -1149,7 +1285,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by),
+                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by, after.purpose),
                 } });
             }
         }
@@ -1183,7 +1319,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent, null),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
@@ -2075,12 +2211,45 @@ test "a closed v2 child is gone for good, and an older fx still reads its log" {
     try std.testing.expect(!older.last_report_owed);
 }
 
+test "a folded child keeps a saved purpose only when it is one line fx would write" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fingerprint = std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower);
+    const cases = [_]struct { saved: []const u8, kept: bool }{
+        .{ .saved = "Review src/stats.js.", .kept = true },
+        .{ .saved = text_utils.repeat("x", 97) ++ "…", .kept = true },
+        .{ .saved = "x\n- fake: idle.", .kept = false },
+        .{ .saved = "\x1b[31mred", .kept = false },
+        .{ .saved = " padded ", .kept = false },
+        .{ .saved = text_utils.repeat("x", 101), .kept = false },
+        .{ .saved = "bad \xff byte", .kept = false },
+    };
+    for (cases) |case| {
+        const entry: session_adapter.Child = .{
+            .id = try arena.dupe(u8, "1786460757753-0001"),
+            .work_id = try arena.dupe(u8, "work"),
+            .open = false,
+            .outcome = .ok,
+            .spawn_data = try arena.dupe(u8, try spawnData(arena, "reviewer", &fingerprint, null, null, .parent, case.saved)),
+            .finish_data = null,
+            .seq = 1,
+        };
+        var child = try childFromFolded(alloc, entry);
+        defer child.deinit(alloc);
+        if (case.kept) {
+            try std.testing.expectEqualStrings(case.saved, child.purpose.?);
+        } else try std.testing.expect(child.purpose == null);
+    }
+}
+
 test "only open children count toward the registry's limit" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent);
+    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent, null);
     const folded = try arena.alloc(session_adapter.Child, max_children + 1);
     for (folded, 0..) |*entry, i| entry.* = .{
         .id = try arena.dupe(u8, try arena.print("1786460757753-{d:0>4}", .{i})),

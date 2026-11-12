@@ -39,7 +39,7 @@ type Walk = { steps: Step[] };
 const MaxAttempt = 3; // Recovery.tla MaxAttempt
 const Active = new Set(["working", "waiting", "need_user"]);
 // Steps after which the model has a send on the wire, when it has one.
-const Sends = new Set(["Init", "TimerFires", "UserActs", "Relaunch"]);
+const Sends = new Set(["Init", "TimerFires", "SignInPoll", "UserActs", "Relaunch"]);
 
 function flag(name: string): boolean {
   return process.argv.includes(name);
@@ -130,7 +130,10 @@ async function loadGraph(out: string): Promise<Graph> {
 
 // The operations one model step becomes. `Respond` answers as the world
 // stands, in the model's order: no network, then trouble only the user can
-// fix, then a broken gateway, otherwise a complete answer.
+// fix, then a broken gateway, otherwise a complete answer. A broken gateway
+// fails as a 5xx or as a refused login, and a sign-in wait resends at the end
+// of its wait or when the sign-in fx opened closes, by the attempt's parity,
+// so both of each are walked.
 function opsFor(label: string, s: Model): Op[] {
   switch (label) {
     case "Responding": return [{ op: "event", name: "responding" }];
@@ -138,8 +141,10 @@ function opsFor(label: string, s: Model): Op[] {
     case "Respond":
       if (s.net === "down") return [{ op: "failed", kind: "offline" }];
       if (s.needUser) return [{ op: "failed", kind: "sign_in" }];
-      if (s.gateway === "broken") return [{ op: "failed", kind: "server" }];
+      if (s.gateway === "broken") return [{ op: "failed", kind: s.attempt % 2 === 0 ? "refused" : "server" }];
       return [{ op: "event", name: "succeeded" }];
+    case "SignInPoll":
+      return s.attempt % 2 === 0 ? [{ op: "event", name: "sign_in_closed" }] : [{ op: "poll" }];
     case "Drop": return [{ op: "failed", kind: "dropped" }];
     case "TimerFires": return [{ op: "wait" }];
     case "Crash": return [{ op: "exit" }];
@@ -148,6 +153,7 @@ function opsFor(label: string, s: Model): Op[] {
     case "UserCancels": return [{ op: "event", name: "user_cancel" }];
     case "UserActs": return [{ op: "event", name: "user_continue" }];
     case "NetDown": case "NetUp": case "GatewayBreak": case "GatewayHeal": case "NeedUserFault":
+    case "TroubleClears":
       return [];
     default:
       throw new Error(`no mapping for model action ${label}`);
@@ -327,13 +333,33 @@ if (options.selfCheck) {
   const mutants = [
     {
       name: "resends at once after a failure",
-      target: ".offline, .dropped, .unreadable, .server, .rate_limited => waitAfter(state, failure, now_ms),",
-      planted: ".offline, .dropped, .unreadable, .server, .rate_limited => sendNow(state, now_ms, .{}),",
+      target: "        else\n            waitAfter(state, failure, now_ms),\n        .too_long",
+      planted: "        else\n            sendNow(state, now_ms, .{}),\n        .too_long",
+    },
+    {
+      name: "asks for a sign-in when the gateway refuses a fresh login",
+      target: "        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (polled and !signed_in)",
+      planted: "        .refused => askUser(state, .sign_in, now_ms),\n        .offline, .dropped, .unreadable, .server, .rate_limited => if (polled and !signed_in)",
+    },
+    {
+      name: "opens a second sign-in when its own resend fails on the way",
+      target: ".refused => if (polled and !signed_in)\n            waitForSignInAgain(state, now_ms)",
+      planted: ".refused => if (polled and !signed_in)\n            waitAfter(state, failure, now_ms)",
+    },
+    {
+      name: "never resends while waiting for a sign-in",
+      target: ".need_user => if (state.need != .sign_in)",
+      planted: ".need_user => if (true)",
+    },
+    {
+      name: "shows the retry status on a resend while waiting for a sign-in",
+      target: "        .send = .{ .no_fast = state.flags.no_fast },\n        .status = show(state, signInStatus(state, now_ms)),",
+      planted: "        .send = .{ .no_fast = state.flags.no_fast },\n        .status = show(state, retryingStatus(state)),",
     },
     {
       name: "never hands a resend's status back to the thinking row",
-      target: ".sending => if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms)",
-      planted: ".sending => if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms and false)",
+      target: "else if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms)",
+      planted: "else if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms and false)",
     },
     {
       name: "forgets its crashes when the user signs in",

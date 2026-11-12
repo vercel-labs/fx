@@ -1073,6 +1073,11 @@ pub fn Runtime(comptime App: type) type {
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent);
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
+            // The agent's own subagents, as its turn started with them.
+            const subagents: ?[]const u8 = if (comptime agents.hasAgentField(App, "session_persistence"))
+                if (app_session_runtime.Runtime(App).ownSubagentHost(agent)) |team_host| try team_host.teamNote(arena, agent.worker.activeTurnId()) else null
+            else
+                null;
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
@@ -1083,6 +1088,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .subagents = subagents,
             }, arena, messages);
         }
 
@@ -1643,6 +1649,7 @@ pub fn Runtime(comptime App: type) type {
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
+                .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
