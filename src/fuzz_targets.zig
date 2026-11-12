@@ -18,7 +18,7 @@ test {
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/cli/doctor_child_status.zig");
     _ = @import("core/app/trace_report.zig");
-    _ = @import("core/compactor/progress.zig");
+    _ = @import("core/compactor/compactor.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
     _ = @import("core/images/image_attachments.zig");
