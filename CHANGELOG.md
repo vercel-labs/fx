@@ -1,8 +1,145 @@
 # fx
 
-## 0.0.16
+## 0.0.17
 
 <!-- release:start -->
+
+**Subagents now work alongside you: switch between agents and run several fx instances in one window. Vercel Token Pass is now first-class in fx. Tool definitions 48.0% smaller, and 82.0% of later input from the prompt cache, up from 61.3%.**
+
+### New Features
+
+- Subagents work alongside the main agent and report back when they finish.
+- Switch to any subagent to watch it, message it, or answer its prompts.
+- Open the agent list with Down or Ctrl+X to see, search, switch, and close agents.
+- Each subagent has its own model, effort, Fast mode, and permission mode, and subagents can nest two levels deep.
+- The main agent sees its subagents each turn and reuses idle ones for related work.
+- Agent profiles in `~/.fx/agents` or `.fx/agents` set an agent's tools, MCP servers, model, and prompt.
+- `fx --profile <name>` starts a session in an agent profile.
+- `fx --instances <n>` and `/launch` run several fx instances in one window.
+- `fx sessions --live` lists open sessions and their subagents.
+- `fx session <id>/<agent>` reads a subagent's conversation, and `--tail <n>` shows only the last turns.
+- Vercel Token Pass models come first in the model picker.
+- `/credits` and `fx credits` show your Token Pass credit and its reset date.
+- Token Pass sessions use Token Pass models for titles, images, and auto mode review.
+- The `toolbox` tool replaces `skill`, `capability_search`, and `mcp_select_tool`, so every request sends the same tools.
+- `fx mcp call TOOL` runs an MCP tool from a shell command.
+- Custom connections can set effort levels, request fields, headers, timeouts, and a title model.
+- Cache warming keeps Claude's prompt cache warm while you pause, and `"cache_warming": false` turns it off.
+- Reopening a session after a crash or a closed window sends the interrupted request again.
+- Plain `fx` shows `Interrupted turn · /resume to continue` when a turn was left unfinished.
+- `fx config` lists, reads, and changes settings.
+- `fx ask --config key=value` overrides a setting for one request.
+- `fx completion bash`, `zsh`, and `fish` print a shell completion script.
+- `fx "<prompt>"` starts a session with that prompt, and `-r` is short for `--resume`.
+- `FX_HOME` moves the profile folder from `~/.fx`.
+
+### Improvements
+
+- Toolbox raised prompt cache reads from 61.3% to 82.0% of later input in live tests across 9 model families.
+- Built-in tool definitions are 48.0% smaller than in 0.0.16, and a new session's first request is 32.4% smaller.
+- libfx's native addons are 10.1% to 12.9% smaller than in 0.0.16.
+- A shell result for a command with no output is about 70 characters instead of about 340.
+- Skill descriptions in the toolbox menu stop at 200 characters, down from 1,024.
+- Earlier turns go back to the model unchanged, so the prompt cache keeps covering them.
+- Conversations with many images drop the oldest in blocks, so the prompt cache stays valid longer.
+- Amazon Nova models now use the prompt cache.
+- Long sessions stay responsive, with the last turn of a 2,400-tool-call session taking 3 s instead of 11 s.
+- Full detail in Ctrl+O shows each model call with its model, time, tokens, and call ID.
+- `/trace` writes JSON Lines instead of a Markdown report.
+- Questions from the model render as Markdown.
+- `fx doctor` now tests your credential and connects to each approved MCP server.
+- Requests keep retrying through network drops, gateway errors, and rate limits until they succeed or you press Esc.
+- More gateway errors are retried, including 520, 524, and 529.
+- The status line shows why a request is retrying and when it tries again.
+- fx resends a request within about a second when the Mac changes networks, instead of after 45 seconds.
+- fx finds a dead connection within about 5 seconds after the network returns, instead of waiting up to 10 minutes.
+- On a dead network, `fx ask` and `fx acp` start in about 2 seconds instead of 20 to 30.
+- A brief Mac sleep no longer restarts a healthy answer.
+- Errors show in plain words instead of error names.
+- A rejected or filtered request waits for you to send it again with Enter instead of ending the turn.
+- Running out of credits offers to retry, switch models, or cancel.
+- An expired sign-in opens the sign-in and then sends the request again.
+- A restarted answer replaces the broken one instead of following it.
+- A reply cut off before any text is sent again once instead of ending the turn.
+- fx asks the model to continue once when it stops without a reply.
+- A command that fails again after an edit goes back to the model instead of ending the turn.
+- Shell results tell the model when a command has printed nothing for 2 minutes.
+- `edit_file` errors show the lines the model most likely meant.
+- MCP arguments sent as text go to the server as the type its schema names.
+- Menus and pickers match letters in order, so `/mdl` finds `/model`.
+- The model picker labels Fast models and Fast mode apart and lists newer GPT versions first.
+- Ordered lists in replies align their numbers.
+- Skill discovery warnings no longer show at startup.
+- MCP config changes made outside a session load at the next prompt.
+- `fx mcp add` signs in to a new server that needs it, and `--no-login` skips that.
+- Mistyped commands, flags, and settings suggest the closest match.
+- Every command accepts flags as `--flag=value`.
+- `fx pr`, `fx issue`, and `fx acp` take the same run flags as `fx ask`.
+- fx turns off color when `NO_COLOR` is set or `TERM=dumb`.
+- The resume command prints on its own line at exit.
+- A new libfx session skips 3 empty storage reads on its first prompt.
+- libfx starts preparing a prompt's run while the queue confirms the prompt.
+
+### Bug Fixes
+
+- Closing the window during a request no longer cancels it, so `fx -c` sends it again.
+- `fx ask` and ACP no longer wait 15 seconds for a stuck session title.
+- Esc and Ctrl-C stop a request at once during a stuck DNS lookup.
+- fx uses a login another fx just refreshed instead of asking you to sign in again.
+- A request waiting for a sign-in resends with the team you picked.
+- Claude Fable 5.1 and later no longer reject a continued session with "Invalid signature in thinking block".
+- Starting many HTTP MCP servers no longer crashes fx.
+- MCP logins save while other fx processes use the Keychain.
+- MCP logout says when a login couldn't be removed or revoked.
+- A named pipe in place of `~/.fx/mcp.json` no longer hangs fx.
+- fx says when it can't write its output and stops quietly when piped into `head`.
+- Startup-file wrappers such as Socket Firewall's `npm` work in fx.
+- Large shell snapshots restore in full with macOS's bash 3.2.
+- A startup file that defines `builtin` no longer breaks fx's shell.
+- A backslash before a newline continues the line, as in the shell.
+- A daemon started by a command keeps running after the command ends.
+- Ctrl+Backspace deletes a word, and repeated Cmd+Backspace deletes across lines.
+- `/rename`, `/image`, and `/shell` picked from the slash menu wait for their argument.
+- Wide edit rows keep their `+N / -M` counts.
+- Theme switches and bracketed paste keep working after a terminal reset or Ctrl+Z.
+- Ctrl+G updates fx without moving or repeating the conversation.
+- A damaged session says it is unreadable and points to `fx doctor`.
+- `/credits` shows the AI Gateway amount used.
+- Skills load from a linked `FX_HOME`, with multi-line descriptions and nested keys.
+- fx keeps running when herdr doesn't answer.
+- A relative `HOME` no longer crashes `fx mcp`.
+- MCP calls wait up to 5 minutes, up from 60 seconds.
+- Common tool-call mistakes from models no longer fail the call.
+- A blank custom answer no longer submits a question.
+- Quitting while the transcript loads no longer crashes fx.
+- Deeply nested provider events no longer crash fx.
+- Fixed a data race in parallel `grep_files` searches.
+
+### Security
+
+- Control codes in model replies and prompts show as text instead of acting on the terminal.
+- `fx logout codex` revokes the login at OpenAI.
+- Shell commands no longer inherit `web_fetch` connections.
+- `fx doctor` fix lines can't run commands from a project's `.mcp.json`.
+- When other users can write to `~/.fx`, fx removes their access and still loads your settings.
+- Control characters in error messages show as visible escapes.
+
+### Breaking Changes
+
+- Auto mode now holds an action only for prompt injection or harm to your machine.
+- The subagent tool's one-off `run` action is gone.
+- `fx doctor` exits 1 when a check fails.
+- Usage errors exit with status 2 instead of 1.
+- `statusLine` is now `status_line`, and `notifications` is now `sound`.
+- `fx setup`, `/setup`, `fx mcp --profile`, and `/allowlist user` and `local` warn now and stop working in fx 0.0.18.
+- Old resume spellings, such as `fx resume` and `--resume-id`, are removed.
+- `fx ask --verbose` and `FLASH_SYNC_UPDATES` are removed; use `FX_SYNC_UPDATES`.
+- Esc during a retry ends the turn, and the separate Esc-to-pause is gone.
+- `fx ask --json` and ACP report recovery as `state`, `attempt`, `need`, and `message`.
+
+<!-- release:end -->
+
+## 0.0.16
 
 **fx uses 41% fewer tokens. The CLI is 2.8% smaller. libfx npm downloads are about 60% smaller. Edit files up to 4× larger, now up to 16 MiB.**
 
@@ -54,8 +191,6 @@
 
 - libfx now requires Node.js `^20.19.0 || >=22.12.0`, including when loaded with `require()`.
 - libfx 0.0.15 cannot reopen saved turns containing the new context updates. Upgrade every worker sharing their session store before starting new turns.
-
-<!-- release:end -->
 
 ## 0.0.15
 
