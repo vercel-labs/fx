@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
-import { latestTraceReportPath, readTraceReport, waitForNewTraceReport } from "./trace-report";
+import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
   canonicalSubagentIdForStore,
   confirmationReplay,
@@ -1983,6 +1983,19 @@ describe("effect-aware command permissions", () => {
       const report = await waitForNewTraceReport(tmpDir);
       expect(report.one("last_shutdown").status).toBe("unreadable");
       expect(report.all("transcript_entry").some((entry) => String(entry.text).includes("TRACE_FAULT_READY"))).toBe(true);
+
+      // A report time past year 9999 is left out instead of stopping fx.
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-shutdown.json"),
+        '{"total_ms":42,"recorded_at_ms":9000000000000000000}',
+      );
+      const before = new Set(traceReportNames(tmpDir));
+      await activeSession.sendText("/trace");
+      const farReport = await waitForNewTraceReport(tmpDir, before);
+      const farShutdown = farReport.one("last_shutdown");
+      expect(farShutdown).toMatchObject({ status: "recorded", total_ms: 42 });
+      expect(farShutdown.recorded_at).toBeUndefined();
+      expect(farShutdown.recorded_at_ms).toBeUndefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

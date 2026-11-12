@@ -14,7 +14,8 @@
 //!
 //! - A time is two fields: `<name>` is ISO 8601 UTC with milliseconds, such as
 //!   `2026-11-11T19:14:21.123Z`, and `<name>_ms` is Unix time in
-//!   milliseconds. Both are left out when the time is unknown.
+//!   milliseconds. Both are left out when the time is unknown or outside the
+//!   years 1970 to 9999.
 //! - A field with no value is left out; no field is `null`.
 //! - Counts, sizes, and durations are integers; durations end in `_ms`.
 //! - `source` is `parent` for the main agent, or `subagent` with a
@@ -161,6 +162,9 @@ const notice_text = "Private diagnostic report. It may include prompts, file pat
 const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
+/// The last millisecond of year 9999. ISO 8601 writes a later year with more
+/// than four digits, and `formatUtc` overflows on a year past 65535.
+const max_time_ms: i64 = 253_402_300_799_999;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
 
@@ -256,9 +260,11 @@ const Records = struct {
         try self.json.write(value);
     }
 
-    /// A time as `<name>` (ISO 8601 UTC) and `<name>_ms`; nothing when unknown.
+    /// A time as `<name>` (ISO 8601 UTC) and `<name>_ms`; nothing when it is
+    /// unknown or outside the years 1970 to 9999. A time can come from a file
+    /// on disk, such as the last-shutdown report, so it is checked here.
     fn time(self: *Records, comptime name: []const u8, ms: i64) !void {
-        if (ms <= 0) return;
+        if (ms <= 0 or ms > max_time_ms) return;
         var buf: [40]u8 = undefined;
         try self.text(name, try formatUtc(&buf, ms));
         try self.number(name ++ "_ms", ms);
@@ -1789,6 +1795,10 @@ test "trace times leave out unknown values" {
     try w.records.time("zero", 0);
     try w.records.time("negative", -5);
     try w.records.time("at", 1);
+    try w.records.time("last", 253_402_300_799_999);
+    try w.records.time("year_10000", 253_402_300_800_000);
+    try w.records.time("far", 9_000_000_000_000_000_000);
+    try w.records.time("max", std.math.maxInt(i64));
     try w.records.end();
     var trace = try w.trace();
     defer trace.deinit();
@@ -1797,6 +1807,11 @@ test "trace times leave out unknown values" {
     try expectAbsent(record, "zero_ms");
     try expectAbsent(record, "negative");
     try std.testing.expectEqualStrings("1970-01-01T00:00:00.001Z", try testString(record, "at"));
+    try std.testing.expectEqualStrings("9999-12-31T23:59:59.999Z", try testString(record, "last"));
+    inline for (.{ "year_10000", "far", "max" }) |name| {
+        try expectAbsent(record, name);
+        try expectAbsent(record, name ++ "_ms");
+    }
 }
 
 test "trace process memory reads ps output and keeps other shapes as lines" {
@@ -2728,6 +2743,9 @@ test "trace last shutdown reads a report or says why it cannot" {
         .{ .contents = "[1,2]", .status = "unreadable" },
         .{ .contents = "\"text\"", .status = "unreadable" },
         .{ .contents = "{\"total_ms\":\"slow\",\"recorded_at_ms\":null,\"stages\":{\"name\":1}}", .status = "recorded" },
+        // A time past year 9999 is left out instead of stopping fx.
+        .{ .contents = "{\"recorded_at_ms\":9000000000000000000}", .status = "recorded" },
+        .{ .contents = "{\"recorded_at_ms\":-9000000000000000000}", .status = "recorded" },
     };
     for (cases) |case| {
         const w = try TestWriter.create();
