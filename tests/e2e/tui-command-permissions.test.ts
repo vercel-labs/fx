@@ -3116,7 +3116,9 @@ describe("effect-aware command permissions", () => {
       const foregroundRawAnsi = await activeSession.captureFullScrollbackEscapes();
       expect(foregroundScrollback).toContain("large TUI foreground complete");
       expect(foregroundScrollback).not.toContain("integer does not fit in destination type");
-      expect(foregroundRawAnsi).toContain("…");
+      // The comment lines drop out of the short form, so the row is short.
+      expect(foregroundScrollback).toContain("● Ran printf ✓");
+      expect(foregroundRawAnsi).not.toContain("large lifecycle");
       expect(existsSync(join(foregroundRoot.workspace, foregroundMarker))).toBe(true);
       expect(foregroundGateway.requests).toHaveLength(2);
       expect(readFileSync(foregroundStderr, "utf8")).toBe("");

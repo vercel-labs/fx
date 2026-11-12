@@ -2090,7 +2090,11 @@ fn shortenCommandPhrase(
     if (display.len == 0 or phrase.len <= display.len or !std.mem.endsWith(u8, phrase, display)) return null;
     const label = phrase[0 .. phrase.len - display.len];
     if (label[label.len - 1] != ' ') return null;
-    const short = try shortCommandSteps(scratch, display) orelse return null;
+    // Lex the command as the model sent it. The display folds its lines into
+    // one, which would turn a comment line into a comment over the whole
+    // command.
+    const source = storyArgString(scratch, record, "command") orelse display;
+    const short = try shortCommandSteps(scratch, source) orelse return null;
     return try scratch.print("{s}{s}", .{ label, try formatShortCommand(scratch, short, base_style) });
 }
 
@@ -4779,6 +4783,22 @@ fn storySearchDetail(entry_id: u32, tool_name: []const u8, kind: types.ToolActiv
         .arguments_json = @constCast(arguments_json),
         .outcome = .completed,
     };
+}
+
+test "a command that starts with a comment line shows the steps after it" {
+    const alloc = std.testing.allocator;
+    // The display folds the command's lines into one, as core stores it.
+    const display = "# check that the build left the tree clean git status --short && git diff --stat";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ display ++ "\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"command\":\"# check that the build left the tree clean\\ngit status --short && git diff --stat\"}", 0, null)};
+    details[0].command_display = @constCast(display);
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const row = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(u8, row, "● Ran \x1b[38;5;252mgit\x1b[39m status, \x1b[38;5;252mgit\x1b[39m diff ✓"));
+    try std.testing.expect(std.mem.find(u8, row, "check that") == null);
 }
 
 test "searches for one pattern share a row that names their folders" {
