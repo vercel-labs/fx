@@ -2454,8 +2454,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the MCP fixture with a typed argument.");
       const cause = "arguments rejected: limit is a string, the schema wants a number";
-      await tui.waitForText(`Failed ${TOOL_NAME}: ${cause}`, 20_000);
+      // The row names the failed call, and the reason line under it names the
+      // cause.
+      await tui.waitForText(cause, 20_000);
       await tui.waitForText("Rejected arguments complete.", 20_000);
+      expect(await tui.captureFullScrollback()).toContain(`Failed ${TOOL_NAME}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
 
