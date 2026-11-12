@@ -6,6 +6,7 @@ const net_connect = @import("net_connect.zig");
 
 const posix = std.posix;
 const Threaded = std.Io.Threaded;
+const log = std.log.scoped(.testing_listener);
 
 /// How long one wait for a connection lasts before the stop flag is read
 /// again.
@@ -21,12 +22,30 @@ pub const AcceptError = posix.PollError || std.Io.net.Server.AcceptError;
 /// a connection opened only to wake it can fail like any other. The caller
 /// owns the returned stream.
 ///
-/// A connection that is gone by the time `accept` runs sends the loop back
-/// to waiting, through `acceptIfWaiting`, so the stop is still read.
+/// A connection that `poll` reports and `accept` then does not find is
+/// logged as an error, which fails the running test with the port, the poll
+/// result and the accept error, and the loop goes back to waiting, so the
+/// stop is still read. With one thread accepting on a listener nothing else
+/// takes its connections, so the report names a cause to look into instead
+/// of a hang.
 pub fn acceptUnlessStopping(
     server: *std.Io.net.Server,
     io: std.Io,
     stopping: *const std.atomic.Value(bool),
+) AcceptError!?std.Io.net.Stream {
+    return acceptUntilStop(server, io, stopping, .report);
+}
+
+/// What a waiting thread does with a connection that `poll` reported and
+/// `accept` did not find: report it, or, in a test whose threads take
+/// connections from each other on purpose, only wait again.
+const OnGone = enum { report, wait };
+
+fn acceptUntilStop(
+    server: *std.Io.net.Server,
+    io: std.Io,
+    stopping: *const std.atomic.Value(bool),
+    on_gone: OnGone,
 ) AcceptError!?std.Io.net.Stream {
     var fds = [_]posix.pollfd{.{
         .fd = server.socket.handle,
@@ -36,13 +55,53 @@ pub fn acceptUnlessStopping(
     while (!stopping.load(.seq_cst)) {
         fds[0].revents = 0;
         if (try posix.poll(&fds, stop_check_ms) == 0) continue;
-        if (try acceptIfWaiting(server, io)) |stream| return stream;
+        switch (try acceptWaiting(server, io)) {
+            .stream => |stream| return stream,
+            .gone => |errno| if (on_gone == .report) {
+                reportGone(server.socket.address.getPort(), fds[0].revents, errno);
+            },
+        }
     }
     return null;
 }
 
+/// Room for the longest report `goneMessage` writes.
+const gone_message_max = 160;
+
+/// Logs a connection that `poll` reported and `accept` did not find. An
+/// error logged during a test fails that test, with this text in its output.
+fn reportGone(port: u16, revents: i16, errno: posix.E) void {
+    var buffer: [gone_message_max]u8 = undefined;
+    const text = goneMessage(&buffer, port, revents, errno) catch "poll reported a connection, but accept found none";
+    log.err("{s}", .{text});
+}
+
+fn goneMessage(buffer: []u8, port: u16, revents: i16, errno: posix.E) error{NoSpaceLeft}![]const u8 {
+    return std.mem.print(buffer, "poll reported a connection on port {d} (revents 0x{x}), but accept found none ({s})", .{
+        port,
+        @as(u16, @bitCast(revents)),
+        @tagName(errno),
+    });
+}
+
 /// Accepts the connection that `poll` found waiting on `server`, or returns
-/// null when it is gone, as when another thread took it first. A blocking
+/// null when it is gone, as when another thread took it first.
+pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.Io.net.Stream {
+    return switch (try acceptWaiting(server, io)) {
+        .stream => |stream| stream,
+        .gone => null,
+    };
+}
+
+/// What `acceptWaiting` found: the connection, or the accept error that
+/// says it is gone.
+const Waiting = union(enum) {
+    stream: std.Io.net.Stream,
+    gone: posix.E,
+};
+
+/// Accepts the connection that `poll` found waiting on `server`, or reports
+/// it gone with the accept error, as when another thread took it first. A blocking
 /// `accept` would wait for the next connection instead, and a thread waiting
 /// there never reads its stop flag. This leaves the listener non-blocking,
 /// so accept on it only through this function from then on:
@@ -52,7 +111,7 @@ pub fn acceptUnlessStopping(
 /// uses it. macOS has no `accept4` and gives the stream the listener's
 /// non-blocking flag, so there both are set after the accept, as std does.
 /// The caller owns the returned stream.
-pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.Io.net.Stream {
+fn acceptWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!Waiting {
     const listener = server.socket.handle;
     try net_connect.setNonblocking(listener);
     var storage: Threaded.PosixAddress = undefined;
@@ -65,7 +124,7 @@ pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.
         switch (posix.errno(rc)) {
             .SUCCESS => break @intCast(rc),
             .INTR => continue,
-            .AGAIN, .CONNABORTED => return null,
+            .AGAIN, .CONNABORTED => |errno| return .{ .gone = errno },
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NFILE => return error.SystemFdQuotaExceeded,
             .NOBUFS, .NOMEM => return error.SystemResources,
@@ -81,7 +140,7 @@ pub fn acceptIfWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!?std.
         try net_connect.setCloexec(fd);
         try net_connect.setBlocking(fd);
     }
-    return stream;
+    return .{ .stream = stream };
 }
 
 /// Waits up to `limit_ms` for `flag` to be set and returns whether it was.
@@ -274,7 +333,7 @@ const Rivals = struct {
         var backend: std.Io.Threaded = .init_single_threaded;
         const zio = backend.io();
         self.started[index].store(true, .seq_cst);
-        const stream = acceptUnlessStopping(&self.server, zio, &self.stopping) catch {
+        const stream = acceptUntilStop(&self.server, zio, &self.stopping, .wait) catch {
             self.failed.store(true, .seq_cst);
             return;
         } orelse return;
@@ -360,6 +419,35 @@ test "a waiting accept ends at the stop when another thread takes the connection
         try std.testing.expectEqual(@as(usize, 1), rivals.accepted.load(.seq_cst));
         try std.testing.expect(!rivals.failed.load(.seq_cst));
     }
+}
+
+test "a waiting accept reports a connection that is gone, with the accept error" {
+    var backend: std.Io.Threaded = .init_single_threaded;
+    const zio = backend.io();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    try connectOnce(&server);
+    // Another accept takes the connection first, as a thread that saw the
+    // same poll result could.
+    const taken = posix.system.accept(server.socket.handle, null, null);
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(taken));
+    _ = posix.system.close(@intCast(taken));
+    switch (try acceptWaiting(&server, zio)) {
+        .stream => |stream| {
+            stream.close(zio);
+            return error.TestUnexpectedResult;
+        },
+        .gone => |errno| try std.testing.expectEqual(posix.E.AGAIN, errno),
+    }
+}
+
+test "the report of a gone connection names the port, the poll result and the accept error" {
+    var buffer: [gone_message_max]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "poll reported a connection on port 43210 (revents 0x1), but accept found none (AGAIN)",
+        try goneMessage(&buffer, 43210, posix.POLL.IN, .AGAIN),
+    );
 }
 
 test "a stream the waiting accept returns blocks and is closed on exec" {
