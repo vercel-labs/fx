@@ -4934,7 +4934,8 @@ pub const TranscriptRuntime = struct {
     /// The last stable frame handed a resumed transcript's flow to the commit
     /// anchor and invalidated it, so the rows it painted are on screen with
     /// no anchor until the next stable frame. The transcript window holds
-    /// every drop until then.
+    /// every drop until then, or until the transcript leaves the screen
+    /// (`slotLeftScreen`).
     resume_handoff_repaint_pending: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
@@ -5020,6 +5021,15 @@ pub const TranscriptRuntime = struct {
         inline for (transcript_slot_fields) |name| {
             std.mem.swap(@FieldType(TranscriptRuntime, name), &@field(self, name), &@field(slot, name));
         }
+    }
+
+    /// Marks `slot`'s transcript as off the screen after another agent's
+    /// took its place. None of its rows are on screen any more, so a resume
+    /// handoff it was waiting to repaint no longer holds its transcript
+    /// window's drops; showing it again resets the terminal and repaints it
+    /// from its entries.
+    pub fn slotLeftScreen(slot: *TranscriptSlot) void {
+        slot.resume_handoff_repaint_pending = false;
     }
 
     /// Frees a transcript that is not on screen.

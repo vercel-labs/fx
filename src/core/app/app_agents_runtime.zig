@@ -2158,6 +2158,7 @@ pub fn Runtime(comptime App: type) type {
             if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
+            TranscriptRuntime.slotLeftScreen(&leaving.transcript);
             std.mem.swap(AssistantPacer, &app.pacer, &leaving.pacer);
             std.mem.swap(bool, &app.fast_mode, &leaving.fast_mode);
             app.shell.swapSlot(&arriving.transcript);

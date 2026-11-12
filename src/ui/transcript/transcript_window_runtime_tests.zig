@@ -634,3 +634,33 @@ test "a resumed transcript keeps the rows it painted until a frame repaints them
     try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
     try expectWindowMatchesEntries(&runtime);
 }
+
+test "a resumed transcript that leaves the screen before its repaint lets its window drop" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    var handoff = try transcriptFrame(alloc, &runtime, runtime.notebook.pending_resume_source.?.bytes, .none);
+    defer handoff.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &handoff, committedFrameResult());
+
+    // Another agent comes on screen before the next frame, as `attach` does.
+    var hidden: runtime_mod.TranscriptSlot = .{};
+    defer TranscriptRuntime.deinitSlot(&hidden, alloc);
+    runtime.swapSlot(&hidden);
+    TranscriptRuntime.slotLeftScreen(&hidden);
+    // A turn it ends while hidden runs with its transcript swapped in, and
+    // none of its rows are on screen.
+    runtime.swapSlot(&hidden);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}
