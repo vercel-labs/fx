@@ -1,5 +1,8 @@
 const std = @import("std");
 const observation = @import("../agent/runtime/observation.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const auth_transition = @import("../auth/auth_transition.zig");
+const credentials = @import("../auth/credentials.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -8,6 +11,8 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const gateway_step = @import("../agent/runtime/gateway_step.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const stored_login_testing = @import("../auth/stored_login_testing.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -20,8 +25,10 @@ pub const max_prompt_excerpt_bytes: usize = 2048;
 pub const default_timeout_ms: u32 = 15_000;
 /// How long a turn that has ended still waits for its title before it
 /// cancels the call. The title runs alongside the whole turn, so only a
-/// call slower than the turn waits at all, and a stuck one holds the turn's
-/// end for at most this long instead of `default_timeout_ms`.
+/// call slower than the turn waits at all, and a stuck model call holds the
+/// turn's end for at most this long instead of `default_timeout_ms`. A read
+/// of the shared sign-in that waits for another fx process's lock can hold it
+/// longer, because cancelling does not interrupt that wait.
 pub const after_turn_grace_ms: u32 = 2_000;
 const max_output_tokens: u32 = 128;
 const content_capture_limit: usize = 4 * 1024;
@@ -41,6 +48,11 @@ pub const Gate = struct {
     recovery_replay: bool,
     /// A generation attempt is already running.
     task_running: bool,
+    /// This session already started a title request. A turn the next prompt
+    /// interrupts reaches the history only after that prompt starts, so the
+    /// history alone cannot tell the first prompt from a later one
+    /// (tests/tla/session_title/SessionTitle.tla AtMostOneTitleRequest).
+    title_started: bool = false,
 };
 
 pub fn shouldGenerate(gate: Gate) bool {
@@ -48,7 +60,8 @@ pub fn shouldGenerate(gate: Gate) bool {
         gate.provider_supports_titles and
         gate.session_untitled and
         !gate.recovery_replay and
-        !gate.task_running;
+        !gate.task_running and
+        !gate.title_started;
 }
 
 /// Returns the bounded excerpt of the first user prompt used as title source
@@ -110,6 +123,11 @@ pub const Request = struct {
     prompt_excerpt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: u32 = default_timeout_ms,
+    /// The shared sign-in `api_key` belongs to. With it, the request sends
+    /// the stored token, which another fx process may have refreshed, and
+    /// after a 401 sends once more only with a stored token that replaced the
+    /// rejected one. It never refreshes the sign-in itself.
+    shared_sign_in: ?auth_runtime.SharedSignIn = null,
 };
 
 /// Why a title generation attempt did not install a generated title. Static
@@ -147,17 +165,98 @@ pub const Outcome = union(enum) {
 /// Runs one bounded title generation call. Effects live here; prompt
 /// selection and output sanitization stay pure above.
 pub fn run(alloc: Allocator, request: Request) !Outcome {
-    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instructions_text }};
-    const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt_excerpt }};
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(request.timeout_ms),
     });
+    if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+    var token: Token = .{ .bytes = request.api_key };
+    defer token.deinit(alloc);
+    // Another fx process may have refreshed the shared sign-in since this one
+    // read it (tests/tla/session_title/SessionTitle.tla TitleFirstSendUsesStore).
+    if (request.shared_sign_in) |sign_in| {
+        if (try auth_runtime.readStoredCredential(alloc, sign_in)) |stored| token.adopt(alloc, stored);
+    }
+    if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+
+    var sent = try send(alloc, request, token.bytes, deadline);
+    defer sent.deinit(alloc);
+    if (request.shared_sign_in) |sign_in| {
+        if (rejectedAsStale(sent, sign_in)) {
+            if (try auth_runtime.storedReplacement(alloc, sign_in, token.bytes)) |replacement| {
+                token.adopt(alloc, replacement);
+                debug_trace.logf("session", "event=title_generation replay=stored_credential", .{});
+                sent.deinit(alloc);
+                // Keeps the deferred deinit safe if the next send fails.
+                sent = .{ .unavailable = .{ .reason = .cancelled } };
+                sent = try send(alloc, request, token.bytes, deadline);
+            } else {
+                debug_trace.logf("session", "event=title_generation replay=skipped reason=no_stored_replacement", .{});
+            }
+        }
+    }
+    return finish(alloc, request, sent);
+}
+
+/// The token a title request sends: the caller's copy until the request reads
+/// one from the store, which it then owns and wipes.
+const Token = struct {
+    bytes: []const u8,
+    owned: ?credentials.Credential = null,
+
+    fn adopt(self: *Token, alloc: Allocator, credential: credentials.Credential) void {
+        if (self.owned) |*old| old.deinit(alloc);
+        self.owned = credential;
+        self.bytes = credential.token;
+    }
+
+    fn deinit(self: *Token, alloc: Allocator) void {
+        if (self.owned) |*credential| credential.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// One request to the title model, or why it could not complete.
+const Sent = union(enum) {
+    result: stream_provider.Result,
+    unavailable: Failure,
+
+    fn deinit(self: *Sent, alloc: Allocator) void {
+        switch (self.*) {
+            .result => |*result| result.deinit(alloc),
+            .unavailable => {},
+        }
+    }
+};
+
+/// Whether the gateway rejected the request with 401, which a token another
+/// fx process already replaced can explain (tests/tla/session_title/
+/// SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable). The title has no tools
+/// and shows nothing while it streams, so sending it again is always safe.
+fn rejectedAsStale(sent: Sent, sign_in: auth_runtime.SharedSignIn) bool {
+    const failure = switch (sent) {
+        .result => |result| switch (result) {
+            .failed => |failed| failed,
+            .completed => return false,
+        },
+        .unavailable => return false,
+    };
+    return auth_transition.decideAuthReplay(.{
+        .authentication_rejected = failure.kind == .unauthorized,
+        .refreshable = credentials.sourceRefreshable(sign_in.source),
+        .delivery_safe = true,
+        .already_replayed = false,
+    }) == .refresh_and_replay;
+}
+
+fn send(alloc: Allocator, request: Request, token: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!Sent {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instructions_text }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt_excerpt }};
     const credential: stream_provider.CredentialLease = if (request.credential_source == .host_managed)
         .host_managed
     else
         .{ .direct = .{
-            .secret_bytes = request.api_key,
+            .secret_bytes = token,
             .source = request.credential_source,
             .account_id = request.account_id,
             .tenant_context = request.gateway_team,
@@ -165,7 +264,7 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
     var delivery = stream_provider.DeliveryCertainty.init();
     var attempt_evidence: stream_provider.AttemptEvidence = .{};
     var callback_context: u8 = 0;
-    var result = gateway_step.streamModelCompletion(
+    const result = gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
         .{
@@ -197,8 +296,15 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         debug_trace.logf("session", "event=title_generation result=unavailable err={s}", .{@errorName(err)});
         return .{ .unavailable = .{ .reason = .transport_error, .detail = @errorName(err) } };
     };
-    defer result.deinit(alloc);
+    return .{ .result = result };
+}
+
+fn finish(alloc: Allocator, request: Request, sent: Sent) !Outcome {
     if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+    const result = switch (sent) {
+        .unavailable => |failure| return .{ .unavailable = failure },
+        .result => |result| result,
+    };
     const completion = switch (result) {
         .failed => |failure| {
             debug_trace.logf(
@@ -220,10 +326,12 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
 
 fn ignoreEvent(_: *anyopaque, _: stream_provider.Event) void {}
 
-/// One background title generation call with owned inputs. The thread is
-/// bounded by `default_timeout_ms`; `destroy` cancels, joins, and frees, so
-/// it is safe before `spawn` returns and after completion. All fields are
-/// written before `done` is published and read after it (or after join).
+/// One background title generation call with owned inputs. The model call is
+/// bounded by `default_timeout_ms`, and a read of the shared sign-in can also
+/// wait for another fx process that holds the store's lock, which cancelling
+/// does not interrupt. `destroy` cancels, joins, and frees, so it is safe
+/// before `spawn` returns and after completion. All fields are written before
+/// `done` is published and read after it (or after join).
 pub const Task = struct {
     /// Terminal state of the attempt, readable once `done` is set.
     pub const Status = enum { pending, generated, unavailable };
@@ -240,6 +348,8 @@ pub const Task = struct {
     gateway_team: ?[]u8 = null,
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
+    /// Sends with the stored token of a shared sign-in (`Request.shared_sign_in`).
+    reads_shared_sign_in: bool = false,
     stream_provider: stream_provider.Provider,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
@@ -259,6 +369,7 @@ pub const Task = struct {
         gateway_team: ?[]const u8 = null,
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
+        reads_shared_sign_in: bool = false,
         stream_provider: stream_provider.Provider,
     };
 
@@ -289,6 +400,7 @@ pub const Task = struct {
             .gateway_team = gateway_team,
             .account_id = account_id,
             .credential_source = init.credential_source,
+            .reads_shared_sign_in = init.reads_shared_sign_in,
             .stream_provider = init.stream_provider,
         };
         return task;
@@ -366,6 +478,7 @@ pub const Task = struct {
 
     fn threadMain(self: *Task) void {
         defer self.done.store(true, .release);
+        debug_trace.logf("session", "event=title_generation_started session={s}", .{self.session_id});
         const alloc = std.heap.c_allocator;
         const outcome = run(alloc, .{
             .observer = self.observer,
@@ -378,6 +491,10 @@ pub const Task = struct {
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
             .cancel_flag = &self.cancel_requested,
+            .shared_sign_in = if (self.reads_shared_sign_in)
+                auth_runtime.SharedSignIn.forSource(self.credential_source, self.account_id, self.gateway_team)
+            else
+                null,
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;
@@ -418,6 +535,7 @@ test "shouldGenerate requires an enabled, supported, untitled first submit" {
         .{ .setting_enabled = true, .provider_supports_titles = true, .session_untitled = false, .recovery_replay = false, .task_running = false },
         .{ .setting_enabled = true, .provider_supports_titles = true, .session_untitled = true, .recovery_replay = true, .task_running = false },
         .{ .setting_enabled = true, .provider_supports_titles = true, .session_untitled = true, .recovery_replay = false, .task_running = true },
+        .{ .setting_enabled = true, .provider_supports_titles = true, .session_untitled = true, .recovery_replay = false, .task_running = false, .title_started = true },
     };
     for (blocked) |gate| try std.testing.expect(!shouldGenerate(gate));
 }
@@ -686,6 +804,102 @@ const HeadWaitProvider = struct {
         return error.Cancelled;
     }
 };
+
+/// Accepts only `accepted`. When `rotate_to` is set, the first send finds the
+/// login renewed by another fx process after it was read: the store gets that
+/// token, and the gateway rejects the one that was sent.
+const SharedLoginGateway = struct {
+    home: *stored_login_testing.StoredLoginHome,
+    accepted: []const u8,
+    rotate_to: ?[]const u8 = null,
+    sends: usize = 0,
+    accepted_sends: usize = 0,
+
+    fn stream(raw: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+        const self: *SharedLoginGateway = @ptrCast(@alignCast(raw.?));
+        try request.admission.admit();
+        self.sends += 1;
+        if (self.sends == 1) if (self.rotate_to) |token| try self.home.store(token, "team-a", stored_login_testing.far_future_ms);
+        if (!std.mem.eql(u8, request.credential.secret().?, self.accepted)) return .{ .failed = .{ .kind = .unauthorized } };
+        self.accepted_sends += 1;
+        return .{ .completed = .{ .completion = .{ .content = "Fix the renderer", .finish_reason = .stop }, .ownership = .borrowed } };
+    }
+
+    fn titleRequest(self: *SharedLoginGateway, cancelled: *std.atomic.Value(bool), team: []const u8) Request {
+        return .{
+            .stream_provider = .{ .context = self, .stream_fn = stream },
+            .model = "test/title",
+            .api_key = "launch-token",
+            .credential_source = .fx_login,
+            .gateway_team = team,
+            .prompt_excerpt = "fix the renderer",
+            .cancel_flag = cancelled,
+            .shared_sign_in = auth_runtime.SharedSignIn.forSource(.fx_login, null, team),
+        };
+    }
+};
+
+fn expectTitle(outcome: Outcome) !void {
+    switch (outcome) {
+        .generated => |title| {
+            defer std.testing.allocator.free(title);
+            try std.testing.expectEqualStrings("Fix the renderer", title);
+        },
+        .unavailable => return error.TestExpectedGeneratedTitle,
+    }
+}
+
+test "run sends the stored token of a shared sign-in, and replays a 401 only with a newer stored token" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    // Another fx process refreshed the login before the title read it.
+    try home.store("other-fx-token", "team-a", stored_login_testing.far_future_ms);
+    var renewed: SharedLoginGateway = .{ .home = &home, .accepted = "other-fx-token" };
+    try expectTitle(try run(alloc, renewed.titleRequest(&cancelled, "team-a")));
+    try std.testing.expectEqual(@as(usize, 1), renewed.sends);
+
+    // ...or between the read and the send: one replay with its token.
+    try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
+    var rotated: SharedLoginGateway = .{ .home = &home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
+    try expectTitle(try run(alloc, rotated.titleRequest(&cancelled, "team-a")));
+    try std.testing.expectEqual(@as(usize, 2), rotated.sends);
+
+    // The store still holds the rejected token: no second send, no refresh.
+    try home.store("revoked-token", "team-a", stored_login_testing.far_future_ms);
+    var revoked: SharedLoginGateway = .{ .home = &home, .accepted = "never" };
+    const unavailable = try run(alloc, revoked.titleRequest(&cancelled, "team-a"));
+    try std.testing.expectEqual(FailureReason.provider_failure, unavailable.unavailable.reason);
+    try std.testing.expectEqualStrings("unauthorized", unavailable.unavailable.detail);
+    try std.testing.expectEqual(@as(usize, 1), revoked.sends);
+
+    // Another fx process signed in to another team: its token is never sent.
+    try home.store("team-b-token", "team-b", stored_login_testing.far_future_ms);
+    var other_team: SharedLoginGateway = .{ .home = &home, .accepted = "launch-token" };
+    try expectTitle(try run(alloc, other_team.titleRequest(&cancelled, "team-a")));
+    try std.testing.expectEqual(@as(usize, 1), other_team.sends);
+}
+
+test "run frees every stored token when an allocation fails" {
+    const Sweep = struct {
+        fn run_once(alloc: Allocator, home: *stored_login_testing.StoredLoginHome) !void {
+            try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
+            var cancelled = std.atomic.Value(bool).init(false);
+            var gateway: SharedLoginGateway = .{ .home = home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
+            switch (try run(alloc, gateway.titleRequest(&cancelled, "team-a"))) {
+                .generated => |title| alloc.free(title),
+                .unavailable => {},
+            }
+        }
+    };
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(std.testing.allocator);
+    defer home.deinit();
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Sweep.run_once, .{&home});
+}
 
 test "joinOrCancel cancels a title call when the turn is cancelled" {
     const task = try Task.create(.{

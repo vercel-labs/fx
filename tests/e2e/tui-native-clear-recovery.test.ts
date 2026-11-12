@@ -295,3 +295,52 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
     gateway.stop();
   }
 }, 30_000);
+
+tmuxTest("bracketed paste comes back after the terminal turns it off under fx", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-paste-rearm-"));
+  temp_dirs.push(dir);
+  const home = join(dir, "home");
+  const stderr_path = join(dir, "stderr.log");
+  const capture_path = join(dir, "pane-output.bin");
+  const paste_off = "\x1b[?2004l";
+  const paste_on = "\x1b[?2004h";
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  writeFileSync(capture_path, "");
+
+  session = await TmuxSession.create({
+    cwd: dir,
+    width: 100,
+    height: 30,
+    stderrPath: stderr_path,
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      FX_THEME: undefined,
+      TMUX: undefined,
+    },
+  });
+  await session.waitForComposer(10_000);
+  session.startPaneOutputCapture(capture_path);
+
+  // A terminal reset, or another program's restore, turns bracketed paste off
+  // and tells fx nothing. Without it, each line break in a paste presses Enter.
+  const tty = execFileSync(
+    "tmux",
+    ["display-message", "-t", session.name, "-p", "#{pane_tty}"],
+    { encoding: "utf-8" },
+  ).trim();
+  writeFileSync(tty, paste_off);
+  await session.waitForPane(() => readFileSync(capture_path, "latin1").includes(paste_off), 5_000);
+
+  // fx turns bracketed paste on again within one 30 second interval.
+  await session.waitForPane(() => {
+    const bytes = readFileSync(capture_path, "latin1");
+    const off = bytes.lastIndexOf(paste_off);
+    return off >= 0 && bytes.indexOf(paste_on, off) > off;
+  }, 40_000);
+  expect(readFileSync(stderr_path, "utf8")).toBe("");
+}, 60_000);

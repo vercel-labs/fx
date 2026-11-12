@@ -7,6 +7,7 @@ const stream_provider = @import("../../core/agent/stream_provider.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const vercel_model_policy = @import("../../gateway/vercel_model_policy.zig");
 const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
+const token_pass = @import("../../core/gateway/token_pass.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -51,8 +52,10 @@ fn reviewGateway(
     // model. typesafeai/jev selects the TypeSafe System One reviewer; any
     // other value stays on this gateway chat path with that model id. Every
     // composition site selects this provider, so the override covers
-    // interactive, ask, and subagent reviews uniformly.
-    const selected = if (input.reviewer_model.len > 0) input.reviewer_model else reviewer_model;
+    // interactive, ask, and subagent reviews uniformly. Without one, a
+    // session on a Token Pass model is reviewed by a Token Pass model, so its
+    // reviews stay on Token Pass credit too.
+    const selected = selectedReviewerModel(input.reviewer_model, request.review_turn.model);
     if (typesafe_permission_reviewer.isJevModelId(selected)) {
         debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
         return typesafe_permission_reviewer.review(null, alloc, input, request);
@@ -64,6 +67,17 @@ fn reviewGateway(
         .chat_url = input.endpoint,
         .cancel_flag = input.cancel_flag,
     }, alloc, request, selected);
+}
+
+fn selectedReviewerModel(override: []const u8, session_model: []const u8) []const u8 {
+    if (override.len > 0) return override;
+    return token_pass.modelForSideCall(.review, session_model, reviewer_model);
+}
+
+test "the reviewer follows the override, then Token Pass, then the default" {
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "anthropic/claude-opus-4.8"));
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", selectedReviewerModel("", "zai/glm-5.3"));
+    try std.testing.expectEqualStrings("openai/gpt-6-sol", selectedReviewerModel("openai/gpt-6-sol", "zai/glm-5.3"));
 }
 
 fn reviewGatewayConfig(
