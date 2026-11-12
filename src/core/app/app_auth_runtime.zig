@@ -335,10 +335,10 @@ pub fn Runtime(comptime App: type) type {
                 .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
-                try writeRemoteRevocationWarning(app, .chatgpt_subscription);
+                try writeRemoteRevocationWarning(app, .chatgpt_subscription, false);
             }
             try reconcileSubscriptionLogout(app, agent, .codex);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// Signs out of Grok locally, then revokes its refresh token at the
@@ -366,10 +366,10 @@ pub fn Runtime(comptime App: type) type {
                 .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
-                try writeRemoteRevocationWarning(app, .grok_subscription);
+                try writeRemoteRevocationWarning(app, .grok_subscription, false);
             }
             try reconcileSubscriptionLogout(app, agent, .grok);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// Signs out of fx login locally, then revokes the session at the
@@ -388,19 +388,20 @@ pub fn Runtime(comptime App: type) type {
             var revocation: ?auth_runtime.RemoteRevocation = if (local.session) |session| .{ .fx_login = session } else null;
             defer if (revocation) |pending| releaseRemoteRevocation(pending);
             try applyLogoutResult(app, local.result);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// The local sign-out is already done. Revoking the session at its
         /// issuer can take seconds, so it runs off the input loop, and a
         /// failure is reported when `collectRemoteRevocationFacts` sees it.
         /// Takes `pending`, leaving null so the caller's release skips it.
-        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation) !void {
+        /// `kept` says whether its tokens are kept to revoke later.
+        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation, kept: bool) !void {
             const revocation = pending.* orelse return;
             pending.* = null;
             const source = revocation.source();
-            if (!app.auth.beginRemoteRevocation(revocation)) {
-                try writeRemoteRevocationWarning(app, source);
+            if (!app.auth.beginRemoteRevocation(revocation, kept)) {
+                try writeRemoteRevocationWarning(app, source, kept);
             }
         }
 
@@ -415,18 +416,23 @@ pub fn Runtime(comptime App: type) type {
         /// Reports a remote revocation that finished with a failure.
         pub fn collectRemoteRevocationFacts(app: *App) !void {
             while (app.auth.takeRemoteRevocation()) |outcome| {
-                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source);
+                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source, outcome.retry_kept);
             }
         }
 
-        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source) !void {
+        /// `retry_kept` says whether the tokens are kept, so fx revokes them
+        /// later (`pending_revocation`).
+        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source, retry_kept: bool) !void {
+            const grok = "The local Grok session was removed, but remote revocation could not be confirmed.";
+            const codex = "The local Codex session was removed, but remote revocation could not be confirmed.";
+            const retry_later = " fx will try again later.";
             try writeAuthNotice(app, .{
                 .topic = "auth",
                 .tone = .warning,
                 .body = switch (source) {
-                    .grok_subscription => "The local Grok session was removed, but remote revocation could not be confirmed.",
-                    .chatgpt_subscription => "The local Codex session was removed, but remote revocation could not be confirmed.",
-                    else => login_flow.remote_revocation_warning,
+                    .grok_subscription => if (retry_kept) grok ++ retry_later else grok,
+                    .chatgpt_subscription => if (retry_kept) codex ++ retry_later else codex,
+                    else => if (retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning,
                 },
             });
         }

@@ -28,6 +28,9 @@ pub const service_name = "FX_AI_GATEWAY_API_KEY";
 /// rewrite that item (`mcp_host/credentials.zig` says why).
 pub const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V3";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
+/// The fx login's sign-outs that its issuer did not confirm, kept to revoke
+/// later (`auth/pending_revocation.zig`).
+pub const oauth_pending_revocations_service_name = "FX_OAUTH_PENDING_REVOCATIONS_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
 pub const AccountBuffer = [256]u8;
@@ -35,6 +38,8 @@ pub const AccountBuffer = [256]u8;
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
 const max_oauth_session_bytes: usize = 64 * 1024;
+/// `pending_revocation.max_record_bytes`.
+const max_oauth_pending_revocations_bytes: usize = 128 * 1024;
 /// How long one Keychain call may take, in milliseconds; leased locks held
 /// across Keychain calls allow each call this much (`shared/leased_lock.zig`).
 pub const keychain_call_ms: i64 = 10_000;
@@ -378,6 +383,23 @@ pub fn storeOAuthSession(value: []const u8) Error!void {
 
 pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
     return deleteMcpValueMac(alloc, oauth_session_service_name);
+}
+
+/// Returns error.KeychainItemNotFound when no sign-out is kept.
+pub fn loadOAuthPendingRevocations(alloc: std.mem.Allocator) Error!?[]u8 {
+    return loadMcpValueMacControlled(alloc, oauth_pending_revocations_service_name, null);
+}
+
+pub fn storeOAuthPendingRevocations(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_oauth_pending_revocations_bytes) {
+        return error.KeychainWriteFailed;
+    }
+    return storeMcpValueMac(oauth_pending_revocations_service_name, value);
+}
+
+pub fn deleteOAuthPendingRevocations(alloc: std.mem.Allocator) Error!bool {
+    return deleteMcpValueMac(alloc, oauth_pending_revocations_service_name);
 }
 
 /// Returns error.KeychainItemNotFound when nothing was stored yet.

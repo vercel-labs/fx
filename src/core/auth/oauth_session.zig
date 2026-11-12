@@ -104,6 +104,11 @@ fn selectStorageBackend(os_tag: std.Target.Os.Tag, keychain_disabled: bool) Stor
     return .profile_file;
 }
 
+/// Whether the fx login is kept in the macOS Keychain rather than the profile file.
+pub fn storesInKeychain() bool {
+    return storageBackend() == .macos_keychain;
+}
+
 fn storageBackend() StorageBackend {
     // A temporary HOME does not isolate the host account's macOS Keychain.
     // Keychain-specific tests inject their backend explicitly.

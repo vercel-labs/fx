@@ -8,6 +8,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -959,6 +960,22 @@ pub const RemoteRevocation = union(enum) {
         };
     }
 
+    fn keptSource(self: RemoteRevocation) pending_revocation.Source {
+        return switch (self) {
+            .fx_login => .fx_login,
+            .grok => .grok,
+            .codex => .codex,
+        };
+    }
+
+    /// Identifies the sign-out in `pending_revocation`.
+    fn refreshToken(self: RemoteRevocation) []const u8 {
+        return switch (self) {
+            .fx_login => |session| session.refresh_token,
+            .grok, .codex => |token| token,
+        };
+    }
+
     pub fn deinit(self: *RemoteRevocation) void {
         const alloc = std.heap.c_allocator;
         switch (self.*) {
@@ -972,6 +989,8 @@ pub const RemoteRevocation = union(enum) {
 const RemoteRevocationOutcome = struct {
     source: credentials.Source,
     failed: bool,
+    /// The failed revocation's tokens are kept, and fx revokes them later.
+    retry_kept: bool,
 };
 
 /// How long shutdown waits for revocations in flight before cancelling them.
@@ -985,13 +1004,17 @@ const RemoteRevocationTask = struct {
     done: std.Io.Event = .unset,
     cancel: std.atomic.Value(bool) = .init(false),
     failed: bool = false,
+    /// Whether `target`'s tokens are kept (`pending_revocation`): a
+    /// confirmed revocation forgets them, and any other end leaves them for a
+    /// later retry.
+    kept: bool,
 
     /// Takes ownership of `target` only when the task starts.
-    fn start(transport: oauth_transport.Provider, target: RemoteRevocation) !*RemoteRevocationTask {
+    fn start(transport: oauth_transport.Provider, target: RemoteRevocation, kept: bool) !*RemoteRevocationTask {
         const alloc = std.heap.c_allocator;
         const task = try alloc.create(RemoteRevocationTask);
         errdefer alloc.destroy(task);
-        task.* = .{ .transport = transport, .target = target };
+        task.* = .{ .transport = transport, .target = target, .kept = kept };
         task.future = try io_mod.getIo().concurrent(workerMain, .{task});
         return task;
     }
@@ -1005,19 +1028,68 @@ const RemoteRevocationTask = struct {
             .codex => |token| chatgpt_oauth.revokeToken(alloc, transport.provider(), token),
         };
         revoked catch |err| {
-            debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });
+            debug_trace.logf("auth", "remote revocation failed source={t} err={s} kept={}", .{ self.target.source(), @errorName(err), self.kept });
             self.failed = true;
+            if (self.kept and !pending_revocation.retryable(err)) {
+                // A retry could never revoke it, so nothing stays kept.
+                pending_revocation.forget(alloc, self.target.keptSource(), self.target.refreshToken());
+                self.kept = false;
+            }
         };
+        if (!self.failed and self.kept) pending_revocation.forget(alloc, self.target.keptSource(), self.target.refreshToken());
         self.done.set(io_mod.getIo());
     }
 
     /// Awaits the task, releases it, and returns its outcome.
     fn finish(self: *RemoteRevocationTask) RemoteRevocationOutcome {
         self.future.await(io_mod.getIo());
-        const outcome: RemoteRevocationOutcome = .{ .source = self.target.source(), .failed = self.failed };
+        const outcome: RemoteRevocationOutcome = .{
+            .source = self.target.source(),
+            .failed = self.failed,
+            .retry_kept = self.failed and self.kept,
+        };
         self.target.deinit();
         std.heap.c_allocator.destroy(self);
         return outcome;
+    }
+};
+
+/// Revokes, on a worker, the sign-outs that earlier logouts kept because their
+/// provider did not confirm them (`pending_revocation`). The TUI starts one at
+/// launch, and shutdown cancels it: what it did not revoke stays kept.
+const KeptSignOutRetryTask = struct {
+    transport: oauth_transport.Provider,
+    future: std.Io.Future(void) = undefined,
+    cancel: std.atomic.Value(bool) = .init(false),
+
+    fn start(transport: oauth_transport.Provider) !*KeptSignOutRetryTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(KeptSignOutRetryTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .transport = transport };
+        task.future = try io_mod.getIo().concurrent(workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *KeptSignOutRetryTask) void {
+        const alloc = std.heap.c_allocator;
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        const codex = chatgpt_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const grok = grok_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const fx_login = login_flow.retryKeptSignOuts(alloc, transport.provider(), null);
+        if (codex.revoked + grok.revoked + fx_login.revoked == 0 and !(codex.failed or grok.failed or fx_login.failed)) return;
+        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} failed={}", .{
+            codex.revoked,
+            grok.revoked,
+            fx_login.revoked,
+            codex.failed or grok.failed or fx_login.failed,
+        });
+    }
+
+    fn stop(self: *KeptSignOutRetryTask) void {
+        self.cancel.store(true, .seq_cst);
+        self.future.await(io_mod.getIo());
+        std.heap.c_allocator.destroy(self);
     }
 };
 
@@ -1967,6 +2039,8 @@ pub const Runtime = struct {
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
     /// Revocations of signed-out sessions still talking to their issuer.
     remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
+    /// The launch's retry of kept sign-outs (`beginKeptSignOutRetry`).
+    kept_sign_out_retry_task: ?*KeptSignOutRetryTask = null,
     team_list_task: ?*TeamListTask = null,
     provider_preparation: ?*ProviderPreparation = null,
     startup_credential_task: ?*StartupCredentialTask = null,
@@ -2014,7 +2088,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 35) {
+            if (@typeInfo(Self).@"struct".field_names.len != 36) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -2050,6 +2124,7 @@ pub const Runtime = struct {
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.remote_revocation_tasks = .empty;
+        storage.kept_sign_out_retry_task = null;
         storage.team_list_task = null;
         storage.provider_preparation = null;
         storage.startup_credential_task = null;
@@ -2064,6 +2139,8 @@ pub const Runtime = struct {
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        if (self.kept_sign_out_retry_task) |task| task.stop();
+        self.kept_sign_out_retry_task = null;
         if (self.team_list_task) |task| {
             if (!task.done.load(.acquire)) debug_trace.logf("auth", "team list dropped reason=shutdown", .{});
             task.deinit();
@@ -2086,7 +2163,7 @@ pub const Runtime = struct {
                 };
             }
             if (!task.done.isSet()) {
-                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t}", .{task.target.source()});
+                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t} kept={}", .{ task.target.source(), task.kept });
                 task.cancel.store(true, .seq_cst);
             }
             _ = task.finish();
@@ -3192,8 +3269,9 @@ pub const Runtime = struct {
 
     /// Revokes a signed-out session's tokens on a worker and takes ownership
     /// of `target`. Returns false, after releasing `target`, when the worker
-    /// cannot start; the revocation then did not happen.
-    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation) bool {
+    /// cannot start; the revocation then did not happen. `kept` says whether
+    /// `target`'s tokens are kept to revoke later (`pending_revocation`).
+    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation, kept: bool) bool {
         var owned = target;
         if (comptime builtin.single_threaded) {
             owned.deinit();
@@ -3203,13 +3281,25 @@ pub const Runtime = struct {
             owned.deinit();
             return false;
         };
-        const task = RemoteRevocationTask.start(self.oauth_transport, owned) catch |err| {
+        const task = RemoteRevocationTask.start(self.oauth_transport, owned, kept) catch |err| {
             debug_trace.logf("auth", "remote revocation task unavailable source={t} err={s}", .{ owned.source(), @errorName(err) });
             owned.deinit();
             return false;
         };
         self.remote_revocation_tasks.appendAssumeCapacity(task);
         return true;
+    }
+
+    /// Starts revoking, on a worker, the sign-outs that earlier logouts kept
+    /// because their provider did not confirm them. A host that manages
+    /// credentials keeps none.
+    pub fn beginKeptSignOutRetry(self: *Self) void {
+        if (comptime builtin.single_threaded) return;
+        if (self.kept_sign_out_retry_task != null or self.authMode() == .host_managed) return;
+        self.kept_sign_out_retry_task = KeptSignOutRetryTask.start(self.oauth_transport) catch |err| blk: {
+            debug_trace.logf("auth", "kept sign-out retry unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
     }
 
     /// Returns one finished revocation's outcome, or null when none finished.
@@ -5686,7 +5776,7 @@ test "auth runtime revokes a signed-out Grok session on a worker" {
         defer runtime.deinit(std.testing.allocator);
 
         const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
-        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }, false));
         const outcome = while (true) {
             if (runtime.takeRemoteRevocation()) |finished| break finished;
             std.Thread.yield() catch {};
@@ -5704,7 +5794,7 @@ test "auth runtime shutdown waits for a remote revocation in flight" {
     var runtime: Runtime = .{ .oauth_transport = transport.provider() };
 
     const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
-    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }, false));
     runtime.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));

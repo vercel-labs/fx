@@ -13,6 +13,7 @@ const js_host_auth = @import("js_host_auth.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -43,11 +44,16 @@ pub const LoginError = error{
 const LogoutError = error{SessionDeleteFailed};
 
 pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
+/// `remote_revocation_warning`, when the session's tokens are kept and fx
+/// revokes them later (`pending_revocation`).
+pub const remote_revocation_retry_warning = remote_revocation_warning ++ " fx will try again later.";
 
 pub const LogoutResult = struct {
     session_deleted: bool = false,
     local_durability_failed: bool = false,
     remote_revocation_failed: bool = false,
+    /// The unconfirmed revocation's tokens are kept, and fx revokes them later.
+    retry_kept: bool = false,
 };
 
 pub const Team = struct {
@@ -907,9 +913,13 @@ pub fn logout(
     var result = local.result;
     if (local.session) |session| {
         if (before_revocation) |notice| notice.run(notice.context);
-        revokeLoggedOutSession(alloc, transport, session) catch {
+        revokeLoggedOutSession(alloc, transport, session) catch |err| {
             result.remote_revocation_failed = true;
+            result.retry_kept = local.kept and pending_revocation.retryable(err);
+            if (local.kept and !result.retry_kept) pending_revocation.forget(alloc, .fx_login, session.refresh_token);
+            return result;
         };
+        if (local.kept) pending_revocation.forget(alloc, .fx_login, session.refresh_token);
     }
     return result;
 }
@@ -921,6 +931,9 @@ pub const LocalLogout = struct {
     /// Owned by the caller when set; release it with `Session.deinit` using
     /// the allocator passed to `logoutLocally`.
     session: ?oauth_session.Session = null,
+    /// Whether `session`'s tokens are kept to revoke later
+    /// (`pending_revocation`). Forget them once the revocation is confirmed.
+    kept: bool = false,
 };
 
 /// Deletes the saved fx login session without contacting the issuer. Revoke
@@ -928,6 +941,7 @@ pub const LocalLogout = struct {
 pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
+    var kept = false;
     const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
@@ -940,10 +954,18 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
                 break :load null;
             },
         };
+        // Kept before the login is deleted, so a revocation that never
+        // completes still leaves the tokens for a later retry.
+        if (session) |loaded| kept = pending_revocation.keep(alloc, .fx_login, keptTokens(loaded));
         break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
         };
     };
+    if (kept and !delete_result.session_deleted) {
+        // The login is still saved, so its tokens must not be revoked later.
+        pending_revocation.forget(alloc, .fx_login, session.?.refresh_token);
+        kept = false;
+    }
     return .{
         .result = .{
             .session_deleted = delete_result.session_deleted,
@@ -951,7 +973,33 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
             .remote_revocation_failed = session_load_failed,
         },
         .session = session,
+        .kept = kept,
     };
+}
+
+fn keptTokens(session: oauth_session.Session) pending_revocation.Tokens {
+    return .{
+        .refresh_token = session.refresh_token,
+        .access_token = session.access_token,
+        .issuer = session.issuer,
+        .client_id = session.client_id,
+    };
+}
+
+/// Revokes the fx login sign-outs that earlier logouts kept because the
+/// issuer did not confirm them (`pending_revocation.retry`).
+pub fn retryKeptSignOuts(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) pending_revocation.RetryOutcome {
+    return pending_revocation.retry(alloc, .fx_login, .{ .context = &transport, .run = revokeKept }, before_revocation);
+}
+
+fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
+    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
+    if (tokens.access_token.len == 0 or tokens.issuer.len == 0 or tokens.client_id.len == 0) return error.KeptSignOutUnusable;
+    return revokeTokens(alloc, transport.*, tokens.issuer, tokens.client_id, tokens.refresh_token, tokens.access_token);
 }
 
 /// Revokes a signed-out session's refresh and access tokens at its issuer.
@@ -960,24 +1008,35 @@ pub fn revokeLoggedOutSession(
     transport: oauth_transport.Provider,
     session: oauth_session.Session,
 ) !void {
-    var metadata = try oauth.discover(alloc, transport, session.issuer);
+    return revokeTokens(alloc, transport, session.issuer, session.client_id, session.refresh_token, session.access_token);
+}
+
+fn revokeTokens(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer: []const u8,
+    client_id: []const u8,
+    refresh_token: []const u8,
+    access_token: []const u8,
+) !void {
+    var metadata = try oauth.discover(alloc, transport, issuer);
     defer metadata.deinit(alloc);
     const endpoint = metadata.revocation_endpoint orelse return error.RevocationEndpointMissing;
-    try oauth_session.validateE2EEndpoint(session.issuer, endpoint);
+    try oauth_session.validateE2EEndpoint(issuer, endpoint);
     const refresh_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.refresh_token,
+        client_id,
+        refresh_token,
         .refresh_token,
     );
     const access_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.access_token,
+        client_id,
+        access_token,
         .access_token,
     );
     try refresh_result;
