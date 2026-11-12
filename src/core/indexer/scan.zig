@@ -37,6 +37,10 @@ pub const Options = struct {
     /// ignored root. Never applied inside a repository.
     skipped_names: []const []const u8 = &default_skipped_names,
     max_workers: usize = 8,
+    /// When `tree_mod.nowNs()` reaches this, the scan stops with
+    /// `error.Canceled`, as when its stop flag is raised. The workers check
+    /// it themselves, so it holds however busy the caller's threads are.
+    stop_at_ns: ?i64 = null,
 };
 
 pub const Result = struct {
@@ -136,6 +140,7 @@ const Shared = struct {
     root_abs: []const u8,
     rules: *const Rules,
     stop: ?*std.atomic.Value(bool),
+    stop_at_ns: ?i64 = null,
     collect_limit: usize,
     scan_started_ns: i64,
 
@@ -150,9 +155,30 @@ const Shared = struct {
     incomplete: std.atomic.Value(bool) = .init(false),
     limit_reached: std.atomic.Value(bool) = .init(false),
     overlong: std.atomic.Value(usize) = .init(0),
+    /// `stop_at_ns` passed; sticky, so every later check agrees.
+    expired: std.atomic.Value(bool) = .init(false),
+    checks: std.atomic.Value(u32) = .init(0),
 
     fn canceled(self: *Shared) bool {
-        return if (self.stop) |flag| flag.load(.acquire) else false;
+        if (self.stop) |flag| if (flag.load(.acquire)) return true;
+        const at = self.stop_at_ns orelse return false;
+        if (self.expired.load(.acquire)) return true;
+        // A clock read on every entry would cost more than the entry.
+        if (self.checks.fetchAdd(1, .monotonic) % 64 != 0) return false;
+        if (tree_mod.nowNs() < at) return false;
+        self.expired.store(true, .release);
+        return true;
+    }
+
+    /// `canceled`, reading the clock every time: for checks made once per
+    /// phase or per folder rather than per entry.
+    fn canceledNow(self: *Shared) bool {
+        if (self.stop) |flag| if (flag.load(.acquire)) return true;
+        const at = self.stop_at_ns orelse return false;
+        if (self.expired.load(.acquire)) return true;
+        if (tree_mod.nowNs() < at) return false;
+        self.expired.store(true, .release);
+        return true;
     }
 
     fn fail(self: *Shared, err: Error) void {
@@ -231,6 +257,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
         .root_abs = root,
         .rules = &rules,
         .stop = stop,
+        .stop_at_ns = options.stop_at_ns,
         .collect_limit = std.math.mul(usize, options.candidate_cap, collect_factor) catch std.math.maxInt(usize),
         .scan_started_ns = scan_started_ns,
     };
@@ -255,7 +282,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
 
     runMain(&shared, workers);
     if (shared.failure) |err| return err;
-    if (shared.canceled()) return error.Canceled;
+    if (shared.canceledNow()) return error.Canceled;
 
     var listing_count: usize = 0;
     for (workers) |*worker| listing_count += worker.listings.items.len;
@@ -269,8 +296,12 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     }
 
     var entries: std.ArrayList(Entry) = .empty;
-    try assemble(arena, scratch, listings, rules.repository, &entries);
+    try assemble(arena, scratch, &shared, listings, rules.repository, &entries);
+    // Assembling and sorting a large tree can take longer than the walk, so
+    // a stop that comes due meanwhile still ends the scan.
+    if (shared.canceledNow()) return error.Canceled;
     std.mem.sortUnstable(Entry, entries.items, {}, entryLessThan);
+    if (shared.canceledNow()) return error.Canceled;
     var cap_reached = false;
     if (capCut(entries.items, options.candidate_cap)) |len| {
         entries.shrinkRetainingCapacity(len);
@@ -571,7 +602,7 @@ fn joinPath(arena: Allocator, parent: []const u8, name: []const u8) Allocator.Er
 
 /// Applies git's folder rules bottom-up and gathers the visible entries.
 /// `out` and its paths use `arena`; the bookkeeping uses `scratch`.
-fn assemble(arena: Allocator, scratch: Allocator, listings: []const *const Listing, repository: bool, out: *std.ArrayList(Entry)) Allocator.Error!void {
+fn assemble(arena: Allocator, scratch: Allocator, shared: *Shared, listings: []const *const Listing, repository: bool, out: *std.ArrayList(Entry)) (Allocator.Error || error{Canceled})!void {
     var by_path: std.StringHashMapUnmanaged(usize) = .empty;
     try by_path.ensureTotalCapacity(scratch, @intCast(listings.len));
     for (listings, 0..) |listing, index| by_path.putAssumeCapacity(listing.rel, index);
@@ -610,6 +641,7 @@ fn assemble(arena: Allocator, scratch: Allocator, listings: []const *const Listi
     }
     try out.ensureTotalCapacityPrecise(arena, out.items.len + count);
     for (listings, 0..) |listing, index| {
+        if (shared.canceledNow()) return error.Canceled;
         if (!visible[index]) continue;
         for (listing.files) |path| out.appendAssumeCapacity(.{ .path = try arena.dupe(u8, path), .kind = .file });
         for (listing.children) |child| {
@@ -874,6 +906,8 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
 
     var stop: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, scan(std.testing.allocator, root, .{}, &stop));
+    // A stop time already past cancels the same way, with no flag.
+    try std.testing.expectError(error.Canceled, scan(std.testing.allocator, root, .{ .stop_at_ns = tree_mod.nowNs() - 1 }, null));
     try std.testing.expectError(error.RootUnavailable, scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ root, "missing" }), .{}, null));
 }
 
