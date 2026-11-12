@@ -453,6 +453,35 @@ pub const StoreCommand = union(enum) {
     /// Every capture ref, one `<ref> <object> <unix seconds>` line each; the
     /// time is the newest capture's.
     list_refs,
+    /// Deletes a capture ref only while it still names `old`, so a capture
+    /// that just moved it keeps it.
+    delete_ref: struct { ref: []const u8, old: []const u8 },
+    /// Packs every object the refs reach into one pack, the ones the store
+    /// reads through its alternates included, drops every other pack, and
+    /// prunes every unreachable loose object at once: `repack -a -d` and then
+    /// `prune --expire=now`. Not `git gc`, whose repack always passes `-l`
+    /// and so drops the copies of objects the alternates also hold, which
+    /// captures keep so they never depend on the user's objects. Capture
+    /// commits link only to earlier captures, so no user history comes in.
+    /// Only for a caller that holds every capture lock of the store, so no
+    /// capture has written objects it has not yet named. Prefer `gc_locked`:
+    /// a prune that outlives its caller, such as one a killed fx left, can
+    /// still be running when the next capture writes objects.
+    gc,
+    /// `gc`, but the prune keeps every loose object modified at or after
+    /// `locked_unix`, the second the caller took every capture lock of the
+    /// store: `prune --expire=@<locked_unix - 1>`. Objects a capture writes
+    /// after that, even while a prune its killed caller left is still
+    /// running, are never deleted. Unreachable objects from before go at once.
+    gc_locked: struct { locked_unix: i64 },
+    /// Packs every object of the store into one new pack, reachable or not,
+    /// with the ones refs reach through the alternates, then drops the old
+    /// packs and the loose objects: `repack -a -d -k` without `-l`. Deletes
+    /// no object the new pack lacks and prunes nothing. Captures keep the
+    /// objects they wrote loose, and with `-l` or `--unpacked` git leaves an
+    /// object some alternate pack also holds out of the store's pack, so
+    /// whether its loose file survived would depend on git's version.
+    repack,
 };
 
 pub const Listing = enum {
@@ -637,6 +666,16 @@ fn runStoreWith(
             has_input = true;
         },
         .list_refs => try argv.appendSlice(arena, &.{ "for-each-ref", "--format=%(refname) %(objectname) %(committerdate:unix)", capture_ref_prefix }),
+        .delete_ref => |delete| {
+            try validateRef(delete.ref);
+            try validateOid(delete.old);
+            try argv.appendSlice(arena, &.{ "update-ref", "--no-deref", "-d", delete.ref, delete.old });
+        },
+        // No `-l`; `-n` skips the server info a bare store never serves, and
+        // no bitmap is written. The prune follows below.
+        .gc, .gc_locked => try argv.appendSlice(arena, &.{ "repack", "-a", "-d", "-q", "-n", "--no-write-bitmap-index" }),
+        // `-k` packs unreachable objects too, loose ones included.
+        .repack => try argv.appendSlice(arena, &.{ "repack", "-a", "-d", "-k", "-q", "-n", "--no-write-bitmap-index" }),
     }
     if (comptime builtin.target.os.tag != .windows) try base.put("PATH", route_path);
     try base.put("GIT_DIR", store.git_dir);
@@ -656,6 +695,21 @@ fn runStoreWith(
             outcome.stderr[0..@min(outcome.stderr.len, 512)],
         });
         return .{ .failed = .path_rejected };
+    }
+    // `repack -a -d` keeps unreachable loose objects; the prune deletes them,
+    // and the temporary files of a pack a killed git left, up to its expiry.
+    const prune_expire: ?[]const u8 = switch (command) {
+        .gc => "--expire=now",
+        // git prunes an object whose modification second is at or before
+        // the expiry, so the second before the locks keeps every later one.
+        .gc_locked => |gc| try arena.print("--expire=@{d}", .{gc.locked_unix - 1}),
+        else => null,
+    };
+    if (prune_expire != null and outcome.result == .ok) {
+        argv.clearRetainingCapacity();
+        try appendStorePrelude(arena, &argv, ready, store.conversions);
+        try argv.appendSlice(arena, &.{ "prune", prune_expire.? });
+        return (try runBoundedWithStderr(arena, argv.items, store.work_tree, base, null, store.scratch_dir, limits)).result;
     }
     return outcome.result;
 }
@@ -1877,6 +1931,142 @@ test "safe git capture store copies the objects a tree borrows from its alternat
     try std.Io.Dir.deleteFileAbsolute(std.testing.io, try repo.path("store.git/objects/info/alternates"));
     for (objects.items) |oid| _ = try fixture.storeOutput(&.{ "cat-file", "-e", oid });
     try std.testing.expectEqualStrings("staged", try fixture.storeOutput(&.{ "cat-file", "-p", try repo.arena.print("{s}:staged.txt", .{tree}) }));
+}
+
+test "safe git capture store deletes a ref only while it still names the expected commit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const fixture = try StoreFixture.init(repo);
+    _ = try fixture.ok(.{ .read_tree = head });
+    const tree = try fixture.ok(.write_tree);
+    const first = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "one\n", .unix_seconds = 1 } });
+    const second = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = first, .message = "two\n", .unix_seconds = 2 } });
+    const ref = "refs/fx/sessions/s1/w";
+    _ = try fixture.ok(.{ .update_ref = .{ .ref = ref, .new = second, .old = null } });
+    // A capture moved the ref past `first`, so deleting at `first` fails and
+    // the ref survives.
+    try expectFailure(.exited_nonzero, try fixture.run(.{ .delete_ref = .{ .ref = ref, .old = first } }, .{ .safe = null }, .{}));
+    try std.testing.expectEqualStrings(second, try fixture.ok(.{ .resolve_ref = ref }));
+    _ = try fixture.ok(.{ .delete_ref = .{ .ref = ref, .old = second } });
+    try std.testing.expectEqualStrings("", try fixture.ok(.{ .resolve_ref = ref }));
+    try std.testing.expectError(error.InvalidArgument, fixture.run(.{ .delete_ref = .{ .ref = "refs/heads/main", .old = second } }, .{ .safe = null }, .{}));
+    try std.testing.expectError(error.InvalidArgument, fixture.run(.{ .delete_ref = .{ .ref = ref, .old = "HEAD" } }, .{ .safe = null }, .{}));
+}
+
+test "safe git capture store gc keeps every ref's chain and prunes the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const fixture = try StoreFixture.init(repo);
+    _ = try fixture.ok(.{ .read_tree = head });
+    try repo.write("repo/b.txt", "b\n");
+    _ = try fixture.ok(.{ .add_remove = &.{"b.txt"} });
+    const kept_tree = try fixture.ok(.write_tree);
+    const first = try fixture.ok(.{ .commit_tree = .{ .tree = kept_tree, .parent = null, .message = "one\n", .unix_seconds = 1 } });
+    const second = try fixture.ok(.{ .commit_tree = .{ .tree = kept_tree, .parent = first, .message = "two\n", .unix_seconds = 2 } });
+    _ = try fixture.ok(.{ .update_ref = .{ .ref = "refs/fx/sessions/s1/w", .new = second, .old = null } });
+    // An object no ref reaches: a blob only this commit's tree names.
+    try repo.write("repo/c.txt", "orphan\n");
+    _ = try fixture.ok(.{ .add_remove = &.{"c.txt"} });
+    const orphan_tree = try fixture.ok(.write_tree);
+    const orphan = try fixture.ok(.{ .commit_tree = .{ .tree = orphan_tree, .parent = null, .message = "orphan\n", .unix_seconds = 3 } });
+    _ = try repo.runs();
+
+    _ = try fixture.ok(.gc);
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+    // The ref's whole chain survives, down to the first commit's content.
+    try std.testing.expectEqualStrings(second, try fixture.storeOutput(&.{ "rev-parse", "refs/fx/sessions/s1/w" }));
+    try std.testing.expectEqualStrings(first, try fixture.storeOutput(&.{ "rev-parse", try repo.arena.print("{s}^", .{second}) }));
+    try std.testing.expectEqualStrings("b", try fixture.storeOutput(&.{ "cat-file", "-p", try repo.arena.print("{s}:b.txt", .{first}) }));
+    // The unreachable commit is gone at once, not after git's grace period.
+    const probe = try repo.run(repo.root, try repo.plainArgv(&.{ "--git-dir", fixture.store.git_dir, "cat-file", "-e", orphan }), .plain);
+    try std.testing.expect(probe.term == .exited and probe.term.exited != 0);
+}
+
+test "safe git capture store gc_locked prunes what predates the locks and keeps what a capture wrote after" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const fixture = try StoreFixture.init(repo);
+    _ = try fixture.ok(.{ .read_tree = head });
+    const tree = try fixture.ok(.write_tree);
+    const kept = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "kept\n", .unix_seconds = 1 } });
+    _ = try fixture.ok(.{ .update_ref = .{ .ref = "refs/fx/sessions/s1/w", .new = kept, .old = null } });
+    // Two commits no ref names: one written long before the locks, one a
+    // capture wrote after them and has not named yet.
+    const locked_unix = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+    const old = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "old\n", .unix_seconds = 2 } });
+    const fresh = try fixture.ok(.{ .commit_tree = .{ .tree = tree, .parent = null, .message = "fresh\n", .unix_seconds = 3 } });
+    const long_ago: std.Io.Timestamp = .{ .nanoseconds = @as(i96, locked_unix - 3600) * std.time.ns_per_s };
+    const old_path = try repo.arena.print("{s}/objects/{s}/{s}", .{ fixture.store.git_dir, old[0..2], old[2..] });
+    try std.Io.Dir.cwd().setTimestamps(std.testing.io, old_path, .{ .access_timestamp = .{ .new = long_ago }, .modify_timestamp = .{ .new = long_ago } });
+
+    _ = try fixture.ok(.{ .gc_locked = .{ .locked_unix = locked_unix } });
+    _ = try fixture.storeOutput(&.{ "cat-file", "-e", kept });
+    _ = try fixture.storeOutput(&.{ "cat-file", "-e", fresh });
+    const probe = try repo.run(repo.root, try repo.plainArgv(&.{ "--git-dir", fixture.store.git_dir, "cat-file", "-e", old }), .plain);
+    try std.testing.expect(probe.term == .exited and probe.term.exited != 0);
+}
+
+test "safe git capture store repack packs what refs reach, keeps every other object and runs no planted program" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const fixture = try StoreFixture.init(repo);
+    // Programs a repack could start: hooks, an fsmonitor, auto gc and
+    // maintenance, and a pack-objects hook.
+    const hooks = try repo.path("global-hooks");
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, hooks);
+    for ([_][]const u8{ "pre-auto-gc", "post-index-change", "reference-transaction" }) |hook| {
+        try repo.writeExecutable(try std.Io.Dir.path.join(repo.arena, &.{ hooks, hook }));
+    }
+    try repo.write("home/.gitconfig", try repo.arena.print(
+        "[core]\n\thooksPath = {s}\n\tfsmonitor = {s}\n[gc]\n\tauto = 1\n\tautoDetach = false\n[maintenance]\n\tauto = true\n[uploadpack]\n\tpackObjectsHook = {s}\n",
+        .{ hooks, repo.sentinel, repo.sentinel },
+    ));
+    _ = try fixture.ok(.{ .read_tree = head });
+    try repo.write("repo/b.txt", "b\n");
+    _ = try fixture.ok(.{ .add_remove = &.{"b.txt"} });
+    const kept_tree = try fixture.ok(.write_tree);
+    const first = try fixture.ok(.{ .commit_tree = .{ .tree = kept_tree, .parent = null, .message = "one\n", .unix_seconds = 1 } });
+    const second = try fixture.ok(.{ .commit_tree = .{ .tree = kept_tree, .parent = first, .message = "two\n", .unix_seconds = 2 } });
+    _ = try fixture.ok(.{ .update_ref = .{ .ref = "refs/fx/sessions/s1/w", .new = second, .old = null } });
+    // A commit no ref reaches, as a capture writes before it moves its ref.
+    const orphan = try fixture.ok(.{ .commit_tree = .{ .tree = kept_tree, .parent = second, .message = "orphan\n", .unix_seconds = 3 } });
+    const loose = struct {
+        fn path(fixture_value: StoreFixture, oid: []const u8) ![]const u8 {
+            return fixture_value.repo.arena.print("{s}/objects/{s}/{s}", .{ fixture_value.store.git_dir, oid[0..2], oid[2..] });
+        }
+    }.path;
+    std.Io.Dir.accessAbsolute(std.testing.io, try loose(fixture, second), .{}) catch return error.TestUnexpectedResult;
+    _ = try repo.runs();
+
+    _ = try fixture.ok(.repack);
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+    // The ref's chain is now in a pack, and its loose copies are gone.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, try loose(fixture, second), .{}));
+    try std.testing.expect(std.mem.find(u8, try fixture.storeOutput(&.{ "count-objects", "-v" }), "in-pack: 0\n") == null);
+    try std.testing.expectEqualStrings(second, try fixture.storeOutput(&.{ "rev-parse", "refs/fx/sessions/s1/w" }));
+    try std.testing.expectEqualStrings(first, try fixture.storeOutput(&.{ "rev-parse", try repo.arena.print("{s}^", .{second}) }));
+    try std.testing.expectEqualStrings("b", try fixture.storeOutput(&.{ "cat-file", "-p", try repo.arena.print("{s}:b.txt", .{first}) }));
+    // Nothing was pruned: the unreachable commit stays, packed with the rest.
+    _ = try fixture.storeOutput(&.{ "cat-file", "-e", orphan });
+    // The store holds the ref's chain itself, without its alternates.
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, try repo.path("store.git/objects/info/alternates"));
+    _ = try fixture.storeOutput(&.{ "fsck", "--connectivity-only", "--no-dangling", "--no-progress" });
 }
 
 test "safe git capture index clears inherited flags and takes recorded entries" {

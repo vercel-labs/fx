@@ -5467,6 +5467,7 @@ test {
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/workspace_capture.zig");
     _ = @import("core/workspace/capture_store.zig");
+    _ = @import("core/workspace/capture_retention.zig");
     _ = @import("core/shared/repo_path.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
