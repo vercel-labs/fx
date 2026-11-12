@@ -65,6 +65,18 @@ pub const Lookup = struct {
         return task.finish();
     }
 
+    /// `deinit` for process exit, which never waits. A lookup still running,
+    /// such as one renewing the sign-in, which is never cut off
+    /// (`oauth_transport.Request` `outlives_cancel`), is cancelled and left to
+    /// end with the process. It holds only its own copies and static providers.
+    pub fn leaveForExit(self: *Lookup) void {
+        const task = self.task orelse return;
+        if (task.done.load(.acquire)) return self.deinit();
+        self.task = null;
+        task.cancel.store(true, .seq_cst);
+        debug_trace.logf("credits", "lookup left running reason=process_exit", .{});
+    }
+
     /// Cancels a running lookup and waits for its bounded requests to stop.
     pub fn deinit(self: *Lookup) void {
         const task = self.task orelse return;
@@ -170,6 +182,8 @@ const TestProvider = struct {
     release: std.atomic.Value(bool) = .init(false),
     calls: std.atomic.Value(usize) = .init(0),
     saw_input: std.atomic.Value(bool) = .init(false),
+    /// Runs until released however it is cancelled, as a sign-in renewal does.
+    ignores_cancel: bool = false,
 
     fn provider(self: *TestProvider) gateway_provider.CreditsProvider {
         return .{ .context = self, .fetch_fn = fetch };
@@ -190,7 +204,7 @@ const TestProvider = struct {
         );
         // Stands in for a slow endpoint until the test releases it or the
         // lookup is cancelled.
-        while (!self.release.load(.seq_cst) and !input.cancel_flag.?.load(.seq_cst)) {
+        while (!self.release.load(.seq_cst) and (self.ignores_cancel or !input.cancel_flag.?.load(.seq_cst))) {
             std.Thread.yield() catch {};
         }
         if (input.cancel_flag.?.load(.seq_cst)) {
@@ -245,6 +259,25 @@ test "credits lookup reports busy while one runs" {
     result.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.seq_cst));
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null));
+}
+
+test "credits lookup at exit is cancelled and left running instead of waited for" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var fake: TestProvider = .{ .ignores_cancel = true };
+    var lookup: Lookup = .{};
+
+    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null));
+    while (fake.calls.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    const task = lookup.task.?;
+    lookup.leaveForExit();
+    try std.testing.expect(lookup.task == null);
+    try std.testing.expect(task.cancel.load(.seq_cst));
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    fake.release.store(true, .seq_cst);
+    var result = task.finish();
+    result.deinit();
 }
 
 test "credits lookup shutdown cancels a stalled fetch and waits for it" {

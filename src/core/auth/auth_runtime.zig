@@ -1251,6 +1251,8 @@ const PreparationTestCatalog = struct {
     entered: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Runs until released however it is cancelled, as a sign-in refresh does.
+    ignores_cancel: bool = false,
 
     fn provider(self: *PreparationTestCatalog) model_catalog.Provider {
         return .{ .context = self, .fetch_fn = fetch };
@@ -1260,7 +1262,7 @@ const PreparationTestCatalog = struct {
         const self: *PreparationTestCatalog = @ptrCast(@alignCast(raw.?));
         self.entered.store(true, .release);
         while (!self.release.load(.acquire)) {
-            if (input.cancel_flag.?.load(.seq_cst)) {
+            if (!self.ignores_cancel and input.cancel_flag.?.load(.seq_cst)) {
                 self.cancelled.store(true, .release);
                 return .{ .failure = .{ .category = .cancellation } };
             }
@@ -1333,6 +1335,32 @@ test "provider preparation cancellation reaches blocked transport and teardown j
     try std.testing.expect(catalog.cancelled.load(.acquire));
     try std.testing.expect(!runtime.providerPreparationPending());
     runtime.stopProviderPreparation();
+}
+
+test "provider preparation at exit is cancelled and left running instead of waited for" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{ .ignores_cancel = true };
+    const candidate: credentials.Credential = .{ .source = .ai_gateway_api_key, .token = @constCast("key") };
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = candidate,
+    });
+    try waitForPreparationTest(&catalog.entered);
+    const task = runtime.provider_preparation.?;
+
+    runtime.leaveProviderPreparationForExit();
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expect(task.cancel_requested.load(.seq_cst));
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    catalog.release.store(true, .release);
+    try waitForPreparationTest(&task.done);
+    task.deinit();
 }
 
 test "provider preparation retains cancellation when a result wins the transport race" {
@@ -2348,6 +2376,21 @@ pub const Runtime = struct {
         const task = self.provider_preparation orelse return;
         self.provider_preparation = null;
         task.deinit();
+    }
+
+    /// `stopProviderPreparation` for process exit, which never waits. A
+    /// preparation still running, such as one in the middle of a sign-in
+    /// refresh, which is never cut off (`oauth_transport.Request`
+    /// `outlives_cancel`), is cancelled and left to end with the process. It
+    /// holds only its own copies and static providers.
+    pub fn leaveProviderPreparationForExit(self: *Self) void {
+        const task = self.provider_preparation orelse return;
+        if (task.done.load(.acquire)) return self.stopProviderPreparation();
+        self.provider_preparation = null;
+        task.requestCancel();
+        debug_trace.logf("auth", "provider preparation left running reason=process_exit target={t}", .{task.input.target()});
+        if (task.thread) |thread| thread.detach();
+        task.thread = null;
     }
 
     pub fn skipOnboarding(self: *Self) void {

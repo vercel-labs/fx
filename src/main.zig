@@ -975,7 +975,9 @@ const App = struct {
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
-        self.auth.stopProviderPreparation();
+        // Exit never waits, not even for a sign-in refresh, which is never cut
+        // off: a preparation still running ends with the process.
+        self.auth.leaveProviderPreparationForExit();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);
@@ -1002,7 +1004,7 @@ const App = struct {
         };
         // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
-        self.credits_lookup.deinit();
+        self.credits_lookup.leaveForExit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Quitting from a subagent's screen resumes its instance.

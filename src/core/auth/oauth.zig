@@ -277,7 +277,7 @@ pub fn refreshToken(
         .post_form,
         metadata.token_endpoint,
         writer.written(),
-        .{},
+        .{ .outlives_cancel = true },
     );
     defer secret.zeroAndFree(alloc, bytes);
     return parseTokenSet(alloc, bytes);
@@ -408,6 +408,7 @@ fn fetchJson(
     bounds: struct {
         cancel_flag: ?*std.atomic.Value(bool) = null,
         deadline: ?std.Io.Clock.Timestamp = null,
+        outlives_cancel: bool = false,
     },
 ) ![]u8 {
     var response = try transport.execute(alloc, .{
@@ -416,6 +417,7 @@ fn fetchJson(
         .url = url,
         .cancel_flag = bounds.cancel_flag,
         .deadline = bounds.deadline,
+        .outlives_cancel = bounds.outlives_cancel,
     });
     defer response.deinit(alloc);
 
