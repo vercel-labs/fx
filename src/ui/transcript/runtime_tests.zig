@@ -14968,10 +14968,14 @@ const debt_growth_flow = debt_rewrite_2_flow ++ "row-17\n";
 
 const debt_history_for_test: u32 = 8;
 
-/// Leaves a stable anchor whose history trails the viewport by four rows, the
-/// way a recovery does: a frame whose terminal write fails leaves a receipt
-/// that owes rows, and the next frame, over a rewritten source, drops that
-/// debt and commits stable.
+/// Leaves a stable anchor whose history trails the viewport by four rows and
+/// that has no catch-up flag. A recovery builds the debt: a frame whose
+/// terminal write fails leaves a receipt that owes rows, and the next frame,
+/// over a rewritten source, drops that debt and commits stable. That commit
+/// flags the debt for the next frame to replay, but a recovery the flag does
+/// not cover, such as one a resize owns or one with a normal-buffer restore
+/// pending, leaves the rows owed without it. The helper clears the flag to
+/// leave the anchor in that state.
 fn leaveHistoryDebtForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void {
     var base = try testSource(alloc, debt_base_flow, runtime.layout.cols);
     defer base.deinit(alloc);
@@ -14994,11 +14998,12 @@ fn leaveHistoryDebtForTest(runtime: *TranscriptRuntime, alloc: Allocator) !void 
     var rewritten_prepared = try prepareTestSourceForCurrentArea(runtime, alloc, &rewritten);
     defer rewritten_prepared.deinit(alloc);
     try commitPreparedForTest(runtime, alloc, &rewritten, &rewritten_prepared);
-    const anchor = runtime.transcript_commit_state.stable;
+    const anchor = &runtime.transcript_commit_state.stable;
     try std.testing.expectEqual(debt_history_for_test, anchor.history_visual_offset);
     try std.testing.expectEqual(debt_history_for_test + 4, anchor.visual_offset);
-    try std.testing.expect(!anchor.history_catchup_pending);
+    try std.testing.expect(anchor.history_catchup_pending);
     try std.testing.expect(!anchor.normal_buffer_recovery_pending);
+    anchor.history_catchup_pending = false;
 }
 
 /// Commits one more rewritten frame over the debt. It cannot replay the owed
