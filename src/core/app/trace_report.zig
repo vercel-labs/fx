@@ -2904,10 +2904,7 @@ fn checkSubagentText(fuzzed: []const u8) !void {
 
         var trace = try w.trace();
         defer trace.deinit();
-        expectNoPlantedSecret(&trace) catch |err| {
-            std.debug.print("secret {s} with {d} bytes before the cut\n", .{ secret.text, inside });
-            return err;
-        };
+        try expectNoPlantedSecret(&trace);
         const ta = trace.arena.allocator();
         const record = try trace.one("subagent");
         inline for (.{ "name", "model", "effort" }) |field| {
