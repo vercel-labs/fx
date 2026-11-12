@@ -11,6 +11,7 @@ const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const ascii_case = @import("../../core/shared/ascii_case.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -652,20 +653,133 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
     return scratch.print("{f}", .{text_utils.terminalSafe(written)});
 }
 
-fn storyArgs(scratch: std.mem.Allocator, record: *const ToolDetailRecord) ?std.json.ObjectMap {
-    const json = record.arguments_json orelse return null;
-    const value = std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{}) catch return null;
-    if (value != .object) return null;
-    // A call can wrap its fields in {"request": {...}}, which core unwraps the
-    // same way (src/core/tooling/tool_presentation.zig).
-    if (value.object.get("request")) |request| return if (request == .object) request.object else null;
-    return value.object;
+/// A string or whole-number field of a JSON object; `.other` for any other
+/// value.
+const JsonField = union(enum) { string: []const u8, integer: i64, other };
+
+/// The value of `key` among the top-level fields of the JSON object `json`,
+/// or among the fields of its "request" object: a call can wrap its fields
+/// in {"request": {...}}, which core unwraps the same way
+/// (src/core/tooling/tool_presentation.zig). It reads only as far as the key,
+/// skips the strings before it by jumping from quote to quote, and decodes
+/// only the key's own value, so a write_file call that holds a whole file
+/// costs one quick scan on each render, not a parse. It does not check the
+/// rest of the text. error.NotObject when `json` is not an object; null when
+/// it has no such key.
+fn jsonObjectField(scratch: std.mem.Allocator, json: []const u8, key: []const u8) !?JsonField {
+    const open = skipJsonSpace(json, 0);
+    if (open >= json.len or json[open] != '{') return error.NotObject;
+    return objectField(scratch, json, open + 1, key, true);
+}
+
+fn jsonField(scratch: std.mem.Allocator, json: []const u8, key: []const u8) ?JsonField {
+    return jsonObjectField(scratch, json, key) catch null;
+}
+
+/// Searches the fields of an object whose text starts at `start`, just after
+/// its "{".
+fn objectField(scratch: std.mem.Allocator, json: []const u8, start: usize, key: []const u8, top: bool) !?JsonField {
+    var index = skipJsonSpace(json, start);
+    while (index < json.len and json[index] != '}') {
+        if (json[index] != '"') return error.SyntaxError;
+        const name_end = skipJsonString(json, index) orelse return error.SyntaxError;
+        const raw_name = json[index..name_end];
+        const name = if (std.mem.findScalar(u8, raw_name, '\\') == null)
+            raw_name[1 .. raw_name.len - 1]
+        else
+            try std.json.parseFromSliceLeaky([]const u8, scratch, raw_name, .{});
+        index = skipJsonSpace(json, name_end);
+        if (index >= json.len or json[index] != ':') return error.SyntaxError;
+        index = skipJsonSpace(json, index + 1);
+        if (index >= json.len) return error.SyntaxError;
+        if (std.mem.eql(u8, name, key)) return try fieldValue(scratch, json, index);
+        if (top and json[index] == '{' and std.mem.eql(u8, name, "request")) {
+            if (try objectField(scratch, json, index + 1, key, false)) |found| return found;
+        }
+        index = skipJsonSpace(json, skipJsonValue(json, index) orelse return error.SyntaxError);
+        if (index < json.len and json[index] == ',') index = skipJsonSpace(json, index + 1);
+    }
+    return null;
+}
+
+fn fieldValue(scratch: std.mem.Allocator, json: []const u8, start: usize) !JsonField {
+    const end = skipJsonValue(json, start) orelse return error.SyntaxError;
+    const raw = json[start..end];
+    return switch (raw[0]) {
+        '"' => .{ .string = if (std.mem.findScalar(u8, raw, '\\') == null)
+            raw[1 .. raw.len - 1]
+        else
+            try std.json.parseFromSliceLeaky([]const u8, scratch, raw, .{}) },
+        '-', '0'...'9' => .{ .integer = std.fmt.parseInt(i64, raw, 10) catch return .other },
+        else => .other,
+    };
+}
+
+fn skipJsonSpace(json: []const u8, start: usize) usize {
+    var index = start;
+    while (index < json.len and std.mem.findScalar(u8, " \t\r\n", json[index]) != null) index += 1;
+    return index;
+}
+
+/// Where the string that starts with the quote at `start` ends, just after
+/// its closing quote. It jumps from quote to quote, so a long string costs
+/// little.
+fn skipJsonString(json: []const u8, start: usize) ?usize {
+    var from = start + 1;
+    while (std.mem.findScalarPos(u8, json, from, '"')) |quote| {
+        var slashes: usize = 0;
+        while (quote - slashes > start + 1 and json[quote - slashes - 1] == '\\') slashes += 1;
+        if (slashes % 2 == 0) return quote + 1;
+        from = quote + 1;
+    }
+    return null;
+}
+
+/// Where the value that starts at `start` ends.
+fn skipJsonValue(json: []const u8, start: usize) ?usize {
+    switch (json[start]) {
+        '"' => return skipJsonString(json, start),
+        '{', '[' => {
+            var depth: usize = 0;
+            var index = start;
+            while (index < json.len) {
+                switch (json[index]) {
+                    '"' => {
+                        index = skipJsonString(json, index) orelse return null;
+                        continue;
+                    },
+                    '{', '[' => depth += 1,
+                    '}', ']' => {
+                        depth -= 1;
+                        if (depth == 0) return index + 1;
+                    },
+                    else => {},
+                }
+                index += 1;
+            }
+            return null;
+        },
+        else => {
+            var index = start;
+            while (index < json.len and std.mem.findScalar(u8, ",}] \t\r\n", json[index]) == null) index += 1;
+            return if (index > start) index else null;
+        },
+    }
 }
 
 fn storyArgString(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?[]const u8 {
-    const args = storyArgs(scratch, record) orelse return null;
-    const value = args.get(key) orelse return null;
-    return if (value == .string and value.string.len > 0) value.string else null;
+    const json = record.arguments_json orelse return null;
+    return switch (jsonField(scratch, json, key) orelse return null) {
+        .string => |text| if (text.len > 0) text else null,
+        else => null,
+    };
+}
+
+/// Whether a call saved its arguments as an object; old records keep none.
+fn storyHasArgs(record: *const ToolDetailRecord) bool {
+    const json = record.arguments_json orelse return false;
+    const open = skipJsonSpace(json, 0);
+    return open < json.len and json[open] == '{';
 }
 
 const DiffTotals = struct { added: usize = 0, removed: usize = 0 };
@@ -729,6 +843,9 @@ const StoryTally = struct {
     toolbox_searches: usize = 0,
     subagent_calls: usize = 0,
     subagent_names: std.ArrayList([]const u8) = .empty,
+    /// The subagents main sent a message to, each once; a stop, close, or
+    /// status names a subagent without starting it.
+    subagents_messaged: std.ArrayList([]const u8) = .empty,
     /// Reports and messages from subagents, which show as subagent calls
     /// with empty arguments (src/core/subagent/reports.zig, Row.call).
     subagent_updates: usize = 0,
@@ -823,9 +940,11 @@ const StoryTally = struct {
             .subagent => {
                 self.subagent_calls += 1;
                 // Old records keep no arguments, so they say nothing more.
-                if (storyArgs(scratch, record) == null) return;
+                if (!storyHasArgs(record)) return;
                 if (storyArgString(scratch, record, "agent")) |agent| {
                     try addDistinct(&self.subagent_names, scratch, agent);
+                    const action = storyArgString(scratch, record, "action") orelse "message";
+                    if (std.mem.eql(u8, action, "message")) try addDistinct(&self.subagents_messaged, scratch, agent);
                 } else if (storyArgString(scratch, record, "action")) |action| {
                     if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) self.subagent_waits += 1;
                 } else {
@@ -913,8 +1032,14 @@ const StoryHeader = struct {
     parts: []const []const u8,
     /// " ✓" or " ✗" for the commands, or "".
     mark: []const u8,
+    /// The part that names the commands, so the mark shows only while that
+    /// part does; null when the lead names them.
+    mark_part: ?usize,
     /// " · 1 failed", " · 2 denied", and the other states.
     states: []const u8,
+    /// The states for a header whose mark does not show: a last command that
+    /// failed counts in " · N failed", so the failure still shows.
+    states_without_mark: []const u8,
 };
 
 /// The kinds of work a header names, in the order that breaks a tie.
@@ -943,10 +1068,12 @@ fn workAmount(tally: StoryTally, kind: WorkKind) usize {
         .edits => tally.changedFiles(),
         .subagents => if (tally.subagent_calls == 0)
             0
-        else if (tally.subagent_names.items.len > 0)
-            tally.subagent_names.items.len
+        else if (tally.subagents_messaged.items.len > 0)
+            tally.subagents_messaged.items.len
         else if (tally.subagent_updates > 0)
             tally.subagent_updates
+        else if (tally.subagent_names.items.len > 0)
+            tally.subagent_names.items.len
         else
             tally.subagent_calls,
         .commands => tally.commands,
@@ -979,14 +1106,13 @@ fn workPhrase(tally: StoryTally, kind: WorkKind) []const u8 {
             if (writes_only) break :blk if (one) "wrote a file" else "wrote files";
             break :blk if (one) "edited a file" else "edited files";
         },
-        .subagents => if (tally.subagent_names.items.len > 0)
+        .subagents => if (tally.subagents_messaged.items.len > 0)
             (if (one) "started a subagent" else "started subagents")
         else if (tally.subagent_updates > 0)
             (if (one) "got a subagent update" else "got subagent updates")
         else if (tally.subagent_waits == tally.subagent_calls)
             "waited for subagents"
-        else
-            "used subagents",
+        else if (one) "used a subagent" else "used subagents",
         .commands => if (tally.commands_running == tally.commands)
             (if (one) "running a command" else "running commands")
         else if (one) "ran a command" else "ran commands",
@@ -1030,13 +1156,23 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     try lead.writer.writeAll("● ");
     var parts: std.ArrayList([]const u8) = .empty;
     var lead_says_failed = false;
+    // The mark says how the commands ended, so it shows only beside them:
+    // not when ", and more" folds them in.
+    var mark_shown = true;
+    var mark_part: ?usize = null;
     if (kinds.items.len > 0) {
         const first = workPhrase(tally, kinds.items[0]);
         try lead.writer.print("{c}{s}", .{ std.ascii.toUpper(first[0]), first[1..] });
         if (with_diff and kinds.items[0] == .edits) try writeDiffTotals(&lead.writer, tally.diff, style);
         const named = @min(kinds.items.len, header_max_parts);
-        for (kinds.items[1..named]) |kind| try parts.append(scratch, try scratch.print(", {s}", .{workPhrase(tally, kind)}));
+        for (kinds.items[1..named]) |kind| {
+            if (kind == .commands) mark_part = parts.items.len;
+            try parts.append(scratch, try scratch.print(", {s}", .{workPhrase(tally, kind)}));
+        }
         if (kinds.items.len > named) try parts.append(scratch, ", and more");
+        for (kinds.items[named..]) |kind| if (kind == .commands) {
+            mark_shown = false;
+        };
     } else if (tally.other_failures > 0) {
         try lead.writer.print("{d} {s} failed", .{ tally.other_failures, pluralWord(tally.other_failures, "call", "calls") });
         lead_says_failed = true;
@@ -1047,44 +1183,59 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     }
 
     var mark: std.Io.Writer.Allocating = .init(scratch);
-    try writeResultMark(&mark.writer, tally);
-    var states: std.Io.Writer.Allocating = .init(scratch);
-    if (!lead_says_failed)
-        try appendSegment(&states.writer, tally.other_failures + tally.earlier_command_failures, "failed");
-    try appendSegment(&states.writer, summary.completion_unreported, "unreported");
-    try appendSegment(&states.writer, summary.not_executed, "not executed");
-    try appendSegment(&states.writer, summary.timed_out, "timed out");
-    try appendSegment(&states.writer, summary.denied, "denied");
-    try appendSegment(&states.writer, summary.cancelled, "cancelled");
+    if (mark_shown) try writeResultMark(&mark.writer, tally);
+    const failed = if (lead_says_failed) 0 else tally.other_failures + tally.earlier_command_failures;
+    const last_failed: usize = if (tally.last_command_failed orelse false) 1 else 0;
+    const states = try formatHeaderStates(scratch, failed, summary);
+    const states_without_mark = try formatHeaderStates(scratch, failed + last_failed, summary);
     return .{
         .lead = lead.written(),
         .parts = parts.items,
         .mark = mark.written(),
-        .states = states.written(),
+        .mark_part = mark_part,
+        .states = if (mark_shown) states else states_without_mark,
+        .states_without_mark = states_without_mark,
     };
 }
 
+/// " · 1 failed · 2 denied" and the other states a header ends with.
+fn formatHeaderStates(scratch: std.mem.Allocator, failed: usize, summary: Summary) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    try appendSegment(&out.writer, failed, "failed");
+    try appendSegment(&out.writer, summary.completion_unreported, "unreported");
+    try appendSegment(&out.writer, summary.not_executed, "not executed");
+    try appendSegment(&out.writer, summary.timed_out, "timed out");
+    try appendSegment(&out.writer, summary.denied, "denied");
+    try appendSegment(&out.writer, summary.cancelled, "cancelled");
+    return out.written();
+}
+
 /// Fits a story header to `cols`. Parts that do not fit drop from the end,
-/// and " …" says the header goes on, so the first part, the mark, and the
-/// states, failures first, always show. When those alone are too wide, the
-/// first part clips and the mark and states stay; when they would take more
-/// than half the row, the header clips from the right like any other
-/// summary. Caller owns the returned text.
+/// and " …" says the header goes on, so the first part and the states,
+/// failures first, always show; the mark shows while the part that names the
+/// commands does. When the first part and states alone are too wide, the
+/// first part clips and the states stay; when they would take more than half
+/// the row, the header clips from the right like any other summary. Caller
+/// owns the returned text.
 fn clipStoryHeader(alloc: std.mem.Allocator, header: StoryHeader, cols: u16) ![]u8 {
     var kept = header.parts.len;
     while (true) {
+        const mark_shows = if (header.mark_part) |part| part < kept else true;
         var line: std.Io.Writer.Allocating = .init(alloc);
         defer line.deinit();
         try line.writer.writeAll(header.lead);
         for (header.parts[0..kept]) |part| try line.writer.writeAll(part);
         if (kept < header.parts.len) try line.writer.writeAll(" …");
-        try line.writer.writeAll(header.mark);
-        try line.writer.writeAll(header.states);
+        if (mark_shows) try line.writer.writeAll(header.mark);
+        try line.writer.writeAll(if (mark_shows) header.states else header.states_without_mark);
         if (display_width.visibleWidthIgnoringAnsi(line.written()) <= cols) return try line.toOwnedSlice();
         if (kept == 0) break;
         kept -= 1;
     }
-    const tail = try std.mem.concat(alloc, u8, &.{ header.mark, header.states });
+    const tail = if (header.mark_part == null)
+        try std.mem.concat(alloc, u8, &.{ header.mark, header.states })
+    else
+        try alloc.dupe(u8, header.states_without_mark);
     defer alloc.free(tail);
     return clipKeepingTail(alloc, header.lead, tail, cols, "");
 }
@@ -1243,9 +1394,11 @@ fn endsInsideLink(text: []const u8) bool {
 }
 
 fn storyArgInt(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?i64 {
-    const args = storyArgs(scratch, record) orelse return null;
-    const value = args.get(key) orelse return null;
-    return if (value == .integer) value.integer else null;
+    const json = record.arguments_json orelse return null;
+    return switch (jsonField(scratch, json, key) orelse return null) {
+        .integer => |value| value,
+        else => null,
+    };
 }
 
 fn withoutSuffix(text: []const u8, suffix: []const u8) ?[]const u8 {
@@ -1314,7 +1467,8 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: StoryRow, 
         const start = storyArgInt(scratch, record, "start_line");
         const count = storyArgInt(scratch, record, "line_count");
         if (start != null and start.? > 0 and count != null and count.? > 0) {
-            try out.writer.print(" L{d}-{d}", .{ start.?, start.? + count.? - 1 });
+            // The model chooses both numbers, so their sum saturates.
+            try out.writer.print(" L{d}-{d}", .{ start.?, start.? +| (count.? - 1) });
         } else if (start != null and start.? > 1) {
             try out.writer.print(" L{d}+", .{start.?});
         } else if (count != null and count.? > 0) {
@@ -1324,46 +1478,49 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: StoryRow, 
     return out.written();
 }
 
-/// A file by its name, in place of its whole path. An absolute path makes the
-/// name a file link, so Cmd+click opens the file. A path with no name shows
-/// whole. The text is terminal-safe.
+/// Extensions of files that macOS runs, installs, or follows when one is
+/// opened, so a Cmd+click on a link to one would act on it.
+const runnable_extensions = [_][]const u8{
+    ".app",     ".command", ".tool",   ".terminal", ".workflow",    ".action",
+    ".pkg",     ".mpkg",    ".scpt",   ".scptd",    ".applescript", ".jar",
+    ".fileloc", ".inetloc", ".webloc", ".prefpane", ".saver",       ".kext",
+};
+
+/// Whether a link may open `name`. A file with no extension can be a
+/// program, which opens in Terminal and runs, and the transcript cannot tell
+/// which files are programs, so only a file whose extension is not a
+/// runnable kind gets a link.
+fn linkOpensSafely(name: []const u8) bool {
+    const extension = std.Io.Dir.path.extension(name);
+    if (extension.len == 0) return false;
+    for (runnable_extensions) |runnable| if (std.ascii.eqlIgnoreCase(extension, runnable)) return false;
+    return true;
+}
+
+/// A file by its name, in place of its whole path. An absolute path to a
+/// file that opens safely makes the name a file link, so Cmd+click opens
+/// the file. A path with no name shows whole. The text is terminal-safe.
 fn writeFileName(writer: *std.Io.Writer, path: []const u8) !void {
     const base = std.Io.Dir.path.basename(path);
     const name = if (base.len == 0) path else base;
-    if (base.len > 0 and std.Io.Dir.path.isAbsolute(path)) {
+    if (base.len > 0 and std.Io.Dir.path.isAbsolute(path) and linkOpensSafely(base)) {
         try writer.writeAll("\x1b]8;;file://");
         try writeFileUrlPath(writer, path);
         try writer.print("\x1b\\{f}" ++ link_close, .{text_utils.terminalSafe(name)});
     } else try writer.print("{f}", .{text_utils.terminalSafe(name)});
 }
 
-/// The text of a row that names several files or patterns: its verb, the
+/// The text of a row that names several files or patterns: its past verb, the
 /// names that fit in `cols` after the row's two-column connector, then how
 /// many did not, such as "Read a.zig, b.zig +3 more". At least one name
 /// shows; the row clips it when even that one is too wide, and keeps the
 /// count. Ctrl+O shows every call.
 fn nameListRowText(scratch: std.mem.Allocator, row: StoryRow, cols: u16) !StoryRowText {
-    const record = row.detail;
     const is_read = row.identity.kind == .read;
     const tool = if (is_read) "read_file" else storySearchTool(row.identity.key);
-    const default_verb = if (is_read) "Read" else if (std.mem.eql(u8, tool, "glob_files")) "Matched" else "Searched";
-    // The latest call's own label, such as "Reading" while it runs.
-    const status = switch (row.entry) {
-        .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
-        else => null,
-    };
-    const latest_name: ?[]const u8 = if (record) |detail|
-        (if (is_read) storyArgString(scratch, detail, "path") else storyArgString(scratch, detail, "pattern"))
-    else
-        null;
-    const verb = verb: {
-        const phrase = status orelse break :verb default_verb;
-        const name = latest_name orelse break :verb default_verb;
-        if (phrase.len <= name.len + 1 or !std.mem.endsWith(u8, phrase, name)) break :verb default_verb;
-        const label = phrase[0 .. phrase.len - name.len];
-        if (label[label.len - 1] != ' ' or std.mem.findScalar(u8, label[0 .. label.len - 1], ' ') != null) break :verb default_verb;
-        break :verb label[0 .. label.len - 1];
-    };
+    // The row stands for every call it names, so it says what they did, even
+    // while the newest still runs.
+    const verb = if (is_read) "Read" else if (std.mem.eql(u8, tool, "glob_files")) "Matched" else "Searched";
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
     var body: std.Io.Writer.Allocating = .init(scratch);
@@ -1471,12 +1628,10 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
     switch (kind) {
         .command => {
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
-            if (record.result) |result| {
-                if (std.json.parseFromSliceLeaky(std.json.Value, scratch, result, .{})) |parsed| {
-                    if (parsed == .object) if (parsed.object.get("session_id")) |id| if (id == .string and id.string.len > 0)
-                        return .{ .kind = .session, .key = id.string };
-                } else |_| {}
-            }
+            if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
+                .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
+                else => {},
+            };
             const command = storyArgString(scratch, record, "command") orelse record.command_display orelse "";
             if (command.len > 0) return .{ .kind = .command, .key = command };
             return .{};
@@ -1693,15 +1848,6 @@ fn ordinalSuffix(number: usize) []const u8 {
     };
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or haystack.len < needle.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
-}
-
 /// The line of command output that says what went wrong: the first line that
 /// mentions an error or a failure, else the last line.
 /// Command output kept in its escaped form, where text_utils.encodeTerminalSafe
@@ -1719,7 +1865,7 @@ fn verdictLine(text: []const u8) ?[]const u8 {
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        if (containsIgnoreCase(trimmed, "error") or containsIgnoreCase(trimmed, "fail")) return trimmed;
+        if (ascii_case.containsIgnoreCase(trimmed, "error") or ascii_case.containsIgnoreCase(trimmed, "fail")) return trimmed;
     }
     return lastNonEmptyLine(text);
 }
@@ -1768,6 +1914,9 @@ fn splitFailedPhrase(phrase: []const u8, detail: ?*const ToolDetailRecord) ?Spli
 /// One plain line that says why a call failed, such as
 /// "exit 1 · 1 failed: backoff adds 500ms". Null for calls that did not fail
 /// and for failures whose output has no line to show.
+/// The most bytes of a failure's reason line, before the row clips it.
+const story_reason_max_bytes = 160;
+
 fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !?[]const u8 {
     const record = detail orelse return null;
     if (!storyCallFailed(detail)) return null;
@@ -1785,17 +1934,20 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
         // Command details keep the plain output, where the line that names
         // the error says the most; other tools lead with their error.
         const plain_line = if (is_command) verdictLine(try storyOutputLines(scratch, result)) else firstNonEmptyLine(result);
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch, result, .{}) catch break :blk plain_line;
-        if (parsed != .object) break :blk plain_line;
-        if (parsed.object.get("output_delta")) |value| if (value == .string) break :blk verdictLine(value.string);
-        if (parsed.object.get("error")) |value| if (value == .string) break :blk firstNonEmptyLine(value.string);
-        if (parsed.object.get("message")) |value| if (value == .string) break :blk firstNonEmptyLine(value.string);
+        const fields = [_][]const u8{ "output_delta", "error", "message" };
+        for (fields) |field_name| {
+            const field = jsonObjectField(scratch, result, field_name) catch break :blk plain_line;
+            if (field) |value| switch (value) {
+                .string => |text| break :blk if (std.mem.eql(u8, field_name, "output_delta")) verdictLine(text) else firstNonEmptyLine(text),
+                else => {},
+            };
+        }
         break :blk null;
     } else null;
     // Without a line of output the reason would only repeat the row's own
     // status, such as "Exited 2" or "Timed out", so there is no reason line.
     const text = line orelse return null;
-    const safe = try storySafeLine(scratch, text, 160);
+    const safe = try storySafeLine(scratch, text, story_reason_max_bytes);
     if (safe.len == 0) return null;
     if (out.written().len > 0) try w.writeAll(" · ");
     try w.writeAll(safe);
@@ -1815,7 +1967,7 @@ fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
         if (tally.diff.removed > 0) try w.print(" -{d}", .{tally.diff.removed});
         try w.writeAll(" · ");
     }
-    if (tally.last_command_failed != null) {
+    if (tally.commands > 0) {
         try w.print("ran {d} {s} · ", .{ tally.commands, pluralWord(tally.commands, "command", "commands") });
     }
     // A turn that handed its work to subagents did more than explore.
@@ -1930,7 +2082,7 @@ fn formatGroupBlock(
     const header = if (single_row) |row| blk: {
         const text = single_text.?;
         const succeeded_command = if (row.detail) |record|
-            record.activity_kind == .command and record.outcome == .completed and
+            isShellCommandCall(scratch, record) and record.outcome == .completed and
                 !storyCallFailed(row.detail) and !phraseNamesFailure(text.display) and
                 !phraseShowsProgress(text.display)
         else
@@ -2043,7 +2195,7 @@ fn writeRowDetails(
         if (style.text_style.len > 0) try writer.writeAll(style.reset_style);
     }
     const failure_reason = if (text.split_failure) |split|
-        try storySafeLine(scratch, split.reason, 160)
+        try storySafeLine(scratch, split.reason, story_reason_max_bytes)
     else
         try storyFailureReason(scratch, row.detail);
     if (failure_reason) |reason| {
@@ -5719,12 +5871,12 @@ test "every read in a group shares one row, and so does each search tool" {
     _ = narrow_rows.next();
     try std.testing.expectEqualStrings("├ Read a.zig +2 more", narrow_rows.next().?);
 
-    // A narrow header drops its last parts first and keeps the mark and the
-    // failure.
+    // A narrow header drops its last parts first and keeps the failure; the
+    // mark goes with the commands it is for.
     var short = try build(alloc, &entries, &details, 28);
     defer short.deinit(alloc);
     const short_bytes = short.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Read files … ✓ · 1 failed", short_bytes[0..std.mem.findScalar(u8, short_bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● Read files … · 1 failed", short_bytes[0..std.mem.findScalar(u8, short_bytes, '\n').?]);
 }
 
 test "a list row links each file it names" {
@@ -5792,8 +5944,125 @@ test "a header puts edits first, then the most work, and names three kinds" {
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
     // One edit comes first; three searches did more than two reads; the
-    // command and the web page are the "more".
-    try std.testing.expectEqualStrings("● Edited a file, searched, read files, and more ✓", bytes[0..std.mem.findScalar(u8, bytes, '\n').?]);
+    // command and the web page are the "more", so the mark goes with them.
+    try std.testing.expectEqualStrings("● Edited a file, searched, read files, and more", bytes[0..std.mem.findScalar(u8, bytes, '\n').?]);
+}
+
+test "a read row's lines never overflow, whatever numbers the model sends" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read src/main.zig\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("read_file"),
+        .activity_kind = .read,
+        .arguments_json = @constCast("{\"path\":\"src/main.zig\",\"start_line\":4611686018427387904,\"line_count\":6917529027641081856}"),
+        .outcome = .completed,
+    }};
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings("● Read main.zig L4611686018427387904-9223372036854775807", projection.entry_actions.items[0].override.bytes);
+}
+
+test "story fields come from a JSON scan that skips values it does not need" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const big = text_utils.repeat("x", 4096);
+    // The key after a large value, inside a request wrapper, and with an
+    // escaped name.
+    const json = "{\"content\":\"" ++ big ++ "\",\"nested\":{\"path\":\"no\"},\"path\":\"src/a.zig\",\"line_count\":12}";
+    try std.testing.expectEqualStrings("src/a.zig", jsonField(arena, json, "path").?.string);
+    try std.testing.expectEqual(@as(i64, 12), jsonField(arena, json, "line_count").?.integer);
+    const wrapped = "{\"request\":{\"action\":\"message\",\"ag\\u0065nt\":\"reviewer\"}}";
+    try std.testing.expectEqualStrings("reviewer", jsonField(arena, wrapped, "agent").?.string);
+    try std.testing.expect(jsonField(arena, wrapped, "missing") == null);
+    try std.testing.expect(jsonField(arena, "[1,2]", "path") == null);
+    try std.testing.expect(jsonField(arena, "not json", "path") == null);
+    try std.testing.expect(jsonField(arena, "{\"line_count\":1.5}", "line_count").? == .other);
+    try std.testing.expectError(error.NotObject, jsonObjectField(arena, "\"text\"", "path"));
+}
+
+test "session input alone gives no command count in the turn recap" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Observed npm run dev\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "  2s", .class = .turn_summary } },
+    };
+    const details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"action\":\"interact\",\"session_id\":\"shell-7\",\"chars\":\"q\"}", 0, null),
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    for (projection.entry_actions.items) |action| if (action == .override) {
+        try std.testing.expect(std.mem.find(u8, action.override.bytes, "Ran 0") == null);
+    };
+}
+
+test "a subagent that is only closed is not started" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● closed reviewer\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● closed tester\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"close\",\"agent\":\"reviewer\"}"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"close\",\"agent\":\"tester\"}"), .outcome = .completed },
+    };
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● Used subagents\n├ Closed reviewer\n└ Closed tester",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "the result mark shows only beside the commands it is for" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited src/main.zig +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Exited 2 zig build\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"src/main.zig\"}"), .outcome = .completed },
+        storyCommandDetail(2, "{\"command\":\"zig build\"}", 2, null),
+    };
+    details[1].command_display = @constCast("zig build");
+    var wide = try build(alloc, &entries, &details, 120);
+    defer wide.deinit(alloc);
+    const wide_bytes = wide.entry_actions.items[0].override.bytes;
+    try std.testing.expectEqualStrings("● Edited a file, ran a command ✗", wide_bytes[0..std.mem.findScalar(u8, wide_bytes, '\n').?]);
+    // Clipped to the edit, the header says that a call failed, not that the
+    // edit did.
+    var narrow = try build(alloc, &entries, &details, 30);
+    defer narrow.deinit(alloc);
+    const narrow_bytes = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expectEqualStrings("● Edited a file … · 1 failed", narrow_bytes[0..std.mem.findScalar(u8, narrow_bytes, '\n').?]);
+}
+
+test "a list row says what its calls did, and links only files that open safely" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/run.command\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /Users/example/bin/fx\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Reading /Users/example/a.zig\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyReadDetailForTest(1, "/Users/example/run.command"),
+        storyReadDetailForTest(2, "/Users/example/bin/fx"),
+        storyReadDetailForTest(3, "/Users/example/a.zig"),
+    };
+    details[2].outcome = null;
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    // A runnable file and a file with no extension get no link; the row
+    // reads "Read" while the last read still runs.
+    try std.testing.expectEqualStrings(
+        "● Read files\n" ++
+            "└ Read run.command, fx, \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close,
+        projection.entry_actions.items[0].override.bytes,
+    );
 }
 
 test "repeated bare subagent waits share one row of their own" {
@@ -5991,6 +6260,13 @@ const StoryFuzzBytes = struct {
         defer self.index += len;
         return self.bytes[self.index..][0..len];
     }
+
+    /// Any i64, from the next eight bytes, so the ends of the range come up.
+    fn int(self: *StoryFuzzBytes) i64 {
+        var bits: u64 = 0;
+        for (0..8) |_| bits = (bits << 8) | self.byte();
+        return @bitCast(bits);
+    }
 };
 
 /// Builds one compact group and its turn summary from fuzz bytes: core status
@@ -6040,8 +6316,18 @@ fn checkStoryRows(input: []const u8) !void {
             .bytes = statuses[fuzz.byte() % statuses.len],
             .class = .tool_status,
         } };
-        const arguments_json: ?[]u8 = switch (fuzz.byte() % 4) {
+        const arguments_json: ?[]u8 = switch (fuzz.byte() % 5) {
             0 => null,
+            4 => blk: {
+                // A read of a fuzzed path at fuzzed lines, any whole numbers
+                // the model could send.
+                var out: std.Io.Writer.Allocating = .init(arena);
+                try out.writer.writeAll("{\"path\":");
+                const path = try arena.print("/w/{s}", .{fuzz.chunk(24)});
+                std.json.Stringify.value(path, .{}, &out.writer) catch try out.writer.writeAll("\"\"");
+                try out.writer.print(",\"start_line\":{d},\"line_count\":{d}}}", .{ fuzz.int(), fuzz.int() });
+                break :blk out.written();
+            },
             1 => try arena.dupe(u8, fuzz.chunk(64)),
             2 => blk: {
                 var out: std.Io.Writer.Allocating = .init(arena);
@@ -6108,34 +6394,48 @@ fn checkStoryRows(input: []const u8) !void {
             // terminal-safe.
             var plain: std.Io.Writer.Allocating = .init(arena);
             var index: usize = 0;
+            var link_open = false;
             while (index < line.len) {
                 if (skipSgrSequence(line, &index)) continue;
-                if (skipFileLink(line, &index)) continue;
+                switch (skipFileLink(line, &index)) {
+                    .none => {},
+                    // Links never nest, and each one closes on its line.
+                    .open => {
+                        try std.testing.expect(!link_open);
+                        link_open = true;
+                        continue;
+                    },
+                    .close => {
+                        link_open = false;
+                        continue;
+                    },
+                }
                 try plain.writer.writeByte(line[index]);
                 index += 1;
             }
+            try std.testing.expect(!link_open);
             try std.testing.expect(text_utils.isTerminalSafe(plain.written()));
         }
     }
 }
 
-/// Skips a file link sequence fx writes: its close, or an open whose URL holds
-/// only percent-encoded path bytes.
-fn skipFileLink(text: []const u8, index: *usize) bool {
+/// Skips a file link sequence fx writes, and says which it was: its close,
+/// or an open whose URL holds only percent-encoded path bytes.
+fn skipFileLink(text: []const u8, index: *usize) enum { none, open, close } {
     const rest = text[index.*..];
     if (std.mem.startsWith(u8, rest, link_close)) {
         index.* += link_close.len;
-        return true;
+        return .close;
     }
     const open = "\x1b]8;;file://";
-    if (!std.mem.startsWith(u8, rest, open)) return false;
-    const end = std.mem.find(u8, rest, "\x1b\\") orelse return false;
+    if (!std.mem.startsWith(u8, rest, open)) return .none;
+    const end = std.mem.find(u8, rest, "\x1b\\") orelse return .none;
     for (rest[open.len..end]) |byte| {
         const url_byte = std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '-' or byte == '.' or byte == '_' or byte == '~' or byte == '%';
-        if (!url_byte) return false;
+        if (!url_byte) return .none;
     }
     index.* += end + 2;
-    return true;
+    return .open;
 }
 
 fn fuzzStoryRows(_: void, smith: *std.testing.Smith) !void {
