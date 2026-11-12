@@ -5317,18 +5317,22 @@ fn optionalBytesEqual(current: ?[]const u8, next: []const u8) bool {
 }
 
 /// Refreshes the job's login in `mode` and takes it, with its team, through
-/// `adoptJobCredential`.
+/// `adoptJobCredential`. `rejected_token`, with `.force`, is the access token
+/// the provider just answered 401 for: the saved login then rotates only while
+/// it still holds that token (`tests/tla/auth/SharedLoginRefresh.tla`
+/// NoRedundantRotation).
 fn refreshGatewayCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
     job: *QueuedPrompt,
     job_arena: Allocator,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
     active_api_key: *[]const u8,
     owned_api_key: *?[]u8,
     trace_ctx: TraceContext,
 ) !bool {
-    const refreshed = (try loadJobCredential(deps, alloc, job.*, mode, trace_ctx)) orelse return false;
+    const refreshed = (try loadJobCredential(deps, alloc, job.*, mode, rejected_token, trace_ctx)) orelse return false;
     try adoptJobCredential(alloc, job, job_arena, mode, refreshed, active_api_key, owned_api_key, trace_ctx);
     return true;
 }
@@ -5341,12 +5345,13 @@ fn loadJobCredential(
     alloc: Allocator,
     job: QueuedPrompt,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
     trace_ctx: TraceContext,
 ) !?RefreshedGatewayCredential {
     const source = job.credential_source orelse return null;
     if (!credentials.sourceRefreshable(source)) return null;
     const refresh = deps.refresh_gateway_credential orelse return null;
-    return refresh(deps.ctx, alloc, source, mode, job.account_id) catch |err| {
+    return refresh(deps.ctx, alloc, source, mode, job.account_id, rejected_token) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.eventf(
             "gateway",
@@ -5426,7 +5431,7 @@ fn renewRejectedCredentialForJob(
     // comparison.
     const rejected = try alloc.dupe(u8, active_api_key.*);
     defer secret.zeroAndFree(alloc, rejected);
-    const stored = (try loadJobCredential(deps, alloc, job.*, .reload, trace_ctx)) orelse {
+    const stored = (try loadJobCredential(deps, alloc, job.*, .reload, null, trace_ctx)) orelse {
         debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
         return false;
     };
@@ -5435,7 +5440,7 @@ fn renewRejectedCredentialForJob(
     // it holds if the forced refresh gives nothing.
     try adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx);
     if (renewed) return true;
-    return refreshGatewayCredentialForJob(deps, alloc, job, job_arena, .force, active_api_key, owned_api_key, trace_ctx);
+    return refreshGatewayCredentialForJob(deps, alloc, job, job_arena, .force, rejected, active_api_key, owned_api_key, trace_ctx);
 }
 
 const ProviderAdmission = struct {
@@ -7983,6 +7988,7 @@ fn processQueuedPromptLoop(
                     &job,
                     arena,
                     if (credential_reload_pending) .reload else .if_needed,
+                    null,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
@@ -9108,9 +9114,9 @@ fn processQueuedPromptLoop(
                 }
             };
 
-            // fx refreshed the login after a 401 and the gateway refused the
-            // new one too, so the login itself is good and signing in again
-            // cannot help. On a host that can ask, the request waits and
+            // fx refreshed the login after a 401, or took the one another fx
+            // had saved, and the gateway refused that one too, so the login
+            // itself is good and signing in again cannot help. On a host that can ask, the request waits and
             // resends with the same login as for a 5xx, showing the gateway's
             // reason once; Esc during the wait falls through to the cancel
             // path below. A host that cannot ask ends the turn as before.
