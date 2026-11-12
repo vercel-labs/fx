@@ -453,12 +453,12 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
             if (rest.len > 0) try earlier_summary.print(arena, "{s}\n", .{rest});
             continue;
         }
-        if (sectionRest(plain)) |rest| {
+        if (sectionHeading(plain)) |heading| {
             in_sections = true;
             in_earlier = false;
             turn = null;
             current = null;
-            try sections.print(arena, "{s}\n", .{rest});
+            try sections.print(arena, "{s}\n", .{heading.rest});
             continue;
         }
         if (in_earlier) {
@@ -657,16 +657,51 @@ fn earlierRest(plain: []const u8) ?[]const u8 {
     return null;
 }
 
-/// What follows a section heading like `Rules:` or `Facts of the session:`
-/// on its line, or null when `plain` is not one.
-fn sectionRest(plain: []const u8) ?[]const u8 {
-    const headings = [_][]const u8{ "Rules of the session", "Facts of the session", "Status and open", "Rules", "Facts", "Decisions", "Status", "Open" };
-    for (headings) |heading| {
-        if (!startsWithIgnoreCase(plain, heading)) continue;
-        const after = plain[heading.len..];
-        if (after.len == 0) return after;
-        if (after[0] == ':') return std.mem.trim(u8, after[1..], " ");
+/// A section of the notes after the turns', and Earlier, which only a request
+/// that folds the compaction before it asks for.
+pub const Section = enum { rules, facts, decisions, status, open, earlier };
+
+/// The section headings `read` accepts, a longer one before its prefix.
+const section_headings = [_]struct { name: []const u8, section: Section }{
+    .{ .name = "Rules of the session", .section = .rules },
+    .{ .name = "Facts of the session", .section = .facts },
+    .{ .name = "Status and open", .section = .status },
+    .{ .name = "Rules", .section = .rules },
+    .{ .name = "Facts", .section = .facts },
+    .{ .name = "Decisions", .section = .decisions },
+    .{ .name = "Status", .section = .status },
+    .{ .name = "Open", .section = .open },
+};
+
+const SectionHeading = struct { section: Section, rest: []const u8 };
+
+/// The section a heading like `Rules:` or `Facts of the session:` starts and
+/// what follows it on its line, or null when `plain` is not one.
+fn sectionHeading(plain: []const u8) ?SectionHeading {
+    for (section_headings) |heading| {
+        if (!startsWithIgnoreCase(plain, heading.name)) continue;
+        const after = plain[heading.name.len..];
+        if (after.len == 0) return .{ .section = heading.section, .rest = after };
+        if (after[0] == ':') return .{ .section = heading.section, .rest = std.mem.trim(u8, after[1..], " ") };
     }
+    return null;
+}
+
+/// What a line of the notes starts, read as `read` reads it.
+pub const LineStart = union(enum) {
+    /// A note for calls `first` through `last`.
+    tools: struct { first: usize, last: usize },
+    section: Section,
+};
+
+/// What `line` starts, or null for any other line. `arena` holds the line
+/// without its Markdown when it has any `**`, never more than `line.len`
+/// bytes.
+pub fn lineStart(arena: Allocator, line: []const u8) Allocator.Error!?LineStart {
+    const plain = try undecorated(arena, std.mem.trim(u8, line, " \t\r"));
+    if (toolNote(plain)) |note| return .{ .tools = .{ .first = note.number, .last = @max(note.number, note.last) } };
+    if (earlierRest(plain) != null) return .{ .section = .earlier };
+    if (sectionHeading(plain)) |heading| return .{ .section = heading.section };
     return null;
 }
 
