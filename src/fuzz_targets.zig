@@ -14,8 +14,8 @@ test {
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("core/cli/cli_flags.zig");
+    _ = @import("core/compactor/compactor.zig");
     _ = @import("core/config/configured_provider.zig");
-    _ = @import("core/compactor/checkpoint.zig");
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/cli/doctor_child_status.zig");

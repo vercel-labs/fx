@@ -521,6 +521,40 @@ test "an unreadable checkpoint numbers new turns, tool calls and ledgers after t
     try std.testing.expectEqual(@as(usize, 7), recovered.tool_count);
 }
 
+test "a checkpoint's provider block survives a round trip on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzProviderBlock, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "fx-compactor-v1\n{\"entries\":[],\"used\":[],\"earlier\":\"\",\"turns\":[],\"provider\":{\"provider\":\"gateway\",\"model\":\"anthropic/claude-fable-5.2\",\"text\":\"sum\",\"parts_json\":\"[]\",\"kept_turns\":3,\"runtime_context\":[\"ctx\"]}}",
+            "fx-compactor-v1\n{\"earlier\":\"e\",\"provider\":{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"parts_json\":\"[{}]\"}}",
+            "fx-compactor-v1\n{\"provider\":null}",
+            "fx-compactor-v1\n{",
+            "plain summary",
+        }) ++ @import("fuzz_corpus").checkpoint_provider_block.*),
+    });
+}
+
+/// A provider block a saved checkpoint holds reads back unchanged after fx
+/// writes it again, and another model still gets fx's text for it.
+fn fuzzProviderBlock(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [4096]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const payload = try checkpoint.parse(arena, bytes) orelse return;
+    const block = payload.provider orelse return;
+    const encoded = try checkpoint.encode(arena, payload);
+    const kept = (try checkpoint.providerBlock(arena, encoded)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(block.provider, kept.provider);
+    try std.testing.expectEqualStrings(block.model, kept.model);
+    try std.testing.expectEqualStrings(block.text, kept.text);
+    try std.testing.expectEqualStrings(block.parts_json, kept.parts_json);
+    try std.testing.expectEqual(block.kept_turns, kept.kept_turns);
+    try std.testing.expectEqual(block.runtime_context.len, kept.runtime_context.len);
+    for (block.runtime_context, kept.runtime_context) |a, b| try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect((try checkpoint.modelText(arena, encoded)) != null);
+}
+
 test {
     _ = window;
     _ = summarize;
