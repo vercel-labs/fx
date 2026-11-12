@@ -212,6 +212,9 @@ pub const FakeCompletion = struct {
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
+    /// Set while this request is on the wire, before its answer, as when
+    /// the user signs in during a resend.
+    set_before_answer: ?*std.atomic.Value(bool) = null,
 };
 
 /// Fails a model request whose prompt ends on an assistant message, and one the
@@ -293,6 +296,7 @@ pub const FakeGateway = struct {
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        if (completion.set_before_answer) |flag| flag.store(true, .seq_cst);
         if (completion.pre_admission_error) |err| return err;
         try request.admission.admit();
         self.admitted_requests += 1;
@@ -633,6 +637,10 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_error: ?anyerror = null,
     /// A forced refresh finds nothing, as when the refresh token is rejected.
     credential_refresh_fail_force: bool = false,
+    /// Only this many forced refreshes work; later ones find nothing, as
+    /// when the refresh token is revoked during the turn.
+    credential_refresh_force_successes: ?usize = null,
+    credential_refresh_force_count: usize = 0,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
@@ -906,6 +914,10 @@ pub const FakeAgentRuntimeDeps = struct {
             null;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_fail_force and mode == .force) return null;
+        if (mode == .force) if (self.credential_refresh_force_successes) |limit| {
+            if (self.credential_refresh_force_count >= limit) return null;
+            self.credential_refresh_force_count += 1;
+        };
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
         self.credential_refresh_index += 1;

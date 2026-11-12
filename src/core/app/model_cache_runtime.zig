@@ -1,5 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const stored_login_testing = @import("../auth/stored_login_testing.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
@@ -142,6 +144,75 @@ const OwnedCatalogAccess = struct {
                 if (access.account_id) |account| alloc.free(@constCast(account));
             },
         }
+        self.* = undefined;
+    }
+};
+
+/// A warmup's copy of the shared sign-in it fetches with; it owns the account
+/// and team bytes.
+const OwnedSignIn = struct {
+    sign_in: auth_runtime.SharedSignIn,
+
+    fn init(alloc: Allocator, sign_in: auth_runtime.SharedSignIn) !OwnedSignIn {
+        var owned = sign_in;
+        owned.account_id = if (sign_in.account_id) |account| try alloc.dupe(u8, account) else null;
+        errdefer if (owned.account_id) |account| alloc.free(account);
+        owned.team = if (sign_in.team) |team| try alloc.dupe(u8, team) else null;
+        return .{ .sign_in = owned };
+    }
+
+    fn deinit(self: *OwnedSignIn, alloc: Allocator) void {
+        if (self.sign_in.account_id) |account| alloc.free(account);
+        if (self.sign_in.team) |team| alloc.free(team);
+        self.* = undefined;
+    }
+};
+
+/// Gives the model list's fetch the stored token of its shared sign-in, which
+/// another fx process may have refreshed since the app read it. It never
+/// refreshes the sign-in, and it owns every token it hands to the fetch until
+/// the fetch returns.
+const CatalogSignIn = struct {
+    alloc: Allocator,
+    sign_in: auth_runtime.SharedSignIn,
+    stored: ?credentials.Credential = null,
+    replacement: ?credentials.Credential = null,
+
+    /// The stored token when it differs from `current`
+    /// (tests/tla/session_title/SessionTitle.tla CatalogFirstSendUsesStore).
+    fn storedToken(self: *CatalogSignIn, current: []const u8) ?[]const u8 {
+        var credential = (auth_runtime.readStoredCredential(self.alloc, self.sign_in) catch |err| {
+            debug_trace.logf("catalog", "model catalog keeps its credential reason=stored_read_failed err={s}", .{@errorName(err)});
+            return null;
+        }) orelse return null;
+        if (std.mem.eql(u8, credential.token, current)) {
+            credential.deinit(self.alloc);
+            return null;
+        }
+        if (self.stored) |*old| old.deinit(self.alloc);
+        self.stored = credential;
+        return credential.token;
+    }
+
+    fn hook(self: *CatalogSignIn) model_catalog.RenewAfterRejection {
+        return .{ .context = self, .renew_fn = replace };
+    }
+
+    /// The stored token that replaced `rejected`, or null to fall back.
+    fn replace(context: *anyopaque, rejected: []const u8) ?[]const u8 {
+        const self: *CatalogSignIn = @ptrCast(@alignCast(context));
+        const credential = (auth_runtime.storedReplacement(self.alloc, self.sign_in, rejected) catch |err| {
+            debug_trace.logf("catalog", "model catalog falls back reason=stored_read_failed err={s}", .{@errorName(err)});
+            return null;
+        }) orelse return null;
+        if (self.replacement) |*old| old.deinit(self.alloc);
+        self.replacement = credential;
+        return credential.token;
+    }
+
+    fn deinit(self: *CatalogSignIn) void {
+        if (self.stored) |*credential| credential.deinit(self.alloc);
+        if (self.replacement) |*credential| credential.deinit(self.alloc);
         self.* = undefined;
     }
 };
@@ -441,25 +512,45 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
     }
 
-    pub fn startWarmup(
+    fn startWarmup(
         self: *Self,
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
         trigger: LoadTrigger,
     ) void {
+        self.startWarmupWithSharedSignIn(provider, access, trigger, null);
+    }
+
+    /// Starts a warmup for `access`. With a shared sign-in, the warmup fetches
+    /// with its stored token, and after a 401 tries once more with a stored
+    /// token that replaced the rejected one before it falls back to the public
+    /// list.
+    pub fn startWarmupWithSharedSignIn(
+        self: *Self,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
+        trigger: LoadTrigger,
+        shared_sign_in: ?auth_runtime.SharedSignIn,
+    ) void {
         self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
-        const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
-            self.completeFetch(.{ .failed = .{
-                .access = .init(access),
-                .anonymous_fallback_used = false,
-                .failure = .{ .category = .resource_exhausted },
-            } });
+        const failed_to_copy: model_catalog.FetchResult = .{ .failed = .{
+            .access = .init(access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .resource_exhausted },
+        } };
+        var owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
+            self.completeFetch(failed_to_copy);
             return;
         };
+        const owned_sign_in: ?OwnedSignIn = if (shared_sign_in) |value| OwnedSignIn.init(self.alloc, value) catch {
+            owned_access.deinit(self.alloc);
+            self.completeFetch(failed_to_copy);
+            return;
+        } else null;
 
-        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access }) catch {
+        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access, owned_sign_in }) catch {
             var failed_access = owned_access;
             const failure = model_catalog.FailedOutcome{
                 .access = .init(failed_access.access),
@@ -467,6 +558,10 @@ pub const Runtime = struct {
                 .failure = .{ .category = .runtime, .retryable = true },
             };
             failed_access.deinit(self.alloc);
+            if (owned_sign_in) |value| {
+                var failed_sign_in = value;
+                failed_sign_in.deinit(self.alloc);
+            }
             self.completeFetch(.{ .failed = failure });
             return;
         };
@@ -888,15 +983,36 @@ pub const Runtime = struct {
         self: *Self,
         provider: model_catalog.Provider,
         owned_access: OwnedCatalogAccess,
+        owned_sign_in: ?OwnedSignIn,
     ) void {
         var access = owned_access;
         defer access.deinit(self.alloc);
+        var sign_in = owned_sign_in;
+        defer if (sign_in) |*value| value.deinit(self.alloc);
+
+        var fetch_access = access.access;
+        var stored: ?CatalogSignIn = null;
+        defer if (stored) |*active| active.deinit();
+        if (sign_in) |value| {
+            if (fetch_access.authorizationCredential()) |current| {
+                if (fetch_access.credentialSource() == value.sign_in.source) {
+                    stored = .{ .alloc = self.alloc, .sign_in = value.sign_in };
+                    if (stored) |*active| {
+                        if (active.storedToken(current)) |token| {
+                            debug_trace.logf("catalog", "model catalog uses the stored credential reason=newer", .{});
+                            fetch_access = fetch_access.withCredential(token);
+                        }
+                    }
+                }
+            }
+        }
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
-            .access = access.access,
+            .access = fetch_access,
             .endpoint = self.models_path,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
+            .renew_after_rejection = if (stored) |*active| active.hook() else null,
         }));
     }
 
@@ -1602,6 +1718,100 @@ test "open model menu keeps its provider tab and selection when a revalidated ca
     try std.testing.expectEqual(ModelProviderFilter.all, runtime.menu.providerFilter());
     try std.testing.expectEqualStrings("anthropic/c", runtime.menu.itemAt(runtime.menu.selected_index).?.id);
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.window_start);
+}
+
+/// Lists `private/model` only for `accepted`, and `public/model` without a
+/// token. When `rotate_to` is set, the first authenticated fetch finds the
+/// login renewed by another fx process: the store gets that token, and the
+/// provider rejects the one sent.
+const SharedLoginCatalog = struct {
+    home: *stored_login_testing.StoredLoginHome,
+    accepted: []const u8,
+    rotate_to: ?[]const u8 = null,
+    sent: [3][32]u8 = undefined,
+    sent_len: [3]usize = .{ 0, 0, 0 },
+    calls: usize = 0,
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        const self: *SharedLoginCatalog = @ptrCast(@alignCast(raw.?));
+        const token = input.access.authorizationCredential() orelse "";
+        std.debug.assert(self.calls < self.sent.len and token.len <= self.sent[0].len);
+        @memcpy(self.sent[self.calls][0..token.len], token);
+        self.sent_len[self.calls] = token.len;
+        self.calls += 1;
+        if (token.len == 0) return .{ .catalog = try testCatalog(alloc, "public/model") };
+        if (self.calls == 1) if (self.rotate_to) |rotated| self.home.store(rotated, "team-a", stored_login_testing.far_future_ms) catch unreachable;
+        if (std.mem.eql(u8, token, self.accepted)) return .{ .catalog = try testCatalog(alloc, "private/model") };
+        return .{ .failure = model_catalog.failureForHttpStatus(.unauthorized) };
+    }
+
+    fn provider(self: *SharedLoginCatalog) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn sentToken(self: *const SharedLoginCatalog, index: usize) []const u8 {
+        return self.sent[index][0..self.sent_len[index]];
+    }
+};
+
+test "model cache fetches with the stored token of a shared sign-in and never refreshes it" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    const access = credentials.catalogAccessForCredential(.fx_login, "launch-token", "team-a");
+    const sign_in: auth_runtime.SharedSignIn = .{ .source = .fx_login, .team = "team-a" };
+
+    // Another fx process refreshed the login after this one read it.
+    {
+        try home.store("other-fx-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "other-fx-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+        try std.testing.expectEqualStrings("other-fx-token", catalog.sentToken(0));
+        try std.testing.expect(!runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // ...or between the read and the fetch: one more fetch with its token.
+    {
+        try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 2), catalog.calls);
+        try std.testing.expectEqualStrings("read-token", catalog.sentToken(0));
+        try std.testing.expectEqualStrings("rotated-token", catalog.sentToken(1));
+        try std.testing.expect(!runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // The store still holds the rejected token: the public list, with no
+    // refresh and no second authenticated fetch.
+    {
+        try home.store("revoked-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "never" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 2), catalog.calls);
+        try std.testing.expectEqualStrings("revoked-token", catalog.sentToken(0));
+        try std.testing.expectEqualStrings("", catalog.sentToken(1));
+        try std.testing.expect(runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // Another team's stored login is never sent.
+    {
+        try home.store("team-b-token", "team-b", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "launch-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+        try std.testing.expectEqualStrings("launch-token", catalog.sentToken(0));
+    }
 }
 
 test "model cache projects anonymous fallback provenance for 401 and 403" {

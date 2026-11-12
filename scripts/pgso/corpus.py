@@ -58,6 +58,9 @@ class Scenario:
     allow_keychain: bool
     test_file: str | None
     profile_runs: int = 1
+    # The exit code a direct command must return, such as 1 for a doctor
+    # run in a training home that has no credential.
+    expected_exit: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,6 +240,16 @@ def _parse_scenario(
             f"{MAX_PROFILE_RUNS}"
         )
 
+    expected_exit = values.get("expected_exit", 0)
+    if (
+        isinstance(expected_exit, bool)
+        or not isinstance(expected_exit, int)
+        or not 0 <= expected_exit <= 255
+    ):
+        raise PgsoError(
+            f"scenario {name} expected_exit must be an integer from 0 to 255"
+        )
+
     test_file = values.get("test_file")
     if test_file is not None:
         if not isinstance(test_file, str) or pathlib.Path(test_file).name != test_file:
@@ -266,6 +279,12 @@ def _parse_scenario(
             "noninteractive direct training commands without Keychain access"
         )
 
+    if expected_exit != 0 and (argv[0] != "{binary}" or test_file is not None):
+        raise PgsoError(
+            f"scenario {name} expected_exit is only supported for direct "
+            "training commands"
+        )
+
     if "skip_reason" in defaults or "skip_reason" in scenario_raw:
         raise PgsoError(f"scenario {name} cannot be skipped")
 
@@ -280,6 +299,7 @@ def _parse_scenario(
         allow_keychain=allow_keychain,
         test_file=test_file,
         profile_runs=profile_runs,
+        expected_exit=expected_exit,
     )
 
 
@@ -583,6 +603,7 @@ def _execute_scenario(
             env=environment,
             timeout_s=scenario.timeout_seconds,
             log_path=log_dir / f"{log_name}.json",
+            allowed_returncodes=(scenario.expected_exit,),
         )
     except BaseException as error:
         primary_error = error

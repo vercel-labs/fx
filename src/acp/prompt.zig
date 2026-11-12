@@ -1263,6 +1263,7 @@ fn maybeStartAcpTitleTask(
         .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .credential_source = session.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return;
     task.spawn() catch |err| {

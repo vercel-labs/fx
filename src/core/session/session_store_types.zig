@@ -116,6 +116,43 @@ pub const SessionListPage = struct {
     }
 };
 
+/// What a live session or subagent is doing, as its log says: a turn or a
+/// work item is open, none is, or its log can't be read.
+pub const LiveState = enum { working, idle, unknown };
+
+/// A subagent of a live session, by the name its parent gave it.
+pub const LiveAgent = struct {
+    name: []const u8,
+    /// `<session-id>/<name>[/<name>...]`, what `fx session` reads it by.
+    address: []const u8,
+    /// The subagent's own session.
+    id: []const u8,
+    state: LiveState,
+    /// Its own subagents.
+    agents: []const LiveAgent,
+};
+
+/// A root session some fx process has open now.
+pub const LiveSession = struct {
+    summary: SessionSummary,
+    /// The model saved with the session, null when none can be read. A run
+    /// can use another, such as through `FX_MODEL`, without saving it.
+    saved_model: ?[]const u8,
+    state: LiveState,
+    agents: []const LiveAgent,
+};
+
+/// `fx sessions --live`, newest first. Every slice lives in `arena`.
+pub const LiveSessionList = struct {
+    arena: std.heap.ArenaAllocator,
+    sessions: []const LiveSession,
+
+    pub fn deinit(self: *LiveSessionList) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Selector for a resume request: the most recent session, or a specific id.
 pub const ResumeTarget = union(enum) {
     last,

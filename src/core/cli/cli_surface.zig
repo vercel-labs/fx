@@ -27,6 +27,9 @@ const profiles = @import("../profiles/profiles.zig");
 const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
+const doctor_probes = @import("doctor_probes.zig");
+const mcp_runtime = @import("../mcp_host/runtime.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
@@ -345,6 +348,10 @@ const SessionListOptions = struct {
     scope: session_store.SessionListScope = .current_workspace,
     limit: usize = session_store.session_list_default_limit,
     continuation: ?session_store.ResumableSessionContinuation = null,
+    /// `--live`: only the sessions an fx process has open now.
+    live: bool = false,
+    /// The first paging flag given, which `--live` refuses.
+    paging_flag: ?[]const u8 = null,
 };
 
 const UsageOptions = struct {
@@ -373,6 +380,8 @@ const SessionDetailTarget = union(enum) {
 const SessionDetailOptions = struct {
     format: output_contracts.OutputFormat = .text,
     target: ?SessionDetailTarget = null,
+    /// `--tail`: only the last this many turns.
+    tail: ?usize = null,
 
     fn deinit(self: *SessionDetailOptions, alloc: Allocator) void {
         if (self.target) |*target| target.deinit(alloc);
@@ -1650,11 +1659,14 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
-                return switch (outcome) {
+                if (outcome.revocation_failed) {
+                    try writeStderr(deps, "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                }
+                return switch (outcome.deletion) {
                     .deleted => result: {
                         try writeStdout(deps, "Signed out of Codex.\n");
                         break :result .handled_success;
@@ -1986,38 +1998,11 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .doctor => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseDoctorArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .doctor, "doctor", err, rest);
                 return usage_failure;
             };
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
-            var snapshot = try doctor_runtime.collect(
-                alloc,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-                mcp_inspection.profile_diagnostic,
-            );
-            defer snapshot.deinit(alloc);
-
-            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
-            output_snapshot.mcp = localMcpView(&mcp_inspection);
-            if (opts.format == .json) {
-                try writeDoctorJsonLine(alloc, deps, output_snapshot);
-                return .handled_success;
-            }
-
-            const text = try output_snapshot.render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
+            return runDoctor(alloc, cfg, deps, opts);
         },
         .session => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "recover")) {
@@ -2050,7 +2035,7 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", error.InvalidSessionDetailArgs, rest);
                 return usage_failure;
             };
-            return runSessionDetail(alloc, deps, target, opts.format);
+            return runSessionDetail(alloc, deps, target, opts.format, opts.tail);
         },
         .sessions => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
@@ -2064,6 +2049,13 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return usage_failure;
             };
+            if (opts.live) {
+                if (opts.paging_flag) |flag| {
+                    try writeLivePagingError(alloc, cfg.command_catalog, deps, flag, opts.format);
+                    return usage_failure;
+                }
+                return runLiveSessionList(alloc, deps, opts);
+            }
             return runSessionList(alloc, deps, opts);
         },
         .workspace => |rest| {
@@ -2987,7 +2979,8 @@ fn writeUsageOrJsonError(
 /// absent.
 fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     return switch (kind) {
-        .status, .doctor, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .status, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .doctor => &builtin_commands.doctor_options,
         .slack => &command_specs.slack_options,
         .sessions => &builtin_commands.sessions_options,
         .login => &builtin_commands.login_options,
@@ -3034,6 +3027,15 @@ fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
         return null;
     }
     return try writer.toOwnedSlice();
+}
+
+test "a doctor usage error names the flag that is wrong, not --fix" {
+    const alloc = std.testing.allocator;
+    const args = [_][:0]const u8{ "--fix", "--bogus" };
+    const problem = (try flagProblem(alloc, .doctor, @as([]const [:0]const u8, &args))).?;
+    defer alloc.free(problem);
+    try std.testing.expect(std.mem.find(u8, problem, "--bogus") != null);
+    try std.testing.expect(std.mem.find(u8, problem, "--fix") == null);
 }
 
 fn writeUsageCommandFailure(
@@ -3329,8 +3331,10 @@ fn writeSessionDetail(
     deps: RunDeps,
     state: session_codec.DurableSessionState,
     format: output_contracts.OutputFormat,
+    tail: ?usize,
+    address: ?[]const u8,
 ) !RunResult {
-    const text = try (output_contracts.SessionDetailSnapshot{ .state = state }).render(alloc, format);
+    const text = try (output_contracts.SessionDetailSnapshot{ .state = state, .tail = tail, .address = address }).render(alloc, format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
     return .handled_success;
@@ -3367,6 +3371,51 @@ fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !Ru
     };
     defer page.deinit(alloc);
     return writeSessionList(alloc, deps, page, opts);
+}
+
+/// `fx sessions --live`: the sessions an fx process has open now, with
+/// their subagents (`session_adapter.listLive`). Reads every session in the
+/// scope and writes none.
+fn runLiveSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    const scope: ?[]const u8 = switch (opts.scope) {
+        .current_workspace => workspace_root,
+        .all_workspaces => null,
+    };
+    var list = session_adapter.listLive(&store, alloc, scope) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
+        return .handled_failure;
+    };
+    defer list.deinit();
+    const text = try (output_contracts.LiveSessionListSnapshot{
+        .sessions = list.sessions,
+        .all_workspaces = opts.scope == .all_workspaces,
+    }).render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return .handled_success;
+}
+
+/// `--live` with `--limit` or `--cursor`: it lists every live session at
+/// once, so it has no pages.
+fn writeLivePagingError(
+    alloc: Allocator,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+    flag: []const u8,
+    format: output_contracts.OutputFormat,
+) !void {
+    const message = try alloc.print("--live lists every live session, so it takes no {s}", .{flag});
+    defer alloc.free(message);
+    if (format == .json) return writeJsonCommandFailure(alloc, deps, "sessions", error.InvalidLocalSurfaceArgs, message);
+    try writeStderrLine(alloc, deps, "fx sessions: {s}\n", message);
+    try writeTopLevelUsage(command_catalog, deps, .sessions);
 }
 
 const SessionConvertFlag = enum { json };
@@ -3442,12 +3491,15 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
     return if (skipped.len == 0) .handled_success else .handled_failure;
 }
 
-/// `fx session last|{id}` on v2, read without the session's lock (D37).
+/// `fx session last|{id}|{id}/{agent}` on v2, read without the session's
+/// lock (D37). `last` alone is a summary; with `--tail` it is the newest
+/// session's last turns.
 fn runSessionDetail(
     alloc: Allocator,
     deps: RunDeps,
     target: SessionDetailTarget,
     format: output_contracts.OutputFormat,
+    tail: ?usize,
 ) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), format);
@@ -3467,17 +3519,113 @@ fn runSessionDetail(
                 try writeLookupFailure(alloc, deps, "session", session_adapter.noLatestError(&store, alloc), format);
                 return .handled_failure;
             }
-            return writeSessionSummary(alloc, deps, page.summaries.items[0], format);
+            if (tail == null) return writeSessionSummary(alloc, deps, page.summaries.items[0], format);
+            return writeRootDetail(alloc, deps, &store, page.summaries.items[0].id, format, tail);
         },
         .id => |id| {
-            var resumed = session_adapter.readSession(&store, alloc, id) catch |err| {
-                try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), store.problem.text(), format);
+            const parsed = session_adapter.parseSessionTarget(id) catch |err| {
+                try writeLookupFailure(alloc, deps, "session", err, format);
                 return .handled_failure;
             };
-            defer resumed.deinit(alloc);
-            return writeSessionDetail(alloc, deps, resumed.state, format);
+            switch (parsed) {
+                .session => return writeRootDetail(alloc, deps, &store, id, format, tail),
+                .agent => |address| return writeAgentDetail(alloc, deps, &store, id, address, format, tail),
+                .invalid => |problem| {
+                    try writeAgentAddressInvalid(alloc, deps, id, problem, format);
+                    return .handled_failure;
+                },
+            }
         },
     }
+}
+
+fn writeRootDetail(
+    alloc: Allocator,
+    deps: RunDeps,
+    store: *session_adapter.Store,
+    id: []const u8,
+    format: output_contracts.OutputFormat,
+    tail: ?usize,
+) !RunResult {
+    var resumed = session_adapter.readSession(store, alloc, id) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), store.problem.text(), format);
+        return .handled_failure;
+    };
+    defer resumed.deinit(alloc);
+    return writeSessionDetail(alloc, deps, resumed.state, format, tail, null);
+}
+
+/// `fx session {id}/{agent}`: a subagent by the names its parents gave it.
+fn writeAgentDetail(
+    alloc: Allocator,
+    deps: RunDeps,
+    store: *session_adapter.Store,
+    target: []const u8,
+    address: session_adapter.AgentAddress,
+    format: output_contracts.OutputFormat,
+    tail: ?usize,
+) !RunResult {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const lookup = session_adapter.resolveAgent(store, arena.allocator(), address) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, target, session_adapter.commandError(err), store.problem.text(), format);
+        return .handled_failure;
+    };
+    const child_id = switch (lookup) {
+        .found => |id| id,
+        .missing => |missing| {
+            try writeAgentMissing(alloc, deps, missing.parent, missing.name, missing.names, format);
+            return .handled_failure;
+        },
+    };
+    var resumed = session_adapter.readChild(store, alloc, child_id) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, target, session_adapter.commandError(err), store.problem.text(), format);
+        return .handled_failure;
+    };
+    defer resumed.deinit(alloc);
+    return writeSessionDetail(alloc, deps, resumed.state, format, tail, target);
+}
+
+/// `text` is an agent address no subagent can have: says which part is at
+/// fault and why.
+fn writeAgentAddressInvalid(
+    alloc: Allocator,
+    deps: RunDeps,
+    text: []const u8,
+    problem: session_adapter.AddressProblem,
+    format: output_contracts.OutputFormat,
+) !void {
+    var message: std.Io.Writer.Allocating = .init(alloc);
+    defer message.deinit();
+    try problem.describe(&message.writer, text);
+    if (format == .json) return writeJsonCommandFailureCode(alloc, deps, "session", "InvalidAgentAddress", message.written());
+    try writeStderrLine(alloc, deps, "fx session: {s}\n", message.written());
+}
+
+/// No subagent of `parent` goes by `name`: says so, with the names its
+/// subagents do go by.
+fn writeAgentMissing(
+    alloc: Allocator,
+    deps: RunDeps,
+    parent: []const u8,
+    name: []const u8,
+    names: []const []const u8,
+    format: output_contracts.OutputFormat,
+) !void {
+    var message: std.Io.Writer.Allocating = .init(alloc);
+    defer message.deinit();
+    try message.writer.print("session {s} has no agent named {s}; ", .{ parent, name });
+    if (names.len == 0) {
+        try message.writer.writeAll("it has no agents");
+    } else {
+        try message.writer.writeAll("its agents: ");
+        for (names, 0..) |known, i| {
+            if (i > 0) try message.writer.writeAll(", ");
+            try message.writer.writeAll(known);
+        }
+    }
+    if (format == .json) return writeJsonCommandFailureCode(alloc, deps, "session", "AgentNotFound", message.written());
+    try writeStderrLine(alloc, deps, "fx session: {s}\n", message.written());
 }
 
 /// `fx session recover` on v2 (D15): a copy up to the last good turn.
@@ -4127,6 +4275,245 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
     return options;
 }
 
+const DoctorOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    fix: bool = false,
+};
+const DoctorFlag = enum { json, fix };
+const doctor_flag_ids = cli_flags.idTable(DoctorFlag, &builtin_commands.doctor_options);
+
+fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
+    var options = DoctorOptions{};
+    var parser: cli_flags.Parser = .init(&builtin_commands.doctor_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => |match| switch (doctor_flag_ids[match.index].?) {
+            .json => options.format = .json,
+            .fix => options.fix = true,
+        },
+    };
+    return options;
+}
+
+/// The network and process checks `fx doctor` started, until `wait` stops
+/// and joins them. Probes are allocated with `std.heap.c_allocator` and left
+/// to the process exit, which follows the report.
+const DoctorProbes = struct {
+    deadline: i64,
+    /// The limit `deadline` ends, in milliseconds.
+    limit_ms: i64,
+    catalog: ?*doctor_probes.CatalogProbe = null,
+    /// The MCP server checks first, then gh.
+    processes: std.ArrayList(*doctor_probes.ProcessProbe) = .empty,
+    server_children: usize = 0,
+    /// The MCP server checks, which `wait` starts from as slots free.
+    servers: doctor_probes.ServerChecks = .{},
+    gh: ?*doctor_probes.ProcessProbe = null,
+    waiters: std.Io.Group = .init,
+    mcp_statuses: []const mcp_runtime.Status = &.{},
+    mcp_checked: bool = false,
+
+    /// Starts the provider, MCP server, and gh checks. Whatever it started
+    /// before an error is still in `self`, for `wait` to stop.
+    fn start(self: *DoctorProbes, cfg: Config, deps: RunDeps, snapshot: *const doctor_runtime.Snapshot, workspace_root: []const u8) !void {
+        const probe_alloc = std.heap.c_allocator;
+        // An expired login is reported as it is: doctor never refreshes it. A
+        // configured provider's model list comes from its settings, with no
+        // request, so asking it would confirm nothing.
+        if (snapshot.auth.missingHelp(.cli) == null and !snapshot.auth.expired and snapshot.model.len > 0 and snapshot.provider != .configured) {
+            try self.startCatalog(cfg, deps, snapshot.model);
+        }
+        if (cfg.load_mcp_host) |load| {
+            // A config doctor cannot load is already a check of its own.
+            const doctor_host = load(probe_alloc, workspace_root, cfg.tool_set.registry, .{}) catch |err| blk: {
+                debug_trace.logf("doctor", "MCP server checks skipped: host failed to load err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (doctor_host) |loaded_host| {
+                self.mcp_statuses = try loaded_host.runtime.statuses(probe_alloc);
+                const exe_path = try self_exe.pathForReexec(probe_alloc);
+                defer self.server_children = self.processes.items.len;
+                self.servers = try doctor_probes.startServerChildren(probe_alloc, &self.waiters, &self.processes, self.mcp_statuses, exe_path, self.deadline, self.limit_ms, doctor_probes.serverCap());
+                self.mcp_checked = true;
+            }
+        }
+        // gh matters only to fx pr and fx issue, which need a repository; outside
+        // one, doctor does not run it, so gh writes nothing on its behalf. Unit
+        // tests run inside this repository and must not reach GitHub.
+        if (snapshot.in_git_repository and !builtin.is_test) {
+            self.gh = try doctor_probes.startGh(probe_alloc, &self.waiters, &self.processes);
+        }
+    }
+
+    /// Starts the provider catalog request, when the provider has a catalog.
+    fn startCatalog(self: *DoctorProbes, cfg: Config, deps: RunDeps, model: []const u8) !void {
+        const probe_alloc = std.heap.c_allocator;
+        const startup = try probe_alloc.create(app_lifecycle.StartupState);
+        startup.* = (if (cfg.auth_mode == .host_managed)
+            deps.load_catalog_startup_state_with_auth_mode(probe_alloc, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, null, null)
+        else
+            deps.load_startup_state(probe_alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit)) catch |err| {
+            // Startup itself refuses this setup, and the config check says why.
+            debug_trace.logf("doctor", "provider check skipped: startup state failed err={s}", .{@errorName(err)});
+            return;
+        };
+        var available = cfg.provider_set;
+        available.definitions = startup.configured_providers.definitions;
+        const catalog = available.select(startup.provider).cli_model_catalog orelse return;
+        const probe = try probe_alloc.create(doctor_probes.CatalogProbe);
+        probe.* = .{
+            .provider = catalog,
+            .access = startup.modelCatalogAccess(),
+            .endpoint = cfg.models_path,
+            .model = try probe_alloc.dupe(u8, model),
+        };
+        probe.start();
+        self.catalog = probe;
+    }
+
+    /// Waits for the checks until the deadline, then stops and joins them.
+    /// The ending signal that stopped the checks, if one did.
+    fn wait(self: *DoctorProbes) ?std.posix.SIG {
+        return doctor_probes.wait(self.deadline, self.catalog, self.processes.items, &self.waiters, &self.servers);
+    }
+
+    /// One line on a terminal's stderr while doctor waits on its network
+    /// checks, so a slow one does not look like a hang.
+    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, deadline_ms: i64) !void {
+        if (builtin.is_test or !stderrIsTerminal()) return;
+        var servers: usize = 0;
+        for (self.processes.items[0..self.server_children]) |probe| {
+            if (!probe.not_started and probe.spawn_error == null) servers += 1;
+        }
+        const gh_started = if (self.gh) |gh| gh.spawn_error == null else false;
+        const notice = try doctor_probes.waitNotice(alloc, .{
+            .provider = if (self.catalog != null) provider else null,
+            .mcp_servers = servers,
+            .gh = if (gh_started) .checking else .not_checked,
+        }, deadline_ms) orelse return;
+        defer alloc.free(notice);
+        try writeStderr(deps, notice);
+    }
+
+    /// The probe check lines, and what doctor found for each MCP server.
+    fn checks(
+        self: *const DoctorProbes,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+        deadline_ms: i64,
+        out: *std.ArrayList(doctor_runtime.Check),
+        results: *std.ArrayList(output_contracts.McpServerResult),
+    ) !void {
+        if (self.catalog) |probe| try doctor_probes.catalogChecks(out, alloc, probe, provider, deadline_ms);
+        try doctor_probes.serverStatusChecks(out, alloc, self.mcp_statuses);
+        try doctor_probes.serverChildChecks(out, results, alloc, self.processes.items[0..self.server_children], deadline_ms);
+        try doctor_probes.ghCheck(out, alloc, self.gh, deadline_ms);
+    }
+};
+
+/// Whether doctor's stderr is a terminal, for its wait notice.
+fn stderrIsTerminal() bool {
+    return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
+}
+
+/// The local checks with the probe checks after them. The provider's answer
+/// replaces the local auth line, which only saw a credential; a credential
+/// the provider was asked about and never answered for is not confirmed.
+/// `unconfirmed` holds that line's detail, which the caller frees.
+fn mergeDoctorChecks(
+    alloc: Allocator,
+    local: []const doctor_runtime.Check,
+    probe_checks: []const doctor_runtime.Check,
+    provider_asked: bool,
+    out: *std.ArrayList(doctor_runtime.Check),
+    unconfirmed: *?[]u8,
+) !void {
+    var verified_auth = false;
+    for (probe_checks) |entry| verified_auth = verified_auth or std.mem.eql(u8, entry.name, "auth");
+    for (local) |entry| {
+        if (std.mem.eql(u8, entry.name, "auth") and entry.status == .ok) {
+            if (verified_auth) continue;
+            if (provider_asked) {
+                unconfirmed.* = try alloc.print("{s}; the provider did not confirm it", .{entry.detail});
+                try out.append(alloc, .{ .name = entry.name, .status = .warn, .detail = unconfirmed.*.?, .fix = "run fx doctor again once the provider check passes" });
+                continue;
+            }
+        }
+        try out.append(alloc, entry);
+    }
+    try out.appendSlice(alloc, probe_checks);
+}
+
+/// `fx doctor`: the local checks, then the provider, MCP, and gh checks
+/// under one deadline (`doctor_probes.zig`). Exits 1 when a check fails.
+fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) !RunResult {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var mcp_inspection = try cfg.inspect_mcp_local_config(alloc, workspace_root);
+    defer mcp_inspection.deinit(alloc);
+    var snapshot = try doctor_runtime.collect(
+        alloc,
+        cfg.secret_store,
+        cfg.default_model,
+        cfg.default_agent_step_limit,
+        mcp_inspection.profile_diagnostic,
+        mcp_inspection.snapshot.configuration_issues,
+        .{
+            .orphans = if (opts.fix) .remove else .count,
+            .version = cfg.version,
+            .channel = cfg.build_channel.label(),
+            .skill_root_policy = cfg.skill_root_policy,
+        },
+    );
+    defer snapshot.deinit(alloc);
+
+    const deadline_ms = doctor_probes.deadlineMs();
+    var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms, .limit_ms = deadline_ms };
+    const started = probes.start(cfg, deps, &snapshot, workspace_root);
+    if (opts.format == .text) probes.writeWaitNotice(alloc, deps, snapshot.provider, deadline_ms) catch |err| {
+        debug_trace.logf("doctor", "wait notice not written err={s}", .{@errorName(err)});
+    };
+    // Runs on every path, so nothing doctor started outlives it.
+    if (probes.wait()) |sig| doctor_probes.endBySignal(sig);
+    try started;
+
+    var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer {
+        for (probe_checks.items) |*entry| entry.deinit(alloc);
+        probe_checks.deinit(alloc);
+    }
+    var server_results: std.ArrayList(output_contracts.McpServerResult) = .empty;
+    defer server_results.deinit(alloc);
+    try probes.checks(alloc, snapshot.provider, deadline_ms, &probe_checks, &server_results);
+
+    var checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer checks.deinit(alloc);
+    var unconfirmed: ?[]u8 = null;
+    defer if (unconfirmed) |detail| alloc.free(detail);
+    try mergeDoctorChecks(alloc, snapshot.checks, probe_checks.items, probes.catalog != null, &checks, &unconfirmed);
+
+    var failed = false;
+    for (checks.items) |entry| failed = failed or entry.status == .fail;
+    var output_snapshot = doctorSnapshotFromRuntime(snapshot);
+    output_snapshot.version = cfg.version;
+    output_snapshot.checks = checks.items;
+    var mcp_view = localMcpView(&mcp_inspection);
+    if (probes.mcp_checked) {
+        mcp_view.connection_check = .checked;
+        mcp_view.results = server_results.items;
+    }
+    output_snapshot.mcp = mcp_view;
+    try writeDoctorReport(alloc, deps, output_snapshot, opts.format);
+    return if (failed) .handled_failure else .handled_success;
+}
+
+fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
+    if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
+    const text = try snapshot.render(alloc, format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
+}
+
 const UpgradeFlag = enum { channel, json };
 const upgrade_flag_ids = cli_flags.idTable(UpgradeFlag, &builtin_commands.upgrade_options);
 
@@ -4161,7 +4548,7 @@ fn channelSavedLine(
     };
 }
 
-const SessionListFlag = enum { all, limit, cursor, json };
+const SessionListFlag = enum { live, all, limit, cursor, json };
 const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
 
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
@@ -4170,18 +4557,35 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
         .positional => return error.InvalidLocalSurfaceArgs,
         .option => |match| switch (session_list_flag_ids[match.index].?) {
+            .live => options.live = true,
             .all => options.scope = .all_workspaces,
             .limit => {
                 options.limit = std.fmt.parseUnsigned(usize, match.value.?, 10) catch
                     return error.InvalidLocalSurfaceArgs;
                 if (options.limit == 0 or options.limit > session_store.session_list_max_limit)
                     return error.InvalidLocalSurfaceArgs;
+                if (options.paging_flag == null) options.paging_flag = "--limit";
             },
-            .cursor => options.continuation = try parseSessionListCursor(match.value.?),
+            .cursor => {
+                options.continuation = try parseSessionListCursor(match.value.?);
+                if (options.paging_flag == null) options.paging_flag = "--cursor";
+            },
             .json => options.format = .json,
         },
     };
     return options;
+}
+
+test "fx sessions --live reads through the shared parser and names the paging flag it refuses" {
+    const live = try parseSessionListArgs(&.{ "--live", "--all", "--json" });
+    try std.testing.expect(live.live);
+    try std.testing.expectEqual(session_store.SessionListScope.all_workspaces, live.scope);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, live.format);
+    try std.testing.expectEqual(@as(?[]const u8, null), live.paging_flag);
+    try std.testing.expectEqualStrings("--cursor", (try parseSessionListArgs(&.{ "--cursor", "v1:1:abc", "--live", "--limit", "5" })).paging_flag.?);
+    try std.testing.expectEqualStrings("--limit", (try parseSessionListArgs(&.{ "--live", "--limit=5" })).paging_flag.?);
+    try std.testing.expect(!(try parseSessionListArgs(&.{})).live);
+    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionListArgs(&.{"--liv"}));
 }
 
 const UsageFlag = enum { period, json };
@@ -4280,8 +4684,11 @@ fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {
     return error.InvalidWorkspaceArgs;
 }
 
-const SessionFlag = enum { id, json };
+const SessionFlag = enum { id, tail, json };
 const session_flag_ids = cli_flags.idTable(SessionFlag, &builtin_commands.session_options);
+
+/// The most turns `fx session --tail` takes, as its placeholder says.
+const session_tail_max = 1000;
 
 /// The flags and the one target shared by `fx session` and
 /// `fx session recover`. A repeated `--id` keeps its last value; two
@@ -4292,6 +4699,8 @@ const SessionTargetArgs = struct {
     target: ?[]const u8 = null,
     /// The target came from `--id`, so `last` is a literal ID.
     exact_id: bool = false,
+    /// `--tail`, from 1 to `session_tail_max`; only `fx session` takes it.
+    tail: ?usize = null,
 };
 
 fn parseSessionTargetArgs(args: []const [:0]const u8) error{InvalidSessionArgs}!SessionTargetArgs {
@@ -4306,6 +4715,11 @@ fn parseSessionTargetArgs(args: []const [:0]const u8) error{InvalidSessionArgs}!
         },
         .option => |match| switch (session_flag_ids[match.index].?) {
             .id => id_flag = match.value.?,
+            .tail => {
+                const count = std.fmt.parseUnsigned(usize, match.value.?, 10) catch return error.InvalidSessionArgs;
+                if (count == 0 or count > session_tail_max) return error.InvalidSessionArgs;
+                parsed.tail = count;
+            },
             .json => parsed.format = .json,
         },
     };
@@ -4323,7 +4737,7 @@ fn parseSessionDetailArgs(
     args: []const [:0]const u8,
 ) !SessionDetailOptions {
     const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionDetailArgs;
-    var options = SessionDetailOptions{ .format = parsed.format };
+    var options = SessionDetailOptions{ .format = parsed.format, .tail = parsed.tail };
     const target = parsed.target orelse return options;
     options.target = if (!parsed.exact_id and std.mem.eql(u8, target, "last"))
         .last
@@ -4337,6 +4751,8 @@ fn parseSessionRecoveryArgs(
     args: []const [:0]const u8,
 ) !SessionRecoveryOptions {
     const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionRecoveryArgs;
+    // A recovery copies the whole session; it shows no turns to tail.
+    if (parsed.tail != null) return error.InvalidSessionRecoveryArgs;
     const target = parsed.target orelse return error.InvalidSessionRecoveryArgs;
     return .{
         .format = parsed.format,
@@ -6515,7 +6931,8 @@ test "status and doctor inspect MCP configuration once per command" {
         cfg,
         doctor_capture.deps(),
     );
-    try std.testing.expectEqual(RunResult.handled_success, doctor_result);
+    // The broken MCP config is a failed check, so doctor exits 1.
+    try std.testing.expectEqual(RunResult.handled_failure, doctor_result);
     try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),

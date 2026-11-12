@@ -781,6 +781,9 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn catalogMenuOwnsSurface(app: *App, agent: *AppAgent) bool {
             if (app.input_runtime.help_menu.active or app.input_runtime.settings_menu.active) return true;
+            if (comptime @hasField(App, "instances")) {
+                if (app.instances.agents_menu.open) return true;
+            }
             if (comptime @hasField(App, "skills")) {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
                     if (app.skills.menuVisible()) return true;

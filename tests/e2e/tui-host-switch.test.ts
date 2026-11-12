@@ -1524,14 +1524,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(over).not.toContain("Apply this change?");
         // Its row names the profile it runs in, and says it waits for the
         // approval main shows for it.
-        expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}writer {2,}\S/m);
+        expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}\S+ {2,}writer\s*$/m);
         expect(over).toMatch(/^ {2}\u2514 writer .*needs approval/m);
-        // A digit searches the list, so it can't answer the prompt under it.
-        // Esc clears the search, then closes the list.
+        // A digit goes in the list's search box, so it can't answer the
+        // prompt under it. Esc clears the search, then closes the list.
         await session.sendKeys("1");
-        await session.waitForText('matching "1"', 10_000);
+        await session.waitForText("esc clear", 10_000);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes('matching "1"'), 10_000);
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes("esc clear"), 10_000);
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
         expect(back).toContain("Subagent writer needs permission");
@@ -1976,7 +1976,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         expect(await session.capturePane()).not.toContain(LIST_HINT);
 
-        // Ctrl+X opens the list; typing there searches it, not the draft.
+        // Ctrl+X opens the list and sets the draft aside: typing there
+        // searches the list.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendLiteral("q");
@@ -2001,49 +2002,122 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
   test(
-    "typing in the agent list searches it by name and title, and Enter opens the match",
+    "typing in the agent list searches it from the composer, and Enter opens the match",
     async () => {
       await withReviewer(async (session) => {
         await session.sendLiteral("EDGE_KEEP_ME");
         await session.waitForPane((pane) => pane.includes("main \u00b7 ctrl+x"), 10_000);
         await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        // The draft is set aside, so the composer is the search box.
+        const opened = await session.waitForPane((pane) => pane.includes(LIST_HINT) && !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        expect(opened).toContain("Agents 2");
 
         // Case aside, only reviewer's name has it, so main's row goes.
         await session.sendLiteral("VIEW");
-        const found = await session.waitForPane((pane) => pane.includes('Agents 1 matching "VIEW"'), 10_000);
+        const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "VIEW"), 10_000);
         expect(found).toMatch(subagentRow("reviewer"));
         expect(found).toContain("esc clear");
         expect(found).not.toContain("delete close");
 
         // Nothing matches: the list stays open, with no rows.
         await session.sendLiteral("q");
-        const none = await session.waitForPane((pane) => pane.includes('Agents 0 matching "VIEWq"'), 10_000);
+        const none = await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "VIEWq"), 10_000);
         expect(none).not.toMatch(subagentRow("reviewer"));
 
-        // Backspace takes a letter off; Esc clears the search, not the list.
+        // Backspace edits the search; Esc clears it, not the list.
         await session.sendKeys("BSpace");
-        await session.waitForText('Agents 1 matching "VIEW"', 10_000);
+        await session.waitForPane((pane) => pane.includes("Agents 1") && !composerContains(pane, "VIEWq"), 10_000);
         await session.sendKeys("Escape");
         const cleared = await session.waitForPane((pane) => pane.includes("Agents 2") && pane.includes("esc back"), 10_000);
-        expect(cleared).not.toContain("matching");
+        expect(composerContains(cleared, "VIEW")).toBe(false);
 
-        // Enter opens the match, and main's draft never took the letters.
+        // Enter opens the match, with its own empty composer.
         await session.sendLiteral("rev");
-        await session.waitForText('Agents 1 matching "rev"', 10_000);
+        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "rev"), 10_000);
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        expect(composerContains(child, "rev")).toBe(false);
+
+        // /agents opens the list with an empty search box, and leaves the
+        // composer empty when it closes.
+        await session.sendLiteral("/agents");
+        await session.sendKeys("Enter");
+        const listed = await session.waitForPane((pane) => pane.includes(LIST_HINT), 10_000);
+        expect(composerContains(listed, "/agents")).toBe(false);
+        await session.sendKeys("Escape");
+        const closed = await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        expect(composerContains(closed, "/agents")).toBe(false);
+
+        // Back on main, its draft is as it was typed.
         await showAgent(session, "main");
-        const main = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_KEEP_ME"), 10_000);
+        const main = await session.waitForPane((pane) => composerContains(pane, "EDGE_KEEP_ME"), 10_000);
         expect(main).not.toContain("EDGE_KEEP_MEVIEW");
         expect(main).not.toContain("EDGE_KEEP_MErev");
+
+        // Ctrl+P lends the composer to the model picker; Ctrl+X from there
+        // opens the list on the same draft, which comes back when it closes.
+        await session.sendKeys("C-p");
+        await session.waitForPane((pane) => !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT) && composerContains(pane, "EDGE_KEEP_ME"), 10_000);
       });
     },
     TIMEOUT,
   );
 
   test(
-    "the agent list shows each agent's title, state, profile, and model in columns, and main's footer counts the subagents working",
+    "the agent list puts subagents that wait for the user first, then working ones, then idle ones, and names only a profile other than main",
+    async () => {
+      const busy = held();
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            const asked = (marker: string) => userTexts(body).some((text) => text.includes(marker));
+            if (asked("ORDER_BUSY")) {
+              await busy.promise;
+              return text("busy_done", "ORDER_BUSY_DONE");
+            }
+            if (asked("ORDER_STUCK")) return refused();
+            return text("idle_done", "ORDER_IDLE_DONE");
+          }
+          if (!body.includes('"main_idle"')) return toolCall("main_idle", "subagent", { request: { action: "message", agent: "idler", message: "ORDER_IDLE look" } });
+          if (!body.includes('"main_busy"')) return toolCall("main_busy", "subagent", { request: { action: "message", agent: "busy", message: "ORDER_BUSY write", profile: "notes" } });
+          if (!body.includes('"main_one"')) return toolCall("main_one", "subagent", { request: { action: "message", agent: "stuck1", message: "ORDER_STUCK one" } });
+          if (!body.includes('"main_two"')) return toolCall("main_two", "subagent", { request: { action: "message", agent: "stuck2", message: "ORDER_STUCK two" } });
+          return text("main_done", "ORDER_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER order them");
+          // Two subagents wait for the user, and the footer counts them.
+          await session.waitForPane((pane) => pane.includes("2 agents require attention \u00b7 main \u2193"), 30_000);
+          await session.sendKeys("Down");
+          const list = await session.waitForPane((pane) =>
+            subagentRow("idler", "idle").test(pane) && subagentRow("stuck2", "needs you").test(pane), 10_000);
+          // They started idler, busy, stuck1, stuck2; the list puts the two
+          // waiting for the user first, then the working one, then the idle one.
+          expectRowOrder(list, mainRow(), subagentRow("stuck1"), subagentRow("stuck2"), subagentRow("busy"), subagentRow("idler"));
+          // Only busy runs in a profile other than main, and its row names it
+          // after its model.
+          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
+          expect(list).toMatch(/^ {2}\u2514 idler {2,}.* {2,}idle {2,}\S+\s*$/m);
+          expect(list).not.toMatch(/ {2}main\s*$/m);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        }, (home) => {
+          const folder = join(home, ".fx", "agents", "notes");
+          mkdirSync(folder, { recursive: true });
+          writeFileSync(join(folder, "profile.json"), JSON.stringify({ description: "Writes notes" }));
+        });
+      } finally {
+        busy.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the agent list shows each agent's title, state, and model in columns, and main's footer counts the subagents working",
     async () => {
       const reviewer = held();
       let childCalls = 0;
@@ -2075,8 +2149,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForPane((pane) => waitRow.test(pane), 5_000);
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
-        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}main {2,}\S/m.test(pane), 15_000);
-        expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}main {2,}\S/m);
+        // The model follows the state; the main profile goes unnamed.
+        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}\S+\s*$/m.test(pane), 15_000);
+        expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain("Agents 2");
         // Main's row stays first and selected, above a working child.
         expectRowOrder(list, mainRow(), subagentRow("reviewer"));

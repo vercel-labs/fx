@@ -1161,6 +1161,9 @@ const App = struct {
         // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
+        // The suspend restore turned theme notifications off, and the theme
+        // may have changed while fx was stopped.
+        self.terminal_input_runtime.terminal_theme_monitor.requestRearm();
     }
 
     pub fn ensurePromptCredential(self: *App, agent: *agents.Agent) !bool {
@@ -2367,10 +2370,11 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
-            self.model_cache.startWarmup(
+            self.model_cache.startWarmupWithSharedSignIn(
                 self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
                 trigger,
+                self.auth.backgroundSignIn(),
             );
         }
     }
@@ -3206,6 +3210,22 @@ const App = struct {
                 });
             };
         }
+        if (self.terminal_input_runtime.terminal_theme_monitor.takeRearmRequest(now_ms)) {
+            debug_trace.logf("theme", "theme_notifications_rearmed", .{});
+            self.terminal.enableThemeNotifications() catch |err| {
+                debug_trace.logf("theme", "theme_notification_enable_failed err={s}", .{@errorName(err)});
+            };
+            self.terminal.requestThemeColorScheme() catch |err| {
+                debug_trace.logf("theme", "theme_color_scheme_query_failed err={s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn collectBracketedPasteFacts(self: *App) void {
+        if (!self.terminal_input_runtime.bracketed_paste_rearm.take(io_mod.milliTimestamp())) return;
+        self.terminal.enableBracketedPaste() catch |err| {
+            debug_trace.logf("input", "bracketed_paste_rearm_failed err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
@@ -3233,6 +3253,7 @@ const App = struct {
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
 
         try self.collectThemeFacts();
+        self.collectBracketedPasteFacts();
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -5408,6 +5429,7 @@ test {
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
+    _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
@@ -5415,6 +5437,8 @@ test {
     _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/shared/history_range.zig");
     _ = @import("core/cli/doctor_runtime.zig");
+    _ = @import("core/cli/doctor_probes.zig");
+    _ = @import("core/cli/doctor_child_status.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");
@@ -5520,6 +5544,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
@@ -5753,7 +5778,8 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try app.input_runtime.edit_state.setText(alloc, "main draft");
 
     // The list opens on main; ↓ moves the highlight to the first subagent,
-    // and main stays on screen with its draft.
+    // and main stays on screen, its draft set aside while the composer is
+    // the list's search box.
     try runtime.openMenu(&app);
     try std.testing.expect(runtime.menuActive(&app));
     try std.testing.expectEqual(@as(usize, 0), menu.selected);
@@ -5761,7 +5787,8 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try std.testing.expectEqual(@as(usize, 1), menu.selected);
     try std.testing.expect(app.agent_on_screen == null);
     try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("main draft", menu.draft.?.edit.input.items);
 
     // On to the last row, which stays put past the end. Main stays on screen.
     _ = try runtime.moveMenu(&app, 1, 10);
@@ -5793,13 +5820,14 @@ test "the agent list moves only its highlight, Enter shows the highlighted agent
     try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
 
     // The list opens on the subagent on screen. A draft typed on it stays
-    // with it while ↑ moves to main, and when Enter brings main back.
+    // with it, set aside while ↑ moves to main, and when Enter brings main back.
     try app.input_runtime.edit_state.setText(alloc, "first draft");
     try runtime.openMenu(&app);
     try std.testing.expectEqual(@as(usize, 1), menu.selected);
     _ = try runtime.moveMenu(&app, -1, 10);
     try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expectEqualStrings("first draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("first draft", menu.draft.?.edit.input.items);
     _ = try runtime.submitMenu(&app);
     try std.testing.expect(app.agent_on_screen == null);
     try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
@@ -6073,7 +6101,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     // From another subagent's screen, main's own request comes first.
     try App.AgentsAppRuntime.show(&app, reviewer);
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
-    try std.testing.expectEqualStrings("main and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "the footer notes a hidden agent whose request waits for the user" {
@@ -6105,7 +6133,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
     // It counts with the agents waiting on an answer.
     try App.AgentsAppRuntime.show(&app, null);
     _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer and 1 more need you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
