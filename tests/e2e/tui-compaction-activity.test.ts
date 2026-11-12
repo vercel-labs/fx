@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
@@ -534,43 +535,36 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await until(() => f.durable() === 1, "checkpoint after recovery compact");
       await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
 
-      const before = new Set(readdirSync(f.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md")));
-      let report = "";
+      const before = new Set(traceReportNames(f.root));
       await terminal.sendText("/trace");
-      await until(() => {
-        const fresh = readdirSync(f.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md") && !before.has(name));
-        if (fresh.length === 0) return false;
-        const content = readFileSync(join(f.root, fresh[fresh.length - 1]), "utf8");
-        if (!content.includes("## Transcript Timeline")) return false;
-        report = content;
-        return true;
-      }, "trace report", 15_000);
+      const report = await waitForNewTraceReport(f.root, before);
 
-      // No FX_TRACE_LOG was configured, so the opt-in trace tail is absent while
-      // the always-on compaction section still carries the full story.
-      expect(report).not.toContain("## Trace Tail");
-      expect(report).toContain("## Context Compaction\n");
-      expect(report).toMatch(/last=\d+ failed=[1-9]\d* \(always recorded; does not require FX_TRACE\)/);
-      expect(report).toContain("event=summary_transport_failed");
+      // No FX_TRACE_LOG was configured, so the opt-in trace log tail is absent
+      // while the always-on compaction records still carry the full story.
+      expect(report.all("trace_log")).toEqual([]);
+      const compaction = report.one("compaction");
+      expect(compaction.failed).toBeGreaterThan(0);
+      const events = report.all("compaction_event");
+      expect(events).toHaveLength(Number(compaction.retained));
+      const names = events.map((event) => event.event);
+      for (const name of ["summary_transport_failed", "transaction_failed", "provider_start", "provider_completed", "committed"]) {
+        expect(names).toContain(name);
+      }
       // Provider error text is secret-masked before it reaches the report.
-      expect(report).toContain("[redacted]");
-      expect(report).not.toContain("abcdef0123456789xyz");
-      expect(report).toContain("event=transaction_failed");
-      expect(report).toContain("event=provider_start");
-      expect(report).toContain("event=provider_completed");
-      expect(report).toContain("event=committed");
-      const problems = report.split("## Problems")[1]?.split("##")[0] ?? "";
-      expect(problems).toContain("- context compaction");
+      expect(events.some((event) => String(event.detail ?? "").includes("[redacted]"))).toBe(true);
+      expect(report.text).not.toContain("abcdef0123456789xyz");
+      expect(report.problems("compaction").length).toBeGreaterThan(0);
       // The failures are also kept apart from the event window, so later
-      // events never push them out of the report or its Problems.
-      const compaction = report.split("\n## Context Compaction\n")[1]?.split("\n## ")[0] ?? "";
-      const kept = compaction
-        .split(/\nfailures: kept=\d+ of \d+ this session, newest last; later events do not push these out\n/)[1]
-        ?.split("\n").filter((line) => line.startsWith("  [")) ?? [];
-      expect(kept.some((line) => line.includes(" event=summary_transport_failed "))).toBe(true);
-      expect(kept.some((line) => line.includes(" event=transaction_failed "))).toBe(true);
-      expect(kept.every((line) => line.includes(" failed"))).toBe(true);
-      expect(problems).toContain("- context compaction transaction_failed ");
+      // events never push them out of the trace or its problems.
+      const kept = report.all("failed_compaction_event");
+      expect(kept.length).toBeGreaterThan(0);
+      expect(compaction.kept_failures).toBe(kept.length);
+      expect(compaction.session_failures).toBeGreaterThanOrEqual(kept.length);
+      const keptNames = kept.map((event) => event.event);
+      expect(keptNames).toContain("summary_transport_failed");
+      expect(keptNames).toContain("transaction_failed");
+      expect(kept.every((event) => event.failed === true)).toBe(true);
+      expect(report.problems("compaction").map((problem) => problem.event)).toContain("transaction_failed");
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }

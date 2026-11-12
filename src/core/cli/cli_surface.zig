@@ -40,6 +40,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
@@ -1246,7 +1247,9 @@ fn activateProviderSelectionFallible(
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
-        try writeProviderActivationError(alloc, deps, caller, "could not load settings");
+        const message = try config_runtime.configuredProviderMessage(alloc, err);
+        defer if (message) |text| alloc.free(text);
+        try writeProviderActivationError(alloc, deps, caller, message orelse "could not load settings");
         debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
         return false;
     };
@@ -1262,7 +1265,7 @@ fn activateProviderSelectionFallible(
                 // exits as a usage error.
                 return error.UnknownConfiguredProvider;
             },
-            error.ConfiguredProviderChanged => return err,
+            error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => return err,
         };
         const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
@@ -1659,7 +1662,8 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
+                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
@@ -1682,7 +1686,8 @@ fn runNonInteractiveWithDeps(
                 };
             }
             if (login_provider == .grok) {
-                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok };
+                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
                     return .handled_failure;
                 };
@@ -1704,7 +1709,8 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login };
+            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
                     return .handled_failure;
@@ -1977,6 +1983,12 @@ fn runNonInteractiveWithDeps(
             defer collections.freeStringList(alloc, &ids);
             var entries = loaded.entries;
             defer model_catalog.freeModelCatalog(alloc, &entries);
+            defer if (loaded.notice) |notice| alloc.free(notice);
+            if (loaded.notice) |notice| {
+                try writeStderr(deps, "fx models: ");
+                try writeStderr(deps, notice);
+                try writeStderr(deps, "\n");
+            }
             const details = try modelDetails(
                 alloc,
                 ids.items,
@@ -4411,6 +4423,33 @@ const DoctorProbes = struct {
     }
 };
 
+/// The line `fx logout` writes to a terminal's stderr while it waits for the
+/// provider to revoke the login, so a slow provider does not look like a hang.
+/// Like doctor's wait notice, pipes and unit tests never get it.
+const LogoutWaitLine = struct {
+    deps: RunDeps,
+    text: []const u8,
+
+    const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
+    const codex = std.fmt.comptimePrint("revoking the Codex login at OpenAI (up to {d} s)...\n", .{request_s});
+    const grok = std.fmt.comptimePrint("revoking the Grok login at xAI (up to {d} s)...\n", .{request_s});
+    /// The fx login asks for its issuer's endpoints, then revokes two tokens
+    /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
+    const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
+
+    fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
+        if (builtin.is_test or !stderrIsTerminal()) return null;
+        return .{ .context = self, .run = write };
+    }
+
+    fn write(context: *const anyopaque) void {
+        const self: *const LogoutWaitLine = @ptrCast(@alignCast(context));
+        writeStderr(self.deps, self.text) catch |err| {
+            debug_trace.logf("auth", "logout wait line not written err={s}", .{@errorName(err)});
+        };
+    }
+};
+
 /// Whether doctor's stderr is a terminal, for its wait notice.
 fn stderrIsTerminal() bool {
     return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
@@ -6821,7 +6860,7 @@ test "runIfRequested credits renders through the configured provider" {
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(probe.saw_expected_input);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\"}\n",
+        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\",\"token_pass\":null}\n",
         capture.stdout.written(),
     );
 }

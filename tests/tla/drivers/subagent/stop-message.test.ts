@@ -10,9 +10,15 @@
 // starting: fx holds main's call until the turn begins, so the driver lets
 // the start go once fx says the message waits for it.
 //
+// Each finish and end also carries what fx told main about it: no report,
+// a report that says the subagent is idle, or a plain one (the idle= of
+// fx's report_queued trace line); and each message carries the idle
+// subagents its answer named when it started a new one.
+//
 //   bun test ./tests/tla/drivers/subagent/stop-message.test.ts
 //   FX_TLA_STOP_RANDOM=20 FX_TLA_STOP_SEED=7   adds 20 random walks
-//   FX_TLA_STOP_STRESS=40                       adds walks that stop and message 40 subagents in one step, and that message 40 starting ones
+//   FX_TLA_STOP_STRESS=40                       adds walks that stop and message 40 subagents in one step, that message 40 starting ones,
+//                                               and that start one more beside 40 idle ones
 //   FX_TLA_REPEAT=3                             runs each walk 3 times
 //   FX_BIN=<binary>                             drives another build
 import { expect, test } from "bun:test";
@@ -41,6 +47,12 @@ type Obs = {
   count: number;
   calls: Array<{ op: Op; sub: string; msg: Msg | null }>;
   msgs: Msg[];
+  // A finish's or end's report: "none", "idle", or "plain".
+  note: string;
+  // The idle subagents a message's answer named, and how many more it
+  // counted past them.
+  named: string[];
+  more: number;
 };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Result = {
@@ -88,6 +100,18 @@ const WALKS: Walk[] = [
   { name: "close-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(close("s1")), end("s1")] },
   { name: "stop-and-message-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(stop("s1"), send("s1")), end("s1"), finish("s1")] },
   { name: "message-then-stop-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(send("s1"), stop("s1")), end("s1")] },
+  // A new subagent's start names the idle ones, and only those.
+  { name: "start-beside-idle", subs: ["s1", "s2"], actions: [main(send("s1")), finish("s1"), main(send("s2")), finish("s2")] },
+  { name: "start-beside-working", subs: ["s1", "s2"], actions: [main(send("s1")), main(send("s2")), finish("s1"), finish("s2")] },
+  {
+    name: "start-beside-idle-and-working",
+    subs: ["s1", "s2", "s3"],
+    actions: [main(send("s1")), finish("s1"), main(send("s2")), main(send("s3")), finish("s2"), finish("s3")],
+  },
+  { name: "start-beside-stopped", subs: ["s1", "s2"], actions: [main(send("s1")), main(stop("s1")), main(send("s2")), end("s1"), finish("s2")] },
+  { name: "start-beside-closed", subs: ["s1", "s2"], actions: [main(send("s1")), finish("s1"), main(close("s1")), main(send("s2")), finish("s2")] },
+  // A message to a subagent that exists names none.
+  { name: "message-idle-names-none", subs: ["s1", "s2"], actions: [main(send("s1")), main(send("s2")), finish("s1"), finish("s2"), main(send("s1")), finish("s1")] },
 ];
 
 function rng(seed: number): () => number {
@@ -134,6 +158,14 @@ function stressWalk(count: number): Walk {
   };
 }
 
+// `count` subagents start and finish, then one more starts beside them all
+// idle: its answer names the first 8 and counts the rest.
+function stressNamesWalk(count: number): Walk {
+  const idle = Array.from({ length: count }, (_, i) => `s${i + 1}`);
+  const last = `s${count + 1}`;
+  return { name: `stress-names-${count}`, subs: [...idle, last], actions: [main(...idle.map(send)), ...idle.map(finish), main(send(last)), finish(last)] };
+}
+
 // Every subagent is started and held, then messaged while it starts.
 function stressStartWalk(count: number): Walk {
   const subs = Array.from({ length: count }, (_, i) => `s${i + 1}`);
@@ -174,6 +206,26 @@ function sendAnswer(text: string): string {
   if (text.includes("so the message waits and starts its next turn")) return "waits";
   if (text.includes("\"ok\":false")) return "refused";
   return `other: ${text.slice(0, 160)}`;
+}
+
+// The idle subagents a message's answer named when it started a new one,
+// and how many more it counted past them.
+// The answer lists them one to a line, "- <name>" or "- <name>: <purpose>",
+// and "- and N more" last; a name never holds a colon.
+function idleNames(raw: string): { named: string[]; more: number } {
+  // The answer is read from the tool result's JSON text, where each line
+  // break is still escaped.
+  const text = raw.replace(/\\n/g, "\n");
+  const at = text.indexOf("Idle subagents, each with its own context:");
+  if (at < 0) return { named: [], more: 0 };
+  const named: string[] = [];
+  for (const line of text.slice(at).split("\n").slice(1)) {
+    if (!line.startsWith("- ")) break;
+    const more = /^- and (\d+) more$/.exec(line);
+    if (more) return { named, more: Number(more[1]) };
+    named.push(line.slice(2).split(":")[0]!);
+  }
+  return { named, more: 0 };
 }
 
 function dropCount(text: string): number {
@@ -333,6 +385,16 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     const ids = childIds(sub);
     return [...readFileSync(log, "utf8").matchAll(/event=report_queued to=main from=(\S+)/g)].filter((m) => ids.has(m[1]!)).length;
   };
+  // What the newest report of `sub`'s works told main: whether it said the
+  // subagent is idle (the idle= of fx's report_queued trace line).
+  const reportNote = (sub: string): string => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return "plain";
+    const ids = childIds(sub);
+    const last = [...readFileSync(log, "utf8").matchAll(/event=report_queued to=main from=(\S+) [^\n]*?idle=(true|false)/g)]
+      .filter((m) => ids.has(m[1]!)).at(-1);
+    return last?.[2] === "true" ? "idle" : "plain";
+  };
   // The first held end of `sub` the walk has not released.
   const heldEnd = (sub: string): number | undefined => {
     const ids = childIds(sub);
@@ -372,7 +434,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     starting.delete(sub);
   };
   const row = (o: Partial<Obs> & { op: string }): Obs => ({
-    sub: "none", msg: null, answer: "none", count: 0, calls: [], msgs: [], ...o,
+    sub: "none", msg: null, answer: "none", count: 0, calls: [], msgs: [], note: "none", named: [], more: 0, ...o,
   });
   const push = (o: Partial<Obs> & { op: string }) => observations.push(row(o));
   // A first request takes every message that joined its turn before it was
@@ -439,16 +501,20 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const endAction = async (sub: string) => {
     if (!ending.has(sub)) return;
     const before = finishedCount(sub);
+    const reportsBefore = reportsQueued(sub);
     const n = await poll(() => heldEnd(sub), 15_000);
     if (n === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never reached its end`);
     released.add(n);
     writeFileSync(`${release}.${n}`, "");
     if ((await poll(() => finishedCount(sub) > before, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never finished`);
+    // A report, if the end owes one, is queued as the work finishes.
+    await Bun.sleep(200);
+    const note = reportsQueued(sub) > reportsBefore ? reportNote(sub) : "none";
     const msgs = closing.has(sub) ? [] : [...waiting.get(sub)!];
     ending.delete(sub);
     closing.delete(sub);
     waiting.get(sub)!.clear();
-    push({ op: "end", sub, msgs: msgs.map(parseToken) });
+    push({ op: "end", sub, msgs: msgs.map(parseToken), note });
     if (msgs.length === 0) return;
     starting.add(sub);
     await releaseStart(sub);
@@ -484,7 +550,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     // The work publishes its end just after queuing the report.
     await Bun.sleep(200);
     running.delete(sub);
-    push({ op: "finish", sub });
+    push({ op: "finish", sub, note: reportNote(sub) });
   };
   const takeAnswers = async (body: string, calls: Call[]) => {
     stepRunning = false;
@@ -494,7 +560,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
       const s = call.sub;
       if (call.op === "send") {
         const answer = sendAnswer(text);
-        push({ op: "send", sub: s, msg: call.msg, answer });
+        push({ op: "send", sub: s, msg: call.msg, answer, ...idleNames(text) });
         const t = token(call.msg!);
         if (answer === "started") {
           startTokens.add(t);
@@ -673,7 +739,8 @@ function observedModule(observations: Obs[]): string {
   const rows = observations.map((o) => {
     const calls = `<<${o.calls.map((c) => `[op |-> ${str(c.op)}, sub |-> ${str(c.sub)}, msg |-> ${tlaMsg(c.msg)}]`).join(", ")}>>`;
     const msgs = `{${o.msgs.map(tlaMsg).join(", ")}}`;
-    return `[op |-> ${str(o.op)}, sub |-> ${str(o.sub)}, msg |-> ${tlaMsg(o.msg)}, answer |-> ${str(o.answer)}, count |-> ${o.count}, calls |-> ${calls}, msgs |-> ${msgs}]`;
+    const named = `{${o.named.map(str).join(", ")}}`;
+    return `[op |-> ${str(o.op)}, sub |-> ${str(o.sub)}, msg |-> ${tlaMsg(o.msg)}, answer |-> ${str(o.answer)}, count |-> ${o.count}, calls |-> ${calls}, msgs |-> ${msgs}, note |-> ${str(o.note)}, named |-> ${named}, more |-> ${o.more}]`;
   });
   return ["---- MODULE StopMessageObserved ----", "EXTENDS Sequences", `Observed == <<${rows.join(",\n  ")}>>`, "====", ""].join("\n");
 }
@@ -737,7 +804,7 @@ const stress = Number(process.env.FX_TLA_STOP_STRESS ?? "0");
 const walks = [
   ...WALKS,
   ...Array.from({ length: random }, (_, i) => randomWalk(seed + i)),
-  ...(stress > 0 ? [stressWalk(stress), stressStartWalk(stress)] : []),
+  ...(stress > 0 ? [stressWalk(stress), stressStartWalk(stress), stressNamesWalk(stress)] : []),
 ];
 
 for (const walk of walks) {
@@ -755,7 +822,7 @@ test("the trace check rejects planted changes to a walk", async () => {
   const base = (name: string) => {
     const result = recorded.get(name);
     if (!result) throw new Error(`${name} has not run`);
-    return result.observations.map((o) => ({ ...o, calls: [...o.calls], msgs: [...o.msgs] }));
+    return result.observations.map((o) => ({ ...o, calls: [...o.calls], msgs: [...o.msgs], named: [...o.named] }));
   };
   const subs = ["s1"];
   expect(await checkTrace(base("stop-then-message"), subs, join(dir, "kept"))).toBe("ACCEPTED");
@@ -778,5 +845,19 @@ test("the trace check rejects planted changes to a walk", async () => {
   planted["joined-before-begin"] = [...early.slice(0, at), early[at + 1]!, early[at]!, ...early.slice(at + 2)];
   for (const [name, observations] of Object.entries(planted)) {
     expect(`${name}: ${await checkTrace(observations, subs, join(dir, name))}`).toBe(`${name}: REJECTED`);
+  }
+  const pair = ["s1", "s2"];
+  expect(await checkTrace(base("start-beside-idle"), pair, join(dir, "kept-idle"))).toBe("ACCEPTED");
+  const idle: Record<string, Obs[]> = {};
+  // A finished turn's report did not say its subagent is idle, as fx did before.
+  idle["plain-when-idle"] = base("start-beside-idle").map((o) => o.op === "finish" ? { ...o, note: "plain" } : o);
+  // A new subagent's start named no idle subagent, as fx did before.
+  idle["names-missing"] = base("start-beside-idle").map((o) => o.op === "send" && o.named.length > 0 ? { ...o, named: [] } : o);
+  // A new subagent's start named one that was still working.
+  idle["names-working"] = base("start-beside-working").map((o) => o.op === "send" && o.sub === "s2" ? { ...o, named: ["s1"] } : o);
+  // A main stop's end sent a report.
+  idle["report-after-stop"] = base("start-beside-stopped").map((o) => o.op === "end" ? { ...o, note: "idle" } : o);
+  for (const [name, observations] of Object.entries(idle)) {
+    expect(`${name}: ${await checkTrace(observations, pair, join(dir, name))}`).toBe(`${name}: REJECTED`);
   }
 }, 300_000);
