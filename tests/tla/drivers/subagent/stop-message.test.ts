@@ -402,6 +402,16 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     const ids = childIds(sub);
     return [...readFileSync(log, "utf8").matchAll(/event=report_queued to=main from=(\S+)/g)].filter((m) => ids.has(m[1]!)).length;
   };
+  // The end hook's `child_end` line for each work of `sub` that ended, in
+  // order, with whether the end owes main a report. The hook logs it once the
+  // work is finished, and queues the report that is owed right after.
+  const endsLogged = (sub: string): { owes: boolean }[] => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return [];
+    const ids = childIds(sub);
+    return [...readFileSync(log, "utf8").matchAll(/event=child_end child=(\S+) work_id=\S+ outcome=\S+ report=(true|false)/g)]
+      .filter((m) => ids.has(m[1]!)).map((m) => ({ owes: m[2] === "true" }));
+  };
   // What the newest report of `sub`'s works told main: whether it said the
   // subagent is idle (the idle= of fx's report_queued trace line).
   const reportNote = (sub: string): string => {
@@ -536,15 +546,19 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const endAction = async (sub: string, keep = false) => {
     if (!ending.has(sub)) return;
     const before = finishedCount(sub);
+    const endsBefore = endsLogged(sub).length;
     const reportsBefore = reportsQueued(sub);
     const n = await poll(() => heldEnd(sub), 15_000);
     if (n === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never reached its end`);
     released.add(n);
     writeFileSync(`${release}.${n}`, "");
     if ((await poll(() => finishedCount(sub) > before, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never finished`);
-    // A report, if the end owes one, is queued as the work finishes.
-    await Bun.sleep(200);
-    const note = reportsQueued(sub) > reportsBefore ? reportNote(sub) : "none";
+    // The end hook says whether the end owes a report, and queues the one it
+    // owes next: wait for that line, then for the report, not a fixed time.
+    const ended = await poll(() => (endsLogged(sub).length > endsBefore ? endsLogged(sub)[endsBefore] : undefined), 15_000);
+    if (ended === undefined) throw new Error(`${walk.name}: ${sub}'s end hook never ran`);
+    if (ended.owes && (await poll(() => reportsQueued(sub) > reportsBefore, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s end owed a report that was never queued`);
+    const note = ended.owes ? reportNote(sub) : "none";
     const msgs = closing.has(sub) ? [] : [...waiting.get(sub)!];
     ending.delete(sub);
     closing.delete(sub);

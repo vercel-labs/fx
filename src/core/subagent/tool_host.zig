@@ -3355,9 +3355,10 @@ test "a stop that lands as the next work is installed drops it, and it never beg
     defer HeldNextWork.disarm();
 
     try EndHooks.endFirstWorkHoldingNext(runtime, &fixture, arena);
+    const child_id = try reviewerId(runtime, arena);
     const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
     HeldNextWork.go.set(io_mod.getIo());
-    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
     // Only the first work's turn began, and the stop's answer says what it
     // dropped.
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
@@ -3393,7 +3394,9 @@ test "the parent's close that lands as the next work is installed drops it, and 
     const child_id = try reviewerId(runtime, arena);
     const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
     HeldNextWork.go.set(io_mod.getIo());
-    try waitUntilQuiet(runtime);
+    // The close is written as the slot ends, after the host stops counting
+    // the child as working.
+    try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try std.testing.expect(std.mem.find(u8, closed, "Closed reviewer, ending its turn. The message waiting for it was dropped.") != null);
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
@@ -3421,7 +3424,7 @@ test "the user's close that lands as the next work is installed drops it, and it
     const child_id = try reviewerId(runtime, arena);
     const closed = (try runtime.closeChild(child_id, .user)).?;
     HeldNextWork.go.set(io_mod.getIo());
-    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try std.testing.expect(closed.stopped);
     try std.testing.expectEqual(@as(usize, 1), closed.dropped);
@@ -3904,6 +3907,20 @@ fn waitForActiveWork(runtime: *Runtime, arena: Allocator, child_id: []const u8, 
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.Timeout;
+}
+
+/// Waits for the slot of `child_id` to end its last work, which is the slot's
+/// `done` event: the slot sets it after its end hook returned, so every write
+/// that end makes is in by then, the close of a closing child included.
+/// `waitUntilQuiet` is not enough for a test that reads that state: the host
+/// stops counting a closing child as working (`endClosingWork`) before it
+/// writes the close (`settleClose`).
+fn waitForSlotEnd(runtime: *Runtime, child_id: []const u8) !void {
+    _ = runtime.managed.wait(child_id, .{ .clock = .awake, .raw = .fromSeconds(30) }) catch |err| {
+        // A closed child is gone from the registry once its slot ends.
+        if (err != error.ChildUnavailable) return err;
+    };
+    try std.testing.expect(!runtime.managed.hasRunningChild(child_id));
 }
 
 fn waitUntilQuiet(runtime: *Runtime) !void {
