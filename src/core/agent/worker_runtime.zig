@@ -2305,6 +2305,22 @@ pub const WorkerRuntime = struct {
         return snapshot;
     }
 
+    /// Whether the mail queued for this worker waits for its next turn,
+    /// with none of it joining the running one, as fx ask's always does: its
+    /// turns run apart from this worker (`postMailWith`). False when nothing
+    /// waits.
+    pub fn queuedMailWaitsForNextTurn(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var waits = false;
+        for (self.queued_prompts.items) |prompt| switch (prompt.delivery) {
+            .active_turn => return false,
+            .continuation => waits = true,
+            .ordinary => {},
+        };
+        return waits;
+    }
+
     pub fn queuedPromptCount(self: *WorkerRuntime) usize {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -4753,6 +4769,10 @@ fn dupeToolResultMemory(
     else
         null;
     errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
+    const quiet_crossing: ?types.QuietCrossing = if (memory.quiet_crossing) |crossing|
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+    else
+        null;
     return .{
         .output_handle = output_handle,
         .preview = preview,
@@ -4763,6 +4783,7 @@ fn dupeToolResultMemory(
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
+        .quiet_crossing = quiet_crossing,
     };
 }
 
@@ -4776,6 +4797,7 @@ fn freeToolResultMemory(
     if (value.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }
+    if (value.quiet_crossing) |crossing| alloc.free(@constCast(crossing.command));
 }
 
 fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
@@ -6033,6 +6055,23 @@ test "an agent's posted message joins the running turn, waits behind older work,
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("wakes", job.prompt);
     try std.testing.expect(job.delivery.isContinuation());
+}
+
+test "mail waits for the next turn only when none of it joins the running one" {
+    const alloc = std.testing.allocator;
+    var idle = WorkerRuntime{};
+    defer idle.deinit(alloc);
+    try std.testing.expect(!idle.queuedMailWaitsForNextTurn());
+    // An idle worker's mail, as fx ask's always is, starts the next turn.
+    try idle.postMail(alloc, try makePrompt(alloc, "note", "model"));
+    try std.testing.expect(idle.queuedMailWaitsForNextTurn());
+
+    var running = WorkerRuntime{};
+    defer running.deinit(alloc);
+    running.worker_processing = true;
+    running.active_turn_id = 9;
+    try running.postMail(alloc, try makePrompt(alloc, "joins", "model"));
+    try std.testing.expect(!running.queuedMailWaitsForNextTurn());
 }
 
 test "a posted message joins a turn the worker started after an earlier turn closed" {

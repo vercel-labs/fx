@@ -196,8 +196,12 @@ pub const AgentsMenuRow = struct {
     /// The agent profile it runs in, or empty for the main one, which the
     /// list leaves unnamed.
     profile: []const u8 = "",
-    /// What it is doing, such as "needs approval".
+    /// What it is doing, such as "needs approval", or "working 12s" while a
+    /// subagent is in a tool call, for as long as that call has run.
     state: []const u8,
+    /// A working subagent's current tool call, such as "Waiting for npm
+    /// test", which the row shows in place of its title; else empty.
+    activity: []const u8 = "",
     state_tone: AgentStateTone = .idle,
     /// The model its turns use, as the agent's settings name it, such as
     /// "anthropic/claude-opus-4-7"; empty when unknown.

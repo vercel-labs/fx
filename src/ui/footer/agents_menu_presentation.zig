@@ -97,7 +97,9 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
+/// A working subagent's current call, else its session's title.
 fn titleOf(row: AgentsMenuRow) []const u8 {
+    if (row.activity.len > 0) return row.activity;
     return if (row.title.len > 0) row.title else untitled;
 }
 
@@ -358,6 +360,19 @@ test "the agent list counts the agents, then shows each one's name, title, state
         defer std.testing.allocator.free(row.text);
         try std.testing.expectEqual(row_index == 3, row.selected);
     }
+}
+
+test "a working subagent's row shows its current call in place of its title, and the call's time with its state" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active, .model = "anthropic/claude-opus-4-7", .effort = "high" },
+        .{ .name = "worker", .subagent = true, .title = "Run the auth tests", .activity = "Waiting for npm test", .state = "working 4m12s", .state_tone = .active, .model = "openai/gpt-5.4-mini" },
+    };
+    try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
+        "  Agents 2",
+        "",
+        "  main      Fix the login bug     working        opus 4-7 high",
+        "  \u{2514} worker  Waiting for npm test  working 4m12s  gpt-5.4-mini",
+    });
 }
 
 test "a search counts what it matched, and keeps the list open when nothing does" {

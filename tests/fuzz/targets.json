@@ -27,6 +27,7 @@
     {"name": "session_log_scan", "module": "session_manager", "test": "scanning never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "session_schema_header", "module": "session_manager", "test": "header parsing never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "session_child_copy", "module": "session_manager", "test": "a child copy of a child log with arbitrary bytes after its lines never panics and copies whole lines (D97)", "iterations": 20000},
+    {"name": "subagent_call_label", "module": "fx", "test": "a subagent's call label stays bounded, one line, and terminal-safe on fuzzed bytes", "iterations": 500000},
     {"name": "display_width", "module": "fx", "test": "fuzz display unit boundaries", "iterations": 620000},
     {"name": "fuzzy_match", "module": "fx", "test": "fuzzy match keeps the model's laws on arbitrary bytes", "iterations": 300000},
     {"name": "toolbox_menu", "module": "fx", "test": "toolbox menu stays bounded and well formed on fuzzed entries", "iterations": 500000},
