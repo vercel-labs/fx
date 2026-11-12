@@ -22,6 +22,7 @@ import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
+import { rotateFxLogin } from "./fx-login-fakes";
 import { rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -29,6 +30,7 @@ import {
   fakeGatewaySse,
   fakeGatewayToolCall,
   heldFakeGatewayFinalText,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -2248,6 +2250,50 @@ tmuxTest(
 );
 
 tmuxTest(
+  "a sign-in team list with bad entries shows only the usable team and finishes the request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-bad-teams-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      fakeGatewayFinalText("BAD_TEAM_LIST_RESPONSE"),
+    ]);
+    // The refresh token is rejected, so fx opens a sign-in. One team's name
+    // and another team's slug hold control characters.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "\u001b]2;NAME_TITLE\u0007Vercel Labs" },
+        { id: "team_bad", slug: "\u001b[2JBAD_SLUG", name: "BAD_TEAM" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after I sign in again.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    // The team with a bad name shows under its slug; the team fx could not
+    // send is left out.
+    const picker = await session.waitForPane((pane) => pane.includes("› vercel-labs"), TIMEOUT);
+    expect(picker).not.toContain("BAD_TEAM");
+    expect(picker).not.toContain("BAD_SLUG");
+    expect(picker).not.toContain("NAME_TITLE");
+    await session.sendKeys("Enter");
+    await session.waitForText("BAD_TEAM_LIST_RESPONSE", TIMEOUT);
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "an expired login during a request opens sign-in and finishes the request",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-sign-in-"));
@@ -2454,6 +2500,120 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("POLL_503_RECOVERY_RESPONSE", TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a team picked during a sign-in wait sends the waiting request with that team",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-team-change-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    // The first answer says the login expired. After that, AI Gateway
+    // refuses the first team and takes the login for the second.
+    gateway = startDynamicFakeGateway(() => {
+      const requests = gateway!.requests;
+      const team = requests[requests.length - 1]?.headers.get("x-vercel-ai-gateway-team");
+      if (requests.length > 1 && team === "team_456") return fakeGatewayFinalText("TEAM_CHANGE_RESPONSE");
+      return new Response(JSON.stringify({ error: { message: requests.length === 1 ? "token expired" : "not allowed for this team" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    // The refresh token is rejected, so fx opens a sign-in, and its team
+    // choice comes while the request waits.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer on the team I pick.");
+    await session.waitForText("Choose a team to finish setup", TIMEOUT);
+    await session.waitForText("› Vercel Labs", TIMEOUT);
+    await session.sendLiteral("other");
+    await session.waitForText("› Other Team", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Other Team (other-team).", TIMEOUT);
+    await session.waitForText("TEAM_CHANGE_RESPONSE", TIMEOUT);
+    // The waiting request was sent again with the team just picked.
+    const last = gateway.requests[gateway.requests.length - 1]!;
+    expect(last.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  90_000,
+);
+
+tmuxTest(
+  "a refused login names the team fx sent and how to choose another",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-refused-team-notice-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "not allowed for this team" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer with the team fx has.");
+    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    const refused = await session.captureFullScrollback();
+    expect(refused).toContain("not allowed for this team");
+    expect(refused).toContain("Vercel team example-internal-team");
+    expect(refused).toContain("press Esc twice, run /login, choose another team, and send it again");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a refused login whose saved team slug has control characters names the team id and keeps fx running",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-refused-team-bad-slug-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => new Response(JSON.stringify({ error: { message: "not allowed for this team" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+    // fx does not check a saved login's team slug when it loads it.
+    const authPath = join(home, ".fx", "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    auth.team_slug = "\u001b]2;SLUG_TITLE\u0007\u001b[2J\u202eSLUG_TEXT";
+    writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer with the team fx has.");
+    await session.waitForPane((pane) => pane.includes("Gateway refused the login"), TIMEOUT);
+    await session.waitForText("for the Vercel team team_123.", TIMEOUT);
+    const refused = await session.captureFullScrollback();
+    expect(refused).not.toContain("SLUG_TITLE");
+    expect(refused).not.toContain("SLUG_TEXT");
+    expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -9332,3 +9492,63 @@ tmuxTest("provider preparation completes existing-key recovery for a held prompt
   expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, TIMEOUT);
+
+// Another fx process refreshed the shared login after this one loaded the
+// model list, and the gateway stopped accepting the old token. The model list
+// reads the stored login before it fetches instead of falling back to the
+// public list (tests/tla/session_title/SessionTitle.tla
+// CatalogFirstSendUsesStore).
+tmuxTest(
+  "model list uses the login another fx refreshed after launch",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-rotated-catalog-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    const tracePath = join(home, "trace.log");
+    const ROTATED_TOKEN = "rotated-login-token";
+    let accepted = LOGIN_TOKEN;
+    const publicModel = { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] };
+    gateway = startFakeGateway([], {
+      models: (request) => {
+        const authorization = request.headers.get("authorization");
+        if (authorization === null) return [publicModel];
+        if (authorization !== `Bearer ${accepted}`) {
+          return Response.json({ error: { message: "Invalid token" } }, { status: 401 });
+        }
+        return accepted === ROTATED_TOKEN
+          ? [publicModel, { id: "private/red-kite", type: "language", tags: ["tool-use"] }]
+          : [publicModel, { id: "private/blue-hornbill", type: "language", tags: ["tool-use"] }];
+      },
+    });
+    oauth = startFakeOAuth("unexpected-refresh-token");
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+      FX_TRACE_SCOPES: "auth,catalog",
+    });
+    await session.waitForComposer(TIMEOUT);
+    await waitForModelRequestCount(gateway, 1);
+    expect(gateway.modelRequests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+
+    rotateFxLogin(home, ROTATED_TOKEN);
+    accepted = ROTATED_TOKEN;
+    // The picker reloads the list only 5 s after the last load
+    // (picker_revalidate_floor_ms in src/core/app/model_cache_runtime.zig).
+    await Bun.sleep(5_500);
+    await session.sendText("/model");
+    await session.waitForPane((pane) => pane.includes("private/red-kite"), TIMEOUT);
+
+    const authorizations = gateway.modelRequests.map((request) => request.headers.get("authorization"));
+    expect(authorizations.slice(1)).toEqual([`Bearer ${ROTATED_TOKEN}`]);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+    const loads = readFileSync(tracePath, "utf8").split("\n").filter((line) =>
+      line.includes("[catalog] event=model_catalog_load ")
+    );
+    expect(loads.at(-1)).toContain("effective_access=authenticated");
+    expect(loads.at(-1)).toContain("anonymous_fallback=false");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);

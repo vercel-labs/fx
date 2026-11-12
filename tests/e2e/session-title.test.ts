@@ -5,6 +5,15 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
 import {
+  bearer,
+  rotateFxLogin,
+  signInFxLoginToTeam,
+  startFakeIssuer,
+  storedFxLoginToken,
+  unauthorized,
+  writeFxLogin,
+} from "./fx-login-fakes";
+import {
   fakeGatewayFinalText,
   startDynamicFakeGateway,
   startUpgradeServer,
@@ -419,3 +428,302 @@ test.skipIf(SKIP_TMUX)("tui generates a title in the fresh session an upgrade re
     release.stop();
   }
 }, 120_000);
+
+// Title requests made with a refreshable sign-in. Another fx process can
+// refresh the shared fx login after this one has read it, so the token it holds
+// in memory is rejected while the store already holds a newer one. The title
+// request sends the stored token, and after a 401 sends once more only with a
+// stored token that replaced the rejected one. It never refreshes the login
+// itself (tests/tla/session_title/SessionTitle.tla BackgroundNeverRefreshes).
+
+const FIRST_PROMPT = "refactor the renderer loop to fix the crash";
+
+function loginEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string }, issuer: { issuerUrl: string }) {
+  return {
+    ...baseEnv(root, gateway),
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_NO_OPEN_BROWSER: "1",
+  };
+}
+
+/// A title channel that answers with the generated title only for `accepts`.
+function titleFor(accepts: (token: string) => boolean) {
+  return (_body: string, headers: Headers) =>
+    accepts(bearer(headers)) ? fakeGatewayFinalText(GENERATED_TITLE) : unauthorized();
+}
+
+function titleTokens(gateway: ReturnType<typeof startDynamicFakeGateway>): string[] {
+  return gateway.titleRequests.map((request) => bearer(request.headers));
+}
+
+function lastTitle(root: FixtureRoot): string | undefined {
+  return sessionTitles(root).at(-1);
+}
+
+function startLoginGateway(titles: Array<(body: string, headers: Headers) => Response>) {
+  return startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: titles,
+  });
+}
+
+async function askWithLogin(label: string, titles: (home: string) => Array<(body: string, headers: Headers) => Response>) {
+  const root = createFixtureRoot(label);
+  const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+  const gateway = startLoginGateway(titles(root.home));
+  try {
+    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("MAIN_ANSWER_OK");
+    // A title request never refreshes the login all fx processes share.
+    expect(issuer.refreshes).toHaveLength(0);
+    return { tokens: titleTokens(gateway), title: lastTitle(root), stored: storedFxLoginToken(root.home) };
+  } finally {
+    gateway.stop();
+    issuer.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
+test("fx ask keeps the derived title without refreshing the login when the gateway rejects the stored one", async () => {
+  const rejected = titleFor(() => false);
+  const run = await askWithLogin("login-401-stored", () => [rejected, rejected]);
+  expect(run.tokens).toEqual(["launch-token"]);
+  expect(run.stored).toBe("launch-token");
+  expect(run.title).toContain("refactor the renderer loop");
+}, 45_000);
+
+test("fx ask sends a rejected title with the login another fx already renewed, without refreshing", async () => {
+  const accept = titleFor((token) => token === "other-fx-token");
+  // The first title request arrives after another fx renewed the login.
+  const run = await askWithLogin("login-401-renewed-elsewhere", (home) => [(body, headers) => {
+    rotateFxLogin(home, "other-fx-token");
+    return accept(body, headers);
+  }, accept, accept]);
+  expect(run.tokens).toEqual(["launch-token", "other-fx-token"]);
+  expect(run.title).toBe(GENERATED_TITLE);
+}, 45_000);
+
+test("fx ask sends the title at most twice while another fx keeps renewing the login", async () => {
+  let renewals = 0;
+  const run = await askWithLogin("login-401-always", (home) => Array.from({ length: 3 }, () => () => {
+    renewals += 1;
+    rotateFxLogin(home, `other-fx-token-${renewals}`);
+    return unauthorized();
+  }));
+  expect(run.tokens).toEqual(["launch-token", "other-fx-token-1"]);
+  expect(run.title).toContain("refactor the renderer loop");
+}, 45_000);
+
+test("fx ask never sends the title with the login another fx signed in to another team", async () => {
+  const any = titleFor(() => true);
+  const run = await askWithLogin("login-other-team", (home) => [() => {
+    signInFxLoginToTeam(home, "other-team-token", "team_other");
+    return unauthorized();
+  }, any, any]);
+  expect(run.tokens).toEqual(["launch-token"]);
+  expect(run.stored).toBe("other-team-token");
+  expect(run.title).toContain("refactor the renderer loop");
+}, 45_000);
+
+test("fx ask does not send the title again when the gateway refuses it with 403", async () => {
+  const forbidden = () => Response.json({ error: { message: "Model not allowed", type: "permission_error" } }, { status: 403 });
+  const run = await askWithLogin("login-403", (home) => [() => {
+    rotateFxLogin(home, "other-fx-token");
+    return forbidden();
+  }, forbidden]);
+  expect(run.tokens).toEqual(["launch-token"]);
+}, 45_000);
+
+test("fx ask sends a static key's rejected title once", async () => {
+  const root = createFixtureRoot("static-key-401");
+  const rejected = titleFor(() => false);
+  const gateway = startLoginGateway([rejected, rejected]);
+  try {
+    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: baseEnv(root, gateway), timeoutMs: 30_000 });
+    expect(result.code, result.stderr).toBe(0);
+    expect(titleTokens(gateway)).toEqual(["synthetic-title"]);
+    expect(lastTitle(root)).toContain("refactor the renderer loop");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test.skipIf(SKIP_TMUX)("tui sends the title with the login another fx refreshed after launch", async () => {
+  const root = createFixtureRoot("tui-stale-login", JSON.stringify({ statusLine: { session: true } }));
+  const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+  let accepted = "launch-token";
+  const title = titleFor((token) => token === accepted);
+  const gateway = startLoginGateway([title, title]);
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: loginEnv(root, gateway, issuer),
+    });
+    await tui.waitForStableComposer(15000);
+    // Another fx refreshes the shared login, and the old token stops working.
+    rotateFxLogin(root.home, "other-fx-token");
+    accepted = "other-fx-token";
+    await tui.sendText(FIRST_PROMPT);
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+    await tui.waitForText(GENERATED_TITLE, 15000);
+    expect(titleTokens(gateway)).toEqual(["other-fx-token"]);
+    expect(issuer.refreshes).toHaveLength(0);
+    expect(lastTitle(root)).toBe(GENERATED_TITLE);
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    issuer.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test.skipIf(SKIP_TMUX)("tui gets a title when the login is due for refresh at the first prompt", async () => {
+  const root = createFixtureRoot("tui-due-login", JSON.stringify({ statusLine: { session: true } }));
+  const issuer = startFakeIssuer({ refresh: () => "renewed-token" });
+  // Not expired, but past its refresh deadline: the prompt renews it first.
+  writeFxLogin(root.home, issuer.issuerUrl, "launch-token", { expiresAtMs: Date.now() + 60_000 });
+  const title = titleFor((token) => token === "renewed-token");
+  const gateway = startLoginGateway([title, title]);
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: loginEnv(root, gateway, issuer),
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText(FIRST_PROMPT);
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+    await tui.waitForText(GENERATED_TITLE, 15000);
+    expect(titleTokens(gateway)).toEqual(["renewed-token"]);
+    expect(issuer.refreshes).toHaveLength(1);
+    expect(lastTitle(root)).toBe(GENERATED_TITLE);
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    issuer.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+type Held = { started: boolean; cancelled: boolean };
+
+/// A tool-free reply that keeps streaming until fx cancels it.
+function heldReply(held: Held): Response {
+  const encoder = new TextEncoder();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      held.started = true;
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "held", delta: "Working on it.\n" })}\n\n`));
+      timer = setInterval(() => controller.enqueue(encoder.encode(": held\n\n")), 50);
+    },
+    cancel() {
+      held.cancelled = true;
+      if (timer) clearInterval(timer);
+    },
+  }), { headers: { "content-type": "text/event-stream" } });
+}
+
+async function waitUntil(condition: () => boolean, label: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+function traceHas(tracePath: string, line: string): boolean {
+  return existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(line);
+}
+
+test.skipIf(SKIP_TMUX)("tui titles a session once, from its first prompt, when the next prompt interrupts the first turn", async () => {
+  const root = createFixtureRoot("tui-interrupted-first-turn");
+  const tracePath = join(root.root, "trace.log");
+  const held: Held = { started: false, cancelled: false };
+  let mainRequests = 0;
+  const gateway = startDynamicFakeGateway(() => {
+    mainRequests += 1;
+    return mainRequests === 1 ? heldReply(held) : fakeGatewayFinalText("SECOND_ANSWER_OK");
+  }, {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    // The first title request fails, so only the first-prompt record keeps a
+    // second one from starting.
+    titleResponses: [unauthorized(), fakeGatewayFinalText(GENERATED_TITLE)],
+  });
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: { ...baseEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText(FIRST_PROMPT);
+    await waitUntil(() => held.started, "the first turn's reply");
+    // The main loop has collected the failed title task, so only the record
+    // can stop the next prompt from starting another.
+    await waitUntil(() => traceHas(tracePath, "event=title_generation_apply result=unavailable"), "the failed title task");
+    await tui.sendText("now write the regression test for it");
+    await waitUntil(() => held.cancelled, "the interrupted first turn");
+    await waitUntil(() => traceHas(tracePath, "event=title_generation_skipped reason=already_started"), "the gate to refuse a second title");
+    await tui.waitForText("SECOND_ANSWER_OK", 20000);
+    expect(gateway.titleRequests).toHaveLength(1);
+    expect(gateway.titleRequests[0]!.body).toContain("refactor the renderer loop");
+    expect(sessionTitles(root)).not.toContain(GENERATED_TITLE);
+    expect(lastTitle(root)).toContain("refactor the renderer loop");
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test.skipIf(SKIP_TMUX)("tui titles the next session after /new when the first session's title failed", async () => {
+  const root = createFixtureRoot("tui-new-after-failed-title", JSON.stringify({ statusLine: { session: true } }));
+  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: [unauthorized(), fakeGatewayFinalText(GENERATED_TITLE)],
+  });
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: baseEnv(root, gateway),
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText(FIRST_PROMPT);
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+    await waitUntil(() => gateway.titleRequests.length === 1, "the first title request");
+    await tui.sendText("/new");
+    await tui.waitForStableComposer(15000);
+    await tui.sendText("explain the session store layout");
+    await waitUntil(() => gateway.titleRequests.length === 2, "the second session's title request", 20_000);
+    await tui.waitForText(GENERATED_TITLE, 15000);
+    expect(gateway.titleRequests[1]!.body).toContain("explain the session store layout");
+    expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);

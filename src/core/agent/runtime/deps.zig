@@ -180,6 +180,19 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+/// A refreshed login for the request that asked for it. Every field is
+/// allocated with the allocator the hook was given, and the caller owns it;
+/// the caller zeroes `token` when it frees it.
+pub const RefreshedGatewayCredential = struct {
+    token: []u8,
+    /// The Vercel team the refreshed login sends. Null keeps the request's
+    /// team, which is what a host that refuses a team change during a request
+    /// returns.
+    gateway_team: ?[]u8 = null,
+    /// That team's slug, which fx shows the user.
+    gateway_team_label: ?[]u8 = null,
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
@@ -287,7 +300,7 @@ pub const AgentRuntimeDeps = struct {
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,

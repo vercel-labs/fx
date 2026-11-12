@@ -10,6 +10,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -1244,7 +1245,12 @@ fn maybeStartAcpTitleTask(
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
-    const title_model = bundle.title_model orelse return;
+    const provider_title_model = bundle.title_model orelse return;
+    // A Token Pass session titles itself with a Token Pass model.
+    const title_model = if (session.provider == .gateway)
+        token_pass.modelForSideCall(.title, session.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
     if (session.credential_source != .host_managed and session.api_key.len == 0) return;
@@ -1257,6 +1263,7 @@ fn maybeStartAcpTitleTask(
         .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .credential_source = session.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return;
     task.spawn() catch |err| {
@@ -2164,15 +2171,18 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
-    return server.refreshModelCredential(
+    // The server refuses a team change during a request, so the request
+    // keeps its team.
+    const token = (try server.refreshModelCredential(
         @ptrCast(ctx.state),
         alloc,
         source,
         mode,
         expected_account_id,
-    );
+    )) orelse return null;
+    return .{ .token = token };
 }
 
 /// The prompt's session while it is still the active one.

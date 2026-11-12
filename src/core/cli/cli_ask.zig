@@ -46,6 +46,7 @@ const agent_run_flags = @import("agent_run_flags.zig");
 const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -2017,7 +2018,12 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    const provider_title_model = bundle.title_model orelse return null;
+    // A Token Pass session titles itself with a Token Pass model.
+    const title_model = if (ctx.provider == .gateway)
+        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
@@ -2029,6 +2035,7 @@ fn maybeStartAskTitleTask(
         .gateway_team = ctx.gateway_team,
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return null;
     task.spawn() catch |err| {
@@ -2201,7 +2208,7 @@ fn refreshGatewayCredential(
     source: credentials.Source,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -2215,7 +2222,8 @@ fn refreshGatewayCredential(
         expected_account_id,
     )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
-    return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = try adoptRefreshedAskCredential(ctx, alloc, &refreshed) };
 }
 
 fn adoptRefreshedAskCredential(
@@ -5127,6 +5135,37 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "fx ask refuses a refreshed login on another team" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "stale-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // Another fx process saved the login on another team while this request
+    // ran; fx ask does not move a request to it.
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_456"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    try std.testing.expectError(error.CredentialAuthorityChanged, adoptRefreshedAskCredential(&ctx, alloc, &refreshed));
+    try std.testing.expectEqualStrings("stale-token", ctx.api_key);
+    try std.testing.expectEqualStrings("team_123", ctx.gateway_team.?);
 }
 
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {

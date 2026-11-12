@@ -18,6 +18,8 @@ const io_mod = @import("../shared/io.zig");
 const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
 const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
+const image_provider = @import("../agent/runtime/image_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -1884,6 +1886,11 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
+        // A Token Pass session reads images with a Token Pass model.
+        .model = if (state.runtime.provider == .gateway)
+            token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+        else
+            image_provider.default_model,
     };
     if (request.image_ids() != null) {
         if (authority != .ordinary) return error.InvalidVisionExecutionAuthority;
