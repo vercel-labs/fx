@@ -2114,6 +2114,76 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP turns route the gateway request by provider_order and provider_strict, as TUI turns do",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-provider-routing-");
+      const gateway = startFakeGateway([finalText("ACP_ROUTED_IN_ORDER"), finalText("ACP_ROUTED_STRICT")]);
+      const startSession = async () => {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2);
+        await client.readLine();
+      };
+      try {
+        // A project's committed preference, which .fx.json may hold.
+        writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ provider_order: ["azure", "anthropic"] }));
+        await startSession();
+        const ordered = await runPrompt(client!, "Route this request.", TIMEOUT);
+        expect(ordered.promptResult.result.stopReason).toBe("end_turn");
+        const preferred = JSON.parse(gateway.requests[0]!.body).providerOptions?.gateway;
+        expect(preferred?.order).toEqual(["azure", "anthropic"]);
+        expect(preferred?.only).toBeUndefined();
+        expect(client!.stderr).toBe("");
+        await client!.close();
+
+        // The profile makes the same order a hard restriction.
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ provider_strict: true }));
+        await startSession();
+        const strict = await runPrompt(client!, "Route this request strictly.", TIMEOUT);
+        expect(strict.promptResult.result.stopReason).toBe("end_turn");
+        const restricted = JSON.parse(gateway.requests[1]!.body).providerOptions?.gateway;
+        expect(restricted?.only).toEqual(["azure", "anthropic"]);
+        expect(restricted?.order).toBeUndefined();
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP auto reviews use the review_model setting, as TUI reviews do",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-review-model-");
+      const target = join(root.external, "reviewed.txt");
+      writeFileSync(target, "before");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ review_model: "openai/gpt-5-alt" }));
+      const gateway = startFakeGateway([
+        fileToolCall("write_reviewed", target, "FX_ACP_REVIEW_MODEL"),
+        finalText("ACP review model used"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, `Use only the write_file tool to overwrite ${target}.`, TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe("openai/gpt-5-alt");
+        expect(readFileSync(target, "utf8")).toBe("FX_ACP_REVIEW_MODEL");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ordinary ACP rejects private libfx methods without replacing its session",
     async () => {
       const root = createIsolatedRoot("fx-acp-private-methods-");

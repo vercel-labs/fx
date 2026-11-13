@@ -534,6 +534,9 @@ const AcpContext = struct {
             .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
             .first_call_tool_choice = session.first_call_tool_choice,
+            .reviewer_model = self.state.review_model,
+            .provider_order = providerOrderFor(self.state, session),
+            .provider_strict = providerStrictFor(self.state, session),
             .permission_mode = self.captured_permission_mode orelse session.permission_mode,
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
@@ -1455,11 +1458,23 @@ fn buildAgentConfig(
         .ultrafast_mode = session.ultrafast_mode,
         .effort = session.effort,
         .first_call_tool_choice = session.first_call_tool_choice,
+        .provider_order = providerOrderFor(state, session),
+        .provider_strict = providerStrictFor(state, session),
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .enforce_response_language = !state.cfg.minimal_kernel,
         .context_limits = state.context_limits,
     };
+}
+
+/// The configured gateway provider order, which only gateway requests carry,
+/// as in the TUI.
+fn providerOrderFor(state: *const server.ServerState, session: *const server.ActiveSessionState) []const []const u8 {
+    return if (session.provider == .gateway) state.provider_order else &.{};
+}
+
+fn providerStrictFor(state: *const server.ServerState, session: *const server.ActiveSessionState) bool {
+    return session.provider == .gateway and state.provider_strict;
 }
 
 test "libfx inline prompt source references survive capture without a filesystem" {
@@ -5846,4 +5861,40 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
+}
+
+test "ACP gateway turns carry the configured provider routing and reviewer model, and other providers' turns carry no routing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    const order = try alloc.alloc([]const u8, 2);
+    order[0] = try alloc.dupe(u8, "azure");
+    order[1] = try alloc.dupe(u8, "anthropic");
+    state.provider_order = order;
+    state.provider_strict = true;
+    state.review_model = try alloc.dupe(u8, "openai/gpt-5-alt");
+    const session = &state.active_session.?;
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    session.provider = .gateway;
+    const routed = buildAgentConfig(&state, session, .{ .custom_tool_guidance = "" });
+    try std.testing.expectEqual(@as(usize, 2), routed.provider_order.len);
+    try std.testing.expectEqualStrings("azure", routed.provider_order[0]);
+    try std.testing.expect(routed.provider_strict);
+    const routed_tools = ctx.toolContext();
+    try std.testing.expectEqualStrings("anthropic", routed_tools.provider_order[1]);
+    try std.testing.expect(routed_tools.provider_strict);
+    try std.testing.expectEqualStrings("openai/gpt-5-alt", routed_tools.reviewer_model);
+
+    session.provider = .codex;
+    const unrouted = buildAgentConfig(&state, session, .{ .custom_tool_guidance = "" });
+    try std.testing.expectEqual(@as(usize, 0), unrouted.provider_order.len);
+    try std.testing.expect(!unrouted.provider_strict);
+    try std.testing.expectEqual(@as(usize, 0), ctx.toolContext().provider_order.len);
 }
