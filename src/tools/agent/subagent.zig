@@ -503,6 +503,7 @@ test "every call the decoder refuses tells the model what is wrong and what to d
     defer problems.deinit(std.testing.allocator);
     const message = "\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\"";
     const cases = [_]struct { args: []const u8, code: []const u8 }{
+        // Only a direct call of `decode` reaches this; see `Refusal.invalid_json`.
         .{ .args = "{not json", .code = "invalid_json" },
         .{ .args = "[]", .code = "invalid_field_type" },
         .{ .args = "{\"action\":\"message\",\"agent\":5,\"message\":\"do it\"}", .code = "invalid_field_type" },
@@ -516,9 +517,9 @@ test "every call the decoder refuses tells the model what is wrong and what to d
         .{ .args = "{\"action\":\"stop\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"\"}", .code = "invalid_message" },
-        .{ .args = "{" ++ message ++ ",\"instructions\":\"\"}", .code = "invalid_instructions" },
+        .{ .args = "{" ++ message ++ ",\"instructions\":\"a\\u0000b\"}", .code = "invalid_instructions" },
         .{ .args = "{" ++ message ++ ",\"report\":\"often\"}", .code = "invalid_report" },
-        .{ .args = "{" ++ message ++ ",\"model\":\"\"}", .code = "invalid_model" },
+        .{ .args = "{" ++ message ++ ",\"model\":\"a\\u0000b\"}", .code = "invalid_model" },
         .{ .args = "{" ++ message ++ ",\"effort\":\"not an effort!\"}", .code = "invalid_effort" },
         .{ .args = "{" ++ message ++ ",\"profile\":\"Bad Profile\"}", .code = "invalid_profile" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"done\",\"report\":\"never\"}", .code = "invalid_parent_message" },

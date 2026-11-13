@@ -16,14 +16,21 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const model_contract = @import("model_contract.zig");
 const profiles = @import("../profiles/profiles.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// How many open subagents a sentence names; it counts the rest.
-pub const max_named_open: usize = 8;
+const max_named_open: usize = 8;
 
 pub const Refusal = union(enum) {
     // A call that does not decode or validate.
+    /// Not reached by a call a model makes. The agent runtime answers arguments
+    /// that are not a JSON object before the decoder runs
+    /// (`argument_integrity` in `src/core/agent/runtime/orchestrator.zig`),
+    /// and a toolbox run's arguments are rebuilt from a parsed object
+    /// (`carriedCall` in `src/core/tooling/toolbox.zig`). Only a direct call of
+    /// `decode` gets here, so that a parse failure never answers with a bare code.
     invalid_json,
     invalid_agent: AgentFault,
     invalid_message,
@@ -58,7 +65,7 @@ pub const Refusal = union(enum) {
     }
 
     /// Writes the sentences the model reads.
-    pub fn sentence(self: Refusal, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn sentence(self: Refusal, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .invalid_json => try writer.writeAll("The arguments are not valid JSON. Send one JSON object with \"action\" and the fields that action takes."),
             .invalid_agent => |fault| try writer.writeAll(switch (fault) {
@@ -67,17 +74,17 @@ pub const Refusal = union(enum) {
             }),
             .invalid_message => try writer.writeAll(message_rule),
             .invalid_instructions => try writer.writeAll(instructions_rule),
-            .invalid_report => try writer.writeAll("report must be \"final\", \"every_turn\", or \"never\". Leave the field out to keep the subagent's current rule."),
+            .invalid_report => try writer.writeAll("report must be \"final\", \"every_turn\", or \"never\". Leave the field out to keep the rule it has, which is final until you change it."),
             .invalid_model => try writer.writeAll(model_rule),
-            .invalid_effort => try writer.writeAll("effort must be one word of up to 64 letters, digits, \"-\", \"_\" or \".\", such as low, medium or high. Leave the field out to use the default."),
+            .invalid_effort => try writer.writeAll(effort_rule),
             .invalid_profile => try writer.writeAll(profile_rule),
             .invalid_parent_message => try writer.writeAll("A message to \"parent\" takes only message. Send it without instructions, report, model, effort or profile."),
             .host_unavailable => try writer.writeAll("Subagents are not available in this session. Do the work yourself."),
             .caller_unavailable => |fault| try writer.writeAll(switch (fault) {
-                .not_owner => "Only the agent that started the subagents can start, stop, close or list them. You can send a message to \"parent\".",
+                .not_owner => "Only the agent that started the subagents can message, stop, close or list them. You can still send a message to \"parent\".",
                 .unidentified => "fx could not tell which agent made this call, so it was refused. Continue without it.",
             }),
-            .wait_unavailable => try writer.writeAll("wait is not available here. Call status to see where your subagents stand."),
+            .wait_unavailable => try writer.writeAll("wait is not available here. A subagent's report arrives on its own when its work ends, so keep working or end your turn."),
             .child_busy => try writer.writeAll("The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them."),
             .override_after_create => try writer.writeAll("model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation."),
             .child_closing => try writer.writeAll("The subagent is being closed and takes no message. Once it is gone, a message to its name starts a new one, or use another name."),
@@ -119,21 +126,21 @@ pub const Refusal = union(enum) {
     }
 };
 
-pub const AgentFault = enum {
+const AgentFault = enum {
     /// The name breaks the rule for subagent names.
     name,
     /// `stop` or `close` named "parent", which is no subagent of the caller's.
     parent_target,
 };
 
-pub const CallerFault = enum {
+const CallerFault = enum {
     /// A subagent called for what only the agent that started it may do.
     not_owner,
     /// The host could not tell who called.
     unidentified,
 };
 
-pub const Unavailable = union(enum) {
+const Unavailable = union(enum) {
     /// `stop`, `close`, or `status` named a subagent that is not open.
     /// `open` is every open subagent, in the order `status` lists them.
     not_open: struct { agent: []const u8, open: []const []const u8 },
@@ -141,21 +148,21 @@ pub const Unavailable = union(enum) {
     finished,
 };
 
-pub const QueueFault = enum {
+const QueueFault = enum {
     /// The subagent already holds as many of the caller's messages as it takes.
     subagent,
     /// The caller's parent already holds as many of the caller's messages as it takes.
     parent,
 };
 
-pub const ParentFault = enum {
+const ParentFault = enum {
     /// The caller has no parent: it is the main agent.
     none,
     /// The caller has a parent that cannot take a message now.
     unreachable_now,
 };
 
-pub const HostFault = enum {
+const HostFault = enum {
     /// A new subagent would be one more than a session holds open.
     subagent_limit,
     /// Any other failure of the host, whose cause only the trace names.
@@ -178,6 +185,10 @@ const model_rule = std.fmt.comptimePrint(
     "model must be 1 to {d} bytes of valid text with no NUL character. Leave the field out to use the default.",
     .{domain.max_model_bytes},
 );
+const effort_rule = std.fmt.comptimePrint(
+    "effort must be one word of up to {d} letters, digits, \"-\", \"_\" or \".\", such as low, medium or high. Leave the field out to use the default.",
+    .{types.ReasoningEffort.max_name_bytes},
+);
 const profile_rule = std.fmt.comptimePrint(
     "profile must be 1 to {d} characters: lowercase letters, digits, \"-\" or \"_\". Leave the field out to start in the main profile.",
     .{profiles.max_name_bytes},
@@ -191,7 +202,7 @@ const subagent_queue_full = std.fmt.comptimePrint(
     .{agent_frame.queue_cap},
 );
 const parent_queue_full = std.fmt.comptimePrint(
-    "Your parent already holds the most messages it takes from you ({d}). Put the rest in your final reply.",
+    "Your parent already has {d} messages from its subagents waiting, the most it holds. Put the rest in your final reply.",
     .{agent_frame.queue_cap},
 );
 

@@ -3612,6 +3612,32 @@ fn postFull(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
     return error.QueueFull;
 }
 
+/// A sink that posts into a real worker queue, as the app's, `fx ask`'s and
+/// ACP's do, so the cap on messages is that queue's own.
+fn postToWorker(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+    const worker: *worker_runtime.WorkerRuntime = @ptrCast(@alignCast(raw.?));
+    const alloc = std.testing.allocator;
+    const text = try alloc.dupe(u8, delivery.message.text);
+    worker.postMail(alloc, .{
+        .prompt = text,
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+        .author = .child,
+        .mail = .message,
+    }) catch |err| {
+        alloc.free(text);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.QueueFull => error.QueueFull,
+            else => error.AgentGone,
+        };
+    };
+}
+
 test "every refusal the host returns tells the model what happened and what to do next" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3719,6 +3745,37 @@ test "a refusal reaches the model as its code with the sentence that says what t
     _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-7", null);
     _ = try callTool(runtime, arena, .{ .close = .{ .agent = "fixer" } }, "call-8", null);
     try waitUntilQuiet(runtime);
+}
+
+test "a parent queue that one subagent filled refuses another that sent nothing, and the sentence says whose messages it counts" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    // The parent's turn runs, so what its subagents send waits in its queue.
+    var parent_worker = worker_runtime.WorkerRuntime{};
+    defer parent_worker.deinit(alloc);
+    parent_worker.worker_processing = true;
+    parent_worker.active_turn_id = 9;
+    runtime.report_sink = .{ .context = &parent_worker, .post_fn = postToWorker };
+
+    // alpha sends as many messages as the queue takes.
+    for (0..agent_frame.queue_cap) |index| {
+        const sent = try callToolAs(runtime, arena, "alpha-1", .{ .message = .{ .agent = "parent", .message = "a note" } }, try arena.print("alpha-{d}", .{index}));
+        try std.testing.expectStringStartsWith(sent, "{\"ok\":true");
+    }
+    const full =
+        "{\"ok\":false,\"result\":\"Your parent already has 64 messages from its subagents waiting, the most it holds. Put the rest in your final reply.\",\"error_code\":\"queue_full\"}";
+    // beta has sent none, and the queue is full for it all the same.
+    try std.testing.expectEqualStrings(full, try callToolAs(runtime, arena, "beta-1", .{ .message = .{ .agent = "parent", .message = "a note" } }, "beta-0"));
+    try std.testing.expectEqualStrings(full, try callToolAs(runtime, arena, "alpha-1", .{ .message = .{ .agent = "parent", .message = "a note" } }, "alpha-more"));
 }
 
 test "a name no subagent bears, with no subagent ever started, says there are none open" {
