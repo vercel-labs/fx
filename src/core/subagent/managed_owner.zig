@@ -60,6 +60,12 @@ const Slot = struct {
     /// The parent's messages the ended turn never took, as works of their
     /// own, for the host to queue next. Owned; emptied after each work.
     leftovers: std.ArrayList(child_state.ActiveWork) = .empty,
+    /// How many of `leftovers`, from the first, a stop or close has counted
+    /// as dropped, so no later one counts them again.
+    leftovers_counted: usize = 0,
+    /// How many unread messages in the attached worker's queue a stop has
+    /// counted. They become the first of `leftovers` when the worker detaches.
+    unread_counted: usize = 0,
     worker: ?*worker_runtime.WorkerRuntime = null,
     /// True when `worker` is the child agent's own, which runs its later
     /// turns too: stopping the turn cancels it instead of shutting it down.
@@ -147,6 +153,12 @@ pub const WorkEnd = struct {
 pub const EndHook = struct {
     context: *anyopaque,
     end_fn: *const fn (*anyopaque, WorkEnd) bool,
+};
+
+/// A running child's current tool call, for status.
+pub const ChildCall = struct {
+    child_id: []const u8,
+    call: live_metrics.Call,
 };
 
 pub const Owner = struct {
@@ -321,6 +333,48 @@ pub const Owner = struct {
             if (std.mem.eql(u8, slot.child_id, child_id)) return slot.completion == .running;
         }
         return false;
+    }
+
+    /// The current tool call of `child_id`'s running turn, for status and
+    /// its row in the agent list.
+    pub fn currentCall(self: *Owner, child_id: []const u8) ?live_metrics.Call {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion != .running) return null;
+            return slot.metrics.currentCall();
+        }
+        return null;
+    }
+
+    /// Each running turn's current tool call, by child id, allocated in
+    /// `alloc`. Status reads them before it takes the registry's lock, since
+    /// `wait` takes that lock under this owner's mutex.
+    pub fn currentCalls(self: *Owner, alloc: Allocator) ![]const ChildCall {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var calls: std.ArrayList(ChildCall) = .empty;
+        for (self.slots.items) |slot| {
+            if (slot.completion != .running) continue;
+            const call = slot.metrics.currentCall() orelse continue;
+            try calls.append(alloc, .{ .child_id = try alloc.dupe(u8, slot.child_id), .call = call });
+        }
+        return calls.items;
+    }
+
+    /// Records a tool call's start or end in `child_id`'s running turn, for
+    /// a turn whose events reach the host instead of the turn, as a hosted
+    /// child's do in the interactive app. A null `label` ends `call_id`.
+    pub fn noteCall(self: *Owner, child_id: []const u8, call_id: []const u8, label: ?[]const u8, now_ms: i64) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion != .running) return;
+            if (label) |text| slot.metrics.callStarted(call_id, text, now_ms) else slot.metrics.callEnded(call_id);
+            return;
+        }
     }
 
     /// Starts child `child_id`'s slot. `unstarted` is how many of the
@@ -573,7 +627,8 @@ pub const Owner = struct {
     /// The user closed the child from the agent list: ends its running turn
     /// as the user's own stop does, and its report says the user closed it.
     /// Returns how many of the parent's messages its next work carried that
-    /// no turn had begun on, which the close drops, or null when nothing runs.
+    /// no turn had begun on, and the ended turn's kept messages that no stop
+    /// counted, which the close drops, or null when nothing runs.
     pub fn closeByUser(self: *Owner, child_id: []const u8) ?usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -586,7 +641,7 @@ pub const Owner = struct {
             stopTurn(slot, .cancel);
             const unstarted = slot.unstarted;
             slot.unstarted = 0;
-            return unstarted;
+            return unstarted + uncountedLeftovers(slot);
         }
         return null;
     }
@@ -595,7 +650,10 @@ pub const Owner = struct {
     /// report, since the stop call answers it. Returns how many of the
     /// parent's messages the turn leaves unread, or its next work carries
     /// with no turn begun on them, which the stop drops, or null when nothing
-    /// runs (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
+    /// runs (`tests/tla/subagent/StopMessage.tla` NoSilentLoss). A turn that
+    /// has ended leaves its unread messages with the slot until the host
+    /// takes them, and the stop counts those too: the slot drops them, and
+    /// the host does not queue them (`handOverLeftovers`).
     pub fn stop(self: *Owner, child_id: []const u8) ?usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -613,9 +671,35 @@ pub const Owner = struct {
             // them any more (`StopMessage.tla` CountedNeverRead).
             const unstarted = slot.unstarted;
             slot.unstarted = 0;
-            return unstarted + if (slot.worker) |worker| worker.queuedParentSteering() else 0;
+            if (slot.worker) |worker| {
+                const unread = worker.queuedParentSteering();
+                slot.unread_counted = unread;
+                return unstarted + unread;
+            }
+            return unstarted + uncountedLeftovers(slot);
         }
         return null;
+    }
+
+    /// The host's end hook asks, before it queues the parent's messages the
+    /// ended turn never took, whether it may. It may not when a stop, a user
+    /// stop, a close, or a quit ended the work: `slotMain` drops them under
+    /// that rule before the hook runs, and a stop that lands after that has
+    /// counted them, so none may start a work. When it may, the host holds
+    /// them from now as waiting messages, which a stop counts there, and no
+    /// stop counts them again from the slot. Call with the host's admission
+    /// lock held, as a stop or close of the child does, so none lands between
+    /// the answer and the queueing.
+    pub fn handOverLeftovers(self: *Owner, child_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id) or slot.completion != .running) continue;
+            if (dropsLeftoversLocked(self, slot)) return false;
+            slot.leftovers_counted = slot.leftovers.items.len;
+            return true;
+        }
+        return true;
     }
 
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
@@ -986,6 +1070,16 @@ fn slotMain(slot: *Slot) void {
     while (true) {
         const outcome = runOne(slot);
         defer outcome.deinit(owner.alloc);
+        // A test can hold the slot here, with the turn's unread messages kept
+        // and the work not finished (src/core/subagent/end_test_controls.zig).
+        if (end_test_controls.runArmed()) {
+            const unread = blk: {
+                owner.mutex.lockUncancelable(io_mod.getIo());
+                defer owner.mutex.unlock(io_mod.getIo());
+                break :blk slot.leftovers.items.len;
+            };
+            if (unread > 0) end_test_controls.holdAfterRun(slot.child_id, unread);
+        }
         if (end_test_controls.armed()) {
             const stopped_by: ?[]const u8 = blk: {
                 owner.mutex.lockUncancelable(io_mod.getIo());
@@ -1004,10 +1098,11 @@ fn slotMain(slot: *Slot) void {
         const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
-        if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
-            dropLeftovers(owner.alloc, slot, "stopped");
-        }
+        if (dropsLeftoversLocked(owner, slot)) dropLeftovers(owner.alloc, slot, "stopped");
         owner.mutex.unlock(io_mod.getIo());
+        // A test can hold the slot here, with the work finished and the end
+        // hook not called.
+        end_test_controls.holdBeforeEndHook(slot.child_id);
         const next = if (owner.on_end) |hook| hook.end_fn(hook.context, .{
             .child_id = slot.child_id,
             .work_id = outcome.work_id,
@@ -1027,7 +1122,7 @@ fn slotMain(slot: *Slot) void {
             // Owner.start drops them. The hook armed it (`armNext`), so a stop
             // that came since is the next work's, and is not cleared here.
             owner.dropSettledFeedbackLocked(slot.child_id);
-            slot.metrics = .{};
+            slot.metrics.reset();
             owner.mutex.unlock(io_mod.getIo());
             continue;
         }
@@ -1052,6 +1147,15 @@ const OneOutcome = struct {
 
 fn runOne(slot: *Slot) OneOutcome {
     const owner = slot.owner;
+    // The work is over once this returns, whether its turn began or not. A
+    // work that failed before its worker attached still has the messages it
+    // carried counted as unbegun; the failure's report names them, and a stop
+    // from here on must not count them again.
+    defer {
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        slot.unstarted = 0;
+        owner.mutex.unlock(io_mod.getIo());
+    }
     var snapshot = loadRunSnapshot(owner, slot.child_id) catch |err| {
         debugFailure(slot.child_id, "run_snapshot", err);
         return fallbackOutcome(owner.alloc, "unknown", .failed);
@@ -1085,6 +1189,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.live_metrics = &slot.metrics;
     // The interactive app runs the turn on the child's own agent. Bound before
     // `slot.worker` is read, so cancel, steering, and approvals reach it.
+    if (start_test_controls.bindFails()) return failedOutcome(work_id, "hosted_agent", error.TestBindFailed);
     owner.services.bind(&turn, &slot.cancel) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
@@ -1357,12 +1462,34 @@ fn dropLeftovers(alloc: Allocator, slot: *Slot, reason: []const u8) void {
     for (slot.leftovers.items) |work| {
         debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ slot.child_id, work.id, reason });
     }
+    if (slot.leftovers.items.len > 0) {
+        debug_trace.eventf("mailbox", "leftovers_dropped", .{}, "child={s} count={d} counted={d} reason={s}", .{ slot.child_id, slot.leftovers.items.len, slot.leftovers_counted, reason });
+    }
     freeLeftovers(alloc, slot);
 }
 
 fn freeLeftovers(alloc: Allocator, slot: *Slot) void {
     for (slot.leftovers.items) |*work| work.deinit(alloc);
     slot.leftovers.clearAndFree(alloc);
+    slot.leftovers_counted = 0;
+}
+
+/// How many kept messages no stop or close has counted yet, which the one
+/// asking now counts. Call with the owner's lock held.
+fn uncountedLeftovers(slot: *Slot) usize {
+    const total = slot.leftovers.items.len;
+    const fresh = total - @min(total, slot.leftovers_counted);
+    slot.leftovers_counted = total;
+    return fresh;
+}
+
+/// The rule for the parent's messages an ended turn never took: a stop, a
+/// user stop, a close, or a quit that came before the host queued them drops
+/// them (`tests/tla/subagent/StopMessage.tla` NoSilentLoss and
+/// StopHoldsForQueued). Call with the owner's lock held.
+fn dropsLeftoversLocked(owner: *const Owner, slot: *const Slot) bool {
+    return slot.stopped_by_parent or slot.stopped_by_user or owner.closed or slot.shutdown.load(.seq_cst) or
+        owner.tree_closed or owner.quitting.load(.seq_cst);
 }
 
 fn detachWorker(slot: *Slot, active: *const child_state.ActiveWork) void {
@@ -1374,6 +1501,10 @@ fn detachWorker(slot: *Slot, active: *const child_state.ActiveWork) void {
         slot.route_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     }
     if (slot.worker) |worker| keepLeftovers(owner.alloc, slot, worker, active);
+    // A stop that counted the worker's unread messages counted the ones kept
+    // here, which are those same messages.
+    slot.leftovers_counted = @min(slot.leftovers.items.len, slot.unread_counted);
+    slot.unread_counted = 0;
     slot.worker = null;
     slot.hosted = false;
     slot.work_id = null;

@@ -1,38 +1,50 @@
-//! A test control for the end of a subagent's work that a stop ended. With
-//! `FX_TEST_SUBAGENT_END_HELD` and `FX_TEST_SUBAGENT_END_RELEASE` set, the
-//! slot of a work that its parent or the user stopped writes `<held>.<n>` for
-//! the n-th such end in the process, naming the child and who stopped it,
-//! then waits until `<release>` or `<release>.<n>` exists, for at most a
-//! minute, before it finishes the work. The stop has answered by then and the
-//! work still counts as running, so a test can send a message in that gap
-//! every time (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message right
-//! after a stop starts the subagent's next turn";
-//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! Test controls for the end of a subagent's work. Each holds the slot at one
+//! point of its end, through the file protocol in `file_hold.zig`, so a test
+//! can land a stop or close where it could not land before. Only those tests
+//! set the controls, so the libfx artifacts leave them out. An inline test
+//! sets a hook in place of the files.
 //!
-//! With `FX_TEST_SUBAGENT_NEXT_HELD` and `FX_TEST_SUBAGENT_NEXT_RELEASE` set,
-//! the slot of a work whose end hook has installed the child's next work
-//! writes `<held>.<n>` for the n-th such install in the process, naming the
-//! child, then waits until `<release>` or `<release>.<n>` exists, for at most
-//! a minute, before it takes that work up. The next work is in the log and
-//! has not begun, and a stop or close that lands now must take it, as one
-//! that lands before it is installed drops the message that made it. An
-//! inline test's hook is called after every end hook, with whether it
-//! installed a next work.
+//! - `FX_TEST_SUBAGENT_END_HELD` and `FX_TEST_SUBAGENT_END_RELEASE` hold the
+//!   slot of a work that its parent or the user stopped, before it finishes
+//!   the work. The stop has answered by then and the work still counts as
+//!   running, so a test can send a message in that gap every time
+//!   (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message right after a
+//!   stop starts the subagent's next turn";
+//!   `tests/tla/drivers/subagent/stop-message.test.ts`).
+//! - `FX_TEST_SUBAGENT_RUN_HELD` and `FX_TEST_SUBAGENT_RUN_RELEASE` hold the
+//!   slot of a work whose turn ended and left parent messages unread, which
+//!   the slot keeps for the host. The slot has not finished the work, so a
+//!   stop or close that lands now meets the kept messages.
+//! - `FX_TEST_SUBAGENT_NEXT_HELD` and `FX_TEST_SUBAGENT_NEXT_RELEASE` hold the
+//!   slot of a work whose end hook has installed the child's next work,
+//!   before it takes that work up. The next work is in the log and has not
+//!   begun, and a stop or close that lands now must take it, as one that
+//!   lands before it is installed drops the message that made it. An inline
+//!   test's hook is called after every end hook, with whether it installed a
+//!   next work.
+//!
+//! An inline test can also hold the slot between its finishing a work and
+//! calling the end hook (`test_hold_hook`), which has no file control.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const io_mod = @import("../shared/io.zig");
+const file_hold = @import("file_hold.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const max_hold_ms = 60_000;
-
-var holds = std.atomic.Value(u32).init(0);
-var next_holds = std.atomic.Value(u32).init(0);
+var stopped_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_END_HELD", .release_env = "FX_TEST_SUBAGENT_END_RELEASE" };
+var run_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_RUN_HELD", .release_env = "FX_TEST_SUBAGENT_RUN_RELEASE" };
+var next_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_NEXT_HELD", .release_env = "FX_TEST_SUBAGENT_NEXT_RELEASE" };
 
 /// Test builds only: an inline test sets it to hold a stopped work's end, in
 /// place of the file controls.
 pub var test_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Test builds only: an inline test sets it to hold the slot of a work whose
+/// turn ended with parent messages unread.
+pub var test_hold_run: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Test builds only: an inline test sets it to hold the slot of a work that
+/// is finished, before it calls the end hook.
+pub var test_hold_hook: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
 
 /// Test builds only: an inline test sets it to hold the slot of a work whose
 /// end hook has returned, `next` saying whether it installed the child's next
@@ -44,7 +56,7 @@ pub var test_hold_next: if (builtin.is_test) ?*const fn (child_id: []const u8, n
 pub fn armed() bool {
     if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold != null;
-    return io_mod.getenv("FX_TEST_SUBAGENT_END_HELD") != null and io_mod.getenv("FX_TEST_SUBAGENT_END_RELEASE") != null;
+    return stopped_hold.armed();
 }
 
 /// Called by the slot of `child_id` once a work that `by` stopped has ended,
@@ -55,28 +67,47 @@ pub fn holdStoppedEnd(child_id: []const u8, by: []const u8) void {
         if (test_hold) |hold| hold(child_id);
         return;
     }
-    const held = io_mod.getenv("FX_TEST_SUBAGENT_END_HELD") orelse return;
-    const release = io_mod.getenv("FX_TEST_SUBAGENT_END_RELEASE") orelse return;
-    const n = holds.fetchAdd(1, .seq_cst) + 1;
-    var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ held, n }) catch return;
-    var own_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "stopped_end child={s} by={s}", .{ child_id, by }) catch return;
-    writeMarker(marker, contents) catch return;
-    const deadline = io_mod.milliTimestamp() + max_hold_ms;
-    while (!pathExists(release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
-        io_mod.sleep(std.time.ns_per_ms);
+    stopped_hold.wait(contents, null);
+}
+
+/// Whether a work's end may be held where its turn left messages unread, so
+/// the slot looks at its kept messages only when a test asked.
+pub fn runArmed() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_hold_run != null;
+    return run_hold.armed();
+}
+
+/// Called by the slot of `child_id` once its turn ended and left `unread`
+/// parent messages that the slot kept, before the slot finishes the work.
+pub fn holdAfterRun(child_id: []const u8, unread: usize) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_run) |hold| hold(child_id);
+        return;
+    }
+    var contents_buf: [256]u8 = undefined;
+    const contents = std.mem.print(&contents_buf, "ended_with_unread child={s} unread={d}", .{ child_id, unread }) catch return;
+    run_hold.wait(contents, null);
+}
+
+/// Called by the slot of `child_id` once the work is finished, before the end
+/// hook runs. An inline test's hook only.
+pub fn holdBeforeEndHook(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_hook) |hold| hold(child_id);
     }
 }
 
-/// Whether the next work's install may be held, so the slot checks only when
-/// a test asked.
+/// Whether the slot may be held after a work's end hook, so it checks only
+/// when a test asked.
 pub fn nextArmed() bool {
     if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold_next != null;
-    return io_mod.getenv("FX_TEST_SUBAGENT_NEXT_HELD") != null and io_mod.getenv("FX_TEST_SUBAGENT_NEXT_RELEASE") != null;
+    return next_hold.armed();
 }
 
 /// Called by the slot of `child_id` once its end hook has returned, before
@@ -89,35 +120,9 @@ pub fn holdAfterEndHook(child_id: []const u8, next: bool) void {
         return;
     }
     if (!next) return;
-    const held = io_mod.getenv("FX_TEST_SUBAGENT_NEXT_HELD") orelse return;
-    const release = io_mod.getenv("FX_TEST_SUBAGENT_NEXT_RELEASE") orelse return;
-    const n = next_holds.fetchAdd(1, .seq_cst) + 1;
-    var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ held, n }) catch return;
-    var own_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "installed_next child={s}", .{child_id}) catch return;
-    writeMarker(marker, contents) catch return;
-    const deadline = io_mod.milliTimestamp() + max_hold_ms;
-    while (!pathExists(release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-}
-
-fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
-}
-
-fn pathExists(path: []const u8) bool {
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    return true;
+    next_hold.wait(contents, null);
 }
 
 test "a test build holds a stopped work's end only through its hook" {
@@ -125,11 +130,15 @@ test "a test build holds a stopped work's end only through its hook" {
     // controls are never read.
     try std.testing.expect(!armed());
     holdStoppedEnd("child", "parent");
-    try std.testing.expectEqual(@as(u32, 0), holds.load(.seq_cst));
+    try std.testing.expectEqual(@as(u32, 0), stopped_hold.count.load(.seq_cst));
 }
 
-test "a test build holds the install of a next work only through its hook" {
+test "a test build holds a work's end around its hook only through hooks" {
+    try std.testing.expect(!runArmed());
     try std.testing.expect(!nextArmed());
+    holdAfterRun("child", 1);
+    holdBeforeEndHook("child");
     holdAfterEndHook("child", true);
-    try std.testing.expectEqual(@as(u32, 0), next_holds.load(.seq_cst));
+    try std.testing.expectEqual(@as(u32, 0), run_hold.count.load(.seq_cst));
+    try std.testing.expectEqual(@as(u32, 0), next_hold.count.load(.seq_cst));
 }

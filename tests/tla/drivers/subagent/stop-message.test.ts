@@ -5,7 +5,9 @@
 // closed work through FX_TEST_SUBAGENT_END_HELD until the walk lets it go,
 // holds each next work the end hook installed through
 // FX_TEST_SUBAGENT_NEXT_HELD, where an `install` action keeps it for a stop
-// or close of the walk, and has TLC check that what fx answered is a behavior
+// or close of the walk, holds the slot of a turn that ended with unread
+// messages through FX_TEST_SUBAGENT_RUN_HELD, where a `fail` action keeps it
+// for a stop or close, and has TLC check that what fx answered is a behavior
 // of the model
 // (StopMessageTrace.tla). The driver acts for a subagent only after main's
 // step has run and every answer is in, so each walk is one ordered sequence
@@ -37,7 +39,7 @@ type Op = "send" | "stop" | "close";
 type Msg = [string, number];
 type Call = { op: Op; sub: string; msg: Msg | null; id: string };
 type Planned = { op: Op; sub: string };
-type Action = { main: Planned[] } | { finish: string } | { end: string } | { begin: string } | { install: string };
+type Action = { main: Planned[] } | { finish: string } | { end: string } | { begin: string } | { install: string } | { fail: string } | { hook: string };
 // holdStarts keeps a new turn's start held until a message reaches it, a
 // begin action, or the end of the walk; otherwise each start is let go as
 // soon as main's step has answered.
@@ -81,6 +83,12 @@ const begin = (sub: string): Action => ({ begin: sub });
 // next work, which the slot is held at, so the next call lands before its
 // turn begins.
 const install = (sub: string): Action => ({ install: sub });
+// The running turn fails on its next model request without reading the messages
+// that joined it: its slot keeps them and is held before it finishes the work,
+// so the next call lands while the subagent is "ended".
+const fail = (sub: string): Action => ({ fail: sub });
+// The held slot goes on: its end hook queues the kept messages as the next work.
+const hook = (sub: string): Action => ({ hook: sub });
 
 // The named edge cases.
 const WALKS: Walk[] = [
@@ -112,6 +120,14 @@ const WALKS: Walk[] = [
   { name: "stop-between-works", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1")), install("s1"), main(stop("s1")), end("s1")] },
   { name: "stop-between-works-two-messages", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1"), send("s1")), install("s1"), main(stop("s1")), end("s1")] },
   { name: "close-between-works", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1")), install("s1"), main(close("s1")), end("s1")] },
+  // A turn that ends without reading what joined it leaves those messages with
+  // its slot until the end hook queues them. A stop or close that lands then
+  // counts and drops them; a message after the stop starts the next work; with
+  // no stop they run as the next work.
+  { name: "stop-after-failed-turn", subs: ["s1"], actions: [main(send("s1")), main(send("s1")), fail("s1"), main(stop("s1")), end("s1")] },
+  { name: "close-after-failed-turn", subs: ["s1"], actions: [main(send("s1")), main(send("s1")), fail("s1"), main(close("s1")), end("s1")] },
+  { name: "message-after-stop-of-failed-turn", subs: ["s1"], actions: [main(send("s1")), main(send("s1")), fail("s1"), main(stop("s1")), main(send("s1")), end("s1"), finish("s1")] },
+  { name: "failed-turn-messages-run", subs: ["s1"], actions: [main(send("s1")), main(send("s1")), fail("s1"), hook("s1"), finish("s1")] },
   // A new subagent's start names the idle ones, and only those.
   { name: "start-beside-idle", subs: ["s1", "s2"], actions: [main(send("s1")), finish("s1"), main(send("s2")), finish("s2")] },
   { name: "start-beside-working", subs: ["s1", "s2"], actions: [main(send("s1")), main(send("s2")), finish("s1"), finish("s2")] },
@@ -322,6 +338,13 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const nextReleased = new Set<number>();
   // Subagents whose slot is held with its next work installed, by the hold.
   const installed = new Map<string, number>();
+  // Subagents whose turn failed with unread messages, and the slot hold each
+  // is at; and the messages each slot kept.
+  const endedHolds = new Map<string, number>();
+  const keptTokens = new Map<string, string[]>();
+  const runMarker = join(root, "run-held");
+  const runRelease = join(root, "run-release");
+  const runReleased = new Set<number>();
   // Set while main's step runs; a background release stops once it is false.
   let stepRunning = false;
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -465,6 +488,34 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     }
     return held.sort((a, b) => a - b)[0];
   };
+  // The first held run end of `sub` the walk has not released: its turn ended
+  // with unread messages.
+  const heldRun = (sub: string): number | undefined => {
+    const ids = childIds(sub);
+    const held: number[] = [];
+    for (const name of readdirSync(root)) {
+      const match = /^run-held\.(\d+)$/.exec(name);
+      if (!match || runReleased.has(Number(match[1]))) continue;
+      const child = /child=(\S+)/.exec(readFileSync(join(root, name), "utf8"))?.[1];
+      if (child && ids.has(child)) held.push(Number(match[1]));
+    }
+    return held.sort((a, b) => a - b)[0];
+  };
+  const releaseRun = (sub: string) => {
+    const n = endedHolds.get(sub);
+    if (n === undefined) return;
+    endedHolds.delete(sub);
+    runReleased.add(n);
+    writeFileSync(`${runRelease}.${n}`, "");
+  };
+  // A stopped turn that left a message unread is held too, where the walk
+  // has no action for it: it goes on as soon as it is there.
+  const releaseOtherRuns = (sub: string) => {
+    for (let n = heldRun(sub); n !== undefined; n = heldRun(sub)) {
+      runReleased.add(n);
+      writeFileSync(`${runRelease}.${n}`, "");
+    }
+  };
   const releaseNext = (n: number) => {
     nextReleased.add(n);
     writeFileSync(`${nextRelease}.${n}`, "");
@@ -545,10 +596,17 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   // stop or close of the walk to land before the turn begins.
   const endAction = async (sub: string, keep = false) => {
     if (!ending.has(sub)) return;
+    // A turn that ended with unread messages is held before its work finishes:
+    // the stop that came while it was held has set its flags, so the slot goes
+    // on to the stopped end.
+    releaseRun(sub);
     const before = finishedCount(sub);
     const endsBefore = endsLogged(sub).length;
     const reportsBefore = reportsQueued(sub);
-    const n = await poll(() => heldEnd(sub), 15_000);
+    const n = await poll(() => {
+      releaseOtherRuns(sub);
+      return heldEnd(sub);
+    }, 15_000);
     if (n === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never reached its end`);
     released.add(n);
     writeFileSync(`${release}.${n}`, "");
@@ -579,6 +637,53 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     push({ op: "begin", sub, msgs: msgs.map(parseToken) });
     const tokens = await nextArrival(sub);
     for (const t of msgs) {
+      if (!tokens.includes(t)) throw new Error(`${walk.name}: ${sub}'s next turn did not take ${t}`);
+      readTokens.add(t);
+    }
+  };
+  // The running turn of `sub` fails on its next model request without reading
+  // the messages that joined it. Its slot keeps them and is held, with the work
+  // not finished, until a stop or close of the walk, or `hook`, lets it go.
+  const failAction = async (sub: string) => {
+    if (starting.has(sub)) {
+      await beginAction(sub);
+      await readFirst(sub);
+    }
+    if (!running.has(sub) || ending.has(sub) || unread.get(sub)!.size === 0) throw new Error(`${walk.name}: ${sub} has no running turn with a message to leave unread`);
+    const resolve = await poll(() => held.get(sub), 15_000);
+    if (!resolve) throw new Error(`${walk.name}: ${sub}'s running turn sent no model request`);
+    held.delete(sub);
+    keptTokens.set(sub, [...unread.get(sub)!]);
+    resolve(new Response(JSON.stringify({ error: { message: "WALKFAIL" } }), { status: 400, headers: { "content-type": "application/json" } }));
+    const n = await poll(() => heldRun(sub), 15_000);
+    if (n === undefined) throw new Error(`${walk.name}: ${sub}'s failed turn never reached its end`);
+    endedHolds.set(sub, n);
+    running.delete(sub);
+    unread.get(sub)!.clear();
+    push({ op: "fail", sub });
+  };
+  // The slot of `sub`'s failed turn goes on: its end hook reports the failure
+  // and queues the kept messages as the next work, which begins and reads them.
+  const hookAction = async (sub: string) => {
+    if (!endedHolds.has(sub)) return;
+    const kept = keptTokens.get(sub) ?? [];
+    const endsBefore = endsLogged(sub).length;
+    const reportsBefore = reportsQueued(sub);
+    releaseRun(sub);
+    const ended = await poll(() => (endsLogged(sub).length > endsBefore ? endsLogged(sub)[endsBefore] : undefined), 15_000);
+    if (ended === undefined) throw new Error(`${walk.name}: ${sub}'s end hook never ran`);
+    if (ended.owes && (await poll(() => reportsQueued(sub) > reportsBefore, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s failed work owed a report that was never queued`);
+    push({ op: "hook", sub, note: ended.owes ? reportNote(sub) : "none" });
+    starting.add(sub);
+    const next = await poll(() => heldNext(sub), 15_000);
+    if (next === undefined) throw new Error(`${walk.name}: ${sub}'s end hook installed no next work`);
+    push({ op: "rearm", sub });
+    releaseNext(next);
+    await releaseStart(sub);
+    running.add(sub);
+    push({ op: "begin", sub, msgs: kept.map(parseToken) });
+    const tokens = await nextArrival(sub);
+    for (const t of kept) {
       if (!tokens.includes(t)) throw new Error(`${walk.name}: ${sub}'s next turn did not take ${t}`);
       readTokens.add(t);
     }
@@ -668,7 +773,8 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const settle = async () => {
     for (const s of walk.subs) {
       for (let guard = 0; guard < 20; guard += 1) {
-        if (ending.has(s)) await endAction(s);
+        if (endedHolds.has(s) && !ending.has(s)) await hookAction(s);
+        else if (ending.has(s)) await endAction(s);
         else if (starting.has(s) || running.has(s)) await finishAction(s);
         else break;
       }
@@ -678,6 +784,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     writeFileSync(release, "");
     writeFileSync(startRelease, "");
     writeFileSync(nextRelease, "");
+    writeFileSync(runRelease, "");
     for (const [s, resolve] of held) {
       held.delete(s);
       resolve(final(`WALKDONE ${s}`));
@@ -722,6 +829,8 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
         }
         if ("finish" in action) await finishAction(action.finish);
         else if ("install" in action) await endAction(action.install, true);
+        else if ("fail" in action) await failAction(action.fail);
+        else if ("hook" in action) await hookAction(action.hook);
         else if ("begin" in action) {
           await beginAction(action.begin);
           await readFirst(action.begin);
@@ -772,6 +881,8 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
       FX_TEST_SUBAGENT_START_RELEASE: startRelease,
       FX_TEST_SUBAGENT_NEXT_HELD: nextMarker,
       FX_TEST_SUBAGENT_NEXT_RELEASE: nextRelease,
+      FX_TEST_SUBAGENT_RUN_HELD: runMarker,
+      FX_TEST_SUBAGENT_RUN_RELEASE: runRelease,
     }),
     stdin: "ignore",
     stdout: "pipe",
@@ -917,6 +1028,12 @@ test("the trace check rejects planted changes to a walk", async () => {
   expect(await checkTrace(base("stop-between-works"), subs, join(dir, "kept-between"))).toBe("ACCEPTED");
   planted["between-uncounted"] = base("stop-between-works").map((o) => o.op === "stop" && o.count > 0 ? { ...o, count: 0 } : o);
   planted["between-close-uncounted"] = base("close-between-works").map((o) => o.op === "close" && o.count > 0 ? { ...o, count: 0 } : o);
+  // A stop or close that landed after a turn ended with a message unread was
+  // answered with nothing counted, as fx did before the slot's kept messages
+  // counted: the slot dropped them unannounced, or the hook ran them.
+  expect(await checkTrace(base("stop-after-failed-turn"), subs, join(dir, "kept-failed"))).toBe("ACCEPTED");
+  planted["failed-uncounted"] = base("stop-after-failed-turn").map((o) => o.op === "stop" && o.count > 0 ? { ...o, count: 0 } : o);
+  planted["failed-close-uncounted"] = base("close-after-failed-turn").map((o) => o.op === "close" && o.count > 0 ? { ...o, count: 0 } : o);
   for (const [name, observations] of Object.entries(planted)) {
     expect(`${name}: ${await checkTrace(observations, subs, join(dir, name))}`).toBe(`${name}: REJECTED`);
   }

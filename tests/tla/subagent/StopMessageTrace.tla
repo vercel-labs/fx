@@ -19,9 +19,14 @@
 (*             read the messages `msgs` that made it, if any did;          *)
 (*   "read"    subagent `sub`'s running turn read the messages `msgs`;     *)
 (*   "finish"  its turn ended with nothing more to read;                  *)
+(*   "fail"    its turn ended without reading the messages that joined   *)
+(*             it, and its slot kept them: the driver holds the slot     *)
+(*             there (FX_TEST_SUBAGENT_RUN_HELD);                         *)
+(*   "hook"    the end hook of that turn queued the kept messages as its  *)
+(*             next work, to begin after a "rearm";                       *)
 (*   "end"     its stopped or closed work ended, and the waiting messages  *)
 (*             became its next work, to begin after a "rearm".            *)
-(* A finish or end carries `note`, what fx told main of it: "none" when it *)
+(* A finish, hook or end carries `note`, what fx told main of it: "none" when it *)
 (* queued no report, "idle" when its report said the subagent is idle,    *)
 (* "plain" otherwise. A send carries `named`, the idle subagents its       *)
 (* answer named, and `more`, how many it counted past them.                *)
@@ -79,6 +84,11 @@ Observable(o) ==
   \/ /\ o.op = "finish"
      /\ Finish(o.sub)
      /\ read' \ read = o.msgs
+     /\ note' = o.note
+  \/ /\ o.op = "fail"
+     /\ Fail(o.sub)
+  \/ /\ o.op = "hook"
+     /\ Hook(o.sub)
      /\ note' = o.note
   \/ /\ o.op = "end"
      /\ EndStopped(o.sub)

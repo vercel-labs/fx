@@ -21,6 +21,7 @@ import { basename, join } from "node:path";
 import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks } from "./tui-render-assertions";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySerializedToolCall,
@@ -5521,6 +5522,133 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resuming from the picker keeps a transcript whose newest compaction followed its last turn",
+  async () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "fx-tui-resume-picker-compacted-")),
+    );
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    // Taller than the window, so the resume leaves the start of the answer in
+    // terminal history and its end on screen.
+    const rows = Array.from(
+      { length: 60 },
+      (_, index) => `PICKER_COMPACTED_ROW_${String(index + 1).padStart(2, "0")}`,
+    );
+    const tail = "PICKER_COMPACTED_TAIL";
+    const summary =
+      "Facts:\nF1: PICKER_COMPACTED_SUMMARY: the user asked for a long answer.";
+    // Two short turns give /compact older turns to summarize.
+    const shortAnswers = ["PICKER_COMPACTED_FIRST", "PICKER_COMPACTED_SECOND"];
+    let turns = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      // The compactor asks for its summary with no tools.
+      const request = JSON.parse(body) as {
+        toolChoice?: { type?: string };
+        tools?: unknown[];
+      };
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        return fakeGatewayFinalText(summary);
+      }
+      turns += 1;
+      return fakeGatewayFinalText(
+        shortAnswers[turns - 1] ?? `${rows.join("\n\n")}\n\n${tail}`,
+      );
+    });
+    let active: TmuxSession | null = null;
+    let passed = false;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      for (const [index, answer] of shortAnswers.entries()) {
+        await active.sendText(`Give short answer ${index + 1}.`);
+        await active.waitForText(answer, TIMEOUT);
+        await active.waitForComposer(TIMEOUT);
+      }
+      await active.sendText("Write a long answer before the compaction.");
+      await active.waitForText(tail, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const sessionId = sessionIdFromHome(home);
+      // With no turn after the compaction, a resume shows the cycle before
+      // it, and the transcript window lets those entries go as they scroll
+      // off.
+      await active.sendText("/compact");
+      await waitForCondition(
+        () => logLines(home, sessionId).some((line: any) => line.kind === "compacted"),
+        "the saved compaction",
+      );
+      await active.waitForPane(
+        (pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane),
+        TIMEOUT,
+      );
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} -r`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForPane(
+        (pane) => pane.includes("Sessions 1") && pane.includes("enter resume"),
+        TIMEOUT,
+      );
+      await active.sendKeys("Enter");
+      await waitForSessionPickerClosed(active);
+      // A typed character draws a later frame than the resume's own, so the
+      // pane below shows what the resume left on screen.
+      await active.sendLiteral("x");
+      const pane = stripAnsi(
+        await active.waitForPane((value) => composerContains(stripAnsi(value), "x"), TIMEOUT),
+      );
+      expect(pane).toContain(rows.at(-1)!);
+      expect(pane).toContain(tail);
+      const scrollback = stripAnsi(await active.captureFullScrollback());
+      for (const row of [...rows, tail]) {
+        expect(countOccurrences(scrollback, row)).toBe(1);
+      }
+      expect(sessionIdFromHome(home)).toBe(sessionId);
+      await active.sendKeys("BSpace");
+      await active.waitForPane((value) => hasEmptyComposer(stripAnsi(value)), TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      if (passed) {
+        rmSync(root, { recursive: true, force: true });
+      } else {
+        console.error(`retained picker compaction artifacts at ${root}`);
+      }
+    }
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(

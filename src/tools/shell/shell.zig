@@ -1601,7 +1601,7 @@ fn publishSnapshotMetadata(
         .completed => |value| value,
         .stopped => |value| value,
         .lost => .indeterminate,
-        .running => return,
+        .running => return publishQuietCrossing(ctx, snapshot),
     };
     const projection: command_contract.StatusProjection = if (status) |value|
         command_contract.projectStatus(value)
@@ -1668,6 +1668,22 @@ fn publishSnapshotMetadata(
     if (ctx.tool_result_memory_sink != null) {
         tool_dispatch.reportToolResultMemory(ctx, memory);
     }
+}
+
+/// A running result carries metadata only when its wait ended at the quiet
+/// crossing: the command and its quiet time, for the note fx relays to a
+/// subagent's parent (`noteChildQuiet` in `src/core/subagent/tool_host.zig`).
+fn publishQuietCrossing(
+    ctx: tool_dispatch.DispatchContext,
+    snapshot: managed_execution.Snapshot,
+) !void {
+    if (!snapshot.quiet_crossed or ctx.tool_result_memory_sink == null) return;
+    const command = try ctx.allocator.dupe(u8, snapshot.command);
+    debug_trace.eventf("shell", "quiet_crossing", .{}, "session={s} quiet_ms={d}", .{ snapshot.execution_id, snapshot.quiet_ms orelse 0 });
+    tool_dispatch.reportToolResultMemory(ctx, .{ .quiet_crossing = .{
+        .command = command,
+        .quiet_ms = snapshot.quiet_ms orelse 0,
+    } });
 }
 
 fn handoffPreparedDelivery(
@@ -2721,6 +2737,39 @@ test "stopped execution is a successful shell observation without command failur
             .output_truncated = false,
         });
         try std.testing.expect(memory != null);
+        try std.testing.expect(memory.?.command_process_presentation == null);
+    }
+}
+
+test "only a running result that ended its wait at the quiet crossing carries the crossing" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |crossed| {
+        var memory: ?types.ToolResultMemory = null;
+        try publishSnapshotMetadata(.{
+            .allocator = alloc,
+            .tool_result_memory_sink = &memory,
+        }, .{
+            .execution_id = @constCast("shell-quiet"),
+            .command = @constCast("node verify.mjs --mock"),
+            .cwd = @constCast("/tmp"),
+            .retained = true,
+            .state = .running,
+            .output_delta = @constCast(""),
+            .output_truncated = false,
+            .running_ms = 130_000,
+            .quiet_ms = 125_000,
+            .quiet_notice = true,
+            // A later wait in the same spell gets the notice without crossing.
+            .quiet_crossed = crossed,
+        });
+        if (!crossed) {
+            try std.testing.expect(memory == null);
+            continue;
+        }
+        defer types.freeToolResultMemory(alloc, memory.?);
+        const crossing = memory.?.quiet_crossing.?;
+        try std.testing.expectEqualStrings("node verify.mjs --mock", crossing.command);
+        try std.testing.expectEqual(@as(u64, 125_000), crossing.quiet_ms);
         try std.testing.expect(memory.?.command_process_presentation == null);
     }
 }
