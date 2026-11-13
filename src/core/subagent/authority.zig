@@ -283,8 +283,8 @@ pub const ProfileCache = struct {
     /// Builds into `held` the profile `saved` describes for `name`. Its prompt
     /// is not saved: it is read again by name from the folder of the saved
     /// source alone, the fx home for a profile of the user's own and the
-    /// folder fx runs in for a repository's, so a profile of the same name in
-    /// the other can neither take the prompt away nor supply its own.
+    /// session's workspace root for a repository's, so a profile of the same
+    /// name in the other can neither take the prompt away nor supply its own.
     /// Without the file there, or for a built-in profile, the child has no
     /// profile prompt.
     fn restore(
