@@ -1323,7 +1323,12 @@ pub fn Handlers(comptime App: type) type {
             try writeCreditsNotice(app, snapshot);
         }
 
-        fn startCreditsLookup(app: *App) !void {
+        const CreditsLookupArgs = struct {
+            input: gateway_provider.CreditsLookupInput,
+            renewal: ?credits_lookup.Renewal,
+        };
+
+        fn creditsLookupArgs(app: *App) CreditsLookupArgs {
             // A due token still names the session; the task renews it before
             // asking for credits.
             const queued = app.auth.queuedPromptCredential();
@@ -1335,12 +1340,19 @@ pub fn Handlers(comptime App: type) type {
                     null
             else
                 null;
-            const input: gateway_provider.CreditsLookupInput = .{
-                .credential = if (queued) |credential| credential.api_key else null,
-                .credential_source = source,
-                .tenant = if (queued) |credential| credential.gateway_team else null,
+            return .{
+                .input = .{
+                    .credential = if (queued) |credential| credential.api_key else null,
+                    .credential_source = source,
+                    .tenant = if (queued) |credential| credential.gateway_team else null,
+                },
+                .renewal = renewal,
             };
-            const started = app.credits_lookup.start(app.creditsProvider(), input, renewal) catch |err| {
+        }
+
+        fn startCreditsLookup(app: *App) !void {
+            const args = creditsLookupArgs(app);
+            const started = app.credits_lookup.start(app.creditsProvider(), args.input, args.renewal) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
                 return app.writeDomainNotice(.{
@@ -1366,7 +1378,101 @@ pub fn Handlers(comptime App: type) type {
             var result = app.credits_lookup.take() orelse return;
             defer result.deinit();
             if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
-            try writeCreditsNotice(app, result.snapshot);
+            if (result.quiet) {
+                observeTokenPass(app, result.snapshot);
+            } else {
+                try writeCreditsNotice(app, result.snapshot);
+            }
+            if (comptime @hasField(App, "model_cache")) {
+                const state = &app.model_cache.token_pass_default;
+                if (app.model_cache.tokenPassStatus() == .active) {
+                    if (state.* != .settled) state.* = .pending;
+                } else if (state.* == .checking) {
+                    state.* = .settled;
+                }
+            }
+        }
+
+        /// Records what a credits reply says about Token Pass.
+        fn observeTokenPass(app: *App, snapshot: output_contracts.CreditsSnapshot) void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (snapshot.err_message != null) return;
+            if (snapshot.token_pass != null) {
+                app.model_cache.observeTokenPassCredit();
+            } else if (snapshot.no_token_pass) {
+                app.model_cache.observeNoTokenPass("credits");
+            }
+        }
+
+        /// Asks once per credential, in the background, whether the team has
+        /// Token Pass, when the answer could change the model. Call it after
+        /// the model catalog loads, when the credential is ready.
+        pub fn startTokenPassDefaultCheck(app: *App) !void {
+            if (comptime !@hasField(App, "credits_lookup") or !@hasField(App, "model_cache") or @import("builtin").single_threaded) return;
+            if (app.model_cache.token_pass_default != .unchecked) return;
+            if (!usesBuiltInModelDefault(app)) {
+                app.model_cache.token_pass_default = .settled;
+                return;
+            }
+            if (app.model_cache.tokenPassStatus() == .active) {
+                app.model_cache.token_pass_default = .pending;
+                return;
+            }
+            const args = creditsLookupArgs(app);
+            const started = app.credits_lookup.startQuiet(app.creditsProvider(), args.input, args.renewal) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("credits", "token pass check start failed err={s}", .{@errorName(err)});
+                app.model_cache.token_pass_default = .settled;
+                return;
+            };
+            // A /credits lookup already running answers the same question.
+            app.model_cache.token_pass_default = .checking;
+            if (started == .busy) debug_trace.logf("credits", "token pass check joined running lookup", .{});
+        }
+
+        /// Moves the main agent to the Token Pass default model once the
+        /// team is known to have Token Pass and the agent is idle. The
+        /// choice lasts for this run and is not saved, so the user still has
+        /// no chosen model.
+        pub fn applyTokenPassDefault(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (app.model_cache.token_pass_default != .pending) return;
+            if (comptime agents.hasAgentField(App, "stream") and agents.hasAgentField(App, "worker")) {
+                if (app.main_agent.stream.active or app.main_agent.worker.queuedPromptCount() > 0) return;
+            }
+            app.model_cache.token_pass_default = .settled;
+            if (!usesBuiltInModelDefault(app)) return;
+            if (std.ascii.eqlIgnoreCase(provider_runtime.modelOf(app, &app.main_agent), token_pass.pass_default_model)) return;
+            try provider_runtime.replaceModel(app, token_pass.pass_default_model);
+            if (comptime agents.hasAgentField(App, "worker")) {
+                try app.main_agent.worker.syncQueuedPromptModel(std.heap.c_allocator, provider_runtime.modelOf(app, &app.main_agent));
+            }
+            app_session_runtime.Runtime(App).syncTerminalTitle(app, &app.main_agent);
+            debug_trace.logf("credits", "token pass default model applied model={s}", .{token_pass.pass_default_model});
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .neutral,
+                .body = token_pass.default_model_notice,
+            }, true);
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Whether the main agent on screen runs AI Gateway's built-in
+        /// default: no saved Gateway model, and no `--model`, `--provider`,
+        /// or `FX_MODEL` for this run.
+        fn usesBuiltInModelDefault(app: *App) bool {
+            if (provider_runtime.providerOf(app, &app.main_agent) != .gateway) return false;
+            if (comptime @hasField(App, "screen_owner")) {
+                if (agents.screenAgentOf(app) != &app.main_agent) return false;
+            }
+            if (config_runtime.modelEnvOverride() != null) return false;
+            if (provider_runtime.runsProcessModel(app, &app.main_agent)) return false;
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                debug_trace.logf("credits", "token pass default skipped reason=settings err={s}", .{@errorName(err)});
+                return false;
+            };
+            defer settings.deinit(app.alloc);
+            return settings.models.get(.gateway) == null;
         }
 
         fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {
@@ -1384,21 +1490,17 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
+            observeTokenPass(app, snapshot);
             if (comptime @hasField(App, "model_cache")) {
-                if (snapshot.err_message == null) {
-                    if (snapshot.token_pass != null) {
-                        app.model_cache.observeTokenPassCredit();
-                    } else if (snapshot.no_token_pass) {
-                        app.model_cache.observeNoTokenPass("credits");
-                    } else if (app.model_cache.tokenPassStatus() == .active) {
-                        // The team uses Token Pass, but this reply does not
-                        // mention Token Pass: point at the tab that has it.
-                        try app.writeDomainNotice(.{
-                            .topic = "credits",
-                            .tone = .neutral,
-                            .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
-                        }, true);
-                    }
+                const mentions_token_pass = snapshot.token_pass != null or snapshot.no_token_pass;
+                if (snapshot.err_message == null and !mentions_token_pass and app.model_cache.tokenPassStatus() == .active) {
+                    // The team uses Token Pass, but this reply does not
+                    // mention Token Pass: point at the tab that has it.
+                    try app.writeDomainNotice(.{
+                        .topic = "credits",
+                        .tone = .neutral,
+                        .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
+                    }, true);
                 }
             }
         }

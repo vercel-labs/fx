@@ -42,6 +42,9 @@ pub const SemanticNotice = struct {
     tone: NoticeTone,
     body: []const u8,
     visibility: NoticeVisibility = .compact_and_full,
+    /// An optional dim line under the body, indented like a wrapped body row
+    /// and without its own glyph.
+    detail: []const u8 = "",
 };
 
 /// Status glyph leading every semantic notice, keyed by tone. Tool activity
@@ -59,22 +62,26 @@ pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     };
 }
 
-/// Returns a duplicate with owned topic and body bytes. The caller frees it
+/// Returns a duplicate with owned topic, body, and detail bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
     const topic = try alloc.dupe(u8, notice.topic);
     errdefer alloc.free(topic);
+    const body = try alloc.dupe(u8, notice.body);
+    errdefer alloc.free(body);
     return .{
         .topic = topic,
         .tone = notice.tone,
-        .body = try alloc.dupe(u8, notice.body),
+        .body = body,
         .visibility = notice.visibility,
+        .detail = try alloc.dupe(u8, notice.detail),
     };
 }
 
 pub fn freeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) void {
     alloc.free(notice.topic);
     alloc.free(notice.body);
+    alloc.free(notice.detail);
 }
 
 /// Converts legacy context-notice text into a semantic notice body while

@@ -392,6 +392,18 @@ fn modelMenuDisplayIndex(
 /// can name both the provider and the model, and on the model's own name
 /// after the last `/`, so typing that name exactly lists it first:
 /// `gpt-4o` finds `openai/gpt-4o` before `openai/gpt-4o-mini`.
+pub const TokenPassDefault = enum {
+    /// fx has not asked whether this team has Token Pass.
+    unchecked,
+    /// A quiet credits lookup is asking.
+    checking,
+    /// The team has Token Pass; fx moves to its default model once the main
+    /// agent is idle.
+    pending,
+    /// Nothing more to do for this credential.
+    settled,
+};
+
 pub fn modelIdMatch(query: []const u8, id: []const u8) ?fuzzy_match.Match {
     const slash = std.mem.findScalarLast(u8, id, '/') orelse return fuzzy_match.match(query, &.{.{ .text = id }});
     return fuzzy_match.match(query, &.{ .{ .text = id }, .{ .text = id[slash + 1 ..] } });
@@ -497,6 +509,9 @@ pub const Runtime = struct {
     /// both belong to one credential and team. Main thread only, so the
     /// mutex does not guard it.
     token_pass: token_pass_mod.Tracker = .{},
+    /// How far fx got moving a user with no chosen model to the Token Pass
+    /// default for this credential. Resets with `token_pass`.
+    token_pass_default: TokenPassDefault = .unchecked,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -695,6 +710,7 @@ pub const Runtime = struct {
             debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
         }
         self.token_pass = .{};
+        self.token_pass_default = .unchecked;
     }
 
     /// Records the provider that served one of this credential's requests.

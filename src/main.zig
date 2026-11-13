@@ -3273,6 +3273,7 @@ const App = struct {
 
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+            try app_commands.Handlers(App).startTokenPassDefaultCheck(self);
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
@@ -3286,6 +3287,7 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         try app_commands.Handlers(App).collectCreditsFacts(self);
+        try app_commands.Handlers(App).applyTokenPassDefault(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self, self.screenAgent());
             try AuthAppRuntime.collectSourceInventoryFacts(self, self.screenAgent());
