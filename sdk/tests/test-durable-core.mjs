@@ -3911,6 +3911,33 @@ if (durabilityKind === "queue") {
   });
 }
 
+if (durabilityKind === "world") {
+  test("Workflow replay reaches the app World's real in-process queue handler", async () => {
+    const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-local-replay-"));
+    dirs.push(dir);
+    const durability = await appWorldAt(dir);
+    const stored = durability.world();
+    const agent = createAgent({ durability });
+    try {
+      const original = agent.session();
+      await original.prompt("local-replay", { messageId: "first" }).result;
+      const source = await stored.runs.get(original.id, { resolveData: "all" });
+      await cancelRun(stored, original.id);
+      const replayed = await recreateRunFromExisting(stored, original.id, { specVersion: source.specVersion });
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(replayed);
+      const ended = async () => (await log.read()).some(({ entry }) => entry.k === "record" && entry.marks?.some((mark) => mark.end));
+      const deadline = Date.now() + 15_000;
+      while (!await ended() && Date.now() < deadline) await sleep(20);
+      assert.equal(await ended(), true, "the app World's queue delivered the Workflow replay");
+      const lines = await readLines(agent.session(replayed).stream(0), 5);
+      assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join("").trim(), "local-replay-0 local-replay-1 local-replay-2");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
 if (durabilityKind === "queue") {
   test("Workflow replay rejects a descriptor for another store, agent, or source before opening a harness", async () => {
     const { workflowCodec } = await import("../durable/workflow.mjs");
@@ -3987,7 +4014,7 @@ if (durabilityKind === "queue") {
         assert.deepEqual(seen.at(-1), input, "the first saved prompt's image bytes reached the harness");
         const log = await internals.openLog(replayed);
         const inputs = (await log.read()).filter(({ entry }) => entry.k === "input" && entry.type === "prompt");
-        assert.equal(inputs.length, 1, "later prompts are not copied");
+        assert.equal(inputs.length, 1, "the first prompt is copied once, including when a health check names the run");
         assert.deepEqual(inputs[0].entry.context, { customer: "fixture" });
         assert.equal(inputs[0].entry.settings.model, "fixture/model");
         const run = await stored.runs.get(replayed, { resolveData: "all" });

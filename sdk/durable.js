@@ -707,6 +707,7 @@ const uiStreamOf = (runId) => `${runId.replace(/^wrun_/, "strm_")}_user_bGliZngt
 // namespace "libfx-image-" and the image's name.
 const imageStreamOf = (runId, name) => `${runId.replace(/^wrun_/, "strm_")}_user_${base64url(`libfx-image-${name}`)}`;
 const queuePrefix = "__libfx_wkf_workflow_";
+const workflowQueuePrefix = "__wkf_workflow_";
 // The name of an agent created without one, and of whatever a message or a
 // session from before names belonged to.
 const defaultAgentName = "default";
@@ -1030,7 +1031,9 @@ function createWorldBackend(world, durability) {
   // The route a deployment mounts delivers to the agent in this process the
   // message names, on the store it names, whichever agent's route it is. A
   // message from before stores were named is for this World's store.
-  const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
+  const handleMessage = async (message, meta) => {
+    // Capability probes can name a real run but must never replay it.
+    if (message?.__healthCheck === true) return undefined;
     if (workflowCodec && !message?.input && typeof message?.runId === "string") {
       return replayWorkflowRun(message.runId, meta);
     }
@@ -1038,7 +1041,8 @@ function createWorldBackend(world, durability) {
     const agent = await agentOnStore(named, typeof message?.input?.store === "string" ? message.input.store : store);
     if (!agent) throw noAgentNamed(named);
     return agent.deliverHere(message, meta);
-  });
+  };
+  const queueHandler = world.createQueueHandler(queuePrefix, handleMessage);
   const backend = {
     name,
     store,
@@ -1540,7 +1544,7 @@ function createWorldBackend(world, durability) {
           if (listeners.size === 0) return deliverTo(null, message, meta);
           throw noAgentNamed(named);
         }));
-        if (workflowCodec) world.registerHandler("__wkf_workflow_libfx/session", queueHandler);
+        if (workflowCodec) world.registerHandler(workflowQueuePrefix, world.createQueueHandler(workflowQueuePrefix, handleMessage));
       }
       const group = joinGroup(listeners, name, fn);
       return () => {

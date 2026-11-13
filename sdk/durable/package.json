@@ -8,5 +8,11 @@
     "@workflow/core": "5.2.1",
     "@workflow/world-local": "5.1.1",
     "@workflow/world-vercel": "5.2.1"
+  },
+  "overrides": {
+    "@workflow/core": {
+      "devalue": "5.9.3",
+      "nanoid": "5.1.16"
+    }
   }
 }
