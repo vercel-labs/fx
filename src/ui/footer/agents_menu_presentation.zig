@@ -537,7 +537,9 @@ test "a narrow agent list leaves out the profile, then the model, and cuts a lon
     });
 }
 
-test "a row's title comes before what the subagent is for, which comes before new session" {
+test "a row's title comes before what the subagent is for, which comes before new session, and a working call comes first" {
+    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
+    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
     try std.testing.expectEqualStrings("Review the parser", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .state = "idle" }));
     try std.testing.expectEqualStrings("You review the parser.", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .state = "idle" }));
     try std.testing.expectEqualStrings(untitled, titleOf(.{ .name = "a", .title = "", .purpose = "", .state = "idle" }));
