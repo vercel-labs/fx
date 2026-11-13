@@ -1518,7 +1518,12 @@ fn closeTtyBestEffort(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
 ) void {
-    var closed = executeAuthorizedTerminal(ctx, session_id, .{ .close = .{
+    // The close ignores `cancel_flag`. A user cancel is when this cleanup
+    // matters most, and with the flag set the executor would cancel the
+    // close too and leave the command running.
+    var close_ctx = ctx;
+    close_ctx.cancel_flag = null;
+    var closed = executeAuthorizedTerminal(close_ctx, session_id, .{ .close = .{
         .session_id = session_id,
         .policy = .force,
         .authority = null,

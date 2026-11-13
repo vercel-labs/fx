@@ -5186,26 +5186,30 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
-  test(
-    "Escape interrupts a running tool and starts pending steering without review",
+  for (const tty of [false, true]) test(
+    `Escape interrupts a running tool and starts pending steering without review with tty=${tty}`,
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-immediate-steering-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "immediate-steering-tool.pid");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       const steering = "Apply IMMEDIATE_STEERING_SENTINEL now.";
       const finalText = "IMMEDIATE_STEERING_COMPLETE";
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
       const steeringGateway = startFakeGateway([
         fakeGatewayToolCall("immediate_steering_tool", "shell", {
           request: {
             action: "run",
             yield_time_ms: 30_000,
             timeout_ms: 600_000,
-            command: "sleep 30",
+            tty,
+            command,
           },
         }),
         fakeGatewayFinalText(finalText),
@@ -5236,7 +5240,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the immediate steering fixture.");
-      await session.waitForText("Running sleep 30", TIMEOUT);
+      await session.waitForText("Running printf", TIMEOUT);
+      await waitForCondition(
+        () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+        "immediate steering command pid",
+      );
+      const commandPid = Number(readTrimmed(pidPath));
+      expect(isProcessAlive(commandPid)).toBe(true);
       await session.sendText(steering);
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
@@ -5254,6 +5264,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).toContain(steering);
       expect(trace).toContain("steering_pending=true");
       expect(trace).toContain("outcome_kind=interrupted");
+      // The interrupt ends the command, so no process outlives its session.
+      await waitForCondition(
+        () => !isProcessAlive(commandPid),
+        "interrupted command exit",
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
