@@ -21,6 +21,7 @@ const file_index = @import("../workspace/file_index.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_commands = @import("app_commands.zig");
+const copy_targets = @import("copy_targets.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
@@ -154,6 +155,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (comptime agents.hasAgentField(App, "stream")) {
                 if (agent.stream.active) {
+                    if (hasCopyQuery(app)) return .copy;
                     if (hasModelQuery(app)) return .model;
                     if (hasFileQuery(app)) return .file;
                     if (visibleInlineSlashCompletion(app, agent) != null) return .slash;
@@ -161,6 +163,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     return null;
                 }
             }
+            if (hasCopyQuery(app)) return .copy;
             if (hasModelQuery(app)) return .model;
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) return .provider;
             if (hasFileQuery(app)) return .file;
@@ -423,6 +426,14 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (try routeSessionPickerMove(app, agent, delta)) return true;
                 if (try routeForkMenuMove(app, agent, delta)) return true;
             }
+            if (hasCopyQuery(app)) {
+                const labels = try copyPickerCompletions(app, agent);
+                app.input_runtime.picker.copy_completion_index = copyPickerIndex(app, labels);
+                app.input_runtime.picker.copy_completion_window_start = copyPickerWindowStart(app, labels.len, app.input_runtime.picker.copy_completion_index);
+                app.input_runtime.picker.copy_completion_moved = true;
+                navigatePickerOptions(&app.input_runtime.picker.copy_completion_index, &app.input_runtime.picker.copy_completion_window_start, labels.len, delta);
+                return true;
+            }
             if (hasFileQuery(app)) {
                 navigateFilePicker(app, agent, delta);
                 return true;
@@ -652,6 +663,98 @@ pub fn CompletionRuntime(comptime App: type) type {
                 projection,
                 try inlineMenuRowBudget(app, agent, resume_menu_presentation.max_inline_rows),
             );
+        }
+
+        pub fn hasCopyQuery(app: *App) bool {
+            return app.input_runtime.picker.activeCopyPickerQuery(&app.input_runtime.edit_state) != null;
+        }
+
+        fn copyReplies(agent: *AppAgent, buffer: *[3][]const u8) []const []const u8 {
+            if (comptime agents.hasAgentField(App, "session")) {
+                if (comptime @hasDecl(@TypeOf(agent.session), "copyReplies")) return agent.session.copyReplies(buffer);
+            }
+            return &.{};
+        }
+
+        pub fn copyPickerStale(app: *App, agent: *AppAgent) !bool {
+            const picker = &app.input_runtime.picker;
+            if (picker.copy_snapshot_count == null) return false;
+            var buffer: [3][]const u8 = undefined;
+            return !try picker.reconcileCopySnapshot(app.alloc, @intFromPtr(agent), copyReplies(agent, &buffer));
+        }
+
+        /// Labels borrow picker storage until the next call or picker deinit.
+        pub fn copyPickerCompletions(app: *App, agent: *AppAgent) ![]const []const u8 {
+            const query = app.input_runtime.picker.activeCopyPickerQuery(&app.input_runtime.edit_state) orelse return &.{};
+            var replies: [3][]const u8 = undefined;
+            const found = copyReplies(agent, &replies);
+            if (!try app.input_runtime.picker.reconcileCopySnapshot(app.alloc, @intFromPtr(agent), found)) return &.{};
+            const picker = &app.input_runtime.picker;
+            if (!picker.copy_completion_cached) {
+                const targets = try copy_targets.collect(app.alloc, found);
+                defer copy_targets.free(app.alloc, targets);
+                return storeCopyPickerLabels(app, targets, query.query);
+            }
+            return filterCopyPickerLabels(picker, query.query);
+        }
+
+        fn storeCopyPickerLabels(app: *App, targets: []const copy_targets.Target, query: []const u8) ![]const []const u8 {
+            const picker = &app.input_runtime.picker;
+            picker.copy_completion_cached = false;
+            picker.copy_completion_storage.clearRetainingCapacity();
+            picker.copy_completion_all_labels.clearRetainingCapacity();
+            picker.copy_completion_labels.clearRetainingCapacity();
+            var bytes: usize = 0;
+            for (targets) |target| bytes += target.name.len;
+            try picker.copy_completion_storage.ensureTotalCapacity(app.alloc, bytes);
+            try picker.copy_completion_all_labels.ensureTotalCapacity(app.alloc, targets.len);
+            try picker.copy_completion_labels.resize(app.alloc, targets.len);
+            for (targets) |target| {
+                const start = picker.copy_completion_storage.items.len;
+                picker.copy_completion_storage.appendSliceAssumeCapacity(target.name);
+                picker.copy_completion_all_labels.appendAssumeCapacity(picker.copy_completion_storage.items[start..]);
+            }
+            picker.copy_completion_cached = true;
+            return filterCopyPickerLabels(picker, query);
+        }
+
+        fn filterCopyPickerLabels(picker: *picker_state.State, query: []const u8) []const []const u8 {
+            const labels = picker.copy_completion_labels.items;
+            const matching_count = picker_state.filterCompletionLabels(query, picker.copy_completion_all_labels.items, labels);
+            return labels[0..matching_count];
+        }
+
+        pub fn copyPickerIndex(app: *App, labels: []const []const u8) usize {
+            if (labels.len == 0) return 0;
+            const picker = &app.input_runtime.picker;
+            if (!picker.copy_completion_moved) {
+                const query = picker.activeCopyPickerQuery(&app.input_runtime.edit_state).?;
+                const text = std.mem.trim(u8, query.query, " \t");
+                for (labels, 0..) |label, i| {
+                    if (std.ascii.eqlIgnoreCase(text, label)) return i;
+                }
+            }
+            return picker.copy_completion_index % labels.len;
+        }
+
+        pub fn copyPickerWindowStart(app: *App, count: usize, index: usize) usize {
+            if (!app.input_runtime.picker.copy_completion_moved) {
+                return list_window.updateEdgeStart(0, count, index, list_window.default_max_picker_rows);
+            }
+            return app.input_runtime.picker.copy_completion_window_start;
+        }
+
+        pub fn autocompleteCopyPickerSelection(app: *App, agent: *AppAgent) !bool {
+            const labels = try copyPickerCompletions(app, agent);
+            if (labels.len == 0) return false;
+            const name = labels[copyPickerIndex(app, labels)];
+            const text = try app.alloc.print("/copy {s}", .{name});
+            defer app.alloc.free(text);
+            const snapshot_count = app.input_runtime.picker.copy_snapshot_count;
+            try app.input_runtime.textReplacementState().replace(app.alloc, text);
+            app.input_runtime.picker.copy_snapshot_count = snapshot_count;
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         pub fn hasModelQuery(app: *App) bool {
@@ -1622,6 +1725,120 @@ pub fn CompletionRuntime(comptime App: type) type {
             return speedSelection(labels[speedPickerIndex(app, labels[0..count])]);
         }
     };
+}
+
+test "copy picker caches labels until the snapshot resets" {
+    const TestSession = struct {
+        replies: []const []const u8,
+        pub fn copyReplies(self: *const @This(), out: *[3][]const u8) []const []const u8 {
+            @memcpy(out[0..self.replies.len], self.replies);
+            return out[0..self.replies.len];
+        }
+    };
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        input_runtime: core_input_runtime.Runtime = .{},
+        main_agent: struct { session: TestSession },
+    };
+    const alloc = std.testing.allocator;
+    var app: TestApp = .{ .alloc = alloc, .main_agent = .{ .session = .{ .replies = &.{"```sh\necho hello\n```\n| a | b |\n| - | - |\n"} } } };
+    defer app.input_runtime.deinit(alloc);
+    const rt = CompletionRuntime(TestApp);
+    try app.input_runtime.edit_state.setText(alloc, "/copy ");
+    const initial = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 3), initial.len);
+
+    // A redraw and query filtering must not parse or allocate again.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    try app.input_runtime.edit_state.setText(alloc, "/copy cmd_echo");
+    const filtered = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("cmd_echo_hello", filtered[0]);
+    try app.input_runtime.edit_state.setText(alloc, "/copy ");
+    const restored = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 3), restored.len);
+    try std.testing.expectEqualStrings("all", restored[0]);
+
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    try std.testing.expectError(error.OutOfMemory, rt.copyPickerCompletions(&app, &app.main_agent));
+    app.alloc = alloc;
+    app.main_agent.session.replies = &.{"```\nreplacement\n```"};
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    const changed = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 2), changed.len);
+    try std.testing.expectEqualStrings("code_replacement", changed[1]);
+}
+
+test "copy picker lists and filters the selected agent replies" {
+    const TestSession = struct {
+        replies: []const []const u8,
+        pub fn copyReplies(self: *const @This(), out: *[3][]const u8) []const []const u8 {
+            @memcpy(out[0..self.replies.len], self.replies);
+            return out[0..self.replies.len];
+        }
+    };
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        input_runtime: core_input_runtime.Runtime = .{},
+        main_agent: struct { session: TestSession },
+        shell: struct { render_requests: render_request.RenderRequestState = .{} } = .{},
+    };
+    const replies = [_][]const u8{
+        "```\nnew\n```\n| h |\n| - |\n| v |\n",
+        "```\nold\n```\n",
+    };
+    var app: TestApp = .{ .alloc = std.testing.allocator, .main_agent = .{ .session = .{ .replies = &replies } } };
+    defer app.input_runtime.deinit(app.alloc);
+    const rt = CompletionRuntime(TestApp);
+    const targets = try copy_targets.collect(app.alloc, &replies);
+    defer copy_targets.free(app.alloc, targets);
+    try std.testing.expect(targets.len > 1);
+    try app.input_runtime.edit_state.setText(app.alloc, "/copy ");
+    var labels = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(targets.len, labels.len);
+    for (targets, labels) |target, label| try std.testing.expectEqualStrings(target.name, label);
+    const filtered = try app.alloc.print("/copy {s}", .{targets[1].name});
+    defer app.alloc.free(filtered);
+    try app.input_runtime.edit_state.setText(app.alloc, filtered);
+    labels = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expect(labels.len > 0);
+    try std.testing.expectEqualStrings(targets[1].name, labels[0]);
+    var other_agent = app.main_agent;
+    try std.testing.expect(try rt.copyPickerStale(&app, &other_agent));
+    other_agent.session.replies = &.{};
+    try app.input_runtime.edit_state.setText(app.alloc, "/copy ");
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    labels = try rt.copyPickerCompletions(&app, &other_agent);
+    try std.testing.expectEqual(@as(usize, 1), labels.len);
+    try std.testing.expectEqualStrings("all", labels[0]);
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    labels = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqual(targets.len, labels.len);
+    try app.input_runtime.edit_state.setText(app.alloc, "/copy target");
+    const ambiguous = [_][]const u8{ "target_long", "target" };
+    try std.testing.expectEqual(@as(usize, 1), rt.copyPickerIndex(&app, &ambiguous));
+    app.input_runtime.picker.copy_completion_moved = true;
+    try std.testing.expectEqual(@as(usize, 0), rt.copyPickerIndex(&app, &ambiguous));
+    const many: [100]copy_targets.Target = @splat(.{ .name = "quote_once_upon_a_very_long_time", .text = "" });
+    labels = try rt.storeCopyPickerLabels(&app, &many, "");
+    try std.testing.expectEqual(many.len, labels.len);
+    try std.testing.expectEqualStrings(many[99].name, labels[99]);
+
+    // A new reply can assign the selected duplicate's suffix to different text.
+    app.input_runtime.picker.resetInlinePickerEpisode();
+    app.main_agent.session.replies = &.{ "```\nsame\nnew\n```", "```\nsame\nold\n```", "```\nsame\nfirst\n```" };
+    try app.input_runtime.edit_state.setText(app.alloc, "/copy code_same_2");
+    labels = try rt.copyPickerCompletions(&app, &app.main_agent);
+    try std.testing.expectEqualStrings("code_same_2", labels[0]);
+    try std.testing.expect(try rt.autocompleteCopyPickerSelection(&app, &app.main_agent));
+    try std.testing.expect(app.input_runtime.picker.copy_snapshot_count != null);
+    app.main_agent.session.replies = &.{ "```\nsame\nalt\n```", "```\nsame\nnew\n```", "```\nsame\nold\n```" };
+    try std.testing.expect(try rt.copyPickerStale(&app, &app.main_agent));
+    try std.testing.expect(!try rt.autocompleteCopyPickerSelection(&app, &app.main_agent));
+    try std.testing.expectEqualStrings("/copy code_same_2", app.input_runtime.edit_state.input.items);
+    app.input_runtime.picker.resetActiveCompletionIndex();
+    try std.testing.expect(!(try rt.copyPickerStale(&app, &app.main_agent)));
 }
 
 const FilePickerTestApp = struct {

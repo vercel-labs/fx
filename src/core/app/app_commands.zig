@@ -16,6 +16,7 @@ const token_pass = @import("../gateway/token_pass.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
+const copy_targets = @import("copy_targets.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -1234,17 +1235,35 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(InputRuntime, "effort_menu")) app.input_runtime.effort_menu.close(app.alloc);
         }
 
-        fn commandCopyLast(ctx: *anyopaque) !void {
+        fn commandCopyLast(ctx: *anyopaque, target: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const last_reply = agents.screenAgentOf(app).session.lastAssistantReply() orelse {
+            var buffer: [3][]const u8 = undefined;
+            const replies = agents.screenAgentOf(app).session.copyReplies(&buffer);
+            if (replies.len == 0) {
                 try app.writeDomainNotice(.{
                     .topic = "clipboard",
                     .tone = .neutral,
                     .body = "No assistant reply to copy.",
                 }, true);
                 return;
+            }
+            const copied = if (target.len == 0 or std.mem.eql(u8, target, "all"))
+                app.clipboard().copy(replies[0]) catch false
+            else blk: {
+                const targets = try copy_targets.collect(app.alloc, replies);
+                defer copy_targets.free(app.alloc, targets);
+                for (targets) |candidate| {
+                    if (std.mem.eql(u8, candidate.name, target)) {
+                        break :blk app.clipboard().copy(candidate.text) catch false;
+                    }
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "clipboard",
+                    .tone = .@"error",
+                    .body = "Copy target not found. Type /copy followed by a space to see targets.",
+                }, true);
+                return;
             };
-            const copied = app.clipboard().copy(last_reply) catch false;
             if (!copied) {
                 try app.writeDomainNotice(.{
                     .topic = "clipboard",
@@ -2193,19 +2212,28 @@ const ClipboardCommandFakeApp = struct {
     };
 
     const Session = struct {
-        reply: ?[]const u8 = null,
+        replies: []const []const u8 = &.{},
 
-        fn lastAssistantReply(self: *const Session) ?[]const u8 {
-            return self.reply;
+        fn copyReplies(self: *const Session, buffer: *[3][]const u8) []const []const u8 {
+            var count: usize = 0;
+            var i = self.replies.len;
+            while (i > 0 and count < buffer.len) {
+                i -= 1;
+                if (self.replies[i].len == 0) continue;
+                buffer[count] = self.replies[i];
+                count += 1;
+            }
+            return buffer[0..count];
         }
     };
 
+    alloc: std.mem.Allocator = std.testing.allocator,
     main_agent: struct {
         session: Session = .{},
     } = .{},
     copy_outcome: CopyOutcome = .copied,
     copy_calls: usize = 0,
-    copied_text: ?[]const u8 = null,
+    copied_text: ?[]u8 = null,
     last_topic: ?[]const u8 = null,
     last_tone: ?types.NoticeTone = null,
     last_body: ?[]const u8 = null,
@@ -2220,12 +2248,20 @@ const ClipboardCommandFakeApp = struct {
     fn copy(raw_context: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         const self: *ClipboardCommandFakeApp = @ptrCast(@alignCast(raw_context.?));
         self.copy_calls += 1;
-        self.copied_text = text;
-        return switch (self.copy_outcome) {
-            .copied => true,
-            .unavailable => false,
-            .failed => error.CopyFailed,
-        };
+        switch (self.copy_outcome) {
+            .copied => {
+                const copied = self.alloc.dupe(u8, text) catch return error.CopyFailed;
+                if (self.copied_text) |previous| self.alloc.free(previous);
+                self.copied_text = copied;
+                return true;
+            },
+            .unavailable => return false,
+            .failed => return error.CopyFailed,
+        }
+    }
+
+    fn deinit(self: *ClipboardCommandFakeApp) void {
+        if (self.copied_text) |text| self.alloc.free(text);
     }
 
     noinline fn writeDomainNotice(
@@ -2408,33 +2444,76 @@ test "app_commands routes clear through carry-forward session reset" {
 
 test "copy command routes exact reply bytes through the host clipboard" {
     var app = ClipboardCommandFakeApp{
-        .main_agent = .{ .session = .{ .reply = "reply\nwith exact bytes" } },
+        .main_agent = .{ .session = .{ .replies = &.{ "older", "reply\nwith exact bytes", "" } } },
     };
+    defer app.deinit();
 
-    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
+    for ([_][]const u8{ "", "all" }) |target| {
+        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app), target);
+        try std.testing.expectEqualStrings("reply\nwith exact bytes", app.copied_text.?);
+        try std.testing.expectEqualStrings("clipboard", app.last_topic.?);
+        try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+        try std.testing.expectEqualStrings("Copied to clipboard.", app.last_body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
+}
 
+test "copy command selects scanner targets from the three latest nonempty replies" {
+    var app = ClipboardCommandFakeApp{
+        .main_agent = .{ .session = .{ .replies = &.{
+            "```\nexcluded\n```\n",
+            "```\nrepeated\nthird\n```\n",
+            "```\nrepeated\nsecond\n```\n",
+            "",
+            "```\nrepeated\nfirst\n```\n",
+        } } },
+    };
+    defer app.deinit();
+    for ([_][]const u8{ "code_repeated", "code_repeated_2", "code_repeated_3" }, [_][]const u8{ "repeated\nfirst\n", "repeated\nsecond\n", "repeated\nthird\n" }) |target, expected| {
+        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app), target);
+        try std.testing.expectEqualStrings(expected, app.copied_text.?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), app.copy_calls);
+    for ([_][]const u8{ "code_excluded", "missing" }) |target| {
+        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app), target);
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expectEqualStrings("Copy target not found. Type /copy followed by a space to see targets.", app.last_body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), app.copy_calls);
+}
+
+test "copy command copies deindented nested python" {
+    var app = ClipboardCommandFakeApp{
+        .main_agent = .{ .session = .{ .replies = &.{
+            "- Parent\n  - nested\n    > ```python\n    > if True:\n    >     print(2)\n    > ```\n",
+        } } },
+    };
+    defer app.deinit();
+
+    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app), "code_if_true");
     try std.testing.expectEqual(@as(usize, 1), app.copy_calls);
-    try std.testing.expectEqualStrings("reply\nwith exact bytes", app.copied_text.?);
-    try std.testing.expectEqualStrings("clipboard", app.last_topic.?);
+    try std.testing.expectEqualStrings("if True:\n    print(2)\n", app.copied_text.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("Copied to clipboard.", app.last_body.?);
 }
 
 test "copy command reports missing replies and host failures" {
     var app = ClipboardCommandFakeApp{};
+    defer app.deinit();
 
-    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
-    try std.testing.expectEqual(@as(usize, 0), app.copy_calls);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("No assistant reply to copy.", app.last_body.?);
+    for ([_][]const u8{ "", "all", "missing" }) |target| {
+        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app), target);
+        try std.testing.expectEqual(@as(usize, 0), app.copy_calls);
+        try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+        try std.testing.expectEqualStrings("No assistant reply to copy.", app.last_body.?);
+    }
 
-    app.agent().session.reply = "reply";
+    app.agent().session.replies = &.{"reply"};
     for ([_]ClipboardCommandFakeApp.CopyOutcome{ .unavailable, .failed }) |outcome| {
         app.copy_outcome = outcome;
         app.last_tone = null;
         app.last_body = null;
 
-        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
+        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app), "");
 
         try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
         try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
