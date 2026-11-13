@@ -59,6 +59,7 @@ test {
     _ = @import("main.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/capabilities/toolbox.zig");
+    _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/url_policy.zig");
     _ = @import("ui/resize_tests.zig");
