@@ -376,7 +376,7 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
   }
 
   test(
-    "loop arms, lists, and stops",
+    "loop arms, lists, and removes",
     async () => {
       gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LOOP_REPLY"));
       const { stderrPath } = await launchLoopTerminal("arm");
@@ -384,7 +384,7 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       await session!.sendText("/loop");
       await session!.waitForText("No active loops. Start one with /loop <interval> <prompt>.", 5_000);
       await session!.sendText("/loop 1h say LOOP_OK");
-      await session!.waitForText("Loop 1 runs now, then every 1h until you stop it or fx exits: say LOOP_OK", 5_000);
+      await session!.waitForText("Loop 1 runs now, then every 1h until you remove it or fx exits: say LOOP_OK", 5_000);
       // The first run starts right away, not one interval later.
       await waitForCount("loop 1 · every 1h · say LOOP_OK", 1, 5_000);
       await waitForCount("LOOP_REPLY", 1, 10_000);
@@ -397,13 +397,13 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       await waitForCount("LOOP_REPLY", 2, 10_000);
       await session!.waitForComposer(5_000);
       await session!.waitForText(/gpt-5 · 2 loops\s*$/m, 5_000);
-      await session!.sendText("/loop stop 1");
-      await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
       await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
-      await session!.sendText("/loop stop 1");
+      await session!.sendText("/loop remove 1");
       await session!.waitForText("No loop 1. /loop lists active loops.", 5_000);
-      await session!.sendText("/loop stop all");
-      await session!.waitForText("Stopped loop 2.", 5_000);
+      await session!.sendText("/loop remove all");
+      await session!.waitForText("Removed loop 2.", 5_000);
       await session!.waitForText(/gpt-5\s*$/m, 5_000);
       await session!.sendText("/loop 30s ping");
       await session!.waitForText("30s is shorter than the 1m minimum.", 5_000);
@@ -441,16 +441,16 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       expect(await session!.capturePane()).toContain("draft stays");
 
       await session!.sendKeys("C-u");
-      await session!.sendText("/loop stop 1");
-      await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
 
       // A builtin command in a loop prompt is text for the model, never run.
       await session!.sendText("/loop 1m /status");
       await waitForCount("loop 2 · every 1m · /status", 1, 10_000);
       await session!.waitForComposer(5_000);
       expect(showsStatusPanel((await session!.capturePane()).split("\n"))).toBe(false);
-      await session!.sendText("/loop stop all");
-      await session!.waitForText("Stopped loop 2.", 5_000);
+      await session!.sendText("/loop remove all");
+      await session!.waitForText("Removed loop 2.", 5_000);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -478,8 +478,8 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       // The missed intervals collapse into one run, not a burst.
       await waitForCount("loop 1 · every 1m · say ONCE", 2, 5_000);
       expect(await countInScrollback("loop 1 · every 1m · say ONCE")).toBe(2);
-      await session!.sendText("/loop stop 1");
-      await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
     },
     TIMEOUT,
   );
@@ -505,14 +505,14 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       await session!.sendText("hello");
       await waitForCount("BACK", 1, 10_000);
       await waitForCount("loop 1 · every 1m · ping", 2, 10_000);
-      await session!.sendText("/loop stop 1");
-      await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
     },
     TIMEOUT,
   );
 
   test(
-    "loop menu offers intervals, then stop with each loop",
+    "loop menu offers intervals, then pause and remove with each loop",
     async () => {
       gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("MENU_REPLY"));
       const { stderrPath } = await launchLoopTerminal("menu");
@@ -520,25 +520,55 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       // With no loops, the menu offers only ways to start one.
       await session!.sendLiteral("/loop ");
       await session!.waitForText(/1h +run a prompt now, then every hour/, 5_000);
-      expect(await session!.capturePane()).not.toContain("end a loop, or all of them");
+      expect(await session!.capturePane()).not.toContain("delete a loop, or all of them");
       await session!.sendKeys("C-u");
 
       await session!.sendText("/loop 1h say MENU");
       await waitForCount("MENU_REPLY", 1, 10_000);
       await session!.waitForComposer(5_000);
 
-      // A live loop adds stop; nothing is paused, so resume stays hidden.
+      // A live loop adds pause and remove; nothing is paused, so resume stays hidden.
       await session!.sendLiteral("/loop ");
-      await session!.waitForText(/stop +end a loop, or all of them/, 5_000);
+      await session!.waitForText(/pause +pause a loop, or all of them/, 5_000);
+      await session!.waitForText(/remove +delete a loop, or all of them/, 5_000);
       expect(await session!.capturePane()).not.toContain("restart a paused loop");
-      // Choosing stop types a space and lists the loops it can end.
-      await session!.sendLiteral("st");
+      // Choosing remove types a space and lists the loops it can delete.
+      await session!.sendLiteral("rem");
       await session!.sendKeys("Tab");
-      await session!.waitForText(/stop 1 +every 1h · say MENU/, 5_000);
-      await session!.waitForText(/stop all +end every loop/, 5_000);
+      await session!.waitForText(/remove 1 +every 1h · say MENU/, 5_000);
+      await session!.waitForText(/remove all +delete every loop/, 5_000);
       await session!.sendLiteral("1");
       await session!.sendKeys("Enter");
-      await session!.waitForText("Stopped loop 1.", 5_000);
+      await session!.waitForText("Removed loop 1.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "loop pause keeps the loop until resume runs it again",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("PAUSE_REPLY"));
+      const { stderrPath } = await launchLoopTerminal("pause", { FX_TEST_LOOP_INTERVAL_MS: "300" });
+
+      await session!.sendText("/loop 1m say PAUSE");
+      await waitForCount("PAUSE_REPLY", 1, 10_000);
+      await session!.sendText("/loop pause 1");
+      await session!.waitForText("Paused loop 1. /loop resume 1 restarts it.", 5_000);
+      await session!.waitForComposer(5_000);
+      const runsWhenPaused = await countInScrollback("loop 1 · every 1m · say PAUSE");
+      // Several intervals pass and no run starts, but the loop stays listed and counted.
+      await Bun.sleep(1_200);
+      expect(await countInScrollback("loop 1 · every 1m · say PAUSE")).toBe(runsWhenPaused);
+      await session!.sendText("/loop");
+      await session!.waitForText(/1 +every 1m +paused by you · \/loop resume 1/, 5_000);
+      await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
+
+      await session!.sendText("/loop resume 1");
+      await session!.waitForText("Resumed loop 1. It runs now, then every 1m.", 5_000);
+      await waitForCount("loop 1 · every 1m · say PAUSE", runsWhenPaused + 1, 10_000);
+      await session!.sendText("/loop remove all");
+      await session!.waitForText("Removed loop 1.", 5_000);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

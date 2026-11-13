@@ -24,8 +24,9 @@ pub const Target = union(enum) { all, id: u32 };
 pub const Command = union(enum) {
     list,
     arm: struct { interval_ms: u64, prompt: []const u8 },
-    stop: Target,
-    resume_loop: u32,
+    pause: Target,
+    resume_loop: Target,
+    remove: Target,
 };
 
 pub const ParseError = error{ MissingPrompt, InvalidInterval, IntervalTooShort, IntervalTooLong, PromptTooLong, InvalidId };
@@ -37,19 +38,20 @@ pub fn parseCommand(payload: []const u8) ParseError!Command {
     const first_end = std.mem.findAny(u8, text, " \t") orelse text.len;
     const first = text[0..first_end];
     const rest = std.mem.trim(u8, text[first_end..], " \t");
-    if (std.mem.eql(u8, first, "stop")) {
-        if (std.mem.eql(u8, rest, "all")) return .{ .stop = .all };
-        return .{ .stop = .{ .id = try parseId(rest) } };
-    }
-    if (std.mem.eql(u8, first, "resume")) return .{ .resume_loop = try parseId(rest) };
+    // `remove` matches the verb `/mcp`, `/skills`, and `/workspace` use to
+    // delete an item; `pause` keeps the loop for `resume`.
+    if (std.mem.eql(u8, first, "pause")) return .{ .pause = try parseTarget(rest) };
+    if (std.mem.eql(u8, first, "resume")) return .{ .resume_loop = try parseTarget(rest) };
+    if (std.mem.eql(u8, first, "remove")) return .{ .remove = try parseTarget(rest) };
     const interval_ms = try parseInterval(first);
     if (rest.len == 0) return error.MissingPrompt;
     if (rest.len > max_prompt_bytes) return error.PromptTooLong;
     return .{ .arm = .{ .interval_ms = interval_ms, .prompt = rest } };
 }
 
-fn parseId(text: []const u8) ParseError!u32 {
-    return std.fmt.parseInt(u32, text, 10) catch error.InvalidId;
+fn parseTarget(text: []const u8) ParseError!Target {
+    if (std.mem.eql(u8, text, "all")) return .all;
+    return .{ .id = std.fmt.parseInt(u32, text, 10) catch return error.InvalidId };
 }
 
 /// Reads an interval such as `90s`, `5m`, `2h`, or `1d`, in milliseconds.
@@ -80,6 +82,9 @@ pub const Outcome = enum { completed, interrupted, failed, paused };
 
 pub const State = enum { waiting, running, paused };
 
+/// Why a paused loop stopped running, so the list can say what to fix.
+pub const PauseReason = enum { user, failures };
+
 pub const Loop = struct {
     id: u32,
     interval_ms: u64,
@@ -91,6 +96,8 @@ pub const Loop = struct {
     running_turn_id: u64 = 0,
     runs: u32 = 0,
     consecutive_failures: u8 = 0,
+    /// Meaningful only while `state` is `paused`.
+    pause_reason: PauseReason = .failures,
 };
 
 pub const Finished = struct { id: u32, failed: bool, failures: u8, paused: bool };
@@ -124,7 +131,7 @@ pub const Loops = struct {
     }
 
     /// Removes the loop `target` names, or every loop; how many it removed.
-    pub fn stop(self: *Loops, alloc: Allocator, target: Target) error{UnknownLoop}!usize {
+    pub fn remove(self: *Loops, alloc: Allocator, target: Target) error{UnknownLoop}!usize {
         switch (target) {
             .all => return self.endAll(alloc),
             .id => |id| {
@@ -136,14 +143,50 @@ pub const Loops = struct {
         }
     }
 
-    /// Restarts a paused loop with its next run due at `now_ms`, so the fix
-    /// that prompted the resume shows up without waiting an interval.
-    pub fn resumeLoop(self: *Loops, id: u32, now_ms: i64) error{ UnknownLoop, NotPaused }!void {
-        const loop = &self.items.items[self.indexOf(id) orelse return error.UnknownLoop];
-        if (loop.state != .paused) return error.NotPaused;
-        loop.state = .waiting;
-        loop.consecutive_failures = 0;
-        loop.next_due_ms = now_ms;
+    /// Pauses the loop `target` names, or every loop not already paused;
+    /// how many it paused. A run in progress finishes, but its result no
+    /// longer counts, since the loop it belonged to is paused.
+    pub fn pause(self: *Loops, target: Target) error{ UnknownLoop, AlreadyPaused }!usize {
+        switch (target) {
+            .id => |id| {
+                const loop = &self.items.items[self.indexOf(id) orelse return error.UnknownLoop];
+                if (loop.state == .paused) return error.AlreadyPaused;
+                pauseByUser(loop);
+                return 1;
+            },
+            .all => {
+                var paused: usize = 0;
+                for (self.items.items) |*loop| {
+                    if (loop.state == .paused) continue;
+                    pauseByUser(loop);
+                    paused += 1;
+                }
+                return paused;
+            },
+        }
+    }
+
+    /// Restarts the paused loop `target` names, or every paused loop, with
+    /// the next run due at `now_ms`, so the fix that prompted the resume
+    /// shows up without waiting an interval; how many it restarted.
+    pub fn resumeLoop(self: *Loops, target: Target, now_ms: i64) error{ UnknownLoop, NotPaused }!usize {
+        switch (target) {
+            .id => |id| {
+                const loop = &self.items.items[self.indexOf(id) orelse return error.UnknownLoop];
+                if (loop.state != .paused) return error.NotPaused;
+                restart(loop, now_ms);
+                return 1;
+            },
+            .all => {
+                var resumed: usize = 0;
+                for (self.items.items) |*loop| {
+                    if (loop.state != .paused) continue;
+                    restart(loop, now_ms);
+                    resumed += 1;
+                }
+                return resumed;
+            },
+        }
     }
 
     /// The waiting loop due earliest at `now_ms`, or null. Running and paused
@@ -231,9 +274,22 @@ pub const Loops = struct {
         loop.running_turn_id = 0;
         loop.next_due_ms = after(now_ms, self.waitMs(loop.*));
         loop.state = if (loop.consecutive_failures >= pause_after_failures) .paused else .waiting;
+        loop.pause_reason = .failures;
         return .{ .id = loop.id, .failed = true, .failures = loop.consecutive_failures, .paused = loop.state == .paused };
     }
 };
+
+fn pauseByUser(loop: *Loop) void {
+    loop.state = .paused;
+    loop.pause_reason = .user;
+    loop.running_turn_id = 0;
+}
+
+fn restart(loop: *Loop, now_ms: i64) void {
+    loop.state = .waiting;
+    loop.consecutive_failures = 0;
+    loop.next_due_ms = now_ms;
+}
 
 /// `now_ms` plus `interval_ms`, saturating instead of overflowing.
 fn after(now_ms: i64, interval_ms: u64) i64 {
@@ -251,11 +307,17 @@ test "parseCommand reads every form" {
     try testing.expectEqualStrings("check X", arm.arm.prompt);
     try testing.expect(try parseCommand("") == .list);
     try testing.expect(try parseCommand("  \t") == .list);
-    try testing.expect((try parseCommand("stop all")).stop == .all);
-    try testing.expectEqual(@as(u32, 3), (try parseCommand("stop 3")).stop.id);
-    try testing.expectEqual(@as(u32, 2), (try parseCommand("resume 2")).resume_loop);
-    try testing.expectError(error.InvalidId, parseCommand("stop"));
+    try testing.expect((try parseCommand("remove all")).remove == .all);
+    try testing.expectEqual(@as(u32, 3), (try parseCommand("remove 3")).remove.id);
+    try testing.expect((try parseCommand("pause all")).pause == .all);
+    try testing.expectEqual(@as(u32, 4), (try parseCommand("pause 4")).pause.id);
+    try testing.expectEqual(@as(u32, 2), (try parseCommand("resume 2")).resume_loop.id);
+    try testing.expect((try parseCommand("resume all")).resume_loop == .all);
+    try testing.expectError(error.InvalidId, parseCommand("remove"));
+    try testing.expectError(error.InvalidId, parseCommand("pause"));
     try testing.expectError(error.InvalidId, parseCommand("resume x"));
+    // `stop` is not a verb: it reads as an interval, as any other word does.
+    try testing.expectError(error.InvalidInterval, parseCommand("stop 1"));
 }
 
 test "parseInterval rejects below one minute" {
@@ -298,27 +360,27 @@ test "arm refuses an eleventh loop" {
         try testing.expectEqual(@as(u32, @intCast(n)), try loops.arm(testing.allocator, hour_ms, "p", 0));
     }
     try testing.expectError(error.TooManyLoops, loops.arm(testing.allocator, hour_ms, "p", 0));
-    _ = try loops.stop(testing.allocator, .{ .id = 4 });
+    _ = try loops.remove(testing.allocator, .{ .id = 4 });
     // An id is never reused after stop.
     try testing.expectEqual(@as(u32, 11), try loops.arm(testing.allocator, hour_ms, "p", 0));
 }
 
-test "stop reports unknown ids" {
+test "remove reports unknown ids" {
     var loops: Loops = .{};
     defer loops.deinit(testing.allocator);
     _ = try loops.arm(testing.allocator, hour_ms, "p", 0);
-    try testing.expectError(error.UnknownLoop, loops.stop(testing.allocator, .{ .id = 7 }));
-    try testing.expectEqual(@as(usize, 1), try loops.stop(testing.allocator, .{ .id = 1 }));
+    try testing.expectError(error.UnknownLoop, loops.remove(testing.allocator, .{ .id = 7 }));
+    try testing.expectEqual(@as(usize, 1), try loops.remove(testing.allocator, .{ .id = 1 }));
     try testing.expectEqual(@as(usize, 0), loops.count());
 }
 
-test "stop all removes every loop" {
+test "remove all removes every loop" {
     var loops: Loops = .{};
     defer loops.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), try loops.stop(testing.allocator, .all));
+    try testing.expectEqual(@as(usize, 0), try loops.remove(testing.allocator, .all));
     _ = try loops.arm(testing.allocator, hour_ms, "a", 0);
     _ = try loops.arm(testing.allocator, hour_ms, "b", 0);
-    try testing.expectEqual(@as(usize, 2), try loops.stop(testing.allocator, .all));
+    try testing.expectEqual(@as(usize, 2), try loops.remove(testing.allocator, .all));
     try testing.expectEqual(@as(usize, 0), loops.count());
 }
 
@@ -438,8 +500,8 @@ test "resume refuses a running loop" {
     var loops: Loops = .{};
     defer loops.deinit(testing.allocator);
     _ = try loops.arm(testing.allocator, minute_ms, "p", 0);
-    try testing.expectError(error.NotPaused, loops.resumeLoop(1, 0));
-    try testing.expectError(error.UnknownLoop, loops.resumeLoop(2, 0));
+    try testing.expectError(error.NotPaused, loops.resumeLoop(.{ .id = 1 }, 0));
+    try testing.expectError(error.UnknownLoop, loops.resumeLoop(.{ .id = 2 }, 0));
 }
 
 test "resume restarts a paused loop" {
@@ -448,11 +510,56 @@ test "resume restarts a paused loop" {
     _ = try loops.arm(testing.allocator, minute_ms, "p", 0);
     for (0..pause_after_failures) |_| _ = loops.noteAdmissionFailed(&loops.items.items[0], 0);
     try testing.expectEqual(State.paused, loops.items.items[0].state);
-    try loops.resumeLoop(1, 100);
+    _ = try loops.resumeLoop(.{ .id = 1 }, 100);
     try testing.expectEqual(State.waiting, loops.items.items[0].state);
     try testing.expectEqual(@as(u8, 0), loops.items.items[0].consecutive_failures);
     // A resumed loop runs at once, so the fix shows up without waiting.
     try testing.expectEqual(@as(i64, 100), loops.items.items[0].next_due_ms);
+}
+
+test "pause keeps a loop until resume, and says who paused it" {
+    var loops: Loops = .{};
+    defer loops.deinit(testing.allocator);
+    _ = try loops.arm(testing.allocator, minute_ms, "a", 0);
+    _ = try loops.arm(testing.allocator, minute_ms, "b", 0);
+    try testing.expectError(error.UnknownLoop, loops.pause(.{ .id = 9 }));
+    try testing.expectEqual(@as(usize, 1), try loops.pause(.{ .id = 1 }));
+    try testing.expectError(error.AlreadyPaused, loops.pause(.{ .id = 1 }));
+    try testing.expectEqual(State.paused, loops.items.items[0].state);
+    try testing.expectEqual(PauseReason.user, loops.items.items[0].pause_reason);
+    // A paused loop never comes due, but it stays listed and counted.
+    try testing.expectEqualStrings("b", loops.nextDue(10 * minute_ms).?.prompt);
+    try testing.expectEqual(@as(usize, 2), loops.count());
+    // `all` pauses the rest and skips the loop already paused.
+    try testing.expectEqual(@as(usize, 1), try loops.pause(.all));
+    try testing.expect(loops.nextDue(10 * minute_ms) == null);
+    try testing.expectEqual(@as(usize, 0), try loops.pause(.all));
+}
+
+test "pausing a running loop drops that run's result" {
+    var loops: Loops = .{};
+    defer loops.deinit(testing.allocator);
+    _ = try loops.arm(testing.allocator, minute_ms, "p", 0);
+    loops.markStarted(loops.nextDue(0).?, 7);
+    _ = try loops.pause(.{ .id = 1 });
+    try testing.expect(loops.noteTurnFinished(7, .failed, 1) == null);
+    try testing.expectEqual(@as(u8, 0), loops.items.items[0].consecutive_failures);
+    try testing.expectEqual(State.paused, loops.items.items[0].state);
+}
+
+test "resume all restarts every paused loop at once" {
+    var loops: Loops = .{};
+    defer loops.deinit(testing.allocator);
+    _ = try loops.arm(testing.allocator, minute_ms, "a", 0);
+    _ = try loops.arm(testing.allocator, minute_ms, "b", 0);
+    _ = try loops.arm(testing.allocator, minute_ms, "c", 0);
+    _ = try loops.pause(.{ .id = 1 });
+    for (0..pause_after_failures) |_| _ = loops.noteAdmissionFailed(&loops.items.items[1], 0);
+    try testing.expectEqual(PauseReason.failures, loops.items.items[1].pause_reason);
+    try testing.expectEqual(@as(usize, 2), try loops.resumeLoop(.all, 500));
+    for (loops.items.items) |loop| try testing.expectEqual(State.waiting, loop.state);
+    try testing.expectEqual(@as(i64, 500), loops.items.items[0].next_due_ms);
+    try testing.expectEqual(@as(usize, 0), try loops.resumeLoop(.all, 500));
 }
 
 test "count includes paused loops and endAll empties the list" {

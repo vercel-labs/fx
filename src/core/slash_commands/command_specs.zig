@@ -2387,8 +2387,8 @@ test "app argument completions route each command to its own group" {
     };
     const loop = [_]mod_registry.ArgumentCompletion{
         .{ .full = "/loop 1h", .description = "run a prompt now, then every hour", .has_args = true },
-        .{ .full = "/loop stop", .description = "end a loop, or all of them", .has_args = true },
-        .{ .full = "/loop stop 1", .description = "every 1h · say hi" },
+        .{ .full = "/loop remove", .description = "delete a loop, or all of them", .has_args = true },
+        .{ .full = "/loop remove 1", .description = "every 1h · say hi" },
     };
     var registry: SlashRegistry = .{};
     registry.argument_groups = .{ &mcp, &launch, &loop };
@@ -2408,10 +2408,10 @@ test "app argument completions route each command to its own group" {
     // The first word lists only one-word entries; a finished verb lists its names.
     try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/loop "));
     try std.testing.expectEqualStrings("run a prompt now, then every hour", nthSlashCompletionDescription(registry, "/loop ", 0).?);
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/loop stop "));
-    try std.testing.expectEqualStrings("stop 1", nthSlashCompletionLabel(registry, "/loop stop ", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/loop remove "));
+    try std.testing.expectEqualStrings("remove 1", nthSlashCompletionLabel(registry, "/loop remove ", 0).?);
     // An entry that takes more input types a space and waits; a whole command does not.
     try std.testing.expect(slashCompletionHasArgs(registry, "/loop 1h"));
-    try std.testing.expect(slashCompletionHasArgs(registry, "/loop stop"));
-    try std.testing.expect(!slashCompletionHasArgs(registry, "/loop stop 1"));
+    try std.testing.expect(slashCompletionHasArgs(registry, "/loop remove"));
+    try std.testing.expect(!slashCompletionHasArgs(registry, "/loop remove 1"));
 }

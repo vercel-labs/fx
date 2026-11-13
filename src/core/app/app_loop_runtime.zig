@@ -68,9 +68,11 @@ pub const LoopCompletion = struct {
 };
 
 /// The interval starters first, since arming is what a new user came for,
-/// then `stop` and `resume` with the loops each one applies to. `stop` shows
-/// only with a loop to stop, and `resume` only with a paused one, so the menu
-/// never offers a command that can only fail. Allocates from `arena`.
+/// then `pause`, `resume`, and `remove` with the loops each one applies to.
+/// Each verb shows only when a loop can take it: `pause` with a loop that
+/// is not paused, `resume` with one that is, and `remove` with any loop, so
+/// the menu never offers a command that can only fail. Allocates from
+/// `arena`.
 fn buildCompletion(arena: std.mem.Allocator, set: *const loops.Loops) ![]const mod_registry.ArgumentCompletion {
     var out: std.ArrayList(mod_registry.ArgumentCompletion) = .empty;
     try out.appendSlice(arena, &.{
@@ -80,18 +82,32 @@ fn buildCompletion(arena: std.mem.Allocator, set: *const loops.Loops) ![]const m
     });
     if (set.count() == 0) return out.items;
     var any_paused = false;
-    for (set.items.items) |loop| any_paused = any_paused or loop.state == .paused;
-    try out.append(arena, .{ .full = "/loop stop", .description = "end a loop, or all of them", .has_args = true });
-    if (any_paused) try out.append(arena, .{ .full = "/loop resume", .description = "restart a paused loop", .has_args = true });
+    var any_active = false;
+    for (set.items.items) |loop| {
+        if (loop.state == .paused) any_paused = true else any_active = true;
+    }
+    if (any_active) try out.append(arena, .{ .full = "/loop pause", .description = "pause a loop, or all of them", .has_args = true });
+    if (any_paused) try out.append(arena, .{ .full = "/loop resume", .description = "restart a paused loop, or all of them", .has_args = true });
+    try out.append(arena, .{ .full = "/loop remove", .description = "delete a loop, or all of them", .has_args = true });
+    if (any_active) {
+        for (set.items.items) |loop| if (loop.state != .paused) try out.append(arena, .{
+            .full = try arena.print("/loop pause {d}", .{loop.id}),
+            .description = try menuDescription(arena, loop),
+        });
+        try out.append(arena, .{ .full = "/loop pause all", .description = "pause every loop" });
+    }
+    if (any_paused) {
+        for (set.items.items) |loop| if (loop.state == .paused) try out.append(arena, .{
+            .full = try arena.print("/loop resume {d}", .{loop.id}),
+            .description = try menuDescription(arena, .{ .id = loop.id, .interval_ms = loop.interval_ms, .prompt = loop.prompt, .state = .waiting, .next_due_ms = 0 }),
+        });
+        try out.append(arena, .{ .full = "/loop resume all", .description = "restart every paused loop" });
+    }
     for (set.items.items) |loop| try out.append(arena, .{
-        .full = try arena.print("/loop stop {d}", .{loop.id}),
+        .full = try arena.print("/loop remove {d}", .{loop.id}),
         .description = try menuDescription(arena, loop),
     });
-    try out.append(arena, .{ .full = "/loop stop all", .description = "end every loop" });
-    for (set.items.items) |loop| if (loop.state == .paused) try out.append(arena, .{
-        .full = try arena.print("/loop resume {d}", .{loop.id}),
-        .description = try menuDescription(arena, .{ .id = loop.id, .interval_ms = loop.interval_ms, .prompt = loop.prompt, .state = .waiting, .next_due_ms = 0 }),
-    });
+    try out.append(arena, .{ .full = "/loop remove all", .description = "delete every loop" });
     return out.items;
 }
 
@@ -114,8 +130,9 @@ pub fn Runtime(comptime App: type) type {
             switch (command) {
                 .list => try writeList(app, agent),
                 .arm => |arm| try armLoop(app, agent, arm.interval_ms, arm.prompt),
-                .stop => |target| try stopLoops(app, agent, target),
-                .resume_loop => |id| try resumeLoop(app, agent, id),
+                .pause => |target| try pauseLoops(app, agent, target),
+                .resume_loop => |target| try resumeLoops(app, agent, target),
+                .remove => |target| try removeLoops(app, agent, target),
             }
         }
 
@@ -214,7 +231,7 @@ pub fn Runtime(comptime App: type) type {
             var shown = try text_utils.encodeTerminalSafe(app.alloc, prompt, max_prompt_display_bytes);
             defer shown.deinit(app.alloc);
             var interval_buf: [32]u8 = undefined;
-            try writeNotice(app, .neutral, "Loop {d} runs now, then every {s} until you stop it or fx exits: {s}", .{ id, formatInterval(&interval_buf, interval_ms), shown.bytes });
+            try writeNotice(app, .neutral, "Loop {d} runs now, then every {s} until you remove it or fx exits: {s}", .{ id, formatInterval(&interval_buf, interval_ms), shown.bytes });
         }
 
         fn writeList(app: *App, agent: anytype) !void {
@@ -227,7 +244,7 @@ pub fn Runtime(comptime App: type) type {
                 var interval_buf: [32]u8 = undefined;
                 var when_buf: [64]u8 = undefined;
                 const when = switch (loop.state) {
-                    .paused => try std.mem.print(&when_buf, "paused · /loop resume {d}", .{loop.id}),
+                    .paused => try std.mem.print(&when_buf, "{s} · /loop resume {d}", .{ pauseText(loop.pause_reason), loop.id }),
                     .running => "running now",
                     .waiting => try std.mem.print(&when_buf, "next in {s}", .{formatRemaining(&interval_buf, loop.next_due_ms - now_ms)}),
                 };
@@ -249,38 +266,83 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "loop", .tone = .neutral, .body = body.items }, true);
         }
 
-        fn stopLoops(app: *App, agent: anytype, target: loops.Target) !void {
+        fn removeLoops(app: *App, agent: anytype, target: loops.Target) !void {
             switch (target) {
                 .id => |id| {
-                    _ = agent.loops.stop(app.alloc, target) catch return writeUnknownLoop(app, id);
-                    debug_trace.logf("loop", "event=stopped id={d}", .{id});
+                    _ = agent.loops.remove(app.alloc, target) catch return writeUnknownLoop(app, id);
+                    debug_trace.logf("loop", "event=removed id={d}", .{id});
                     requestFooter(app);
-                    try writeNotice(app, .neutral, "Stopped loop {d}.", .{id});
+                    try writeNotice(app, .neutral, "Removed loop {d}.", .{id});
                 },
                 .all => {
                     if (agent.loops.count() == 0) return writeNotice(app, .neutral, "No active loops.", .{});
-                    const ids = try idList(app, agent);
+                    const ids = try idList(app, agent, null);
                     defer app.alloc.free(ids);
-                    const stopped = agent.loops.endAll(app.alloc);
-                    debug_trace.logf("loop", "event=stopped ids={s}", .{ids});
+                    const removed = agent.loops.endAll(app.alloc);
+                    debug_trace.logf("loop", "event=removed ids={s}", .{ids});
                     requestFooter(app);
-                    try writeNotice(app, .neutral, "Stopped {s} {s}.", .{ loopWord(stopped), ids });
+                    try writeNotice(app, .neutral, "Removed {s} {s}.", .{ loopWord(removed), ids });
                 },
             }
         }
 
-        fn resumeLoop(app: *App, agent: anytype, id: u32) !void {
-            agent.loops.resumeLoop(id, app_permission_runtime.monotonicMillis()) catch |err| switch (err) {
-                error.UnknownLoop => return writeUnknownLoop(app, id),
-                error.NotPaused => return writeNotice(app, .neutral, "Loop {d} is not paused.", .{id}),
-            };
-            debug_trace.logf("loop", "event=resumed id={d}", .{id});
-            requestFooter(app);
-            const loop = for (agent.loops.items.items) |item| {
-                if (item.id == id) break item;
-            } else unreachable;
-            var interval_buf: [32]u8 = undefined;
-            try writeNotice(app, .neutral, "Resumed loop {d}. It runs now, then every {s}.", .{ id, formatInterval(&interval_buf, loop.interval_ms) });
+        fn pauseLoops(app: *App, agent: anytype, target: loops.Target) !void {
+            switch (target) {
+                .id => |id| {
+                    _ = agent.loops.pause(target) catch |err| switch (err) {
+                        error.UnknownLoop => return writeUnknownLoop(app, id),
+                        error.AlreadyPaused => return writeNotice(app, .neutral, "Loop {d} is already paused.", .{id}),
+                    };
+                    debug_trace.logf("loop", "event=paused_by_user id={d}", .{id});
+                    try writeNotice(app, .neutral, "Paused loop {d}. /loop resume {d} restarts it.", .{ id, id });
+                },
+                .all => {
+                    // The ids before pausing: the loops `all` is about to pause.
+                    const ids = try idList(app, agent, .waiting_or_running);
+                    defer app.alloc.free(ids);
+                    const paused = agent.loops.pause(.all) catch unreachable;
+                    if (paused == 0) return writeNotice(app, .neutral, "No loops to pause.", .{});
+                    debug_trace.logf("loop", "event=paused_by_user ids={s}", .{ids});
+                    try writeNotice(app, .neutral, "Paused {s} {s}. /loop resume all restarts them.", .{ loopWord(paused), ids });
+                },
+            }
+        }
+
+        fn resumeLoops(app: *App, agent: anytype, target: loops.Target) !void {
+            const now_ms = app_permission_runtime.monotonicMillis();
+            switch (target) {
+                .id => |id| {
+                    _ = agent.loops.resumeLoop(target, now_ms) catch |err| switch (err) {
+                        error.UnknownLoop => return writeUnknownLoop(app, id),
+                        error.NotPaused => return writeNotice(app, .neutral, "Loop {d} is not paused.", .{id}),
+                    };
+                    debug_trace.logf("loop", "event=resumed id={d}", .{id});
+                    const loop = for (agent.loops.items.items) |item| {
+                        if (item.id == id) break item;
+                    } else unreachable;
+                    var interval_buf: [32]u8 = undefined;
+                    try writeNotice(app, .neutral, "Resumed loop {d}. It runs now, then every {s}.", .{ id, formatInterval(&interval_buf, loop.interval_ms) });
+                },
+                .all => {
+                    const ids = try idList(app, agent, .paused);
+                    defer app.alloc.free(ids);
+                    // With one paused loop, the notice names its interval, as
+                    // resuming it by id does.
+                    var first_interval_ms: u64 = 0;
+                    for (agent.loops.items.items) |item| if (item.state == .paused) {
+                        first_interval_ms = item.interval_ms;
+                        break;
+                    };
+                    const resumed = agent.loops.resumeLoop(.all, now_ms) catch unreachable;
+                    if (resumed == 0) return writeNotice(app, .neutral, "No paused loops.", .{});
+                    debug_trace.logf("loop", "event=resumed ids={s}", .{ids});
+                    if (resumed == 1) {
+                        var interval_buf: [32]u8 = undefined;
+                        return writeNotice(app, .neutral, "Resumed loop {s}. It runs now, then every {s}.", .{ ids, formatInterval(&interval_buf, first_interval_ms) });
+                    }
+                    try writeNotice(app, .neutral, "Resumed loops {s}. Each runs now, then on its interval.", .{ids});
+                },
+            }
         }
 
         /// Ends every loop `agent` holds, because its conversation changes
@@ -326,7 +388,7 @@ pub fn Runtime(comptime App: type) type {
                 error.InvalidInterval => try writeNotice(app, .warning, "{s} is not an interval. Use one such as 5m, 2h, or 1d.", .{shown.bytes}),
                 error.MissingPrompt => try writeNotice(app, .warning, "Usage: /loop <interval> <prompt>", .{}),
                 error.PromptTooLong => try writeNotice(app, .warning, "A loop prompt holds at most {d} bytes.", .{loops.max_prompt_bytes}),
-                error.InvalidId => try writeNotice(app, .warning, "Usage: /loop stop <id|all> or /loop resume <id>", .{}),
+                error.InvalidId => try writeNotice(app, .warning, "Usage: /loop pause|resume|remove <id|all>", .{}),
             }
         }
 
@@ -341,17 +403,28 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "loop", .tone = tone, .body = body }, true);
         }
 
-        /// The ids of `agent`'s loops as `1, 2, 3`. Caller frees.
-        fn idList(app: *App, agent: anytype) ![]u8 {
+        /// The ids of `agent`'s loops as `1, 2, 3`, only those in `filter`
+        /// when one is given. Caller frees.
+        fn idList(app: *App, agent: anytype, filter: ?IdFilter) ![]u8 {
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(app.alloc);
-            for (agent.loops.items.items, 0..) |loop, index| {
-                if (index > 0) try out.appendSlice(app.alloc, ", ");
+            for (agent.loops.items.items) |loop| {
+                if (filter) |f| if ((loop.state == .paused) != (f == .paused)) continue;
+                if (out.items.len > 0) try out.appendSlice(app.alloc, ", ");
                 var buf: [16]u8 = undefined;
                 try out.appendSlice(app.alloc, try std.mem.print(&buf, "{d}", .{loop.id}));
             }
             return out.toOwnedSlice(app.alloc);
         }
+    };
+}
+
+const IdFilter = enum { paused, waiting_or_running };
+
+fn pauseText(reason: loops.PauseReason) []const u8 {
+    return switch (reason) {
+        .user => "paused by you",
+        .failures => std.fmt.comptimePrint("paused after {d} failed runs", .{loops.pause_after_failures}),
     };
 }
 
@@ -429,10 +502,27 @@ test "noteTurnFinished reports each failed run, then the pause" {
     try std.testing.expectEqualStrings("Loop 1 failed (2 of 3 before it pauses).", app.notices.items[1]);
     try std.testing.expectEqualStrings("Loop 1 paused after 3 failed runs. Fix the cause, then run /loop resume 1.", app.notices.items[2]);
 
+    try Runtime(FakeApp).writeList(&app, &app.main_agent);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[3], "paused after 3 failed runs · /loop resume 1") != null);
+
     // Resuming runs the loop at once, so the fix shows up without waiting.
-    try Runtime(FakeApp).resumeLoop(&app, &app.main_agent, 1);
-    try std.testing.expectEqualStrings("Resumed loop 1. It runs now, then every 1m.", app.notices.items[3]);
+    try Runtime(FakeApp).resumeLoops(&app, &app.main_agent, .{ .id = 1 });
+    try std.testing.expectEqualStrings("Resumed loop 1. It runs now, then every 1m.", app.notices.items[4]);
     try std.testing.expect(app.main_agent.loops.nextDue(app_permission_runtime.monotonicMillis()) != null);
+
+    // A pause by the user says so in the list, and resume undoes it.
+    try Runtime(FakeApp).pauseLoops(&app, &app.main_agent, .{ .id = 1 });
+    try std.testing.expectEqualStrings("Paused loop 1. /loop resume 1 restarts it.", app.notices.items[5]);
+    try Runtime(FakeApp).pauseLoops(&app, &app.main_agent, .{ .id = 1 });
+    try std.testing.expectEqualStrings("Loop 1 is already paused.", app.notices.items[6]);
+    try Runtime(FakeApp).writeList(&app, &app.main_agent);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[7], "paused by you · /loop resume 1") != null);
+    try Runtime(FakeApp).resumeLoops(&app, &app.main_agent, .all);
+    try std.testing.expectEqualStrings("Resumed loop 1. It runs now, then every 1m.", app.notices.items[8]);
+    try Runtime(FakeApp).resumeLoops(&app, &app.main_agent, .all);
+    try std.testing.expectEqualStrings("No paused loops.", app.notices.items[9]);
+    try Runtime(FakeApp).removeLoops(&app, &app.main_agent, .{ .id = 1 });
+    try std.testing.expectEqualStrings("Removed loop 1.", app.notices.items[10]);
 }
 
 test "loop completion offers starters, then stop and resume for live loops" {
@@ -452,15 +542,28 @@ test "loop completion offers starters, then stop and resume for live loops" {
     for (0..loops.pause_after_failures) |_| _ = set.noteAdmissionFailed(&set.items.items[1], 0);
 
     const entries = try buildCompletion(arena.allocator(), &set);
-    const expected = [_][]const u8{ "/loop 10m", "/loop 1h", "/loop 1d", "/loop stop", "/loop resume", "/loop stop 1", "/loop stop 2", "/loop stop all", "/loop resume 2" };
+    // Loop 1 runs and loop 2 is paused: pause offers only loop 1, resume
+    // only loop 2, and remove both.
+    const expected = [_][]const u8{
+        "/loop 10m",        "/loop 1h",        "/loop 1d",       "/loop pause",      "/loop resume",   "/loop remove",
+        "/loop pause 1",    "/loop pause all", "/loop resume 2", "/loop resume all", "/loop remove 1", "/loop remove 2",
+        "/loop remove all",
+    };
     try std.testing.expectEqual(expected.len, entries.len);
     for (expected, entries) |full, entry| try std.testing.expectEqualStrings(full, entry.full);
-    try std.testing.expect(entries[3].has_args and entries[4].has_args);
-    try std.testing.expect(!entries[5].has_args);
-    try std.testing.expectEqualStrings("every 1h · say hi", entries[5].description.?);
-    try std.testing.expect(std.mem.startsWith(u8, entries[6].description.?, "every 1m · paused · p"));
-    // A prompt never reaches the menu with a raw escape byte.
-    try std.testing.expect(std.mem.findScalar(u8, entries[6].description.?, 0x1b) == null);
-    try std.testing.expectEqualStrings("end every loop", entries[7].description.?);
+    for (entries[3..6]) |verb| try std.testing.expect(verb.has_args);
+    try std.testing.expectEqualStrings("delete a loop, or all of them", entries[5].description.?);
+    try std.testing.expect(!entries[6].has_args);
+    try std.testing.expectEqualStrings("every 1h · say hi", entries[6].description.?);
+    try std.testing.expectEqualStrings("pause every loop", entries[7].description.?);
     try std.testing.expect(std.mem.startsWith(u8, entries[8].description.?, "every 1m · p"));
+    try std.testing.expectEqualStrings("restart every paused loop", entries[9].description.?);
+    try std.testing.expect(std.mem.startsWith(u8, entries[11].description.?, "every 1m · paused · p"));
+    // A prompt never reaches the menu with a raw escape byte.
+    try std.testing.expect(std.mem.findScalar(u8, entries[11].description.?, 0x1b) == null);
+    try std.testing.expectEqualStrings("delete every loop", entries[12].description.?);
+
+    // With every loop paused, the menu stops offering pause.
+    _ = try set.pause(.all);
+    for (try buildCompletion(arena.allocator(), &set)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.full, "/loop pause"));
 }
