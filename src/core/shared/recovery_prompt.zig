@@ -1,10 +1,14 @@
-//! The prompts fx sends on its own to get a turn going again: "Summarize what
-//! you just did." after silent tool steps, a request to continue after a reply
-//! with no text and no tool call (`src/core/agent/runtime/orchestrator.zig`
-//! `appendContinuationPrompt`), and the request to go on from the last tool
-//! result after a model refuses to continue an assistant message; and review
-//! mode's request to look over the changes just made
-//! (`src/core/agent/runtime/tool_batch.zig` `appendReviewContinuationSuffix`).
+//! The messages fx sends the model on its own: the prompts that get a turn going
+//! again, "Summarize what you just did." after silent tool steps, a request to
+//! continue after a reply with no text and no tool call
+//! (`src/core/agent/runtime/orchestrator.zig` `appendContinuationPrompt`), and
+//! the request to go on from the last tool result after a model refuses to
+//! continue an assistant message; review mode's request to look over the
+//! changes just made (`src/core/agent/runtime/tool_batch.zig`
+//! `appendReviewContinuationSuffix`); a tool's notice to the model, such as the
+//! one Vision hands over when it could not read an image
+//! (`src/core/agent/runtime/tool_batch.zig` `appendToolNotice`); and the
+//! message a Stop hook sends to continue the turn.
 //!
 //! A turn saves each one in its steering list at the boundary where it sent
 //! it, so the next turn's request starts with every message the last request
