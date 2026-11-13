@@ -540,6 +540,17 @@ function tokenPassEnv(fixture: { home: string }, gateway: { baseUrl: string; cha
 
 const chatModelOf = (request: { headers: Headers }) => request.headers.get("ai-language-model-id");
 
+/// The answers saved in the profile's `token-pass.json`, one per team.
+function savedTokenPassAnswers(home: string): string[] {
+  const path = join(home, ".fx", "token-pass.json");
+  if (!existsSync(path)) return [];
+  try {
+    return Object.values(JSON.parse(readFileSync(path, "utf8")).teams ?? {}) as string[];
+  } catch {
+    return [];
+  }
+}
+
 // The menu matcher searches skill paths, so this fixture's home directory must
 // not contain the substring "home": a "home" path segment would make the
 // query HOME match every installed skill.
@@ -3507,7 +3518,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-p");
       const plain = await waitForModelsMenu(session, 4);
       expect(plain.join("\n")).not.toContain("All Models");
-      expect(plain.find((line) => !isComposerLine(line) && line.includes("deepseek/deepseek-v4.1-flash"))).toContain("Fast mode");
+      // The transcript's Token Pass default line also names the model; read
+      // the picker's row.
+      expect(plain.find((line) => !isComposerLine(line) && !line.includes("Token Pass is active") && line.includes("deepseek/deepseek-v4.1-flash"))).toContain("Fast mode");
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
 
@@ -3822,6 +3835,170 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
       expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  for (const chosen of [null, "provider/plain-model"] as const) {
+    test(
+      chosen === null
+        ? "a team with Token Pass and no chosen model starts on the Token Pass default model"
+        : "a chosen model stays when the team has Token Pass",
+      async () => {
+        const fixture = createModelsMenuFixture();
+        const tokenPassDefault = "deepseek/deepseek-v4.1-flash";
+        let creditsReplies = 0;
+        gateway = startFakeGateway([], {
+          models: [
+            { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+            { id: tokenPassDefault, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+          ],
+          usage: (url) => {
+            if (url.pathname !== "/coding-agent/v1/credits") return null;
+            creditsReplies += 1;
+            return Response.json({
+              balance: "12.50",
+              total_used: "1.25",
+              token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+            });
+          },
+        });
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath: fixture.stderrPath,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-token-pass-default-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+            FX_MODEL: chosen ?? undefined,
+            FX_AUTO_UPGRADE: "0",
+          },
+          width: 140,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+
+        const notice = `Token Pass is active, so fx uses ${tokenPassDefault}. Change it with /model.`;
+        if (chosen === null) {
+          await session.waitForText(notice, 10_000);
+          await session.waitForPane((pane) => pane.includes("deepseek-v4.1-flash"), 5_000);
+          expect(creditsReplies).toBe(1);
+          // The run uses the default; it is not saved as the user's choice.
+          const settingsPath = join(fixture.home, ".fx", "settings.json");
+          const saved = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : "";
+          expect(saved).not.toContain(tokenPassDefault);
+        } else {
+          // fx still learns the team's Token Pass, for the picker and side
+          // calls, but the chosen model keeps its place.
+          await session.waitForPane(() => savedTokenPassAnswers(fixture.home).includes("has_pass"), 10_000);
+          await session.waitForComposer(5_000);
+          expect(creditsReplies).toBe(1);
+          expect(await session.capturePane()).toContain("plain-model");
+          expect(await session.captureFullScrollback()).not.toContain(notice);
+        }
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      },
+      TEST_TIMEOUT,
+    );
+  }
+
+  test(
+    "a resumed session keeps its own model when the team has Token Pass",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const chosen = "provider/plain-model";
+      let creditsReplies = 0;
+      let hasTokenPass = false;
+      const usage = (url: URL) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        creditsReplies += 1;
+        return Response.json({
+          balance: "12.50",
+          total_used: "1.25",
+          token_pass: hasTokenPass ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
+        });
+      };
+      const models = [
+        { id: chosen, type: "language", released: 200, tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+      ];
+      const env = {
+        HOME: fixture.home,
+        AI_GATEWAY_API_KEY: "fake-token-pass-resume-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+      };
+
+      // Before the team has Token Pass, the user picks a model; the session
+      // saves it with its own preferences.
+      gateway = startFakeGateway([fakeGatewayFinalText("RESUME_MODEL_REPLY")], { models, usage });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          ...env,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForPane(() => creditsReplies === 1, 10_000);
+      await session.sendText(`/model ${chosen}`);
+      await session.waitForText(`Switched to ${chosen}`, 10_000);
+      await session.sendText("remember this model");
+      await session.waitForText("RESUME_MODEL_REPLY", 15_000);
+      await session.waitForStableComposer();
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      const sessionIds = savedSessionIds(fixture.home);
+      expect(sessionIds).toHaveLength(1);
+      gateway.stop();
+
+      // The profile no longer names a model, and the team now has Token
+      // Pass. The resumed session still runs its own model, so fx learns
+      // the team's Token Pass but does not move it to the Token Pass default.
+      writeFileSync(fixture.settingsPath, "{}\n");
+      hasTokenPass = true;
+      creditsReplies = 0;
+      gateway = startFakeGateway([], { models, usage });
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          ...env,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForPane((pane) => pane.includes("plain-model"), 5_000);
+      await session.waitForPane(() => savedTokenPassAnswers(fixture.home).includes("has_pass"), 10_000);
+      await session.waitForComposer(5_000);
+      expect(creditsReplies).toBe(1);
+      expect(await session.capturePane()).toContain("plain-model");
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

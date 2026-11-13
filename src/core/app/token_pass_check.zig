@@ -133,7 +133,7 @@ pub const Check = struct {
             debug_trace.logf("token_pass", "check skipped reason=no_token saved={s}", .{answerLabel(saved)});
             return;
         }
-        _ = self.lookup.start(provider, input, null) catch |err| {
+        _ = self.lookup.start(provider, input, null, 0) catch |err| {
             debug_trace.logf("token_pass", "check start failed err={s}", .{@errorName(err)});
             return;
         };
@@ -293,7 +293,7 @@ pub fn Runtime(comptime App: type) type {
                 .credential_source = credential.source,
                 .tenant = credential.gateway_team,
             };
-            _ = state.lookup.start(app.creditsProvider(), input, null) catch |err| {
+            _ = state.lookup.start(app.creditsProvider(), input, null, 0) catch |err| {
                 debug_trace.logf("token_pass", "check start failed err={s}", .{@errorName(err)});
                 state.start_settled = true;
                 return;
@@ -395,6 +395,11 @@ pub fn Runtime(comptime App: type) type {
             // Token Pass credit pays only for standard speed; the built-in
             // default goes back to the speed the profile chose.
             try session_commands.Commands(App).adoptStartModel(app, agent, target, if (has_pass) false else seed.fast_mode);
+            if (has_pass) try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .neutral,
+                .body = token_pass.default_model_notice,
+            }, true);
         }
     };
 }

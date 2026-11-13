@@ -128,6 +128,7 @@ fn checkStep(before: tw.State, event: tw.Event, out: tw.Output, world: *World) !
             try std.testing.expect(range.to <= after.cycle_first); // L2
             if (config.saved) try std.testing.expect(range.to <= world.log_saved); // L3
             try std.testing.expect(!after.turn_open); // L18
+            try std.testing.expect(event != .compacted); // L22
         },
         .paint_final => |seq| {
             try std.testing.expectEqual(after.next_seq - 1, seq); // L5
@@ -148,7 +149,9 @@ fn checkStep(before: tw.State, event: tw.Event, out: tw.Output, world: *World) !
         else => {},
     };
     // L1
-    if (!after.turn_open and (!config.saved or after.saved_through >= after.cycle_first)) try std.testing.expect(after.prev_first == null);
+    if (!after.turn_open and !after.prev_waits_turn_end and (!config.saved or after.saved_through >= after.cycle_first)) try std.testing.expect(after.prev_first == null);
+    // L22
+    if (after.prev_waits_turn_end) try std.testing.expect(after.prev_first != null);
     if (after.reprinting) {
         // L6
         try std.testing.expect(after.heldFirst() <= after.painted_through and after.painted_through <= after.next_seq);
@@ -197,7 +200,7 @@ fn driveCore(draws: anytype) !void {
             const after = out.state;
             try std.testing.expectEqual(world.log_saved, after.next_seq);
             try std.testing.expectEqual(world.log_saved, after.saved_through);
-            try std.testing.expect(after.prev_first == null and after.live.len == 0 and !after.turn_open);
+            try std.testing.expect(after.prev_first == null and !after.prev_waits_turn_end and after.live.len == 0 and !after.turn_open);
             try std.testing.expect(!after.ctrlo.open and after.ctrlo.pending == 0);
         }
         if (event == .compacted) world.addStart(before.next_seq);

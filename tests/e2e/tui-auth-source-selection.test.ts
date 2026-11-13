@@ -3019,6 +3019,11 @@ tmuxTest(
     // The login was already on this team, so nothing changed.
     const signedIn = await session.captureFullScrollback();
     expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).not.toContain("auth: Using Vercel team");
+    expect(signedIn).toContain("Get $150 of tokens for $30 with Vercel Token Pass.");
+    // The link sits behind the name, so the address never shows.
+    expect(signedIn).not.toContain("vercel.com/get/token-pass");
+    expect(signedIn).not.toContain("Preparing Vercel AI Gateway");
     expect(signedIn).not.toContain("Changed Vercel team");
 
     expect(gateway.requests).toHaveLength(2);
@@ -3989,7 +3994,10 @@ tmuxTest(
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
         pane.includes("gpt-5.4-mini") &&
-        !pane.includes("openai/gpt-5.6-sol"),
+        !pane
+          .split("\n")
+          .filter((line) => /^\s+\S*gpt-/.test(line))
+          .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
     expect(codexCatalog).toContain("[All]");

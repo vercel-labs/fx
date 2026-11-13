@@ -502,6 +502,9 @@ pub const Runtime = struct {
     /// to `token_pass_team`. Main thread only, so the mutex does not guard
     /// it.
     token_pass: token_pass_mod.Tracker = .{},
+    /// Counts credential changes, so a credits reply that started for an
+    /// earlier credential does not speak for this one.
+    token_pass_epoch: u32 = 0,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -701,6 +704,7 @@ pub const Runtime = struct {
         }
         self.token_pass = .{};
         token_pass_team.clear();
+        self.token_pass_epoch +%= 1;
     }
 
     /// Starts this credential's status from the answer fx saved for its

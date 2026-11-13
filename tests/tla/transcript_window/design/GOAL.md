@@ -40,7 +40,7 @@ Each criterion is a check that passes.
 | G7 | Ctrl+O opens on the newest blocks from memory without reading the log; scrolling past memory reads the log; it never holds more than `Window` blocks or more than one read. | TLC invariants `CtrlOWindowBound`, `OneReadInFlight`, `OpenReadsNothing` |
 | G8 | A stale, duplicate, lost, or reordered log read changes nothing it should not. | TLC invariant `StaleReadIgnored`; fault actions in the model and the drivers |
 | G9 | Scrolling up in Ctrl+O reaches the start of the session when reads keep answering. | TLC property `CtrlOReachesStart` |
-| G10 | After a compaction, the previous cycle is dropped once its turn has ended and the log holds it. | TLC property `PreviousCycleDropped` |
+| G10 | After a compaction, the previous cycle is dropped once the next turn has ended and the log holds it. | TLC property `PreviousCycleDropped` |
 | G11 | The core is pure: it imports only `std`, reads no clock, does no I/O. | `verify` source check on `transcript_window.zig` |
 | G12 | A crash keeps only what the log holds, and recovery holds exactly the last cycle. | TLC invariant `RecoveredFromLog`; crash actions in the drivers |
 

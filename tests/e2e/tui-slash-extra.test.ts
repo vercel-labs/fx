@@ -145,6 +145,9 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
             AI_GATEWAY_API_KEY: "credits-fake-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_TEST_GATEWAY_CREDITS_URL: gateway.url,
+            // A chosen model skips the startup Token Pass check, so the only
+            // credits requests are the ones /credits sends.
+            FX_MODEL: FAKE_GATEWAY_MODEL,
           },
           width: 120,
           height: 40,
@@ -194,6 +197,9 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
             AI_GATEWAY_API_KEY: "credits-fake-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_TEST_GATEWAY_CREDITS_URL: gateway.url,
+            // A chosen model skips the startup Token Pass check, so the only
+            // credits requests are the ones /credits sends.
+            FX_MODEL: FAKE_GATEWAY_MODEL,
           },
           stderrPath,
           width: 120,

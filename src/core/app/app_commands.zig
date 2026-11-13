@@ -1321,10 +1321,15 @@ pub fn Handlers(comptime App: type) type {
             };
             var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
-            try writeCreditsNotice(app, snapshot);
+            try writeCreditsNotice(app, snapshot, .current_credential);
         }
 
-        fn startCreditsLookup(app: *App) !void {
+        const CreditsLookupArgs = struct {
+            input: gateway_provider.CreditsLookupInput,
+            renewal: ?credits_lookup.Renewal,
+        };
+
+        fn creditsLookupArgs(app: *App) CreditsLookupArgs {
             // A due token still names the session; the task renews it before
             // asking for credits.
             const queued = app.auth.queuedPromptCredential();
@@ -1336,12 +1341,19 @@ pub fn Handlers(comptime App: type) type {
                     null
             else
                 null;
-            const input: gateway_provider.CreditsLookupInput = .{
-                .credential = if (queued) |credential| credential.api_key else null,
-                .credential_source = source,
-                .tenant = if (queued) |credential| credential.gateway_team else null,
+            return .{
+                .input = .{
+                    .credential = if (queued) |credential| credential.api_key else null,
+                    .credential_source = source,
+                    .tenant = if (queued) |credential| credential.gateway_team else null,
+                },
+                .renewal = renewal,
             };
-            const started = app.credits_lookup.start(app.creditsProvider(), input, renewal) catch |err| {
+        }
+
+        fn startCreditsLookup(app: *App) !void {
+            const args = creditsLookupArgs(app);
+            const started = app.credits_lookup.start(app.creditsProvider(), args.input, args.renewal, tokenPassEpoch(app)) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
                 return app.writeDomainNotice(.{
@@ -1367,10 +1379,30 @@ pub fn Handlers(comptime App: type) type {
             var result = app.credits_lookup.take() orelse return;
             defer result.deinit();
             if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
-            try writeCreditsNotice(app, result.snapshot);
+            // A reply that started before the credential changed says
+            // nothing about the current team's Token Pass.
+            const current = result.epoch == tokenPassEpoch(app);
+            if (!current) debug_trace.logf("credits", "token pass reply ignored reason=credential_changed", .{});
+            try writeCreditsNotice(app, result.snapshot, if (current) .current_credential else .earlier_credential);
         }
 
-        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {
+        fn tokenPassEpoch(app: *App) u32 {
+            if (comptime !@hasField(App, "model_cache")) return 0;
+            return app.model_cache.token_pass_epoch;
+        }
+
+        /// Which credential a credits reply belongs to.
+        const ReplyFor = enum {
+            /// The credential fx uses now: the reply may update Token Pass state.
+            current_credential,
+            /// An earlier credential: show the reply, but it says nothing
+            /// about the current team.
+            earlier_credential,
+        };
+
+        /// Writes the credits notice, and records what it says about Token
+        /// Pass when it belongs to the current credential.
+        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot, reply_for: ReplyFor) !void {
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
@@ -1385,6 +1417,7 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
+            if (reply_for == .earlier_credential) return;
             if (comptime @hasField(App, "model_cache")) {
                 if (snapshot.err_message == null) {
                     if (token_pass_check.answerOf(snapshot)) |answer| {

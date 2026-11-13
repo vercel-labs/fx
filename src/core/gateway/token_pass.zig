@@ -18,6 +18,9 @@ const std = @import("std");
 /// and nothing else chose the model.
 pub const default_model = "deepseek/deepseek-v4.1-flash";
 
+/// What fx says when it starts a session on `default_model`.
+pub const default_model_notice = "Token Pass is active, so fx uses " ++ default_model ++ ". Change it with /model.";
+
 /// The most Token Pass models fx keeps for a team, and the longest model ID.
 /// A team's pass pays for a handful of models; a mark past either limit is
 /// dropped, and the trace says so.
@@ -123,6 +126,15 @@ pub fn identity(buf: *[identity_len]u8, kind: IdentityKind, subject: []const u8,
 
 /// The provider AI Gateway reports for a request Token Pass served.
 const provider_slug = "token-pass";
+
+/// Where a team buys Token Pass.
+pub const purchase_url = "https://vercel.com/get/token-pass";
+
+/// The dim line under the Vercel team notice for a team that fx does not know
+/// has an active Token Pass.
+/// "Vercel Token Pass" is an OSC 8 link to `purchase_url`, so the terminal
+/// shows the name and not the address.
+pub const offer_line = "Get $150 of tokens for $30 with \x1b]8;;" ++ purchase_url ++ "\x1b\\Vercel Token Pass\x1b]8;;\x1b\\.";
 
 /// The dashboard's Token Pass tab, which shows the remaining credit and the
 /// reset date. Vercel fills in the signed-in team for `[team]`.
