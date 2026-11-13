@@ -13,6 +13,7 @@ const js_host_auth = @import("js_host_auth.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -43,11 +44,16 @@ pub const LoginError = error{
 const LogoutError = error{SessionDeleteFailed};
 
 pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
+/// `remote_revocation_warning`, when the session's tokens are kept and fx
+/// revokes them later (`pending_revocation`).
+pub const remote_revocation_retry_warning = remote_revocation_warning ++ " " ++ pending_revocation.retry_later ++ ".";
 
 pub const LogoutResult = struct {
     session_deleted: bool = false,
     local_durability_failed: bool = false,
     remote_revocation_failed: bool = false,
+    /// The unconfirmed revocation's tokens are kept, and fx revokes them later.
+    retry_kept: bool = false,
 };
 
 pub const Team = struct {
@@ -733,7 +739,9 @@ fn completeSignIn(
     var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
-    const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
+    // The new login starts on the person's team, so the team picker selects
+    // it and closing the picker keeps it.
+    const session = try take_login_session(alloc, issuer_url, client_id, token, savedLoginTeam(alloc, teams.items), now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
@@ -783,7 +791,8 @@ pub fn runLogin(
 
     var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
-    const selected_team_index = try selectTeam(alloc, teams.items, null);
+    const saved_team = savedLoginTeam(alloc, teams.items);
+    const selected_team_index = try selectTeam(alloc, teams.items, if (saved_team) |team| team.id else null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
 
     const now_ms = io_mod.milliTimestamp();
@@ -801,6 +810,51 @@ pub fn runLogin(
         debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
         return signInPersistenceError(err);
     };
+}
+
+/// The team a new fx login starts on, so signing in again keeps the person's
+/// team instead of the first team of the list: the saved login's team, else
+/// the team fx kept when it retired the last login (`oauth_session.loadKeptTeam`),
+/// when the new account's list has it. Null means the first team; the trace
+/// says why, without naming the team.
+fn savedLoginTeam(alloc: Allocator, teams: []const Team) ?*const Team {
+    if (teams.len == 0) return null;
+    var saved = oauth_session.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "saved login not read for the team choice err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (saved) |*session| session.deinit(alloc);
+    if (saved) |session| {
+        if (session.team_id != null or session.team_slug != null) {
+            return startingTeam(teams, session.team_id, session.team_slug, "saved_login");
+        }
+    }
+    var kept = oauth_session.loadKeptTeam(alloc) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=no_known_team", .{});
+        return null;
+    };
+    defer kept.deinit(alloc);
+    return startingTeam(teams, kept.id, kept.slug, "kept_team");
+}
+
+fn startingTeam(teams: []const Team, id: ?[]const u8, slug: ?[]const u8, comptime source: []const u8) ?*const Team {
+    const team = teamIn(teams, id, slug) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=" ++ source ++ "_not_in_list", .{});
+        return null;
+    };
+    debug_trace.logf("auth", "sign-in starts on a known team source=" ++ source, .{});
+    return team;
+}
+
+/// The team in `teams` with the id `id`, else with the slug `slug`.
+fn teamIn(teams: []const Team, id: ?[]const u8, slug: ?[]const u8) ?*const Team {
+    if (id) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.id, value)) return team;
+    };
+    if (slug) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.slug, value)) return team;
+    };
+    return null;
 }
 
 fn take_login_session(
@@ -907,9 +961,13 @@ pub fn logout(
     var result = local.result;
     if (local.session) |session| {
         if (before_revocation) |notice| notice.run(notice.context);
-        revokeLoggedOutSession(alloc, transport, session) catch {
+        revokeLoggedOutSession(alloc, transport, session) catch |err| {
             result.remote_revocation_failed = true;
+            result.retry_kept = local.kept and pending_revocation.retryable(err);
+            if (local.kept and !result.retry_kept) pending_revocation.forget(alloc, .fx_login, session.refresh_token);
+            return result;
         };
+        if (local.kept) pending_revocation.forget(alloc, .fx_login, session.refresh_token);
     }
     return result;
 }
@@ -921,6 +979,9 @@ pub const LocalLogout = struct {
     /// Owned by the caller when set; release it with `Session.deinit` using
     /// the allocator passed to `logoutLocally`.
     session: ?oauth_session.Session = null,
+    /// Whether `session`'s tokens are kept to revoke later
+    /// (`pending_revocation`). Forget them once the revocation is confirmed.
+    kept: bool = false,
 };
 
 /// Deletes the saved fx login session without contacting the issuer. Revoke
@@ -928,6 +989,7 @@ pub const LocalLogout = struct {
 pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
+    var kept = false;
     const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
@@ -940,10 +1002,25 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
                 break :load null;
             },
         };
-        break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
+        // Kept before the login is deleted, so a revocation that never
+        // completes still leaves the tokens for a later retry.
+        if (session) |loaded| kept = pending_revocation.keep(alloc, .fx_login, keptTokens(loaded));
+        const deleted = mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
         };
+        // Signing out forgets the team fx kept for the next sign-in.
+        if (mutation.forgetTeam()) |forgotten| {
+            if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=logout", .{});
+        } else |err| {
+            debug_trace.logf("auth", "kept team not forgotten err={s}", .{@errorName(err)});
+        }
+        break :blk deleted;
     };
+    if (kept and !delete_result.session_deleted) {
+        // The login is still saved, so its tokens must not be revoked later.
+        pending_revocation.forget(alloc, .fx_login, session.?.refresh_token);
+        kept = false;
+    }
     return .{
         .result = .{
             .session_deleted = delete_result.session_deleted,
@@ -951,7 +1028,33 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
             .remote_revocation_failed = session_load_failed,
         },
         .session = session,
+        .kept = kept,
     };
+}
+
+fn keptTokens(session: oauth_session.Session) pending_revocation.Tokens {
+    return .{
+        .refresh_token = session.refresh_token,
+        .access_token = session.access_token,
+        .issuer = session.issuer,
+        .client_id = session.client_id,
+    };
+}
+
+/// Revokes the fx login sign-outs that earlier logouts kept because the
+/// issuer did not confirm them (`pending_revocation.retry`).
+pub fn retryKeptSignOuts(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) pending_revocation.RetryOutcome {
+    return pending_revocation.retry(alloc, .fx_login, .{ .context = &transport, .run = revokeKept }, before_revocation);
+}
+
+fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
+    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
+    if (tokens.access_token.len == 0 or tokens.issuer.len == 0 or tokens.client_id.len == 0) return error.KeptSignOutUnusable;
+    return revokeTokens(alloc, transport.*, tokens.issuer, tokens.client_id, tokens.refresh_token, tokens.access_token);
 }
 
 /// Revokes a signed-out session's refresh and access tokens at its issuer.
@@ -960,24 +1063,35 @@ pub fn revokeLoggedOutSession(
     transport: oauth_transport.Provider,
     session: oauth_session.Session,
 ) !void {
-    var metadata = try oauth.discover(alloc, transport, session.issuer);
+    return revokeTokens(alloc, transport, session.issuer, session.client_id, session.refresh_token, session.access_token);
+}
+
+fn revokeTokens(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer: []const u8,
+    client_id: []const u8,
+    refresh_token: []const u8,
+    access_token: []const u8,
+) !void {
+    var metadata = try oauth.discover(alloc, transport, issuer);
     defer metadata.deinit(alloc);
     const endpoint = metadata.revocation_endpoint orelse return error.RevocationEndpointMissing;
-    try oauth_session.validateE2EEndpoint(session.issuer, endpoint);
+    try oauth_session.validateE2EEndpoint(issuer, endpoint);
     const refresh_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.refresh_token,
+        client_id,
+        refresh_token,
         .refresh_token,
     );
     const access_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.access_token,
+        client_id,
+        access_token,
         .access_token,
     );
     try refresh_result;
@@ -1341,9 +1455,10 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     if (teams.len == 0) return null;
     if (teams.len == 1) return 0;
 
-    const default_index = defaultTeamIndex(teams, current);
+    const current_index = currentTeamIndex(teams, current);
+    const default_index = current_index orelse 0;
     const index = if (canUseInteractiveTeamPicker())
-        selectTeamInteractive(alloc, teams, default_index) catch |err| switch (err) {
+        selectTeamInteractive(alloc, teams, default_index, current_index) catch |err| switch (err) {
             error.NotATerminal => try selectTeamByLine(alloc, teams, default_index),
             else => return err,
         }
@@ -1352,12 +1467,12 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     return index;
 }
 
-fn defaultTeamIndex(teams: []const Team, current: ?[]const u8) usize {
-    const needle = current orelse return 0;
+fn currentTeamIndex(teams: []const Team, current: ?[]const u8) ?usize {
+    const needle = current orelse return null;
     for (teams, 0..) |team, i| {
         if (std.mem.eql(u8, team.id, needle) or std.mem.eql(u8, team.slug, needle)) return i;
     }
-    return 0;
+    return null;
 }
 
 fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
@@ -1383,7 +1498,9 @@ fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize)
     }
 }
 
-fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
+/// `current_index` is the team the login already uses, labeled "(current)";
+/// null when it has none in `teams`.
+fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize, current_index: ?usize) !usize {
     var raw = try TeamPickerRawMode.enable();
     defer raw.disable();
 
@@ -1392,17 +1509,17 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
     var selected = default_index;
     var first_render = true;
-    try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+    try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
 
     while (true) {
         switch (try readTeamPickerKey()) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .down => {
                 selected = if (selected + 1 == teams.len) 0 else selected + 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .enter => return selected,
             .cancel => return LoginError.InvalidTeamSelection,
@@ -1423,7 +1540,7 @@ fn renderTeamPicker(
     alloc: Allocator,
     teams: []const Team,
     selected: usize,
-    default_index: usize,
+    current_index: ?usize,
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
@@ -1434,7 +1551,7 @@ fn renderTeamPicker(
 
     for (teams, 0..) |team, i| {
         const prefix = if (i == selected) "  › " else "    ";
-        const marker = if (i == default_index) " (current)" else "";
+        const marker = if (current_index == i) " (current)" else "";
         try writeStdoutFmt("\x1b[2K{s}{d}. {s} ({s}){s}\n", .{ prefix, i + 1, team.name, team.slug, marker });
     }
     first_render.* = false;

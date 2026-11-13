@@ -8,6 +8,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
+const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const compactor = @import("../core/compactor/compactor.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
@@ -720,7 +721,7 @@ fn unavailableCall(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInpu
 }
 
 fn unsupported(ctx: tool_dispatch.DispatchContext) error{OutOfMemory}![]u8 {
-    return ctx.allocator.print("Unsupported tool: {s}", .{ctx.tool_call_name});
+    return ctx.allocator.print("Unsupported tool: {f}", .{model_context_encoding.scalar(ctx.tool_call_name)});
 }
 
 fn unavailableReadsOnly(_: tool_dispatch.ToolInput) bool {
@@ -754,6 +755,13 @@ test "without the tools' code, the registry keeps every tool's name and answers 
     const called = try entry.call(ctx, .{ .ptr = &unused, .deinit_fn = NoInput.deinit });
     defer called.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Unsupported tool: shell", called.failure);
+}
+
+test "the answer for a tool kept only by name writes the name as visible text" {
+    const odd = tool_dispatch.DispatchContext{ .allocator = std.testing.allocator, .tool_call_name = "sh\x1b[2J\x07\x00ell" };
+    const text = try unsupported(odd);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Unsupported tool: sh&#x1b;[2J&#x07;&#x00;ell", text);
 }
 
 pub const advertisement_order = [_][]const u8{
