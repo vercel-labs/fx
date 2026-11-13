@@ -3817,7 +3817,8 @@ test "the user's close ends a hosted subagent's turn that waits for a question's
     try expectTurnEnds(.question, .user_close);
 }
 
-fn askQuestionThread(worker: *worker_runtime.WorkerRuntime, returned: *std.atomic.Value(bool)) void {
+fn askQuestionThread(worker: *worker_runtime.WorkerRuntime, returned: *std.Io.Event) void {
+    defer returned.set(io_mod.getIo());
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
@@ -3825,7 +3826,16 @@ fn askQuestionThread(worker: *worker_runtime.WorkerRuntime, returned: *std.atomi
         for (answers) |answer| alloc.free(answer);
         alloc.free(answers);
     }
-    returned.store(true, .release);
+}
+
+/// Whether the thread that asked has returned, waited for on the event it sets,
+/// so a wait that does not end fails its test instead of hanging it.
+fn askerReturned(event: *std.Io.Event) bool {
+    event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(5000),
+    } }) catch return false;
+    return true;
 }
 
 test "the parent's stop ends a question that waits in a turn the user typed on a hosted subagent's screen" {
@@ -3852,15 +3862,11 @@ test "the parent's stop ends a question that waits in a turn the user typed on a
     try std.testing.expect(hosted.beginDirectProcessing(9));
     const work_id = runtime.beginUserWork(alloc, child_id, &hosted).?;
     defer alloc.free(work_id);
-    var returned = std.atomic.Value(bool).init(false);
+    var returned: std.Io.Event = .unset;
     const thread = try std.Thread.spawn(.{}, askQuestionThread, .{ &hosted, &returned });
     try waitForBlockedOnUser(&hosted);
     _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-2", null);
-    for (0..5000) |_| {
-        if (returned.load(.acquire)) break;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    const ended = returned.load(.acquire);
+    const ended = askerReturned(&returned);
     // A wait that stayed open is released, so the test fails instead of hanging.
     if (!ended) hosted.requestStop();
     thread.join();
