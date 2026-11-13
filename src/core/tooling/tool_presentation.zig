@@ -71,7 +71,7 @@ pub fn subagentAction(
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     // Every other action says what it does to whom, with nothing to preview.
     if (action_words.get(action)) |words| {
-        const named = tool_args.optionalStringArg(args, "agent");
+        const named = namedAgent(args, action);
         // A call that concerns every subagent, a wait or a status that names
         // none, names them when its host listed them in the call's
         // `resolved_display_target`; without the list it says "subagents".
@@ -162,8 +162,18 @@ pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?Subagen
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     if (std.mem.eql(u8, action, "wait")) return .working;
-    if (std.mem.eql(u8, action, "status") and tool_args.optionalStringArg(args, "agent") == null) return .open;
+    if (std.mem.eql(u8, action, "status") and namedAgent(args, action) == null) return .open;
     return null;
+}
+
+/// The `agent` a `subagent` call of `action` names, or null. The decoder reads
+/// an empty `agent` on a `status` or a `wait` as none, so such a call's row
+/// reads as it does without the key. A `stop`, `close`, or `message` needs an
+/// agent, so for those an empty one stays as written.
+fn namedAgent(args: std.json.ObjectMap, action: []const u8) ?[]const u8 {
+    const agent = tool_args.optionalStringArg(args, "agent") orelse return null;
+    const optional = std.mem.eql(u8, action, "status") or std.mem.eql(u8, action, "wait");
+    return if (agent.len == 0 and optional) null else agent;
 }
 
 /// The `agent` a `subagent` call names, read from its arguments while they
@@ -331,6 +341,63 @@ test "only a wait and a status that names no agent concern every subagent" {
     for (cases) |case| {
         try std.testing.expectEqual(case.roster, try subagentRoster(alloc, .{ .id = "c", .name = case.name, .arguments_json = case.args }));
     }
+}
+
+test "an empty field the decoder reads as absent leaves every subagent row as it is without the field" {
+    const alloc = std.testing.allocator;
+    const all_five = "\"instructions\":\"\",\"report\":\"\",\"model\":\"\",\"effort\":\"\",\"profile\":\"\"";
+    // Each pair is one call with and without its empty field, flat and inside
+    // the `request` object.
+    const pairs = [_]struct { without: []const u8, empty: []const u8 }{
+        .{ .without = "{\"action\":\"status\"}", .empty = "{\"action\":\"status\",\"agent\":\"\"}" },
+        .{ .without = "{\"request\":{\"action\":\"status\"}}", .empty = "{\"request\":{\"action\":\"status\",\"agent\":\"\"}}" },
+        .{ .without = "{\"action\":\"wait\"}", .empty = "{\"action\":\"wait\",\"agent\":\"\"}" },
+        .{ .without = "{\"request\":{\"action\":\"wait\"}}", .empty = "{\"request\":{\"action\":\"wait\",\"agent\":\"\"}}" },
+        .{
+            .without = "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"}",
+            .empty = "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"," ++ all_five ++ "}",
+        },
+        .{
+            .without = "{\"request\":{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"}}",
+            .empty = "{\"request\":{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"," ++ all_five ++ "}}",
+        },
+    };
+    const states = [_]SubagentActionState{ .active, .pending, .identity, .completed, .{ .stopped = "Failed" }, .{ .feedback = .queued } };
+    const saved_result = "{\"ok\":true,\"result\":\"r\",\"error_code\":null,\"subagents\":[\"reviewer\",\"builder\"]}";
+    for (pairs) |pair| {
+        const without: ToolCall = .{ .id = "c", .name = "subagent", .arguments_json = pair.without };
+        const empty: ToolCall = .{ .id = "c", .name = "subagent", .arguments_json = pair.empty };
+        // The row names no roster, or the one its host listed.
+        for ([_]?[]const u8{ null, "reviewer, builder" }) |target| {
+            var left = without;
+            var right = empty;
+            left.resolved_display_target = target;
+            right.resolved_display_target = target;
+            for (states) |state| {
+                const a = (try subagentAction(alloc, left, state)).?;
+                defer a.deinit(alloc);
+                const b = (try subagentAction(alloc, right, state)).?;
+                defer b.deinit(alloc);
+                try std.testing.expectEqualStrings(a.label, b.label);
+                try std.testing.expectEqualStrings(a.detail, b.detail);
+            }
+        }
+        try std.testing.expectEqual(try subagentRoster(alloc, without), try subagentRoster(alloc, empty));
+        // The line a saved result gives its row after a resume.
+        const line_without = try subagentStatusLine(alloc, without, saved_result);
+        defer if (line_without) |value| alloc.free(value);
+        const line_empty = try subagentStatusLine(alloc, empty, saved_result);
+        defer if (line_empty) |value| alloc.free(value);
+        if (line_without) |want| {
+            try std.testing.expectEqualStrings(want, line_empty orelse return error.TestExpectedLine);
+        } else {
+            try std.testing.expect(line_empty == null);
+        }
+    }
+    // The row of a status with no agent is the one the empty agent used to lose.
+    const status = (try subagentAction(alloc, .{ .id = "c", .name = "subagent", .arguments_json = "{\"action\":\"status\",\"agent\":\"\"}" }, .active)).?;
+    defer status.deinit(alloc);
+    try std.testing.expectEqualStrings("checking subagents", status.label);
 }
 
 /// The preview a subagent row shows for `raw`: runs of whitespace, line

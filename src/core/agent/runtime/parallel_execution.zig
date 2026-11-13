@@ -54,7 +54,10 @@ fn subagentTarget(arena: Allocator, call: ToolCall) SubagentTarget {
     const Arguments = struct { request: ?struct { agent: ?[]const u8 = null } = null };
     const parsed = json_decode.parseFromSliceLeaky(Arguments, arena, call.arguments_json, .{ .ignore_unknown_fields = true }) catch return .unknown;
     const request = parsed.request orelse return .unknown;
-    return if (request.agent) |agent| .{ .named = agent } else .none;
+    // An empty name is no name. A status or a wait reads an empty `agent` as
+    // none, and any other call with one is refused before it acts.
+    const agent = request.agent orelse return .none;
+    return if (agent.len == 0) .none else .{ .named = agent };
 }
 
 /// Leading subagent calls that may run together. Calls to one subagent run
@@ -758,6 +761,34 @@ test "parallel classifier keeps one leading registered subagent group" {
     try std.testing.expectEqual(@as(usize, 2), group.len);
 }
 
+test "a status or wait with an empty agent names no subagent, as one without the key" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.subagent, builtin_tools.read_file };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const status_empty = "{\"request\":{\"action\":\"status\",\"agent\":\"\"}}";
+    const wait_empty = "{\"request\":{\"action\":\"wait\",\"agent\":\"\"}}";
+    try std.testing.expect(subagentTarget(arena, toolCall("c", "subagent", status_empty)) == .none);
+    try std.testing.expect(subagentTarget(arena, toolCall("c", "subagent", wait_empty)) == .none);
+    try std.testing.expect(subagentTarget(arena, toolCall("c", "subagent", "{\"request\":{\"action\":\"status\"}}")) == .none);
+    // A name is still a name.
+    switch (subagentTarget(arena, toolCall("c", "subagent", "{\"request\":{\"action\":\"status\",\"agent\":\"tester\"}}"))) {
+        .named => |name| try std.testing.expectEqualStrings("tester", name),
+        else => return error.TestExpectedNamed,
+    }
+    // Two of them in one step run together, as two without the key do.
+    const calls = [_]ToolCall{
+        toolCall("c1", "subagent", status_empty),
+        toolCall("c2", "subagent", wait_empty),
+        toolCall("c3", "subagent", status_empty),
+    };
+    const group = leadingParallelGroup(std.testing.allocator, registry, &calls);
+    try std.testing.expectEqual(GroupKind.subagent, group.kind);
+    try std.testing.expectEqual(@as(usize, 3), group.len);
+}
+
 test "parallel classifier admits approval-bearing web fetch read groups" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
@@ -1079,13 +1110,16 @@ test "fuzzed subagent calls never run two calls to one subagent at once" {
             "\x00\x04\x00",
             "\x02\x02\x00\x04\x08\x0c\x00",
             "\x03\x00\x07\x04\x0b\x0f",
+            // Two waits that name an empty agent run together, as two that name none.
+            "\x06\x06",
         }) ++ @import("fuzz_corpus").subagent_parallel_groups.*),
     });
 }
 
-/// Each byte is one call of a step. Its low two bits pick a message (0), a
-/// stop (1), or a wait (2) to agent `a0`..`a3` named by the next two bits,
-/// or (3) one of: arguments that aren't JSON, a message to `a1` spelled with
+/// Each byte is one call of a step. Its low two bits pick a message (0) or a
+/// stop (1) to agent `a0`..`a3` named by the next two bits, a wait (2) that
+/// names no agent, or an empty one when the third bit is set, or (3) one of:
+/// arguments that aren't JSON, a message to `a1` spelled with
 /// a JSON escape, a message to the parent, or a read_file call. The leading
 /// subagent group must stop before a call to an agent already in it, and a
 /// call whose agent can't be read runs alone, so calls to one subagent run
@@ -1109,7 +1143,7 @@ fn fuzzSubagentGroups(_: void, smith: *std.testing.Smith) anyerror!void {
         const call: ToolCall, const target: Target = switch (byte & 3) {
             0 => .{ toolCall(id, "subagent", try arena.print("{{\"request\":{{\"action\":\"message\",\"agent\":\"{s}\",\"message\":\"m\"}}}}", .{agent})), .{ .named = agent } },
             1 => .{ toolCall(id, "subagent", try arena.print("{{\"request\":{{\"action\":\"stop\",\"agent\":\"{s}\"}}}}", .{agent})), .{ .named = agent } },
-            2 => .{ toolCall(id, "subagent", "{\"request\":{\"action\":\"wait\"}}"), .none },
+            2 => .{ toolCall(id, "subagent", if (byte & 4 == 0) "{\"request\":{\"action\":\"wait\"}}" else "{\"request\":{\"action\":\"wait\",\"agent\":\"\"}}"), .none },
             else => switch ((byte >> 2) & 3) {
                 0 => .{ toolCall(id, "subagent", "{\"request\":"), .unknown },
                 1 => .{ toolCall(id, "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"a\\u0031\",\"message\":\"m\"}}"), .{ .named = "a1" } },
