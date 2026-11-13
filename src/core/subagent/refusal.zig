@@ -193,10 +193,10 @@ fn writeNotOpen(writer: *std.Io.Writer, agent: []const u8, open: []const []const
 }
 
 /// The refusal for a request that failed `model_contract.validateRequest`.
-/// `OutOfMemory` is the caller's to return.
-pub fn fromValidation(err: model_contract.ValidationError) Refusal {
+/// An `OutOfMemory` is no refusal, so it stays an error for the caller.
+pub fn fromValidation(err: model_contract.ValidationError) Allocator.Error!Refusal {
     return switch (err) {
-        error.OutOfMemory => unreachable,
+        error.OutOfMemory => error.OutOfMemory,
         error.InvalidAgent => .{ .invalid_agent = .name },
         error.InvalidParentTarget => .{ .invalid_agent = .parent_target },
         error.InvalidReport => .invalid_report,
@@ -253,15 +253,15 @@ const samples = [_]Refusal{
 test "every refusal carries one or two short sentences and its code" {
     const alloc = std.testing.allocator;
     // Every variant has a sample, so a new one fails here until it has one.
+    var uncovered: std.ArrayList(u8) = .empty;
+    defer uncovered.deinit(alloc);
     for (std.meta.tags(std.meta.Tag(Refusal))) |tag| {
         const covered = for (samples) |sample| {
             if (std.meta.activeTag(sample) == tag) break true;
         } else false;
-        if (!covered) {
-            std.debug.print("no sample for the refusal {s}\n", .{@tagName(tag)});
-            return error.TestUnexpectedResult;
-        }
+        if (!covered) try uncovered.print(alloc, "no sample for the refusal {s}\n", .{@tagName(tag)});
     }
+    try std.testing.expectEqualStrings("", uncovered.items);
     for (samples) |sample| {
         const encoded = try sample.body(alloc);
         defer alloc.free(encoded);
@@ -297,6 +297,8 @@ test "the host and the decoder name no code outside Refusal unless it carries it
     };
     const needle = "error_code" ++ " = \"";
     var found: usize = 0;
+    var bare: std.ArrayList(u8) = .empty;
+    defer bare.deinit(std.testing.allocator);
     for ([_][]const u8{ @embedFile("tool_host.zig"), @embedFile("../../tools/agent/subagent.zig") }) |source| {
         var rest: []const u8 = source;
         while (std.mem.find(u8, rest, needle)) |at| {
@@ -306,14 +308,12 @@ test "the host and the decoder name no code outside Refusal unless it carries it
             const allowed = for (own_text) |known| {
                 if (std.mem.eql(u8, known, named)) break true;
             } else false;
-            if (!allowed) {
-                std.debug.print("the code {s} is a string at a call site; make it a Refusal\n", .{named});
-                return error.TestUnexpectedResult;
-            }
+            if (!allowed) try bare.print(std.testing.allocator, "the code {s} is a string at a call site; make it a Refusal\n", .{named});
             found += 1;
             rest = rest[end..];
         }
     }
+    try std.testing.expectEqualStrings("", bare.items);
     // The scan reads the files, so a renamed field would otherwise pass it.
     try std.testing.expect(found > 0);
 }
@@ -350,16 +350,17 @@ test "a refusal says what to do next for the case it names" {
 }
 
 test "each validation failure and each turned-away message maps to a refusal with its own code" {
-    try std.testing.expectEqualStrings("invalid_agent", fromValidation(error.InvalidAgent).code());
-    try std.testing.expectEqualStrings("invalid_agent", fromValidation(error.InvalidParentTarget).code());
-    try std.testing.expectEqual(AgentFault.parent_target, fromValidation(error.InvalidParentTarget).invalid_agent);
-    try std.testing.expectEqualStrings("invalid_report", fromValidation(error.InvalidReport).code());
-    try std.testing.expectEqualStrings("invalid_parent_message", fromValidation(error.InvalidParentMessage).code());
-    try std.testing.expectEqualStrings("invalid_instructions", fromValidation(error.InvalidInstructions).code());
-    try std.testing.expectEqualStrings("invalid_message", fromValidation(error.InvalidMessage).code());
-    try std.testing.expectEqualStrings("invalid_model", fromValidation(error.InvalidModel).code());
-    try std.testing.expectEqualStrings("invalid_effort", fromValidation(error.InvalidEffort).code());
-    try std.testing.expectEqualStrings("invalid_profile", fromValidation(error.InvalidProfile).code());
+    try std.testing.expectEqualStrings("invalid_agent", (try fromValidation(error.InvalidAgent)).code());
+    try std.testing.expectEqualStrings("invalid_agent", (try fromValidation(error.InvalidParentTarget)).code());
+    try std.testing.expectEqual(AgentFault.parent_target, (try fromValidation(error.InvalidParentTarget)).invalid_agent);
+    try std.testing.expectEqualStrings("invalid_report", (try fromValidation(error.InvalidReport)).code());
+    try std.testing.expectEqualStrings("invalid_parent_message", (try fromValidation(error.InvalidParentMessage)).code());
+    try std.testing.expectEqualStrings("invalid_instructions", (try fromValidation(error.InvalidInstructions)).code());
+    try std.testing.expectEqualStrings("invalid_message", (try fromValidation(error.InvalidMessage)).code());
+    try std.testing.expectEqualStrings("invalid_model", (try fromValidation(error.InvalidModel)).code());
+    try std.testing.expectEqualStrings("invalid_effort", (try fromValidation(error.InvalidEffort)).code());
+    try std.testing.expectEqualStrings("invalid_profile", (try fromValidation(error.InvalidProfile)).code());
+    try std.testing.expectError(error.OutOfMemory, fromValidation(error.OutOfMemory));
     try std.testing.expectEqualStrings("child_busy", fromReject(.child_busy).code());
     try std.testing.expectEqualStrings("child_unavailable", fromReject(.child_unavailable).code());
     try std.testing.expectEqualStrings("child_not_persistent", fromReject(.child_not_persistent).code());

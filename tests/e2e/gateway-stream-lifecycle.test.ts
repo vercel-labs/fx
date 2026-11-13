@@ -10348,8 +10348,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
   // A refused call reaches main as its code with one sentence that says what
   // happened and what to try next. Main starts `worker`, which the gateway
-  // holds, then sends it instructions while it works, and stops a name no
-  // subagent bears. The body main reads is pinned whole.
+  // holds, then sends it instructions while it works, stops a name no
+  // subagent bears, and names a subagent badly. The body main reads is pinned
+  // whole.
   test("a refused subagent call tells main what to do next in the result it reads", async () => {
     const root = createFixtureRoot("subagent-refusals");
     const task = "Reply exactly REFUSAL_WORKER_DONE without using tools.";
@@ -10364,7 +10365,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         }
         return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
       }
-      for (const id of ["refusal_start", "refusal_busy", "refusal_stop"]) {
+      for (const id of ["refusal_start", "refusal_busy", "refusal_stop", "refusal_name"]) {
         if (id in results) continue;
         const text = toolResultAnywhere(body, id);
         if (text !== null) results[id] = text;
@@ -10378,12 +10379,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (!("refusal_stop" in results)) {
         return fakeGatewayToolCall("refusal_stop", "subagent", { request: { action: "stop", agent: "ghost" } });
       }
+      if (!("refusal_name" in results)) {
+        return fakeGatewayToolCall("refusal_name", "subagent", { request: { action: "message", agent: "Bad Name", message: "Reply exactly REFUSAL_NAME." } });
+      }
       // The worker may finish now, so the ask can end once its report is read.
       releaseWorker();
       return fakeGatewayFinalText("REFUSALS_READ");
     }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     try {
-      const run = await runFx(["ask", "--json", "--auto", "Provoke two refusals."], {
+      const run = await runFx(["ask", "--json", "--auto", "Provoke three refusals."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
         timeoutMs: 30_000,
@@ -10395,6 +10399,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       expect(results.refusal_stop).toBe(
         '{"ok":false,"result":"No open subagent is named \\"ghost\\". Open subagents: worker.","error_code":"child_unavailable"}',
+      );
+      expect(results.refusal_name).toBe(
+        '{"ok":false,"result":"agent must be a name of 1 to 64 characters: lowercase letters, digits, \\"_\\" or \\"-\\", starting with a letter or digit.","error_code":"invalid_agent"}',
       );
       expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
     } finally {

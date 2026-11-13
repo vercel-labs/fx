@@ -3627,14 +3627,30 @@ test "a refusal reaches the model as its code with the sentence that says what t
     // The refusals changed nothing: both subagents still work.
     try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
 
+    // The two are closed so no thread outlives the test. Which of them the
+    // list still names depends on when each turn ends, so nothing reads it.
     _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-7", null);
     _ = try callTool(runtime, arena, .{ .close = .{ .agent = "fixer" } }, "call-8", null);
     try waitUntilQuiet(runtime);
-    // With none open, it says so.
-    try std.testing.expectEqualStrings(
-        "{\"ok\":false,\"result\":\"No open subagent is named \\\"ghost\\\". You have no open subagents.\",\"error_code\":\"child_unavailable\"}",
-        try callTool(runtime, arena, .{ .stop = .{ .agent = "ghost" } }, "call-9", null),
-    );
+}
+
+test "a name no subagent bears, with no subagent ever started, says there are none open" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const none_open = "{\"ok\":false,\"result\":\"No open subagent is named \\\"ghost\\\". You have no open subagents.\",\"error_code\":\"child_unavailable\"}";
+    try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .stop = .{ .agent = "ghost" } }, "call-1", null));
+    try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .close = .{ .agent = "ghost" } }, "call-2", null));
+    try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .status = .{ .agent = "ghost" } }, "call-3", null));
 }
 
 test "a subagent's message to its parent carries what the user typed in the turn that sends it" {

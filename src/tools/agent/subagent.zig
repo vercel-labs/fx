@@ -63,8 +63,7 @@ pub fn decode(
         return decodeFailure(ctx, decodeErrorCode(err), correction) catch return error.OutOfMemory;
     };
     const request = model_contract.validateRequest(ctx.allocator, request_input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        const refused_with = refusal.fromValidation(err);
+        const refused_with = try refusal.fromValidation(err);
         debug_trace.logf("subagent", "request validation rejected code={s}", .{refused_with.code()});
         return refused(ctx, refused_with);
     };
