@@ -23,16 +23,56 @@
 //!   test's hook is called after every end hook, with whether it installed a
 //!   next work.
 //!
+//! `FX_TEST_SUBAGENT_USER_STOP` names a request file. While a slot is held at
+//! the run or next-work hold, the hold takes that file when it appears, which
+//! is the user's Esc on a turn of the subagent landing while the slot is held:
+//! the host stops the child as the app's `noteUserStop` does
+//! (`Runtime.userStopped`), and the hold goes on waiting. The app cannot press
+//! Esc in `fx ask`, and `tests/tla/drivers/subagent/stop-message.test.ts`
+//! walks that stop through the real binary.
+//!
 //! An inline test can also hold the slot between its finishing a work and
 //! calling the end hook (`test_hold_hook`), which has no file control.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const file_hold = @import("file_hold.zig");
+const io_mod = @import("../shared/io.zig");
 
 var stopped_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_END_HELD", .release_env = "FX_TEST_SUBAGENT_END_RELEASE" };
 var run_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_RUN_HELD", .release_env = "FX_TEST_SUBAGENT_RUN_RELEASE" };
 var next_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_NEXT_HELD", .release_env = "FX_TEST_SUBAGENT_NEXT_RELEASE" };
+
+/// The host the user-stop control acts through.
+pub const UserStopHook = struct {
+    context: *anyopaque,
+    stop_fn: *const fn (context: *anyopaque, child_id: []const u8) void,
+};
+
+var user_stop_hook: ?UserStopHook = null;
+
+/// Sets the host that `FX_TEST_SUBAGENT_USER_STOP` stops children of. The host
+/// clears it when it goes (`clearUserStopHook`).
+pub fn setUserStopHook(hook: UserStopHook) void {
+    if (comptime build_options.libfx) return;
+    user_stop_hook = hook;
+}
+
+pub fn clearUserStopHook(context: *anyopaque) void {
+    if (comptime build_options.libfx) return;
+    if (user_stop_hook) |hook| if (hook.context == context) {
+        user_stop_hook = null;
+    };
+}
+
+/// The user's Esc, as a test asks for it: when its request file appears while
+/// `child_id`'s slot is held, the host stops the child.
+fn pollUserStop(child_id: []const u8) void {
+    const path = io_mod.getenv("FX_TEST_SUBAGENT_USER_STOP") orelse return;
+    const hook = user_stop_hook orelse return;
+    if (!file_hold.takeRequest(path)) return;
+    hook.stop_fn(hook.context, child_id);
+}
 
 /// Test builds only: an inline test sets it to hold a stopped work's end, in
 /// place of the file controls.
@@ -69,7 +109,7 @@ pub fn holdStoppedEnd(child_id: []const u8, by: []const u8) void {
     }
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "stopped_end child={s} by={s}", .{ child_id, by }) catch return;
-    stopped_hold.wait(contents, null);
+    stopped_hold.wait(contents, null, null);
 }
 
 /// Whether a work's end may be held where its turn left messages unread, so
@@ -90,7 +130,7 @@ pub fn holdAfterRun(child_id: []const u8, unread: usize) void {
     }
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "ended_with_unread child={s} unread={d}", .{ child_id, unread }) catch return;
-    run_hold.wait(contents, null);
+    run_hold.wait(contents, null, .{ .context = child_id, .func = pollUserStop });
 }
 
 /// Called by the slot of `child_id` once the work is finished, before the end
@@ -122,7 +162,7 @@ pub fn holdAfterEndHook(child_id: []const u8, next: bool) void {
     if (!next) return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "installed_next child={s}", .{child_id}) catch return;
-    next_hold.wait(contents, null);
+    next_hold.wait(contents, null, .{ .context = child_id, .func = pollUserStop });
 }
 
 test "a test build holds a stopped work's end only through its hook" {
@@ -141,4 +181,35 @@ test "a test build holds a work's end around its hook only through hooks" {
     holdAfterEndHook("child", true);
     try std.testing.expectEqual(@as(u32, 0), run_hold.count.load(.seq_cst));
     try std.testing.expectEqual(@as(u32, 0), next_hold.count.load(.seq_cst));
+}
+
+test "the end holds and the user-stop request ignore variables that are empty or not absolute" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+    defer user_stop_hook = null;
+    for ([_][]const u8{ "relative/path", "./path", "" }) |value| {
+        for ([_][]const u8{
+            "FX_TEST_SUBAGENT_END_HELD",  "FX_TEST_SUBAGENT_END_RELEASE",
+            "FX_TEST_SUBAGENT_RUN_HELD",  "FX_TEST_SUBAGENT_RUN_RELEASE",
+            "FX_TEST_SUBAGENT_NEXT_HELD", "FX_TEST_SUBAGENT_NEXT_RELEASE",
+            "FX_TEST_SUBAGENT_USER_STOP",
+        }) |name| try environ.put(name, value);
+        for ([_]*file_hold.Hold{ &stopped_hold, &run_hold, &next_hold }) |hold| {
+            try std.testing.expect(!hold.armed());
+            hold.wait("child=none", null, .{ .context = "child", .func = pollUserStop });
+            try std.testing.expectEqual(@as(u32, 0), hold.count.load(.seq_cst));
+        }
+        const Seen = struct {
+            var stops: u32 = 0;
+            fn stop(_: *anyopaque, _: []const u8) void {
+                stops += 1;
+            }
+        };
+        var context: u8 = 0;
+        user_stop_hook = .{ .context = &context, .stop_fn = Seen.stop };
+        pollUserStop("child");
+        try std.testing.expectEqual(@as(u32, 0), Seen.stops);
+    }
 }

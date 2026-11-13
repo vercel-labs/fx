@@ -317,6 +317,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_USER_STOP": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_TERMINAL_BACKEND_CLEANUP_DELAY_MS": {
       "job": "test",
       "stability": "internal"

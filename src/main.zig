@@ -5521,6 +5521,9 @@ test {
     _ = @import("core/subagent/execution.zig");
     _ = @import("core/subagent/agent_adapter.zig");
     _ = @import("core/subagent/tool_host.zig");
+    _ = @import("core/subagent/file_hold.zig");
+    _ = @import("core/subagent/end_test_controls.zig");
+    _ = @import("core/subagent/start_test_controls.zig");
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/subagent/reports.zig");

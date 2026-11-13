@@ -81,7 +81,7 @@ pub fn holdStart(child_id: []const u8, cancel: *const std.atomic.Value(bool)) vo
     }
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "start child={s}", .{child_id}) catch return;
-    start_hold.wait(contents, cancel);
+    start_hold.wait(contents, cancel, null);
 }
 
 /// How long a message waits for a starting work's turn to begin.
@@ -108,4 +108,19 @@ test "a test build holds a work's start and sets the wait limit only through its
     test_fail_spawn = true;
     defer test_fail_spawn = false;
     try std.testing.expect(spawnFails());
+}
+
+test "the start hold ignores variables that are empty or not absolute" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+    var cancel = std.atomic.Value(bool).init(false);
+    for ([_][]const u8{ "relative/path", "./path", "" }) |value| {
+        try environ.put("FX_TEST_SUBAGENT_START_HELD", value);
+        try environ.put("FX_TEST_SUBAGENT_START_RELEASE", value);
+        try std.testing.expect(!start_hold.armed());
+        start_hold.wait("child=none", &cancel, null);
+        try std.testing.expectEqual(@as(u32, 0), start_hold.count.load(.seq_cst));
+    }
 }
