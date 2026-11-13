@@ -23,6 +23,9 @@ pub const ToolCallOutcome = tool_call_metrics.ToolCallOutcome;
 pub const ToolCallLifetimeStats = tool_call_metrics.LifetimeStats;
 pub const network_ring_capacity = network_metrics.ring_capacity;
 pub const tool_call_ring_capacity = tool_call_metrics.ring_capacity;
+pub const FailedToolCall = tool_call_metrics.FailedToolCall;
+pub const KeptText = tool_call_metrics.KeptText;
+pub const failed_tool_call_capacity = tool_call_metrics.failure_ring_capacity;
 pub const RenderEvent = render_metrics.Event;
 pub const render_ring_capacity = render_metrics.ring_capacity;
 pub const SubagentTurn = subagent_turn_metrics.Turn;
@@ -115,6 +118,12 @@ pub fn recordToolCallResult(input: ToolCallRecord) void {
 
 pub fn snapshotToolCalls(out: []ToolCallMetric) usize {
     return tool_call_metrics.snapshot(out);
+}
+
+/// Copies the kept failed tool calls, oldest first. Later successful calls
+/// never remove them; only newer failures and a session reset do.
+pub fn snapshotFailedToolCalls(out: []FailedToolCall) usize {
+    return tool_call_metrics.snapshotFailures(out);
 }
 
 pub fn toolCallLifetimeStats() ToolCallLifetimeStats {
