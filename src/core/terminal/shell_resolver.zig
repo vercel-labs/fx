@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,11 +29,38 @@ fn fallbackLoginShell() []const u8 {
     return if (builtin.target.os.tag == .macos) "/bin/zsh" else "/bin/bash";
 }
 
-fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
+fn supportedLoginShell(configured_login_shell: ?[]const u8, buffer: []u8) ResolveError![]const u8 {
     const path = configured_login_shell orelse return error.MissingLoginShell;
     if (!std.Io.Dir.path.isAbsolute(path)) return error.RelativeShellPath;
     if (shellKind(path) != null) return path;
-    return fallbackLoginShell();
+    return resolveFallback(buffer, fallbackLoginShell());
+}
+
+fn resolveFallback(buffer: []u8, fallback: []const u8) []const u8 {
+    if (comptime !builtin.link_libc or builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64 or builtin.target.os.tag == .windows) return fallback;
+    std.Io.Dir.cwd().access(io_mod.getIo(), fallback, .{}) catch |err| {
+        if (err == error.FileNotFound) return fallbackFromPath(buffer, fallback, io_mod.getenv("PATH"));
+    };
+    return fallback;
+}
+
+fn executableFile(path: [:0]const u8) bool {
+    if (comptime !builtin.link_libc or builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64 or builtin.target.os.tag == .windows) return false;
+    if (std.c.access(path.ptr, 1) != 0) return false;
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch return false;
+    return stat.kind == .file;
+}
+
+fn fallbackFromPath(buffer: []u8, fallback: []const u8, search_path: ?[]const u8) []const u8 {
+    var entries = std.mem.splitScalar(u8, search_path orelse return fallback, std.Io.Dir.path.delimiter);
+    while (entries.next()) |entry| {
+        if (!std.Io.Dir.path.isAbsolute(entry)) continue;
+        if (buffer.len == 0) continue;
+        const candidate = std.mem.print(buffer[0 .. buffer.len - 1], "{s}/{s}", .{ std.mem.trimEnd(u8, entry, "/"), std.Io.Dir.path.basename(fallback) }) catch continue;
+        buffer[candidate.len] = 0;
+        if (executableFile(buffer[0..candidate.len :0])) return candidate;
+    }
+    return fallback;
 }
 
 pub const Invocation = struct {
@@ -55,7 +83,9 @@ pub const Invocation = struct {
     }
 };
 
-pub fn resolve(
+/// Returned paths borrow the input shell or caller-owned buffer.
+pub fn resolveInto(
+    buffer: []u8,
     configured_login_shell: ?[]const u8,
     shell: contracts.ShellSpec,
 ) ResolveError!Invocation {
@@ -65,7 +95,7 @@ pub fn resolve(
     };
     const selection: Selection = switch (shell) {
         .user_login => .{
-            .path = try supportedLoginShell(configured_login_shell),
+            .path = try supportedLoginShell(configured_login_shell, buffer),
             .clean_start = false,
         },
         .executable => |value| .{
@@ -131,8 +161,9 @@ pub fn environment(
     profile: ?Profile,
 ) (ResolveError || Allocator.Error)!Environment {
     const selected = profile orelse .user;
-    const path = try supportedLoginShell(configured_login_shell);
-    _ = try resolve(null, switch (selected) {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try supportedLoginShell(configured_login_shell, &buffer);
+    _ = try resolveInto(&.{}, null, switch (selected) {
         .clean => .{ .executable = .{ .path = path, .clean_start = true } },
         .user => .{ .executable = .{ .path = path } },
     });
@@ -147,7 +178,8 @@ pub fn environmentForShellSpec(
     configured_login_shell: ?[]const u8,
     shell: contracts.ShellSpec,
 ) (ResolveError || Allocator.Error)!Environment {
-    const invocation = try resolve(configured_login_shell, shell);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const invocation = try resolveInto(&buffer, configured_login_shell, shell);
     return switch (shell) {
         .user_login => .{ .user = try alloc.dupe(u8, invocation.path) },
         .executable => |value| if (value.clean_start)
@@ -162,10 +194,11 @@ pub fn profileShell(
     configured_login_shell: ?[]const u8,
     profile: Profile,
 ) (ResolveError || Allocator.Error)!contracts.ShellSpec {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     return switch (profile) {
         .clean => blk: {
-            const path = try supportedLoginShell(configured_login_shell);
-            _ = try resolve(null, .{ .executable = .{ .path = path, .clean_start = true } });
+            const path = try supportedLoginShell(configured_login_shell, &buffer);
+            _ = try resolveInto(&.{}, null, .{ .executable = .{ .path = path, .clean_start = true } });
             break :blk .{ .executable = .{
                 .path = try alloc.dupe(u8, path),
                 .clean_start = true,
@@ -174,7 +207,7 @@ pub fn profileShell(
         .user => blk: {
             const configured = configured_login_shell orelse
                 break :blk .user_login;
-            const path = try supportedLoginShell(configured);
+            const path = try supportedLoginShell(configured, &buffer);
             if (std.mem.eql(u8, path, configured)) break :blk .user_login;
             break :blk .{ .executable = .{
                 .path = try alloc.dupe(u8, path),
@@ -202,6 +235,9 @@ const bash_unshadow_builtin = "\\unset -f builtin; ";
 /// snapshot replay have run.
 const zsh_command_prelude = zsh_unshadow_builtin ++ "\\builtin unsetopt equals; ";
 
+/// Borrows input paths and commands when unchanged. The caller owns any copied
+/// fallback path and prefixed command in `alloc`; use an arena that outlives the
+/// invocation, or free those entries after use. argv[0] aliases path.
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
@@ -210,7 +246,7 @@ pub fn capturedInvocation(
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
         .clean => |path| {
-            var invocation = try resolve(null, .{ .executable = .{
+            var invocation = try resolveInto(&.{}, null, .{ .executable = .{
                 .path = path,
                 .clean_start = true,
             } });
@@ -222,13 +258,18 @@ pub fn capturedInvocation(
             return invocation;
         },
         .user => |path| {
-            var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash")) {
+            var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const selected = try supportedLoginShell(path, &buffer);
+            const copied_path = !std.mem.eql(u8, selected, path);
+            const owned_path = if (copied_path) try alloc.dupe(u8, selected) else path;
+            errdefer if (copied_path) alloc.free(owned_path);
+            var invocation = try resolveInto(&.{}, owned_path, .user_login);
+            if (shellKind(invocation.path) == .bash) {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");
             }
-            const effective_command = if (shellKind(path) == .zsh)
+            const effective_command = if (shellKind(invocation.path) == .zsh)
                 try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, captured_zsh_user_prelude, command })
             else
                 command;
@@ -545,15 +586,154 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
+fn createTestShell(dir: std.Io.Dir, path: []const u8, executable: bool) !void {
+    const file = try dir.createFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(if (executable) 0o755 else 0o644));
+}
+
+test "fallback PATH lookup checks real files symlinks ordering and buffer bounds" {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "nonexe", "directory/bash", "first", "second", "link", "broken" }) |dir| {
+        try tmp.dir.createDirPath(std.testing.io, dir);
+    }
+    try createTestShell(tmp.dir, "nonexe/bash", false);
+    try createTestShell(tmp.dir, "first/bash", true);
+    try createTestShell(tmp.dir, "second/bash", true);
+    try tmp.dir.symLink(std.testing.io, "../first/bash", "link/bash", .{});
+    try tmp.dir.symLink(std.testing.io, "../absent/bash", "broken/bash", .{});
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const first = try alloc.print("{s}/first/bash", .{root});
+    defer alloc.free(first);
+    const second = try alloc.print("{s}/second/bash", .{root});
+    defer alloc.free(second);
+    const link = try alloc.print("{s}/link/bash", .{root});
+    defer alloc.free(link);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const search = try alloc.print(":.:relative:{s}/missing:{s}/nonexe:{s}/directory:{s}/broken:{s}/first/:{s}/second", .{ root, root, root, root, root, root });
+    defer alloc.free(search);
+    try std.testing.expectEqualStrings(first, fallbackFromPath(&buffer, "/bin/bash", search));
+    const reversed = try alloc.print("{s}/second:{s}/first", .{ root, root });
+    defer alloc.free(reversed);
+    try std.testing.expectEqualStrings(second, fallbackFromPath(&buffer, "/bin/bash", reversed));
+    const links = try alloc.print("{s}/link:{s}/first", .{ root, root });
+    defer alloc.free(links);
+    try std.testing.expectEqualStrings(link, fallbackFromPath(&buffer, "/bin/bash", links));
+    // A candidate needs room for its terminating zero, not just its text.
+    try std.testing.expectEqualStrings("/bin/bash", fallbackFromPath(buffer[0..first.len], "/bin/bash", search));
+    try std.testing.expectEqualStrings(first, fallbackFromPath(buffer[0 .. first.len + 1], "/bin/bash", search));
+    try std.testing.expectEqualStrings(first, fallbackFromPath(buffer[0 .. first.len + 1], "/bin/bash", reversed));
+    try std.testing.expectEqualStrings("/bin/bash", fallbackFromPath(&.{}, "/bin/bash", search));
+    for ([_][]const u8{ "nonexe", "directory", "broken" }) |entry| {
+        const only = try alloc.print("{s}/{s}", .{ root, entry });
+        defer alloc.free(only);
+        try std.testing.expectEqualStrings("/bin/bash", fallbackFromPath(&buffer, "/bin/bash", only));
+    }
+    for ([_]?[]const u8{ null, "", ":.:relative" }) |path| {
+        try std.testing.expectEqualStrings("/bin/bash", fallbackFromPath(&buffer, "/bin/bash", path));
+    }
+}
+
+test "missing default fallback uses inherited PATH but existing default wins" {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    try tmp.dir.createDirPath(std.testing.io, "default");
+    try createTestShell(tmp.dir, "bin/bash", true);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const bin = try alloc.print("{s}/bin", .{root});
+    defer alloc.free(bin);
+    const expected = try alloc.print("{s}/bin/bash", .{root});
+    defer alloc.free(expected);
+    const default = try alloc.print("{s}/default/bash", .{root});
+    defer alloc.free(default);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("PATH", bin);
+    const previous = io_mod.environMap();
+    io_mod.setEnvironMap(&environ);
+    defer if (previous) |map| io_mod.setEnvironMap(map) else io_mod.resetEnvironForTest();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, resolveFallback(&buffer, default));
+    try createTestShell(tmp.dir, "default/bash", true);
+    try std.testing.expectEqualStrings(default, resolveFallback(&buffer, default));
+}
+
+test "nu login without platform default resolves PATH across execution profiles" {
+    if (comptime !builtin.link_libc or builtin.target.os.tag != .linux) return error.SkipZigTest;
+    // Exercise the real NixOS failure, without modifying the host's /bin.
+    std.Io.Dir.cwd().access(std.testing.io, "/bin/bash", .{}) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try createTestShell(tmp.dir, "bash", true);
+        const bin = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(bin);
+        const expected = try alloc.print("{s}/bash", .{bin});
+        defer alloc.free(expected);
+        var environ = std.process.Environ.Map.init(alloc);
+        defer environ.deinit();
+        try environ.put("PATH", bin);
+        const previous = io_mod.environMap();
+        io_mod.setEnvironMap(&environ);
+        defer if (previous) |map| io_mod.setEnvironMap(map) else io_mod.resetEnvironForTest();
+        var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const invocation = try resolveInto(&buffer, "/run/current-system/sw/bin/nu", .user_login);
+        try std.testing.expectEqualStrings(expected, invocation.path);
+        try std.testing.expectEqual(@as(usize, 3), invocation.argv().len);
+        for ([_][]const u8{ expected, "--login", "-i" }, invocation.argv()) |want, actual| {
+            try std.testing.expectEqualStrings(want, actual);
+        }
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const user = try environment(arena, "/bin/nu", .user);
+        const clean = try environment(arena, "/bin/nu", .clean);
+        @memset(&buffer, 0);
+        try std.testing.expectEqualStrings(expected, user.user);
+        try std.testing.expectEqualStrings(expected, clean.clean);
+        try std.testing.expectEqualStrings(expected, (try environmentForShellSpec(arena, "/bin/nu", .user_login)).user);
+        try std.testing.expectEqualStrings(expected, (try profileShell(arena, "/bin/nu", .user)).executable.path);
+        try std.testing.expectEqualStrings(expected, (try profileShell(arena, "/bin/nu", .clean)).executable.path);
+        const captured = try capturedInvocation(arena, .{ .user = "/bin/nu" }, "true");
+        try std.testing.expectEqual(@as(usize, 6), captured.argv().len);
+        for ([_][]const u8{ expected, "--login", "-O", "expand_aliases", "-c", "true" }, captured.argv()) |want, actual| {
+            try std.testing.expectEqualStrings(want, actual);
+        }
+        return;
+    };
+    return error.SkipZigTest;
+}
+
+test "supported passwd shells remain unchanged with fallback storage" {
+    var buffer: [256]u8 = undefined;
+    for ([_][]const u8{ "/bin/bash", "/bin/zsh", "/nix/profile/bin/bash", "/nix/profile/bin/zsh" }) |path| {
+        const invocation = try resolveInto(&buffer, path, .user_login);
+        try std.testing.expectEqualStrings(path, invocation.path);
+        try std.testing.expect(invocation.path.ptr == path.ptr);
+    }
+    try std.testing.expectError(error.RelativeShellPath, resolveInto(&buffer, "nu", .user_login));
+    try std.testing.expectError(error.UnsupportedShell, resolveInto(&buffer, null, .{ .executable = .{ .path = "/bin/nu" } }));
+}
+
 test "resolver builds Bash and zsh interactive argv" {
-    const bash = try resolve("/bin/bash", .user_login);
+    const bash = try resolveInto(&.{}, "/bin/bash", .user_login);
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--login", "-i" },
         bash.argv(),
     );
 
-    const zsh = try resolve(
+    const zsh = try resolveInto(
+        &.{},
         null,
         .{ .executable = .{ .path = "/bin/zsh" } },
     );
@@ -565,7 +745,8 @@ test "resolver builds Bash and zsh interactive argv" {
 }
 
 test "resolver makes clean startup explicit" {
-    const bash = try resolve(
+    const bash = try resolveInto(
+        &.{},
         null,
         .{ .executable = .{ .path = "/usr/local/bin/bash", .clean_start = true } },
     );
@@ -575,7 +756,8 @@ test "resolver makes clean startup explicit" {
         bash.argv(),
     );
 
-    const zsh = try resolve(
+    const zsh = try resolveInto(
+        &.{},
         null,
         .{ .executable = .{ .path = "/bin/zsh", .clean_start = true } },
     );
@@ -615,20 +797,20 @@ test "shell environments bind executable path and startup mode" {
 test "resolver rejects missing relative and unsupported shells" {
     try std.testing.expectError(
         error.MissingLoginShell,
-        resolve(null, .user_login),
+        resolveInto(&.{}, null, .user_login),
     );
     try std.testing.expectError(
         error.RelativeShellPath,
-        resolve(null, .{ .executable = .{ .path = "zsh" } }),
+        resolveInto(&.{}, null, .{ .executable = .{ .path = "zsh" } }),
     );
     try std.testing.expectError(
         error.UnsupportedShell,
-        resolve(null, .{ .executable = .{ .path = "/bin/fish" } }),
+        resolveInto(&.{}, null, .{ .executable = .{ .path = "/bin/fish" } }),
     );
 }
 
 test "login shell resolution falls back without accepting explicit unsupported shells" {
-    const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
+    const fallback = try resolveInto(&.{}, "/opt/homebrew/bin/fish", .user_login);
     try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
     if (builtin.target.os.tag == .macos) {
         try std.testing.expectEqualSlices(
@@ -646,7 +828,7 @@ test "login shell resolution falls back without accepting explicit unsupported s
 
     try std.testing.expectError(
         error.UnsupportedShell,
-        resolve(null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
+        resolveInto(&.{}, null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
     );
 }
 
@@ -765,6 +947,11 @@ test "unsupported login shell profiles fall back for captured and persistent exe
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var environ = std.process.Environ.Map.init(arena);
+    defer environ.deinit();
+    const previous = io_mod.environMap();
+    io_mod.setEnvironMap(&environ);
+    defer if (previous) |map| io_mod.setEnvironMap(map) else io_mod.resetEnvironForTest();
     const fallback = fallbackLoginShell();
     const user_environment = try environment(arena, "/opt/homebrew/bin/fish", .user);
     const clean_environment = try environment(arena, "/opt/homebrew/bin/fish", .clean);
