@@ -177,7 +177,19 @@ Then subscribe it to libfx's topic in `vercel.json`:
 
 The trigger makes the route private: it has no public URL, and only Vercel Queues can call it. Keep `wakeHandler()` on that route only. An app whose own World queues to a route the internet can reach must check that each request comes from its queue before it calls `wakeHandler()`. libfx runs only inputs its sessions already stored, but a forged request can still wake a session.
 
-That's all. When no other invocation holds the session, `prompt()` runs the turn in the request that called it, so the first model request goes out without a queue hop, and the function stays alive for the turn after the route responds. Vercel Queues keeps the prompt until after that request's time limit, and if the request dies mid-turn, that delivery continues the turn. Other turns go through Vercel Queues to this route:
+That's all. When no other invocation holds the session, `prompt()` runs the turn in the request that called it, so the first model request goes out without a queue hop, and the function stays alive for the turn after the route responds. Vercel Queues keeps the prompt until after that request's time limit, and if the request dies mid-turn, that delivery continues the turn.
+
+Name the route's `functions` key in `vercel({ holdFunction })`, and Vercel Queues holds the prompt for the request instead:
+
+```js
+import { vercel } from "libfx/durable-vercel";
+
+const durability = vercel({ holdFunction: "app/api/libfx/route.js" });
+```
+
+The request then runs the prompt as its message's first delivery, so nothing waits for the request's time limit, and if the request dies mid-turn, Vercel Queues delivers the message to the route, which continues the turn. Vercel names the trigger's consumer group after that key, and the hold is taken for that group. A route that belongs to a Vercel service also passes `holdService`, its service's name. A route whose trigger names its group some other way, such as `"default"` in generated Build Output configuration, passes `holdConsumerGroup` instead. When the queue doesn't hold a prompt, it delivers it to the route.
+
+Other turns go through Vercel Queues to this route:
 
 - When a turn gets within 30 seconds of the function's time limit, libfx stops it, and the next invocation continues it. `vercel({ reserveMs })` from `libfx/durable-vercel` changes that margin.
 - A function holds its session for as long as Vercel Queues keeps the turn's message for it, so nothing is written while a turn runs to show the function is alive. If the function's process exits mid-turn, Vercel runs the same delivery again about a second later, and that invocation continues the turn.

@@ -945,10 +945,18 @@ function claimName(name, member) {
   }
 }
 
+// What a World queue handler answers for what a delivery returned: the queue
+// delivers the same message again after a rejection, which takes back a
+// lease its worker could not let go, and after `{ timeoutSeconds }`.
+async function queueAnswer(result) {
+  if (result?.redeliver === true) throw new Error("libfx asks the queue to deliver this message again");
+  return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
+}
+
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
-  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
+  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true, holdConsumerGroup = null } = durability;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -1003,11 +1011,7 @@ function createWorldBackend(world, durability) {
       if (owned) return undefined;
       throw new Error("no libfx agent is listening; the queue delivers this again");
     }
-    const result = await handle(input, meta);
-    // The queue delivers this same message again, which takes back a lease
-    // its worker could not let go.
-    if (result?.redeliver === true) throw new Error("libfx asks the queue to deliver this message again");
-    return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
+    return queueAnswer(await handle(input, meta));
   };
   const store = worldStore(durability);
   // The route a deployment mounts delivers to the agent in this process the
@@ -1024,8 +1028,10 @@ function createWorldBackend(world, durability) {
     store,
     livenessKnown,
     queueLeases,
-    // A prompt runs in the request that took it, held by its backstop's
-    // message, which the queue keeps until after the request's deadline.
+    // A prompt runs in the request that took it: as the first delivery of
+    // its message, where the queue holds that message for the request, and
+    // otherwise held by its backstop's message, which the queue keeps until
+    // after the request's deadline.
     runInRequest: queueLeases && runInRequest,
     // Keeps the request alive for a turn it runs after its response.
     waitUntil: waitUntil ?? null,
@@ -1429,13 +1435,29 @@ function createWorldBackend(world, durability) {
       };
     },
     queue: {
+      // Whether the World's queue can hold a message for the process that
+      // sends it (`experimental_hold`), so that process runs it as the
+      // message's first delivery. The hold is taken for the consumer group
+      // of the route the queue delivers to, which the durability names: one
+      // taken for another group would leave that route a second copy.
+      holds: () => holdConsumerGroup !== null && world.capabilities?.experimental_queueHold === true,
       // Returns the queue's id for the message, when the World gives one.
-      async send(message, { delaySeconds = 0, idempotencyKey } = {}) {
+      // With `hold`, sent undelayed on a World that holds messages, it also
+      // returns `held`, the message the queue holds for this process, when
+      // it took the hold. Otherwise the queue delivers the message as usual.
+      async send(message, { delaySeconds = 0, idempotencyKey, hold = false } = {}) {
+        const holding = hold && delaySeconds === 0 && backend.queue.holds();
         const sent = await world.queue(queueName, { runId: message.sessionId, requestId: message.messageId, input: message }, {
           ...(idempotencyKey ? { idempotencyKey } : {}),
           ...(delaySeconds > 0 ? { delaySeconds } : {}),
+          ...(holding ? { experimental_hold: { consumerGroup: holdConsumerGroup } } : {}),
         });
-        return typeof sent?.messageId === "string" && sent.messageId.length > 0 ? { messageId: sent.messageId } : {};
+        const messageId = typeof sent?.messageId === "string" && sent.messageId.length > 0 ? sent.messageId : null;
+        // `experimental_hold` says whether the queue took the hold; absent,
+        // or anything but "held", the queue delivers the message.
+        const answer = holding ? sent?.experimental_hold : undefined;
+        const held = answer?.status === "held" && typeof answer.consume === "function" ? answer : null;
+        return { ...(messageId ? { messageId } : {}), ...(held ? { held } : {}) };
       },
     },
     // The route a deployment mounts for queue deliveries, until the World
@@ -2935,7 +2957,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         // Held from before the read until receive() takes over, so a turn
         // run here meanwhile is counted on the worker the handoff goes to,
         // not on one dropped in between (see consume).
-        const worker = inline ? hold(created, sessionId) : null;
+        let worker = inline ? hold(created, sessionId) : null;
         try {
           // Taken before this message is written, so a turn here that could
           // have run it counts, also when a fresh log is not read at all.
@@ -2948,6 +2970,45 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           const newestSeen = log.newest?.();
           const queued = queuedMessage(full, created.store);
           const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
+          if (inline && created.queue.holds?.()) {
+            // The queue holds the message for this request, which runs it as
+            // the message's first delivery: the queue renews its lease while
+            // the turn runs, acknowledges it after, and delivers it again as
+            // usual if this request dies. So no backstop waits past the
+            // request's deadline. A send the queue does not hold, it delivers.
+            const { held } = await created.queue.send(queued, { idempotencyKey, hold: true });
+            seeded = true;
+            if (held) {
+              const entries = handoffEntries(read, newestSeen, appended);
+              let handoff = entries ? { log, entries, seen } : null;
+              // This request's hold on the worker passes to the held
+              // delivery: let go once its receive() holds the worker, so
+              // `seen` is counted on the worker the handoff goes to.
+              let kept = worker;
+              worker = null;
+              const release = () => {
+                if (kept) letGo(kept, sessionId);
+                kept = null;
+              };
+              // The handler the World's queue consumer runs for this message,
+              // for this agent, with the sender's read of the log: the first
+              // model request goes out without reading the log again. It runs
+              // the message as a delivery would, so the lease names it, and the
+              // queue's next delivery of it takes the session over. receive()
+              // reports a failure to the host; the queue retries it.
+              const work = held.consume(async (_payload, meta) => {
+                const first = handoff;
+                handoff = null;
+                const running = receive(created, queued, deliveryOf(meta), { handoff: first });
+                release();
+                return queueAnswer(await running);
+              }).then(() => {}, () => {}).finally(release);
+              agent.track(work);
+              created.waitUntil?.(work);
+            }
+            return;
+          }
+          // A World whose queue cannot hold messages keeps a delayed backstop.
           if (inline) {
             await created.refreshDeadline?.();
             const deadline = deliveryDeadline(created);
