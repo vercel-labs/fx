@@ -12,6 +12,7 @@ test {
     _ = @import("core/auth/credentials.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
+    _ = @import("core/agent/runtime/orchestrator.zig");
     _ = @import("core/agent/runtime/parallel_execution.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
