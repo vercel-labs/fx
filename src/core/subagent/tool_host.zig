@@ -1854,6 +1854,11 @@ pub const Runtime = struct {
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
     }
 
+    /// Whether a child was closed since the last `takeClosed`.
+    pub fn hasClosed(self: *const Runtime) bool {
+        return self.closed_waiting.load(.acquire);
+    }
+
     /// The children closed or closing since the last call, for the app to
     /// drop their agents. The caller owns the ids. Cheap when none is.
     pub fn takeClosed(self: *Runtime, alloc: Allocator) ![][]u8 {

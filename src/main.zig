@@ -6176,6 +6176,48 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
     }
 }
 
+test "a subagent its parent closes during a pending handoff is dropped once the handoff ends" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const closed = try addTestChildAgent(&app, "closed");
+    try App.AgentsAppRuntime.show(&app, closed);
+
+    // The hidden parent's `close` runs on its own worker thread and leaves
+    // the id with its host. Only the fields that path reads are set.
+    var parent_host: subagent_tool_host.Runtime = undefined;
+    parent_host.alloc = alloc;
+    parent_host.admission_mutex = .init;
+    parent_host.closed_unseen = .empty;
+    parent_host.closed_waiting = .init(false);
+    defer {
+        for (parent_host.closed_unseen.items) |id| alloc.free(id);
+        parent_host.closed_unseen.deinit(alloc);
+    }
+    try parent_host.closed_unseen.append(alloc, try alloc.dupe(u8, closed.id));
+    parent_host.closed_waiting.store(true, .release);
+    app.main_agent.session_persistence.subagent_host = &parent_host;
+    defer app.main_agent.session_persistence.subagent_host = null;
+
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+    for (0..10) |_| try std.testing.expect(!try App.AgentsAppRuntime.dropClosedSubagents(&app));
+    try std.testing.expect(parent_host.hasClosed());
+    try std.testing.expectEqual(@as(usize, 1), app.child_agents.items.len);
+    try std.testing.expect(app.screenAgent() == &closed.agent);
+
+    app.shell.pending_session_scrollback_handoff = null;
+    try std.testing.expect(try App.AgentsAppRuntime.dropClosedSubagents(&app));
+    try std.testing.expect(!parent_host.hasClosed());
+    try std.testing.expectEqual(@as(usize, 0), app.child_agents.items.len);
+    try std.testing.expect(app.screenAgent() == &app.main_agent);
+}
+
 test "quitting while a scrollback handoff is pending closes every agent" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });

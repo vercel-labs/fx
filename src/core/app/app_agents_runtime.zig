@@ -1839,6 +1839,13 @@ pub fn Runtime(comptime App: type) type {
         /// it started (`closeBranch`). Cheap when none is. Returns whether it
         /// dropped any.
         pub fn dropClosedSubagents(app: *App) !bool {
+            // Dropping a branch swaps each agent's transcript in, and can put
+            // another agent on screen, which a pending scrollback handoff does
+            // not allow. The hosts keep the closed ones for a later pass.
+            if (app.shell.sessionScrollbackHandoffPending()) {
+                if (anyClosedWaiting(app)) debug_trace.eventf("host", "closed_drop_deferred", .{}, "reason=scrollback_handoff_pending", .{});
+                return false;
+            }
             var dropped = false;
             // Dropping a branch can free hosts, so each pass looks afresh.
             while (try takeAnyClosed(app)) |ids| {
@@ -1852,6 +1859,14 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             return dropped;
+        }
+
+        /// Whether some host closed a child since it was last asked.
+        fn anyClosedWaiting(app: *App) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (firstOpen(app)) if (app.main_agent.session_persistence.subagent_host) |host| if (host.hasClosed()) return true;
+            for (app.child_agents.items) |child| if (child.agent.session_persistence.subagent_host) |host| if (host.hasClosed()) return true;
+            return false;
         }
 
         /// The children some host closed since it was last asked, or null.
