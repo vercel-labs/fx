@@ -122,7 +122,8 @@ fn closerMain() void {
 }
 
 /// A terminal that hangs up is a closed window too, and fx often sees the
-/// hang-up before SIGHUP. With a turn running, fx closes here as `closerMain`
+/// hang-up before SIGHUP: as input that ends, or as a frame it can no longer
+/// write. With a turn running, fx closes here as `closerMain`
 /// does: it saves the request in flight marked clean and ends by SIGHUP, so
 /// the turn stays open and the next launch resumes it
 /// (`tests/tla/recovery/Resume.tla` Close). A graceful shutdown would cancel

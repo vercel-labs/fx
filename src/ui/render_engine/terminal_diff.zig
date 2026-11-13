@@ -665,12 +665,13 @@ fn recoverPartialFrame(
     };
     switch (cleanup_result) {
         .complete => {},
-        .partial => {
+        .partial => |partial| {
             debug_trace.logf(
                 "frame_commit",
-                "wire_frame bytes={d} accepted_bytes={d} applied_scroll_rows={d} cleanup={s}",
-                .{ wire_frame.len, accepted_write.accepted_bytes, accepted_write.applied_scroll_rows, @tagName(CleanupState.failed) },
+                "wire_frame bytes={d} accepted_bytes={d} applied_scroll_rows={d} cleanup={s} err={s}",
+                .{ wire_frame.len, accepted_write.accepted_bytes, accepted_write.applied_scroll_rows, @tagName(CleanupState.failed), @errorName(partial.err) },
             );
+            if (terminalGone(partial.err)) return error.TerminalOutputClosed;
             return error.TerminalSyncRecoveryFailed;
         },
     }
@@ -753,6 +754,14 @@ fn recoveryBytes(synchronized_update: bool, expected_autowrap: bool) []const u8 
         "\x18\x1b]8;;\x1b\\\x1b[0m\x1b[?25h"
     else
         "\x18\x1b]8;;\x1b\\\x1b[0m\x1b[?7l\x1b[?25h";
+}
+
+/// A write error that means the terminal itself is gone: a closed window or
+/// a tty that hung up fails with EIO, an output pipe with no reader with
+/// EPIPE, and a descriptor closed under fx with EBADF. Nothing more can be
+/// drawn, so fx closes as it does when its input ends.
+fn terminalGone(err: anyerror) bool {
+    return err == error.InputOutput or err == error.BrokenPipe or err == error.NotOpenForWriting;
 }
 
 fn acceptedBytesForSinkResult(bytes: []const u8, result: FrameSinkWriteResult) !usize {
@@ -1582,6 +1591,8 @@ const TestSink = struct {
     fail_after_prefix: ?usize = null,
     fail_after_scroll_rows: ?u16 = null,
     fail_on_call: ?usize = null,
+    /// The error the write `fail_on_call` names fails with.
+    fail_err: anyerror = error.TestFrameWriteFailure,
     invalid_progress: bool = false,
     write_calls: usize = 0,
 
@@ -1597,7 +1608,7 @@ const TestSink = struct {
         const self: *TestSink = @ptrCast(@alignCast(ctx));
         self.write_calls += 1;
         if (self.fail_on_call == self.write_calls) {
-            return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestFrameWriteFailure } };
+            return .{ .partial = .{ .accepted_bytes = 0, .err = self.fail_err } };
         }
         if (self.write_calls == 1 and self.invalid_progress) {
             return .{ .partial = .{ .accepted_bytes = bytes.len + 1, .err = error.TestFrameWriteFailure } };
@@ -4190,6 +4201,31 @@ test "flushFrame cleanup rejection stops retry and row acknowledgment" {
         .metrics = &metrics,
     }));
     try std.testing.expectEqual(@as(usize, 2), sink.write_calls);
+}
+
+test "flushFrame ends as a closed terminal when the terminal can no longer take the cleanup" {
+    // A closed window: the frame and its cleanup both fail the way a
+    // terminal that hung up does, so fx closes as it does when input ends.
+    for ([_]anyerror{ error.InputOutput, error.BrokenPipe, error.NotOpenForWriting }) |gone| {
+        var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+        defer previous.deinit();
+        var surface = try makeSurface(std.testing.allocator, previous, testPlan());
+        defer surface.deinit();
+        var sink = TestSink{ .fail = true, .fail_on_call = 2, .fail_err = gone };
+        defer sink.deinit(std.testing.allocator);
+        var metrics: Metrics = .{};
+
+        try std.testing.expectError(error.TerminalOutputClosed, flushFrame(.{
+            .previous = &previous,
+            .surface = &surface,
+            .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(surface.plan, .{ .include_transcript = true }),
+            .synchronized_update = true,
+            .scroll_plan = testScrollPlan(1),
+            .sink = sink.frameSink(),
+            .metrics = &metrics,
+        }));
+        try std.testing.expectEqual(@as(usize, 2), sink.write_calls);
+    }
 }
 
 test "flushFrame rejects impossible sink progress" {
