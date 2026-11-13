@@ -1246,6 +1246,56 @@ function createIsolatedRoot(prefix: string) {
   };
 }
 
+/** Writes the agent profile `name` under `workspace`'s `.fx/agents`. */
+function writeAcpProfile(workspace: string, name: string, settings: Record<string, unknown>, prompt?: string) {
+  const folder = join(workspace, ".fx", "agents", name);
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, "profile.json"), JSON.stringify(settings));
+  if (prompt !== undefined) writeFileSync(join(folder, "prompt.md"), prompt);
+}
+
+/** The tool names a gateway request offers. */
+function acpOfferedTools(body: string): string[] {
+  return acpGatewayRequest(body).tools.map((tool) => tool.name);
+}
+
+/**
+ * Starts `fx acp` in `root.workspace`, opens a session whose `cwd` is
+ * `root.external`, and has the model ask for a subagent in the profile
+ * `reviewer`. Returns what the subagent's requests offered and what the
+ * parent's call returned.
+ */
+async function askForReviewerFromSessionWorkspace(root: ReturnType<typeof createIsolatedRoot>) {
+  const createId = "acp_session_profile_child";
+  const childBodies: string[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (!body.includes('"name":"subagent"')) {
+      childBodies.push(body);
+      return finalText("session review done");
+    }
+    if (acpLatestUserIsReport(body)) return finalText("ACP_SESSION_PROFILE_DONE");
+    if (body.includes(createId)) return finalText("ACP_SESSION_PROFILE_TURN_DONE");
+    return fakeGatewayToolCall(createId, "subagent", {
+      request: { action: "message", agent: "reviewer", message: "Review the workspace.", profile: "reviewer" },
+    });
+  });
+  let acp: AcpClient | undefined;
+  try {
+    acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+    await acp.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await acp.request("session/new", { cwd: root.external, mcpServers: [] }, 2) as any;
+    expect(created.error).toBeUndefined();
+    await acp.readLine();
+    const result = await runPrompt(acp, "Delegate a review.", TIMEOUT);
+    expect(result.promptResult.result.stopReason).toBe("end_turn");
+    const afterCall = gateway.requests.find((request) => request.body.includes(createId))!;
+    return { childBodies, delegated: acpToolResultText(afterCall.body, createId), stderr: acp.stderr };
+  } finally {
+    await acp?.close();
+    gateway.stop();
+  }
+}
+
 function createShortIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join("/tmp", prefix)));
   const home = join(root, "home");
@@ -9889,6 +9939,168 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP starts a subagent in the profile its session's workspace has, not the one in the directory fx acp started in",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-profile-");
+      try {
+        // The directory fx acp started in has a `reviewer` that searches; the
+        // session's workspace has one that reads.
+        writeAcpProfile(root.workspace, "reviewer", { description: "Searches the process directory", tools: ["glob_files"] });
+        writeAcpProfile(root.external, "reviewer", { description: "Reads the session workspace", tools: ["read_file"] });
+        const run = await askForReviewerFromSessionWorkspace(root);
+        expect(run.delegated).toContain("Sent to reviewer");
+        expect(run.childBodies).toHaveLength(1);
+        const offered = acpOfferedTools(run.childBodies[0]!);
+        expect(offered).toContain("read_file");
+        expect(offered).not.toContain("glob_files");
+        expect(run.stderr).toBe("");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP starts a subagent in a profile only its session's workspace has",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-profile-only-");
+      try {
+        writeAcpProfile(root.external, "reviewer", { description: "Reads the session workspace", tools: ["read_file"] });
+        const run = await askForReviewerFromSessionWorkspace(root);
+        expect(run.delegated).toContain("Sent to reviewer");
+        expect(run.childBodies).toHaveLength(1);
+        expect(acpOfferedTools(run.childBodies[0]!)).toContain("read_file");
+        expect(run.stderr).toBe("");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP refuses a subagent profile that only the directory fx acp started in has, and names it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-profile-missing-");
+      try {
+        writeAcpProfile(root.workspace, "reviewer", { description: "Searches the process directory", tools: ["glob_files"] });
+        const run = await askForReviewerFromSessionWorkspace(root);
+        // The session's workspace has no `reviewer`, so no subagent starts in
+        // another directory's.
+        expect(run.delegated).toContain("profile_unavailable");
+        expect(run.delegated).toContain("no profile named 'reviewer'");
+        expect(run.childBodies).toHaveLength(0);
+        expect(run.stderr).toBe("");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP gives a resumed subagent the prompt of its session's workspace, though fx acp started elsewhere",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-profile-resume-");
+      const firstId = "acp_resume_profile_first";
+      const againId = "acp_resume_profile_again";
+      const marker = "SESSION_WORKSPACE_PROFILE_PROMPT";
+      writeAcpProfile(root.external, "reviewer", { description: "Reads the session workspace", tools: ["read_file"] }, marker);
+      const childBodies: string[] = [];
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          childBodies.push(body);
+          return finalText("session review done");
+        }
+        if (acpLatestUserIsReport(body)) return finalText("ACP_RESUME_PROFILE_REPORT_READ");
+        if (body.includes(againId)) return finalText("ACP_RESUME_PROFILE_AGAIN_DONE");
+        if (body.includes("Delegate again.")) {
+          return fakeGatewayToolCall(againId, "subagent", {
+            request: { action: "message", agent: "reviewer", message: "Review it again." },
+          });
+        }
+        if (body.includes(firstId)) return finalText("ACP_RESUME_PROFILE_FIRST_DONE");
+        return fakeGatewayToolCall(firstId, "subagent", {
+          request: { action: "message", agent: "reviewer", message: "Review the workspace.", profile: "reviewer" },
+        });
+      });
+      let first: AcpClient | undefined;
+      let second: AcpClient | undefined;
+      try {
+        // The first run starts in the session's workspace.
+        first = await AcpClient.create({ cwd: root.external, env: fakeGatewayEnv(root, gateway) });
+        await first.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await first.request("session/new", { cwd: root.external, mcpServers: [] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await first.readLine();
+        const firstRun = await runPrompt(first, "Delegate a review.", TIMEOUT);
+        expect(firstRun.promptResult.result.stopReason).toBe("end_turn");
+        expect(childBodies).toHaveLength(1);
+        expect(acpPromptText(childBodies[0]!)).toContain(marker);
+        await first.close();
+
+        // The second starts in a directory with no profiles and opens the
+        // same session by naming its workspace.
+        second = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await second.request("initialize", { protocolVersion: 1 }, 10);
+        const loaded = await second.request("session/load", {
+          sessionId: (created.result as any).sessionId,
+          cwd: root.external,
+          mcpServers: [],
+        }, 11) as any;
+        expect(loaded.error).toBeUndefined();
+        const secondRun = await runPrompt(second, "Delegate again.", TIMEOUT);
+        expect(secondRun.promptResult.result.stopReason).toBe("end_turn");
+        expect(childBodies).toHaveLength(2);
+        const offered = acpOfferedTools(childBodies[1]!);
+        expect(offered).toContain("read_file");
+        expect(offered).not.toContain("glob_files");
+        expect(acpPromptText(childBodies[1]!)).toContain(marker);
+        expect(second.stderr).toBe("");
+      } finally {
+        await first?.close();
+        await second?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP tells the model its session's workspace as the current directory, which is where its commands run",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-current-directory-");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes("cwd_shell")) return finalText("ACP_CWD_DONE");
+        return fakeShellRun("cwd_shell", "pwd");
+      }, { classifierDecision: "clear" });
+      let acp: AcpClient | undefined;
+      try {
+        acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await acp.request("initialize", { protocolVersion: 1 }, 1);
+        acp.setPermissionOption("allow_once");
+        const created = await acp.request("session/new", { cwd: root.external, mcpServers: [] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await acp.readLine();
+        const result = await runPrompt(acp, "Where do your commands run?", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const told = acpPromptText(gateway.requests[0]!.body);
+        expect(told).toContain(`workspace_root: ${root.external}\ncurrent_directory: ${root.external}\n`);
+        expect(told).not.toContain(`current_directory: ${root.workspace}`);
+        expect(acpToolResultText(gateway.requests[1]!.body, "cwd_shell")).toContain(root.external);
+        expect(acp.stderr).toBe("");
+      } finally {
+        await acp?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
