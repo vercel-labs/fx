@@ -229,7 +229,7 @@ const max_cause_bytes = 240;
 /// arguments when an MCP server refuses a call's parameters")
 pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
     if (!std.mem.startsWith(u8, text, invalid_params_prefix)) return null;
-    const message = text[invalid_params_prefix.len..];
+    const message = try withoutData(arena, text[invalid_params_prefix.len..]);
     var line: std.Io.Writer.Allocating = .init(arena);
     const named = (writeGoRejections(&line.writer, message) catch return error.OutOfMemory) or
         try writeZodRejections(arena, &line.writer, message);
@@ -238,6 +238,24 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
     const masked = text_utils.maskSecrets(arena, line.written()) catch return error.OutOfMemory;
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, max_cause_bytes);
     return encoded.bytes;
+}
+
+/// The message of the text `write_protocol_diagnostic` wrote, without the `; data=` and the data it
+/// adds when the server gave some. The data is JSON to the end of the text, so the last `; data=` whose
+/// rest is one JSON value is the one it wrote. A message that says `; data=` itself, with no JSON after
+/// it, stays whole, and so does a text cut inside the data. Only the last few are tried.
+fn withoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    const label = "; data=";
+    var end = text.len;
+    for (0..8) |_| {
+        const at = std.mem.findLast(u8, text[0..end], label) orelse return text;
+        const valid = std.json.validate(arena, text[at + label.len ..]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (valid) return text[0..at];
+        end = at;
+    }
+    return text;
 }
 
 /// The Go SDK's validator names one field a line:
@@ -887,6 +905,28 @@ test "an invalid-params cause stays one terminal-safe line within its bound" {
         try std.testing.expect(cause.len <= max_cause_bytes);
         for (cause) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
     }
+}
+
+test "an invalid-params cause reads the server's message only, not the data written after it" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const go = "MCP protocol error -32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"";
+    const zod = "MCP protocol error -32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
+    // The data holds its own list of issues, and text that looks like the Go validator's lines.
+    const data = "; data={\"errors\":[{\"path\":[\"other\"],\"expected\":\"string\"}],\"hint\":\"validating /properties/forged: type: \\\"1\\\" has type \\\"string\\\", want \\\"number\\\"\"}";
+    for ([_][]const u8{ go, zod }) |message| {
+        const plain = (try invalidParamsCause(arena, message)).?;
+        try std.testing.expect(std.mem.find(u8, plain, "limit") != null);
+        const with_data = (try invalidParamsCause(arena, try arena.print("{s}{s}", .{ message, data }))).?;
+        try std.testing.expectEqualStrings(plain, with_data);
+    }
+    // Data that is not JSON, because the text was cut, is read as part of the message, as before.
+    const cut = (try invalidParamsCause(arena, try arena.print("{s}; data={{\"errors\":[{{\"pa", .{go}))).?;
+    try std.testing.expect(std.mem.find(u8, cut, "limit") != null);
+    // A message that says `; data=` itself keeps what follows it, since nothing JSON ends the text.
+    const says = (try invalidParamsCause(arena, "MCP protocol error -32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"; data=none")).?;
+    try std.testing.expect(std.mem.find(u8, says, "limit") != null);
 }
 
 fn invalidParamsCauseAllocationFailures(alloc: Allocator) !void {

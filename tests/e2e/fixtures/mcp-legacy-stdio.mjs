@@ -410,17 +410,54 @@ function handle(message) {
       // A server built on the Go MCP SDK refuses arguments of the wrong type
       // with -32602, in its validator's words, then the tool's schema, as
       // Datadog's server does.
-      send({
+      // A server may explain a refusal in the error's data: FX_MCP_PROTOCOL_ERROR_DATA is
+      // its JSON, FX_MCP_PROTOCOL_ERROR_DATA_BYTES is a data member of about that size,
+      // and FX_MCP_PROTOCOL_ERROR_CODE is the code. FX_MCP_PROTOCOL_ERROR_FAULT breaks the
+      // reply: "pieces" writes it in small chunks, and "cut" stops in the middle of it.
+      const dataBytes = process.env.FX_MCP_PROTOCOL_ERROR_DATA_BYTES;
+      const dataText = process.env.FX_MCP_PROTOCOL_ERROR_DATA;
+      const reply = {
         jsonrpc: "2.0",
         id: message.id,
         error: {
-          code: -32602,
+          code: Number(process.env.FX_MCP_PROTOCOL_ERROR_CODE ?? -32602),
           message: 'validating "arguments": validating root: validating /properties/limit: ' +
             'type: "40" has type "string", want "number"\n\n' +
             'Full input schema for tool "echo":\n' +
             '{"type":"object","properties":{"limit":{"type":"number"}}}',
+          ...(dataBytes
+            ? { data: { detail: "d".repeat(Number(dataBytes)) } }
+            : dataText
+            ? { data: JSON.parse(dataText) }
+            : {}),
         },
-      });
+      };
+      const fault = process.env.FX_MCP_PROTOCOL_ERROR_FAULT;
+      // FX_MCP_PROTOCOL_ERROR_DATA_RAW is the data's text, written as it is, spaces and all.
+      const rawData = process.env.FX_MCP_PROTOCOL_ERROR_DATA_RAW;
+      if (rawData !== undefined) {
+        reply.error.data = "@@RAW@@";
+        process.stdout.write(JSON.stringify(reply).replace('"@@RAW@@"', () => rawData) + "\n");
+        return;
+      }
+      if (!fault) {
+        send(reply);
+        return;
+      }
+      const line = JSON.stringify(reply);
+      if (fault === "cut") {
+        process.stdout.write(line.slice(0, Math.floor(line.length / 2)), () => process.exit(0));
+      } else {
+        // "pieces": 1,000 bytes at a time, with a breath between them.
+        let sent = 0;
+        const next = () => {
+          if (sent >= line.length) return process.stdout.write("\n");
+          process.stdout.write(line.slice(sent, sent + 1000));
+          sent += 1000;
+          setTimeout(next, 1);
+        };
+        next();
+      }
       return;
     }
     if (mode === "draft7_schema" && draft7Pattern && !new RegExp(draft7Pattern, "u").test(message.params?.arguments?.text)) {
