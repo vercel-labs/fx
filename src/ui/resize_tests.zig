@@ -8555,7 +8555,7 @@ test "resizing after a partial session handoff cancels without clearing transcri
         error.SessionScrollbackHandoffGeometryChanged,
         h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
     );
-    h.shell.cancelSessionScrollbackHandoff();
+    h.shell.cancelSessionScrollbackHandoff("geometry_changed");
     try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
     try std.testing.expect(std.mem.find(u8, h.shell.notebook.transcript.items, "old session retained") != null);
     try std.testing.expect(h.shell.render_requests.hasReason(.footer));

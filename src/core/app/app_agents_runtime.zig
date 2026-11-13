@@ -2269,6 +2269,7 @@ pub fn Runtime(comptime App: type) type {
         /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
             noteQuitting(app);
+            releaseScreenForShutdown(app);
             attach(app, null);
             closeHandoffs(app);
             // A slot thread still reads its child's worker while it detaches,
@@ -2293,6 +2294,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Gives up a scrollback handoff that still has rows to write, as
+        /// shutdown swaps each agent's transcript in to close it. A closed
+        /// terminal fails the handoff's write and then ends the loop, so the
+        /// handoff can still be pending here. Nothing is drawn after this.
+        fn releaseScreenForShutdown(app: *App) void {
+            app.shell.cancelSessionScrollbackHandoff("shutdown");
+        }
+
         /// Logs `child`, kept allocated because a slot thread still holds its
         /// worker after `release_timeout_ms`: its finished turns are saved and
         /// its session is closed, but its agent and worker are not freed.
@@ -2311,6 +2320,7 @@ pub fn Runtime(comptime App: type) type {
         /// run's turn context once the slot thread frees it.
         pub fn stopChildren(app: *App, comptime mode: enum { cooperative, force }) void {
             noteQuitting(app);
+            releaseScreenForShutdown(app);
             // Main's own shutdown writes to its transcript, so it goes back on
             // screen first.
             attach(app, null);

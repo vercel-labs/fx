@@ -5850,6 +5850,403 @@ test "a run handed to a hidden agent waits while a scrollback handoff is pending
     try std.testing.expect(app.screenAgent() == &app.main_agent);
 }
 
+/// A scrollback handoff that still has rows to write, for tests.
+const test_pending_handoff: @FieldType(TranscriptRuntime, "pending_session_scrollback_handoff") = .{
+    .remaining_rows = 1,
+    .total_rows = 2,
+    .terminal_cols = 80,
+    .terminal_rows = 24,
+};
+
+/// Records each agent the tick visits and the assistant text of every event
+/// it takes, in order. Events live in the C allocator, as the worker's own
+/// teardown frees what is left in its queue with it.
+const HiddenWorkVisits = struct {
+    seen: std.ArrayList(*agents.Agent) = .empty,
+    texts: std.ArrayList([]u8) = .empty,
+
+    fn record(self: *HiddenWorkVisits, a: *App, agent: *agents.Agent) anyerror!void {
+        try self.seen.append(a.alloc, agent);
+        var events = agent.worker.takeEvents();
+        defer {
+            for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+            events.deinit(std.heap.c_allocator);
+        }
+        for (events.items) |event| switch (event) {
+            .assistant_presentation => |presentation| {
+                const text = try a.alloc.dupe(u8, presentation.text);
+                errdefer a.alloc.free(text);
+                try self.texts.append(a.alloc, text);
+            },
+            else => {},
+        };
+    }
+
+    fn deinit(self: *HiddenWorkVisits, alloc: Allocator) void {
+        for (self.texts.items) |text| alloc.free(text);
+        self.texts.deinit(alloc);
+        self.seen.deinit(alloc);
+    }
+};
+
+fn pushTestText(agent: *agents.Agent, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [64]u8 = undefined;
+    const text = try std.mem.print(&buf, fmt, args);
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = text } });
+}
+
+test "hidden work held over a thousand passes is all handled once the handoff ends, in order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "hidden-tick.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "host");
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const hidden = try addTestChildAgent(&app, "hidden");
+    var visits: HiddenWorkVisits = .{};
+    defer visits.deinit(alloc);
+
+    const passes = 1000;
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+    for (0..passes) |pass| {
+        try pushTestText(&hidden.agent, "event-{d}", .{pass});
+        try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    }
+    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
+    try std.testing.expect(hidden.agent.worker.hasPendingEvents());
+
+    app.shell.pending_session_scrollback_handoff = null;
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
+    try std.testing.expect(visits.seen.items[0] == &hidden.agent);
+    try std.testing.expectEqual(@as(usize, passes), visits.texts.items.len);
+    var want: [64]u8 = undefined;
+    for (visits.texts.items, 0..) |text, index| {
+        try std.testing.expectEqualStrings(try std.mem.print(&want, "event-{d}", .{index}), text);
+    }
+    try std.testing.expect(!hidden.agent.worker.hasPendingEvents());
+
+    // One line for each pass that held work, and none once it ran.
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, passes), std.mem.count(u8, trace, "event=hidden_tick_deferred"));
+    try std.testing.expectEqual(@as(usize, passes), std.mem.count(u8, trace, "reason=scrollback_handoff_pending agents=1"));
+}
+
+test "main and every hidden subagent wait during a pending handoff and are each handled once after it" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+
+    const count = 64;
+    var hidden: [count]*app_agents_runtime.ChildAgent = undefined;
+    var name: [32]u8 = undefined;
+    for (&hidden, 0..) |*slot, index| slot.* = try addTestChildAgent(&app, try std.mem.print(&name, "hidden-{d}", .{index}));
+    const on_screen = try addTestChildAgent(&app, "on-screen");
+    try App.AgentsAppRuntime.show(&app, on_screen);
+    try pushTestText(&app.main_agent, "main", .{});
+    for (hidden, 0..) |child, index| {
+        for (0..3) |part| try pushTestText(&child.agent, "hidden-{d}-{d}", .{ index, part });
+    }
+
+    var visits: HiddenWorkVisits = .{};
+    defer visits.deinit(alloc);
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+    for (0..10) |_| try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
+    try std.testing.expect(app.screenAgent() == &on_screen.agent);
+
+    app.shell.pending_session_scrollback_handoff = null;
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    try std.testing.expectEqual(@as(usize, count + 1), visits.seen.items.len);
+    try std.testing.expect(visits.seen.items[0] == &app.main_agent);
+    for (hidden, 1..) |child, index| try std.testing.expect(visits.seen.items[index] == &child.agent);
+    try std.testing.expectEqual(@as(usize, 1 + count * 3), visits.texts.items.len);
+    try std.testing.expectEqualStrings("main", visits.texts.items[0]);
+    try std.testing.expectEqualStrings("hidden-0-0", visits.texts.items[1]);
+    try std.testing.expectEqualStrings("hidden-63-2", visits.texts.items[count * 3]);
+    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
+    for (hidden) |child| try std.testing.expect(!child.agent.worker.hasPendingEvents());
+    try std.testing.expect(app.screenAgent() == &on_screen.agent);
+}
+
+test "hidden work held by a handoff runs once a resize cancels the handoff" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
+    app.shell.has_committed_frame = true;
+    const hidden = try addTestChildAgent(&app, "hidden");
+    try pushTestText(&hidden.agent, "held", .{});
+
+    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    var visits: HiddenWorkVisits = .{};
+    defer visits.deinit(alloc);
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
+
+    app.shell.layout.cols = 78;
+    app.shell.render_requests.observeResizeSignal(100, 100);
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
+    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
+
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
+    try std.testing.expectEqual(@as(usize, 1), visits.texts.items.len);
+    try std.testing.expectEqualStrings("held", visits.texts.items[0]);
+}
+
+test "a thousand handoffs that come and go lose no hidden work and run none of it early" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const hidden = try addTestChildAgent(&app, "hidden");
+    var visits: HiddenWorkVisits = .{};
+    defer visits.deinit(alloc);
+    defer app.shell.pending_session_scrollback_handoff = null;
+
+    const cycles = 1000;
+    for (0..cycles) |cycle| {
+        try pushTestText(&hidden.agent, "cycle-{d}", .{cycle});
+        app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+        try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+        try std.testing.expectEqual(cycle, visits.seen.items.len);
+        app.shell.pending_session_scrollback_handoff = null;
+        try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+        try std.testing.expectEqual(cycle + 1, visits.seen.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, cycles), visits.texts.items.len);
+    var want: [64]u8 = undefined;
+    for (visits.texts.items, 0..) |text, index| {
+        try std.testing.expectEqualStrings(try std.mem.print(&want, "cycle-{d}", .{index}), text);
+    }
+}
+
+test "runs handed to hidden agents during a pending handoff stay held in their order" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
+    const first = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+
+    var turns: [2]subagent_execution.TurnContext = undefined;
+    turns[0].child_id = first.id;
+    turns[1].child_id = second.id;
+    for (&turns) |*turn| turn.child_name = null;
+    var posts: [2]app_agents_runtime.Post = undefined;
+    var made: usize = 0;
+    defer for (posts[0..made]) |*post| if (post.run) |*run| run.deinit(alloc);
+    for (&posts, &turns) |*post, *turn| {
+        post.* = .{ .turn = turn, .run = try testChildRun(alloc, &resolver, false, null) };
+        made += 1;
+        try app.child_handoffs.posts.append(std.heap.c_allocator, post);
+    }
+
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+    for (0..100) |_| App.AgentsAppRuntime.takePosts(&app);
+
+    try std.testing.expectEqual(@as(usize, 2), app.child_handoffs.posts.items.len);
+    try std.testing.expect(app.child_handoffs.posts.items[0] == &posts[0]);
+    try std.testing.expect(app.child_handoffs.posts.items[1] == &posts[1]);
+    for (&posts) |*post| {
+        try std.testing.expect(post.held);
+        try std.testing.expectEqual(app_agents_runtime.Post.State.posted, post.state.load(.acquire));
+    }
+    try std.testing.expect(first.agent.child_run == null);
+    try std.testing.expect(second.agent.child_run == null);
+}
+
+test "slot threads that cancel runs held by a pending handoff get them back" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
+    const count = 8;
+    var children: [count]*app_agents_runtime.ChildAgent = undefined;
+    var name: [32]u8 = undefined;
+    for (&children, 0..) |*slot, index| slot.* = try addTestChildAgent(&app, try std.mem.print(&name, "child-{d}", .{index}));
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+
+    const Poster = struct {
+        fn run(handoffs: *app_agents_runtime.Handoffs, post: *app_agents_runtime.Post, cancel: *std.atomic.Value(bool), result: *?anyerror) void {
+            app_agents_runtime.postAndWait(handoffs, post, cancel) catch |err| {
+                result.* = err;
+                return;
+            };
+            result.* = null;
+        }
+    };
+
+    for (0..100) |_| {
+        var turns: [count]subagent_execution.TurnContext = undefined;
+        var posts: [count]app_agents_runtime.Post = undefined;
+        var cancels: [count]std.atomic.Value(bool) = undefined;
+        var results: [count]?anyerror = undefined;
+        var threads: [count]std.Thread = undefined;
+        var made: usize = 0;
+        defer for (posts[0..made]) |*post| if (post.run) |*run| run.deinit(alloc);
+        for (0..count) |index| {
+            turns[index].child_id = children[index].id;
+            turns[index].child_name = null;
+            posts[index] = .{ .turn = &turns[index], .run = try testChildRun(alloc, &resolver, false, null) };
+            made += 1;
+            cancels[index] = .init(false);
+            results[index] = error.TestNotFinished;
+        }
+        var started: usize = 0;
+        defer for (threads[0..started]) |thread| thread.join();
+        for (0..count) |index| {
+            threads[index] = try std.Thread.spawn(.{}, Poster.run, .{ &app.child_handoffs, &posts[index], &cancels[index], &results[index] });
+            started += 1;
+        }
+        // The loop holds the runs while the threads post them.
+        for (0..20) |_| {
+            App.AgentsAppRuntime.takePosts(&app);
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        for (&cancels) |*cancel| cancel.store(true, .seq_cst);
+        // The loop keeps holding runs while each thread withdraws its own.
+        const deadline = io_mod.milliTimestamp() + 10_000;
+        while (true) {
+            App.AgentsAppRuntime.takePosts(&app);
+            var done = true;
+            for (&posts) |*post| {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                for (app.child_handoffs.posts.items) |queued| if (queued == post) {
+                    done = false;
+                };
+            }
+            if (done) break;
+            try std.testing.expect(io_mod.milliTimestamp() < deadline);
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        for (threads[0..started]) |thread| thread.join();
+        started = 0;
+        for (results) |result| try std.testing.expectEqual(@as(?anyerror, error.Cancelled), result);
+        for (children) |child| try std.testing.expect(child.agent.child_run == null);
+        try std.testing.expectEqual(@as(usize, 0), app.child_handoffs.posts.items.len);
+    }
+}
+
+test "quitting while a scrollback handoff is pending closes every agent" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const on_screen = try addTestChildAgent(&app, "on-screen");
+    const hidden = try addTestChildAgent(&app, "hidden");
+    try App.AgentsAppRuntime.show(&app, on_screen);
+    try pushTestText(&hidden.agent, "unhandled", .{});
+
+    // A closed terminal fails the handoff's write and then ends the loop.
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+    App.AgentsAppRuntime.stopChildren(&app, .cooperative);
+    App.AgentsAppRuntime.shutdownChildren(&app);
+
+    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(app.screenAgent() == &app.main_agent);
+}
+
+test "a turn that starts on screen during a pending handoff lets the hidden agents run" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
+    app.shell.has_committed_frame = true;
+    const hidden = try addTestChildAgent(&app, "hidden");
+    try pushTestText(&hidden.agent, "waited on", .{});
+
+    // A subagent's report starts a turn on the idle agent on screen while
+    // its session change still has rows to hand off.
+    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
+    defer app.main_agent.session_persistence.pending_live_session_policy = null;
+    app.main_agent.session_persistence.pending_live_session_wait = .{ .geometry = @import("core/mcp/operation_control.zig").monotonicMillis(io_mod.getIo()) };
+    defer app.main_agent.session_persistence.pending_live_session_wait = null;
+    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
+    defer app.shell.pending_session_scrollback_handoff = null;
+    app.screenAgent().worker.worker_processing = true;
+    defer app.screenAgent().worker.worker_processing = false;
+
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
+    // The session change still waits for the turn.
+    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
+    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
+
+    var visits: HiddenWorkVisits = .{};
+    defer visits.deinit(alloc);
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
+    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
+    try std.testing.expectEqualStrings("waited on", visits.texts.items[0]);
+}
+
 test "the agent list previews each agent by switching, keeps every draft where it was typed, Up on the first row closes it, and Esc goes back" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.

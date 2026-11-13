@@ -871,7 +871,7 @@ pub fn Runtime(comptime App: type) type {
                 error.SessionScrollbackHandoffGeometryChanged => {
                     agent.session_persistence.pending_live_session_policy = null;
                     agent.session_persistence.pending_live_session_wait = null;
-                    app.shell.cancelSessionScrollbackHandoff();
+                    app.shell.cancelSessionScrollbackHandoff("geometry_changed");
                     releaseLiveSessionTransitionHold(app, agent);
                     debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
@@ -905,7 +905,7 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             agent.session_persistence.pending_live_session_policy = null;
             agent.session_persistence.pending_live_session_wait = null;
-            app.shell.cancelSessionScrollbackHandoff();
+            app.shell.cancelSessionScrollbackHandoff(reason);
             releaseLiveSessionTransitionHold(app, agent);
             debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
@@ -914,6 +914,17 @@ pub fn Runtime(comptime App: type) type {
         pub fn settlePendingLiveSessionTransition(app: *App, agent: *AppAgent) !void {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             const processing = agent.worker.isProcessing();
+            // The handoff goes on only while the agent is idle, and no agent's
+            // transcript can be swapped in until it ends. A turn that starts
+            // meanwhile, such as one a subagent's report starts, would hold
+            // the handoff, and every hidden agent, until it ends, and that
+            // turn may wait on a hidden agent. So the handoff yields; the
+            // change hands the rows off again once the agent is idle.
+            if (processing) {
+                if (comptime @hasDecl(@TypeOf(app.shell), "cancelSessionScrollbackHandoff")) {
+                    app.shell.cancelSessionScrollbackHandoff("agent_busy");
+                }
+            }
             const now = operation_control.monotonicMillis(io_mod.getIo());
             var wait = agent.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
             if (wait == .worker and !processing) wait = .{ .geometry = now };
