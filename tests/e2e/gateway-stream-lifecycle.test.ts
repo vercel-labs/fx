@@ -7901,6 +7901,146 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 100_000);
 
+  test("a shell request wrapper the model wrote as JSON text runs its command", async () => {
+    const root = createFixtureRoot("shell-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const marker = join(root.workspace, "request-text-marker.txt");
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("text_request", "shell", {
+            request: JSON.stringify({
+              action: "run",
+              command: "printf REQUEST_TEXT_OK > request-text-marker.txt && cat request-text-marker.txt",
+              profile: "clean",
+              yield_time_ms: 30000,
+            }),
+          });
+        case 1:
+          expect(shellResult(body, "text_request")).toMatchObject({
+            state: "completed", exit_code: 0, output_delta: "REQUEST_TEXT_OK",
+          });
+          return fakeGatewayFinalText("REQUEST_TEXT_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Run the fixture command."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("REQUEST_TEXT_COMPLETE");
+      expect(readFileSync(marker, "utf8")).toBe("REQUEST_TEXT_OK");
+      expect(gateway.requests).toHaveLength(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a subagent message whose request wrapper the model wrote as JSON text reaches the worker", async () => {
+    const root = createFixtureRoot("subagent-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const childBodies: string[] = [];
+    let sentBody = "";
+    let statusBody = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childBodies.push(body);
+        return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
+      }
+      // The worker answers at once, so its report may reach the parent before
+      // either call's result does; each result is taken from the first request
+      // that carries it, report or not.
+      if (body.includes("text-status") && !statusBody) {
+        statusBody = body;
+        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+      }
+      if (body.includes("text-delegate") && !sentBody) {
+        sentBody = body;
+        // Every other action as JSON text is read too.
+        return fakeGatewayToolCall("text-status", "subagent", { request: JSON.stringify({ action: "status" }) });
+      }
+      if (latestUserIsReport(body) || sentBody) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
+      return fakeGatewayToolCall("text-delegate", "subagent", {
+        request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
+      });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Start a worker with a wrapped request."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(toolResultOutput(sentBody, "text-delegate")).not.toContain("request must be an object");
+      expect(childBodies.some((body) => body.includes("TEXT_WRAPPED_TASK"))).toBe(true);
+      // Intake keeps the call with its top-level arguments, as it does for an
+      // object wrapper, so the history and the review see the real action.
+      const call = (gatewayRequest(sentBody).prompt.flatMap((message) =>
+        Array.isArray(message.content) ? message.content : []
+      ) as Array<Record<string, unknown>>).find((part) => part.type === "tool-call" && part.toolCallId === "text-delegate");
+      expect(call?.input).toEqual({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" });
+      const status = toolResultOutput(statusBody, "text-status");
+      expect(status).not.toContain("request must be an object");
+      expect(status).toContain("worker");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a shell request wrapper as JSON text with extra fields or nested too deep gets the correction", async () => {
+    const root = createFixtureRoot("shell-request-text-correction");
+    const tracePath = join(root.root, "trace.log");
+    const command = "printf NOT_RUN > request-text-correction.txt";
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("text_with_extra", "shell", {
+            request: JSON.stringify({ action: "run", command, profile: "clean" }),
+            yield_time_ms: 1000,
+          });
+        case 1: {
+          const correction = JSON.parse(toolResultOutput(body, "text_with_extra")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.problems).toContain("Put the action fields at the top level; shell takes no request wrapper.");
+          expect(correction.retry_with).toEqual({ action: "run", command, profile: "clean", yield_time_ms: 1000 });
+          return fakeGatewayToolCall("text_too_deep", "shell", {
+            request: "{\"a\":".repeat(300) + "1" + "}".repeat(300),
+          });
+        }
+        case 2: {
+          const correction = JSON.parse(toolResultOutput(body, "text_too_deep")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.retry_with).toBeUndefined();
+          return fakeGatewayFinalText("REQUEST_TEXT_CORRECTED");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Run the fixture command."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("REQUEST_TEXT_CORRECTED");
+      expect(existsSync(join(root.workspace, "request-text-correction.txt"))).toBe(false);
+      expect(gateway.requests).toHaveLength(3);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   test.skipIf(!tmuxAvailable())(
     "a read_tool_result request the model wrote as JSON text reads the saved output",
     async () => {
@@ -7910,6 +8050,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const marker = "READ_TEXT_MATCH";
       let step = 0;
       let readOutput = "";
+      let replayedInput: unknown = null;
       const gateway = startDynamicFakeGateway((body) => {
         switch (step++) {
           case 0:
@@ -7923,9 +8064,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               request: JSON.stringify({ handle: source.full_output_handle, query: marker }),
             });
           }
-          case 2:
+          case 2: {
             readOutput = toolResultOutput(body, "read-text-page");
+            const parts = (JSON.parse(body) as { prompt: Array<{ content?: Array<Record<string, unknown>> }> })
+              .prompt.flatMap((message) => message.content ?? []);
+            replayedInput = parts.find((part) =>
+              part.type === "tool-call" && part.toolCallId === "read-text-page"
+            )?.input;
             return fakeGatewayFinalText("READ_TEXT_COMPLETE");
+          }
           default:
             return new Response("unexpected request", { status: 500 });
         }
@@ -7943,6 +8090,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readOutput).not.toContain("must be an object");
         // The row names the output it searches, as it does for an object request.
         expect(pane).toContain(`output for "${marker}"`);
+        // History replays the call with the top-level arguments the schema
+        // advertises, as it does for a wrapper that is an object.
+        expect(replayedInput).toMatchObject({ query: marker });
+        expect(replayedInput).not.toHaveProperty("request");
         await tui.sendText("/quit");
         expect(await tui.waitForSessionEnd(15000)).toBe(true);
         tui = null;

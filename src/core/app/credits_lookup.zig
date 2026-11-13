@@ -30,6 +30,11 @@ pub const Result = struct {
     snapshot: output_contracts.CreditsSnapshot,
     /// The credential the lookup renewed, for the caller to adopt.
     renewed: ?credentials.Credential = null,
+    /// The lookup checked Token Pass in the background, and nobody asked to
+    /// see the credits.
+    quiet: bool = false,
+    /// The caller's epoch when this lookup's request started.
+    epoch: u32 = 0,
 
     /// Releases everything with `std.heap.c_allocator`, which allocated it.
     pub fn deinit(self: *Result) void {
@@ -41,18 +46,49 @@ pub const Result = struct {
 
 pub const Lookup = struct {
     task: ?*Task = null,
+    /// Whether the running lookup is a quiet one.
+    quiet: bool = false,
+    /// The epoch the caller passed when the running lookup's task started.
+    epoch: u32 = 0,
 
     /// Copies `input` and `renewal`, then fetches in a `std.Io` task. Returns
-    /// `.busy` while an earlier lookup runs. `provider.context` and the
-    /// renewal transport's context must outlive the lookup.
+    /// `.busy` while an earlier lookup runs, except that a running quiet
+    /// lookup started with the same `epoch` becomes this one. The result
+    /// carries `epoch`, so the caller can tell a reply for an earlier
+    /// credential.
+    /// `provider.context` and the renewal transport's context must outlive
+    /// the lookup.
     pub fn start(
         self: *Lookup,
         provider: gateway_provider.CreditsProvider,
         input: gateway_provider.CreditsLookupInput,
         renewal: ?Renewal,
+        epoch: u32,
+    ) !Start {
+        if (self.task != null) {
+            if (!self.quiet or self.epoch != epoch) return .busy;
+            self.quiet = false;
+            return .started;
+        }
+        self.task = try Task.start(provider, input, renewal);
+        self.quiet = false;
+        self.epoch = epoch;
+        return .started;
+    }
+
+    /// Starts a lookup whose result only says whether the team has Token
+    /// Pass. Returns `.busy`, and starts nothing, while any lookup runs.
+    pub fn startQuiet(
+        self: *Lookup,
+        provider: gateway_provider.CreditsProvider,
+        input: gateway_provider.CreditsLookupInput,
+        renewal: ?Renewal,
+        epoch: u32,
     ) !Start {
         if (self.task != null) return .busy;
         self.task = try Task.start(provider, input, renewal);
+        self.quiet = true;
+        self.epoch = epoch;
         return .started;
     }
 
@@ -62,13 +98,30 @@ pub const Lookup = struct {
         const task = self.task orelse return null;
         if (!task.done.load(.acquire)) return null;
         self.task = null;
-        return task.finish();
+        var result = task.finish();
+        result.quiet = self.quiet;
+        result.epoch = self.epoch;
+        self.quiet = false;
+        return result;
+    }
+
+    /// `deinit` for process exit, which never waits. A lookup still running,
+    /// such as one renewing the sign-in, which is never cut off
+    /// (`oauth_transport.Request` `outlives_cancel`), is cancelled and left to
+    /// end with the process. It holds only its own copies and static providers.
+    pub fn leaveForExit(self: *Lookup) void {
+        const task = self.task orelse return;
+        if (task.done.load(.acquire)) return self.deinit();
+        self.task = null;
+        task.cancel.store(true, .seq_cst);
+        debug_trace.logf("credits", "lookup left running reason=process_exit", .{});
     }
 
     /// Cancels a running lookup and waits for its bounded requests to stop.
     pub fn deinit(self: *Lookup) void {
         const task = self.task orelse return;
         self.task = null;
+        self.quiet = false;
         if (!task.done.load(.acquire)) {
             debug_trace.logf("credits", "lookup dropped reason=shutdown", .{});
         }
@@ -171,6 +224,8 @@ const TestProvider = struct {
     release: std.atomic.Value(bool) = .init(false),
     calls: std.atomic.Value(usize) = .init(0),
     saw_input: std.atomic.Value(bool) = .init(false),
+    /// Runs until released however it is cancelled, as a sign-in renewal does.
+    ignores_cancel: bool = false,
 
     fn provider(self: *TestProvider) gateway_provider.CreditsProvider {
         return .{ .context = self, .fetch_fn = fetch };
@@ -191,7 +246,7 @@ const TestProvider = struct {
         );
         // Stands in for a slow endpoint until the test releases it or the
         // lookup is cancelled.
-        while (!self.release.load(.seq_cst) and !input.cancel_flag.?.load(.seq_cst)) {
+        while (!self.release.load(.seq_cst) and (self.ignores_cancel or !input.cancel_flag.?.load(.seq_cst))) {
             std.Thread.yield() catch {};
         }
         if (input.cancel_flag.?.load(.seq_cst)) {
@@ -218,7 +273,7 @@ test "credits lookup hands over its finished snapshot once" {
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{
         .credential = &credential,
         .tenant = "tenant",
-    }, null));
+    }, null, 0));
     // The lookup owns copies, so the caller's buffers may change at once.
     @memset(&credential, 'x');
     try std.testing.expect(lookup.take() == null);
@@ -238,14 +293,33 @@ test "credits lookup reports busy while one runs" {
     var lookup: Lookup = .{};
     defer lookup.deinit();
 
-    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null));
-    try std.testing.expectEqual(Start.busy, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null));
+    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
+    try std.testing.expectEqual(Start.busy, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
 
     fake.release.store(true, .seq_cst);
     var result = takeWhenDone(&lookup);
     result.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.seq_cst));
-    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null));
+    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
+}
+
+test "credits lookup at exit is cancelled and left running instead of waited for" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var fake: TestProvider = .{ .ignores_cancel = true };
+    var lookup: Lookup = .{};
+
+    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
+    while (fake.calls.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    const task = lookup.task.?;
+    lookup.leaveForExit();
+    try std.testing.expect(lookup.task == null);
+    try std.testing.expect(task.cancel.load(.seq_cst));
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    fake.release.store(true, .seq_cst);
+    var result = task.finish();
+    result.deinit();
 }
 
 test "credits lookup shutdown cancels a stalled fetch and waits for it" {
@@ -253,10 +327,38 @@ test "credits lookup shutdown cancels a stalled fetch and waits for it" {
     var fake: TestProvider = .{};
     var lookup: Lookup = .{};
 
-    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null));
+    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
     while (fake.calls.load(.seq_cst) == 0) std.Thread.yield() catch {};
     lookup.deinit();
 
     try std.testing.expect(lookup.task == null);
     try std.testing.expect(!fake.release.load(.seq_cst));
+}
+
+test "credits lookup hands a quiet lookup to a later /credits" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var fake: TestProvider = .{};
+    var lookup: Lookup = .{};
+    defer lookup.deinit();
+
+    try std.testing.expectEqual(Start.started, try lookup.startQuiet(fake.provider(), .{ .credential = null, .tenant = null }, null, 3));
+    try std.testing.expectEqual(Start.busy, try lookup.startQuiet(fake.provider(), .{ .credential = null, .tenant = null }, null, 3));
+    // A quiet lookup for an earlier credential is not this /credits.
+    try std.testing.expectEqual(Start.busy, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 4));
+    // /credits takes over a running quiet lookup for the same credential
+    // instead of starting another.
+    try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 3));
+    try std.testing.expectEqual(Start.busy, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 3));
+
+    fake.release.store(true, .seq_cst);
+    var shown = takeWhenDone(&lookup);
+    defer shown.deinit();
+    try std.testing.expect(!shown.quiet);
+    try std.testing.expectEqual(@as(u32, 3), shown.epoch);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.seq_cst));
+
+    try std.testing.expectEqual(Start.started, try lookup.startQuiet(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
+    var quiet = takeWhenDone(&lookup);
+    defer quiet.deinit();
+    try std.testing.expect(quiet.quiet);
 }

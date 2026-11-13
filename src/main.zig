@@ -975,7 +975,11 @@ const App = struct {
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
-        self.auth.stopProviderPreparation();
+        // Exit never waits, not even for a sign-in refresh, which is never cut
+        // off: a preparation or prompt refresh still running ends with the
+        // process.
+        self.auth.leaveProviderPreparationForExit();
+        self.auth.leavePromptRefreshesForExit();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);
@@ -1002,7 +1006,7 @@ const App = struct {
         };
         // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
-        self.credits_lookup.deinit();
+        self.credits_lookup.leaveForExit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Quitting from a subagent's screen resumes its instance.
@@ -3273,6 +3277,7 @@ const App = struct {
 
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+            try app_commands.Handlers(App).startTokenPassDefaultCheck(self, builtin_gateway.default_model);
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
@@ -3285,7 +3290,8 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
-        try app_commands.Handlers(App).collectCreditsFacts(self);
+        try app_commands.Handlers(App).collectCreditsFacts(self, builtin_gateway.default_model);
+        try app_commands.Handlers(App).applyTokenPassDefault(self, builtin_gateway.default_model);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self, self.screenAgent());
             try AuthAppRuntime.collectSourceInventoryFacts(self, self.screenAgent());
@@ -5367,7 +5373,9 @@ test {
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
+    _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");
@@ -5449,6 +5457,7 @@ test {
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");

@@ -15,22 +15,6 @@ const max_query_label_bytes = 60;
 /// reads it. Text that needs more keeps the tool's default label.
 const presentation_request_bytes = 4096;
 
-/// The object a call's arguments ask with: its `request` wrapper, read from
-/// JSON text when the model wrote it as text, or else the arguments themselves.
-/// Null when `request` is neither an object nor JSON text of one. Text read
-/// from JSON is allocated in `alloc`.
-pub fn requestObject(alloc: Allocator, args: std.json.ObjectMap) Allocator.Error!?std.json.ObjectMap {
-    var request = args.get("request") orelse return args;
-    tool_args.normalizeCompositeObjectValue(alloc, &request) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    return switch (request) {
-        .object => |object| object,
-        else => null,
-    };
-}
-
 /// A handle as `validate` resolves it: without surrounding whitespace, plus
 /// the `.txt` a stored result or image handle may omit.
 const HandleNormalization = struct {
@@ -60,7 +44,7 @@ const RequestView = struct {
 };
 
 fn requestView(alloc: Allocator, args: std.json.ObjectMap) Allocator.Error!?RequestView {
-    const object = (try requestObject(alloc, args)) orelse return null;
+    const object = (try tool_args.unwrapRequest(alloc, args)) orelse return null;
     if (object.get("search") != null) return .{ .kind = .history_search };
     const handle = switch (object.get("handle") orelse return null) {
         .string => |value| std.mem.trim(u8, value, " \t\r\n"),

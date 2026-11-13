@@ -268,6 +268,8 @@ const agent = createFxAgent({
 
 Return a string to send it as is, or any other value to send it as JSON. A thrown error reaches the model as a failed tool result. To return images, return `{ type: "libfx.tool-result", text, images }`, with base64 image data.
 
+When the model writes a number, integer, boolean, array, or object argument as JSON text, such as `"40"` for a field that `inputSchema` types as an integer, `execute` receives it as that type. Every other value arrives as the model wrote it.
+
 Validate the input and authorize the action inside `execute`. libfx orders the calls but grants nothing itself.
 
 On the native backend, calls to idempotent tools from one model response run at the same time, up to 16 at once. A tool that isn't idempotent runs alone, and so does one marked `writes: true`. Mark a tool `writes: false` to let it overlap with others anyway. On WebAssembly, calls run one after another.
@@ -313,6 +315,8 @@ createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "high", fast: 
 ### AI Gateway
 
 AI Gateway is the default. libfx uses the first credential it finds: the `apiKey` option, then `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token.
+
+libfx asks AI Gateway to cache the start of each request, as the fx CLI does. Later requests in a session start with the same instructions, tools, and earlier messages, so models that support prompt caching read that part from the cache instead of processing it again.
 
 ### ChatGPT plans
 

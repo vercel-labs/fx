@@ -1,10 +1,12 @@
 {
   "targets": [
+    {"name": "kept_sign_outs", "module": "fx", "test": "a kept sign-out record parses or is refused on fuzzed bytes, and what parses writes back the same", "iterations": 400000},
     {"name": "acp_mcp_servers", "module": "fx", "test": "ACP MCP parser handles fuzzed request bytes", "iterations": 1500000},
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "fx_login_replace_rejected", "module": "fx", "test": "a forced fx login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
+    {"name": "subscription_replace_rejected", "module": "fx", "test": "a forced Codex or Grok refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
     {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 4000000},
@@ -65,15 +67,20 @@
     {"name": "cli_flags", "module": "fx", "test": "the flag parser keeps its laws on fuzzed command lines", "iterations": 1200000},
     {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000},
     {"name": "read_tool_result_request_text", "module": "fx", "test": "read_tool_result requests sent as JSON text decode and label alike", "iterations": 250000},
+    {"name": "request_wrapper_text", "module": "fx", "test": "request wrappers sent as JSON text unwrap as tool_args reads them", "iterations": 250000},
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
+    {"name": "subagent_task_line", "module": "fx", "test": "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text", "iterations": 1200},
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
     {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000},
     {"name": "mcp_call_error_text", "module": "fx", "test": "a reply's text reaches stderr terminal-safe whatever bytes the server sends", "iterations": 150000},
     {"name": "unsupported_tool_name", "module": "fx", "test": "an unsupported tool's name stays one run of visible text whatever bytes the model sends", "iterations": 300000},
     {"name": "network_error_message", "module": "fx", "test": "fuzzed gateway error messages stay one bounded line of UTF-8", "iterations": 2000000},
     {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000},
-    {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000}
+    {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000},
+    {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
+    {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
+    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000}
   ]
 }

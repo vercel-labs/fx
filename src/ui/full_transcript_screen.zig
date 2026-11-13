@@ -5947,6 +5947,10 @@ const ProjectionComposeContext = struct {
         defer safe.deinit();
         var encoder = TerminalSafeIndentedWriter{ .prefix = "" };
         try encoder.append(&safe.writer, notice.body);
+        if (notice.detail.len > 0) {
+            try encoder.append(&safe.writer, "\n");
+            try encoder.append(&safe.writer, notice.detail);
+        }
         try encoder.finish(&safe.writer);
         var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, safe.written(), "\n"), '\n');
 

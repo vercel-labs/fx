@@ -23,19 +23,23 @@ import {
   spawnSharedAsk,
   startSharedLoginWorld,
   type IssuerOptions,
+  type SharedHoldResult,
   type SharedLoginEvent,
   type SharedLoginWorld,
+  type SharedProvider,
 } from "../../../e2e/shared-login-fakes";
 import { artifacts, binary } from "../lib/context";
 import { checkTrace, type Verdict } from "./trace";
 
 const TIMEOUT = 180_000;
 
-type Hold = (label: string, attempt: number) => Promise<void> | void;
+type Hold = (label: string, attempt: number) => Promise<SharedHoldResult> | SharedHoldResult;
 type Scenario = {
   name: string;
   procs: number;
   issuer?: IssuerOptions;
+  /** Whose login the processes share; the fx login when left out. */
+  provider?: SharedProvider;
   /** Sets the gateway's hold and runs the processes to their end. */
   drive: (world: SharedLoginWorld, setHold: (hold: Hold) => void, labels: string[]) => Promise<void>;
 };
@@ -53,11 +57,12 @@ async function waitUntil(what: string, condition: () => boolean): Promise<void> 
 }
 
 /** All `labels` hold generation 0, which the gateway no longer takes, and get their 401 together. */
-function together(name: string, procs: number, issuer?: IssuerOptions, answerDelayMs?: () => number): Scenario {
+function together(name: string, procs: number, issuer?: IssuerOptions, answerDelayMs?: () => number, provider?: SharedProvider): Scenario {
   return {
     name,
     procs,
     issuer,
+    provider,
     drive: async (world, setHold, labels) => {
       const allSent = barrier(labels.length);
       setHold(async (_label, attempt) => {
@@ -72,10 +77,11 @@ function together(name: string, procs: number, issuer?: IssuerOptions, answerDel
 }
 
 /** One process whose token another fx replaces while its first request is out. */
-function replaced(name: string, expiresInMs?: number): Scenario {
+function replaced(name: string, expiresInMs?: number, provider?: SharedProvider): Scenario {
   return {
     name,
     procs: 1,
+    provider,
     drive: async (world, setHold, labels) => {
       setHold((_label, attempt) => {
         if (attempt === 0) world.replaceOutside(expiresInMs === undefined ? undefined : Date.now() + expiresInMs);
@@ -93,6 +99,12 @@ const named: Scenario[] = [
   together("slow-issuer-3", 3, { beforeAnswer: () => Bun.sleep(1_500) }),
   together("issuer-500", 2, { failWith: (index) => (index === 0 ? 500 : null) }),
   together("stress-6", 6),
+  together("codex-together-3", 3, undefined, undefined, "codex"),
+  together("grok-together-3", 3, undefined, undefined, "grok"),
+  together("codex-kept-refresh-2", 2, { keepRefreshToken: true }, undefined, "codex"),
+  replaced("codex-replaced", undefined, "codex"),
+  replaced("grok-replaced", undefined, "grok"),
+  replaced("grok-past-deadline", 30_000, "grok"),
   {
     name: "killed-after-save",
     procs: 2,
@@ -107,8 +119,9 @@ const named: Scenario[] = [
           await bothSent();
           if (label === "p2") await killed;
         } else if (label === "p1") {
+          // p1's retry, sent after it saved the refreshed login, never gets an answer.
           await killed;
-          throw new Error("p1 was killed");
+          return "drop";
         }
       });
       world.revoke(0);
@@ -205,6 +218,7 @@ async function drive(scenario: Scenario): Promise<Verdict> {
   const before = scenario.issuer?.beforeAnswer;
   const world = startSharedLoginWorld({
     home,
+    provider: scenario.provider,
     issuer: {
       ...scenario.issuer,
       beforeAnswer: async (index) => {

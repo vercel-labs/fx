@@ -1959,10 +1959,7 @@ fn permissionOutcomeForDecision(
 fn shellCallRequestsReload(arena: Allocator, call: ToolCall) bool {
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments_json, .{}) catch return false;
     if (value != .object) return false;
-    const args = if (value.object.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return false,
-    } else value.object;
+    const args = (tool_args.unwrapRequest(arena, value.object) catch return false) orelse return false;
     const reload = args.get("reload") orelse return false;
     return reload == .bool and reload.bool;
 }
@@ -1977,7 +1974,11 @@ test "shell reload detection reads top-level and wrapped arguments" {
         .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":false}", .reload = false },
         .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}", .reload = false },
         .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":\"true\"}", .reload = false },
-        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":true}\"}", .reload = false },
+        // Intake runs a wrapper written as JSON text, so its reload counts too.
+        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":true}\"}", .reload = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":false}\"}", .reload = false },
+        .{ .arguments_json = "{\"request\":\"[{\\\"reload\\\":true}]\"}", .reload = false },
+        .{ .arguments_json = "{\"request\":\"not json\"}", .reload = false },
         .{ .arguments_json = "not json", .reload = false },
     };
     for (cases) |case| {
