@@ -29,8 +29,8 @@ pub fn usablePath(raw: ?[]const u8) ?[]const u8 {
 
 /// What a hold does on each turn of its wait: `func` with `context`.
 pub const Poll = struct {
-    context: []const u8,
-    func: *const fn (context: []const u8) void,
+    context: *anyopaque,
+    func: *const fn (context: *anyopaque) void,
 };
 
 pub const Hold = struct {
