@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
+const jwt_claims = @import("../auth/jwt_claims.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -65,8 +66,8 @@ pub fn name(alloc: Allocator, source: credentials.Source, api_key: ?[]const u8, 
     return named;
 }
 
-/// The most bytes of OIDC claims fx decodes to name a token's team.
-const max_oidc_claims_bytes: usize = 8 * 1024;
+/// The longest OIDC token whose claims fx reads to name its team.
+const max_oidc_token_bytes: usize = 16 * 1024;
 
 /// The team and project a Vercel OIDC token names in its `owner_id` and
 /// `project_id` claims, joined by a zero byte, or null when the token is not
@@ -74,18 +75,9 @@ const max_oidc_claims_bytes: usize = 8 * 1024;
 /// them only to name the saved answer, so it does not check the signature.
 /// Caller owns the result.
 fn oidcSubject(alloc: Allocator, token: []const u8) ?[]u8 {
-    var parts = std.mem.splitScalar(u8, token, '.');
-    _ = parts.next();
-    const encoded = std.mem.trimEnd(u8, parts.next() orelse return null, "=");
-    const decoder = std.base64.url_safe_no_pad.Decoder;
-    const len = decoder.calcSizeForSlice(encoded) catch return null;
-    if (len > max_oidc_claims_bytes) return null;
-    const claims = alloc.alloc(u8, len) catch return null;
-    defer alloc.free(claims);
-    decoder.decode(claims, encoded) catch return null;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, claims, .{}) catch return null;
+    if (token.len > max_oidc_token_bytes) return null;
+    var parsed = jwt_claims.parse(alloc, token) catch return null;
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
     const owner = claimString(parsed.value.object, "owner_id") orelse return null;
     const project = claimString(parsed.value.object, "project_id") orelse return null;
     return alloc.print("{s}\x00{s}", .{ owner, project }) catch null;
@@ -132,6 +124,12 @@ pub const Check = struct {
         self.has_pass = saved == .has_pass;
         defer token_pass.publishHasPass(self.has_pass);
         if (comptime builtin.single_threaded) return;
+        // A login that is due for renewal has no token yet; the saved answer
+        // stands, and the next run asks.
+        if (input.credential == null) {
+            debug_trace.logf("token_pass", "check skipped reason=no_token saved={s}", .{answerLabel(saved)});
+            return;
+        }
         _ = self.lookup.start(provider, input, null) catch |err| {
             debug_trace.logf("token_pass", "check start failed err={s}", .{@errorName(err)});
             return;

@@ -581,10 +581,6 @@ export function startFakeGateway(
   }, options);
 }
 
-// Same server and classifier handling as startFakeGateway, but every
-// completion request is answered by the supplied callback instead of a
-// finite queue. For suites that replay one response indefinitely or switch
-// on their own state.
 // fx asks AI Gateway's credits endpoint whether the team has Token Pass. With
 // no fake gateway, that request would reach the real AI Gateway, so it goes to
 // a closed loopback port, where it fails at once.
@@ -593,6 +589,10 @@ export function localCreditsEnv(env: Record<string, string | undefined>): Record
   return { ...env, FX_TEST_GATEWAY_CREDITS_URL: "http://127.0.0.1:9/coding-agent/v1/credits" };
 }
 
+// Same server and classifier handling as startFakeGateway, but every
+// completion request is answered by the supplied callback instead of a
+// finite queue. For suites that replay one response indefinitely or switch
+// on their own state.
 export function startDynamicFakeGateway(
   response: (body: string) => Response | Promise<Response>,
   options: FakeGatewayOptions = {},

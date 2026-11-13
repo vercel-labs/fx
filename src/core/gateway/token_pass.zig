@@ -31,7 +31,7 @@ pub const Answer = enum { has_pass, no_pass };
 
 /// The model a session starts on when nothing chose it: the Token Pass
 /// default for a team with Token Pass, and `builtin_default` otherwise.
-pub fn startModel(builtin_default: []const u8, has_pass: bool) []const u8 {
+fn startModel(builtin_default: []const u8, has_pass: bool) []const u8 {
     return if (has_pass) default_model else builtin_default;
 }
 
