@@ -12,6 +12,10 @@ as NOTE lines and left alone.
 Afterwards run `zig fmt` with Zig 0.17 (it rewrites @intFromEnum and
 @enumFromInt), then check_deprecated.py for what remains: `**`, errdefer
 captures, copyForwards, allocators, and the other non-mechanical changes.
+Directories are searched for .zig files; symbolic links and files that are
+not regular files are skipped there, and a file is never written through a
+link. A file that cannot be read or is not UTF-8 is named, the run goes on
+with the others, and the exit status is 1.
 Reads and writes only the given files; no network access.
 """
 import os
@@ -19,91 +23,18 @@ import re
 import sys
 from collections import Counter
 
-# A name starts after a non-word, non-dot character or right after a range `..`;
-# a single `.` before it means field access on something else.
-START = r"(?:(?<=\.\.)|(?<![\w.]))"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from zig_source import (  # noqa: E402
+    ASCII_RENAMES, MEM_RENAMES, START, STD_RENAMES, Lines, aliases, code_mask, display,
+    read_source, write_source, zig_files,
+)
+
 START_STD = r"(?:(?<=\.\.)|(?<![\w.@]))"
 
-SKIP_DIRS = {".zig-cache", "zig-cache", "zig-out", "zig-pkg", ".git", "node_modules"}
-
-
-def code_mask(text):
-    """True for each character that is Zig code, False inside literals/comments."""
-    mask = bytearray(b"\x01") * len(text)
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "/" and text.startswith("//", i):
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            mask[i:j] = b"\x00" * (j - i)
-            i = j
-        elif c == "\\" and text.startswith("\\\\", i):
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            mask[i:j] = b"\x00" * (j - i)
-            i = j
-        elif c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c and text[j] != "\n":
-                j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-            mask[i:j] = b"\x00" * (j - i)
-            i = j
-        else:
-            i += 1
-    return mask
-
-
-MEM_RENAMES = {
-    "indexOfScalarPos": "findScalarPos", "indexOfScalar": "findScalar",
-    "indexOfAnyPos": "findAnyPos", "indexOfAny": "findAny",
-    "indexOfNone": "findNone", "indexOfDiff": "findDiff",
-    "indexOfSentinel": "findSentinel", "indexOfMinMax": "findMinMax",
-    "indexOfMin": "findMin", "indexOfPos": "findPos", "indexOf": "find",
-    "lastIndexOfScalar": "findScalarLast", "lastIndexOfAny": "findLastAny",
-    "lastIndexOfNone": "findLastNone", "lastIndexOfLinear": "findLastLinear",
-    "lastIndexOf": "findLast",
-}
-ASCII_RENAMES = {
-    "indexOfIgnoreCasePosLinear": "findIgnoreCasePosLinear",
-    "indexOfIgnoreCasePos": "findIgnoreCasePos",
-    "indexOfIgnoreCase": "findIgnoreCase",
-}
-STD_RENAMES = {
-    "std.ArrayListAlignedUnmanaged": "std.array_list.Aligned",
-    "std.ArrayListAligned": "std.array_list.Aligned",
-    "std.ArrayListUnmanaged": "std.ArrayList",
-    "std.StringArrayHashMapUnmanaged": "std.array_hash_map.String",
-    "std.AutoArrayHashMapUnmanaged": "std.array_hash_map.Auto",
-    "std.ArrayHashMapUnmanaged": "std.array_hash_map.Custom",
-    "std.DynamicBitSetUnmanaged": "std.bit_set.Dynamic",
-    "std.StaticBitSet": "std.bit_set.Static",
-    "std.bit_set.IntegerBitSet": "std.bit_set.Integer",
-    "std.bit_set.ArrayBitSet": "std.bit_set.Array",
-    "std.bit_set.StaticBitSet": "std.bit_set.Static",
-    "std.bit_set.DynamicBitSetUnmanaged": "std.bit_set.Dynamic",
-    "std.builtin.OptimizeMode": "std.lang.Optimize",
-    "std.lang.OptimizeMode": "std.lang.Optimize",
-    "std.builtin": "std.lang",
-    "std.fs.max_path_bytes": "std.Io.Dir.max_path_bytes",
-    "std.fs.max_name_bytes": "std.Io.Dir.max_name_bytes",
-    "std.fs.path.resolve": "std.Io.Dir.path.resolveAlloc",
-    "std.fs.path.relative": "std.Io.Dir.path.relativeAlloc",
-    "std.fs.path": "std.Io.Dir.path",
-    "std.fmt.bufPrintSentinel": "std.mem.printSentinel",
-    "std.fmt.bufPrint": "std.mem.print",
-    "std.fmt.BufPrintError": "std.mem.PrintError",
-}
 BUILTIN_FIELDS = {"os": "target.os", "cpu": "target.cpu", "abi": "target.abi", "object_format": "target.ofmt"}
 OPTIMIZE_TAGS = {"Debug": "debug", "ReleaseSafe": "safe", "ReleaseFast": "fast", "ReleaseSmall": "small"}
 SIMPLE_ALLOC = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\.\*|\(\))*$")
 BUILTIN = '@import("builtin")'
-
-
-def aliases(text, target):
-    pat = re.compile(r"\bconst\s+([A-Za-z_]\w*)\s*=\s*" + re.escape(target) + r"\s*;")
-    return {m.group(1) for m in pat.finditer(text)}
 
 
 def first_arg(text, mask, open_paren):
@@ -127,10 +58,11 @@ def first_arg(text, mask, open_paren):
 def migrate(path, text):
     """Return (new_text, Counter of applied rules, list of NOTE strings)."""
     mask = code_mask(text)
+    lines = Lines(text)
     edits, notes = [], []
 
     def line(pos):
-        return text.count("\n", 0, pos) + 1
+        return lines.number(pos)
 
     def add(start, end, repl, kind):
         if all(mask[start:end]):
@@ -222,9 +154,12 @@ def migrate(path, text):
         if e[0] >= last_end:
             kept.append(e)
             last_end = e[1]
-    out = text
-    for start, end, repl, _ in reversed(kept):
-        out = out[:start] + repl + out[end:]
+    pieces, pos = [], 0
+    for start, end, repl, _ in kept:
+        pieces += (text[pos:start], repl)
+        pos = end
+    pieces.append(text[pos:])
+    out = "".join(pieces)
 
     # Drop file-level aliases that the edits left unused.
     for target in ("std.fmt", "std.fs"):
@@ -236,39 +171,41 @@ def migrate(path, text):
     return out, Counter(e[3] for e in kept), notes
 
 
-def zig_files(paths):
-    for p in paths:
-        if os.path.isdir(p):
-            for root, dirs, files in os.walk(p):
-                dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
-                for f in sorted(files):
-                    if f.endswith(".zig"):
-                        yield os.path.join(root, f)
-        else:
-            yield p
-
-
 def main(argv):
     write = "--write" in argv
     paths = [a for a in argv if a != "--write"] or ["."]
     total, all_notes, changed = Counter(), [], 0
-    for f in zig_files(paths):
-        with open(f, encoding="utf-8") as fh:
-            text = fh.read()
-        out, counts, notes = migrate(f, text)
+    errors, warnings = [], []
+    for f in zig_files(paths, errors, warnings):
+        try:
+            text = read_source(f)
+        except OSError as e:
+            errors.append(f"{display(f)}: {e.strerror or e}")
+            continue
+        except ValueError as e:
+            errors.append(f"{display(f)}: {e}")
+            continue
+        out, counts, notes = migrate(display(f), text)
+        if out != text and write:
+            try:
+                write_source(f, out)
+            except OSError as e:
+                errors.append(f"{display(f)}: not written: {e.strerror or e}")
+                continue
         total.update(counts)
         all_notes.extend(notes)
         if out != text:
             changed += 1
-            if write:
-                with open(f, "w", encoding="utf-8") as fh:
-                    fh.write(out)
     for k, v in total.most_common():
         print(f"{v:6}  {k}")
     print(f"files changed: {changed}  edits: {sum(total.values())}" + ("" if write else "  (dry run; pass --write to apply)"))
     for n in all_notes:
         print("NOTE", n)
-    return 0
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    for e in errors:
+        print(f"error: {e}", file=sys.stderr)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

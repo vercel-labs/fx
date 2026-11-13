@@ -121,11 +121,11 @@ class Cli(unittest.TestCase):
             for p in (src, cached):
                 with open(p, "w") as f:
                     f.write("_ = std.mem.indexOf(u8, a, b);\n")
-            dry = subprocess.run([sys.executable, SCRIPT, d], capture_output=True, text=True)
+            dry = subprocess.run([sys.executable, SCRIPT, d], capture_output=True, text=True, timeout=120)
             self.assertEqual(dry.returncode, 0, dry.stderr)
             self.assertIn("files changed: 1", dry.stdout)
             self.assertIn("indexOf", read(src))
-            subprocess.run([sys.executable, SCRIPT, "--write", d], check=True, capture_output=True)
+            subprocess.run([sys.executable, SCRIPT, "--write", d], check=True, capture_output=True, timeout=120)
             self.assertIn("std.mem.find(", read(src))
             self.assertIn("indexOf", read(cached))
 
@@ -133,7 +133,7 @@ class Cli(unittest.TestCase):
 class Compiles(unittest.TestCase):
     def test_migrated_code_compiles_on_017(self):
         try:
-            version = subprocess.run(["zig", "version"], capture_output=True, text=True).stdout.strip()
+            version = subprocess.run(["zig", "version"], capture_output=True, text=True, timeout=120).stdout.strip()
         except FileNotFoundError:
             self.skipTest("zig is not on PATH")
         if not version.startswith("0.17."):
@@ -153,8 +153,83 @@ class Compiles(unittest.TestCase):
             p = os.path.join(d, "m.zig")
             with open(p, "w") as f:
                 f.write(out)
-            r = subprocess.run(["zig", "test", p, "--cache-dir", d, "--global-cache-dir", d], capture_output=True, text=True)
+            r = subprocess.run(["zig", "test", p, "--cache-dir", d, "--global-cache-dir", d], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, out + r.stdout + r.stderr)
+
+
+def run_script(*args):
+    return subprocess.run([sys.executable, SCRIPT, *args], capture_output=True, text=True, timeout=60)
+
+
+DEPRECATED = 'const std = @import("std");\nconst i = std.mem.indexOf(u8, "ab", "b");\n'
+
+
+class InputItCannotTrust(unittest.TestCase):
+    def test_write_never_leaves_the_tree_through_a_link(self):
+        # Observed: --write followed tree/link.zig and rewrote outside/target.zig.
+        with tempfile.TemporaryDirectory() as root:
+            tree, outside = os.path.join(root, "tree"), os.path.join(root, "outside")
+            os.makedirs(tree)
+            os.makedirs(outside)
+            target = os.path.join(outside, "target.zig")
+            with open(target, "w") as f:
+                f.write(DEPRECATED)
+            os.symlink(target, os.path.join(tree, "link.zig"))
+            os.symlink(outside, os.path.join(tree, "linked-dir"))
+            r = run_script("--write", tree)
+            self.assertEqual(read(target), DEPRECATED)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("files changed: 0", r.stdout)
+        self.assertIn("link.zig: skipped a symbolic link", r.stderr)
+        self.assertIn("linked-dir: skipped a symbolic link", r.stderr)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_a_fifo_named_like_a_source_file_does_not_block(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.mkfifo(os.path.join(root, "pipe.zig"))
+            r = run_script(root)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("pipe.zig: skipped, not a regular file", r.stderr)
+
+    def test_a_missing_path_is_named(self):
+        with tempfile.TemporaryDirectory() as root:
+            r = run_script(os.path.join(root, "missing.zig"))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("missing.zig", r.stderr)
+        self.assertIn("files changed: 0", r.stdout)
+
+    def test_a_file_that_is_not_utf8_is_named_and_the_others_are_written(self):
+        # Observed: an undecodable file stopped the run with a traceback that
+        # did not name it, after earlier files were already rewritten.
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "a.zig"), "w") as f:
+                f.write(DEPRECATED)
+            with open(os.path.join(root, "b.zig"), "wb") as f:
+                f.write(b'const b = "\xff";\n')
+            with open(os.path.join(root, "c.zig"), "w") as f:
+                f.write(DEPRECATED)
+            r = run_script("--write", root)
+            a, c = read(os.path.join(root, "a.zig")), read(os.path.join(root, "c.zig"))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("b.zig: not UTF-8 at byte 11", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("files changed: 2", r.stdout)
+        self.assertIn("std.mem.find(", a)
+        self.assertIn("std.mem.find(", c)
+
+    def test_file_names_cannot_drive_the_terminal(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "x\x1b[31m.zig"), "w") as f:
+                f.write('const builtin = @import("builtin");\nconst s = switch (builtin.mode) { else => 1 };\n')
+            r = run_script(root)
+        self.assertNotIn("\x1b", r.stdout + r.stderr)
+        self.assertIn("x\\x1b[31m.zig:2:", r.stdout)
+
+    def test_one_long_line_takes_linear_time(self):
+        line = " ".join(["_ = std.mem.indexOf(u8, a, b);"] * 15000)
+        out, _ = run("const std = @import(\"std\");\n" + line + "\n")
+        self.assertEqual(out.count("std.mem.find("), 15000)
+        self.assertNotIn("indexOf", out)
 
 
 if __name__ == "__main__":

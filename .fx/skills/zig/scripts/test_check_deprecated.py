@@ -9,13 +9,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "check_deprecated.py")
 
 
-def scan(source, *extra):
+def scan(source, *extra, timeout=60):
     with tempfile.TemporaryDirectory() as root:
         path = os.path.join(root, "sample.zig")
         with open(path, "w", encoding="utf-8") as f:
             f.write(source)
-        r = subprocess.run([sys.executable, SCRIPT, *extra, root], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, SCRIPT, *extra, root], capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout
+
+
+def run_on(*paths):
+    return subprocess.run([sys.executable, SCRIPT, *paths], capture_output=True, text=True, timeout=60)
 
 
 class FindsDeprecatedApis(unittest.TestCase):
@@ -47,6 +51,8 @@ class FindsDeprecatedApis(unittest.TestCase):
 
     def test_removed_syntax(self):
         self.assertFlags('const s = "ab" ** 3;\n', "@splat")
+        self.assertFlags("const a = [_]u8{0} ** 4;\n", "@splat")
+        self.assertFlags("const b = .{ 1, 2 } ** 3;\n", "@splat")
         self.assertFlags("fn f() !void {\n    errdefer |err| _ = err;\n}\n", "errdefer capture")
         self.assertFlags("const v = void{};\n", "{}")
 
@@ -63,6 +69,92 @@ class FindsDeprecatedApis(unittest.TestCase):
         self.assertFlags('const std = @import("std");\nconst mem = std.mem;\nconst i = mem.indexOf(u8, "ab", "b");\n', "find")
         self.assertFlags('const native = @import("builtin");\nconst linux = native.os.tag == .linux;\n', "native.target.os")
         self.assertFlags('const std = @import("std");\nconst fmt = std.fmt;\nfn f(b: []u8) ![]u8 { return fmt.bufPrint(b, "x", .{}); }\n', "std.mem.print")
+
+
+class SameLineRules(unittest.TestCase):
+    def test_debug_tag_needs_an_optimize_word_after_it(self):
+        code, out = scan("const strip = b.option(bool, \"s\", \"\") orelse (mode == .Debug); // optimize\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("Debug/ReleaseSafe", out)
+        code, out = scan("const optimize = 1;\nconst e = .Debug;\n")
+        self.assertEqual(code, 0, out)
+
+    def test_linkage_word_after_the_tag(self):
+        code, out = scan("comptime { @export(&f, .{ .name = \"f\", .linkage = .internal }); }\nfn f() void {}\n")
+        self.assertEqual(code, 0, out)
+        code, out = scan("comptime { @export(&f, .{ .name = \"f\", .visibility = .internal, .x = linkage }); }\nfn f() void {}\n")
+        self.assertEqual(code, 1, out)
+
+
+class ValidCodeIsNotFlagged(unittest.TestCase):
+    def test_double_pointer_types_are_not_array_repetition(self):
+        # Observed: `[]**u8` and `fn get() **u8` were reported as removed `**`.
+        source = (
+            "fn get() **u8 {\n    return undefined;\n}\n"
+            "const T = []**u8;\n"
+            "const O = ?**u8;\n"
+            "fn f(p: **const u8) void {\n    _ = p;\n}\n"
+            "const A = [2]**u8;\n"
+        )
+        code, out = scan(source)
+        self.assertEqual(code, 0, out)
+
+
+class InputItCannotTrust(unittest.TestCase):
+    def test_a_missing_path_is_an_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            r = run_on(os.path.join(root, "missing"))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("missing", r.stderr)
+        self.assertIn("1 could not be read", r.stdout)
+
+    def test_links_and_fifos_in_a_tree_are_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree, outside = os.path.join(root, "tree"), os.path.join(root, "outside")
+            os.makedirs(tree)
+            os.makedirs(outside)
+            with open(os.path.join(outside, "target.zig"), "w") as f:
+                f.write('const std = @import("std");\nconst i = std.mem.indexOf(u8, "ab", "b");\n')
+            os.symlink(os.path.join(outside, "target.zig"), os.path.join(tree, "link.zig"))
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(os.path.join(tree, "pipe.zig"))
+            r = run_on(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("link.zig: skipped a symbolic link", r.stderr)
+        if hasattr(os, "mkfifo"):
+            self.assertIn("pipe.zig: skipped, not a regular file", r.stderr)
+
+    def test_a_file_that_is_not_utf8_is_named_and_the_rest_is_checked(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "bad.zig"), "wb") as f:
+                f.write(b'const b = "\xff";\n')
+            with open(os.path.join(root, "good.zig"), "w") as f:
+                f.write('const std = @import("std");\nconst i = std.mem.indexOf(u8, "ab", "b");\n')
+            r = run_on(root)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("bad.zig: not UTF-8 at byte 11", r.stderr)
+        self.assertIn("good.zig:2: [deprecated]", r.stdout)
+
+    def test_file_names_cannot_drive_the_terminal(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "x\x1b[31mred\x07.zig"), "w") as f:
+                f.write('const std = @import("std");\nconst i = std.mem.indexOf(u8, "ab", "b");\n')
+            r = run_on(root)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertNotIn("\x1b", r.stdout)
+        self.assertNotIn("\x07", r.stdout)
+        self.assertIn("x\\x1b[31mred\\x07.zig:2:", r.stdout)
+
+    def test_one_long_line_takes_linear_time(self):
+        # Observed: 40000 `.Debug` tags on one line took about 30 s, because
+        # each one scanned the rest of the line for an optimize word. Twice
+        # as many take about 1.5 s now and about 2 minutes that way.
+        tags = ", ".join([".Debug"] * 80000)
+        code, out = scan(f"const a = .{{ {tags} }};\n", timeout=20)
+        self.assertEqual(code, 0, out)
+        code, out = scan(f"const a = .{{ {tags} }}; // optimize\n", timeout=20)
+        self.assertEqual(code, 1, out)
+        self.assertIn("80000 deprecated", out)
 
 
 class IgnoresNonCode(unittest.TestCase):
@@ -106,7 +198,7 @@ class IgnoresNonCode(unittest.TestCase):
                 os.makedirs(os.path.join(root, d))
                 with open(os.path.join(root, d, "x.zig"), "w") as f:
                     f.write('const std = @import("std");\nconst x = std.fmt.allocPrint;\n')
-            r = subprocess.run([sys.executable, SCRIPT, root], capture_output=True, text=True)
+            r = run_on(root)
             self.assertEqual(r.returncode, 0, r.stdout)
 
 

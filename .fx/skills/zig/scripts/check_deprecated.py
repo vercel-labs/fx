@@ -9,7 +9,9 @@ Each finding prints `path:line: [kind] old -> replacement`.
   review      compiles, but 0.17 changed its meaning; read the call site.
               Counted always, listed only with --review (use it when migrating).
 Exit status is 1 when any deprecated or removed finding exists, or any
-finding at all with --strict. Comments and string literals are ignored.
+finding at all with --strict, and 2 when a given path could not be read.
+Directories are searched for .zig files; symbolic links and files that are
+not regular files are skipped there. Comments and string literals are ignored.
 File-level aliases such as `const mem = std.mem;` are resolved.
 Reads files only; no network access and no code execution.
 """
@@ -17,35 +19,20 @@ import os
 import re
 import sys
 
-# A name starts after a non-word, non-dot character or right after a range
-# `..`; a single `.` before it means field access on something else.
-START = r"(?:(?<=\.\.)|(?<![\w.]))"
-
-SKIP_DIRS = {".zig-cache", "zig-cache", "zig-out", "zig-pkg", ".git", "node_modules"}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from zig_source import (  # noqa: E402
+    ASCII_RENAMES, MEM_RENAMES, START, Lines, aliases, code_mask, display, read_source, zig_files,
+)
 
 # (module, regex for the member, replacement, kind)
 MODULE_RULES = [
+    *(("std.mem", re.escape(old), f"std.mem.{new}", "deprecated") for old, new in MEM_RENAMES.items()),
+    *(("std.ascii", re.escape(old), f"std.ascii.{new}", "removed") for old, new in ASCII_RENAMES.items()),
     ("std.fmt", r"allocPrint(?!Sentinel)", "Allocator.print: allocator.print(fmt, args)", "deprecated"),
     ("std.fmt", r"allocPrintSentinel", "Allocator.printSentinel: allocator.printSentinel(fmt, args, sentinel)", "deprecated"),
     ("std.fmt", r"bufPrint(?!Sentinel)", "std.mem.print(buf, fmt, args)", "deprecated"),
     ("std.fmt", r"bufPrintSentinel", "std.mem.printSentinel(buf, fmt, args, sentinel)", "deprecated"),
     ("std.fmt", r"BufPrintError", "std.mem.PrintError", "deprecated"),
-    ("std.mem", r"indexOfScalarPos", "std.mem.findScalarPos", "deprecated"),
-    ("std.mem", r"indexOfScalar", "std.mem.findScalar", "deprecated"),
-    ("std.mem", r"indexOfAnyPos", "std.mem.findAnyPos", "deprecated"),
-    ("std.mem", r"indexOfAny", "std.mem.findAny", "deprecated"),
-    ("std.mem", r"indexOfNone", "std.mem.findNone", "deprecated"),
-    ("std.mem", r"indexOfDiff", "std.mem.findDiff", "deprecated"),
-    ("std.mem", r"indexOfSentinel", "std.mem.findSentinel", "deprecated"),
-    ("std.mem", r"indexOfMinMax", "std.mem.findMinMax", "deprecated"),
-    ("std.mem", r"indexOfMin", "std.mem.findMin", "deprecated"),
-    ("std.mem", r"indexOfPos", "std.mem.findPos", "deprecated"),
-    ("std.mem", r"indexOf", "std.mem.find", "deprecated"),
-    ("std.mem", r"lastIndexOfScalar", "std.mem.findScalarLast", "deprecated"),
-    ("std.mem", r"lastIndexOfAny", "std.mem.findLastAny", "deprecated"),
-    ("std.mem", r"lastIndexOfNone", "std.mem.findLastNone", "deprecated"),
-    ("std.mem", r"lastIndexOfLinear", "std.mem.findLastLinear", "deprecated"),
-    ("std.mem", r"lastIndexOf", "std.mem.findLast", "deprecated"),
     ("std.mem", r"copy(?:Forwards|Backwards)", "@memmove(dest[0..src.len], src) (lengths must match)", "deprecated"),
     ("std.mem", r"byteSwapAllFields(?:Aligned)?", "std.mem.byteSwap / byteSwapAligned", "deprecated"),
     ("std.mem", r"(?:read|write)PackedInt(?:Native|Foreign)", "std.mem.readPackedInt / writePackedInt", "removed"),
@@ -92,18 +79,23 @@ SYNTAX_RULES = [
     (r"@intFromEnum\s*\(", "@intFromEnum", "@backingInt", "deprecated"),
     (r"@enumFromInt\s*\(", "@enumFromInt", "@fromBackingInt (result type inferred; argument must be the exact backing type)", "deprecated"),
     (r"@cImport\s*\(", "@cImport", "translate-c package (see build-system reference)", "removed"),
-    (r"(?:\"|\]|\))\s*\*\*\s*[\w(]", "** array repetition", "@splat for arrays, a comptime loop for repeated strings", "removed"),
+    # Only after a string or array literal: `**u8` after `]` or `)` is a type.
+    (r"(?:\"|\})\s*\*\*\s*[\w(]", "** array repetition", "@splat for arrays, a comptime loop for repeated strings", "removed"),
     (r"\berrdefer\s*\|", "errdefer capture", "split into an inner function and handle the error in the caller", "removed"),
     # zig fmt writes the removed value syntax as `void{}` and a void function body as `void {}`.
     (r"(?<![\w.!])void\{\s*\}", "void{}", "{}", "removed"),
     # Only in type positions, so a variable named i0 is not reported.
     (r"(?:(?<=[:\]*?!])\s*|@as\(\s*)i0\b", "i0", "u0", "removed"),
-    (r"\.(?:internal|link_once)\b(?=[^\n]*linkage)", "internal/link_once linkage", "do not @export, or use .weak", "removed"),
-    (r"\.Release(?:Safe|Fast|Small)\b|\.Debug\b(?=[^\n]*(?:optimize|mode|Optimize))", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
+    (r"\.Release(?:Safe|Fast|Small)\b", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
     (r"\.getLast(?:OrNull)?\s*\(\s*\)", "ArrayList.getLast/getLastOrNull", "last() (optional) or last().?", "deprecated"),
     (r"\.readAlloc\s*\(", "Io.Reader.readAlloc", "readAllocAll", "deprecated"),
     (r"\.sendMany\s*\(", "Io.net sendMany", "sendManyTimeout(..., .none)", "deprecated"),
     (r"\.(?:initEmpty|initFull)\s*\(\s*\)", "bit set / EnumSet initEmpty()/initFull()", ".empty / .full", "removed"),
+]
+# Reported only when the second pattern follows on the same line.
+SAME_LINE_RULES = [
+    (r"\.(?:internal|link_once)\b", r"linkage", "internal/link_once linkage", "do not @export, or use .weak", "removed"),
+    (r"\.Debug\b", r"optimize|mode|Optimize", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
 ]
 REVIEW_RULES = [
     (r"containsAtLeastScalar\s*\(", "containsAtLeastScalar", "0.17 order is (T, list, element, minimum); 0.16 was (T, list, minimum, element)"),
@@ -113,35 +105,9 @@ REVIEW_RULES = [
 ]
 
 
-def code_mask(text):
-    """Flag each character as code (1) or comment/string/char literal (0)."""
-    mask = bytearray(b"\x01") * len(text)
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "/" and text.startswith("//", i) or c == "\\" and text.startswith("\\\\", i):
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-        elif c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c and text[j] != "\n":
-                j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-        else:
-            i += 1
-            continue
-        mask[i:j] = b"\x00" * (j - i)
-        i = j
-    return mask
-
-
-def aliases(text, target):
-    pat = re.compile(r"\bconst\s+([A-Za-z_]\w*)\s*=\s*" + re.escape(target) + r"\s*;")
-    return {m.group(1) for m in pat.finditer(text)}
-
-
 def findings(text):
     mask = code_mask(text)
+    lines = Lines(text)
     seen = set()
 
     def emit(m, old, new, kind, start=None):
@@ -149,8 +115,7 @@ def findings(text):
         if not mask[s] or (s, kind) in seen:
             return None
         seen.add((s, kind))
-        line = text.count("\n", 0, s) + 1
-        return (line, kind, old, new)
+        return (lines.number(s), kind, old, new)
 
     out = []
     for module, member, new, kind in MODULE_RULES:
@@ -187,6 +152,16 @@ def findings(text):
             f = emit(m, old, new, kind, start)
             if f:
                 out.append(f)
+    for pat, after, old, new, kind in SAME_LINE_RULES:
+        # The last start of `after` on each line, found in one pass.
+        last_after = {}
+        for m in re.finditer(after, text):
+            last_after[lines.number(m.start())] = m.start()
+        for m in re.finditer(pat, text):
+            if last_after.get(lines.number(m.start()), -1) >= m.end():
+                f = emit(m, old, new, kind)
+                if f:
+                    out.append(f)
     for pat, old, note in REVIEW_RULES:
         for m in re.finditer(pat, text):
             f = emit(m, old, note, "review")
@@ -195,31 +170,33 @@ def findings(text):
     return sorted(out)
 
 
-def zig_files(paths):
-    for p in paths:
-        if os.path.isfile(p):
-            yield p
-            continue
-        for root, dirs, files in os.walk(p):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-            for name in files:
-                if name.endswith(".zig"):
-                    yield os.path.join(root, name)
-
-
 def main(argv):
     strict = "--strict" in argv
     show_review = "--review" in argv or strict
     paths = [a for a in argv if a not in ("--strict", "--review")] or ["."]
     counts = {"deprecated": 0, "removed": 0, "review": 0}
-    for path in sorted(zig_files(paths)):
-        with open(path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+    errors, warnings = [], []
+    for path in sorted(zig_files(paths, errors, warnings)):
+        try:
+            text = read_source(path)
+        except OSError as e:
+            errors.append(f"{display(path)}: {e.strerror or e}")
+            continue
+        except ValueError as e:
+            errors.append(f"{display(path)}: {e}")
+            continue
         for line, kind, old, new in findings(text):
             counts[kind] += 1
             if kind != "review" or show_review:
-                print(f"{path}:{line}: [{kind}] {old} -> {new}")
-    print(f"summary: {counts['removed']} removed, {counts['deprecated']} deprecated, {counts['review']} to review")
+                print(f"{display(path)}:{line}: [{kind}] {old} -> {new}")
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    for e in errors:
+        print(f"error: {e}", file=sys.stderr)
+    unread = f", {len(errors)} could not be read" if errors else ""
+    print(f"summary: {counts['removed']} removed, {counts['deprecated']} deprecated, {counts['review']} to review{unread}")
+    if errors:
+        return 2
     failing = counts["removed"] + counts["deprecated"] + (counts["review"] if strict else 0)
     return 1 if failing else 0
 

@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
 ## Writing, migrating, and reviewing
 
 **New code:** use only the right-hand columns above, and before reporting it
-done, require zero removed and zero deprecated findings from the scanner:
+done, require exit 0 from the scanner (no finding to fix, every path read):
 
 ```sh
 python3 <this skill>/scripts/check_deprecated.py <files or directories>
@@ -185,8 +185,8 @@ python3 <this skill>/scripts/check_deprecated.py <files or directories>
    ```
 
    [`scripts/migrate.py`](scripts/migrate.py) only makes exact forwarding
-   renames, never edits strings or comments, prints a `NOTE` for each site that
-   needs judgment, and without `--write` only reports.
+   renames outside strings and comments, prints a `NOTE` where judgment is
+   needed, never writes through a link, and without `--write` only reports.
 3. Zig analyzes lazily: build every artifact the project ships and run the
    full test suite.
 4. Run `check_deprecated.py --review`, replace what remains, and read every
