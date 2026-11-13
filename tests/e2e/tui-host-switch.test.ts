@@ -2964,12 +2964,6 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     return found;
   };
 
-  // Prints `pane` under `label` when FX_E2E_SHOW_PANES is set, to read what a
-  // run showed.
-  const showPane = (label: string, pane: string) => {
-    if (process.env.FX_E2E_SHOW_PANES) console.log(`--- ${label}\n${pane}`);
-  };
-
   // Stops `cut`, which works, as the user does: Esc twice on its screen.
   async function stopCut(session: TmuxSession) {
     await showAgent(session, "cut");
@@ -2986,16 +2980,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       await withEndedSubagents(async (session, _context, _gates, reports) => {
         // `broken` failed and `fine` completed while `cut` still works.
         await session.sendKeys("C-x");
-        const working = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+        await session.waitForPane((pane) => pane.includes(LIST_HINT)
           && subagentRow("broken", "failed").test(pane) && subagentRow("fine", "idle").test(pane) && subagentRow("cut", "working").test(pane), 15_000);
-        showPane("the list while cut works", working);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
 
         await stopCut(session);
         await session.sendKeys("C-x");
         const ended = await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("cut", "stopped").test(pane), 10_000);
-        showPane("the list after the stop", ended);
         expect(ended).toMatch(subagentRow("broken", "failed"));
         expect(ended).toMatch(subagentRow("fine", "idle"));
         await session.sendKeys("Escape");
@@ -3016,11 +3008,11 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     async () => {
       await withEndedSubagents(async (session) => {
         await stopCut(session);
-        showPane("cut's own screen after the stop", await session.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 10_000));
+        await session.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 10_000);
         await showAgent(session, "broken");
-        showPane("broken's own screen", await session.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 10_000));
+        await session.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 10_000);
         await showAgent(session, "fine");
-        showPane("fine's own screen", await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000));
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
       });
     },
     TIMEOUT,
@@ -3033,9 +3025,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await stopCut(session);
         // They start out as the last turn left them.
         await session.sendKeys("C-x");
-        const before = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+        await session.waitForPane((pane) => pane.includes(LIST_HINT)
           && subagentRow("broken", "failed").test(pane) && subagentRow("cut", "stopped").test(pane), 15_000);
-        showPane("the list before main sends them more", before);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
         await showAgent(session, "main");
@@ -3043,9 +3034,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // Main sends both of them a new message, which the test holds.
         await session.sendText("SWITCH_USER again ENDED_AGAIN");
         await session.sendKeys("C-x");
-        const going = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+        await session.waitForPane((pane) => pane.includes(LIST_HINT)
           && subagentRow("broken", "working").test(pane) && subagentRow("cut", "working").test(pane), 30_000);
-        showPane("both start over", going);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
         await showAgent(session, "broken");
@@ -3053,12 +3043,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const footer = await session.waitForPane((pane) => pane.includes("broken \u2193") || pane.includes("broken \u00b7 ctrl+x"), 10_000);
         expect(footer).not.toContain("broken \u00b7 failed");
         gates.again.release();
-        const done = await session.waitForPane((pane) => pane.includes("broken \u00b7 done"), 30_000);
-        showPane("broken's own screen after the next turn", done);
+        await session.waitForPane((pane) => pane.includes("broken \u00b7 done"), 30_000);
         await session.sendKeys("C-x");
         const cleared = await session.waitForPane((pane) => pane.includes(LIST_HINT)
           && subagentRow("broken", "idle").test(pane) && subagentRow("cut", "idle").test(pane), 30_000);
-        showPane("the list after both completed", cleared);
         // No row keeps the end it had.
         for (const name of ["broken", "cut"]) {
           expect(cleared).not.toMatch(subagentRow(name, "failed"));
@@ -3077,11 +3065,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "fine");
         await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
         await session.sendText("ENDED_TYPED ask once more");
-        const footer = await session.waitForPane((pane) => pane.includes("fine \u00b7 failed"), 60_000);
-        showPane("fine's own screen after the user's failed turn", footer);
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 failed"), 60_000);
         await session.sendKeys("C-x");
-        const list = await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("fine", "failed").test(pane), 15_000);
-        showPane("the list after the user's failed turn", list);
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("fine", "failed").test(pane), 15_000);
         // The report that tells main names the same end, for the user's turn:
         // fine's first work, main's, completed.
         await until("the report of the user's turn", () => reports().filter((report) => report.agent === "fine").length >= 2, 60_000);
@@ -3109,14 +3095,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await resumed.sendKeys("Down");
         const list = await resumed.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("broken").test(pane)
           && subagentRow("cut").test(pane) && subagentRow("fine").test(pane), 15_000);
-        showPane("the list after a resume, before any subagent is shown", list);
         expect(list).toMatch(subagentRow("broken", "failed"));
         expect(list).toMatch(subagentRow("cut", "stopped"));
         expect(list).toMatch(subagentRow("fine", "idle"));
         await resumed.sendKeys("Escape");
         await resumed.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
         await showAgent(resumed, "broken");
-        showPane("broken's screen after a resume", await resumed.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 15_000));
+        await resumed.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 15_000);
         await showAgent(resumed, "cut");
         await resumed.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 15_000);
         await showAgent(resumed, "fine");
@@ -3141,7 +3126,6 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-x");
         const list = await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("broken").test(pane)
           && subagentRow("cut").test(pane) && subagentRow("fine").test(pane), 30_000);
-        showPane("the fork's list", list);
         expect(list).toMatch(subagentRow("broken", "failed"));
         expect(list).toMatch(subagentRow("cut", "stopped"));
         expect(list).toMatch(subagentRow("fine", "idle"));

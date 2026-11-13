@@ -6897,6 +6897,63 @@ test "a subagent's run ends only once the turn carrying its work id is saved" {
     try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
 }
 
+test "a turn's end gives a subagent's row and its parent's work one outcome, for every end and hand-off" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+
+    const Work = agents.ChildRunCompletion.Outcome;
+    const LastEnd = @TypeOf(child.last_end);
+    const Case = struct { ended: types.TurnPresentationOutcome, handed_off: bool, work: Work, mark: LastEnd };
+    // A hand-off turns only an interrupted turn into a finished one.
+    const cases = [_]Case{
+        .{ .ended = .completed, .handed_off = false, .work = .completed, .mark = .done },
+        .{ .ended = .completed, .handed_off = true, .work = .completed, .mark = .done },
+        .{ .ended = .failed, .handed_off = false, .work = .failed, .mark = .failed },
+        .{ .ended = .failed, .handed_off = true, .work = .failed, .mark = .failed },
+        .{ .ended = .interrupted, .handed_off = false, .work = .cancelled, .mark = .stopped },
+        .{ .ended = .interrupted, .handed_off = true, .work = .completed, .mark = .done },
+        .{ .ended = .paused, .handed_off = false, .work = .cancelled, .mark = .stopped },
+        .{ .ended = .paused, .handed_off = true, .work = .cancelled, .mark = .stopped },
+    };
+    const Ctx = struct { done: *agents.ChildRunCompletion, case: Case, turn_id: u64 };
+    const Check = struct {
+        fn run(ctx: Ctx, a: *App, agent: *agents.Agent) anyerror!void {
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = ctx.turn_id, .outcome = ctx.case.ended });
+            // The run's own flag is set whatever the end was, as a hand-off
+            // that the end did not use would leave it.
+            agent.child_run.?.handed_off = ctx.case.handed_off;
+            App.AgentsAppRuntime.commitChildTurn(a, agent, .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("task"), .work_id = @constCast("work-1") },
+                    .assistant = @constCast("answer"),
+                } },
+                .terminal_outcome = ctx.case.ended,
+            });
+            try std.testing.expect(!agent.child_run.?.inFlight());
+            try std.testing.expectEqual(ctx.case.work, ctx.done.outcome.?);
+        }
+    };
+    for (cases, 0..) |case, index| {
+        var completion: agents.ChildRunCompletion = .{};
+        var child_run = try testChildRun(alloc, &resolver, false, null);
+        child_run.work_id = try alloc.dupe(u8, "work-1");
+        child_run.completion = &completion;
+        App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+        child.last_end = .done;
+        const turn_id: u64 = 10 + index;
+        child.agent.worker.handed_off_turn_id = if (case.handed_off) turn_id else 0;
+        try App.AgentsAppRuntime.visit(&app, child, Ctx{ .done = &completion, .case = case, .turn_id = turn_id }, Check.run);
+        // The row says what the work's outcome says.
+        try std.testing.expectEqual(case.mark, child.last_end);
+    }
+}
+
 test "each agent keeps its own fast mode across switches, and a run leaves the subagent's alone" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
