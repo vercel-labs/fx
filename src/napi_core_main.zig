@@ -728,6 +728,7 @@ const Runtime = struct {
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         providers.codex = .{
+            .capabilities = .{ .sends_output_limit = false },
             .presentation = provider_catalog.find(.codex),
             .auth_strategy = .chatgpt,
             .agent_stream = bridgeBound(host_openai_codex.provider(&self.codex_context)),

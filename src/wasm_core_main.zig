@@ -104,6 +104,7 @@ const js_host_provider_set = set: {
         .credits = .{ .fetch_fn = fetchCredits },
     });
     providers.codex = .{
+        .capabilities = .{ .sends_output_limit = false },
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,
         .agent_stream = host_openai_codex.provider(@constCast(&codex_context)),

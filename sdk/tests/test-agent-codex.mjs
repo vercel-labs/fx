@@ -45,7 +45,7 @@ const replySse =
   'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":23,"output_tokens":7}}}\n\n';
 
 /** A host fetch that plays npm, Codex and OpenAI's token endpoint. */
-function codexWorld({ rejectFirstReply = false, refreshedToken }) {
+function codexWorld({ rejectFirstReply = false, refreshedToken, reply = replySse }) {
   const log = [];
   let replies = 0;
   const fetch = async (input, init = {}) => {
@@ -62,7 +62,7 @@ function codexWorld({ rejectFirstReply = false, refreshedToken }) {
     if (url === "https://chatgpt.com/backend-api/codex/responses" && method === "POST") {
       replies += 1;
       if (rejectFirstReply && replies === 1) return Response.json({ detail: "token expired" }, { status: 401 });
-      return new Response(replySse, { status: 200, headers: { "content-type": "text/event-stream" } });
+      return new Response(reply, { status: 200, headers: { "content-type": "text/event-stream" } });
     }
     return new Response(`unexpected ${method} ${url}`, { status: 599 });
   };
@@ -212,6 +212,32 @@ await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/
     /provider "codex" needs a model; fx's default model is an AI Gateway id/,
   );
   assert.deepEqual(world.log, []);
+}
+
+// 6. A reply that spends its whole output limit with nothing to show is asked
+// again only when the request can change. Codex picks its own output limit and
+// the request never carries one, so a larger limit is no change: at low
+// effort the turn ends after one request, and with no effort set the one
+// resend asks for low effort.
+{
+  const cutOff =
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
+    'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":23,"output_tokens":4096}}}\n\n';
+  const cutOffTurn = async (model) => {
+    const access = jwt("limit", tenDays);
+    const world = codexWorld({ refreshedToken: jwt("unused", tenDays), reply: cutOff });
+    const { result } = await runTurn({ model, fetch: world.fetch, credentials: () => ({ accessToken: access, refreshToken: "rt-1" }) });
+    assert.equal(result.stopReason, "max_output_tokens");
+    return replyRequests(world.log).map((entry) => JSON.parse(entry.body));
+  };
+
+  const atLow = await cutOffTurn({ id: "gpt-5.6-luna", effort: "low" });
+  assert.equal(atLow.length, 1, "a request Codex would see unchanged is not sent again");
+
+  const unset = await cutOffTurn("gpt-5.6-luna");
+  assert.equal(unset.length, 2, "with no effort set, the reply is asked for once more");
+  assert.equal(unset[0].reasoning?.effort, undefined);
+  assert.equal(unset[1].reasoning?.effort, "low", "the resend asks for low effort");
 }
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Codex agent passed`);
