@@ -2413,6 +2413,70 @@ test "ACP load recognizes the retained active session exactly" {
     ));
 }
 
+test "ACP load of the active session keeps its subagent host and the session it appends to" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const active = &state.active_session.?;
+    _ = server.applySessionMode(state.cfg.mode_registry, active, "review");
+    const subagents = state.subagent_host.?;
+    const children = state.subagent_v2_children.?;
+    const parent = active.v2.?;
+
+    for ([_]struct { method: []const u8, handler: *const fn (*server.ServerState, Allocator, *jsonrpc.Message) anyerror!void }{
+        .{ .method = "session/load", .handler = handleLoadSession },
+        .{ .method = "session/resume", .handler = handleResumeSession },
+    }, 0..) |request, index| {
+        var params: std.Io.Writer.Allocating = .init(arena);
+        defer params.deinit();
+        try params.writer.writeAll("{\"sessionId\":");
+        try writeJsonStr(active.session_id, &params.writer);
+        try params.writer.writeAll(",\"mcpServers\":[]}");
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 2) },
+            .method = request.method,
+            .params_raw = params.writer.buffered(),
+        };
+        try request.handler(&state, arena, &msg);
+
+        // The host, its children, and the session they append to are the ones that were there.
+        try std.testing.expect(state.subagent_host.? == subagents);
+        try std.testing.expect(state.subagent_v2_children.? == children);
+        try std.testing.expect(state.active_session.?.v2.? == parent);
+        // What a reload always did still happens: the mode starts over.
+        try std.testing.expectEqualStrings(
+            test_session_mode_registry.default_mode_id,
+            state.active_session.?.mode,
+        );
+        _ = server.applySessionMode(state.cfg.mode_registry, &state.active_session.?, "review");
+    }
+}
+
 test "ACP history excludes typed summaries without filtering original user text" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3309,70 +3373,6 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
-}
-
-test "ACP load of the active session keeps its subagent host and the session it appends to" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace_path);
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
-    defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
-
-    var new_msg = jsonrpc.Message{
-        .id = .{ .integer = 1 },
-        .method = "session/new",
-        .params_raw = "{\"mcpServers\":[]}",
-    };
-    try handleNewSession(&state, arena, &new_msg);
-    const active = &state.active_session.?;
-    _ = server.applySessionMode(state.cfg.mode_registry, active, "review");
-    const subagents = state.subagent_host.?;
-    const children = state.subagent_v2_children.?;
-    const parent = active.v2.?;
-
-    for ([_]struct { method: []const u8, handler: *const fn (*server.ServerState, Allocator, *jsonrpc.Message) anyerror!void }{
-        .{ .method = "session/load", .handler = handleLoadSession },
-        .{ .method = "session/resume", .handler = handleResumeSession },
-    }, 0..) |request, index| {
-        var params: std.Io.Writer.Allocating = .init(arena);
-        defer params.deinit();
-        try params.writer.writeAll("{\"sessionId\":");
-        try writeJsonStr(active.session_id, &params.writer);
-        try params.writer.writeAll(",\"mcpServers\":[]}");
-        var msg = jsonrpc.Message{
-            .id = .{ .integer = @intCast(index + 2) },
-            .method = request.method,
-            .params_raw = params.writer.buffered(),
-        };
-        try request.handler(&state, arena, &msg);
-
-        // The host, its children, and the session they append to are the ones that were there.
-        try std.testing.expect(state.subagent_host.? == subagents);
-        try std.testing.expect(state.subagent_v2_children.? == children);
-        try std.testing.expect(state.active_session.?.v2.? == parent);
-        // What a reload always did still happens: the mode starts over.
-        try std.testing.expectEqualStrings(
-            test_session_mode_registry.default_mode_id,
-            state.active_session.?.mode,
-        );
-        _ = server.applySessionMode(state.cfg.mode_registry, &state.active_session.?, "review");
-    }
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {
