@@ -4458,6 +4458,11 @@ fn stderrIsTerminal() bool {
     return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
 }
 
+/// Whether doctor's stdout is a terminal, so its report may use color.
+fn stdoutIsTerminal() bool {
+    return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
+}
+
 /// The local checks with the probe checks after them. The provider's answer
 /// replaces the local auth line, which only saw a credential; a credential
 /// the provider was asked about and never answered for is not confirmed.
@@ -4666,7 +4671,7 @@ const DoctorProgress = struct {
 
 fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
     if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
-    const color = !builtin.is_test and !terminal_env.colorDisabled() and (std.Io.File.stdout().isTty(io_mod.getIo()) catch false);
+    const color = !builtin.is_test and !terminal_env.colorDisabled() and stdoutIsTerminal();
     const text = try snapshot.renderTextStyled(alloc, .{ .color = color });
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
