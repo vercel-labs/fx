@@ -8479,6 +8479,68 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
     );
 }
 
+test "processQueuedPrompt names a provider error on the row of the tool start it left unexecuted" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("call_read_failed", "read_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .finish_reason = .provider_error },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The connection was fine; the reply ended with an error.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectRecovered(&hooks, 2);
+    try expectFailedLifecycleContains(
+        hooks.lifecycle_events.items,
+        "call_read_failed",
+        "Reply failed before tool call ran",
+    );
+}
+
+test "processQueuedPrompt names why each unexecuted start ended when a reconciliation stops for review" {
+    const alloc = std.testing.allocator;
+    const first_starts = [_]ToolCall{
+        toolCall("provider_search", "web_search", "{}"),
+        toolCall("call_read_first", "read_file", "{}"),
+    };
+    const repeated = [_]ToolCall{toolCall("call_read_repeat", "read_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &first_starts, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .streamed_tool_starts = &repeated, .tool_calls = &repeated },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The first attempt's start keeps the dropped connection that ended it;
+    // the resend's start ran into the review stop.
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try expectFailedLifecycleContains(
+        hooks.lifecycle_events.items,
+        "call_read_first",
+        "Connection interrupted before tool call ran",
+    );
+    try expectFailedLifecycleContains(
+        hooks.lifecycle_events.items,
+        "call_read_repeat",
+        "Stopped before tool call ran",
+    );
+}
+
 test "processQueuedPrompt settles an interrupted local tool after an HTTP failure" {
     const alloc = std.testing.allocator;
     const starts = [_]ToolCall{toolCall("call_read_interrupted", "read_file", "{}")};

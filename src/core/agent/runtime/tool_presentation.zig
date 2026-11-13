@@ -62,11 +62,29 @@ fn fallbackToolDisplay(
     return if (registry.lookup(lookup_name) != null) "tool call" else tool_name;
 }
 
+/// Why a tool start that fx never ran ended. Its row names the reason.
+pub const UnexecutedStartReason = enum {
+    connection_interrupted,
+    reply_failed,
+    stopped,
+
+    fn summaryPrefix(self: UnexecutedStartReason) []const u8 {
+        return switch (self) {
+            .connection_interrupted => "Connection interrupted",
+            .reply_failed => "Reply failed",
+            .stopped => "Stopped",
+        };
+    }
+};
+
 pub const ProvisionalToolStatuses = struct {
     const TrackedStatus = struct {
         id: []u8,
         tool_name: []u8,
         label_value: ?[]u8,
+        /// Set when the attempt that started this call failed, so the row
+        /// names that failure even when a later attempt settles it.
+        unexecuted_reason: ?UnexecutedStartReason = null,
 
         fn deinit(self: *TrackedStatus, alloc: Allocator) void {
             alloc.free(self.id);
@@ -504,8 +522,18 @@ pub const ProvisionalToolStatuses = struct {
         }
     }
 
+    /// Records why the attempt that started the tracked calls failed, for the
+    /// calls that have no reason yet: the ones the failed attempt started.
+    pub fn noteUnexecutedStarts(self: *ProvisionalToolStatuses, reason: UnexecutedStartReason) void {
+        for (self.tracked.items) |*status| {
+            if (status.unexecuted_reason == null) status.unexecuted_reason = reason;
+        }
+    }
+
     /// Settles provisional starts from an interrupted, proven-unexecuted
-    /// stream unless the recovered completion retained their identity.
+    /// stream unless the recovered completion retained their identity. Each
+    /// row names the reason noted for its attempt, or `fallback_reason` when
+    /// none was noted.
     pub fn finishUnmatchedRecoveryStarts(
         self: *ProvisionalToolStatuses,
         hooks: *const AgentRuntimeDeps,
@@ -513,6 +541,7 @@ pub const ProvisionalToolStatuses = struct {
         arena: Allocator,
         turn_id: u64,
         recovered_calls: []const ToolCall,
+        fallback_reason: UnexecutedStartReason,
     ) !void {
         var index = self.tracked.items.len;
         while (index > 0) {
@@ -540,9 +569,10 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
+            const reason = status.unexecuted_reason orelse fallback_reason;
             const summary = try arena.print(
-                "Connection interrupted before {s} ran",
-                .{encoded.bytes},
+                "{s} before {s} ran",
+                .{ reason.summaryPrefix(), encoded.bytes },
             );
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
@@ -2238,7 +2268,7 @@ test "unmatched recovery starts hide registered names but retain unknown identit
 
     try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
     try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
-    try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{});
+    try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{}, .connection_interrupted);
 
     var terminal_count: usize = 0;
     for (capture.events.items) |event| {
@@ -2259,6 +2289,42 @@ test "unmatched recovery starts hide registered names but retain unknown identit
         }
     }
     try std.testing.expectEqual(@as(usize, 2), terminal_count);
+}
+
+test "unmatched recovery starts name the reason noted for their attempt" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+
+    // Two attempts fail for different reasons; a third start is never noted.
+    try statuses.publish(&hooks, alloc, 9, "first", "mcp_first", .read, "Running", null, null);
+    statuses.noteUnexecutedStarts(.reply_failed);
+    try statuses.publish(&hooks, alloc, 9, "second", "mcp_second", .read, "Running", null, null);
+    statuses.noteUnexecutedStarts(.connection_interrupted);
+    try statuses.publish(&hooks, alloc, 9, "third", "mcp_third", .read, "Running", null, null);
+    try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{}, .stopped);
+
+    const expected = [_]struct { id: []const u8, summary: []const u8 }{
+        .{ .id = "first", .summary = "Reply failed before mcp_first ran" },
+        .{ .id = "second", .summary = "Connection interrupted before mcp_second ran" },
+        .{ .id = "third", .summary = "Stopped before mcp_third ran" },
+    };
+    var terminal_count: usize = 0;
+    for (capture.events.items) |event| {
+        if (event != .terminal) continue;
+        terminal_count += 1;
+        const want = for (expected) |entry| {
+            if (std.mem.eql(u8, entry.id, event.terminal.id.call_id)) break entry;
+        } else return error.TestUnexpectedToolCallId;
+        try std.testing.expectEqualStrings(want.summary, event.terminal.outcome.summary);
+    }
+    try std.testing.expectEqual(@as(usize, 3), terminal_count);
 }
 
 test "provisional lifecycle remains distinct from authoritative lifecycle" {
