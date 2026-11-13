@@ -632,6 +632,10 @@ const UnsupportedRegistry = struct {
         return true;
     }
 
+    pub fn joinDrainingBackendsBefore(_: *UnsupportedRegistry, _: i64) bool {
+        return true;
+    }
+
     pub fn deinit(self: *UnsupportedRegistry) void {
         self.* = undefined;
     }
