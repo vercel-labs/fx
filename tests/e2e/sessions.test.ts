@@ -5076,6 +5076,9 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
   const alive = (pid: number) => {
+    // Signal 0 to pid 0 or below reaches a whole process group, which is
+    // always alive, so only a real pid can be checked.
+    if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
     try {
       process.kill(pid, 0);
       return true;
@@ -5090,7 +5093,16 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const id = onlySessionId(fixture.home);
     await waitForLog(fixture, id, "turn_committed");
-    const shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid);
+    // The run returned at once, so the record may not hold the shell's pid
+    // until the shell has started.
+    let shellPid = 0;
+    const started = Date.now() + TIMEOUT;
+    while (Date.now() < started) {
+      shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid ?? 0);
+      if (shellPid > 0) break;
+      await Bun.sleep(10);
+    }
+    expect(shellPid).toBeGreaterThan(0);
     expect(alive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
