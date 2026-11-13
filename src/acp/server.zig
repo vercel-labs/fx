@@ -757,20 +757,37 @@ fn closeActiveSession(state: *ServerState) !void {
 /// it stays for the session that follows (D41, D97; the app does the same in
 /// `stopSubagentsForSwitch`). The tree closes first, so no work the stop ends
 /// owes a report, and the host is joined before the queue is dropped, so
-/// nothing posts after it. A quit leaves reports owed, and a reload of the
-/// same session keeps its queue, so neither calls this. Call it before
-/// `releaseActiveSession` or `closeActiveSession`.
+/// nothing posts after it. A quit leaves reports owed, so it calls neither this
+/// nor `stopSubagentsForReopen`. A reload of the same session under the same
+/// `cwd` keeps what the session holds and opens nothing again, so it calls
+/// neither either. Call this before `releaseActiveSession` or
+/// `closeActiveSession`.
 pub fn stopSubagentsForSwitch(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     if (state.subagent_host) |host| host.closeTree();
     disableSubagentHost(state);
-    dropQueuedReports(state, active.session_id);
+    dropQueuedReports(state, active.session_id, "session_switch");
+}
+
+/// The client loads the active session again under another `cwd`: the session
+/// is released and opened again from its log. It is the same session, so its
+/// subagents stop as a quit stops them, and what they owe stays owed. The
+/// open log hands each owed report out once, as a restart's does, so the
+/// copies the host queued, before the load or while it stopped, are dropped
+/// once the host is joined, and the report runs once. Call this before
+/// `releaseActiveSession`.
+pub fn stopSubagentsForReopen(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    disableSubagentHost(state);
+    dropQueuedReports(state, active.session_id, "session_reload");
 }
 
 /// Drops the reports and messages `postAcpReport` queued for `session_id`
-/// that no prompt took. A report that was owed stays owed in the session's
-/// log, which posts it again when the session reopens.
-fn dropQueuedReports(state: *ServerState, session_id: []const u8) void {
+/// that no prompt took, and names each in the trace with `reason`. A report
+/// that was owed stays owed in the session's log, which posts it again when
+/// the session opens. A message a child sent is in no log of the parent, so
+/// only the child's own log and the trace line have it.
+fn dropQueuedReports(state: *ServerState, session_id: []const u8, reason: []const u8) void {
     const alloc = std.heap.c_allocator;
     state.report_mutex.lockUncancelable(io_mod.getIo());
     defer state.report_mutex.unlock(io_mod.getIo());
@@ -778,11 +795,12 @@ fn dropQueuedReports(state: *ServerState, session_id: []const u8) void {
     while (state.worker.takeQueuedPrompt(alloc)) |queued| : (index += 1) {
         defer worker_runtime.freeQueuedPrompt(alloc, queued);
         const call: ?*const ReportCall = if (index < state.report_calls.items.len) &state.report_calls.items[index] else null;
-        debug_trace.logf("acp", "event=subagent_mail_dropped session={s} kind={s} child={s} work={s} reason=session_switch", .{
+        debug_trace.logf("acp", "event=subagent_mail_dropped session={s} kind={s} child={s} work={s} reason={s}", .{
             session_id,
             @tagName(queued.mail),
             if (call) |value| value.child_id else "",
             if (call) |value| value.work_id else "",
+            reason,
         });
     }
     for (state.report_calls.items) |*call| call.deinit(alloc);

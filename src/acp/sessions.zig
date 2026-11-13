@@ -136,6 +136,7 @@ pub fn handleNewLibfxSession(
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
+    server.stopSubagentsForSwitch(state);
     try server.releaseActiveSession(state);
     requested_owned = false;
     const session_id = requested orelse try session_store.generateSessionId(alloc);
@@ -841,6 +842,7 @@ fn handleRestoreSession(
         // reopens it through the ordinary rebinding path below.
         if (sameSessionId(active.session_id, session_id) and workspace != null) {
             server.cancelAndReapActivePrompt(state);
+            server.stopSubagentsForReopen(state);
             try server.releaseActiveSession(state);
         }
     }
@@ -3333,6 +3335,65 @@ test "a switch away from a session drops the reports its host queued and closes 
     try server.releaseActiveSession(&state);
     server.stopSubagentsForSwitch(&state);
     try std.testing.expect(state.active_session == null);
+}
+
+test "a reload under another cwd and a libfx/new drop what the host they replace queued" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const subagents = state.subagent_host.?;
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+
+    // A reload under another cwd: the host is joined, what it queued is dropped, and the session stays until it is released.
+    server.stopSubagentsForReopen(&state);
+    try std.testing.expect(state.subagent_host == null);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
+    try std.testing.expect(state.active_session != null);
+    // With no session to reload, a second call has nothing to do.
+    try server.releaseActiveSession(&state);
+    server.stopSubagentsForReopen(&state);
+
+    // A libfx/new session replaces a session whose host queued a report.
+    try handleNewSession(&state, arena, &new_msg);
+    const next = state.subagent_host.?;
+    try next.report_sink.?.post(next, .{ .report = .{ .agent = "reviewer", .child_id = "child-2", .work_id = "work-2", .call_id = "call-2", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+    var libfx_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "libfx/new",
+        .params_raw = "{}",
+    };
+    try handleNewLibfxSession(&state, arena, &libfx_msg);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
+    try std.testing.expect(state.subagent_host == null);
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {

@@ -10069,7 +10069,7 @@ describe("acp: model-independent", () => {
     expect(client!.hookEvents.filter((event) => event.type === "delegation").map((event) => event.data.phase)).toEqual(["dispatched"]);
   }
 
-  for (const via of ["session/new", "session/load", "session/close"] as const) {
+  for (const via of ["session/new", "session/load", "session/resume", "session/close"] as const) {
     test(
       `ACP ${via} away from a working subagent sends none of its report to the next session`,
       async () => {
@@ -10084,7 +10084,7 @@ describe("acp: model-independent", () => {
           });
           await client.request("initialize", { protocolVersion: 1 }, 1);
           let savedId = "";
-          if (via === "session/load") {
+          if (via === "session/load" || via === "session/resume") {
             // A saved session to switch to.
             const prepared = await client.request("session/new", { mcpServers: [] }, 2) as any;
             savedId = prepared.result.sessionId;
@@ -10098,8 +10098,8 @@ describe("acp: model-independent", () => {
 
           if (via === "session/new") {
             await client.request("session/new", { mcpServers: [], ...switchHooks }, 5);
-          } else if (via === "session/load") {
-            await client.request("session/load", { sessionId: savedId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 5);
+          } else if (via === "session/load" || via === "session/resume") {
+            await client.request(via, { sessionId: savedId, cwd: root.workspace, mcpServers: [], ...switchHooks }, 5);
           } else {
             await client.request("session/close", { sessionId: firstId }, 5);
             await client.request("session/new", { mcpServers: [], ...switchHooks }, 6);
@@ -10202,6 +10202,65 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  // A load of the active session under another `cwd` releases it and opens it
+  // again, so the log hands out what it still owes once more. The host is
+  // joined and what it queued is dropped first, so the report runs once.
+  for (const child of ["finished", "working"] as const) {
+    test(
+      `ACP session/load of the active session under another cwd runs the report of a ${child} subagent once`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-subagent-recwd-");
+        const other = join(root.root, "other");
+        mkdirSync(other);
+        const otherRoot = realpathSync(other);
+        const tracePath = join(root.root, "trace.log");
+        const heldChild = deferred<Response>();
+        const gateway = startDynamicFakeGateway(switchRoute(heldChild));
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const first = await client.request("session/new", { mcpServers: [], ...switchHooks }, 2) as any;
+          const firstId: string = first.result.sessionId;
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          await startHeldChild(gateway);
+          if (child === "finished") {
+            // The child ends while no prompt waits, so its report is queued.
+            heldChild.resolve(finalText("late child completion"));
+            await waitForCondition("the child's work to be recorded done", () => childWork(root.home, firstId).outcome === "ok", TIMEOUT);
+          }
+
+          const reloadBase = gateway.requests.length;
+          const loaded = await client.request("session/load", { sessionId: firstId, cwd: otherRoot, mcpServers: [], ...switchHooks }, 4) as any;
+          expect(loaded.error).toBeUndefined();
+          const run = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
+          expect(run.promptResult.result.stopReason).toBe("end_turn");
+          const bodies = gateway.requests.slice(reloadBase).map((request) => request.body);
+          // The same session: the report reaches it once. The user's prompt, then one turn for the report.
+          expect(bodies.filter(acpLatestUserIsReport)).toHaveLength(1);
+          expect(bodies).toHaveLength(2);
+          expect(bodies[1]).toContain(child === "finished" ? "late child completion" : "fx stopped before it finished");
+
+          // The log holds the child's finish once, owing its report, and the trace names what the reload dropped.
+          const work = childWork(root.home, firstId);
+          expect(work.outcome).toBe(child === "finished" ? "ok" : "interrupted");
+          const dropped = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("subagent_mail_dropped"));
+          expect(dropped).toHaveLength(1);
+          expect(dropped[0]).toContain(`session=${firstId} kind=report child=${work.child} work=${work.work} reason=session_reload`);
+          expect(client.stderr).toBe("");
+        } finally {
+          heldChild.resolve(finalText("held child cleanup"));
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
 
   test(
     "ACP allow-once command approval executes with shared authority",
