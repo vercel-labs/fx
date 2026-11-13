@@ -3521,12 +3521,17 @@ const GapTrace = struct {
         return error.Timeout;
     }
 
+    /// Reads the first 64 KiB, which holds every line a test of this scope
+    /// writes. The host appends to the file while a test polls it, so this
+    /// reads from offset 0 into a fixed buffer. `readFileToEnd` sizes the file
+    /// first, and a file that grows during the read makes `std.Io.Writer`'s
+    /// `sendFile` subtract past that size and panic.
     fn has(self: *const GapTrace, needle: []const u8) bool {
         var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.path, .{}) catch return false;
         defer file.close(io_mod.getIo());
-        const text = io_mod.readFileToEnd(std.testing.allocator, &file, 1 << 20) catch return false;
-        defer std.testing.allocator.free(text);
-        return std.mem.find(u8, text, needle) != null;
+        var buf: [64 * 1024]u8 = undefined;
+        const n = file.readPositionalAll(io_mod.getIo(), &buf, 0) catch return false;
+        return std.mem.find(u8, buf[0..n], needle) != null;
     }
 };
 
