@@ -96,9 +96,10 @@
 //!   that work failed, `model`, `effort`, `title` (masked), `status`
 //!   (masked), its status row, such as a failed request that waits for the
 //!   user, `task` (masked), the start of its newest retained turn's prompt:
-//!   at most 240 bytes, without an ASCII word that cut would split, and left
-//!   out when none of it is kept, and `task_bytes`, that prompt's whole
-//!   length, `turns_retained`,
+//!   at most 240 bytes, without the end of a word that cut would split (its
+//!   ASCII bytes, or the whole word when it holds `://`), and left out when
+//!   none of it is kept, and `task_bytes`, that prompt's whole length,
+//!   `turns_retained`,
 //!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
 //!   calls in the tool-call window. A subagent that is not open has only
 //!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
@@ -1109,7 +1110,7 @@ fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) 
 /// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
 /// boundary. Masking comes first, so this cut never splits a secret the mask
 /// would have found. A task comes already cut from the turn ring, which
-/// leaves out the ASCII word its own cut splits
+/// leaves out the end of the word its own cut splits
 /// (`subagent_turn_metrics.keptPrompt`), so no part of a secret that cut
 /// shortened reaches the mask.
 fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
@@ -2785,6 +2786,8 @@ const planted_secrets = [_]PlantedSecret{
     .{ .text = "sk-" ++ text_utils.repeat("Q7Z3", 4), .fixed = "sk-".len },
     .{ .text = "AKIA" ++ text_utils.repeat("Q7Z3", 4), .fixed = "AKIA".len },
     .{ .text = "https://Q7Z3W9X2:V5T8R1N4Q7Z3@example.com", .fixed = "https://".len },
+    // A URL credential may hold raw UTF-8, here "ä", before its `@`.
+    .{ .text = "https://ADMIN:P\u{e4}7Z3W9X2Q7Z3@example.com", .fixed = "https://".len },
 };
 
 /// Fails, naming the secret, when a string anywhere in `trace` shows the
@@ -2914,13 +2917,16 @@ test "trace subagent task is left out when the ring keeps none of the prompt" {
 /// is one JSON line, that no record shows part of a secret, and what a reader
 /// gets back.
 fn checkSubagentText(fuzzed: []const u8) !void {
-    const choice = std.hash.Wyhash.hash(0, fuzzed);
-    for (planted_secrets, 0..) |secret, secret_index| {
+    // Where each secret crosses the cut, and what is around it, follow
+    // from the input.
+    var choices = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, fuzzed));
+    const choice = choices.random();
+    for (planted_secrets) |secret| {
         const w = try TestWriter.create();
         defer w.destroy();
         const a = w.records.arena;
-        const inside = 1 + @as(usize, @intCast((choice >> @intCast(secret_index * 16)) % secret.text.len));
-        const separator = planted_separators[@intCast((choice >> @intCast(secret_index * 16 + 8)) % planted_separators.len)];
+        const inside = 1 + choice.uintLessThan(usize, secret.text.len);
+        const separator = planted_separators[choice.uintLessThan(usize, planted_separators.len)];
         const words = try subagentFiller(a, fuzzed, subagent_text_max_bytes);
         const prompt = try plantAcross(a, words, secret.text, separator, ring_prompt_bytes, inside);
         const text = try plantAcross(a, words, secret.text, separator, subagent_text_max_bytes, inside);
@@ -2961,7 +2967,12 @@ fn checkSubagentText(fuzzed: []const u8) !void {
             } else try expectAbsent(record, field ++ "_bytes");
         }
         const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, turn.prompt()), subagent_text_max_bytes);
-        try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, task), try testString(record, "task"));
+        if (task.len == 0) {
+            // The ring kept nothing, such as a first word that holds a URL.
+            try expectAbsent(record, "task");
+        } else {
+            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, task), try testString(record, "task"));
+        }
         try std.testing.expectEqual(@as(i64, @intCast(prompt.len)), try testInt(record, "task_bytes"));
         try std.testing.expectEqual(@as(i64, 1), try testInt(try trace.one("subagent_turn"), "subagent_id"));
     }
