@@ -5829,6 +5829,24 @@ fn traceRouteFailure(
     );
 }
 
+/// How a turn ended: from the error it returned, else from what its
+/// finalization recorded.
+fn observedTurnOutcome(observed_error: ?anyerror, finalized: ?types.TurnPresentationOutcome) observation.TurnOutcome {
+    if (observed_error) |err| return switch (err) {
+        error.TurnYielded => .yielded,
+        error.Cancelled => .cancelled,
+        error.SessionWriterChanged, error.SessionWriterParked => .fenced,
+        else => .failed,
+    };
+    const outcome = finalized orelse return .failed;
+    return switch (outcome) {
+        .completed => .completed,
+        .interrupted => .interrupted,
+        .failed => .failed,
+        .paused => .paused,
+    };
+}
+
 pub fn processAgentPrompt(
     agent: *runtime_agent.Agent,
     deps: *const AgentRuntimeDeps,
@@ -5863,20 +5881,22 @@ pub fn processAgentPrompt(
 
     var observed_error: ?anyerror = null;
     if (deps.observer) |observer| observer.beginTurn(job.prompt, job.recovery_checkpoint != null);
-    defer if (deps.observer) |observer| {
-        const outcome: observation.TurnOutcome = if (observed_error) |err| switch (err) {
-            error.TurnYielded => .yielded,
-            error.Cancelled => .cancelled,
-            error.SessionWriterChanged, error.SessionWriterParked => .fenced,
-            else => .failed,
-        } else if (finalization.outcome) |outcome| switch (outcome) {
-            .completed => .completed,
-            .interrupted => .interrupted,
-            .failed => .failed,
-            .paused => .paused,
-        } else .failed;
-        observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
-    };
+    // A subagent's turn is recorded for `/trace`, which says which subagent
+    // each `subagent_id` in its tool and network records belongs to.
+    const traced_subagent_id: u64 = if (effective_config.origin == .subagent) effective_config.subagent_id else 0;
+    if (traced_subagent_id != 0) diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = traced_subagent_id,
+        .session_id = effective_lifecycle.scope.session_id orelse "",
+        .model = effective_job.model,
+        .effort = effective_config.effort.label(),
+        .prompt = effective_job.prompt,
+        .started_at_ms = io_mod.milliTimestamp(),
+    });
+    defer {
+        const outcome = observedTurnOutcome(observed_error, finalization.outcome);
+        if (deps.observer) |observer| observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
+        if (traced_subagent_id != 0) diagnostics.recordSubagentTurnEnd(traced_subagent_id, @tagName(outcome));
+    }
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         observed_error = err;
@@ -8571,9 +8591,11 @@ fn processQueuedPromptLoop(
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
+                        .renewal_deps = deps,
                     };
+                    defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
-                    const compacted = compactContext(arena, deps, .{
+                    const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
                         .before_summary = source.hook(),
@@ -8587,7 +8609,22 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
-                    }) catch |err| {
+                    });
+                    // A summary request the provider rejected with 401 renewed
+                    // the sign-in; the rest of the turn sends the renewed one.
+                    // Taken first: renewing can free the credential the turn
+                    // borrowed, such as ACP's.
+                    if (summary_model.takeRenewed()) |renewed| try adoptJobCredential(
+                        std.heap.c_allocator,
+                        &job,
+                        arena,
+                        renewed.mode,
+                        renewed.credential,
+                        &active_api_key,
+                        &owned_refreshed_api_key,
+                        step_ctx,
+                    );
+                    const compacted = compaction_result catch |err| {
                         if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(

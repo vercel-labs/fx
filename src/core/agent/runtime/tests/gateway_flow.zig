@@ -3936,6 +3936,80 @@ test "processQueuedPrompt compacts and retries one context overflow" {
     }
 }
 
+test "a turn's compaction renews a rejected login once and the turn sends the renewed one after it" {
+    const alloc = std.testing.allocator;
+    const model = "provider/compaction-login-renewal";
+    const overflow_body =
+        \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+    ;
+    const Case = struct {
+        // The tokens the host gives out: the turn's check before it sends,
+        // then the stored one after the 401, then a forced refresh.
+        tokens: []const []const u8,
+        modes: []const runtime_deps.CredentialRefreshMode,
+    };
+    const cases = [_]Case{
+        // Another fx process renewed the login: the stored one is sent.
+        .{ .tokens = &.{ "token-before", "token-after" }, .modes = &.{ .if_needed, .reload } },
+        // The store still holds the rejected token: one forced refresh.
+        .{ .tokens = &.{ "token-before", "token-before", "token-after" }, .modes = &.{ .if_needed, .reload, .force } },
+    };
+    for (cases) |case| {
+        const completions = [_]FakeCompletion{
+            .{ .status = .bad_request, .err_body = overflow_body },
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+            .{ .content = "Retain the completed prior turn and continue from it." },
+            .{ .content = "COMPACTION_LOGIN_RENEWED" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &.{.{
+            .model = model,
+            .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+        }};
+        hooks.credential_refresh_tokens = case.tokens;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.credential_source = .fx_login;
+        // A tool call leaves work to summarize, so the compaction asks the model.
+        var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+        var prior_results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("prior-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        }};
+        var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior user") },
+            .assistant = @constCast("prior assistant"),
+            .execution = .{ .tool_steps = &prior_steps },
+        } }};
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 2, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 3, "compacted_conversation");
+        try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+        try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[1]);
+        // The summary is sent once more with the renewed login, and the rest
+        // of the turn sends it too, with no second 401.
+        try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[2]);
+        try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[3]);
+        try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, case.modes, hooks.credential_refresh_modes.items);
+        try std.testing.expectEqualStrings("COMPACTION_LOGIN_RENEWED", hooks.finish_assistant_text.?);
+        try std.testing.expect(hooks.http_status == null);
+    }
+}
+
 test "processQueuedPrompt stops after one context overflow recovery" {
     const alloc = std.testing.allocator;
     const model = "provider/repeated-context-overflow";
@@ -5121,6 +5195,70 @@ test "processQueuedPrompt excludes assistant-authored subagent prompts from inpu
         .input_tokens = 0,
         .output_tokens = 5,
     }, hooks.finish_summary.?.token_progress);
+}
+
+/// Runs one fake turn as a subagent of session `session_id`.
+fn runFakeSubagentPrompt(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, fixture: *PromptFixture, session_id: []const u8) !void {
+    var config = fixture.config();
+    config.origin = .subagent;
+    var lifecycle = test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        hooks.alloc,
+        config.workspace_root,
+    );
+    lifecycle.scope.kind = .subagent;
+    lifecycle.scope.session_id = session_id;
+    try test_support.runFakePromptWithLifecycle(gateway, hooks, config, fixture.job(), lifecycle);
+}
+
+test "a subagent turn is recorded for the trace with its session, model, prompt, and outcome" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{ .{ .content = "done" }, .{ .content = "main done" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakeSubagentPrompt(&gateway, &hooks, &fixture, "child-trace");
+    // A main turn is not a subagent turn, so it is not recorded.
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var turns: [diagnostics.subagent_turn_capacity]diagnostics.SubagentTurn = undefined;
+    const n = diagnostics.snapshotSubagentTurns(&turns);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 1), diagnostics.subagentTurnTotal());
+    const turn = &turns[0];
+    try std.testing.expect(turn.subagent_id != 0);
+    try std.testing.expectEqualStrings("child-trace", turn.sessionId());
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", turn.model());
+    try std.testing.expectEqualStrings("user prompt", turn.prompt());
+    try std.testing.expectEqualStrings("completed", turn.outcome());
+    try std.testing.expect(turn.started_at_ms > 0);
+    try std.testing.expect(turn.ended_at_ms >= turn.started_at_ms);
+}
+
+test "a subagent turn whose request is rejected is recorded with how it ended" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"rejected\"}}" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    runFakeSubagentPrompt(&gateway, &hooks, &fixture, "child-rejected") catch {};
+
+    var turns: [diagnostics.subagent_turn_capacity]diagnostics.SubagentTurn = undefined;
+    const n = diagnostics.snapshotSubagentTurns(&turns);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("child-rejected", turns[0].sessionId());
+    try std.testing.expectEqualStrings("failed", turns[0].outcome());
+    try std.testing.expect(turns[0].ended_at_ms != 0);
 }
 
 test "processQueuedPrompt estimates raw reasoning and content independently of chunk boundaries" {

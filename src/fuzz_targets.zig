@@ -10,6 +10,7 @@ test {
     _ = @import("builtins/context.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/auth/credentials.zig");
+    _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/orchestrator.zig");
@@ -55,9 +56,11 @@ test {
     _ = @import("core/subagent/live_metrics.zig");
     _ = @import("core/subagent/reports.zig");
     _ = @import("core/terminal/engine.zig");
+    _ = @import("core/terminal/shell_snapshot.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/tooling/file_mutation.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/openai_codex.zig");

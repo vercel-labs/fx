@@ -251,17 +251,29 @@ pub const CompactorCaller = struct {
     /// an agent turn does (`credential_renewal.renewRejected`). Null when the
     /// caller cannot renew it. Must outlive the compaction.
     renewal_deps: ?*const runtime_deps.AgentRuntimeDeps = null,
-    /// The renewed credential and team `api_key` and `gateway_team` point to
-    /// once renewed; `deinit` frees them.
-    renewed_api_key: ?[]u8 = null,
-    renewed_gateway_team: ?[]u8 = null,
+    /// The renewed credential `api_key` and `gateway_team` point to once
+    /// renewed, in `std.heap.c_allocator`, and how it was renewed. `deinit`
+    /// frees it unless `takeRenewed` took it.
+    renewed: ?Renewed = null,
     renewal_tried: bool = false,
 
+    pub const Renewed = struct {
+        credential: runtime_deps.RefreshedGatewayCredential,
+        mode: runtime_deps.CredentialRefreshMode,
+    };
+
     pub fn deinit(self: *CompactorCaller) void {
-        if (self.renewed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
-        self.renewed_api_key = null;
-        if (self.renewed_gateway_team) |team| std.heap.c_allocator.free(team);
-        self.renewed_gateway_team = null;
+        if (self.renewed) |renewed| credential_renewal.free(std.heap.c_allocator, renewed.credential);
+        self.renewed = null;
+    }
+
+    /// The renewed credential, now the caller's, in `std.heap.c_allocator`:
+    /// an agent turn sends it from then on. `api_key` and `gateway_team` still
+    /// point to it, so call this once the compaction is over.
+    pub fn takeRenewed(self: *CompactorCaller) ?Renewed {
+        const renewed = self.renewed orelse return null;
+        self.renewed = null;
+        return renewed;
     }
 
     /// Borrows `self`, which must outlive the compaction.
@@ -331,25 +343,18 @@ pub const CompactorCaller = struct {
         const rejected = try alloc.dupe(u8, self.api_key);
         defer secret.zeroAndFree(alloc, rejected);
         const renewal = try credential_renewal.renewRejected(deps, alloc, .{ .source = self.credential_source, .account_id = self.account_id }, rejected, trace_ctx);
-        // Only the newest credential is sent again.
+        // Only the newest credential is kept. It is kept even when it is the
+        // rejected token, as an agent turn keeps it: the host's reload can
+        // free the credential this caller borrowed, as ACP's does, so a later
+        // send must use bytes of its own.
         if (renewal.forced != null) if (renewal.stored) |stored| credential_renewal.free(alloc, stored);
         const newest = renewal.newest() orelse return false;
-        if (!renewal.resend) {
-            credential_renewal.free(alloc, newest);
-            return false;
-        }
-        if (newest.gateway_team_label) |label| alloc.free(label);
-        if (self.renewed_api_key) |old| secret.zeroAndFree(alloc, old);
-        self.renewed_api_key = newest.token;
+        self.renewed = .{ .credential = newest, .mode = if (renewal.forced != null) .force else .reload };
         self.api_key = newest.token;
         // A team the host now sends with the login, such as one the user
         // picked, goes with the next send too.
-        if (newest.gateway_team) |team| {
-            if (self.renewed_gateway_team) |old| alloc.free(old);
-            self.renewed_gateway_team = team;
-            self.gateway_team = team;
-        }
-        return true;
+        if (newest.gateway_team) |team| self.gateway_team = team;
+        return renewal.resend;
     }
 
     fn send(context: *anyopaque, alloc: Allocator, call: compactor.Call) compactor.CallError!compactor.Reply {
@@ -587,6 +592,8 @@ test "a compaction request rejected with 401 is sent once more with the sign-in 
         modes: []const runtime_deps.CredentialRefreshMode,
         sends: usize,
         renewed: ?[]const u8,
+        /// The credential the caller holds after the send, its own copy.
+        kept: ?[]const u8 = null,
     };
     const cases = [_]Case{
         // Another fx renewed the sign-in: its stored token, and no refresh.
@@ -595,6 +602,10 @@ test "a compaction request rejected with 401 is sent once more with the sign-in 
         .{ .tokens = &.{ "launch-key", "forced-key" }, .modes = &.{ .reload, .force }, .sends = 2, .renewed = "forced-key" },
         // Nothing to renew to: the 401 stands after one send.
         .{ .tokens = &.{}, .modes = &.{.reload}, .sends = 1, .renewed = null },
+        // The store holds the rejected token and the forced refresh gives
+        // nothing: the 401 stands, and the caller keeps its own copy of the
+        // stored token, since the host's reload can free the one it borrowed.
+        .{ .tokens = &.{"launch-key"}, .modes = &.{ .reload, .force }, .sends = 1, .renewed = null, .kept = "launch-key" },
     };
     var cancel = std.atomic.Value(bool).init(false);
     const call: compactor.Call = .{ .model = "m", .reasoning = types.ReasoningEffort.literal("none"), .system = "s", .user = "u", .max_bytes = 1024, .cancel_flag = &cancel, .trace_ctx = .{} };
@@ -628,6 +639,12 @@ test "a compaction request rejected with 401 is sent once more with the sign-in 
         } else {
             defer testing.allocator.free(reply.failed.detail);
             try testing.expect(reply.failed.reason == .provider);
+        }
+        if (case.kept) |key| {
+            const kept = summary_model.renewed.?;
+            try testing.expectEqual(runtime_deps.CredentialRefreshMode.reload, kept.mode);
+            try testing.expectEqualStrings(key, kept.credential.token);
+            try testing.expectEqual(kept.credential.token.ptr, summary_model.api_key.ptr);
         }
     }
 

@@ -5393,7 +5393,9 @@ test {
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
+    _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");
@@ -5475,6 +5477,7 @@ test {
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");

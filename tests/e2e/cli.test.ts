@@ -2551,6 +2551,8 @@ describe("cli: logout", () => {
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
+        // No retry could revoke it there, so nothing is kept.
+        expect(existsSync(join(home, ".fx", "auth-revocations.json"))).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
         ]);
@@ -2587,6 +2589,8 @@ describe("cli: logout", () => {
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
+        // No retry could revoke it there, so nothing is kept.
+        expect(existsSync(join(home, ".fx", "auth-revocations.json"))).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
         ]);
@@ -2696,8 +2700,9 @@ describe("cli: logout", () => {
         const logout = await runFx(["logout"], { env });
         expect(logout.code).toBe(0);
         expect(logout.stdout).toBe("Signed out of fx.\n");
+        // The 500 may pass, so fx keeps the tokens to revoke them later.
         expect(logout.stderr).toBe(
-          "Warning: signed out locally, but the remote session could not be revoked.\n",
+          "Warning: signed out locally, but the remote session could not be revoked. fx will try again later.\n",
         );
         expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
         expect(issuer.requests).toEqual([
