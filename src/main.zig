@@ -5538,7 +5538,6 @@ test {
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/subagent/reports.zig");
-    _ = @import("core/subagent/usage_ledger.zig");
     _ = @import("core/shared/agent_frame.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");

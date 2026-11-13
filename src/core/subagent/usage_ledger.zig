@@ -22,7 +22,10 @@ const Allocator = std.mem.Allocator;
 pub const Entry = struct {
     /// The child's session id.
     id: []u8,
-    /// The name its parent gave it, or null for a one-off.
+    /// The name its parent gave it. Null for a child saved with no name, which
+    /// this version cannot start or message: the subagent tool has no `run`
+    /// action and `message` needs a valid agent name. The type keeps the case
+    /// so an unnamed child never breaks the result.
     name: ?[]u8,
     /// A count no reply reported stays null, as in a result's own `usage`.
     usage: types.Usage = .{},
@@ -122,12 +125,21 @@ pub const Ledger = struct {
     }
 };
 
+/// A ledger that child `child_a`, named `alpha`, has begun a turn in. It keeps
+/// the entry only when `enabled`. The caller deinits it.
+fn testLedger(alloc: Allocator, enabled: bool) !Ledger {
+    var ledger: Ledger = .{};
+    errdefer ledger.deinit(alloc);
+    if (enabled) ledger.enable();
+    try ledger.begin(alloc, "child_a", "alpha");
+    return ledger;
+}
+
 test "a ledger that is off keeps nothing" {
     const alloc = std.testing.allocator;
-    var ledger: Ledger = .{};
+    var ledger = try testLedger(alloc, false);
     defer ledger.deinit(alloc);
 
-    try ledger.begin(alloc, "child_a", "alpha");
     ledger.add("child_a", .{ .input_tokens = 10, .output_tokens = 1 });
 
     const entries = try ledger.snapshot(alloc);
@@ -137,11 +149,9 @@ test "a ledger that is off keeps nothing" {
 
 test "a ledger lists children in the order they first ran and adds each reply to its own child" {
     const alloc = std.testing.allocator;
-    var ledger: Ledger = .{};
+    var ledger = try testLedger(alloc, true);
     defer ledger.deinit(alloc);
-    ledger.enable();
 
-    try ledger.begin(alloc, "child_a", "alpha");
     try ledger.begin(alloc, "child_b", null);
     try ledger.begin(alloc, "child_c", "gamma");
     // A later turn of a child that began keeps its place and adds no entry.
@@ -176,10 +186,8 @@ test "a ledger lists children in the order they first ran and adds each reply to
 
 test "a snapshot is a copy that later usage does not change" {
     const alloc = std.testing.allocator;
-    var ledger: Ledger = .{};
+    var ledger = try testLedger(alloc, true);
     defer ledger.deinit(alloc);
-    ledger.enable();
-    try ledger.begin(alloc, "child_a", "alpha");
     ledger.add("child_a", .{ .input_tokens = 10 });
 
     const before = try ledger.snapshot(alloc);
@@ -198,10 +206,8 @@ test "a snapshot is a copy that later usage does not change" {
 test "a ledger frees what it holds when an allocation fails" {
     const Sweep = struct {
         fn run(alloc: Allocator) !void {
-            var ledger: Ledger = .{};
+            var ledger = try testLedger(alloc, true);
             defer ledger.deinit(alloc);
-            ledger.enable();
-            try ledger.begin(alloc, "child_a", "alpha");
             try ledger.begin(alloc, "child_b", null);
             ledger.add("child_a", .{ .input_tokens = 1 });
             const entries = try ledger.snapshot(alloc);

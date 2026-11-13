@@ -4160,7 +4160,8 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.writeAll("],\"usage\":");
     try writeUsageJson(&out.writer, result.usage);
     // Present only when a subagent did work, so a run without one prints the
-    // same JSON as before the field existed. A one-off has a null name.
+    // same JSON as before the field existed. `name` is null only for a child
+    // saved with no name (see `usage_ledger.Entry`).
     if (result.subagents.len > 0) {
         try out.writer.writeAll(",\"subagents\":[");
         for (result.subagents, 0..) |entry, i| {
@@ -7810,8 +7811,8 @@ const TestRunUsage = struct {
     }
 
     /// Two subagents work during the run, as the host sees them: `alpha`
-    /// starts in the first turn and works again in the third, and a one-off
-    /// starts in the second and reports no counts.
+    /// starts in the first turn and works again in the third, and `child_b`,
+    /// which has no name, starts in the second and reports no counts.
     fn noteSubagentWork(deps: *const agent_runtime.AgentRuntimeDeps, turn: usize) !void {
         const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
         const tree = ctx.subagent_host.?;
@@ -7888,13 +7889,13 @@ test "ask JSON usage sums every main turn and subagents lists the work, however 
         try std.testing.expectEqual(@as(i64, 7001), alpha_usage.get("input_tokens").?.integer);
         try std.testing.expectEqual(@as(i64, 71), alpha_usage.get("output_tokens").?.integer);
         try std.testing.expectEqual(@as(i64, 700), alpha_usage.get("cache_read_tokens").?.integer);
-        const one_off = subagents[1].object;
-        try std.testing.expect(one_off.get("name").? == .null);
-        try std.testing.expectEqualStrings("child_b", one_off.get("id").?.string);
-        const one_off_usage = one_off.get("usage").?.object;
-        try std.testing.expect(one_off_usage.get("input_tokens").? == .null);
-        try std.testing.expect(one_off_usage.get("output_tokens").? == .null);
-        try std.testing.expect(one_off_usage.get("cache_read_tokens") == null);
+        const unnamed = subagents[1].object;
+        try std.testing.expect(unnamed.get("name").? == .null);
+        try std.testing.expectEqualStrings("child_b", unnamed.get("id").?.string);
+        const unnamed_usage = unnamed.get("usage").?.object;
+        try std.testing.expect(unnamed_usage.get("input_tokens").? == .null);
+        try std.testing.expect(unnamed_usage.get("output_tokens").? == .null);
+        try std.testing.expect(unnamed_usage.get("cache_read_tokens") == null);
         switch (ending) {
             .completed => try std.testing.expect(parsed.value.object.get("error") == null),
             .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
