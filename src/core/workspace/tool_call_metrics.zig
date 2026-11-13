@@ -353,11 +353,16 @@ pub fn recordResult(input: ToolCallRecord) void {
     if (input.outcome != .succeeded) recordFailureLocked(input, metric.duration_ms, reads_startup_files);
 }
 
-/// Whether a `shell` call's arguments leave the user's startup files on: one
-/// JSON object whose top-level `profile` is absent or `user` and that names no
-/// `shell`. A `clean` profile starts the shell without them, and a named shell
-/// may be another shell or a clean start. Arguments it cannot read count as
-/// off, so a trace never blames startup files a command may not have read.
+/// Whether a `shell` call's arguments started a command with the user's
+/// startup files: one JSON object whose top-level `action` is `run`, whose
+/// `profile` is absent or `user`, and that names no `shell`. `interact` and
+/// `stop` start no command, and a recorded call without an `action` never
+/// ran, since the orchestrator adds the action it infers before a call is
+/// stored. A `clean` profile starts the shell without the startup files, and
+/// a named shell may be another shell or a clean start. Any other value, even
+/// one the tool drops such as a `null` profile, and arguments it cannot read
+/// count as off, so a trace never blames startup files a command may not
+/// have read.
 fn shellArgsReadStartupFiles(arguments_json: []const u8) bool {
     // Holds the scanner's nesting stack; deeper arguments count as off.
     var stack: [256]u8 = undefined;
@@ -365,22 +370,31 @@ fn shellArgsReadStartupFiles(arguments_json: []const u8) bool {
     var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), arguments_json);
     defer scanner.deinit();
     if ((scanner.next() catch return false) != .object_begin) return false;
+    var runs = false;
     while (true) {
         const key = switch (scanner.next() catch return false) {
-            .object_end => return true,
+            .object_end => return runs,
             .string => |text| text,
             else => return false,
         };
         if (std.mem.eql(u8, key, "shell")) return false;
-        if (std.mem.eql(u8, key, "profile")) {
-            switch (scanner.next() catch return false) {
-                .string => |text| if (!std.mem.eql(u8, text, "user")) return false,
-                else => return false,
-            }
+        if (std.mem.eql(u8, key, "action")) {
+            if (!nextStringIs(&scanner, "run")) return false;
+            runs = true;
+        } else if (std.mem.eql(u8, key, "profile")) {
+            if (!nextStringIs(&scanner, "user")) return false;
         } else {
             scanner.skipValue() catch return false;
         }
     }
+}
+
+/// Whether the scanner's next value is the string `expected`.
+fn nextStringIs(scanner: *std.json.Scanner, expected: []const u8) bool {
+    return switch (scanner.next() catch return false) {
+        .string => |text| std.mem.eql(u8, text, expected),
+        else => false,
+    };
 }
 
 pub fn snapshot(out: []ToolCallMetric) usize {
@@ -656,17 +670,26 @@ test "a session reset clears the failure ring" {
     try std.testing.expectEqual(@as(u64, 0), lifetimeStats().failureCount());
 }
 
-test "shell arguments read the startup files only on the user profile without a named shell" {
+test "shell arguments read the startup files only on a user-profile run without a named shell" {
     const reads = [_][]const u8{
         "{\"action\":\"run\",\"command\":\"ls\"}",
         "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"user\"}",
+        "{\"profile\":\"user\",\"command\":\"ls\",\"action\":\"run\"}",
         // Words in a value are not keys.
-        "{\"command\":\"echo \\\"profile\\\":\\\"clean\\\" shell\",\"cwd\":{\"profile\":\"clean\"}}",
-        "{}",
+        "{\"action\":\"run\",\"command\":\"echo \\\"profile\\\":\\\"clean\\\" shell\",\"cwd\":{\"profile\":\"clean\"}}",
     };
     for (reads) |arguments| try std.testing.expect(shellArgsReadStartupFiles(arguments));
 
     const skips = [_][]const u8{
+        // Only `run` starts a command; `interact` types into a session that
+        // may not exist, and `stop` ends one.
+        "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}",
+        "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}",
+        // The orchestrator adds the action a call leaves out before the call
+        // is stored, so a recorded call without one never ran.
+        "{\"command\":\"ls\"}",
+        "{}",
+        "{\"action\":null,\"command\":\"ls\"}",
         "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"clean\"}",
         "{\"profile\":\"clean\",\"command\":\"ls\"}",
         "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\"}}",

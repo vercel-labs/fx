@@ -138,10 +138,10 @@
 //!   Each has `at`, `name`, `outcome`, `duration_ms`, `source`, `cause`, and
 //!   `call_id` as a `tool_call` has them; `dir`, the folder the tool ran
 //!   against, where a shell call runs when its arguments name no `cwd`; for a
-//!   `shell` call that read the startup files, which means its arguments leave
-//!   `profile` unset or `user` and name no `shell`, `redefined`, the entries of
-//!   the `shell` record's `redefined` list that its arguments name, left out
-//!   when there are none;
+//!   `shell` call that ran a command with the startup files, which means its
+//!   arguments have `action` `run`, leave `profile` unset or `user`, and name
+//!   no `shell`, `redefined`, the entries of the `shell` record's `redefined`
+//!   list that its arguments name, left out when there are none;
 //!   and `args` and `result` (each masked), with `args_bytes` and
 //!   `result_bytes`. Each keeps up to 8 KiB of its value: a longer value keeps
 //!   its first bytes in `args` or `result` and its last bytes in `args_tail`
@@ -3498,6 +3498,14 @@ test "trace names redefined commands only for a shell call that read the startup
         "{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
         "exit 1",
     );
+    // Typing into a session that does not exist runs no command.
+    recordTraceTestCall(
+        "shell",
+        .tool_failed,
+        "call_interact",
+        "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}",
+        "no such session",
+    );
     const view = traceTestShellView("ready");
     const w = try TestWriter.create();
     defer w.destroy();
@@ -3505,11 +3513,11 @@ test "trace names redefined commands only for a shell call that read the startup
     var trace = try w.trace();
     defer trace.deinit();
 
-    try std.testing.expectEqual(@as(usize, 3), trace.count("failed_tool_call"));
+    try std.testing.expectEqual(@as(usize, 4), trace.count("failed_tool_call"));
     const user = try trace.nth("failed_tool_call", 0);
     try std.testing.expectEqualStrings("call_user", try testString(user, "call_id"));
     try std.testing.expectEqualStrings("ls alias eza;", try testRedefined(trace.arena.allocator(), user));
-    for ([_][]const u8{ "call_clean", "call_named_shell" }, 1..) |call_id, index| {
+    for ([_][]const u8{ "call_clean", "call_named_shell", "call_interact" }, 1..) |call_id, index| {
         const call = try trace.nth("failed_tool_call", index);
         try std.testing.expectEqualStrings(call_id, try testString(call, "call_id"));
         try expectAbsent(call, "redefined");
