@@ -23,6 +23,7 @@ import {
   spawnSharedAsk,
   startSharedLoginWorld,
   type IssuerOptions,
+  type SharedHoldResult,
   type SharedLoginEvent,
   type SharedLoginWorld,
   type SharedProvider,
@@ -32,7 +33,7 @@ import { checkTrace, type Verdict } from "./trace";
 
 const TIMEOUT = 180_000;
 
-type Hold = (label: string, attempt: number) => Promise<void> | void;
+type Hold = (label: string, attempt: number) => Promise<SharedHoldResult> | SharedHoldResult;
 type Scenario = {
   name: string;
   procs: number;
@@ -118,8 +119,9 @@ const named: Scenario[] = [
           await bothSent();
           if (label === "p2") await killed;
         } else if (label === "p1") {
+          // p1's retry, sent after it saved the refreshed login, never gets an answer.
           await killed;
-          throw new Error("p1 was killed");
+          return "drop";
         }
       });
       world.revoke(0);
