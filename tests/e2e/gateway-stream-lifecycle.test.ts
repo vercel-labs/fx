@@ -9447,20 +9447,23 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      // The summary and its fallback are both rejected, so the turn fails
+      // A 413 refuses the request as too large, so the summary is asked for
+      // again smaller three times, each time from the conversation's model
+      // and then the fallback. Every one is rejected, so the turn fails
       // without running the completed tool again.
       expect(serializedError).toContain("ModelFailed");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(4);
-      for (const index of [2, 3]) {
+      expect(gateway.requestCount()).toBe(10);
+      for (let index = 2; index < 10; index += 1) {
         const summaryRequest = JSON.parse(gateway.requests[index]!.body);
         expect(summaryRequest.tools).toEqual([]);
         expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+        const fallback = gateway.requests[index]!.headers.get("ai-language-model-id") === "anthropic/claude-sonnet-5";
+        expect(fallback).toBe(index % 2 === 1);
       }
-      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
