@@ -54,6 +54,7 @@ pub const Kind = enum {
     provider_start,
     provider_completed,
     summary_transport_failed,
+    summary_too_long,
     summary_incomplete,
     summary_tool_call_rejected,
     summary_truncated,

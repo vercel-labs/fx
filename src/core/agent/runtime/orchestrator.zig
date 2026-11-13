@@ -4814,7 +4814,7 @@ fn needsUserFailureKind(
     {
         return .quota;
     }
-    if (isContextOverflowFailure(failure)) return .too_long;
+    if (agent_stream_provider.isContextOverflow(failure)) return .too_long;
     return switch (failure.kind) {
         .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
         // fx tried to refresh the credential once, and the refresh failed:
@@ -4933,25 +4933,6 @@ fn waitForUser(
     return if (try request_recovery.waitForSend() != null) .resend else .cancelled;
 }
 
-fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
-    if (failure.kind == .request_too_large) return true;
-    if (failure.kind != .invalid_request) return false;
-    const detail = failure.detail orelse return false;
-    inline for (.{
-        "context_length_exceeded",
-        "exceeds the context window",
-        "exceeded the context window",
-        "maximum context length",
-        "maximum prompt length",
-        "input is too long",
-        "prompt is too long",
-        "too many input tokens",
-    }) |needle| {
-        if (text_utils.containsIgnoreCase(detail, needle)) return true;
-    }
-    return false;
-}
-
 const ContextOverflowRecoveryState = enum {
     ready,
     pending,
@@ -4969,7 +4950,7 @@ fn shouldRecoverContextOverflow(
         recovery_available and
         has_compactable_context and
         replay_safe and
-        isContextOverflowFailure(failure);
+        agent_stream_provider.isContextOverflow(failure);
 }
 
 test "context overflow recovery is typed safe and bounded" {
