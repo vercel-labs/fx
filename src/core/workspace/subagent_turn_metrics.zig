@@ -57,8 +57,8 @@ pub const Turn = struct {
         return self.outcome_buf[0..self.outcome_len];
     }
 
-    /// The first bytes of the turn's prompt, without a word the cut split
-    /// (`keptPrompt`).
+    /// The first bytes of the turn's prompt, without an ASCII word the cut
+    /// split (`keptPrompt`). Empty when nothing before the cut was kept.
     pub fn prompt(self: *const Turn) []const u8 {
         return self.prompt_buf[0..self.prompt_len];
     }
@@ -88,17 +88,19 @@ fn copyInto(buf: []u8, len: *u8, value: []const u8) void {
 }
 
 /// The part of `prompt` the ring keeps: its first `max_prompt_len` bytes,
-/// cut on a UTF-8 boundary, without the word the cut falls inside. `/trace`
-/// masks the prompt with `text_utils.maskSecrets`, which finds a secret only
-/// whole, so a secret the cut shortened would show unmasked. Each secret it
-/// finds ends at whitespace or at the end of the text, except a quoted value,
-/// which it masks to the end of a text that lost the closing quote. So the
-/// word that crosses the cut holds every part of a secret the cut split.
+/// cut on a UTF-8 boundary. When the cut splits a word, the ASCII bytes at
+/// the end of what is kept, back to whitespace or to a byte that is not
+/// ASCII, are left out too; other text is never left out. `/trace` masks the
+/// prompt with `text_utils.maskSecrets`, which finds a key, a token, or a URL
+/// credential only whole, so one the cut shortened would show unmasked. Each
+/// of those is ASCII without whitespace, apart from a URL credential that
+/// holds other text, so that run holds every part of one the cut split. An
+/// assignment's value and a quoted value are masked even when cut short.
 fn keptPrompt(prompt: []const u8) []const u8 {
     const kept = text_utils.utf8PrefixByBytes(prompt, max_prompt_len);
     if (kept.len == prompt.len or std.ascii.isWhitespace(prompt[kept.len])) return kept;
     var end = kept.len;
-    while (end > 0 and !std.ascii.isWhitespace(kept[end - 1])) end -= 1;
+    while (end > 0 and std.ascii.isAscii(kept[end - 1]) and !std.ascii.isWhitespace(kept[end - 1])) end -= 1;
     return kept[0..end];
 }
 
@@ -271,7 +273,7 @@ test "long values are cut on a UTF-8 boundary" {
     try testing.expect(std.unicode.utf8ValidateSlice(turns[0].prompt()));
 }
 
-test "a prompt cut inside a word leaves that word out, so no cut secret is kept" {
+test "a prompt cut inside an ASCII word leaves that word out, so no cut secret is kept" {
     const filler = text_utils.repeat("word ", 46); // 230 bytes, ends in a space
     const token = "ghp_" ++ text_utils.repeat("Q7Z3", 9);
     const Case = struct { prompt: []const u8, kept: []const u8 };
@@ -286,6 +288,11 @@ test "a prompt cut inside a word leaves that word out, so no cut secret is kept"
         .{ .prompt = text_utils.repeat("x", max_prompt_len + 5), .kept = "" },
         // A prompt that fits is kept whole, its last word too.
         .{ .prompt = filler ++ token[0..10], .kept = filler ++ token[0..10] },
+        // Text that is not ASCII is never left out: CJK with no space is
+        // cut on a character boundary, here inside the 81st "中".
+        .{ .prompt = "x" ++ text_utils.repeat("\u{4e2d}", 100), .kept = "x" ++ text_utils.repeat("\u{4e2d}", 79) },
+        // A token right after CJK, with no space, is left out alone.
+        .{ .prompt = text_utils.repeat("\u{4e2d}", 70) ++ token ++ " done", .kept = text_utils.repeat("\u{4e2d}", 70) },
     };
     for (cases) |case| try testing.expectEqualStrings(case.kept, keptPrompt(case.prompt));
 }

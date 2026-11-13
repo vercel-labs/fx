@@ -96,8 +96,9 @@
 //!   that work failed, `model`, `effort`, `title` (masked), `status`
 //!   (masked), its status row, such as a failed request that waits for the
 //!   user, `task` (masked), the start of its newest retained turn's prompt:
-//!   at most 240 bytes, without a word that cut would split, and
-//!   `task_bytes`, that prompt's whole length, `turns_retained`,
+//!   at most 240 bytes, without an ASCII word that cut would split, and left
+//!   out when none of it is kept, and `task_bytes`, that prompt's whole
+//!   length, `turns_retained`,
 //!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
 //!   calls in the tool-call window. A subagent that is not open has only
 //!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
@@ -1054,7 +1055,7 @@ fn endSubagentRecord(r: *Records, input: SubagentsInput, session_id: []const u8)
         const turn = &input.turns[index];
         if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
         if (retained == 0 and turn.prompt_total_bytes > 0) {
-            try r.text("task", try maskedSubagentText(r, turn.prompt()));
+            try r.optionalText("task", try maskedSubagentText(r, turn.prompt()));
             try r.number("task_bytes", turn.prompt_total_bytes);
         }
         retained += 1;
@@ -1108,8 +1109,9 @@ fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) 
 /// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
 /// boundary. Masking comes first, so this cut never splits a secret the mask
 /// would have found. A task comes already cut from the turn ring, which
-/// leaves out the word its own cut splits (`subagent_turn_metrics.keptPrompt`),
-/// so no part of a secret that cut shortened reaches the mask.
+/// leaves out the ASCII word its own cut splits
+/// (`subagent_turn_metrics.keptPrompt`), so no part of a secret that cut
+/// shortened reaches the mask.
 fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
     return text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(r.arena, value), subagent_text_max_bytes);
 }
@@ -2728,9 +2730,9 @@ test "trace subagent text is cut on a character boundary and keeps control chara
     try std.testing.expectEqual(@as(i64, long_title.len), try testInt(record, "title_bytes"));
     try std.testing.expectEqualStrings(row.status, try testString(record, "status"));
     try expectAbsent(record, "status_bytes");
-    // The ring's cut at 240 bytes falls inside the run of "é", so it kept
-    // only the words before it.
-    try std.testing.expectEqualStrings("first words ", try testString(record, "task"));
+    // The ring's cut at 240 bytes falls between two "é", and text that is
+    // not ASCII stays.
+    try std.testing.expectEqualStrings(long_task[0..240], try testString(record, "task"));
     try std.testing.expectEqual(@as(i64, long_task.len), try testInt(record, "task_bytes"));
 }
 
@@ -2817,10 +2819,14 @@ fn subagentFiller(arena: std.mem.Allocator, fuzzed: []const u8, len: usize) ![]u
 }
 
 /// `filler` cut to put `secret` across byte `cut`, `inside` bytes of it
-/// before the cut, with a space on each side.
-fn plantAcross(arena: std.mem.Allocator, filler: []const u8, secret: []const u8, cut: usize, inside: usize) ![]u8 {
-    return std.mem.concat(arena, u8, &.{ filler[0 .. cut - inside - 1], " ", secret, " ", filler[0..20] });
+/// before the cut, with `separator` on each side.
+fn plantAcross(arena: std.mem.Allocator, filler: []const u8, secret: []const u8, separator: []const u8, cut: usize, inside: usize) ![]u8 {
+    return std.mem.concat(arena, u8, &.{ filler[0 .. cut - inside - separator.len], separator, secret, separator, filler[0..20] });
 }
+
+/// What the fuzz check puts on each side of a planted secret: a space, a
+/// line break, or CJK text with no space.
+const planted_separators = [_][]const u8{ " ", "\n", "\u{4e2d}\u{6587}" };
 
 /// The `task` a trace shows for one subagent turn whose prompt holds
 /// `secret` across the turn ring's cut, `inside` bytes of it before the cut.
@@ -2829,7 +2835,7 @@ fn taskWithSecretAcrossCut(arena: std.mem.Allocator, secret: []const u8, inside:
     const filler = text_utils.repeat("plan the work ", 20);
     const w = try TestWriter.create();
     defer w.destroy();
-    const prompt = try plantAcross(w.records.arena, filler, secret, ring_prompt_bytes, inside);
+    const prompt = try plantAcross(w.records.arena, filler, secret, " ", ring_prompt_bytes, inside);
     const turn = testRingTurn("child-secret", prompt);
     try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
     var trace = try w.trace();
@@ -2871,6 +2877,37 @@ test "trace subagent task never shows part of a secret the ring's cut split" {
     }
 }
 
+/// The one `subagent` record a trace writes for `turn`, a turn with no
+/// open subagent.
+fn testTaskRecord(w: *TestWriter, turn: diagnostics.SubagentTurn) !struct { TestTrace, std.json.ObjectMap } {
+    try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
+    var trace = try w.trace();
+    errdefer trace.deinit();
+    return .{ trace, try trace.one("subagent") };
+}
+
+test "trace subagent task keeps a CJK prompt up to a character boundary" {
+    // "中" is three bytes and "𠀀" four, so the cut at 240 bytes falls
+    // inside a "中", and the prompt has no space at all.
+    const prompt = text_utils.repeat("\u{4e2d}\u{20000}", 40);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var trace, const record = try testTaskRecord(w, testRingTurn("child-cjk", prompt));
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(text_utils.repeat("\u{4e2d}\u{20000}", 34), try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, prompt.len), try testInt(record, "task_bytes"));
+}
+
+test "trace subagent task is left out when the ring keeps none of the prompt" {
+    const prompt = text_utils.repeat("Q7Z3", 70);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var trace, const record = try testTaskRecord(w, testRingTurn("child-token", prompt));
+    defer trace.deinit();
+    try expectAbsent(record, "task");
+    try std.testing.expectEqual(@as(i64, prompt.len), try testInt(record, "task_bytes"));
+}
+
 /// Writes a subagent whose name, model, and effort are fuzzed filler, and
 /// whose task, title, status row, and failure reason hold each planted secret
 /// across the cut of the turn ring or of the trace. Checks that every record
@@ -2883,9 +2920,10 @@ fn checkSubagentText(fuzzed: []const u8) !void {
         defer w.destroy();
         const a = w.records.arena;
         const inside = 1 + @as(usize, @intCast((choice >> @intCast(secret_index * 16)) % secret.text.len));
+        const separator = planted_separators[@intCast((choice >> @intCast(secret_index * 16 + 8)) % planted_separators.len)];
         const words = try subagentFiller(a, fuzzed, subagent_text_max_bytes);
-        const prompt = try plantAcross(a, words, secret.text, ring_prompt_bytes, inside);
-        const text = try plantAcross(a, words, secret.text, subagent_text_max_bytes, inside);
+        const prompt = try plantAcross(a, words, secret.text, separator, ring_prompt_bytes, inside);
+        const text = try plantAcross(a, words, secret.text, separator, subagent_text_max_bytes, inside);
         const name = try subagentFiller(a, fuzzed, fuzzed.len);
         const registry = [_]subagent_tool_host.Runtime.TraceChild{
             .{ .id = try a.dupe(u8, "child-fuzz"), .phase = .running, .last_outcome = .failed, .last_failure = text, .closing = false },
