@@ -834,11 +834,14 @@ pub const WorkerRuntime = struct {
 
     /// Cancels the turn in flight without stopping the worker, which goes on
     /// to run later turns, as a subagent's agent does: every wait wakes to
-    /// see the cancel, and a permission request the turn is waiting on is
-    /// declined.
+    /// see the cancel, a permission request the turn is waiting on is
+    /// declined, and a question it is waiting on is cancelled.
     pub fn requestTurnCancel(self: *WorkerRuntime) void {
         self.requestCancel();
         self.cancelApprovalTurn();
+        if (self.cancelPendingQuestionBatch()) {
+            debug_trace.logf("worker", "pending question cancelled reason=turn_cancel", .{});
+        }
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
@@ -8337,6 +8340,78 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+/// Whether `runtime` stops waiting on a question, polled for a bounded time so
+/// a wait that does not end fails its test instead of hanging it.
+fn questionWaitEnds(runtime: *WorkerRuntime) bool {
+    for (0..500) |_| {
+        var snapshot = (runtime.snapshotPendingQuestionBatch(std.testing.allocator) catch return false) orelse return true;
+        snapshot.deinit(std.testing.allocator);
+        io_mod.sleep(1 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+fn runMcpElicitationRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    state.answers = runtime.requestMcpElicitationAnswerBlocking(std.testing.allocator, entries) catch |err| {
+        state.err = err;
+        return;
+    };
+}
+
+test "cancelling a turn ends the question it waits on, whoever asked it" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    const Asker = enum { agent, mcp_server, failed_request };
+    for (std.enums.values(Asker)) |asker| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        var state = QuestionThreadState{};
+        const thread = switch (asker) {
+            .agent => try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries }),
+            .mcp_server => try std.Thread.spawn(.{}, runMcpElicitationRequest, .{ &state, &runtime, &entries }),
+            .failed_request => try std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ &state, &runtime, &entries }),
+        };
+        var snapshot = try waitForQuestionSnapshot(&runtime);
+        snapshot.deinit(alloc);
+        runtime.requestTurnCancel();
+        const ended = questionWaitEnds(&runtime);
+        // A wait that did not end is released, so the test fails instead of hanging.
+        if (!ended) runtime.requestStop();
+        thread.join();
+        defer freeAnswers(alloc, state.answers);
+        try std.testing.expect(ended);
+        try std.testing.expect(state.answers == null);
+    }
+}
+
+test "cancelling a turn declines the permission request it waits on" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+    _ = try waitForPermissionLabel(&runtime, "Allow?");
+    runtime.requestTurnCancel();
+    var ended = false;
+    for (0..500) |_| {
+        runtime.worker_mutex.lockUncancelable(io_mod.getIo());
+        const waiting = runtime.pending_permission_waiting;
+        runtime.worker_mutex.unlock(io_mod.getIo());
+        if (!waiting) {
+            ended = true;
+            break;
+        }
+        io_mod.sleep(1 * std.time.ns_per_ms);
+    }
+    // A request that stayed open is released, so the test fails instead of hanging.
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
 }
 
 test "question resume observer runs only for accepted answers before releasing the worker" {
