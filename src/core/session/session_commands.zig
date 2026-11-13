@@ -2,6 +2,7 @@ const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const agents = @import("../agents/agents.zig");
 const build_options = @import("build_options");
+const app_host_config_runtime = @import("../app/app_host_config_runtime.zig");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -553,12 +554,14 @@ pub fn Commands(comptime App: type) type {
             const trimmed = std.mem.trim(u8, rest, " \t");
             if (std.ascii.eqlIgnoreCase(trimmed, "off")) {
                 app.prompt_history.disable();
-                var attempt = config_runtime.attemptUserPreferences(
+                var attempt = app_host_config_runtime.attemptUserPreferences(
+                    App,
                     app.alloc,
                     .{ .prompt_history_enabled = false },
                 );
                 defer attempt.deinit(app.alloc);
                 switch (attempt) {
+                    .host_owned => {},
                     .failure => |failure| {
                         try reportUserSettingsFailure(
                             app,
@@ -582,12 +585,14 @@ pub fn Commands(comptime App: type) type {
             }
 
             if (std.ascii.eqlIgnoreCase(trimmed, "on")) {
-                var attempt = config_runtime.attemptUserPreferences(
+                var attempt = app_host_config_runtime.attemptUserPreferences(
+                    App,
                     app.alloc,
                     .{ .prompt_history_enabled = true },
                 );
                 defer attempt.deinit(app.alloc);
                 switch (attempt) {
+                    .host_owned => app.prompt_history.enable(),
                     .failure => |failure| {
                         app.prompt_history.disable();
                         try reportUserSettingsFailure(
@@ -1260,12 +1265,21 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn saveStartupScrollbackSetting(app: *App, enabled: bool) !void {
-            var attempt = config_runtime.attemptUserPreferences(
+            var attempt = app_host_config_runtime.attemptUserPreferences(
+                App,
                 app.alloc,
                 .{ .startup_scrollback = enabled },
             );
             defer attempt.deinit(app.alloc);
             switch (attempt) {
+                // No settings file on this profile: say what changed, not
+                // where it was saved.
+                .host_owned => {
+                    const msg = try app.alloc.print("startup_scrollback: {s}", .{if (enabled) "on" else "off"});
+                    defer app.alloc.free(msg);
+                    try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
+                    return;
+                },
                 .failure => |failure| {
                     try reportUserSettingsFailure(
                         app,
@@ -1400,11 +1414,13 @@ pub fn Commands(comptime App: type) type {
                 break :blk app.persistRuntimePreferences(agent, patch);
             } else blk: {
                 var committed = app_session_runtime.PreferenceCommitResult{};
-                const attempt = config_runtime.attemptUserPreferences(
+                const attempt = app_host_config_runtime.attemptUserPreferences(
+                    App,
                     app.alloc,
                     patch.userSettingsPatch(),
                 );
                 switch (attempt) {
+                    .host_owned => {},
                     .outcome => |outcome| committed.settings_outcome = outcome,
                     .failure => |failure| {
                         committed.settings_error = failure.err;

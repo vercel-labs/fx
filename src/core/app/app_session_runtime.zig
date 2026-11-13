@@ -19,6 +19,7 @@ const host_capability = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const app_host_config_runtime = @import("app_host_config_runtime.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
@@ -2391,11 +2392,15 @@ pub fn Runtime(comptime App: type) type {
                     patch.model != null and patch.fast_mode != null;
             }
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
+            var settings_attempt = app_host_config_runtime.attemptUserPreferences(
+                App,
                 app.alloc,
                 patch.userSettingsPatch(),
             );
             switch (settings_attempt) {
+                // The host's config store keeps the model and the mode
+                // (persistAcceptedModel), so there is no save to report.
+                .host_owned => {},
                 .outcome => |outcome| {
                     result.settings_outcome = outcome;
                     settings_attempt = undefined;
