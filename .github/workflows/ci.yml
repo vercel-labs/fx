@@ -16,9 +16,12 @@ on:
 
 concurrency:
   # A manual dispatch gets its own group so it cannot cancel the push run on
-  # main.
+  # main. A push to main runs the durable-session model check, which takes
+  # about 40 minutes, so a newer push waits instead of cancelling it. Without
+  # this, merges land faster than a run can finish and main never reports a
+  # result. GitHub keeps only the newest waiting run.
   group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   zig_mode:

@@ -7942,6 +7942,56 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 40_000);
 
+  test("a subagent message whose request wrapper the model wrote as JSON text reaches the worker", async () => {
+    const root = createFixtureRoot("subagent-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const childBodies: string[] = [];
+    let sentBody = "";
+    let statusBody = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childBodies.push(body);
+        return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
+      }
+      // The worker answers at once, so its report may reach the parent before
+      // either call's result does; each result is taken from the first request
+      // that carries it, report or not.
+      if (body.includes("text-status") && !statusBody) {
+        statusBody = body;
+        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+      }
+      if (body.includes("text-delegate") && !sentBody) {
+        sentBody = body;
+        // Every other action as JSON text is read too.
+        return fakeGatewayToolCall("text-status", "subagent", { request: JSON.stringify({ action: "status" }) });
+      }
+      if (latestUserIsReport(body) || sentBody) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
+      return fakeGatewayToolCall("text-delegate", "subagent", {
+        request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
+      });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Start a worker with a wrapped request."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(toolResultOutput(sentBody, "text-delegate")).not.toContain("request must be an object");
+      expect(childBodies.some((body) => body.includes("TEXT_WRAPPED_TASK"))).toBe(true);
+      // Intake keeps the call with its top-level arguments, as it does for an
+      // object wrapper, so the history and the review see the real action.
+      const call = (gatewayRequest(sentBody).prompt.flatMap((message) =>
+        Array.isArray(message.content) ? message.content : []
+      ) as Array<Record<string, unknown>>).find((part) => part.type === "tool-call" && part.toolCallId === "text-delegate");
+      expect(call?.input).toEqual({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" });
+      const status = toolResultOutput(statusBody, "text-status");
+      expect(status).not.toContain("request must be an object");
+      expect(status).toContain("worker");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   test("a shell request wrapper as JSON text with extra fields or nested too deep gets the correction", async () => {
     const root = createFixtureRoot("shell-request-text-correction");
     const tracePath = join(root.root, "trace.log");
