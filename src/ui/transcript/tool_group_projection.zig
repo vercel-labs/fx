@@ -316,6 +316,20 @@ fn appendSegment(writer: *std.Io.Writer, count: usize, label: []const u8) !void 
     try writer.print(" · {d} {s}", .{ count, label });
 }
 
+/// Core's label for a shell run that returned while its command ran on
+/// (`still_running_label` in src/core/agent/runtime/tool_presentation.zig).
+const still_running_label = "Still running";
+
+/// Whether a command's row reads "Still running": its call returned before
+/// the command ended, so it has no exit status yet.
+fn commandStillRunning(scratch: std.mem.Allocator, entry: TranscriptEntry) !bool {
+    const status = switch (entry) {
+        .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
+        else => null,
+    } orelse return false;
+    return std.mem.startsWith(u8, status, still_running_label ++ " ");
+}
+
 fn normalizeCanonicalStatus(
     scratch: std.mem.Allocator,
     text: []const u8,
@@ -838,6 +852,10 @@ const StoryTally = struct {
     last_command_failed: ?bool = null,
     /// Commands that have not finished, which hold back the ✓.
     commands_running: usize = 0,
+    /// Commands whose call returned while they ran on, which core labels
+    /// "Still running". They have no exit status, so they hold back the ✓
+    /// too, while the header still says they ran.
+    commands_still_running: usize = 0,
     /// Calls other than commands that failed, such as an edit that did not
     /// apply.
     other_failures: usize = 0,
@@ -925,6 +943,10 @@ const StoryTally = struct {
                 }
                 if (record.outcome == null and record.command_process_presentation == null) {
                     if (!follow_up) self.commands_running += 1;
+                    return;
+                }
+                if (!follow_up and try commandStillRunning(scratch, entry)) {
+                    self.commands_still_running += 1;
                     return;
                 }
                 const failed = storyCommandFailed(record);
@@ -1025,7 +1047,7 @@ fn writeResultMark(writer: *std.Io.Writer, tally: StoryTally) !void {
     const latest_failed = tally.last_command_failed orelse return;
     if (latest_failed) {
         try writer.writeAll(" ✗");
-    } else if (tally.commands_running == 0) {
+    } else if (tally.commands_running == 0 and tally.commands_still_running == 0) {
         try writer.writeAll(" ✓");
     }
 }
@@ -1834,9 +1856,11 @@ fn storyRowText(scratch: std.mem.Allocator, row: StoryRow, style: SummaryStyle, 
 }
 
 /// A phrase that still says the call is running, such as the status line
-/// `fx ask` prints when a command starts and never rewrites.
+/// `fx ask` prints when a command starts and never rewrites, or core's
+/// "Still running" for a run that returned before its command ended.
 fn phraseShowsProgress(phrase: []const u8) bool {
-    return std.mem.startsWith(u8, phrase, "Running ");
+    return std.mem.startsWith(u8, phrase, "Running ") or
+        std.mem.startsWith(u8, phrase, still_running_label ++ " ");
 }
 
 /// Whether a row's own status already says it failed, as an old record with
@@ -2716,7 +2740,7 @@ const known_multiword_labels = [_][]const u8{
     "Safety caution",
     "Review unavailable",
     "Timed out",
-    "Still running",
+    still_running_label,
 };
 
 fn knownLabelPrefix(phrase: []const u8) ?usize {
@@ -3908,6 +3932,72 @@ test "minimal command details expose running completed and failed process states
     );
 }
 
+test "a command still running when its call returned gets no check mark" {
+    const alloc = std.testing.allocator;
+    const done = "echo ready";
+    const still = "sleep 30; printf done";
+    const done_args = try alloc.print("{{\"command\":{f}}}", .{std.json.fmt(done, .{})});
+    defer alloc.free(done_args);
+    const still_args = try alloc.print("{{\"command\":{f}}}", .{std.json.fmt(still, .{})});
+    defer alloc.free(still_args);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ done ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running " ++ still ++ "\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = done_args,
+            .command_display = @constCast(done),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = still_args,
+            .command_display = @constCast(still),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+        },
+    };
+
+    // The group still ran commands, but the last one has no exit status, so
+    // the header holds back the ✓ and the row keeps core's label.
+    var group = try build(alloc, &entries, &details, 120);
+    defer group.deinit(alloc);
+    var painted: std.ArrayList(u8) = .empty;
+    defer painted.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(alloc, override.bytes);
+            try painted.append(alloc, '\n');
+        },
+        else => {},
+    };
+    const group_text = try visibleLinesForTest(alloc, painted.items, 120);
+    defer alloc.free(group_text);
+    errdefer std.debug.print("group:\n{s}\n", .{group_text});
+    const trimmed = std.mem.trim(u8, group_text, "\n");
+    try std.testing.expectStringStartsWith(trimmed, "● Ran commands\n├ Ran echo ready\n");
+    try std.testing.expect(std.mem.find(u8, trimmed, "└ Still running sleep, printf") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "✓") == null);
+
+    // Alone, the row is the header, and it gets no ✓ either.
+    var single = try build(alloc, entries[1..], details[1..], 120);
+    defer single.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● Still running \x1b[38;5;252msleep\x1b[39m, \x1b[38;5;252mprintf\x1b[39m",
+        single.entry_actions.items[0].override.bytes,
+    );
+}
+
 test "completed command rows shell-highlight quoted strings without coloring the action" {
     const alloc = std.testing.allocator;
     const command = "printf 'hello world'";
@@ -4153,6 +4243,26 @@ fn paintedTreeTextForTest(
         for (text) |byte| {
             if (byte != ' ') try out.append(alloc, byte);
         }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The visible text of `bytes` as the terminal paints it, one line per row,
+/// without colors. The caller owns the result.
+fn visibleLinesForTest(alloc: std.mem.Allocator, bytes: []const u8, cols: u16) ![]u8 {
+    var grid = try paintExpandedRowsForTest(alloc, bytes, cols);
+    defer grid.deinit();
+    const rows: u16 = @intCast(std.mem.countScalar(u8, bytes, '\n') + 1);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(alloc);
+    var row: u16 = 0;
+    while (row < rows) : (row += 1) {
+        row_text.clearRetainingCapacity();
+        try grid.rowTextTrimmed(row, &row_text);
+        if (row > 0) try out.append(alloc, '\n');
+        try out.appendSlice(alloc, row_text.items);
     }
     return out.toOwnedSlice(alloc);
 }
