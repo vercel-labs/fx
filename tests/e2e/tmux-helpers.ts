@@ -394,6 +394,7 @@ export type FakeGatewayModel = {
     [key: string]: unknown;
   }>;
   fast_variant_of?: string;
+  token_pass?: boolean;
 };
 
 export type FakeGatewayModelRequest = {

@@ -1507,7 +1507,7 @@ pub fn Commands(comptime App: type) type {
         fn isGatewayTokenPassModel(app: *App, agent: *AppAgent, model: []const u8) bool {
             if (comptime !provider_runtime.supported(App)) return false;
             if (provider_runtime.providerOf(app, agent) != .gateway) return false;
-            return token_pass.isFeaturedModel(model);
+            return model_capabilities.resolveForApp(App, app, model).token_pass;
         }
 
         /// Whether the agent's speed setting sends `model` at a speed Token

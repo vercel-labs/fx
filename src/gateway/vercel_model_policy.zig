@@ -1,12 +1,15 @@
 const std = @import("std");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const ascii_case = @import("../core/shared/ascii_case.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
 
 pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
     var capabilities = model_capabilities.capabilitiesForModel(model);
     if (std.mem.startsWith(u8, model, "xai/")) {
         capabilities.parallel_tool_calls = true;
     }
+    // Until the catalog loads, fx's own Token Pass list stands in for it.
+    capabilities.token_pass = token_pass.isFeaturedModel(model);
     capabilities.context_window = contextWindowSize(model);
     return capabilities;
 }
@@ -133,6 +136,12 @@ test "Vercel fallback policy owns vendor model heuristics" {
     try std.testing.expect(!capabilitiesForModel("moonshotai/kimi-k3-fast").supports_fast_mode);
     try std.testing.expectEqual(@as(?u32, 1_000_000), contextWindowSize("anthropic/claude-opus-4.8"));
     try std.testing.expectEqual(@as(?bool, true), capabilitiesForModel("xai/grok-4").parallel_tool_calls);
+
+    // fx's own Token Pass list answers until a catalog entry does.
+    try std.testing.expect(capabilitiesForModel("moonshotai/kimi-k3").token_pass);
+    try std.testing.expect(!capabilitiesForModel("moonshotai/kimi-k3-fast").token_pass);
+    try std.testing.expect(!model_capabilities.mergeCapabilities(capabilitiesForModel("moonshotai/kimi-k3"), .{}).token_pass);
+    try std.testing.expect(model_capabilities.mergeCapabilities(capabilitiesForModel("acme/new-pass-model"), .{ .token_pass = true }).token_pass);
 }
 
 test "fallback context window covers every GPT major from 5" {

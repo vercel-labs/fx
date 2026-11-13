@@ -62,6 +62,7 @@ pub const GatewayMetadata = struct {
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
+    token_pass: bool = false,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
 };
@@ -79,6 +80,8 @@ pub const Capabilities = struct {
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
+    /// Whether Token Pass credit pays for the model at standard speed.
+    token_pass: bool = false,
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -128,6 +131,7 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_web_search = metadata.supports_web_search;
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
+        capabilities.token_pass = metadata.token_pass;
         if (metadata.context_window) |window| capabilities.context_window = window;
         if (metadata.max_output_tokens) |tokens| capabilities.max_output_tokens = tokens;
     }

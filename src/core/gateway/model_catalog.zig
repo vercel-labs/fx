@@ -394,6 +394,8 @@ pub const ModelCatalogEntry = struct {
     /// The id of the model whose Fast mode runs this one; null when the
     /// catalog names none.
     fast_variant_of: ?[]u8 = null,
+    /// Whether Token Pass credit pays for this model at standard speed.
+    token_pass: bool = false,
 };
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
@@ -459,6 +461,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .context_window = entry.context_window,
         .max_tokens = entry.max_tokens,
         .web_search_price = null,
+        .token_pass = entry.token_pass,
     };
     errdefer if (cloned.web_search_price) |price| alloc.free(price);
     if (entry.web_search_price) |price| {
@@ -468,6 +471,16 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         cloned.fast_variant_of = try alloc.dupe(u8, base);
     }
     return cloned;
+}
+
+/// Marks the models in fx's own Token Pass list when the catalog marks none.
+/// AI Gateway marks them only for a team that has Token Pass, so every other
+/// catalog still shows which models the pass pays for.
+pub fn markBuiltInTokenPassModels(entries: []ModelCatalogEntry) void {
+    for (entries) |entry| {
+        if (entry.token_pass) return;
+    }
+    for (entries) |*entry| entry.token_pass = token_pass.isFeaturedModel(entry.id);
 }
 
 /// Whether the Models menu leaves `entry` out: the catalog says Fast mode on
@@ -552,13 +565,18 @@ pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const M
     try selected.ensureTotalCapacity(alloc, candidates.len);
 
     // Token Pass models lead the list, so nobody has to scroll the catalog to
-    // find the models a Token Pass pays for.
+    // find the models a Token Pass pays for. fx's own list sets the order of
+    // the models it names, and a model only the catalog marks follows them.
     for (token_pass.featured_models) |id| {
         for (candidates) |candidate| {
-            if (!std.mem.eql(u8, candidate.id, id)) continue;
+            if (!candidate.token_pass or !std.mem.eql(u8, candidate.id, id)) continue;
             if (!pickerCatalogContains(selected.items, candidate.id)) try appendClonedModelCatalogEntry(alloc, &selected, candidate);
             break;
         }
+    }
+    for (candidates) |candidate| {
+        if (!candidate.token_pass or pickerCatalogContains(selected.items, candidate.id)) continue;
+        try appendClonedModelCatalogEntry(alloc, &selected, candidate);
     }
 
     for (featured_picker_families) |featured| {
@@ -1190,10 +1208,13 @@ test "picker lists Token Pass models first without a second slot for their famil
         .{ .id = @constCast("anthropic/claude-fable-5"), .model_type = @constCast("language"), .released = 300, .has_tool_use = true },
         .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language"), .released = 290, .has_tool_use = true },
         .{ .id = @constCast("deepseek/deepseek-v4.1-pro"), .model_type = @constCast("language"), .released = 260, .has_tool_use = true },
-        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language"), .released = 255, .has_tool_use = true },
-        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .released = 250, .has_tool_use = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language"), .released = 255, .has_tool_use = true, .token_pass = true },
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .released = 250, .has_tool_use = true, .token_pass = true },
+        // The catalog does not mark this one, so it keeps its place.
         .{ .id = @constCast("zai/glm-5.3-flash"), .model_type = @constCast("language"), .released = 240, .has_tool_use = true },
-        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 230, .has_tool_use = true },
+        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 230, .has_tool_use = true, .token_pass = true },
+        // Only the catalog names this one, so it follows the models fx knows.
+        .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .released = 220, .has_tool_use = true, .token_pass = true },
         .{ .id = @constCast("zai/glm-5.2"), .model_type = @constCast("language"), .released = 100, .has_tool_use = true },
     };
 
@@ -1203,13 +1224,37 @@ test "picker lists Token Pass models first without a second slot for their famil
     const expected = [_][]const u8{
         "moonshotai/kimi-k3",
         "zai/glm-5.3",
-        "zai/glm-5.3-flash",
         "deepseek/deepseek-v4.1-flash",
+        "acme/new-pass-model",
         "anthropic/claude-fable-5",
         "openai/gpt-6",
         "deepseek/deepseek-v4.1-pro",
+        "zai/glm-5.3-flash",
         "zai/glm-5.2",
     };
     try std.testing.expectEqual(expected.len, curated.items.len);
     for (expected, curated.items) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    for (curated.items[0..4]) |entry| try std.testing.expect(entry.token_pass);
+    for (curated.items[4..]) |entry| try std.testing.expect(!entry.token_pass);
+}
+
+test "fx's own Token Pass list marks a catalog only when the catalog marks none" {
+    var unmarked = [_]ModelCatalogEntry{
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language") },
+        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language") },
+    };
+    markBuiltInTokenPassModels(&unmarked);
+    try std.testing.expect(unmarked[0].token_pass);
+    try std.testing.expect(unmarked[1].token_pass);
+    try std.testing.expect(!unmarked[2].token_pass);
+
+    // A team's catalog marks one model, so fx's list adds nothing to it.
+    var marked = [_]ModelCatalogEntry{
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language") },
+        .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .token_pass = true },
+    };
+    markBuiltInTokenPassModels(&marked);
+    try std.testing.expect(!marked[0].token_pass);
+    try std.testing.expect(marked[1].token_pass);
 }
