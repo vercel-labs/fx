@@ -885,6 +885,21 @@ const storeOf = (durability) => (typeof durability?.create === "function" ? dura
 // (`tests/tla/sdk/TenantIsolation.tla` RunsInSenderStore).
 const agentOnStore = (name, store) => agentNamed(name, (other) => typeof other.world === "function" && other.create === undefined && worldStore(other) === store);
 
+// Standard Workflow deliveries carry only a run id. Find the World that
+// owns that run and the agent/store in its persisted descriptor, rather
+// than choosing whichever agent first installed the HTTP queue wrapper.
+async function replayWorkflowRun(runId, meta) {
+  for (const group of agentsByName.values()) {
+    for (const member of group.members) {
+      const created = await openMember(member);
+      if (typeof created?.replayHere !== "function") continue;
+      const handled = await created.replayHere(runId, meta);
+      if (handled) return handled.result;
+    }
+  }
+  throw new Error("no libfx agent on the saved Workflow replay store is listening");
+}
+
 /**
  * The request handler a deployment mounts for queue deliveries, for every
  * durable agent in the process: each delivery goes to the agent its message
@@ -1017,16 +1032,7 @@ function createWorldBackend(world, durability) {
   // message from before stores were named is for this World's store.
   const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
     if (workflowCodec && !message?.input && typeof message?.runId === "string") {
-      // Read the stored arguments, never an input supplied by a delivery.
-      const run = await world.runs.get(message.runId, { resolveData: "all" });
-      const args = await workflowCodec.decode(run, world);
-      const descriptor = args?.[0];
-      if (run.workflowName !== "libfx/session" || !Array.isArray(args) || args.length !== 1 || descriptor?.libfx !== 1 || descriptor.store !== store || !validId(descriptor.agent)) {
-        throw new Error("invalid libfx Workflow replay arguments");
-      }
-      const agent = await agentOnStore(descriptor.agent, descriptor.store);
-      if (!agent) throw noAgentNamed(descriptor.agent);
-      return agent.replayHere(run, descriptor, meta);
+      return replayWorkflowRun(message.runId, meta);
     }
     const named = agentOf(message?.input);
     const agent = await agentOnStore(named, typeof message?.input?.store === "string" ? message.input.store : store);
@@ -1466,7 +1472,22 @@ function createWorldBackend(world, durability) {
     viaRoute: route,
     // Delivers a routed message to this backend's agent.
     deliverHere: (message, meta) => deliverTo(handler, message, meta),
-    async replayHere(run, descriptor, meta) {
+    async replayHere(runId, meta) {
+      if (!workflowCodec) return null;
+      let run;
+      try {
+        run = await world.runs.get(runId, { resolveData: "all" });
+      } catch (error) {
+        if (missingRun(error)) return null;
+        throw error;
+      }
+      // Read the stored arguments, never an input supplied by a delivery.
+      const args = await workflowCodec.decode(run, world);
+      const descriptor = args?.[0];
+      if (run.workflowName !== "libfx/session" || !Array.isArray(args) || args.length !== 1 || descriptor?.libfx !== 1 || !validId(descriptor.agent)) {
+        throw new Error("invalid libfx Workflow replay arguments");
+      }
+      if (descriptor.store !== store || descriptor.agent !== listeningAgent) return null;
       if (!workflowCodec || !backend.validSessionId(descriptor.sourceRunId) || descriptor.sourceRunId === run.runId || !backend.validSessionId(run.executionContext?.replayedFromRunId)) {
         throw new Error("invalid libfx Workflow replay source");
       }
@@ -1495,7 +1516,7 @@ function createWorldBackend(world, durability) {
       }
       const message = { ...first, sessionId: run.runId, store };
       for (const entry of messageEntries(foldSessionLog(await log.read()), message)) await log.append(entry);
-      return deliverTo(handler, { input: message }, meta);
+      return { result: await deliverTo(handler, { input: message }, meta) };
     },
     listen(fn, name = defaultAgentName) {
       handler = fn;

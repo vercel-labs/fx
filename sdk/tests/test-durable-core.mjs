@@ -2076,6 +2076,38 @@ if (durabilityKind === "queue") {
     for (const { stored } of [acme, evil, twin]) await stored.close();
   });
 
+  test("Workflow replay finds the saved agent and store across Worlds sharing one route", async () => {
+    const { recreateRunFromExisting } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const first = await routeWorld("replay-first");
+    const second = await routeWorld("replay-second");
+    const agents = [
+      createTaggedAgent({ durability: first.durability, name: "support", tag: "first" }),
+      createTaggedAgent({ durability: second.durability, name: "support", tag: "second" }),
+    ];
+    try {
+      for (const [index, fixture] of [first, second].entries()) {
+        const agent = agents[index];
+        const original = agent.session();
+        const turn = original.prompt(`tenant-${index}`, { messageId: `source-${index}` });
+        await turn.accepted;
+        for (const message of fixture.sent.splice(0)) await post(wakeHandler(), message.payload);
+        assert.equal((await turn.result).stopReason, "end_turn");
+        const replayed = await recreateRunFromExisting(fixture.durability.world(), original.id, { specVersion: 8 });
+        const delivery = fixture.sent.find(({ payload }) => payload.runId === replayed && !payload.input);
+        assert.ok(delivery);
+        assert.equal((await post(wakeHandler(), delivery.payload)).status, 200);
+        assert.deepEqual(openersOf(replayed), [index === 0 ? "first" : "second"]);
+        const log = await agent[Symbol.for("libfx.durableInternals")].openLog(replayed);
+        const input = (await log.read()).find(({ entry }) => entry.k === "input");
+        assert.equal(input.entry.input, `tenant-${index}`);
+      }
+    } finally {
+      for (const agent of agents) await agent.close();
+      await first.stored.close();
+      await second.stored.close();
+    }
+  });
+
   test("a forged steer, cancel or resume runs nothing, and a forged delivery is answered alike whether or not its session exists", async () => {
     const { stored, sent, durability } = await routeWorld("tenants");
     const support = createTaggedAgent({ durability, name: "support", tag: "support" });
