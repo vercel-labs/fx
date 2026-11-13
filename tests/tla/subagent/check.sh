@@ -23,6 +23,11 @@
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
 #   late-rearm           the slot clears the stop flags after the end hook
 #                        installed the next work, so a stop in between is erased  StopHoldsForQueued
+#   leftover-gap         a stop of a turn that ended, whose slot kept its unread
+#                        messages, reaches nothing: the hook installs them and
+#                        arms the work, so they run after the stop      StopHoldsForQueued
+#   leftover-uncounted   a stop or close of such a turn drops the kept
+#                        messages and does not count them                NoSilentLoss
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
 #   names-busy           a new subagent's start names every other open one      NamesTheIdle
@@ -112,6 +117,8 @@ StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-mutation-late-rearm StopHoldsForQueued
+StopMessage stop-message-mutation-leftover-gap StopHoldsForQueued
+StopMessage stop-message-mutation-leftover-uncounted NoSilentLoss
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
 StopMessage stop-message-mutation-note-after-take IdleNoteHonest
