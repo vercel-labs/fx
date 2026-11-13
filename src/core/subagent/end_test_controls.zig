@@ -22,6 +22,14 @@
 //!   lands before it is installed drops the message that made it. An inline
 //!   test's hook is called after every end hook, with whether it installed a
 //!   next work.
+//! - `FX_TEST_SUBAGENT_SETTLE_HELD` and `FX_TEST_SUBAGENT_SETTLE_RELEASE` hold
+//!   the host after it has told the owner of a work's end and before it clears
+//!   the child's busy flag and settles a close (`holdBeforeSettle`). The owner
+//!   has been told by then and the child still counts as working, so a test
+//!   can start the owner's `wait` in that gap every time
+//!   (`tests/e2e/gateway-stream-lifecycle.test.ts` and
+//!   `tests/e2e/tui-host-switch.test.ts`, "a wait that starts as a subagent's
+//!   work ends with nothing to report still returns").
 //!
 //! `FX_TEST_SUBAGENT_USER_STOP` names a request file. While a slot is held at
 //! the run or next-work hold, the hold takes that file when it appears, which
@@ -42,6 +50,7 @@ const io_mod = @import("../shared/io.zig");
 var stopped_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_END_HELD", .release_env = "FX_TEST_SUBAGENT_END_RELEASE" };
 var run_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_RUN_HELD", .release_env = "FX_TEST_SUBAGENT_RUN_RELEASE" };
 var next_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_NEXT_HELD", .release_env = "FX_TEST_SUBAGENT_NEXT_RELEASE" };
+var settle_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_SETTLE_HELD", .release_env = "FX_TEST_SUBAGENT_SETTLE_RELEASE" };
 
 /// The host the user-stop control acts through.
 pub const UserStopHook = struct {
@@ -165,6 +174,31 @@ pub fn holdAfterEndHook(child_id: []const u8, next: bool) void {
     next_hold.wait(contents, null, .{ .context = child_id, .func = pollUserStop });
 }
 
+/// Test builds only: an inline test sets it to hold the host before it
+/// settles a child whose work ended, in place of the file controls.
+pub var test_settle_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Whether the host may be held before it settles an ended work, so it
+/// reads the controls only when a test asked.
+pub fn settleArmed() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_settle_hold != null;
+    return settle_hold.armed();
+}
+
+/// Called by the host for `child_id` once it has told the owner of a work's
+/// end, before it clears the child's busy flag.
+pub fn holdBeforeSettle(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_settle_hold) |hold| hold(child_id);
+        return;
+    }
+    var contents_buf: [256]u8 = undefined;
+    const contents = std.mem.print(&contents_buf, "settle child={s}", .{child_id}) catch return;
+    settle_hold.wait(contents, null, null);
+}
+
 test "a test build holds a stopped work's end only through its hook" {
     // Without a hook nothing is armed, a hold returns at once, and the file
     // controls are never read.
@@ -191,12 +225,13 @@ test "the end holds and the user-stop request ignore variables that are empty or
     defer user_stop_hook = null;
     for ([_][]const u8{ "relative/path", "./path", "" }) |value| {
         for ([_][]const u8{
-            "FX_TEST_SUBAGENT_END_HELD",  "FX_TEST_SUBAGENT_END_RELEASE",
-            "FX_TEST_SUBAGENT_RUN_HELD",  "FX_TEST_SUBAGENT_RUN_RELEASE",
-            "FX_TEST_SUBAGENT_NEXT_HELD", "FX_TEST_SUBAGENT_NEXT_RELEASE",
+            "FX_TEST_SUBAGENT_END_HELD",    "FX_TEST_SUBAGENT_END_RELEASE",
+            "FX_TEST_SUBAGENT_RUN_HELD",    "FX_TEST_SUBAGENT_RUN_RELEASE",
+            "FX_TEST_SUBAGENT_NEXT_HELD",   "FX_TEST_SUBAGENT_NEXT_RELEASE",
+            "FX_TEST_SUBAGENT_SETTLE_HELD", "FX_TEST_SUBAGENT_SETTLE_RELEASE",
             "FX_TEST_SUBAGENT_USER_STOP",
         }) |name| try environ.put(name, value);
-        for ([_]*file_hold.Hold{ &stopped_hold, &run_hold, &next_hold }) |hold| {
+        for ([_]*file_hold.Hold{ &stopped_hold, &run_hold, &next_hold, &settle_hold }) |hold| {
             try std.testing.expect(!hold.armed());
             hold.wait("child=none", null, .{ .context = "child", .func = pollUserStop });
             try std.testing.expectEqual(@as(u32, 0), hold.count.load(.seq_cst));
@@ -212,4 +247,21 @@ test "the end holds and the user-stop request ignore variables that are empty or
         pollUserStop("child");
         try std.testing.expectEqual(@as(u32, 0), Seen.stops);
     }
+}
+
+test "a test build holds the host before it settles an ended work only through its hook" {
+    // Without a hook nothing is armed, a hold returns at once, and the file
+    // controls are never read.
+    try std.testing.expect(!settleArmed());
+    holdBeforeSettle("child");
+    try std.testing.expectEqual(@as(u32, 0), settle_hold.count.load(.seq_cst));
+}
+
+test "a hold is armed only when both of its paths are absolute" {
+    try std.testing.expectEqualStrings("/tmp/held", file_hold.usablePath("/tmp/held").?);
+    try std.testing.expect(file_hold.usablePath(null) == null);
+    try std.testing.expect(file_hold.usablePath("held") == null);
+    try std.testing.expect(file_hold.usablePath("./held") == null);
+    try std.testing.expect(file_hold.usablePath("../release") == null);
+    try std.testing.expect(file_hold.usablePath("") == null);
 }
