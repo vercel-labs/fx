@@ -856,14 +856,24 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
-        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        self.markExplicitCancellation();
+        // The worker sets `worker_processing` under this lock as it takes and
+        // ends turns, so the trace reads it under the lock too.
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const processing = if (self.worker_processing) "true" else "false";
+        const queued = self.queuedWorkCountLocked();
+        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ processing, queued });
+        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ processing, queued });
+        self.markExplicitCancellationLocked();
     }
 
     fn markExplicitCancellation(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        self.markExplicitCancellationLocked();
+    }
+
+    fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
