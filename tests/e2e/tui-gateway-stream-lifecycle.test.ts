@@ -1721,16 +1721,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Move the project and rename it.");
-    await session.waitForText("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL).", TIMEOUT);
+    // The first empty reply shows the same stop line before fx asks the model
+    // to continue, so wait for the notice that ends the turn, however it wraps.
+    const failedTurn = "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.";
+    await session.waitForPane((pane) => pane.replace(/\s+/g, " ").includes(failedTurn), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(2);
     const scrollback = await session.captureFullScrollback();
     expect(scrollback).toContain("Asking it to continue.");
     expect(scrollback).not.toContain("Done.");
-    // The failed turn says what the user can do next, however the line wraps.
-    expect(scrollback.replace(/\s+/g, " ")).toContain(
-      "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.",
-    );
+    // The failed turn says what the user can do next.
+    expect(scrollback.replace(/\s+/g, " ")).toContain(failedTurn);
 
     await session.sendText("/trace");
     const report = await waitForNewTraceReport(root);
