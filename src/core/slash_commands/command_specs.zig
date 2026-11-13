@@ -753,6 +753,15 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     return nthSlashCompletion(registry, prefix, n);
 }
 
+/// Whether completion `n` is an app-supplied entry that still needs input,
+/// such as `/loop 1h` before its prompt. Submitting one can only fail, so
+/// Enter submits the typed text instead. Built-in commands that take
+/// arguments are not covered: Enter on `/ren` still picks `/rename`.
+pub fn nthSlashCompletionNeedsMoreInput(registry: SlashRegistry, prefix: []const u8, n: usize) bool {
+    const query = runtimeArgQuery(registry, prefix) orelse return false;
+    return (nthRuntimeArg(query, n) orelse return false).has_args;
+}
+
 /// Whether completion `n`, selected, draws its description selected too.
 pub fn nthSlashCompletionSelectsDescription(registry: SlashRegistry, prefix: []const u8, n: usize) bool {
     const query = runtimeArgQuery(registry, prefix) orelse return false;
@@ -2414,4 +2423,9 @@ test "app argument completions route each command to its own group" {
     try std.testing.expect(slashCompletionHasArgs(registry, "/loop 1h"));
     try std.testing.expect(slashCompletionHasArgs(registry, "/loop remove"));
     try std.testing.expect(!slashCompletionHasArgs(registry, "/loop remove 1"));
+    // Enter must not submit an app entry that still needs input, such as an
+    // interval without its prompt; a whole command it may submit.
+    try std.testing.expect(nthSlashCompletionNeedsMoreInput(registry, "/loop ", 0));
+    try std.testing.expect(!nthSlashCompletionNeedsMoreInput(registry, "/loop remove ", 0));
+    try std.testing.expect(!nthSlashCompletionNeedsMoreInput(registry, "/launch ", 0));
 }

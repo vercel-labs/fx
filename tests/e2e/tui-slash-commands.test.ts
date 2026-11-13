@@ -383,6 +383,13 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
 
       await session!.sendText("/loop");
       await session!.waitForText("No active loops. Start one with /loop <interval> <prompt>.", 5_000);
+      // Enter with the menu open after "/loop " lists loops; it does not
+      // submit the highlighted interval, which still needs a prompt.
+      await session!.sendLiteral("/loop ");
+      await session!.waitForText(/10m +run a prompt now, then every 10 minutes/, 5_000);
+      await session!.sendKeys("Enter");
+      await waitForCount("No active loops. Start one with /loop <interval> <prompt>.", 2, 5_000);
+      expect(await session!.captureFullScrollback()).not.toContain("Usage: /loop <interval> <prompt>");
       await session!.sendText("/loop 1h say LOOP_OK");
       await session!.waitForText("Loop 1 runs now, then every 1h until you remove it or fx exits: say LOOP_OK", 5_000);
       // The first run starts right away, not one interval later.

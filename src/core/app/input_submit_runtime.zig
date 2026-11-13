@@ -1890,6 +1890,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             const count = command_specs.slashCompletionCount(registry, text);
             if (count == 0) return text;
             const idx = selected_index % count;
+            if (command_specs.nthSlashCompletionNeedsMoreInput(registry, text, idx)) return text;
             return command_specs.nthSlashCompletion(registry, text, idx) orelse text;
         }
 
