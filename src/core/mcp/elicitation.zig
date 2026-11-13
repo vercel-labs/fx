@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const json_depth = @import("json_depth.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
 
@@ -623,6 +624,7 @@ pub fn parseRequest(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRequest;
+    json_depth.require(parsed.value, .form) catch return error.LimitExceeded;
 
     const mode_value = parsed.value.object.get("mode");
     const mode = parseMode(wire, mode_value);
@@ -2151,4 +2153,111 @@ test "elicitation request and response parsers stay bounded under fuzzed bytes" 
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
         }) ++ @import("fuzz_corpus").mcp_elicitation.*),
     });
+}
+
+// A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so a
+// form nested past 128 levels is refused (`src/core/mcp/json_depth.zig`).
+
+const depth_testing = @import("json_depth_testing.zig");
+
+fn expectFormRefused(params: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var request = parseRequest(alloc, .modern_mcp, params, .{}) catch |err| {
+        try std.testing.expectEqualStrings("LimitExceeded", @errorName(err));
+        return;
+    };
+    request.deinit(alloc);
+    return error.TestUnexpectedResult;
+}
+
+const depth_shapes = [_]depth_testing.Shape{ .objects, .arrays, .mixed };
+
+test "a form nested one level past the limit through _meta is refused whatever its shape" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const params = try depth_testing.elicitationMeta(alloc, depth, shape);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    };
+}
+
+test "a form nested 300 levels deep through _meta is refused and never reaches the ACP projection" {
+    const alloc = std.testing.allocator;
+    // The projection aborts on 257 levels or more: today this test fails at the first refusal it expects.
+    for ([_]usize{ 257, 300, 2000 }) |depth| {
+        const params = try depth_testing.elicitationMeta(alloc, depth, .objects);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    }
+}
+
+test "a form nested 127 and 128 levels deep through _meta is accepted and projected for ACP" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 4, 64, 127, 128 }) |depth| {
+        const params = try depth_testing.elicitationMeta(alloc, depth, shape);
+        defer alloc.free(params);
+        var request = try parseRequest(alloc, .modern_mcp, params, .{});
+        defer request.deinit(alloc);
+        const projected = try projectToAcpCreateParams(
+            alloc,
+            request,
+            .{ .session = .{ .session_id = "session", .tool_call_id = "tool" } },
+            null,
+            null,
+            .{},
+        );
+        defer alloc.free(projected);
+        try std.testing.expect(std.mem.find(u8, projected, "\"_meta\":") != null);
+    };
+}
+
+test "a requested schema nested past the limit is refused as nested too deep" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const params = try depth_testing.elicitationSchema(alloc, depth, shape);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    };
+}
+
+test "a requested schema nested 300 levels deep is refused and does not abort" {
+    const alloc = std.testing.allocator;
+    // Writing the schema again aborts when the schema is 257 levels deep or more: this test dies there today.
+    for ([_]usize{ 2000, 300, 258 }) |depth| {
+        const params = try depth_testing.elicitationSchema(alloc, depth, .objects);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    }
+}
+
+test "a requested schema within the limit is judged by the schema rules and not by the depth limit" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 4, 127, 128 }) |depth| {
+        const params = try depth_testing.elicitationSchema(alloc, depth, .objects);
+        defer alloc.free(params);
+        var request = parseRequest(alloc, .modern_mcp, params, .{}) catch |err| {
+            try std.testing.expect(!std.mem.eql(u8, @errorName(err), "LimitExceeded"));
+            continue;
+        };
+        request.deinit(alloc);
+    }
+}
+
+test "a form refused past the limit leaves one trace line with the code, the limit and the place, and no server text" {
+    const alloc = std.testing.allocator;
+    var capture = try depth_testing.TraceCapture.start(alloc);
+    defer capture.stop();
+    const params = try depth_testing.elicitationMeta(alloc, 129, .objects);
+    defer alloc.free(params);
+    try expectFormRefused(params);
+    var lines = try capture.lines("JSON refused");
+    defer {
+        for (lines.items) |line| alloc.free(line);
+        lines.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=form", lines.items[0]);
+    const trace = try capture.read();
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "Profile") == null);
 }

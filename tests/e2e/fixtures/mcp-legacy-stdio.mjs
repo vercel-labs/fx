@@ -302,6 +302,10 @@ function handle(message) {
   if (message.method === "notifications/initialized") return;
   if (message.method === "tools/list") {
     toolsListCalls += 1;
+    if (deepSite().startsWith("tool_")) {
+      sendDeepToolList(message);
+      return;
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,
@@ -406,6 +410,10 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/call") {
+    if (deepSite() !== "" && !deepSite().startsWith("tool_")) {
+      sendDeepResult(message);
+      return;
+    }
     if (mode === "invalid_params") {
       // A server built on the Go MCP SDK refuses arguments of the wrong type
       // with -32602, in its validator's words, then the tool's schema, as
@@ -520,3 +528,82 @@ process.stdin.on("data", (chunk) => {
     if (line.length > 0) handle(JSON.parse(line));
   }
 });
+
+// FX_MCP_DEEP_SITE nests JSON at one place, for the depth limit on a server's JSON. FX_MCP_DEEP_DEPTH is the
+// nesting depth of the root value fx checks (the result for the result sites, the tool object for the tool
+// sites), FX_MCP_DEEP_SHAPE is object (the default), array or mixed. Sites: structured, content_meta,
+// content_annotations, error_data, tool_meta, tool_annotations, tool_icons.
+function deepSite() {
+  return process.env.FX_MCP_DEEP_SITE ?? "";
+}
+
+/** A value with exactly `depth` containers inside one another, and 1 at the bottom. */
+function deepValue(depth, objectRoot) {
+  const shape = process.env.FX_MCP_DEEP_SHAPE ?? "object";
+  let text = "1";
+  for (let level = 1; level <= depth; level += 1) {
+    const fromRoot = depth - level;
+    const object = shape === "object" || (shape === "mixed" && fromRoot % 2 === 0) || (objectRoot && fromRoot === 0);
+    text = object ? `{"a":${text}}` : `[${text}]`;
+  }
+  return text;
+}
+
+function sendDeepText(message, replacements) {
+  let text = JSON.stringify(message);
+  for (const [marker, value] of Object.entries(replacements)) text = text.replace(`"${marker}"`, () => value);
+  if (process.env.FX_MCP_DEEP_FAULT === "cut") {
+    // The reply stops in the middle of the nesting, as a server that dies while writing it.
+    process.stdout.write(text.slice(0, Math.floor(text.length / 2)), () => process.exit(0));
+    return;
+  }
+  process.stdout.write(`${text}\n`);
+}
+
+function sendDeepToolList(message) {
+  const site = deepSite();
+  const depth = Number(process.env.FX_MCP_DEEP_DEPTH ?? "0");
+  const deep = {
+    name: "deep",
+    description: "A tool whose listing is nested deeper than fx accepts",
+    inputSchema: { type: "object", properties: { text: { type: "string" } } },
+  };
+  if (site === "tool_meta") deep._meta = "@@DEEP@@";
+  if (site === "tool_annotations") deep.annotations = { x: "@@DEEP@@" };
+  if (site === "tool_icons") deep.icons = [{ src: "https://example.test/icon.png", x: "@@DEEP@@" }];
+  // The tool object is one level, and the field's own wrapper levels come out of the depth.
+  const inner = site === "tool_meta" ? depth - 1 : site === "tool_annotations" ? depth - 2 : depth - 3;
+  const good = {
+    name: currentToolName,
+    description: "Echo text through the legacy MCP fixture",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+  };
+  sendDeepText({ jsonrpc: "2.0", id: message.id, result: { tools: [good, deep] } }, { "@@DEEP@@": deepValue(inner, site === "tool_meta") });
+}
+
+function sendDeepResult(message) {
+  const site = deepSite();
+  const depth = Number(process.env.FX_MCP_DEEP_DEPTH ?? "0");
+  if (site === "error_data") {
+    sendDeepText(
+      { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "bad", data: "@@DEEP@@" } },
+      { "@@DEEP@@": deepValue(depth, false) },
+    );
+    return;
+  }
+  const result = { content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }] };
+  let inner = depth;
+  if (site === "structured") {
+    result.structuredContent = "@@DEEP@@";
+    inner = depth - 1;
+  }
+  if (site === "content_meta") {
+    result.content[0]._meta = "@@DEEP@@";
+    inner = depth - 3;
+  }
+  if (site === "content_annotations") {
+    result.content[0].annotations = { x: "@@DEEP@@" };
+    inner = depth - 4;
+  }
+  sendDeepText({ jsonrpc: "2.0", id: message.id, result }, { "@@DEEP@@": deepValue(inner, site === "structured" || site === "content_meta") });
+}

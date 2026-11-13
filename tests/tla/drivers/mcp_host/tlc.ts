@@ -39,11 +39,14 @@ export interface TlcRun {
 export async function runTlc(opts: {
   outDir: string; label: string; module: string; cfgText: string;
   files?: Record<string, string>; extraArgs?: string[]; workers?: number; timeoutMs?: number;
+  /** The folder of the model, when it is not tests/tla/mcp_host/. */
+  specDir?: string;
 }): Promise<TlcRun> {
   const { java, jar } = tools();
   const work = join(opts.outDir, opts.label);
   mkdirSync(join(work, "tmp"), { recursive: true, mode: 0o700 });
-  for (const name of readdirSync(tlaDir)) if (/\.(tla|cfg)$/.test(name)) cpSync(join(tlaDir, name), join(work, name));
+  const specDir = opts.specDir ?? tlaDir;
+  for (const name of readdirSync(specDir)) if (/\.(tla|cfg)$/.test(name)) cpSync(join(specDir, name), join(work, name));
   for (const [name, text] of Object.entries(opts.files ?? {})) writeFileSync(join(work, name), text);
   const cfgName = `${opts.label}.run.cfg`;
   writeFileSync(join(work, cfgName), opts.cfgText);

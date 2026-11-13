@@ -5,6 +5,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const elicitation = @import("elicitation.zig");
+const json_depth = @import("json_depth.zig");
 const mcp_json = @import("mcp_json.zig");
 const mrtr = @import("mrtr.zig");
 const tools_feature = @import("features/tools.zig");
@@ -36,10 +37,10 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         .{},
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const raw = try alloc.print(
-            "MCP protocol failure: {s}",
-            .{@errorName(err)},
-        );
+        const raw = if (err == error.NestingTooDeep)
+            try alloc.print("MCP protocol failure: the server's reply is nested deeper than fx accepts ({d} levels)", .{json_depth.max_server_json_depth})
+        else
+            try alloc.print("MCP protocol failure: {s}", .{@errorName(err)});
         defer alloc.free(raw);
         return .{
             .model_output = try tool_result_limits.prepareModelOutput(
