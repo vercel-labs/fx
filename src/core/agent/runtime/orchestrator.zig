@@ -456,7 +456,8 @@ fn normalize_terminal_model_input(
 }
 
 /// Returns the top-level arguments of an exact {"request":{...}}
-/// read_tool_result call, or null to replay the call as it was sent.
+/// read_tool_result call, its wrapper an object or JSON text of one, or null
+/// to replay the call as it was sent.
 fn projected_read_tool_result_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -472,12 +473,12 @@ fn projected_read_tool_result_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.get("request") orelse return null;
-    if (request != .object) return null;
+    if (parsed.value.object.get("request") == null) return null;
+    const request = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request, .{}, &out.writer) catch
+    std.json.Stringify.value(std.json.Value{ .object = request }, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -1329,7 +1330,8 @@ fn project_read_tool_result_request_messages(
 }
 
 /// Returns the arguments a shell call is stored and admitted with: an exact
-/// {"request":{...}} unwrapped, and a missing action filled in when
+/// {"request":{...}} unwrapped, its wrapper an object or JSON text of one,
+/// and a missing action filled in when
 /// `infer_action` names exactly one. Null keeps the call as it was sent.
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
@@ -1345,13 +1347,10 @@ fn normalized_terminal_request_arguments(
     const arena = parsed.arena.allocator();
     var args = parsed.value;
     var changed = false;
-    if (args.object.count() == 1) {
-        if (args.object.get("request")) |request| {
-            if (request != .object) return null;
-            args = request;
-            _ = try normalize_terminal_model_input(arena, &args.object);
-            changed = true;
-        }
+    if (args.object.count() == 1 and args.object.get("request") != null) {
+        args = .{ .object = (try tool_args.unwrapRequest(arena, args.object)) orelse return null };
+        _ = try normalize_terminal_model_input(arena, &args.object);
+        changed = true;
     }
     if (infer_action) |infer| {
         if (infer(args.object)) |action| {
@@ -1682,7 +1681,8 @@ test "wrapped read_tool_result history replays with top-level arguments" {
         .{ .id = "flat", .name = "read_tool_result", .arguments_json = "{\"handle\":\"flat.bin\",\"start_byte\":1,\"byte_count\":160}" },
         .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
         .{ .id = "beside", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"a.bin\"},\"query\":\"b\"}" },
-        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"{}\"}" },
+        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"[1]\"}" },
+        .{ .id = "text", .name = "read_tool_result", .arguments_json = "{\"request\":\"{\\\"handle\\\":\\\"text.bin\\\",\\\"query\\\":\\\"needle\\\"}\"}" },
     };
     const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
 
@@ -1697,9 +1697,13 @@ test "wrapped read_tool_result history replays with top-level arguments" {
         "{\"handle\":\"new.bin\",\"query\":\"needle\"}",
         projected[0].tool_calls[1].arguments_json,
     );
-    // Only an exact wrapper around an object is unwrapped.
+    // Only an exact wrapper around an object, or JSON text of one, is unwrapped.
     try std.testing.expectEqual(calls[2].arguments_json.ptr, projected[0].tool_calls[2].arguments_json.ptr);
     try std.testing.expectEqual(calls[3].arguments_json.ptr, projected[0].tool_calls[3].arguments_json.ptr);
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"text.bin\",\"query\":\"needle\"}",
+        projected[0].tool_calls[4].arguments_json,
+    );
     try std.testing.expectEqualStrings(
         "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}",
         messages[0].tool_calls[1].arguments_json,
@@ -2169,6 +2173,93 @@ test "terminal request projection cleans every partial allocation failure" {
         check_terminal_request_projection_allocation_failures,
         .{},
     );
+}
+
+const max_fuzz_request_text_bytes: usize = 16 * 1024;
+
+fn fuzzRequestWrapperText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_request_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before request is read.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+    const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
+    const wrapped = try tool_args.unwrapRequest(arena, args);
+    const expected = if (wrapped) |object|
+        try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = object }, .{})
+    else
+        null;
+
+    // History replays read_tool_result with the arguments the wrapper holds,
+    // exactly when tool_args reads some.
+    const replayed = try projected_read_tool_result_arguments(alloc, args_json);
+    defer if (replayed) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, replayed == null);
+    if (expected) |json| try std.testing.expectEqualStrings(json, replayed.?);
+
+    // Shell intake unwraps the same wrappers.
+    const shell = try normalized_terminal_request_arguments(alloc, args_json, null);
+    defer if (shell) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, shell == null);
+}
+
+test "request wrappers sent as JSON text unwrap as tool_args reads them" {
+    try std.testing.fuzz({}, fuzzRequestWrapperText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"action\":\"run\",\"command\":\"printf ok\"}",
+            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}",
+            "{\"handle\":\"h.txt\",\"query\":\"needle\"}",
+            "{}",
+            "[1]",
+            "\"{\\\"action\\\":\\\"run\\\"}\"",
+            "{",
+        }) ++ @import("fuzz_corpus").request_wrapper_text.*),
+    });
+}
+
+test "terminal request normalization reads a wrapper written as JSON text" {
+    const alloc = std.testing.allocator;
+    const run = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"printf ok\\\"}\"}",
+        null,
+    )).?;
+    defer alloc.free(run);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", run);
+    // The write input is read from a text wrapper as from an object.
+    const write = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":\"{\\\"action\\\":\\\"write\\\",\\\"session_id\\\":\\\"terminal-a\\\",\\\"input\\\":{\\\"keys\\\":[\\\"enter\\\"]}}\"}",
+        null,
+    )).?;
+    defer alloc.free(write);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
+        write,
+    );
+
+    // Anything else is kept as it was sent: text of another kind, an object
+    // encoded twice, text nested deeper than tool input may be, and a wrapper
+    // beside other fields.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "{\"action\":\"run\",\"command\":\"true\"}", .{});
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |text| {
+        const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+        try std.testing.expect(try normalized_terminal_request_arguments(alloc, args_json, null) == null);
+    }
+    const beside = try std.json.Stringify.valueAlloc(arena, .{
+        .request = "{\"action\":\"run\",\"command\":\"true\"}",
+        .yield_time_ms = 1000,
+    }, .{});
+    try std.testing.expect(try normalized_terminal_request_arguments(alloc, beside, null) == null);
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {
