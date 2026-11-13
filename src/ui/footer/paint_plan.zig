@@ -24,6 +24,7 @@ const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
+const menu_frame = @import("menu_frame.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
@@ -869,57 +870,21 @@ pub fn composeFooterFrame(
                 picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
             if (count > 0) {
                 if (input.slash_menu_layout) |layout| {
-                    var row = rows.picker_start;
-                    if (layout.show_header) {
-                        var header = try picker_presentation.composeSlashMenuHeaderRow(alloc, slash_prefix, layout, shell.layout.cols);
-                        try pushFooterBandRow(alloc, &frame, plan, row, &header);
-                        row += 1;
-
-                        var gap: std.ArrayList(u8) = .empty;
-                        try pushFooterBandRow(alloc, &frame, plan, row, &gap);
-                        row += 1;
-                    }
-
-                    const column_widths = if (input.prepared_slash_menu) |prepared|
-                        picker_presentation.preparedSlashMenuColumnWidths(
-                            prepared,
-                            layout.window,
-                            ctx.input.slash_menu_categories,
-                        )
+                    const source: picker_presentation.SlashMenuFrame = if (input.prepared_slash_menu) |prepared|
+                        .{ .prepared = prepared, .include_metadata = ctx.input.slash_menu_categories }
                     else
-                        picker_presentation.mixedSlashMenuColumnWidths(
-                            ctx.slash_registry,
-                            slash_prefix,
-                            ctx.skills_menu.items,
-                            layout.window,
-                            ctx.input.slash_menu_categories,
-                        );
-                    var match_idx = layout.window.start;
-                    while (match_idx < layout.window.end) : (match_idx += 1) {
-                        var slash_row = if (input.prepared_slash_menu) |prepared|
-                            try picker_presentation.composePreparedSlashMenuOptionRow(
-                                alloc,
-                                prepared,
-                                match_idx,
-                                match_idx == layout.selected,
-                                column_widths,
-                                shell.layout.cols,
-                                ctx.input.slash_menu_categories,
-                            )
-                        else
-                            try picker_presentation.composeSlashMenuOptionRow(
-                                alloc,
-                                ctx.slash_registry,
-                                slash_prefix,
-                                ctx.skills_menu.items,
-                                match_idx,
-                                match_idx == layout.selected,
-                                column_widths,
-                                shell.layout.cols,
-                                ctx.input.slash_menu_categories,
-                            );
-                        try pushFooterBandRow(alloc, &frame, plan, row, &slash_row);
-                        row += 1;
+                        .{
+                            .registry = ctx.slash_registry,
+                            .prefix = slash_prefix,
+                            .skills = ctx.skills_menu.items,
+                            .include_metadata = ctx.input.slash_menu_categories,
+                        };
+                    const spec = source.spec(layout);
+                    const menu_layout = menu_frame.prepare(spec, shell.layout.cols, layout.row_count);
+                    var menu_row_index: u16 = 0;
+                    while (menu_row_index < layout.row_count) : (menu_row_index += 1) {
+                        var menu_row = try menu_frame.composePreparedRow(alloc, spec, menu_layout, menu_row_index);
+                        try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
                     }
                 } else {
                     const selected = input.picker_selection_index % count;

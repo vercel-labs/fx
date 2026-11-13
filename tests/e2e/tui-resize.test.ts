@@ -3170,8 +3170,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 40 · type to filter");
-      expect(shrinkStage).toContain("1–4");
+      expect(shrinkStage).toMatch(/^commands\s*$/m);
+      expect(shrinkStage).toContain("↓ 37 more");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
       await session.resizeWindow(120, 34, 250);
@@ -3183,7 +3183,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         10_000,
       );
       semanticMarkerRows(growStage, [beforeMarker]);
-      expect(growStage).toContain("1–6");
+      expect(growStage).toContain("↓ 35 more");
       writeFileSync(join(root, "scrollback-after-grow.txt"), growStage);
 
       await session.sendKeys("C-u");
