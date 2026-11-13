@@ -5397,6 +5397,103 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
+  test(
+    "Escape keeps a background command the model was polling when steering came",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-polled-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const backgroundPidPath = join(workspace, "polled-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const steering = "Check the config while that server runs.";
+      const hold: HoldState = { started: false, cancelled: false };
+      const steeringGateway = startFakeGateway([
+        // The model starts a server in the background itself, then waits on
+        // its output, and steering cuts that wait short.
+        fakeGatewayToolCall("polled_start_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 0,
+            timeout_ms: 600_000,
+            command: `printf %s $$ > ${JSON.stringify(backgroundPidPath)}; exec sleep 90`,
+          },
+        }),
+        fakeGatewayToolCall("polled_wait_tool", "shell", {
+          request: { action: "interact", session_id: "shell-1", yield_time_ms: 30_000 },
+        }),
+        () => heldGatewayResponse(hold),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-polled-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,shell",
+        },
+      });
+
+      let backgroundPid = 0;
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Start the server and watch it.");
+        await waitForCondition(
+          () => existsSync(backgroundPidPath) && readTrimmed(backgroundPidPath) !== "",
+          "background command pid",
+        );
+        backgroundPid = Number(readTrimmed(backgroundPidPath));
+        await waitForCondition(
+          () => /execution_start[^\n]*call_id=polled_wait_tool/.test(readFileSync(tracePath, "utf8")),
+          "interact poll start",
+        );
+        await session.sendText(steering);
+        await waitForCondition(
+          () => steeringGateway.requests.length === 3 && hold.started,
+          "steering request while the poll waits",
+        );
+        // Steering cut the poll short, so its result carries the notice.
+        expect(steeringGateway.requests[2]!.body).toContain("steering_notice");
+        await waitForCondition(() => isProcessAlive(backgroundPid), "background command alive before Escape");
+
+        await session.sendInterruptEscapePair(TIMEOUT);
+        await waitForCondition(() => hold.cancelled, "held steering request cancellation");
+        // The stop of steering-detached commands runs before this event.
+        await waitForCondition(
+          () => readFileSync(tracePath, "utf8").includes("finish_event_emitted"),
+          "interrupted turn finish",
+        );
+        await waitForCondition(
+          () => isProcessAlive(backgroundPid) &&
+            !readFileSync(tracePath, "utf8").includes("stopping steering-detached command"),
+          "background command kept after Escape",
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(session.isAlive()).toBe(true);
+        expect(session.isPaneAlive()).toBe(true);
+      } finally {
+        if (backgroundPid > 0 && isProcessAlive(backgroundPid)) process.kill(backgroundPid, "SIGKILL");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
   for (const tty of [false, true]) test(
     `Escape interrupts a running tool and starts pending steering without review with tty=${tty}`,
     async () => {
