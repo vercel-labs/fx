@@ -393,6 +393,7 @@ export type FakeGatewayModel = {
     type: string;
     [key: string]: unknown;
   }>;
+  fast_variant_of?: string;
 };
 
 export type FakeGatewayModelRequest = {

@@ -391,6 +391,9 @@ pub const ModelCatalogEntry = struct {
     context_window: u32 = 0,
     max_tokens: u32 = 0,
     web_search_price: ?[]u8 = null,
+    /// The id of the model whose Fast mode runs this one; null when the
+    /// catalog names none.
+    fast_variant_of: ?[]u8 = null,
 };
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
@@ -405,6 +408,7 @@ pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry)
     var reasoning_efforts = entry.reasoning_efforts;
     reasoning_efforts.deinit(alloc);
     if (entry.web_search_price) |price| alloc.free(price);
+    if (entry.fast_variant_of) |base| alloc.free(base);
 }
 
 /// Returns owned model id strings in catalog order; caller frees with `collections.freeStringList`.
@@ -456,10 +460,25 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .max_tokens = entry.max_tokens,
         .web_search_price = null,
     };
+    errdefer if (cloned.web_search_price) |price| alloc.free(price);
     if (entry.web_search_price) |price| {
         cloned.web_search_price = try alloc.dupe(u8, price);
     }
+    if (entry.fast_variant_of) |base| {
+        cloned.fast_variant_of = try alloc.dupe(u8, base);
+    }
     return cloned;
+}
+
+/// Whether the Models menu leaves `entry` out: the catalog says Fast mode on
+/// another model runs it, and that model is in `catalog` and offers Fast mode.
+/// The entry stays in the catalog, so a session that names it still runs.
+pub fn foldsIntoFastMode(entry: ModelCatalogEntry, catalog: []const ModelCatalogEntry) bool {
+    const base_id = entry.fast_variant_of orelse return false;
+    for (catalog) |candidate| {
+        if (std.mem.eql(u8, candidate.id, base_id)) return candidate.supports_fast_mode;
+    }
+    return false;
 }
 
 pub fn compareModelCatalogEntries(_: void, a: ModelCatalogEntry, b: ModelCatalogEntry) bool {
@@ -607,6 +626,8 @@ fn newestUnselectedPickerProviderCandidate(candidates: []const ModelCatalogEntry
 
 fn isPickerCandidate(candidate: ModelCatalogEntry) bool {
     if (text_utils.containsIgnoreCase(candidate.id, "claude-sonnet")) return false;
+    // A model that Fast mode on another model runs never takes a highlight slot.
+    if (candidate.fast_variant_of != null) return false;
     if (isGlmFastVariant(candidate.id)) return false;
 
     const excluded_variants = [_][]const u8{ "-mini", "-nano", "-oss", "-safeguard" };
@@ -1040,6 +1061,45 @@ test "picker curation skips fast variants in provider scan but keeps them select
     try std.testing.expectEqualStrings("zai/glm-5.2", curated.items[0].id);
     try std.testing.expectEqualStrings("zai/glm-5.1", curated.items[1].id);
     try std.testing.expectEqualStrings("zai/glm-5.2-fast", curated.items[2].id);
+}
+
+test "picker curation keeps a marked fast variant selectable without a highlight slot" {
+    const candidates = [_]ModelCatalogEntry{
+        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 100, .has_tool_use = true },
+        .{
+            .id = @constCast("moonshotai/kimi-k3-fast"),
+            .model_type = @constCast("language"),
+            .released = 100,
+            .has_tool_use = true,
+            .fast_variant_of = @constCast("moonshotai/kimi-k3"),
+        },
+        .{ .id = @constCast("moonshotai/kimi-k2"), .model_type = @constCast("language"), .released = 90, .has_tool_use = true },
+    };
+
+    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
+    defer freeModelCatalog(std.testing.allocator, &curated);
+
+    try std.testing.expectEqual(@as(usize, 3), curated.items.len);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3", curated.items[0].id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k2", curated.items[1].id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3-fast", curated.items[2].id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3", curated.items[2].fast_variant_of.?);
+}
+
+test "a fast variant folds into its base only when the base is listed and offers Fast mode" {
+    const catalog = [_]ModelCatalogEntry{
+        .{ .id = @constCast("anthropic/claude-opus-5"), .model_type = @constCast("language"), .supports_fast_mode = true },
+        .{ .id = @constCast("anthropic/claude-opus-5-fast"), .model_type = @constCast("language"), .fast_variant_of = @constCast("anthropic/claude-opus-5") },
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+        .{ .id = @constCast("provider/plain-fast"), .model_type = @constCast("language"), .fast_variant_of = @constCast("provider/plain") },
+        .{ .id = @constCast("provider/orphan-fast"), .model_type = @constCast("language"), .fast_variant_of = @constCast("provider/orphan") },
+        .{ .id = @constCast("provider/unmarked-fast"), .model_type = @constCast("language") },
+    };
+
+    const expected = [_]bool{ false, true, false, false, false, false };
+    for (catalog, expected) |entry, folds| {
+        try std.testing.expectEqual(folds, foldsIntoFastMode(entry, &catalog));
+    }
 }
 
 test "projectModelIds preserves order and returns owned copies" {

@@ -1188,6 +1188,8 @@ fn hydrateMenuSnapshot(
     try items.ensureTotalCapacity(alloc, catalog.len);
 
     for (catalog) |entry| {
+        // Fast mode on the base model's row already selects this model.
+        if (model_catalog.foldsIntoFastMode(entry, catalog)) continue;
         const item = item: {
             const id = try alloc.dupe(u8, entry.id);
             errdefer alloc.free(id);
@@ -2237,6 +2239,39 @@ test "model menu owns resolved catalog state and filters without changing catalo
     const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings("standalone", selected);
+}
+
+test "model menu leaves out a fast variant that Fast mode on a listed model runs" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("anthropic/claude-opus-5"), .model_type = @constCast("language"), .supports_fast_mode = true },
+        .{
+            .id = @constCast("anthropic/claude-opus-5-fast"),
+            .model_type = @constCast("language"),
+            .fast_variant_of = @constCast("anthropic/claude-opus-5"),
+        },
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+        .{
+            .id = @constCast("provider/plain-fast"),
+            .model_type = @constCast("language"),
+            .fast_variant_of = @constCast("provider/plain"),
+        },
+    };
+    runtime.state = .ready;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    runtime.menu.active = true;
+
+    // `provider/plain` has no Fast mode, so its variant is the only way to run fast.
+    try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("anthropic/claude-opus-5", runtime.menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("provider/plain", runtime.menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("provider/plain-fast", runtime.menu.itemAt(2).?.id);
+
+    // A session that names the left-out model still finds it in the catalog.
+    try std.testing.expect(findCatalogModel(&entries, "anthropic/claude-opus-5-fast") != null);
 }
 
 test "model menu ranks fuzzy matches below verbatim ones and keeps the selection" {
