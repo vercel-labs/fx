@@ -2,7 +2,7 @@
 
 libfx is the agent from [fx](https://github.com/vercel-labs/fx), the open source coding agent from Vercel Labs, as a JavaScript library. You give it a model, instructions and your own tools, and it runs the conversation: the model loop, streaming, tool calls, retries, steering and images. It's the same Zig engine that runs fx in a terminal, built as a Node.js addon and as WebAssembly.
 
-The hard part of running an agent on a server is that the server goes away. A function reaches its time limit in the middle of a reply, a deploy replaces the process, or it crashes during a tool call. libfx stores every prompt before it accepts it and every step of a turn as the turn runs, so the next process that picks up the session continues the turn where it stopped. On Vercel, that takes one route and one line of `vercel.json`.
+The hard part of running an agent on a server is that the server goes away. A function reaches its time limit in the middle of a reply, a deploy replaces the process, or it crashes during a tool call. libfx stores every prompt before it accepts it and every step of a turn as the turn runs, so the next process that picks up the session continues the turn where it stopped. On Vercel, sessions continue through a queue route configured in `vercel.json`.
 
 ```sh
 npm install libfx
@@ -163,19 +163,41 @@ export const POST = wakeHandler();
 
 The route delivers each turn to the agent it belongs to, so one route serves every agent the module it imports creates. With one agent, `agent.wakeHandler()` does the same.
 
-Then subscribe it to libfx's topic in `vercel.json`:
+For dashboard replay, create a second route that exports the same handler:
+
+```js
+// app/api/libfx-replay/route.js
+export { POST } from "../libfx/route.js";
+```
+
+Vercel permits one queue trigger of this type per route. Subscribe the routes to
+the session and Workflow replay topics in `vercel.json`:
 
 ```json
 {
   "functions": {
     "app/api/libfx/route.js": {
       "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "__libfx_wkf_workflow_session", "retryAfterSeconds": 5 }]
+    },
+    "app/api/libfx-replay/route.js": {
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "__wkf_workflow_libfx-session", "retryAfterSeconds": 5 }]
     }
   }
 }
 ```
 
-The trigger makes the route private: it has no public URL, and only Vercel Queues can call it. Keep `wakeHandler()` on that route only. An app whose own World queues to a route the internet can reach must check that each request comes from its queue before it calls `wakeHandler()`. libfx runs only inputs its sessions already stored, but a forged request can still wake a session.
+The triggers make the route private: it has no public URL, and only Vercel Queues can call it. Keep `wakeHandler()` on that route only. An app whose own World queues to a route the internet can reach must check that each request comes from its queue before it calls `wakeHandler()`. libfx runs only inputs its sessions already stored, but a forged request can still wake a session.
+
+New sessions store their run arguments with Workflow's serializer. Replaying a
+run from the Workflow dashboard creates a fresh session and runs the source
+session's first saved prompt again, with its saved context, settings, and images.
+Later prompts, steers, cancellations, checkpoints, and tool results are not
+copied. Tools can run again, as they do for other Workflow replays. The source
+session must still exist, and the target deployment must create the same named
+agent. Sessions created by older libfx versions with raw JSON run inputs cannot
+be replayed through the dashboard; start a new session from your application.
+For an Eve deployment, subscribe the replay trigger to
+`__eve_wkf_workflow_libfx-session` instead.
 
 That's all. When no other invocation holds the session, `prompt()` runs the turn in the request that called it, so the first model request goes out without a queue hop, and the function stays alive for the turn after the route responds. Vercel Queues keeps the prompt until after that request's time limit, and if the request dies mid-turn, that delivery continues the turn. Other turns go through Vercel Queues to this route:
 

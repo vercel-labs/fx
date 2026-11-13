@@ -1131,6 +1131,7 @@ function recordingAgent(durability, { refuseFirst = false } = {}) {
     harness: () => {
       const base = scriptedHarness()();
       return {
+        settings: ({ model }) => model === undefined ? undefined : { model },
         open: async (options) => {
           const session = await base.open(options);
           return {
@@ -3875,6 +3876,101 @@ if (durabilityKind === "queue") {
     const lines = await readLines(second.session(session.id).stream(0), 32);
     assert.equal(lines.filter((line) => line.type === "turn_end").length, 1, "the turn ended once");
     for (const closing of [first, second]) await closing.close();
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("Workflow replay rejects a descriptor for another store, agent, or source before opening a harness", async () => {
+    const { workflowCodec } = await import("../durable/workflow.mjs");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-replay-validation-"));
+    dirs.push(dir);
+    const { durability } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
+    const stored = durability.world();
+    const createHandler = stored.createQueueHandler;
+    let deliver;
+    stored.createQueueHandler = (prefix, handler) => {
+      deliver ??= handler;
+      return createHandler(prefix, handler);
+    };
+    const agent = createAgent({ durability });
+    try {
+      const original = agent.session();
+      await original.prompt("private", { messageId: "private-prompt" }).result;
+      const source = await stored.runs.get(original.id, { resolveData: "all" });
+      const [descriptor] = await workflowCodec.decode(source, stored);
+      const target = await agent.newSessionId();
+      const get = stored.runs.get;
+      const before = opened.count;
+      for (const overrides of [
+        { libfx: 0 },
+        { store: "another-customer" },
+        { agent: "missing-agent" },
+        { sourceRunId: target },
+        { sourceRunId: "invalid" },
+      ]) {
+        const input = await workflowCodec.encode([{ ...descriptor, ...overrides }], target);
+        stored.runs.get = (runId, options) => runId === target
+          ? Promise.resolve({ ...source, runId: target, input, executionContext: { replayedFromRunId: original.id } })
+          : get(runId, options);
+        await assert.rejects(deliver({ runId: target }, { messageId: "invalid-replay", attempt: 1 }));
+      }
+      stored.runs.get = get;
+      assert.equal(opened.count, before, "no rejected replay opened a harness");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("Workflow dashboard replay runs a saved prompt in a fresh session on the same or latest deployment", async () => {
+    const { workflowCodec } = await import("../durable/workflow.mjs");
+    const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-workflow-replay-"));
+    dirs.push(dir);
+    const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
+    const stored = durability.world();
+    const { agent, seen } = recordingAgent(durability);
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const until = async (check, message) => {
+      const deadline = Date.now() + 10_000;
+      while (!await check()) {
+        if (Date.now() > deadline) throw new Error(message);
+        await sleep(20);
+      }
+    };
+    try {
+      const original = agent.session(undefined, { context: { customer: "fixture" }, model: "fixture/model" });
+      const input = [{ type: "text", text: "replay" }, image];
+      assert.equal((await textOf(original.prompt(input, { messageId: "replay-first" }))).result.stopReason, "end_turn");
+      await original.prompt("later prompt", { messageId: "replay-later" }).result;
+      const saved = await stored.runs.get(original.id, { resolveData: "all" });
+      assert.deepEqual(await workflowCodec.decode(saved, stored), [{ libfx: 1, sourceRunId: original.id, agent: "default", store: "queue" }]);
+      await cancelRun(stored, original.id);
+      for (const deploymentId of [undefined, "dpl_latest"]) {
+        const replayed = await recreateRunFromExisting(stored, original.id, { ...(deploymentId ? { deploymentId } : {}), specVersion: saved.specVersion });
+        await until(async () => (await (await internals.openLog(replayed)).read()).some(({ entry }) => entry.k === "record" && entry.marks?.some((mark) => mark.end)), "replayed prompt did not execute");
+        const lines = await readLines(agent.session(replayed).stream(0), 5);
+        assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join("").trim(), "image-0 image-1 image-2");
+        assert.deepEqual(seen.at(-1), input, "the first saved prompt's image bytes reached the harness");
+        const log = await internals.openLog(replayed);
+        const inputs = (await log.read()).filter(({ entry }) => entry.k === "input" && entry.type === "prompt");
+        assert.equal(inputs.length, 1, "later prompts are not copied");
+        assert.deepEqual(inputs[0].entry.context, { customer: "fixture" });
+        assert.equal(inputs[0].entry.settings.model, "fixture/model");
+        const run = await stored.runs.get(replayed, { resolveData: "all" });
+        assert.equal(run.executionContext.replayedFromRunId, original.id);
+        if (deploymentId) assert.equal(run.deploymentId, deploymentId);
+        // A duplicate Workflow delivery must not execute the prompt again.
+        const delivery = broker.sent.find((message) => message.payload.runId === replayed && !message.payload.input);
+        const before = ran.length;
+        broker.adopt(delivery);
+        await sleep(100);
+        assert.equal(ran.length, before);
+      }
+    } finally {
+      await agent.close();
+    }
   });
 }
 

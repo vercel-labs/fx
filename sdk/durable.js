@@ -949,6 +949,8 @@ function claimName(name, member) {
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
   const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
+  const workflowCodec = durability[Symbol.for("libfx.workflowCodec")];
+  let listeningAgent = defaultAgentName;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -1014,6 +1016,18 @@ function createWorldBackend(world, durability) {
   // message names, on the store it names, whichever agent's route it is. A
   // message from before stores were named is for this World's store.
   const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
+    if (workflowCodec && !message?.input && typeof message?.runId === "string") {
+      // Read the stored arguments, never an input supplied by a delivery.
+      const run = await world.runs.get(message.runId, { resolveData: "all" });
+      const args = await workflowCodec.decode(run, world);
+      const descriptor = args?.[0];
+      if (run.workflowName !== "libfx/session" || !Array.isArray(args) || args.length !== 1 || descriptor?.libfx !== 1 || descriptor.store !== store || !validId(descriptor.agent)) {
+        throw new Error("invalid libfx Workflow replay arguments");
+      }
+      const agent = await agentOnStore(descriptor.agent, descriptor.store);
+      if (!agent) throw noAgentNamed(descriptor.agent);
+      return agent.replayHere(run, descriptor, meta);
+    }
     const named = agentOf(message?.input);
     const agent = await agentOnStore(named, typeof message?.input?.store === "string" ? message.input.store : store);
     if (!agent) throw noAgentNamed(named);
@@ -1124,7 +1138,13 @@ function createWorldBackend(world, durability) {
           const slot = slotWritten(await world.events.create(runId, {
             eventType: "run_created",
             ...spec,
-            eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}") },
+            eventData: {
+              deploymentId,
+              workflowName: "libfx/session",
+              input: workflowCodec
+                ? await workflowCodec.encode([{ libfx: 1, sourceRunId: runId, agent: listeningAgent, store }], runId)
+                : encoder.encode("{}"),
+            },
           }));
           made = slot === firstEventSlot;
           passOver(slot);
@@ -1446,8 +1466,40 @@ function createWorldBackend(world, durability) {
     viaRoute: route,
     // Delivers a routed message to this backend's agent.
     deliverHere: (message, meta) => deliverTo(handler, message, meta),
+    async replayHere(run, descriptor, meta) {
+      if (!workflowCodec || !backend.validSessionId(descriptor.sourceRunId) || descriptor.sourceRunId === run.runId || !backend.validSessionId(run.executionContext?.replayedFromRunId)) {
+        throw new Error("invalid libfx Workflow replay source");
+      }
+      // The parent and source must agree with the saved descriptor, on this
+      // store. A delivery cannot choose another session or another agent.
+      for (const runId of new Set([descriptor.sourceRunId, run.executionContext.replayedFromRunId])) {
+        const source = await world.runs.get(runId, { resolveData: "all" });
+        const args = await workflowCodec.decode(source, world);
+        const saved = args?.[0];
+        if (source.workflowName !== "libfx/session" || !Array.isArray(args) || args.length !== 1 || saved?.libfx !== 1 || saved.sourceRunId !== descriptor.sourceRunId || saved.agent !== descriptor.agent || saved.store !== store) {
+          throw new Error("libfx Workflow replay source does not match its saved arguments");
+        }
+      }
+      const source = await backend.session(descriptor.sourceRunId);
+      const entries = await source.readSince("0");
+      const first = entries.find(({ entry }) => entry.k === "input" && entry.type === "prompt")?.entry;
+      if (!first || agentOf(first) !== descriptor.agent) throw new Error("libfx Workflow replay has no saved prompt for this agent");
+      const log = await backend.session(run.runId);
+      // Image bytes precede the admitted input, as they do for prompt().
+      for (const block of Array.isArray(first.input) ? first.input : []) {
+        const image = block?.type === "image" ? block.data?.sha256 : undefined;
+        if (typeof image !== "string") continue;
+        const bytes = await source.images.get(image);
+        if (!bytes) throw new Error("libfx Workflow replay is missing a saved image");
+        await log.images.put(image, bytes);
+      }
+      const message = { ...first, sessionId: run.runId, store };
+      for (const entry of messageEntries(foldSessionLog(await log.read()), message)) await log.append(entry);
+      return deliverTo(handler, { input: message }, meta);
+    },
     listen(fn, name = defaultAgentName) {
       handler = fn;
+      listeningAgent = name;
       if (route) return () => { if (handler === fn) handler = null; };
       // The agents on this World, by name: an agent's copies take the
       // deliveries for its name in turn. A name none of them has goes to an
@@ -1467,6 +1519,7 @@ function createWorldBackend(world, durability) {
           if (listeners.size === 0) return deliverTo(null, message, meta);
           throw noAgentNamed(named);
         }));
+        if (workflowCodec) world.registerHandler("__wkf_workflow_libfx/session", queueHandler);
       }
       const group = joinGroup(listeners, name, fn);
       return () => {
