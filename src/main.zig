@@ -6394,6 +6394,34 @@ test "the agent list says failed or stopped on a subagent row whose last turn en
     try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(app), "failing"));
 }
 
+test "a subagent's record in /trace says failed or stopped as its row does" {
+    const alloc = std.testing.allocator;
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const runtime = App.AgentsAppRuntime;
+    const failing = try addTestChildAgent(app, "failing");
+    const stopping = try addTestChildAgent(app, "stopping");
+    const fine = try addTestChildAgent(app, "fine");
+    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 1, .outcome = .failed });
+    runtime.noteChildTurnFinished(app, &stopping.agent, .{ .turn_id = 1, .outcome = .interrupted });
+    runtime.noteChildTurnFinished(app, &fine.agent, .{ .turn_id = 1, .outcome = .completed });
+    try runtime.openMenu(app);
+    const list = runtime.menuProjection(app);
+
+    var rows: std.ArrayList(app_agents_runtime.TraceRow) = .empty;
+    defer rows.deinit(alloc);
+    try runtime.traceRows(app, alloc, &rows);
+    defer for (rows.items) |row| if (row.status.len > 0) alloc.free(row.status);
+    try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+    // The record and the list say the same of each subagent.
+    for (rows.items) |row| try std.testing.expectEqualStrings(try menuRowState(list, row.id), row.state);
+    try std.testing.expectEqualStrings("failed", rows.items[0].state);
+    try std.testing.expectEqualStrings("stopped", rows.items[1].state);
+    try std.testing.expectEqualStrings("idle", rows.items[2].state);
+}
+
 test "an instance's row keeps its states whatever its turns did" {
     var fixture: EndsFixture = undefined;
     try fixture.init();
