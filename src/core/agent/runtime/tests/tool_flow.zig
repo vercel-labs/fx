@@ -33,6 +33,7 @@ const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
+const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
 const test_support = @import("support.zig");
@@ -7481,6 +7482,83 @@ test "a subagent's always approval of a file change stores the session grant" {
 
 test "a subagent's always approval of a command stores the session grant" {
     try expectChildAlwaysStoresGrant(.command);
+}
+
+/// What a subagent's approval of a call that reads an image kept, as the turn
+/// reported it. The call's authority is the one for image paths, which stores
+/// its grants in a branch of its own.
+const VisionApprovalGrants = struct {
+    executed: usize,
+    propagated: usize,
+    events: usize,
+    covers_image: bool,
+};
+
+fn visionApproval(decision: types.ToolPermissionDecision, live: bool) !VisionApprovalGrants {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "photo.png",
+        .data = "\x89PNG\r\n\x1a\nimage bytes",
+    });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "photo.png");
+    defer alloc.free(image_path);
+
+    const calls = [_]ToolCall{toolCall(
+        "child_call",
+        "vision",
+        "{\"paths\":[\"photo.png\"],\"focus\":\"read the image\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    hooks.permission_decisions = &.{decision};
+    var authority = AskingChildAuthority{ .tool = "vision" };
+    if (live) hooks.live_tool_authority = .{ .context = &authority, .resolve_fn = AskingChildAuthority.resolve };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.model = @constCast("zai/glm-5.2");
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    return .{
+        .executed = hooks.executed_names.items.len,
+        .propagated = hooks.propagated_grants.items.len,
+        .events = hooks.event_grants.items.len,
+        .covers_image = permissions.sessionGrantAllowed(hooks.propagated_grants.items, "vision", image_path),
+    };
+}
+
+test "a subagent's always approval of an image path stores the session grant" {
+    const child = try visionApproval(.always, true);
+    try std.testing.expectEqual(@as(usize, 1), child.executed);
+    try std.testing.expect(child.propagated > 0);
+    try std.testing.expectEqual(child.propagated, child.events);
+    try std.testing.expect(child.covers_image);
+
+    // The same call from a turn with no live authority, which main's is.
+    const main = try visionApproval(.always, false);
+    try std.testing.expectEqual(main.propagated, child.propagated);
+    try std.testing.expectEqual(main.events, child.events);
+    try std.testing.expect(main.covers_image);
+}
+
+test "a subagent's one-time approval of an image path stores no session grant" {
+    const child = try visionApproval(.once, true);
+    try std.testing.expectEqual(@as(usize, 1), child.executed);
+    try std.testing.expectEqual(@as(usize, 0), child.propagated);
+    try std.testing.expectEqual(@as(usize, 0), child.events);
+    try std.testing.expect(!child.covers_image);
 }
 
 test "a subagent's one-time approval stores no session grant" {

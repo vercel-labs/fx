@@ -233,8 +233,10 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Frees `agent`'s session approvals when the agent goes. Its
-        /// worker has stopped, so nothing else reads them.
+        /// Frees `agent`'s session approvals when the agent goes. It takes no
+        /// lock: the agent's worker and the worker of every subagent in its
+        /// tree have been joined first, as `closeTree` and `shutdownChildren`
+        /// do before they free the agent, so nothing else reads or writes them.
         pub fn deinitSessionGrants(app: *App, agent: *AppAgent) void {
             if (comptime !per_instance) return;
             permissions.clearAllowedTools(app.alloc, &agent.session_grants);
