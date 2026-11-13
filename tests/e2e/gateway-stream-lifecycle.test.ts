@@ -7942,6 +7942,44 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 40_000);
 
+  test("a subagent message whose request wrapper the model wrote as JSON text reaches the worker", async () => {
+    const root = createFixtureRoot("subagent-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const childBodies: string[] = [];
+    let sentBody = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childBodies.push(body);
+        return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
+      }
+      if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
+      if (body.includes("text-delegate")) {
+        sentBody = body;
+        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+      }
+      return fakeGatewayToolCall("text-delegate", "subagent", {
+        request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
+      });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Start a worker with a wrapped request."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(toolResultOutput(sentBody, "text-delegate")).not.toContain("request must be an object");
+      expect(childBodies.some((body) => body.includes("TEXT_WRAPPED_TASK"))).toBe(true);
+      // Intake keeps the call with its top-level arguments, as it does for an
+      // object wrapper, so the history and the review see the real action.
+      const call = (gatewayRequest(sentBody).prompt.flatMap((message) =>
+        Array.isArray(message.content) ? message.content : []
+      ) as Array<Record<string, unknown>>).find((part) => part.type === "tool-call" && part.toolCallId === "text-delegate");
+      expect(call?.input).toEqual({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   test("a shell request wrapper as JSON text with extra fields or nested too deep gets the correction", async () => {
     const root = createFixtureRoot("shell-request-text-correction");
     const tracePath = join(root.root, "trace.log");

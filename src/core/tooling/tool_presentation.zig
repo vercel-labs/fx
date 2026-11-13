@@ -64,10 +64,7 @@ pub fn subagentAction(
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
-    const args = if (outer.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return null,
-    } else outer;
+    const args = (try tool_args.unwrapRequest(scratch, outer)) orelse return null;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     // Every other action says what it does to whom, with nothing to preview.
     if (action_words.get(action)) |words| {
@@ -152,14 +149,12 @@ pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?Subagen
     if (!std.mem.eql(u8, call.name, "subagent")) return null;
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
-    const outer = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch |err| return switch (err) {
+    const scratch = scratch_state.allocator();
+    const outer = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
-    const args = if (outer.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return null,
-    } else outer;
+    const args = (try tool_args.unwrapRequest(scratch, outer)) orelse return null;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     if (std.mem.eql(u8, action, "wait")) return .working;
     if (std.mem.eql(u8, action, "status") and tool_args.optionalStringArg(args, "agent") == null) return .open;
@@ -321,6 +316,8 @@ test "only a wait and a status that names no agent concern every subagent" {
     const cases = [_]struct { name: []const u8 = "subagent", args: []const u8, roster: ?SubagentRoster }{
         .{ .args = "{\"action\":\"wait\"}", .roster = .working },
         .{ .args = "{\"request\":{\"action\":\"wait\",\"agent\":\"tester\"}}", .roster = .working },
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}", .roster = .working },
+        .{ .args = "{\"request\":\"[1]\"}", .roster = null },
         .{ .args = "{\"action\":\"status\"}", .roster = .open },
         .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .roster = null },
         .{ .args = "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"hi\"}", .roster = null },
@@ -441,6 +438,7 @@ test "subagent rows project request identity state and bounded safe previews" {
     const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8, detail: []const u8 }{
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "reviewer working", .detail = "· Check cancellation cleanup" },
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "sent to reviewer", .detail = "· Check replay" },
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"Check text\\\"}\"}", .state = .active, .label = "reviewer working", .detail = "· Check text" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied reviewer", .detail = "· Check again" },
@@ -463,7 +461,7 @@ test "subagent rows project request identity state and bounded safe previews" {
         try std.testing.expectEqualStrings(case.label, action.label);
         try std.testing.expectEqualStrings(case.detail, action.detail);
     }
-    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"request\":\"[1]\"}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
         try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
     }
     const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;
