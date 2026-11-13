@@ -1162,6 +1162,7 @@ pub const Runtime = struct {
                 .closing = self.closingIndexLocked(end.child_id) != null,
                 .waiting = self.hasPendingLocked(end.child_id),
                 .turn_waiting = self.inTurnWorkLocked(end.child_id),
+                .unusable = if (end.failure) |*failure| std.mem.startsWith(u8, failure.view(), managed_owner.profile_unavailable_code) else false,
             };
             var lock = self.managed.state_store.acquireLock();
             defer lock.release();
@@ -3899,9 +3900,12 @@ const IdleFacts = struct {
     turn_waiting: bool = false,
     /// The child is still in the registry.
     open: bool = false,
+    /// Every later message to the child fails the same way, as when its
+    /// profile cannot be loaded, so there is nothing to keep it for.
+    unusable: bool = false,
 
     fn idle(self: IdleFacts) bool {
-        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting;
+        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting and !self.unusable;
     }
 };
 
@@ -3913,6 +3917,7 @@ test "a child is idle after its report only when nothing starts its next turn or
     try std.testing.expect(!(IdleFacts{ .open = true, .closing = true }).idle());
     try std.testing.expect(!(IdleFacts{ .open = true, .waiting = true }).idle());
     try std.testing.expect(!(IdleFacts{ .open = true, .turn_waiting = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .unusable = true }).idle());
 }
 
 /// An idle subagent a new subagent's start names, with what it is for.

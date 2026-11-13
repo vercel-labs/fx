@@ -3064,11 +3064,13 @@ test("a named subagent keeps its id, history and instructions across fx ask runs
   }
 }, TIMEOUT * 3);
 
-/// Saves agent profile `name` the way a repository does, in its `.fx/agents`.
-function writeRepositoryProfile(repository: string, name: string, profile: object) {
-  const dir = join(repository, ".fx", "agents", name);
+/// Saves agent profile `name` in the `.fx/agents` of `folder`, which is a
+/// repository, or the fx home's parent for a profile of the user's own.
+function writeRepositoryProfile(folder: string, name: string, profile: object, prompt?: string) {
+  const dir = join(folder, ".fx", "agents", name);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
+  if (prompt !== undefined) writeFileSync(join(dir, "prompt.md"), prompt);
 }
 
 /// `fx ask` run in `cwd`, such as another repository than the fixture's.
@@ -3129,9 +3131,9 @@ test("a subagent keeps the tools its profile gave it when its session is resumed
   const fixture = createFixture("fx-v2-subagent-profile-moved-");
   const other = join(fixture.root, "other");
   mkdirSync(other);
-  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] });
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] }, "PROMPT_FROM_REPOSITORY_A");
   // The other repository has a profile of the same name that gives other tools.
-  writeRepositoryProfile(other, "reviewer", { description: "Searches files", tools: ["glob_files"] });
+  writeRepositoryProfile(other, "reviewer", { description: "Searches files", tools: ["glob_files"] }, "PROMPT_FROM_REPOSITORY_B");
   const round = { n: 1 as 1 | 2 };
   const childBodies: string[] = [];
   const gateway = reviewerGateway(round, childBodies, []);
@@ -3151,6 +3153,11 @@ test("a subagent keeps the tools its profile gave it when its session is resumed
     // profile of its name gives.
     expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
     expect(childBodies[1]).toContain("Review round one.");
+    // The prompt is not saved. A repository profile's prompt is read from the
+    // repository fx runs in, by the profile's name.
+    expect(childBodies[0]).toContain("PROMPT_FROM_REPOSITORY_A");
+    expect(childBodies[1]).toContain("PROMPT_FROM_REPOSITORY_B");
+    expect(childBodies[1]).not.toContain("PROMPT_FROM_REPOSITORY_A");
     // The parent's log keeps what the profile set, on each of the child's spawns.
     const lines = childLines(fixture.home, id).filter((line) => line.kind === "child_spawned");
     expect(lines).toHaveLength(2);
@@ -3158,6 +3165,36 @@ test("a subagent keeps the tools its profile gave it when its session is resumed
       expect(line.data.profile).toBe("reviewer");
       expect(line.data.started_with).toEqual({ v: 1, from: "project", tools: ["read_file"] });
     }
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a user's profile of the same name takes neither the prompt a subagent started with in a repository, nor its tools", async () => {
+  const fixture = createFixture("fx-v2-subagent-profile-shadowed-");
+  writeRepositoryProfile(fixture.workspace, "reviewer", { description: "Reads files", tools: ["read_file"] }, "PROMPT_FROM_REPOSITORY");
+  const round = { n: 1 as 1 | 2 };
+  const childBodies: string[] = [];
+  const gateway = reviewerGateway(round, childBodies, []);
+  try {
+    const first = await askIn(fixture, gateway, fixture.workspace, ["First review."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    expect(childBodies[0]).toContain("PROMPT_FROM_REPOSITORY");
+    // The user then saves a profile of the same name, which a lookup by name
+    // finds before the repository's.
+    writeRepositoryProfile(fixture.home, "reviewer", { description: "Searches files", tools: ["glob_files"] }, "PROMPT_FROM_HOME");
+    round.n = 2;
+    const second = await askIn(fixture, gateway, fixture.workspace, ["--resume", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+
+    expect(childBodies).toHaveLength(2);
+    expect(offeredTools(childBodies[1]!)).toEqual(offeredTools(childBodies[0]!));
+    expect(childBodies[1]).toContain("PROMPT_FROM_REPOSITORY");
+    expect(childBodies[1]).not.toContain("PROMPT_FROM_HOME");
     expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
@@ -3228,6 +3265,10 @@ test("a subagent an earlier fx saved with only its profile's name fails with the
     expect(reports[1]).toContain("profile_unavailable");
     expect(reports[1]).toContain("no profile named 'reviewer'");
     expect(reports[1]).not.toContain("AdmissionFailed");
+    // It says what works, and does not advise keeping a child that fails on
+    // every message.
+    expect(reports[1]).toContain("Restore the profile, or close this subagent and start a new one, which loses its conversation.");
+    expect(reports[1]).not.toContain("Keep it if related work may follow");
     expectWholeLog(fixture, id);
   } finally {
     gateway.stop();

@@ -8,8 +8,11 @@
 //! unset has no entry, and follows the agent that started the child, live. The
 //! lists are saved as written, patterns included, so fx's own tools and the
 //! live MCP servers still decide what they name. A profile's prompt, model,
-//! effort, and description are not saved here: the prompt is read again by
-//! name, and the model and effort are saved in the child's own preferences.
+//! effort, and description are not saved here. The prompt is read again by
+//! name, from the folder of the source saved here. The model and effort are
+//! kept in memory until the child's first turn starts, and then saved in the
+//! child's own preferences, so a child that is lost before that turn loses
+//! them (`tests/tla/session_manager/system-design.md` D34).
 //!
 //! The spawn line's data is kept small (4096 bytes in the session manager,
 //! because every snapshot holds it for every child), so a block that would not
@@ -100,14 +103,18 @@ const Read = union(enum) {
     started: StartedWith,
 };
 
-/// The block in a spawn line's `data`, if fx wrote it. Anything else, such as a
-/// version fx does not know, an unknown key, a mode on a repository's profile,
-/// or text that `encode` would not give for what it says, reads as `.invalid`,
-/// and the child is treated as if it had none. The result belongs to `arena`.
+/// The block in a spawn line's `data`, if fx wrote it. What it accepts is a
+/// block whose parsed value is what `encode` gives for what it says: the same
+/// keys in the same order with values fx can write. Another JSON spelling of
+/// that value, with spaces or `\u` escapes, reads the same. Anything else, such
+/// as a version fx does not know, an unknown or repeated key, a mode on a
+/// repository's profile, or data that holds the block's key but does not parse,
+/// reads as `.invalid`, and the child is treated as if it had none. The result
+/// belongs to `arena`.
 pub fn read(arena: Allocator, spawn_data: []const u8) Allocator.Error!Read {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, spawn_data, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .none,
+        else => return if (std.mem.find(u8, spawn_data, "\"" ++ key ++ "\"") != null) .invalid else .none,
     };
     if (root != .object) return .none;
     const block = root.object.get(key) orelse return .none;
@@ -154,38 +161,21 @@ fn extract(arena: Allocator, block: std.json.Value) Allocator.Error!?StartedWith
 fn names(arena: Allocator, value: std.json.Value) Allocator.Error!?[]const []const u8 {
     if (value != .array) return null;
     const out = try arena.alloc([]const u8, value.array.items.len);
-    for (value.array.items, out) |item, *slot| {
-        if (item != .string or item.string.len == 0 or item.string.len > profiles.max_list_entry_bytes) return null;
-        slot.* = item.string;
-    }
+    for (value.array.items, out) |item, *slot| slot.* = profiles.listEntry(item) orelse return null;
     return out;
 }
 
 /// A copy of `started` that `alloc` owns. Free it with `free`.
 pub fn dupe(alloc: Allocator, started: StartedWith) Allocator.Error!StartedWith {
-    const tools = if (started.tools) |list| try dupeNames(alloc, list) else null;
+    const tools = if (started.tools) |list| try profiles.cloneNames(alloc, list) else null;
     errdefer if (tools) |list| freeNames(alloc, list);
-    const mcp_servers = if (started.mcp_servers) |list| try dupeNames(alloc, list) else null;
+    const mcp_servers = if (started.mcp_servers) |list| try profiles.cloneNames(alloc, list) else null;
     return .{ .source = started.source, .permission_mode = started.permission_mode, .tools = tools, .mcp_servers = mcp_servers };
 }
 
 pub fn free(alloc: Allocator, started: StartedWith) void {
     if (started.tools) |list| freeNames(alloc, list);
     if (started.mcp_servers) |list| freeNames(alloc, list);
-}
-
-fn dupeNames(alloc: Allocator, list: []const []const u8) Allocator.Error![]const []const u8 {
-    const out = try alloc.alloc([]const u8, list.len);
-    var done: usize = 0;
-    errdefer {
-        for (out[0..done]) |text| alloc.free(text);
-        alloc.free(out);
-    }
-    for (list, out) |text, *slot| {
-        slot.* = try alloc.dupe(u8, text);
-        done += 1;
-    }
-    return out;
 }
 
 fn freeNames(alloc: Allocator, list: []const []const u8) void {
@@ -300,6 +290,8 @@ test "a block fx would not write reads as invalid" {
         "{\"v\":1,\"from\":\"home\",\"mcp_servers\":[null]}",
         // The keys in the order fx writes them.
         "{\"from\":\"home\",\"v\":1}",
+        // A repeated key, which the parser refuses, so the data does not parse.
+        "{\"v\":1,\"from\":\"home\",\"tools\":[\"glob_files\"],\"tools\":[\"read_file\"]}",
         // Not an object.
         "[]",
         "\"home\"",
@@ -312,6 +304,23 @@ test "a block fx would not write reads as invalid" {
     // A name longer than a profile may list.
     const long = try arena.print("{{\"started_with\":{{\"v\":1,\"from\":\"home\",\"tools\":[\"{s}\"]}}}}", .{text_utils.repeat("x", profiles.max_list_entry_bytes + 1)});
     try testing.expectEqual(Read.invalid, try read(arena, long));
+    // Data that holds the block's key but is cut short is a block fx did not
+    // write, not data with none. Data with no key stays without one.
+    try testing.expectEqual(Read.invalid, try read(arena, "{\"agent\":\"reviewer\",\"started_with\":{\"v\":1,\"from\":\"ho"));
+    try testing.expectEqual(Read.none, try read(arena, "{\"agent\":\"reviewer\",\"fingerprint\":\"ab"));
+}
+
+test "a block spelled with spaces or escapes reads as the block it says, and is written back as fx writes it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const spelled = "{\"agent\": \"reviewer\", \"started_with\": { \"v\": 1, \"from\": \"pr\\u006fject\", \"tools\": [ \"read\\u005ffile\", \"glob_files\" ] } }";
+    const got = try read(arena, spelled);
+    const expected: StartedWith = .{ .source = .project, .tools = &.{ "read_file", "glob_files" } };
+    try testing.expect(eql(expected, got.started));
+    try testing.expectEqualStrings("{\"v\":1,\"from\":\"project\",\"tools\":[\"read_file\",\"glob_files\"]}", try encode(arena, got.started));
+    // Spelled another way, a value fx would not write is still refused.
+    try testing.expectEqual(Read.invalid, try read(arena, "{\"started_with\": { \"v\": 1, \"from\": \"pr\\u006fject\", \"permission_mode\": \"yolo\" } }"));
 }
 
 test "a block over its budget is not saved, and one over it that is read is invalid" {
@@ -376,6 +385,8 @@ test "a saved profile block stays canonical for fuzzed spawn data" {
             "{\"started_with\":{\"v\":1,\"from\":\"project\",\"permission_mode\":\"yolo\"}}",
             "{\"started_with\":{\"v\":2,\"from\":\"home\",\"extra\":[]}}",
             "{\"started_with\":{\"v\":1,\"from\":\"home\",\"tools\":[\"\\u0000\",\"a\\nb\",\"\"]}}",
+            "{\"started_with\":{\"v\":1,\"from\":\"home\",\"tools\":[\"a\"],\"tools\":[\"b\"]}}",
+            "{\"started_with\": { \"v\": 1, \"from\": \"pr\\u006fject\", \"tools\": [ \"read_file\" ] }}",
         }) ++ @import("fuzz_corpus").subagent_started_with.*),
     });
 }
