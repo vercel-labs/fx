@@ -226,18 +226,35 @@ await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/
   const cutOffTurn = async (model) => {
     const access = jwt("limit", tenDays);
     const world = codexWorld({ refreshedToken: jwt("unused", tenDays), reply: cutOff });
-    const { result } = await runTurn({ model, fetch: world.fetch, credentials: () => ({ accessToken: access, refreshToken: "rt-1" }) });
-    assert.equal(result.stopReason, "max_output_tokens");
-    return replyRequests(world.log).map((entry) => JSON.parse(entry.body));
+    const seen = [];
+    const engine = await createFxEngine({
+      ...backendOptions,
+      provider: "codex",
+      model,
+      fetch: world.fetch,
+      onEvent: (event) => seen.push(event),
+      credentials: () => ({ accessToken: access, refreshToken: "rt-1" }),
+    });
+    try {
+      const turn = engine.prompt("say ok");
+      for await (const event of turn) seen.push(event);
+      assert.equal((await turn.result).stopReason, "max_output_tokens");
+    } finally {
+      await engine.close();
+    }
+    return { requests: replyRequests(world.log).map((entry) => JSON.parse(entry.body)), shown: JSON.stringify(seen) };
   };
 
   const atLow = await cutOffTurn({ id: "gpt-5.6-luna", effort: "low" });
-  assert.equal(atLow.length, 1, "a request Codex would see unchanged is not sent again");
+  assert.equal(atLow.requests.length, 1, "a request Codex would see unchanged is not sent again");
+  assert.equal(atLow.shown.includes("Retrying"), false, "no retry is announced");
 
   const unset = await cutOffTurn("gpt-5.6-luna");
-  assert.equal(unset.length, 2, "with no effort set, the reply is asked for once more");
-  assert.equal(unset[0].reasoning?.effort, undefined);
-  assert.equal(unset[1].reasoning?.effort, "low", "the resend asks for low effort");
+  assert.equal(unset.requests.length, 2, "with no effort set, the reply is asked for once more");
+  assert.equal(unset.requests[0].reasoning?.effort, undefined);
+  assert.equal(unset.requests[1].reasoning?.effort, "low", "the resend asks for low effort");
+  assert.ok(unset.shown.includes("Retrying with low effort."), "the notice names the change the resend makes");
+  assert.equal(unset.shown.includes("higher limit"), false, "the notice does not claim a limit Codex never gets");
 }
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Codex agent passed`);

@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const openai_codex = @import("gateway/openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
 const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const model_provider = @import("core/config/model_provider.zig");
@@ -104,7 +105,7 @@ const js_host_provider_set = set: {
         .credits = .{ .fetch_fn = fetchCredits },
     });
     providers.codex = .{
-        .capabilities = .{ .sends_output_limit = false },
+        .capabilities = openai_codex.bundle_capabilities,
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,
         .agent_stream = host_openai_codex.provider(@constCast(&codex_context)),
