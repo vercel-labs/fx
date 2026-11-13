@@ -1005,8 +1005,10 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           },
           remainOnExit: true,
         });
-        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-        expect(session.paneStatus().status).toBe(1);
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
         const shown = await session.captureFullScrollback();
         expect(shown).toContain("fx: unable to start terminal recording: a file-size limit was reached.");
       } finally {
@@ -1046,8 +1048,10 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           stderrPath,
           remainOnExit: true,
         });
-        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-        expect(session.paneStatus().status).toBe(1);
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
         expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
       } finally {
         if (session) {
@@ -1089,8 +1093,10 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           stderrPath,
           remainOnExit: true,
         });
-        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-        expect(session.paneStatus().status).toBe(1);
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
         expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
       } finally {
         if (session) {
