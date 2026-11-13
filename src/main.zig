@@ -6246,6 +6246,133 @@ test "the footer indicator names the agent on screen and the key that opens the 
     try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
 }
 
+test "a subagent's footer says how its last turn ended until its next turn starts" {
+    const alloc = std.testing.allocator;
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const runtime = App.AgentsAppRuntime;
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    try runtime.show(&app, writer);
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+
+    // A turn that fails, and one that is stopped, each say so.
+    runtime.noteChildTurnFinished(&app, &writer.agent, .{ .turn_id = 1, .outcome = .failed });
+    try std.testing.expectEqualStrings("writer · failed ↓", app.footerAgentLabel());
+    // The next turn starts over: the name stands alone while it goes.
+    writer.agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("writer ↓", app.footerAgentLabel());
+    writer.agent.worker.worker_processing = false;
+    runtime.noteChildTurnFinished(&app, &writer.agent, .{ .turn_id = 2, .outcome = .interrupted });
+    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
+    // A turn that waits for the user was cancelled for its parent too.
+    runtime.noteChildTurnFinished(&app, &writer.agent, .{ .turn_id = 3, .outcome = .paused });
+    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
+
+    // A later turn that completes clears it.
+    runtime.noteChildTurnFinished(&app, &writer.agent, .{ .turn_id = 4, .outcome = .completed });
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+
+    // A turn that handed off to the user's image or `$skill` is not a stop.
+    writer.agent.worker.handed_off_turn_id = 5;
+    runtime.noteChildTurnFinished(&app, &writer.agent, .{ .turn_id = 5, .outcome = .interrupted });
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+    runtime.noteChildTurnFinished(&app, &writer.agent, .{ .turn_id = 6, .outcome = .interrupted });
+    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
+}
+
+test "the agent list says failed or stopped on a subagent row whose last turn ended so, and the row sorts as an idle one does" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const failing = try addTestChildAgent(&app, "failing");
+    const stopping = try addTestChildAgent(&app, "stopping");
+    const fine = try addTestChildAgent(&app, "fine");
+    defer failing.agent.session.agent.history.deinit(alloc);
+    defer {
+        var left = failing.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+        left.deinit(alloc);
+    }
+    var before: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
+    defer before.deinit(alloc);
+    try runtime.switchList(&app, &before);
+
+    runtime.noteChildTurnFinished(&app, &failing.agent, .{ .turn_id = 1, .outcome = .failed });
+    runtime.noteChildTurnFinished(&app, &stopping.agent, .{ .turn_id = 1, .outcome = .interrupted });
+    runtime.noteChildTurnFinished(&app, &fine.agent, .{ .turn_id = 1, .outcome = .completed });
+    try runtime.openMenu(&app);
+    const ended = runtime.menuProjection(&app);
+    try std.testing.expectEqualStrings("failed", try menuRowState(ended, "failing"));
+    try std.testing.expectEqualStrings("stopped", try menuRowState(ended, "stopping"));
+    try std.testing.expectEqualStrings("idle", try menuRowState(ended, "fine"));
+    try std.testing.expectEqualStrings("idle", try menuRowState(ended, "main"));
+
+    // They sort where the same rows sorted while they showed idle.
+    var after: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
+    defer after.deinit(alloc);
+    try runtime.switchList(&app, &after);
+    try std.testing.expectEqualSlices(?*app_agents_runtime.ChildAgent, before.items, after.items);
+
+    // A turn that starts says working, and the next one that completes clears
+    // the failure.
+    failing.agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(&app), "failing"));
+    failing.agent.worker.worker_processing = false;
+    try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(&app), "failing"));
+    runtime.noteChildTurnFinished(&app, &failing.agent, .{ .turn_id = 2, .outcome = .completed });
+    try std.testing.expectEqualStrings("idle", try menuRowState(runtime.menuProjection(&app), "failing"));
+
+    // A turn that ended but is not applied yet is still working: the row
+    // says what its newest reply decides, as the sort does.
+    runtime.noteChildTurnFinished(&app, &failing.agent, .{ .turn_id = 3, .outcome = .failed });
+    try failing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(&app), "failing"));
+    var events = failing.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(&app), "failing"));
+}
+
+test "an instance's row keeps its states whatever its turns did" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const second = try addTestChildAgent(&app, "instance-2");
+    second.agent.role = .instance;
+    const LastEnd = @TypeOf(second.last_end);
+    // Its turns end as a subagent's do, but nothing is kept for an instance.
+    runtime.noteChildTurnFinished(&app, &second.agent, .{ .turn_id = 1, .outcome = .failed });
+    runtime.noteChildTurnFinished(&app, &app.main_agent, .{ .turn_id = 1, .outcome = .interrupted });
+    try std.testing.expectEqual(LastEnd.done, second.last_end);
+    // And what is kept for it is not read: an instance's row is its own.
+    second.last_end = .failed;
+    try runtime.openMenu(&app);
+    const rows = runtime.menuProjection(&app).rows;
+    try std.testing.expect(rows.len >= 2);
+    for (rows) |row| try std.testing.expectEqualStrings("idle", row.state);
+}
+
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.

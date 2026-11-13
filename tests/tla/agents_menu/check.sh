@@ -23,15 +23,23 @@
 #
 # spec/RowOrder.tla models how a subagent's row changes when its turn ends: its
 # label comes from the worker and its place from the history the main loop
-# applies later, and the two must come from the same applied update.
-# row-order.cfg is the design and must pass. The planted bug below must be
-# caught by the rule it names; the second config checks the place rule alone:
+# applies later, and the two must come from the same applied update. A row
+# that does not work says how its last applied turn ended: idle, failed, or
+# stopped. row-order.cfg is the design and must pass. The planted bugs below
+# must each be caught by the rule they name; the second config checks the
+# place rule alone:
 #
 #   worker-flag       the label follows the worker flag alone, so a finished
 #                     turn that is not applied shows idle at its old place
 #                                                              IdleRowIsApplied
 #   worker-flag-flip  the same bug, seen as a row that moves with no change
 #                     of label                              PlaceChangesWithLabel
+#   end-sorts         a failed or stopped row sorts below the idle ones
+#                                                                PlaceIgnoresEnd
+#   end-sticks        a turn that completes does not clear an earlier failure
+#                     or stop                                  EndIsOfAppliedTurn
+#   restart-forgets   a restart shows every row idle, so a failed or stopped
+#                     row reads as done once fx runs again     RestartKeepsLabel
 #
 # tests/tla/drivers/agents_menu/ runs the built zig-out/bin/fx along the model:
 # binary-to-spec.ts has TLC check seeded key sequences the binary ran
@@ -65,4 +73,7 @@ MCAgentsMenu agents-menu-mutation-stale-sel SelListed
 MCRowOrder row-order -
 MCRowOrder row-order-mutation-worker-flag IdleRowIsApplied
 MCRowOrder row-order-mutation-worker-flag-flip PlaceChangesWithLabel
+MCRowOrder row-order-mutation-end-sorts PlaceIgnoresEnd
+MCRowOrder row-order-mutation-end-sticks EndIsOfAppliedTurn
+MCRowOrder row-order-mutation-restart-forgets RestartKeepsLabel
 VERDICTS
