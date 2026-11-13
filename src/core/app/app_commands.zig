@@ -1320,7 +1320,7 @@ pub fn Handlers(comptime App: type) type {
             };
             var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
-            try writeCreditsNotice(app, snapshot);
+            try writeCreditsNotice(app, snapshot, true);
         }
 
         const CreditsLookupArgs = struct {
@@ -1352,7 +1352,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn startCreditsLookup(app: *App) !void {
             const args = creditsLookupArgs(app);
-            const started = app.credits_lookup.start(app.creditsProvider(), args.input, args.renewal) catch |err| {
+            const started = app.credits_lookup.start(app.creditsProvider(), args.input, args.renewal, tokenPassEpoch(app)) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
                 return app.writeDomainNotice(.{
@@ -1378,19 +1378,35 @@ pub fn Handlers(comptime App: type) type {
             var result = app.credits_lookup.take() orelse return;
             defer result.deinit();
             if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
-            if (result.quiet) {
+            // A reply that started before the credential changed says
+            // nothing about the current team's Token Pass.
+            const current = result.epoch == tokenPassEpoch(app);
+            if (!current) debug_trace.logf("credits", "token pass reply ignored reason=credential_changed quiet={}", .{result.quiet});
+            if (!result.quiet) {
+                try writeCreditsNotice(app, result.snapshot, current);
+            } else if (current) {
                 observeTokenPass(app, result.snapshot);
-            } else {
-                try writeCreditsNotice(app, result.snapshot);
             }
             if (comptime @hasField(App, "model_cache")) {
                 const state = &app.model_cache.token_pass_default;
-                if (app.model_cache.tokenPassStatus() == .active) {
+                if (!current) {
+                    // The check for this credential joined the stale lookup;
+                    // ask again for this credential.
+                    if (state.* == .checking) {
+                        state.* = .unchecked;
+                        try startTokenPassDefaultCheck(app);
+                    }
+                } else if (app.model_cache.tokenPassStatus() == .active) {
                     if (state.* != .settled) state.* = .pending;
                 } else if (state.* == .checking) {
                     state.* = .settled;
                 }
             }
+        }
+
+        fn tokenPassEpoch(app: *App) u32 {
+            if (comptime !@hasField(App, "model_cache")) return 0;
+            return app.model_cache.token_pass_epoch;
         }
 
         /// Records what a credits reply says about Token Pass.
@@ -1419,7 +1435,7 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             const args = creditsLookupArgs(app);
-            const started = app.credits_lookup.startQuiet(app.creditsProvider(), args.input, args.renewal) catch |err| {
+            const started = app.credits_lookup.startQuiet(app.creditsProvider(), args.input, args.renewal, tokenPassEpoch(app)) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 debug_trace.logf("credits", "token pass check start failed err={s}", .{@errorName(err)});
                 app.model_cache.token_pass_default = .settled;
@@ -1475,7 +1491,9 @@ pub fn Handlers(comptime App: type) type {
             return settings.models.get(.gateway) == null;
         }
 
-        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {
+        /// Writes the credits notice. `current` says the reply belongs to
+        /// the credential fx uses now, so it may update the Token Pass state.
+        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot, current: bool) !void {
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
@@ -1490,6 +1508,7 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
+            if (!current) return;
             observeTokenPass(app, snapshot);
             if (comptime @hasField(App, "model_cache")) {
                 const mentions_token_pass = snapshot.token_pass != null or snapshot.no_token_pass;
