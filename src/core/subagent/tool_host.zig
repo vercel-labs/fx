@@ -24,6 +24,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const model_provider = @import("../config/model_provider.zig");
 const permissions = @import("../permissions/permissions.zig");
+const permission_request = @import("../permissions/permission_request.zig");
 const session = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -3691,7 +3692,6 @@ fn waitForBlockedOnUser(worker: *worker_runtime.WorkerRuntime) !void {
 
 /// The user's decision on the permission request `worker` waits on.
 fn decideWaitingPermission(worker: *worker_runtime.WorkerRuntime, decision: types.ToolPermissionDecision) !void {
-    const permission_request = @import("../permissions/permission_request.zig");
     worker.worker_mutex.lockUncancelable(io_mod.getIo());
     const request_id = worker.pending_permission_request_shared.?.id;
     worker.worker_mutex.unlock(io_mod.getIo());
@@ -3714,25 +3714,25 @@ const AskEnd = enum {
     quit,
 };
 
-/// Fails, printing `haystack`, when it lacks `needle`.
+/// Fails, showing `needle` against `haystack`, when `haystack` lacks it.
 fn expectHas(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.find(u8, haystack, needle) != null) return;
-    std.debug.print("expected \"{s}\" in:\n{s}\n", .{ needle, haystack });
-    return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(needle, haystack);
+}
+
+/// Fails, showing the text from where it says a subagent waits, when `text`
+/// does.
+fn expectNotWaiting(text: []const u8) !void {
+    const at = std.mem.find(u8, text, "waiting for") orelse return;
+    try std.testing.expectEqualStrings("", text[at..]);
 }
 
 fn expectNoWaitingLabel(runtime: *Runtime, arena: Allocator) !void {
     const status = try callTool(runtime, arena, .{ .status = .{} }, "call-status", null);
-    if (std.mem.find(u8, status, "waiting for") != null) {
-        std.debug.print("expected no wait in:\n{s}\n", .{status});
-        return error.TestExpectedEqual;
-    }
+    try expectNotWaiting(status);
     const note = try runtime.teamNote(std.testing.allocator, 0);
     defer if (note) |text| std.testing.allocator.free(text);
-    if (note) |text| if (std.mem.find(u8, text, "waiting for") != null) {
-        std.debug.print("expected no wait in:\n{s}\n", .{text});
-        return error.TestExpectedEqual;
-    };
+    if (note) |text| try expectNotWaiting(text);
 }
 
 /// A hosted subagent blocks on the user as `kind` says, and `end` ends it.
@@ -3791,14 +3791,56 @@ fn expectAskEnds(kind: AskKind, end: AskEnd) !void {
     try expectNoWaitingLabel(runtime, arena);
 }
 
-test "status and the team note say a hosted subagent waits for the user, and no longer once the wait ends, however it ends" {
-    for (std.enums.values(AskKind)) |kind| {
-        for (std.enums.values(AskEnd)) |end| {
-            if (kind == .question and end == .declined) continue;
-            errdefer std.debug.print("wait: {s}, end: {s}\n", .{ @tagName(kind), @tagName(end) });
-            try expectAskEnds(kind, end);
-        }
-    }
+test "status says a subagent waits for an approval, and not once the user allows it" {
+    try expectAskEnds(.permission, .answered);
+}
+
+test "status says a subagent waits for an approval, and not once the user declines it" {
+    try expectAskEnds(.permission, .declined);
+}
+
+test "status says a subagent waits for an approval, and not once the user presses Esc on its screen" {
+    try expectAskEnds(.permission, .escaped);
+}
+
+test "status says a subagent waits for an approval, and not once main stops it" {
+    try expectAskEnds(.permission, .parent_stop);
+}
+
+test "status says a subagent waits for an approval, and not once main closes it" {
+    try expectAskEnds(.permission, .parent_close);
+}
+
+test "status says a subagent waits for an approval, and not once the user closes it" {
+    try expectAskEnds(.permission, .user_close);
+}
+
+test "status says a subagent waits for an approval, and not once fx quits" {
+    try expectAskEnds(.permission, .quit);
+}
+
+test "status says a subagent waits for the user's answer, and not once the user answers" {
+    try expectAskEnds(.question, .answered);
+}
+
+test "status says a subagent waits for the user's answer, and not once the user presses Esc on its screen" {
+    try expectAskEnds(.question, .escaped);
+}
+
+test "status says a subagent waits for the user's answer, and not once main stops it" {
+    try expectAskEnds(.question, .parent_stop);
+}
+
+test "status says a subagent waits for the user's answer, and not once main closes it" {
+    try expectAskEnds(.question, .parent_close);
+}
+
+test "status says a subagent waits for the user's answer, and not once the user closes it" {
+    try expectAskEnds(.question, .user_close);
+}
+
+test "status says a subagent waits for the user's answer, and not once fx quits" {
+    try expectAskEnds(.question, .quit);
 }
 
 test "only the subagent that waits for the user says so" {
