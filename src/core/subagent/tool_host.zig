@@ -1404,7 +1404,6 @@ pub const Runtime = struct {
         defer self.alloc.free(suffix);
         const work_id = try alloc.print("{s}:{s}", .{ if (started_by == .user) "fxuser" else "fxwake", suffix });
         errdefer alloc.free(work_id);
-        if (open_now) try self.startTurnWorkInLog(child_id, work_id, started_by);
         var work: TurnWork = .{
             .child_id = try self.alloc.dupe(u8, child_id),
             .work_id = undefined,
@@ -1417,7 +1416,12 @@ pub const Runtime = struct {
         errdefer self.alloc.free(work.work_id);
         try self.turn_works.append(self.alloc, work);
         errdefer _ = self.turn_works.pop();
+        const was_busy = self.isBusyLocked(child_id);
         try self.markBusyLocked(child_id);
+        errdefer if (!was_busy) self.clearBusyLocked(child_id);
+        // The save is the last step that can fail, so a failure leaves no
+        // active work in the log with nothing behind it.
+        if (open_now) try self.startTurnWorkInLog(child_id, work_id, started_by);
         debug_trace.eventf("mailbox", if (started_by == .user) "user_work" else "turn_work", .{}, "child={s} work_id={s} started_by={s} opened={}", .{ child_id, work_id, @tagName(started_by), open_now });
         return work_id;
     }
@@ -4337,6 +4341,66 @@ test "a message whose start fails at any allocation leaves its subagent idle or 
         // sweep that ended at once would prove nothing.
         try std.testing.expect(at > 8);
     }
+}
+
+/// One try of the sweep below: the user's turn begins on an idle child, and the
+/// `fail_at`-th allocation the call's thread makes fails. Returns whether it
+/// failed.
+fn sweepTurnWork(fail_at: usize) !bool {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    const original = runtime.alloc;
+    const original_owner = runtime.managed.alloc;
+    defer {
+        runtime.alloc = original;
+        runtime.managed.alloc = original_owner;
+        runtime.deinit();
+    }
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try std.testing.expect(worker.beginDirectProcessing(5));
+
+    var fault: FaultAllocator = .{ .backing = alloc, .thread = std.Thread.getCurrentId(), .fail_at = fail_at };
+    runtime.alloc = fault.allocator();
+    runtime.managed.alloc = fault.allocator();
+    const begun = runtime.beginTurnWork(arena, child_id, .user, &worker);
+    runtime.alloc = original;
+    runtime.managed.alloc = original_owner;
+    const failed = fault.fired;
+    if (begun) |work_id| runtime.endUserWork(child_id, work_id, .completed, "");
+    // Whether or not the work opened, the child is working or idle, never
+    // marked running with no work of the host's behind it.
+    const found = try reviewerPhase(runtime, arena);
+    const where = try alloc.print("allocation {d} of a user's turn work", .{fail_at});
+    defer alloc.free(where);
+    if ((found.phase == .running or found.phase == .awaiting_approval) and !found.busy) {
+        try expectAt(where, "reviewer is idle or working", "reviewer is running with no work behind it");
+    }
+    const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
+    const taken = std.mem.find(u8, again, "Sent to reviewer") != null or std.mem.find(u8, again, "is busy") != null;
+    try expectAt(where, "the next message is taken", if (taken) "the next message is taken" else again);
+    try waitUntilQuiet(runtime);
+    try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], " completed DONE again");
+    return failed;
+}
+
+test "a user's turn whose work fails to open at any allocation leaves its subagent idle or working, then takes the next message" {
+    var at: usize = 0;
+    while (try sweepTurnWork(at)) : (at += 1) {}
+    // The call allocates in more places than the few that matter; a sweep that
+    // ended at once would prove nothing.
+    try std.testing.expect(at > 3);
 }
 
 test "an early-ended work names each file it changed once, without reads or failed changes" {
