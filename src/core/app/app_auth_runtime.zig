@@ -258,6 +258,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn runLogoutCommand(app: *App, agent: *AppAgent, target: []const u8) !void {
             if (try rejectPendingPreparation(app)) return;
+            if (try rejectFinishingSignInRefresh(app)) return;
             if (hostManagesAuth(app)) {
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
                 return;
@@ -1320,6 +1321,20 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Refuses an action that takes a sign-in's lock on the input loop,
+        /// such as a logout or a team change, while a refresh nothing waits
+        /// for may hold it (`auth_runtime.Runtime.signInRefreshFinishing`).
+        fn rejectFinishingSignInRefresh(app: *App) !bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "signInRefreshFinishing")) return false;
+            if (!app.auth.signInRefreshFinishing()) return false;
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "A sign-in refresh is still finishing. Try again in a moment.",
+            }, true);
+            return true;
+        }
+
         fn beginPreparation(app: *App, input: auth_runtime.ProviderPreparationInput) !void {
             app.auth.beginProviderPreparation(app.alloc, input) catch |err| {
                 debug_trace.logf("provider", "preparation start failed err={s}", .{@errorName(err)});
@@ -1342,9 +1357,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn collectProviderPreparationFacts(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
             if (pendingPromptNeedsAdoption(app, agent)) return;
-            const task = app.auth.takeProviderPreparation() orelse return;
-            defer task.deinit();
-            if (task.cancel_requested.load(.seq_cst)) {
+            // A cancelled preparation ends at once, even one in the middle of
+            // a sign-in refresh, which keeps running until it saves the login.
+            if (app.auth.takeCancelledProviderPreparation()) {
                 holdPromptAfterPreparationFailure(app, agent);
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1353,6 +1368,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            const task = app.auth.takeProviderPreparation() orelse return;
+            defer task.deinit();
             const applied = switch (task.input.intent) {
                 .provider => try finishProviderSwitch(app, agent, task),
                 .team => try finishTeamPreparation(app, agent, task),
@@ -1672,6 +1689,7 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
             if (try rejectPendingPreparation(app)) return false;
+            if (try rejectFinishingSignInRefresh(app)) return false;
             if (try reject_provider_picker_if_busy(app, agent)) return false;
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
