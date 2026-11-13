@@ -19,6 +19,7 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1356,10 +1357,18 @@ fn fallbackOutcome(alloc: Allocator, work_id: []const u8, outcome: child_state.O
     };
 }
 
+/// The failure code of a child whose profile could not be loaded. Every later
+/// message to it fails the same way, so a report with this code leaves the
+/// child out of the idle note (`tool_host.zig` `IdleFacts`).
+pub const profile_unavailable_code = "profile_unavailable";
+
+/// What works for a child that cannot load its profile. A profile cannot be
+/// given to a child that exists, so a new one is the only other way.
+const profile_next_step = "Restore the profile, or close this subagent and start a new one, which loses its conversation.";
+
 /// The outcome of a work whose admission could not be captured. When the child's
-/// profile could not be loaded, the failure says so and names the profile, so
-/// its parent can close the child and start it again; otherwise it names only
-/// the stage.
+/// profile could not be loaded, the failure says so, names the profile, and
+/// says what works; otherwise it names only the stage.
 fn admissionFailure(owner: *Owner, work_id: []u8, child_id: []const u8, err: anyerror) OneOutcome {
     const found = owner.authority_resolver.profileFailure(owner.alloc, child_id) catch null;
     const message = found orelse return failedOutcome(work_id, "admission", err);
@@ -1367,8 +1376,20 @@ fn admissionFailure(owner: *Owner, work_id: []u8, child_id: []const u8, err: any
     return .{
         .work_id = work_id,
         .outcome = .failed,
-        .failure = execution.failureDiagnosticValue("profile_unavailable", message),
+        .failure = profileUnavailableFailure(message),
     };
+}
+
+/// `profile_unavailable: <reason>; <next step>`, within the bytes a failure
+/// holds. The reason is cut to leave room for the next step, which the parent
+/// needs more.
+fn profileUnavailableFailure(reason: []const u8) types.ModelFailureDiagnostic {
+    var buffer: [types.ModelFailureDiagnostic.max_bytes]u8 = undefined;
+    const room = buffer.len -| profile_unavailable_code.len -| 4 -| profile_next_step.len;
+    const cut = text_utils.utf8PrefixByBytes(reason, room);
+    const why = if (text_utils.isTerminalSafe(cut)) cut else "its profile could not be loaded";
+    const detail = std.mem.print(&buffer, "{s}; {s}", .{ why, profile_next_step }) catch profile_next_step;
+    return execution.failureDiagnosticValue(profile_unavailable_code, detail);
 }
 
 fn failedOutcome(work_id: []u8, stage: []const u8, err: anyerror) OneOutcome {
@@ -1391,6 +1412,8 @@ test "an admission that failed for the child's profile names the profile, and an
     defer named.deinit(alloc);
     try std.testing.expectEqual(child_state.Outcome.failed, named.outcome);
     try std.testing.expect(std.mem.startsWith(u8, named.failure.?.view(), "profile_unavailable: no profile named 'reviewer'"));
+    // It says what works, though the profile's reason is cut to make room.
+    try std.testing.expect(std.mem.endsWith(u8, named.failure.?.view(), profile_next_step));
 
     const plain = admissionFailure(&owner, try alloc.dupe(u8, "work-2"), "other", error.AdmissionFailed);
     defer plain.deinit(alloc);

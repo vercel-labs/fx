@@ -281,10 +281,12 @@ pub const ProfileCache = struct {
     }
 
     /// Builds into `held` the profile `saved` describes for `name`. Its prompt
-    /// is not saved: it is read again by name, and only from a profile of the
-    /// same kind as the saved one, so a repository's prompt never joins a
-    /// child that started in a profile of the user's own. Without one, the
-    /// child has no profile prompt.
+    /// is not saved: it is read again by name from the folder of the saved
+    /// source alone, the fx home for a profile of the user's own and
+    /// the session's workspace for a repository's, so a profile of the same
+    /// name in the other can neither take the prompt away nor supply its own.
+    /// Without the file there, or for a built-in profile, the child has no
+    /// profile prompt.
     fn restore(
         self: *ProfileCache,
         held: *profiles.Held,
@@ -301,14 +303,19 @@ pub const ProfileCache = struct {
         var profile = started_with_mod.toProfile(facts, try arena.dupe(u8, name));
         var prompt: []const u8 = "none";
         if (saved.source != .builtin) {
-            const roots = try profiles.Roots.init(arena, home, workspace_root);
+            const roots = try profiles.Roots.init(
+                arena,
+                if (saved.source == .home) home else null,
+                if (saved.source == .project) workspace_root else null,
+            );
             var failure: ?[]const u8 = null;
             if (profiles.load(arena, roots, name, &failure)) |loaded| {
+                // With one folder to look in, only a built-in of the same name can answer instead.
                 if (loaded.source == saved.source) {
                     profile.prompt = loaded.prompt;
                     profile.prompt_mode = loaded.prompt_mode;
                     prompt = "read";
-                } else prompt = "other_source";
+                } else prompt = "not_in_source";
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => prompt = "not_loaded",
@@ -321,7 +328,7 @@ pub const ProfileCache = struct {
 
     /// Under the mutex.
     fn noteFailure(self: *ProfileCache, child_id: []const u8, message: []const u8) void {
-        const text = self.alloc.dupe(u8, message) catch return;
+        const text = self.alloc.dupe(u8, message) catch return self.failureNoteDropped(child_id);
         if (self.failures.getPtr(child_id)) |known| {
             self.alloc.free(known.*);
             known.* = text;
@@ -329,12 +336,18 @@ pub const ProfileCache = struct {
         }
         const key = self.alloc.dupe(u8, child_id) catch {
             self.alloc.free(text);
-            return;
+            return self.failureNoteDropped(child_id);
         };
         self.failures.put(self.alloc, key, text) catch {
             self.alloc.free(key);
             self.alloc.free(text);
+            self.failureNoteDropped(child_id);
         };
+    }
+
+    /// The parent then sees the failure without the profile's name.
+    fn failureNoteDropped(_: *ProfileCache, child_id: []const u8) void {
+        debug_trace.logf("profile", "profile failure note dropped child={s} reason=out_of_memory", .{child_id});
     }
 
     /// Under the mutex.
@@ -1478,13 +1491,6 @@ const LiveHost = struct {
     }
 };
 
-fn writeTestFile(dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) !void {
-    if (std.Io.Dir.path.dirname(sub_path)) |parent| try dir.createDirPath(io_mod.getIo(), parent);
-    var file = try dir.createFile(io_mod.getIo(), sub_path, .{});
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), bytes);
-}
-
 /// What the profile `name` in `roots` set, as a child that starts in it saves.
 fn startedIn(arena: Allocator, roots: profiles.Roots, name: []const u8) !started_with_mod.StartedWith {
     var failure: ?[]const u8 = null;
@@ -1501,10 +1507,10 @@ test "a child keeps what its profile set when the session is resumed in another 
     defer tmp.cleanup();
     // Repository A's `reviewer` reads files and uses GitHub; B's writes files and
     // uses Slack; C has none.
-    try writeTestFile(tmp.dir, "a/.fx/agents/reviewer/profile.json", "{\"description\": \"Reads\", \"tools\": [\"read_file\"], \"mcp_servers\": [\"github\"]}");
-    try writeTestFile(tmp.dir, "a/.fx/agents/reviewer/prompt.md", "Review only.");
-    try writeTestFile(tmp.dir, "b/.fx/agents/reviewer/profile.json", "{\"description\": \"Writes\", \"tools\": [\"write_file\"], \"mcp_servers\": [\"slack\"]}");
-    try writeTestFile(tmp.dir, "b/.fx/agents/reviewer/prompt.md", "Write freely.");
+    try profiles.writeTestFile(tmp.dir, "a/.fx/agents/reviewer/profile.json", "{\"description\": \"Reads\", \"tools\": [\"read_file\"], \"mcp_servers\": [\"github\"]}");
+    try profiles.writeTestFile(tmp.dir, "a/.fx/agents/reviewer/prompt.md", "Review only.");
+    try profiles.writeTestFile(tmp.dir, "b/.fx/agents/reviewer/profile.json", "{\"description\": \"Writes\", \"tools\": [\"write_file\"], \"mcp_servers\": [\"slack\"]}");
+    try profiles.writeTestFile(tmp.dir, "b/.fx/agents/reviewer/prompt.md", "Write freely.");
     try tmp.dir.createDirPath(io_mod.getIo(), "c");
     const repo_a = try io_mod.dirRealpathAlloc(arena, tmp.dir, "a");
     const repo_b = try io_mod.dirRealpathAlloc(arena, tmp.dir, "b");
@@ -1607,7 +1613,7 @@ test "what a profile left unset follows the parent live, and a mode chosen on th
     // edited, to tighten its mode among other things.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "home/.fx/agents/loose/profile.json", "{\"description\": \"Edited\", \"permission_mode\": \"ask\", \"tools\": [\"write_file\"]}");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/loose/profile.json", "{\"description\": \"Edited\", \"permission_mode\": \"ask\", \"tools\": [\"write_file\"]}");
     const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
 
     var host: LiveHost = .{};
@@ -1675,38 +1681,44 @@ test "what a profile left unset follows the parent live, and a mode chosen on th
     try std.testing.expectEqualStrings("read_file", own.tools[0]);
 }
 
-test "a saved profile takes a prompt by name only from a profile of the kind it started in" {
+test "a saved profile reads its prompt from the folder of the source it started in, whatever the other has" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The user's own `reviewer` has a prompt, and so does the repository's, whose
-    // `agent` also replaces fx's own with a prompt.
-    try writeTestFile(tmp.dir, "home/.fx/agents/reviewer/profile.json", "{\"description\": \"Mine\"}");
-    try writeTestFile(tmp.dir, "home/.fx/agents/reviewer/prompt.md", "Mine.");
-    try writeTestFile(tmp.dir, "repo/.fx/agents/reviewer/profile.json", "{\"description\": \"Theirs\"}");
-    try writeTestFile(tmp.dir, "repo/.fx/agents/reviewer/prompt.md", "Theirs.");
-    try writeTestFile(tmp.dir, "repo/.fx/agents/agent/profile.json", "{\"description\": \"Theirs\", \"prompt\": \"replace\"}");
-    try writeTestFile(tmp.dir, "repo/.fx/agents/agent/prompt.md", "Theirs replaces fx's own.");
-    try writeTestFile(tmp.dir, "repo/.fx/agents/only-repo/profile.json", "{\"description\": \"Theirs\"}");
-    try writeTestFile(tmp.dir, "repo/.fx/agents/only-repo/prompt.md", "Only theirs.");
+    // `reviewer` is in both folders, with a prompt in each. `shadowed` is the
+    // repository's, and the user's has the name but does not parse. `home-only`
+    // is the user's, and the repository's does not parse. The repository's
+    // `agent` replaces fx's own, with a prompt.
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/reviewer/profile.json", "{\"description\": \"Mine\"}");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/reviewer/prompt.md", "Mine.");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/reviewer/profile.json", "{\"description\": \"Theirs\"}");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/reviewer/prompt.md", "Theirs.");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/shadowed/profile.json", "{not json");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/shadowed/profile.json", "{\"description\": \"Theirs\"}");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/shadowed/prompt.md", "Theirs shadowed.");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/home-only/profile.json", "{\"description\": \"Mine\"}");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/home-only/prompt.md", "Mine only.");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/home-only/profile.json", "{not json");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/agent/profile.json", "{\"description\": \"Theirs\", \"prompt\": \"replace\"}");
+    try profiles.writeTestFile(tmp.dir, "repo/.fx/agents/agent/prompt.md", "Theirs replaces fx's own.");
+    try tmp.dir.createDirPath(io_mod.getIo(), "empty");
     const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
     const repo = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo");
+    const empty = try io_mod.dirRealpathAlloc(arena, tmp.dir, "empty");
 
     var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = repo } };
     defer cache.deinit();
-    // Started in the user's own profile: the user's prompt, by name.
-    const mine = try cache.get("mine", "reviewer", .{ .source = .home });
-    try std.testing.expectEqualStrings("Mine.", mine.prompt);
-    // Started in a repository's profile of the same name, which the user's now
-    // hides: no prompt joins it, as the user's profile is not that one.
-    const theirs = try cache.get("theirs", "reviewer", .{ .source = .project });
-    try std.testing.expectEqualStrings("", theirs.prompt);
-    // Where the name is only the repository's, it is read.
-    const only = try cache.get("only", "only-repo", .{ .source = .project });
-    try std.testing.expectEqualStrings("Only theirs.", only.prompt);
+    // Started in the user's profile: the user's prompt, though the repository has one.
+    try std.testing.expectEqualStrings("Mine.", (try cache.get("mine", "reviewer", .{ .source = .home })).prompt);
+    // Started in the repository's: the repository's prompt, though the user's
+    // profile of the name hides it from a lookup by name.
+    try std.testing.expectEqualStrings("Theirs.", (try cache.get("theirs", "reviewer", .{ .source = .project })).prompt);
+    // A profile of the other source that does not parse takes nothing away.
+    try std.testing.expectEqualStrings("Theirs shadowed.", (try cache.get("shadowed", "shadowed", .{ .source = .project })).prompt);
+    try std.testing.expectEqualStrings("Mine only.", (try cache.get("home-only", "home-only", .{ .source = .home })).prompt);
     // fx's own `agent` has no prompt, whatever a repository saves under its name.
     const builtin_agent = try cache.get("builtin", "agent", .{ .source = .builtin });
     try std.testing.expectEqualStrings("", builtin_agent.prompt);
@@ -1715,6 +1727,13 @@ test "a saved profile takes a prompt by name only from a profile of the kind it 
     const gone = try cache.get("gone", "nowhere", .{ .source = .home, .tools = &.{"read_file"} });
     try std.testing.expectEqualStrings("", gone.prompt);
     try std.testing.expect(profiles.setsTools(gone));
+
+    // Where the repository's `agent` is gone, the built-in does not stand in for its prompt.
+    var elsewhere: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = empty } };
+    defer elsewhere.deinit();
+    try std.testing.expectEqualStrings("", (try elsewhere.get("replaced", "agent", .{ .source = .project, .tools = &.{"read_file"} })).prompt);
+    // And the user's profile is read in whatever repository fx runs in.
+    try std.testing.expectEqualStrings("Mine.", (try elsewhere.get("mine", "reviewer", .{ .source = .home })).prompt);
 }
 
 test "a profile that could not be loaded keeps its message until a load works" {
@@ -1724,7 +1743,7 @@ test "a profile that could not be loaded keeps its message until a load works" {
     const arena = arena_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "home/.fx/agents/broken/profile.json", "{not json");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/broken/profile.json", "{not json");
     const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
     var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
     defer cache.deinit();
@@ -1741,7 +1760,7 @@ test "a profile that could not be loaded keeps its message until a load works" {
     try std.testing.expect((try cache.failureOf(alloc, "other")) == null);
 
     // A load that works removes it.
-    try writeTestFile(tmp.dir, "home/.fx/agents/broken/profile.json", "{\"description\": \"Fixed\"}");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/broken/profile.json", "{\"description\": \"Fixed\"}");
     _ = try cache.get("kid", "broken", null);
     try std.testing.expect((try cache.failureOf(alloc, "kid")) == null);
 }
