@@ -1368,6 +1368,19 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// Set on a running shell result whose wait ended when its command
+    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
+    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// reads it; the session never saves it.
+    quiet_crossing: ?QuietCrossing = null,
+};
+
+/// A shell command that crossed the quiet limit during a wait: its command
+/// line and how long it had printed nothing. Each quiet spell crosses once
+/// (`tests/tla/subagent/QuietRelay.tla`).
+pub const QuietCrossing = struct {
+    command: []const u8,
+    quiet_ms: u64,
 };
 
 pub const ToolExecutionStep = struct {
@@ -1618,6 +1631,10 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const quiet_crossing: ?QuietCrossing = if (memory.quiet_crossing) |crossing|
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+    else
+        null;
     return .{
         .review_feedback = memory.review_feedback,
         .tool_images = tool_images,
@@ -1632,6 +1649,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
+        .quiet_crossing = quiet_crossing,
     };
 }
 
@@ -1644,6 +1662,7 @@ pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     if (memory.preview) |value| alloc.free(value);
     if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
     if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    if (memory.quiet_crossing) |crossing| alloc.free(crossing.command);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {

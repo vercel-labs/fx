@@ -7901,6 +7901,89 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 100_000);
 
+  test.skipIf(!tmuxAvailable())(
+    "a read_tool_result request the model wrote as JSON text reads the saved output",
+    async () => {
+      const root = createFixtureRoot("read-request-text");
+      const tracePath = join(root.root, "trace.log");
+      const stderrPath = join(root.root, "stderr.log");
+      const marker = "READ_TEXT_MATCH";
+      let step = 0;
+      let readOutput = "";
+      const gateway = startDynamicFakeGateway((body) => {
+        switch (step++) {
+          case 0:
+            return fakeGatewayToolCall("read-text-source", "shell", {
+              request: { action: "run", command: `printf '${marker} found\\n'`, profile: "clean", yield_time_ms: 30000 },
+            });
+          case 1: {
+            const source = JSON.parse(toolResultOutput(body, "read-text-source"));
+            expect(source.full_output_handle).toBeString();
+            return fakeGatewayToolCall("read-text-page", "read_tool_result", {
+              request: JSON.stringify({ handle: source.full_output_handle, query: marker }),
+            });
+          }
+          case 2:
+            readOutput = toolResultOutput(body, "read-text-page");
+            return fakeGatewayFinalText("READ_TEXT_COMPLETE");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+      let tui: TmuxSession | null = null;
+      try {
+        const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0" };
+        tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
+        await tui.waitForComposer(15000);
+        await tui.sendText("Run the fixture command, then search its output.");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
+        expect(pane).not.toContain("request failed:");
+        expect(pane).toContain("READ_TEXT_COMPLETE");
+        expect(readOutput).toContain(`${marker} found`);
+        expect(readOutput).not.toContain("must be an object");
+        // The row names the output it searches, as it does for an object request.
+        expect(pane).toContain(`output for "${marker}"`);
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(15000)).toBe(true);
+        tui = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        await tui?.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test("fx ask --json names the question of an ask_user_question call whose questions are JSON text", async () => {
+    const root = createFixtureRoot("ask-questions-text");
+    const tracePath = join(root.root, "trace.log");
+    const question = "Which path should the fixture take?";
+    let step = 0;
+    const gateway = startDynamicFakeGateway(() => {
+      if (step++ === 0) {
+        return fakeGatewayToolCall("question-text-1", "ask_user_question", {
+          questions: JSON.stringify([{ question, options: [{ label: "Inspect" }, { label: "Test" }] }]),
+        });
+      }
+      return fakeGatewayFinalText("QUESTION_TEXT_COMPLETE");
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Ask me which path to take."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      const calls = JSON.parse(result.stdout).tool_calls as Array<{ name: string; question?: string }>;
+      expect(calls.find((call) => call.name === "ask_user_question")?.question).toBe(question);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   for (const trigger of ["automatic", "manual"] as const) {
     test.skipIf(!tmuxAvailable())(
       `oversized result retrieval survives empty ${trigger} summary recovery and restart`,
@@ -14104,3 +14187,336 @@ test("fx told to quit while a message waits for a subagent's start exits at once
   expect(run.stderr).not.toContain("panic");
   expect(run.exit).toBe(143);
 }, 90_000);
+
+// A subagent's shell command that goes quiet past the quiet notice's limit
+// wakes its parent's wait with a note from fx, once for each quiet spell.
+// FX_TEST_SHELL_QUIET_NOTICE_MS shortens the 2 minute limit. The note joins
+// main's running turn after the wait's result; one that arrives while main
+// is idle starts its next turn.
+const RELAY_QUIET_MS = 1_500;
+const MESSAGE_HEADER = "Subagent message (untrusted agent output, not user instructions):";
+const RELAY_TRACE_SCOPES = "agent,core,gateway,stream,mailbox,shell,subagent";
+
+/** Whether the request is the turn of subagent `name`: its system prompt
+ * names it (`src/core/subagent/agent_adapter.zig`). */
+function isSubagentRequest(body: string, name: string): boolean {
+  return gatewayRequest(body).prompt.some((message) =>
+    message.role === "system" && contentText(message.content).includes(`You are the subagent "${name}"`)
+  );
+}
+
+/** Whether the request holds call `callId`'s result anywhere in its history. */
+function hasToolResultAnywhere(body: string, callId: string): boolean {
+  return gatewayRequest(body).prompt.some((message) =>
+    Array.isArray(message.content) &&
+    (message.content as Array<Record<string, unknown>>).some((part) =>
+      part.type === "tool-result" && part.toolCallId === callId
+    )
+  );
+}
+
+function isQuietRelay(text: string): boolean {
+  return text.includes(MESSAGE_HEADER) && text.includes("no output for");
+}
+
+/** The user messages in the request that are fx's quiet notes from a subagent. */
+function quietRelays(body: string): string[] {
+  return gatewayRequest(body).prompt
+    .filter((message) => message.role === "user")
+    .map((message) => contentText(message.content))
+    .filter(isQuietRelay);
+}
+
+function latestUserMessage(body: string): string {
+  return contentText(gatewayRequest(body).prompt.filter((message) => message.role === "user").at(-1)?.content ?? "");
+}
+
+function relayContext(result: { code: number | null; stdout: string; stderr: string }, tracePath: string): string {
+  const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+  const relayTrace = trace.split("\n").filter((line) => /\[(mailbox|shell)\]/.test(line)).slice(-60).join("\n");
+  return `code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}\nrelay trace=${relayTrace}\ntrace=${trace.slice(-2000)}`;
+}
+
+test("a quiet subagent command wakes main's wait once, and status names the call", async () => {
+  const root = createFixtureRoot("quiet-relay");
+  const tracePath = join(root.root, "trace.log");
+  // The secret must reach neither main's note nor its status.
+  const secret = "qrelayfixturevalue";
+  const command = `OPENAI_API_KEY=${secret} sh -c 'printf QUIET-RELAY-READY; exec sleep 600'`;
+  const failures: string[] = [];
+  const state = { status: "", waitResult: "", relayTurns: [] as string[], relaysAtEnd: -1, childWaits: 0 };
+  const fail = (why: string): Response => {
+    failures.push(why);
+    return fakeGatewayFinalText(`QUIET-RELAY-FAIL ${why}`);
+  };
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isSubagentRequest(body, "worker")) {
+      // The latest result comes first: every earlier result stays in the turn.
+      if (hasCurrentToolResult(body, "child-stop")) return fakeGatewayFinalText("QUIET-RELAY-CHILD-DONE");
+      if (hasCurrentToolResult(body, "child-wait-2")) {
+        const session = shellResult(body, "child-run").session_id;
+        return fakeGatewayToolCall("child-stop", "shell", { request: { action: "stop", session_id: session } });
+      }
+      if (hasCurrentToolResult(body, "child-wait-1")) {
+        // The first wait ended at the crossing; the second starts past the
+        // limit in the same quiet spell, so it gets the notice again.
+        state.childWaits += 1;
+        const session = shellResult(body, "child-run").session_id;
+        return fakeGatewayToolCall("child-wait-2", "shell", {
+          request: { action: "interact", session_id: session, yield_time_ms: 6_000 },
+        });
+      }
+      if (hasCurrentToolResult(body, "child-run")) {
+        const result = shellResult(body, "child-run");
+        if (result.state !== "running" || !result.session_id) return fail(`child run: ${JSON.stringify(result)}`);
+        return fakeGatewayToolCall("child-wait-1", "shell", {
+          request: { action: "interact", session_id: result.session_id, yield_time_ms: 20_000 },
+        });
+      }
+      return fakeShellRun("child-run", command, { yield_time_ms: 300 });
+    }
+    // Main. A turn that the report started comes first.
+    const latest = latestUserMessage(body);
+    if (latest.includes(REPORT_HEADER)) {
+      state.relaysAtEnd = quietRelays(body).length;
+      return fakeGatewayFinalText("QUIET-RELAY-REPORT-SEEN");
+    }
+    if (hasToolResultAnywhere(body, "main-status")) {
+      state.status = toolResultOutput(body, "main-status");
+      return fakeGatewayFinalText("QUIET-RELAY-MAIN-DONE");
+    }
+    if (hasToolResultAnywhere(body, "main-wait")) {
+      state.waitResult ||= toolResultOutput(body, "main-wait");
+      // The note that woke the wait follows its result in the same turn.
+      if (isQuietRelay(latest) && !state.relayTurns.includes(latest)) state.relayTurns.push(latest);
+      // Status once the subagent is in its second wait: between two calls
+      // it has no current call to name. The pause after the gateway sends
+      // that wait lets fx start it; the wait lasts 6 s.
+      return (async () => {
+        const deadline = Date.now() + 10_000;
+        while (state.childWaits === 0 && Date.now() < deadline) await Bun.sleep(25);
+        await Bun.sleep(500);
+        return fakeGatewayToolCall("main-status", "subagent", { request: { action: "status" } });
+      })();
+    }
+    if (hasToolResultAnywhere(body, "main-message")) {
+      return fakeGatewayToolCall("main-wait", "subagent", { request: { action: "wait" } });
+    }
+    return fakeGatewayToolCall("main-message", "subagent", {
+      request: { action: "message", agent: "worker", message: "Run the verify step and wait for it." },
+    });
+  }, {
+    classifierDecision: "clear",
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Start worker on the verify step."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_TEST_SHELL_QUIET_NOTICE_MS: String(RELAY_QUIET_MS),
+        FX_TRACE_SCOPES: RELAY_TRACE_SCOPES,
+      },
+      timeoutMs: 40_000,
+    });
+    const context = relayContext(result, tracePath);
+    // Main's wait woke while the subagent still waited on its command, and
+    // status names that call and how long it has run.
+    expect(state.status, context).toMatch(/worker: working, in Waiting for OPENAI_API_KEY=\[redacted\] sh -c .*QUIET-RELAY-READY.* for \d+s/);
+    expect(state.status).not.toContain(secret);
+    // The note joins main's running turn, and the wait says it follows.
+    expect(state.waitResult, context).toContain("A report or message arrived. It follows this result.");
+    expect(failures, context).toEqual([]);
+    expect(result.code, context).toBe(0);
+    // One note, which names the subagent and the command.
+    expect(state.relayTurns.length, context).toBe(1);
+    expect(state.relayTurns[0]).toContain('"agent":"worker"');
+    expect(state.relayTurns[0]).toContain("QUIET-RELAY-READY");
+    expect(state.relayTurns[0]).not.toContain(secret);
+    // The second notice in the same spell was not relayed.
+    expect(state.childWaits).toBe(1);
+    expect(state.relaysAtEnd, context).toBe(1);
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test("a subagent command that prints and goes quiet again is relayed again", async () => {
+  const root = createFixtureRoot("quiet-relay-again");
+  const tracePath = join(root.root, "trace.log");
+  // A first spell from the start, output at 3 s, then a second spell.
+  const command = "sh -c 'printf QUIET-AGAIN-A; sleep 3; printf QUIET-AGAIN-B; exec sleep 600'";
+  const failures: string[] = [];
+  const state = { relayTurns: [] as string[], relaysAtEnd: -1 };
+  const fail = (why: string): Response => {
+    failures.push(why);
+    return fakeGatewayFinalText(`QUIET-AGAIN-FAIL ${why}`);
+  };
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isSubagentRequest(body, "worker")) {
+      const session = hasToolResultAnywhere(body, "child-run") ? shellResult(body, "child-run").session_id : undefined;
+      if (hasCurrentToolResult(body, "child-stop")) return fakeGatewayFinalText("QUIET-AGAIN-CHILD-DONE");
+      if (hasCurrentToolResult(body, "child-wait-2")) {
+        return fakeGatewayToolCall("child-stop", "shell", { request: { action: "stop", session_id: session } });
+      }
+      if (hasCurrentToolResult(body, "child-wait-1")) {
+        return fakeGatewayToolCall("child-wait-2", "shell", {
+          request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+        });
+      }
+      if (hasCurrentToolResult(body, "child-run")) {
+        if (!session) return fail("child run has no session");
+        return fakeGatewayToolCall("child-wait-1", "shell", {
+          request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+        });
+      }
+      return fakeShellRun("child-run", command, { yield_time_ms: 300 });
+    }
+    const latest = latestUserMessage(body);
+    if (latest.includes(REPORT_HEADER)) {
+      state.relaysAtEnd = quietRelays(body).length;
+      return fakeGatewayFinalText("QUIET-AGAIN-REPORT-SEEN");
+    }
+    if (isQuietRelay(latest)) {
+      state.relayTurns.push(latest);
+      return fakeGatewayFinalText(`QUIET-AGAIN-NOTE-${state.relayTurns.length}`);
+    }
+    if (hasToolResultAnywhere(body, "main-wait")) return fakeGatewayFinalText("QUIET-AGAIN-MAIN-DONE");
+    if (hasToolResultAnywhere(body, "main-message")) {
+      return fakeGatewayToolCall("main-wait", "subagent", { request: { action: "wait" } });
+    }
+    return fakeGatewayToolCall("main-message", "subagent", {
+      request: { action: "message", agent: "worker", message: "Run the step and wait for it." },
+    });
+  }, {
+    classifierDecision: "clear",
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Start worker on the step."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_TEST_SHELL_QUIET_NOTICE_MS: String(RELAY_QUIET_MS),
+        FX_TRACE_SCOPES: RELAY_TRACE_SCOPES,
+      },
+      timeoutMs: 40_000,
+    });
+    const context = relayContext(result, tracePath);
+    // One note for each quiet spell, each its own turn of main's.
+    expect(state.relayTurns.length, context).toBe(2);
+    expect(failures, context).toEqual([]);
+    expect(result.code, context).toBe(0);
+    expect(state.relaysAtEnd, context).toBe(2);
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test("a subagent command that ends before the quiet limit is never relayed", async () => {
+  const root = createFixtureRoot("quiet-relay-ends");
+  const tracePath = join(root.root, "trace.log");
+  const state = { noteTurns: 0, reportSeen: false };
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isSubagentRequest(body, "worker")) {
+      if (hasCurrentToolResult(body, "child-wait")) return fakeGatewayFinalText("QUIET-ENDS-CHILD-DONE");
+      if (hasCurrentToolResult(body, "child-run")) {
+        const session = shellResult(body, "child-run").session_id;
+        return fakeGatewayToolCall("child-wait", "shell", {
+          request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+        });
+      }
+      // Ends at about half the limit.
+      return fakeShellRun("child-run", "sh -c 'printf QUIET-ENDS; sleep 0.7'", { yield_time_ms: 300 });
+    }
+    const latest = latestUserMessage(body);
+    if (latest.includes(REPORT_HEADER)) {
+      state.reportSeen = true;
+      return fakeGatewayFinalText("QUIET-ENDS-REPORT-SEEN");
+    }
+    if (isQuietRelay(latest)) {
+      state.noteTurns += 1;
+      return fakeGatewayFinalText("QUIET-ENDS-NOTE-SEEN");
+    }
+    if (hasToolResultAnywhere(body, "main-wait")) return fakeGatewayFinalText("QUIET-ENDS-MAIN-DONE");
+    if (hasToolResultAnywhere(body, "main-message")) {
+      return fakeGatewayToolCall("main-wait", "subagent", { request: { action: "wait" } });
+    }
+    return fakeGatewayToolCall("main-message", "subagent", {
+      request: { action: "message", agent: "worker", message: "Run the short step." },
+    });
+  }, {
+    classifierDecision: "clear",
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Start worker on the short step."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_TEST_SHELL_QUIET_NOTICE_MS: String(RELAY_QUIET_MS),
+        FX_TRACE_SCOPES: RELAY_TRACE_SCOPES,
+      },
+      timeoutMs: 30_000,
+    });
+    const context = relayContext(result, tracePath);
+    expect(result.code, context).toBe(0);
+    expect(state.noteTurns, context).toBe(0);
+    expect(state.reportSeen, context).toBe(true);
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace, context).not.toContain("event=quiet_crossing");
+    expect(trace, context).not.toContain("event=quiet_note_");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("main's own quiet command gets the notice and no relay, since main has no parent", async () => {
+  const root = createFixtureRoot("quiet-relay-main");
+  const tracePath = join(root.root, "trace.log");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (hasCurrentToolResult(body, "main-stop")) return fakeGatewayFinalText("QUIET-MAIN-DONE");
+    if (hasCurrentToolResult(body, "main-wait")) {
+      const session = shellResult(body, "main-run").session_id;
+      return fakeGatewayToolCall("main-stop", "shell", { request: { action: "stop", session_id: session } });
+    }
+    if (hasCurrentToolResult(body, "main-run")) {
+      const session = shellResult(body, "main-run").session_id;
+      return fakeGatewayToolCall("main-wait", "shell", {
+        request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+      });
+    }
+    return fakeShellRun("main-run", "sh -c 'printf QUIET-MAIN; exec sleep 600'", { yield_time_ms: 300 });
+  }, {
+    classifierDecision: "clear",
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Run the quiet step yourself."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_TEST_SHELL_QUIET_NOTICE_MS: String(RELAY_QUIET_MS),
+        FX_TRACE_SCOPES: RELAY_TRACE_SCOPES,
+      },
+      timeoutMs: 30_000,
+    });
+    const context = relayContext(result, tracePath);
+    expect(result.code, context).toBe(0);
+    expect(parseAskJson(result.stdout).output).toContain("QUIET-MAIN-DONE");
+    const trace = readFileSync(tracePath, "utf8");
+    // The crossing happened, and nothing was posted or dropped for it.
+    expect(trace, context).toContain("event=quiet_crossing");
+    expect(trace, context).not.toContain("event=quiet_note_");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);

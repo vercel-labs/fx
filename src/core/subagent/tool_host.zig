@@ -12,6 +12,7 @@ const managed_owner = @import("managed_owner.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const live_metrics = @import("live_metrics.zig");
+const activity_status = @import("../output/activity_status.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
@@ -74,6 +75,24 @@ fn unavailableChildRun(
     _: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     return error.ProviderFailed;
+}
+
+/// fx's note from a subagent whose command crossed the quiet limit, as its
+/// parent reads it. `command` is already one terminal-safe line.
+fn quietNoteText(writer: *std.Io.Writer, command: []const u8, quiet_ms: u64) std.Io.Writer.Error!void {
+    try writer.print("fx: my command `{s}` has had no output for ", .{command});
+    try activity_status.writeElapsed(writer, @intCast(quiet_ms / std.time.ms_per_s));
+    try writer.writeAll(". It may still be working, or it may be hung. Message me to check on it, or stop me.");
+}
+
+test "the quiet note names the command and how long it has been quiet" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try quietNoteText(&writer, "node verify.mjs --mock", 125_000);
+    try std.testing.expectEqualStrings(
+        "fx: my command `node verify.mjs --mock` has had no output for 2m5s. It may still be working, or it may be hung. Message me to check on it, or stop me.",
+        writer.buffered(),
+    );
 }
 
 test "managed execution receipts retain the pending contract" {
@@ -1708,6 +1727,10 @@ pub const Runtime = struct {
         // The open subagents a status that names none reports on, named in
         // its result for its row.
         var open: std.ArrayList([]const u8) = .empty;
+        // Read before the locks below: the owner takes the registry's lock
+        // under its own mutex.
+        const calls = try self.managed.currentCalls(a);
+        const now_ms = io_mod.milliTimestamp();
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         var lock = self.managed.state_store.acquireLock();
@@ -1724,6 +1747,12 @@ pub const Runtime = struct {
             }
             if (listed > 0) try out.writer.writeByte('\n');
             try out.writer.print("{s}: {s}", .{ name, self.childStateLocked(child).label() });
+            if (self.isBusyLocked(child.id)) for (calls) |entry| {
+                if (!std.mem.eql(u8, entry.child_id, child.id)) continue;
+                try out.writer.print(", in {s} for ", .{entry.call.label()});
+                try activity_status.writeElapsed(&out.writer, @intCast(entry.call.runningMs(now_ms) / std.time.ms_per_s));
+                break;
+            };
             if (waiting > 0) try out.writer.print(", {d} waiting message{s}", .{ waiting, if (waiting == 1) "" else "s" });
             if (child.last_outcome) |outcome| try out.writer.print(", last work {s}", .{@tagName(outcome)});
             try out.writer.print(", reports {s}", .{@tagName(child.report_rule)});
@@ -2034,6 +2063,58 @@ pub const Runtime = struct {
             arena.allocator().print("fx: my last request failed and waits for the user ({s}). Only the user can continue it, on my screen, so tell them.", .{reason})) catch return;
         sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
             debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+    }
+
+    /// Tells the owner, as child `child_id`'s own message, that a shell
+    /// command of its running turn crossed the quiet limit, once for each
+    /// quiet spell, so a parent that waits on it hears of a command that may
+    /// be hung (`tests/tla/subagent/QuietRelay.tla`). A note for a child that
+    /// is closing or gone, or one the parent's queue refuses, is dropped with
+    /// a trace line. The check and the post are separate steps, since the
+    /// sink takes its own locks: a close between them lets that one note
+    /// through, as it does a child's own message.
+    pub fn noteChildQuiet(self: *Runtime, child_id: []const u8, name: []const u8, crossing: types.QuietCrossing) void {
+        if (!self.childOpen(child_id)) return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason=closed quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+        const sink = self.report_sink orelse return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason=no_parent quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+        var label: [live_metrics.max_label_bytes]u8 = undefined;
+        const command = label[0..live_metrics.storeLabel(&label, crossing.command)];
+        var buffer: [live_metrics.max_label_bytes + 256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        quietNoteText(&writer, command, crossing.quiet_ms) catch
+            return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason=too_long quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err|
+            return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason={s} quiet_ms={d}", .{ child_id, @errorName(err), crossing.quiet_ms });
+        debug_trace.eventf("mailbox", "quiet_note_posted", .{}, "child={s} quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+    }
+
+    /// Whether `child_id` is one of this host's children and not closing.
+    fn childOpen(self: *Runtime, child_id: []const u8) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        if (self.closingIndexLocked(child_id) != null) return false;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = self.managed.state_store.load(arena.allocator()) catch |err| {
+            debug_trace.logf("mailbox", "quiet note check failed child={s} err={s}", .{ child_id, @errorName(err) });
+            return false;
+        };
+        for (registry.children) |child| if (std.mem.eql(u8, child.id, child_id)) return true;
+        return false;
+    }
+
+    /// Records the start, or with a null `label` the end, of call `call_id`
+    /// in child `child_id`'s running turn, for status and the agent list:
+    /// the interactive app calls it for its hosted children, whose events
+    /// reach the app instead of the turn.
+    pub fn noteChildCall(self: *Runtime, child_id: []const u8, call_id: []const u8, label: ?[]const u8) void {
+        self.managed.noteCall(child_id, call_id, label, io_mod.milliTimestamp());
+    }
+
+    /// Child `child_id`'s current tool call, while its turn runs.
+    pub fn childCall(self: *Runtime, child_id: []const u8) ?live_metrics.Call {
+        return self.managed.currentCall(child_id);
     }
 
     const ChildProfile = union(enum) {
@@ -3847,6 +3928,29 @@ test "the root has no parent to message" {
     defer runtime.deinit();
     const body = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-1", null);
     try std.testing.expect(std.mem.find(u8, body, "no_parent") != null);
+}
+
+test "a quiet note for a child this host does not have posts nothing" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const Count = struct {
+        posts: usize = 0,
+        fn post(raw: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.posts += 1;
+        }
+    };
+    var count: Count = .{};
+    runtime.report_sink = .{ .context = &count, .post_fn = Count.post };
+    // A closed child is gone from the registry, as this one never was in it.
+    runtime.noteChildQuiet("no-such-child", "ghost", .{ .command = "sleep 600", .quiet_ms = 120_000 });
+    try std.testing.expectEqual(@as(usize, 0), count.posts);
 }
 
 test "a subagent's message to its parent carries what the user typed in the turn that sends it" {

@@ -1265,7 +1265,8 @@ pub fn Runtime(comptime App: type) type {
             );
             // A terminal reset clears the screen and replays the transcript,
             // so the entries the transcript window kept only because a row of
-            // theirs was on screen go before the replay.
+            // theirs was on screen go before the replay, unless the replay is
+            // a resumed transcript's first paint (`transcriptWindowScreenCleared`).
             if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowScreenCleared")) {
                 if (app.shell.terminal_reset_pending) try app.shell.transcriptWindowScreenCleared(app.alloc);
             }
