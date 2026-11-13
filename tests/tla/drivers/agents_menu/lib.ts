@@ -88,6 +88,25 @@ export function listRows(paneEscapes: string): Array<{ name: string; instance: b
   return rows;
 }
 
+/// Each row's state as the open list draws it, "working" or "idle": a
+/// subagent that finished counts as idle whether or not the person has seen it
+/// (the list calls that "finished"). Any other state, such as one that waits
+/// for an approval, is an error here, since the drivers that read it start no
+/// such agent.
+export function listStates(paneEscapes: string): Array<{ name: string; instance: boolean; state: "working" | "idle" }> {
+  const rows: Array<{ name: string; instance: boolean; state: "working" | "idle" }> = [];
+  for (const line of paneEscapes.split("\n")) {
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+    const row = /^ {2}(?:(fx \d+|main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S(.*)$/.exec(plain);
+    if (!row) continue;
+    const state = /(?: {2,})(working|idle|finished|needs approval|has a question|needs you)(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
+    if (state === undefined) continue;
+    if (state !== "working" && state !== "idle" && state !== "finished") throw new Error(`the list shows a row in state "${state}": ${plain}`);
+    rows.push({ name: (row[1] ?? row[2])!, instance: row[1] !== undefined, state: state === "working" ? "working" : "idle" });
+  }
+  return rows;
+}
+
 export class World {
   readonly instances: string[];
   readonly subs: string[];
@@ -392,6 +411,11 @@ export class World {
 
   async capture(): Promise<string> {
     return (await this.session.capturePane()) as string;
+  }
+
+  /// The pane with its escapes, as `listRows` and `listStates` read it.
+  async captureEscapes(): Promise<string> {
+    return (await this.session.capturePaneEscapes()) as string;
   }
 
   /// Pastes `text`, which closes the list and lands in the composer of the
