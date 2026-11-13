@@ -7953,16 +7953,19 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childBodies.push(body);
         return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
       }
-      if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
-      if (body.includes("text-status")) {
+      // The worker answers at once, so its report may reach the parent before
+      // either call's result does; each result is taken from the first request
+      // that carries it, report or not.
+      if (body.includes("text-status") && !statusBody) {
         statusBody = body;
         return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
       }
-      if (body.includes("text-delegate")) {
+      if (body.includes("text-delegate") && !sentBody) {
         sentBody = body;
         // Every other action as JSON text is read too.
         return fakeGatewayToolCall("text-status", "subagent", { request: JSON.stringify({ action: "status" }) });
       }
+      if (latestUserIsReport(body) || sentBody) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
       return fakeGatewayToolCall("text-delegate", "subagent", {
         request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
       });
