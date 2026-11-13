@@ -3016,6 +3016,7 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     errdefer alloc.free(owned_model_type);
     const name = try parseModelName(alloc, entry.object.get("name"));
     errdefer if (name) |value| alloc.free(value);
+    const fast_variant_of = try parseFastVariantOf(alloc, entry.object.get("fast_variant_of"), id);
 
     return .{
         .id = id,
@@ -3035,7 +3036,16 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .context_window = context_window,
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
+        .fast_variant_of = fast_variant_of,
     };
+}
+
+/// The model whose Fast mode runs the model `id`; null when the catalog names
+/// none, or names something other than another model's id.
+fn parseFastVariantOf(alloc: std.mem.Allocator, value: ?std.json.Value, id: []const u8) !?[]u8 {
+    const raw = value orelse return null;
+    if (raw != .string or raw.string.len == 0 or std.mem.eql(u8, raw.string, id)) return null;
+    return try alloc.dupe(u8, raw.string);
 }
 
 /// The catalog's display name without surrounding whitespace; null when it is missing, not a string, or blank.
@@ -3436,6 +3446,30 @@ test "gateway catalog derives Fast support from explicit provider metadata" {
             if (std.mem.eql(u8, wanted.id, actual.id)) break actual.supports_fast_mode;
         } else return error.TestExpectedEqual;
         try std.testing.expectEqual(wanted.supports_fast_mode, supports_fast_mode);
+    }
+}
+
+test "gateway catalog keeps the base model a fast variant names through the picker view" {
+    const json_text =
+        \\{"object":"list","data":[
+        \\  {"id":"provider/base","type":"language"},
+        \\  {"id":"provider/base-fast","type":"language","fast_variant_of":"provider/base"},
+        \\  {"id":"provider/self-fast","type":"language","fast_variant_of":"provider/self-fast"},
+        \\  {"id":"provider/blank-fast","type":"language","fast_variant_of":""},
+        \\  {"id":"provider/typed-fast","type":"language","fast_variant_of":["provider/base"]}
+        \\ ]}
+    ;
+
+    var catalog = try parseModelCatalogForView(std.testing.allocator, json_text, .picker);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 5), catalog.items.len);
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "provider/base-fast")) {
+            try std.testing.expectEqualStrings("provider/base", entry.fast_variant_of.?);
+        } else {
+            try std.testing.expect(entry.fast_variant_of == null);
+        }
     }
 }
 

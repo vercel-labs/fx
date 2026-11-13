@@ -3046,6 +3046,95 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "model picker leaves out a fast variant that Fast mode on a listed model runs",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const baseModel = "anthropic/claude-opus-5";
+      const foldedModel = `${baseModel}-fast`;
+      const plainModel = "provider/plain";
+      const keptModel = `${plainModel}-fast`;
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: baseModel,
+            type: "language",
+            released: 400,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+          },
+          {
+            id: foldedModel,
+            type: "language",
+            released: 400,
+            tags: ["tool-use"],
+            context_window: 1_000_000,
+            fast_variant_of: baseModel,
+          },
+          {
+            id: plainModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+          // Its base has no Fast mode, so this row is the only way to run it.
+          {
+            id: keptModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            context_window: 128_000,
+            fast_variant_of: plainModel,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-picker-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: plainModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/model");
+      const grid = await waitForModelsMenu(session, 3);
+      const rows = grid.filter((line) => line.includes(" context"));
+      expect(rows.map((line) => line.trim().split(/\s+/)[0])).toEqual([baseModel, plainModel, keptModel]);
+      expect(rows[0]).toContain("Fast mode");
+      expect(rows[2]).toMatch(/\bFast$/);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
+        5_000,
+      );
+
+      // The left-out model is still in the catalog, so its id selects it.
+      await session.sendLiteralText(`/model ${foldedModel}`);
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${foldedModel}`, 5_000);
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(foldedModel);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "model picker skips effort stage for reasoning models without declared tiers",
     async () => {
       const fixture = createModelsMenuFixture();
