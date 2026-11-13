@@ -156,12 +156,15 @@ pub fn rootIdsUntil(alloc: Allocator, home: []const u8, stop: anytype, complete:
     }
     var candidates = store.readOnlyCandidates();
     while (true) {
+        try roots.ensureUnusedCapacity(alloc, 1);
+        const id = (try candidates.nextId(alloc, null)) orelse break;
+        // Asked only when a folder is left, so a scan with nothing to read
+        // is complete however late it starts.
         if (stopNow(stop)) {
+            alloc.free(id);
             complete.* = false;
             break;
         }
-        try roots.ensureUnusedCapacity(alloc, 1);
-        const id = (try candidates.nextId(alloc, null)) orelse break;
         errdefer alloc.free(id);
         const kind = kindOf(&store, alloc, id) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -217,12 +220,12 @@ pub fn strayChildren(alloc: Allocator, home: []const u8, stop: anytype, complete
     }
     var candidates = store.readOnlyCandidates();
     while (true) {
+        const id = (try candidates.nextId(alloc, null)) orelse break;
+        defer alloc.free(id);
         if (stopNow(stop)) {
             complete.* = false;
             break;
         }
-        const id = (try candidates.nextId(alloc, null)) orelse break;
-        defer alloc.free(id);
         if ((kindOf(&store, alloc, id) catch continue) != .child) continue;
         const parent = parentOf(&store, alloc, id) catch |err| switch (err) {
             error.OutOfMemory => return err,
