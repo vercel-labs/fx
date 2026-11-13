@@ -20,10 +20,26 @@ pub const featured_models = [_][]const u8{
     "deepseek/deepseek-v4.1-flash",
 };
 
+/// The model fx uses for a team with an active Token Pass when the user has
+/// not chosen one.
+pub const pass_default_model = "deepseek/deepseek-v4.1-flash";
+
+/// What fx says when it moves to `pass_default_model`.
+pub const default_model_notice = "Token Pass is active, so fx uses " ++ pass_default_model ++ ". Change it with /model.";
+
 /// The provider AI Gateway reports for a request Token Pass served.
 const provider_slug = "token-pass";
 
 pub const docs_url = "https://vercel.com/docs/ai-gateway/token-pass";
+
+/// Where a team buys Token Pass.
+pub const purchase_url = "https://vercel.com/get/token-pass";
+
+/// The dim line under the Vercel team notice for a team that fx does not know
+/// has an active Token Pass.
+/// "Vercel Token Pass" is an OSC 8 link to `purchase_url`, so the terminal
+/// shows the name and not the address.
+pub const offer_line = "Get $150 of tokens for $30 with \x1b]8;;" ++ purchase_url ++ "\x1b\\Vercel Token Pass\x1b]8;;\x1b\\.";
 
 /// The dashboard's Token Pass tab, which shows the remaining credit and the
 /// reset date. Vercel fills in the signed-in team for `[team]`.
@@ -35,6 +51,10 @@ pub fn isFeaturedModel(model: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(model, featured)) return true;
     }
     return false;
+}
+
+test "the Token Pass default model is one Token Pass pays for" {
+    try std.testing.expect(isFeaturedModel(pass_default_model));
 }
 
 fn isTokenPassProvider(provider: []const u8) bool {

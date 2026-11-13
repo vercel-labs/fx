@@ -240,8 +240,13 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
             writeStderr(deps, "fx needs at least 5 terminal rows.\n");
             return .returned;
         },
-        error.RecordingStartFailed => {
-            writeStderr(deps, "fx: unable to start terminal recording.\n");
+        error.RecordingStartFailed,
+        error.RecordingDiskFull,
+        error.RecordingFileTooBig,
+        error.RecordingAccessDenied,
+        error.RecordingReadOnly,
+        => {
+            writeStderr(deps, recordingStartMessage(err));
             return .{ .exit = 1 };
         },
         error.NoRememberedSession => {
@@ -570,6 +575,18 @@ fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
         error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
         error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
         else => null,
+    };
+}
+
+/// Why a terminal recording asked for with FX_DEBUG_RECORD could not start,
+/// by the failure `record_tape.startFailure` named.
+fn recordingStartMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RecordingDiskFull => "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n",
+        error.RecordingFileTooBig => "fx: unable to start terminal recording: a file-size limit was reached.\n",
+        error.RecordingAccessDenied => "fx: unable to start terminal recording: permission denied.\n",
+        error.RecordingReadOnly => "fx: unable to start terminal recording: the disk is read-only.\n",
+        else => "fx: unable to start terminal recording.\n",
     };
 }
 
@@ -1552,6 +1569,32 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
 
         try std.testing.expectEqual(@as(u8, 1), outcome.exit);
         try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+    }
+}
+
+test "app entry says why a terminal recording could not start" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        init_error: anyerror,
+        message: []const u8,
+    }{
+        .{ .init_error = error.RecordingStartFailed, .message = "fx: unable to start terminal recording.\n" },
+        .{ .init_error = error.RecordingDiskFull, .message = "fx: unable to start terminal recording: the disk is full. Free some space, or unset FX_DEBUG_RECORD.\n" },
+        .{ .init_error = error.RecordingFileTooBig, .message = "fx: unable to start terminal recording: a file-size limit was reached.\n" },
+        .{ .init_error = error.RecordingAccessDenied, .message = "fx: unable to start terminal recording: permission denied.\n" },
+        .{ .init_error = error.RecordingReadOnly, .message = "fx: unable to start terminal recording: the disk is read-only.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = case.init_error;
+        capture.fail_unexpected_format = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     }
 }
 

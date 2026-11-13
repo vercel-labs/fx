@@ -38,9 +38,15 @@ const default_steer_yield_grace_ms: i64 = 1_000;
 /// `FX_TEST_STEER_YIELD_GRACE_MS` to hold steering behind a running command.
 /// Read once per wait.
 pub fn steerYieldGraceMs() i64 {
-    const raw = io_mod.getenv("FX_TEST_STEER_YIELD_GRACE_MS") orelse return default_steer_yield_grace_ms;
-    const value = std.fmt.parseInt(i64, raw, 10) catch return default_steer_yield_grace_ms;
-    return if (value < 0) default_steer_yield_grace_ms else value;
+    return steerYieldGraceFromValue(io_mod.getenv("FX_TEST_STEER_YIELD_GRACE_MS"));
+}
+
+/// The grace `value` names in whole milliseconds, or the default when it is
+/// missing, not a number, or negative.
+fn steerYieldGraceFromValue(value: ?[]const u8) i64 {
+    const raw = value orelse return default_steer_yield_grace_ms;
+    const parsed = std.fmt.parseInt(i64, raw, 10) catch return default_steer_yield_grace_ms;
+    return if (parsed < 0) default_steer_yield_grace_ms else parsed;
 }
 
 /// Whether a wait that began at `started_ms` stops now for steering: the
@@ -2099,6 +2105,15 @@ test "steering yield waits out its grace time" {
     try std.testing.expect(!steerYieldDue(&flag, 0, 999, 1_000));
     try std.testing.expect(steerYieldDue(&flag, 0, 1_000, 1_000));
     try std.testing.expect(!steerYieldDue(null, 0, 10_000, 1_000));
+}
+
+test "the steering grace falls back to the default for a bad test value" {
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue(null));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue(""));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue("-5"));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue("abc"));
+    try std.testing.expectEqual(@as(i64, 0), steerYieldGraceFromValue("0"));
+    try std.testing.expectEqual(@as(i64, 2_500), steerYieldGraceFromValue("2500"));
 }
 
 test "captured managed execution exposes full output only by opaque replay handle" {

@@ -467,6 +467,10 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
     const started_at_ms = io_mod.milliTimestamp();
+    const call_dir = workspace_access.AccessScope.primaryDirectoryOf(
+        execution_ctx.access_scope,
+        execution_ctx.workspace_root,
+    );
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
         request.call.name,
@@ -510,21 +514,69 @@ pub fn executeToolCallAuthorized(
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
             .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+            .call_id = request.call.id,
+            .dir = call_dir,
+            // The tool returned no result, so nothing shows that a command
+            // ran: a run cancelled or out of time before it started ends here,
+            // as does a shell that could not start.
+            .reads_startup_files = false,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
+    const outcome = classifyReturnedToolCallOutcome(result);
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(result),
+        .outcome = outcome,
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+        .call_id = request.call.id,
+        .dir = call_dir,
+        // Only a command that ran leaves a command result, which makes the call
+        // `command_failed`; a call refused before its command started, and one
+        // that succeeded, are not resolved again.
+        .reads_startup_files = outcome == .command_failed and
+            callReadsStartupFiles(execution_ctx, request.call_allocator, request.call),
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+/// Whether `call` is a run whose command reads the startup files the shell
+/// snapshot holds: one that admission's `runCommandContext` resolves to the
+/// `user` environment, as its routine-command rule does, in the login shell
+/// the snapshot captures. `interact` and `stop` calls, a `clean` profile, a
+/// clean start, a tty run in another shell, and a call that does not resolve
+/// read none of them.
+fn callReadsStartupFiles(ctx: Context, alloc: Allocator, call: ToolCall) bool {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = tool_admission.runCommandContext(ctx.admissionInput(), arena, call) catch return false;
+    const shell = switch (command.environment) {
+        .user => |path| path,
+        else => return false,
+    };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const login = switch (shell_resolver.environment(arena, configured, null) catch return false) {
+        .user => |path| path,
+        else => return false,
+    };
+    return sameShellPath(arena, shell, login);
+}
+
+/// Whether two shell paths name one file, as `/bin/bash` and `/usr/bin/bash`
+/// do where `/bin` links to `/usr/bin`. A path that does not resolve matches
+/// only itself.
+fn sameShellPath(arena: Allocator, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const real_a = io_mod.realpathAlloc(arena, a) catch return false;
+    const real_b = io_mod.realpathAlloc(arena, b) catch return false;
+    return std.mem.eql(u8, real_a, real_b);
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
@@ -4383,6 +4435,102 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "a call reads the startup files only when admission resolves it to a user-profile run" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry };
+    defer rt.deinit(std.testing.allocator);
+    const cases = [_]struct { arguments_json: []const u8, reads: bool }{
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", .reads = false },
+        // A clean start skips the startup files of any shell.
+        .{
+            .arguments_json = "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+            .reads = false,
+        },
+        // `interact` types into a session, here one that does not exist, and
+        // `stop` ends one; neither starts a command.
+        .{ .arguments_json = "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}", .reads = false },
+        .{ .arguments_json = "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}", .reads = false },
+        // The orchestrator adds the action a call leaves out before the call
+        // is stored, so a stored call without one never ran.
+        .{ .arguments_json = "{\"command\":\"ls\"}", .reads = false },
+        .{ .arguments_json = "not json", .reads = false },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "case", .name = "shell", .arguments_json = case.arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("arguments: {s}\n", .{case.arguments_json});
+            return err;
+        };
+    }
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
+    try std.testing.expect(!callReadsStartupFiles(rt.context(), std.testing.allocator, read));
+
+    // A tty run reads the snapshot's startup files only in the login shell
+    // the snapshot captured; another shell reads its own.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var login_buffer: [4096]u8 = undefined;
+    const login = switch (try shell_resolver.environment(arena, shell_resolver.configuredLoginShellInto(&login_buffer), null)) {
+        .user => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    const other: []const u8 = if (std.mem.endsWith(u8, login, "/zsh")) "/bin/bash" else "/bin/zsh";
+    const tty_cases = [_]struct { shell: ?[]const u8, reads: bool }{
+        .{ .shell = null, .reads = true },
+        .{ .shell = login, .reads = true },
+        .{ .shell = other, .reads = false },
+    };
+    for (tty_cases) |case| {
+        const shell_field = if (case.shell) |path|
+            try arena.print(",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\"}}", .{path})
+        else
+            "";
+        const arguments_json = try arena.print("{{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\"{s}}}", .{shell_field});
+        const call: ToolCall = .{ .id = "tty", .name = "shell", .arguments_json = arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("login {s}, arguments: {s}\n", .{ login, arguments_json });
+            return err;
+        };
+    }
+    // Two spellings of one file name one shell; a path that does not resolve
+    // matches only itself.
+    try std.testing.expect(sameShellPath(arena, "/bin/../bin/sh", "/bin/sh"));
+    try std.testing.expect(sameShellPath(arena, "/missing/zsh", "/missing/zsh"));
+    try std.testing.expect(!sameShellPath(arena, "/missing/zsh", "/missing/../missing/zsh"));
+}
+
+test "trace keeps a user-profile run cancelled before it starts as reading no startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    // Set before the call, so the runner stops before it starts a shell.
+    var cancel = std.atomic.Value(bool).init(true);
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry, .cancel_flag = &cancel };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // The shell tool reports the cancel as a failed result with no command
+    // result; a cancel the runner raises instead ends as an error.
+    if (executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "cancelled_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}",
+    })) |result| {
+        try std.testing.expect(result.cancelled);
+        try std.testing.expect(result.command_result_json == null);
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    var kept: [1]diagnostics.FailedToolCall = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotFailedToolCalls(&kept));
+    try std.testing.expectEqualStrings("cancelled_run", kept[0].callId());
+    try std.testing.expect(kept[0].outcome != .succeeded and kept[0].outcome != .command_failed);
+    // The trace writes `redefined` only for a call marked as reading them.
+    try std.testing.expect(!kept[0].reads_startup_files);
 }
 
 test "tool-call metrics retain caller identity across returned results" {

@@ -388,12 +388,12 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     if (raw.object.get("request")) |wrapper| {
         try problems.append(arena, "Put the action fields at the top level; shell takes no request wrapper.");
         var request = wrapper;
-        if (request == .string) {
-            request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return correction_json(alloc, problems.items, null),
-            };
-        }
+        // A wrapper written as JSON text is read like intake reads it, with
+        // the same depth limit.
+        tool_args.normalizeCompositeObjectValue(arena, &request) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return correction_json(alloc, problems.items, null),
+        };
         if (request != .object or request.object.count() > 32) {
             return correction_json(alloc, problems.items, null);
         }
@@ -1518,7 +1518,12 @@ fn closeTtyBestEffort(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
 ) void {
-    var closed = executeAuthorizedTerminal(ctx, session_id, .{ .close = .{
+    // The close ignores `cancel_flag`. A user cancel is when this cleanup
+    // matters most, and with the flag set the executor would cancel the
+    // close too and leave the command running.
+    var close_ctx = ctx;
+    close_ctx.cancel_flag = null;
+    var closed = executeAuthorizedTerminal(close_ctx, session_id, .{ .close = .{
         .session_id = session_id,
         .policy = .force,
         .authority = null,
@@ -2194,15 +2199,14 @@ fn resolveCwd(
     ctx: tool_dispatch.DispatchContext,
     requested: ?[]const u8,
 ) ![]const u8 {
-    const scope = ctx.access_scope orelse
-        workspace_access.AccessScope.primaryOnly(ctx.workspace_root);
-    const value = requested orelse return arena.dupe(u8, scope.primary_directory);
+    const primary = workspace_access.AccessScope.primaryDirectoryOf(ctx.access_scope, ctx.workspace_root);
+    const value = requested orelse return arena.dupe(u8, primary);
     if (std.mem.eql(u8, value, ".")) {
-        return arena.dupe(u8, scope.primary_directory);
+        return arena.dupe(u8, primary);
     }
     return pathing.resolveWorkspaceOrExternalPath(
         arena,
-        scope.primary_directory,
+        primary,
         value,
     );
 }
@@ -2353,6 +2357,11 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"},\"command\":\"false\"}", .retry = null },
+        // Text nested deeper than tool input may be, and an object encoded
+        // twice, are refused without a suggestion.
+        .{ .input = "{\"request\":\"" ++ text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300) ++ "\",\"yield_time_ms\":1}", .retry = null },
+        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\",\\\"x\\\":" ++ text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300) ++ "}\",\"yield_time_ms\":1}", .retry = null },
+        .{ .input = "{\"request\":\"\\\"{\\\\\\\"action\\\\\\\":\\\\\\\"run\\\\\\\",\\\\\\\"command\\\\\\\":\\\\\\\"true\\\\\\\"}\\\"\"}", .retry = null },
         .{ .input = "{", .retry = null },
         .{ .input = "[]", .retry = null },
     };
@@ -2389,6 +2398,28 @@ test "shell request correction suggests only unambiguous repairs without executi
             try std.testing.expect(detail.get("retry_with") == null);
         }
     }
+}
+
+test "shell request correction does not read a text wrapper nested deeper than tool input may be" {
+    const alloc = std.testing.allocator;
+    const deep = text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    const input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\",\\\"x\\\":" ++ deep ++ "}\",\"yield_time_ms\":1}";
+    const failure = switch (try decode(.{ .allocator = alloc }, input)) {
+        .failure => |failure| failure,
+        .input => |decoded| {
+            decoded.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(failure);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+    defer parsed.deinit();
+    const detail = parsed.value.object.get("error").?.object;
+    // Only the wrapper is named: nothing inside the text was read.
+    const problems = detail.get("problems").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), problems.len);
+    try std.testing.expectEqualStrings("Put the action fields at the top level; shell takes no request wrapper.", problems[0].string);
+    try std.testing.expect(detail.get("retry_with") == null);
 }
 
 fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8) !void {

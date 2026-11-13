@@ -7901,6 +7901,146 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 100_000);
 
+  test("a shell request wrapper the model wrote as JSON text runs its command", async () => {
+    const root = createFixtureRoot("shell-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const marker = join(root.workspace, "request-text-marker.txt");
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("text_request", "shell", {
+            request: JSON.stringify({
+              action: "run",
+              command: "printf REQUEST_TEXT_OK > request-text-marker.txt && cat request-text-marker.txt",
+              profile: "clean",
+              yield_time_ms: 30000,
+            }),
+          });
+        case 1:
+          expect(shellResult(body, "text_request")).toMatchObject({
+            state: "completed", exit_code: 0, output_delta: "REQUEST_TEXT_OK",
+          });
+          return fakeGatewayFinalText("REQUEST_TEXT_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Run the fixture command."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("REQUEST_TEXT_COMPLETE");
+      expect(readFileSync(marker, "utf8")).toBe("REQUEST_TEXT_OK");
+      expect(gateway.requests).toHaveLength(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a subagent message whose request wrapper the model wrote as JSON text reaches the worker", async () => {
+    const root = createFixtureRoot("subagent-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const childBodies: string[] = [];
+    let sentBody = "";
+    let statusBody = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childBodies.push(body);
+        return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
+      }
+      // The worker answers at once, so its report may reach the parent before
+      // either call's result does; each result is taken from the first request
+      // that carries it, report or not.
+      if (body.includes("text-status") && !statusBody) {
+        statusBody = body;
+        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+      }
+      if (body.includes("text-delegate") && !sentBody) {
+        sentBody = body;
+        // Every other action as JSON text is read too.
+        return fakeGatewayToolCall("text-status", "subagent", { request: JSON.stringify({ action: "status" }) });
+      }
+      if (latestUserIsReport(body) || sentBody) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
+      return fakeGatewayToolCall("text-delegate", "subagent", {
+        request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
+      });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Start a worker with a wrapped request."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(toolResultOutput(sentBody, "text-delegate")).not.toContain("request must be an object");
+      expect(childBodies.some((body) => body.includes("TEXT_WRAPPED_TASK"))).toBe(true);
+      // Intake keeps the call with its top-level arguments, as it does for an
+      // object wrapper, so the history and the review see the real action.
+      const call = (gatewayRequest(sentBody).prompt.flatMap((message) =>
+        Array.isArray(message.content) ? message.content : []
+      ) as Array<Record<string, unknown>>).find((part) => part.type === "tool-call" && part.toolCallId === "text-delegate");
+      expect(call?.input).toEqual({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" });
+      const status = toolResultOutput(statusBody, "text-status");
+      expect(status).not.toContain("request must be an object");
+      expect(status).toContain("worker");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a shell request wrapper as JSON text with extra fields or nested too deep gets the correction", async () => {
+    const root = createFixtureRoot("shell-request-text-correction");
+    const tracePath = join(root.root, "trace.log");
+    const command = "printf NOT_RUN > request-text-correction.txt";
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("text_with_extra", "shell", {
+            request: JSON.stringify({ action: "run", command, profile: "clean" }),
+            yield_time_ms: 1000,
+          });
+        case 1: {
+          const correction = JSON.parse(toolResultOutput(body, "text_with_extra")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.problems).toContain("Put the action fields at the top level; shell takes no request wrapper.");
+          expect(correction.retry_with).toEqual({ action: "run", command, profile: "clean", yield_time_ms: 1000 });
+          return fakeGatewayToolCall("text_too_deep", "shell", {
+            request: "{\"a\":".repeat(300) + "1" + "}".repeat(300),
+          });
+        }
+        case 2: {
+          const correction = JSON.parse(toolResultOutput(body, "text_too_deep")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.retry_with).toBeUndefined();
+          return fakeGatewayFinalText("REQUEST_TEXT_CORRECTED");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Run the fixture command."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("REQUEST_TEXT_CORRECTED");
+      expect(existsSync(join(root.workspace, "request-text-correction.txt"))).toBe(false);
+      expect(gateway.requests).toHaveLength(3);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   test.skipIf(!tmuxAvailable())(
     "a read_tool_result request the model wrote as JSON text reads the saved output",
     async () => {
@@ -7910,6 +8050,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const marker = "READ_TEXT_MATCH";
       let step = 0;
       let readOutput = "";
+      let replayedInput: unknown = null;
       const gateway = startDynamicFakeGateway((body) => {
         switch (step++) {
           case 0:
@@ -7923,9 +8064,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               request: JSON.stringify({ handle: source.full_output_handle, query: marker }),
             });
           }
-          case 2:
+          case 2: {
             readOutput = toolResultOutput(body, "read-text-page");
+            const parts = (JSON.parse(body) as { prompt: Array<{ content?: Array<Record<string, unknown>> }> })
+              .prompt.flatMap((message) => message.content ?? []);
+            replayedInput = parts.find((part) =>
+              part.type === "tool-call" && part.toolCallId === "read-text-page"
+            )?.input;
             return fakeGatewayFinalText("READ_TEXT_COMPLETE");
+          }
           default:
             return new Response("unexpected request", { status: 500 });
         }
@@ -7943,6 +8090,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readOutput).not.toContain("must be an object");
         // The row names the output it searches, as it does for an object request.
         expect(pane).toContain(`output for "${marker}"`);
+        // History replays the call with the top-level arguments the schema
+        // advertises, as it does for a wrapper that is an object.
+        expect(replayedInput).toMatchObject({ query: marker });
+        expect(replayedInput).not.toHaveProperty("request");
         await tui.sendText("/quit");
         expect(await tui.waitForSessionEnd(15000)).toBe(true);
         tui = null;
@@ -13546,7 +13697,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const tracePath = join(root.root, "trace.log");
     writeFileSync(join(root.workspace, "notes.txt"), "malformed call fixture\n");
     // Gemini ends a reply with MALFORMED_FUNCTION_CALL after a local tool
-    // call, and its answer to the resend calls a tool again.
+    // call. fx tells it at once that the call could not be read, and its
+    // answer calls the tool again.
     const responses = [
       fakeGatewaySse([
         { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
@@ -13581,19 +13733,221 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(json.recovery?.message ?? "").not.toContain("Tool state needs review");
       expect(gateway.requestCount()).toBe(3);
-      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).toContain(
+        "Your last tool call to read_file could not be read: the provider reported MALFORMED_FUNCTION_CALL",
+      );
       expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
+      expect(result.stderr).not.toContain("next try in");
+      expect(`${result.stdout}\n${result.stderr}`).toContain("Asking it to try again.");
       expect(toolResultOutput(gateway.requests[2]!.body, "read_resent")).toContain(
         "malformed call fixture",
       );
+      expect(trace).toContain("event=malformed_tool_call_feedback");
       expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("a recorded Gemini MALFORMED_FUNCTION_CALL reply gets feedback and the turn continues", async () => {
+    const root = createFixtureRoot("malformed-function-call-recorded");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "a.txt"), "alpha\nbeta\n");
+    // gemini-4-carbon's own stream for a reply it could not finish: reasoning,
+    // a sentence, and the error finish, with no tool call event.
+    const recorded = readFileSync(
+      join(import.meta.dirname, "fixtures", "gemini-malformed-function-call.sse"),
+      "utf8",
+    );
+    const responses = [
+      sse(recorded),
+      fakeGatewaySse([
+        { type: "tool-call", toolCallId: "read_a", toolName: "read_file", input: { path: "a.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+      ]),
+      fakeGatewayFinalText("The second line of a.txt is beta."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the read_file tool to read a.txt, then tell me its second line."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("The second line of a.txt is beta.");
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain(
+        "Your last tool call could not be read: the provider reported MALFORMED_FUNCTION_CALL",
+      );
+      expect(gateway.requests[1]!.body).not.toContain('"toolChoice":{"type":"none"}');
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("three malformed function call finishes in a row end the turn with a notice", async () => {
+    const root = createFixtureRoot("malformed-function-call-three");
+    const tracePath = join(root.root, "trace.log");
+    const malformed = () =>
+      fakeGatewaySse([
+        { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+      ]);
+    const responses = [malformed(), malformed(), malformed(), fakeGatewayFinalText("must not be requested")];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Write the report."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const combined = `${result.stdout}\n${result.stderr}`;
+
+      expect(result.code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain("Your last tool call could not be read");
+      expect(gateway.requests[2]!.body).toContain("could not be read again");
+      expect(gateway.requests[2]!.body).toContain("make smaller calls");
+      expect(combined).toContain(
+        "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL).",
+      );
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed reply that started a provider search resends with tools on", async () => {
+    const root = createFixtureRoot("failed-provider-search");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      fakeGatewaySse([
+        { type: "tool-input-start", id: "search_1", toolName: "exa_search" },
+        { type: "finish", finishReason: { unified: "error", raw: "provider_error" } },
+      ]),
+      fakeGatewayFinalText("Answered after the failed search."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Search for the release notes."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Answered after the failed search.");
+      expect(gateway.requestCount()).toBe(2);
+      // A search only reads, so a second one is safe: tools stay on.
+      expect(gateway.requests[1]!.body).not.toContain(
+        '"toolChoice":{"type":"none"}',
+      );
+      expect(gateway.requests[1]!.body).toContain("search again if you still need one");
+      expect(gateway.requests[1]!.body).not.toContain("Reconcile the available tool evidence");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a turn killed while its malformed-call feedback waits resumes with tools on and runs nothing twice", async () => {
+    const root = createFixtureRoot("malformed-call-crash");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "malformed crash fixture\n");
+    let releaseHeld: (() => void) | undefined;
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    let served = 0;
+    const gateway = startDynamicFakeGateway(async () => {
+      const request = served++;
+      if (request === 0) {
+        return fakeGatewaySse([
+          { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+          { type: "tool-call", toolCallId: "read_malformed", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+        ]);
+      }
+      if (request === 1) {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return fakeGatewayFinalText("Too late.");
+      }
+      if (request === 2) {
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "read_after_crash", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+        ]);
+      }
+      return fakeGatewayFinalText("Recovered after the malformed crash.");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "Read notes.txt."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      // fx dies while the feedback request waits on the gateway.
+      proc.kill("SIGKILL");
+      await proc.exited;
+      expect(gateway.requests[1]!.body).toContain("Your last tool call to read_file could not be read");
+      const sessionId = onlySessionId(root.home);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Continue after the crash."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      const json = parseAskJson(resumed.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(resumed.code).toBe(0);
+      expect(json.output).toContain("Recovered after the malformed crash.");
+      // The malformed call never ran, so the resume keeps tools on and the
+      // model's new call runs once.
+      for (const request of gateway.requests.slice(2)) {
+        expect(request.body).not.toContain('"toolChoice":{"type":"none"}');
+      }
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
+      expect(trace).not.toContain("event=malformed_tool_call_rejected");
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 // Statuses and streams the request-recovery campaign found ending turns that a

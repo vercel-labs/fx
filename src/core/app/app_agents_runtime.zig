@@ -24,6 +24,7 @@ const app_process_runtime = @import("app_process_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const profiles = @import("../profiles/profiles.zig");
+const worker_status = @import("../output/worker_status.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -324,6 +325,28 @@ pub const Busiest = enum { needs_approval, has_question, needs_you, working, idl
 /// An agent that restarting fx, as an upgrade does, would stop, and what it
 /// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
 pub const BusyAgent = struct { name: []const u8, doing: Busiest };
+
+/// One subagent as `/trace` shows it (`Runtime.traceRows`): what the agent
+/// list says of it, and its status row. Every string but `status` borrows
+/// from the app, so a row is read on the main loop before anything changes.
+pub const TraceRow = struct {
+    /// Its session ID, the name of its folder in the session store.
+    id: []const u8,
+    /// The name its parent gave it, or empty for a one-off.
+    name: []const u8,
+    profile: []const u8,
+    title: []const u8,
+    /// What it is doing, as the agent list says, such as `needs_you`.
+    state: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    /// Its status row, such as a failed request that waits for the user, or
+    /// empty. Owned by the allocator `traceRows` was given.
+    status: []const u8,
+    /// The host that started it, whose registry holds its work, or null
+    /// before it is bound.
+    host: ?*subagent_tool_host.Runtime,
+};
 
 /// What an agent in `state` is doing for a state that stands for others,
 /// or null when it is idle. A finished turn counts as idle.
@@ -2399,6 +2422,40 @@ pub fn Runtime(comptime App: type) type {
         /// child is on screen, its own slot's otherwise.
         fn pacerOf(app: *App, child: *ChildAgent) *AssistantPacer {
             return if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
+        }
+
+        /// The app's subagents in the order they started, for `/trace`.
+        /// Main loop only. `alloc` owns each row's `status`.
+        pub fn traceRows(app: *App, alloc: Allocator, out: *std.ArrayList(TraceRow)) !void {
+            for (app.child_agents.items) |child| {
+                const agent = &child.agent;
+                if (agent.role != .subagent) continue;
+                const model = provider_runtime.modelOf(app, agent);
+                try out.append(alloc, .{
+                    .id = child.id,
+                    .name = child.name,
+                    .profile = if (child.profile.len > 0) child.profile else profiles.main_name,
+                    .title = agent.session_title.items,
+                    .state = @tagName(stateOf(app, child)),
+                    .model = model,
+                    .effort = effortLabel(app, agent, model),
+                    .status = try statusText(app, child, alloc),
+                    .host = child.parent_host,
+                });
+            }
+        }
+
+        /// A copy of the label on agent `target`'s status row, or empty.
+        fn statusText(app: *App, target: ?*ChildAgent, alloc: Allocator) ![]const u8 {
+            const state: *const worker_status.State = if (target == app.agent_on_screen) blk: {
+                if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return "";
+                break :blk app.shell.worker_status_state();
+            } else &screenOf(app, target).transcript.notebook.worker_status;
+            const projection = state.projection() orelse return "";
+            return switch (projection) {
+                .turn_thinking => |row| try alloc.dupe(u8, row.label),
+                .none, .tool_slot => "",
+            };
         }
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {

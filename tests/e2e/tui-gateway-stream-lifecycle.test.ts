@@ -1746,6 +1746,70 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
   }, TIMEOUT * 2);
 
+  test("a malformed tool call shows that fx asked the model to try again, then the answer", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-malformed-call-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    writeFileSync(join(workspacePath, "notes.txt"), "malformed call fixture\n");
+    const workspace = realpathSync(workspacePath);
+    // Gemini ends a reply with MALFORMED_FUNCTION_CALL after a local tool call.
+    const queuedGateway = startFakeGateway(
+      [
+        fakeGatewaySse([
+          { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+          { type: "tool-call", toolCallId: "read_malformed", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+        ]),
+        fakeGatewaySse([
+          { type: "tool-call", toolCallId: "read_again", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+        ]),
+        fakeGatewayFinalText("MALFORMED_RECOVERY_DONE"),
+      ],
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] },
+    );
+    gateway = queuedGateway;
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 120,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-malformed-call-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Read notes.txt.");
+    await session.waitForText("MALFORMED_RECOVERY_DONE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    const scrollback = (await session.captureFullScrollback()).replace(/\s+/g, " ");
+    expect(scrollback).toContain(
+      "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
+    );
+    expect(scrollback).not.toContain("next try in");
+    expect(scrollback).not.toContain("Tool state needs review");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  }, TIMEOUT * 2);
+
   test("trace report explains a rejected image when the model catalog is unavailable", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-trace-catalog-")));
     const home = join(root, "home");
@@ -5148,6 +5212,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           "steering request while the command runs",
         );
         expect(existsSync(finishedPath)).toBe(false);
+        // The command has no exit status yet, so its row must not read "Ran".
+        const backgroundScrollback = await session.captureFullScrollback();
+        expect(backgroundScrollback).toContain("Still running while");
+        expect(backgroundScrollback).not.toContain("Ran while");
         const continuedBody = steeringGateway.requests[1]!.body;
         expect(continuedBody).toContain("<user_steering>");
         expect(continuedBody).toContain(steering);
@@ -5186,26 +5254,30 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
-  test(
-    "Escape interrupts a running tool and starts pending steering without review",
+  for (const tty of [false, true]) test(
+    `Escape interrupts a running tool and starts pending steering without review with tty=${tty}`,
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-immediate-steering-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "immediate-steering-tool.pid");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       const steering = "Apply IMMEDIATE_STEERING_SENTINEL now.";
       const finalText = "IMMEDIATE_STEERING_COMPLETE";
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
       const steeringGateway = startFakeGateway([
         fakeGatewayToolCall("immediate_steering_tool", "shell", {
           request: {
             action: "run",
             yield_time_ms: 30_000,
             timeout_ms: 600_000,
-            command: "sleep 30",
+            tty,
+            command,
           },
         }),
         fakeGatewayFinalText(finalText),
@@ -5236,7 +5308,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the immediate steering fixture.");
-      await session.waitForText("Running sleep 30", TIMEOUT);
+      await session.waitForText("Running printf", TIMEOUT);
+      await waitForCondition(
+        () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+        "immediate steering command pid",
+      );
+      const commandPid = Number(readTrimmed(pidPath));
+      expect(isProcessAlive(commandPid)).toBe(true);
       await session.sendText(steering);
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
@@ -5254,6 +5332,88 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).toContain(steering);
       expect(trace).toContain("steering_pending=true");
       expect(trace).toContain("outcome_kind=interrupted");
+      // The interrupt ends the command, so no process outlives its session.
+      await waitForCondition(
+        () => !isProcessAlive(commandPid),
+        "interrupted command exit",
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "Escape ends a running tty command with no steering",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tty-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "tty-escape-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
+      const escapeGateway = startFakeGateway([
+        fakeGatewayToolCall("tty_escape_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            tty: true,
+            command,
+          },
+        }),
+      ]);
+      gateway = escapeGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tty-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: escapeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: escapeGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: escapeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the tty escape fixture.");
+      await session.waitForText("Running printf", TIMEOUT);
+      await waitForCondition(
+        () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+        "tty escape command pid",
+      );
+      const commandPid = Number(readTrimmed(pidPath));
+      expect(isProcessAlive(commandPid)).toBe(true);
+
+      await session.sendInterruptEscapePair(TIMEOUT);
+      // The interrupt ends the command, so no process outlives its session.
+      await waitForCondition(
+        () => !isProcessAlive(commandPid),
+        "interrupted tty command exit",
+      );
+      // fx can write the interrupt outcome after the command exits.
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes("outcome_kind=interrupted"),
+        "interrupted turn outcome",
+      );
+      expect(escapeGateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);

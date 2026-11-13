@@ -432,6 +432,61 @@ pub const Runtime = struct {
         alloc.free(entry.purpose);
     }
 
+    /// What `/trace` says of one subagent from the registry.
+    pub const TraceChild = struct {
+        id: []u8,
+        phase: child_state.Phase,
+        /// How its last piece of work ended, or null before its first ends.
+        last_outcome: ?child_state.Outcome,
+        /// Why that work failed, or empty.
+        last_failure: []u8,
+        /// Whether `/close` is closing it.
+        closing: bool,
+    };
+
+    /// Every subagent of the root, with its work phase and last outcome,
+    /// one that is closing too. `alloc` owns the listing: `/trace` passes an
+    /// arena, and this file's tests free it with `freeTraceChildren`.
+    pub fn traceChildren(self: *Runtime, alloc: Allocator) ![]TraceChild {
+        // Admission before the registry, as everywhere in this host.
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        const listing = try alloc.alloc(TraceChild, registry.children.len);
+        var filled: usize = 0;
+        errdefer {
+            for (listing[0..filled]) |entry| freeTraced(alloc, entry);
+            alloc.free(listing);
+        }
+        for (registry.children) |child| {
+            const id = try alloc.dupe(u8, child.id);
+            errdefer alloc.free(id);
+            const failure = if (child.last_failure) |*diagnostic| diagnostic.view() else "";
+            listing[filled] = .{
+                .id = id,
+                .phase = child.phase,
+                .last_outcome = child.last_outcome,
+                .last_failure = try alloc.dupe(u8, failure),
+                .closing = self.closingIndexLocked(child.id) != null,
+            };
+            filled += 1;
+        }
+        return listing;
+    }
+
+    fn freeTraceChildren(alloc: Allocator, listing: []TraceChild) void {
+        for (listing) |entry| freeTraced(alloc, entry);
+        alloc.free(listing);
+    }
+
+    fn freeTraced(alloc: Allocator, entry: TraceChild) void {
+        alloc.free(entry.id);
+        alloc.free(entry.last_failure);
+    }
+
     /// A child's saved conversation, read without opening it. The caller
     /// owns the turns (`types.freeHistoryTurnSlice`).
     pub fn childHistory(self: *Runtime, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
@@ -3239,6 +3294,71 @@ test "stop ends a subagent's turn without a report and drops what waits for it" 
     try std.testing.expect(std.mem.find(u8, again, "reviewer was not working.") != null);
     const missing = try callTool(runtime, arena, .{ .stop = .{ .agent = "nobody" } }, "call-5", null);
     try std.testing.expect(std.mem.find(u8, missing, "child_unavailable") != null);
+}
+
+test "trace children show each subagent's work phase, last outcome, and closing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 0), traced.len);
+    }
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 1), traced.len);
+        try std.testing.expectEqualStrings(child_id, traced[0].id);
+        try std.testing.expectEqual(child_state.Phase.running, traced[0].phase);
+        try std.testing.expect(traced[0].last_outcome == null);
+        try std.testing.expectEqualStrings("", traced[0].last_failure);
+        try std.testing.expect(!traced[0].closing);
+    }
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 1), traced.len);
+        try std.testing.expectEqual(child_state.Phase.idle, traced[0].phase);
+        try std.testing.expectEqual(child_state.Outcome.cancelled, traced[0].last_outcome.?);
+        try std.testing.expect(!traced[0].closing);
+    }
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-3", null);
+    try waitForRuns(&fixture, 2);
+    _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-4", null);
+    {
+        // The list drops a closing subagent at once; the trace keeps it,
+        // marked, until it is gone from the registry.
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expect(traced.len <= 1);
+        if (traced.len == 1) try std.testing.expect(traced[0].closing);
+    }
+    try waitUntilQuiet(runtime);
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 0), traced.len);
+    }
 }
 
 test "the parent's close ends a working subagent's turn without a report and removes it for good" {
