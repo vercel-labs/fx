@@ -2325,7 +2325,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await resumed.waitForPane((pane) => pane.includes("main \u2193"), 10_000);
         await resumed.sendKeys("Down");
         const list = await resumed.waitForPane((pane) => pane.includes(LIST_HINT) && /^ {2}\u2514 auditor {2,}\S/m.test(pane), 15_000);
-        expect(list).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}idle/m);
+        // The quit cut the auditor's turn short, so its row says stopped.
+        expect(list).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}stopped/m);
         expect(list).not.toContain("new session");
 
         await resumed.sendLiteral("zebra");
