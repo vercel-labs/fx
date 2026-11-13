@@ -4060,7 +4060,7 @@ fn rawEnvValue(raw_env: RawEnviron, comptime key: []const u8) ?[]const u8 {
 }
 
 fn topLevelHelpColumns(raw_env: RawEnviron) usize {
-    if (stdoutTerminalColumns()) |columns| return columns;
+    if (terminal_env.stdoutColumns()) |columns| return columns;
     if (rawEnvValue(raw_env, "COLUMNS")) |value| {
         if (parseColumnCount(value)) |columns| return columns;
     }
@@ -4075,26 +4075,11 @@ fn topLevelHelpColumns(raw_env: RawEnviron) usize {
 fn topLevelHelpStyle(raw_env: RawEnviron) command_specs.HelpStyle {
     const no_color = terminal_env.noColorValue(rawEnvValue(raw_env, "NO_COLOR"));
     const dumb_terminal = terminal_env.dumbTerminalValue(rawEnvValue(raw_env, "TERM"));
-    return topLevelHelpStyleForValues(stdoutIsTerminal(), no_color, dumb_terminal);
+    return topLevelHelpStyleForValues(terminal_env.stdoutIsTerminal(), no_color, dumb_terminal);
 }
 
 fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: bool) command_specs.HelpStyle {
     return if (is_terminal and !no_color and !dumb_terminal) .ansi else .plain;
-}
-
-fn stdoutIsTerminal() bool {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
-    return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
-}
-
-fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
-
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws);
-    if (rc == -1 or ws.col == 0) return null;
-    return @intCast(ws.col);
 }
 
 fn parseColumnCount(value: []const u8) ?usize {
@@ -5506,6 +5491,7 @@ test {
     _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
+    _ = @import("core/output/session_list_text.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
