@@ -5735,6 +5735,42 @@ test "visiting a child agent puts its context, transcript, and pacer on the scre
     try std.testing.expect(child.screen.pacer.hasPending());
 }
 
+test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    // Main's resume handed its flow to the commit anchor, and the next frame
+    // has not repainted it yet.
+    app.shell.resume_handoff_repaint_pending = true;
+
+    // A hidden agent's work swaps main's transcript out only until it
+    // returns, so main's rows are still on screen.
+    const Body = struct {
+        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
+            try std.testing.expect(!a.shell.resume_handoff_repaint_pending);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, {}, Body.run);
+    try std.testing.expect(app.shell.resume_handoff_repaint_pending);
+
+    // Showing the subagent takes main's rows off the screen. Main comes back
+    // before the checks, so a failed check never leaves the subagent on
+    // screen for the cleanup.
+    try App.AgentsAppRuntime.show(&app, child);
+    const shown = app.agent_on_screen;
+    const held_off_screen = app.main_screen.transcript.resume_handoff_repaint_pending;
+    try App.AgentsAppRuntime.show(&app, null);
+    try std.testing.expect(shown == child);
+    try std.testing.expect(!held_off_screen);
+    try std.testing.expect(!app.shell.resume_handoff_repaint_pending);
+}
+
 test "the tick visits only the child agents with work waiting" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
