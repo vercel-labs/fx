@@ -2703,17 +2703,6 @@ test "subagent session title is derived only from the current request identity" 
     }
 }
 
-fn subagentProviderFailure(
-    alloc: Allocator,
-    error_code: []const u8,
-) Allocator.Error!subagent_tool_provider.Result {
-    const body = subagent_model_contract.encodeResultAlloc(alloc, .{
-        .ok = false,
-        .error_code = error_code,
-    }) catch return error.OutOfMemory;
-    return .{ .status = .failure, .body = body };
-}
-
 fn subagentProviderRefusal(
     alloc: Allocator,
     why: subagent_refusal.Refusal,
@@ -2762,7 +2751,8 @@ fn executeSubagentProvider(
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
-        return subagentProviderFailure(arena, "host_failure");
+        debug_trace.logf("subagent", "host failure err={s}", .{@errorName(err)});
+        return subagentProviderRefusal(arena, .{ .host_failure = .internal });
     };
     if (output.final_status) |status_value| {
         var status = status_value;

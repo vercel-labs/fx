@@ -2306,13 +2306,19 @@ pub const Runtime = struct {
                 }
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
-                try registry.appendPersistent(
+                registry.appendPersistent(
                     alloc,
                     child_id,
                     message.agent,
                     message.instructions orelse "",
                     active,
-                );
+                ) catch |err| switch (err) {
+                    error.CapacityExceeded => {
+                        debug_trace.logf("subagent", "create refused agent={s}: open subagents at the limit", .{message.agent});
+                        return managedAdmissionRejected(alloc, null, .{ .host_failure = .subagent_limit });
+                    },
+                    else => return err,
+                };
                 // Without one named it runs in fx's own main, which sets
                 // nothing, so it has what its parent has.
                 try registry.setProfile(alloc, child_id, request.override().profile orelse profiles.main_name);
@@ -3651,6 +3657,58 @@ test "a name no subagent bears, with no subagent ever started, says there are no
     try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .stop = .{ .agent = "ghost" } }, "call-1", null));
     try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .close = .{ .agent = "ghost" } }, "call-2", null));
     try std.testing.expectEqualStrings(none_open, try callTool(runtime, arena, .{ .status = .{ .agent = "ghost" } }, "call-3", null));
+}
+
+test "a message that would start a subagent past the session's limit says what to close, and closing one lifts it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    // One subagent that really ran, and so can be messaged.
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "keeper", .message = "go" } }, "call-keeper", null);
+    try std.testing.expectStringStartsWith(first, "{\"ok\":true");
+    try waitUntilQuiet(runtime);
+    // The rest of the limit is taken by subagents that only the registry knows.
+    {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        while (registry.children.len < child_state.max_children) {
+            const id = try session_store.generateSessionId(alloc);
+            defer alloc.free(id);
+            try registry.appendPersistent(alloc, id, try arena.print("worker-{d}", .{registry.children.len}), "", .{
+                .id = @constCast("fill-work"),
+                .message = @constCast("go"),
+                .created_at_ms = 1,
+            });
+        }
+        try runtime.managed.state_store.save(alloc, registry);
+    }
+
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"This session already has 256 open subagents, the most it holds. Close one you are done with, or send a message to one that exists.\",\"error_code\":\"host_failure\"}",
+        try callTool(runtime, arena, .{ .message = .{ .agent = "overflow", .message = "one too many" } }, "call-over", null),
+    );
+    // A message to one that exists still goes through.
+    const existing = try callTool(runtime, arena, .{ .message = .{ .agent = "keeper", .message = "again" } }, "call-existing", null);
+    try std.testing.expectStringStartsWith(existing, "{\"ok\":true");
+    try waitUntilQuiet(runtime);
+
+    // Closing one frees its place at once.
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "keeper" } }, "call-close", null);
+    try std.testing.expectStringStartsWith(closed, "{\"ok\":true");
+    const started = try callTool(runtime, arena, .{ .message = .{ .agent = "overflow", .message = "now it fits" } }, "call-fits", null);
+    try std.testing.expectStringStartsWith(started, "{\"ok\":true");
+    try waitUntilQuiet(runtime);
 }
 
 test "a subagent's message to its parent carries what the user typed in the turn that sends it" {

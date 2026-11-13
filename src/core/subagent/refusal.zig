@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const agent_frame = @import("../shared/agent_frame.zig");
+const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const model_contract = @import("model_contract.zig");
 const profiles = @import("../profiles/profiles.zig");
@@ -48,6 +49,8 @@ pub const Refusal = union(enum) {
     queue_full: QueueFault,
     // A message to the agent that started the caller.
     no_parent: ParentFault,
+    // A call the host could not carry out.
+    host_failure: HostFault,
 
     /// The `error_code` the model and the transcript row read.
     pub fn code(self: Refusal) []const u8 {
@@ -93,6 +96,10 @@ pub const Refusal = union(enum) {
             .no_parent => |fault| try writer.writeAll(switch (fault) {
                 .none => "You have no parent agent, because you are the main agent. Say it in your reply to the user.",
                 .unreachable_now => "Your parent cannot take a message now. Put it in your final reply instead.",
+            }),
+            .host_failure => |fault| try writer.writeAll(switch (fault) {
+                .subagent_limit => subagent_limit,
+                .internal => "fx hit an internal error before it could finish this call. Call status to see where your subagents stand, then try again; if it fails again, do the work yourself.",
             }),
         }
     }
@@ -148,6 +155,13 @@ pub const ParentFault = enum {
     unreachable_now,
 };
 
+pub const HostFault = enum {
+    /// A new subagent would be one more than a session holds open.
+    subagent_limit,
+    /// Any other failure of the host, whose cause only the trace names.
+    internal,
+};
+
 const agent_name_rule = std.fmt.comptimePrint(
     "agent must be a name of 1 to {d} characters: lowercase letters, digits, \"_\" or \"-\", starting with a letter or digit.",
     .{domain.max_agent_name_bytes},
@@ -167,6 +181,10 @@ const model_rule = std.fmt.comptimePrint(
 const profile_rule = std.fmt.comptimePrint(
     "profile must be 1 to {d} characters: lowercase letters, digits, \"-\" or \"_\". Leave the field out to start in the main profile.",
     .{profiles.max_name_bytes},
+);
+const subagent_limit = std.fmt.comptimePrint(
+    "This session already has {d} open subagents, the most it holds. Close one you are done with, or send a message to one that exists.",
+    .{child_state.max_children},
 );
 const subagent_queue_full = std.fmt.comptimePrint(
     "The subagent already has {d} of your messages waiting. Call wait for its report, then send this one again.",
@@ -248,6 +266,8 @@ const samples = [_]Refusal{
     .{ .queue_full = .parent },
     .{ .no_parent = .none },
     .{ .no_parent = .unreachable_now },
+    .{ .host_failure = .subagent_limit },
+    .{ .host_failure = .internal },
 };
 
 test "every refusal carries one or two short sentences and its code" {
@@ -280,7 +300,7 @@ test "every refusal carries one or two short sentences and its code" {
     }
 }
 
-test "the host and the decoder name no code outside Refusal unless it carries its own text" {
+test "the host, the decoder and the provider name no code outside Refusal unless it carries its own text" {
     // A code written as a string at a call site skips `sentence`. These carry
     // a sentence or a report of their own, so they stay where they are built.
     const own_text = [_][]const u8{
@@ -299,7 +319,7 @@ test "the host and the decoder name no code outside Refusal unless it carries it
     var found: usize = 0;
     var bare: std.ArrayList(u8) = .empty;
     defer bare.deinit(std.testing.allocator);
-    for ([_][]const u8{ @embedFile("tool_host.zig"), @embedFile("../../tools/agent/subagent.zig") }) |source| {
+    for ([_][]const u8{ @embedFile("tool_host.zig"), @embedFile("../../tools/agent/subagent.zig"), @embedFile("../tooling/tool_runtime.zig") }) |source| {
         var rest: []const u8 = source;
         while (std.mem.find(u8, rest, needle)) |at| {
             const start = at + needle.len;
@@ -342,6 +362,10 @@ test "a refusal says what to do next for the case it names" {
     out.clearRetainingCapacity();
     try busy.sentence(&out.writer);
     try std.testing.expectEqualStrings("The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.", out.written());
+
+    out.clearRetainingCapacity();
+    try (Refusal{ .host_failure = .subagent_limit }).sentence(&out.writer);
+    try std.testing.expectEqualStrings("This session already has 256 open subagents, the most it holds. Close one you are done with, or send a message to one that exists.", out.written());
 
     const fixed: Refusal = .override_after_create;
     out.clearRetainingCapacity();

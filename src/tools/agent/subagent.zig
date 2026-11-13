@@ -86,7 +86,7 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
 fn decodeFailure(
     ctx: tool_dispatch.DispatchContext,
     code: []const u8,
-    correction: ?[]const u8,
+    correction: []const u8,
 ) !tool_dispatch.DecodeResult {
     return .{ .failure = try model_contract.encodeResultAlloc(ctx.allocator, .{
         .ok = false,
@@ -504,6 +504,12 @@ test "every call the decoder refuses tells the model what is wrong and what to d
     const message = "\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\"";
     const cases = [_]struct { args: []const u8, code: []const u8 }{
         .{ .args = "{not json", .code = "invalid_json" },
+        .{ .args = "[]", .code = "invalid_field_type" },
+        .{ .args = "{\"action\":\"message\",\"agent\":5,\"message\":\"do it\"}", .code = "invalid_field_type" },
+        .{ .args = "{\"agent\":\"reviewer\"}", .code = "missing_field" },
+        .{ .args = "{\"action\":\"stop\"}", .code = "missing_field" },
+        .{ .args = "{\"action\":\"wait\",\"task\":\"x\"}", .code = "unknown_field" },
+        .{ .args = "{\"action\":\"fly\"}", .code = "invalid_enum" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"Bad Name\",\"message\":\"do it\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"status\",\"agent\":\"Bad Name\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"stop\",\"agent\":\"Ghost\"}", .code = "invalid_agent" },
