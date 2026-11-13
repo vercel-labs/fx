@@ -277,6 +277,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_STEER_YIELD_GRACE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_END_HELD": {
       "job": "test",
       "stability": "internal"
@@ -377,6 +381,7 @@
   "not_env": {
     "FX_AI_GATEWAY_API_KEY": "Keychain service name for the AI Gateway API key, not an env var",
     "FX_MCP_OAUTH_CREDENTIALS_V3": "Keychain service name for MCP OAuth credentials, not an env var",
+    "FX_OAUTH_PENDING_REVOCATIONS_V1": "Keychain service name for the fx login's kept sign-outs, not an env var",
     "FX_OAUTH_SESSION_V1": "Keychain service name for the fx OAuth session, not an env var",
     "FX_PARITY_LOG": "Set for the fake shell in a unit test; fx never reads it",
     "FX_TEST_AI_GATEWAY_API_KEY": "Keychain service name used by keychain tests, not an env var"

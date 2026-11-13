@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -24,6 +25,40 @@ import {
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
+
+/// Whether this process can write into a folder whose mode forbids it, as root
+/// or a sandbox that holds every capability can.
+function ignoresFileModes(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-mode-probe-"));
+  try {
+    chmodSync(probe, 0o500);
+    try {
+      writeFileSync(join(probe, "probe"), "");
+      return true;
+    } catch {
+      return false;
+    }
+  } finally {
+    chmodSync(probe, 0o700);
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+/// Whether `chflags` can make a file immutable here, as macOS can and Linux
+/// cannot without root.
+function canMakeImmutable(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-immutable-probe-"));
+  try {
+    const file = join(probe, "probe");
+    writeFileSync(file, "");
+    if (spawnSync("chflags", ["uchg", file]).status !== 0) return false;
+    spawnSync("chflags", ["nouchg", file]);
+    return true;
+  } finally {
+    spawnSync("chflags", ["-R", "nouchg", probe]);
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
 
 let session: TmuxSession | null = null;
 
@@ -883,8 +918,10 @@ describe.skipIf(SKIP_TMUX)("tui: standard terminal variables", () => {
         env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", TERM: "dumb" },
         remainOnExit: true,
       });
-      await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-      expect(session.paneStatus().status).toBe(1);
+      // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+      // the pane dead many seconds later.
+      await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+      expect(session.recordedExitStatus()).toBe(1);
       expect(await session.captureFullScrollback()).toContain(
         "fx: TERM=dumb can't show the interactive session; use fx ask, or run fx in a terminal that supports cursor movement",
       );
@@ -922,8 +959,10 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           stderrPath,
           remainOnExit: true,
         });
-        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-        expect(session.paneStatus().status).toBe(1);
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
         expect(readFileSync(stderrPath, "utf8")).toBe("fx: session path unsafe\n");
         expect(readFileSync(tracePath, "utf8")).toContain("interactive error err=SessionPathUnsafe");
       } finally {
@@ -931,6 +970,140 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           await session.kill();
           session = null;
         }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a debug recording that cannot start says why",
+    async () => {
+      // A file-size limit of zero fails the tape's first write as a full disk
+      // does. The limit also covers a stderr file, so the message is read from
+      // the pane.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-fault-")));
+      const home = join(root, "home");
+      const limited = join(root, "limited.sh");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        limited,
+        `#!/bin/sh\ntrap '' XFSZ\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
+        { mode: 0o700 },
+      );
+
+      try {
+        session = await TmuxSession.create({
+          cmd: limited,
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+          },
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        const shown = await session.captureFullScrollback();
+        expect(shown).toContain("fx: unable to start terminal recording: a file-size limit was reached.");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(ignoresFileModes())(
+    "a debug recording in a folder fx cannot write says permission denied",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-denied-")));
+      const home = join(root, "home");
+      const locked = join(root, "locked");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(locked);
+      chmodSync(locked, 0o500);
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+            FX_RECORD: join(locked, "tape.fxtape"),
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        chmodSync(locked, 0o700);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!canMakeImmutable())(
+    "a debug recording into an immutable file says permission denied",
+    async () => {
+      // An immutable file fails the open with EPERM, which Zig reports apart
+      // from the EACCES a read-only folder gives.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-immutable-")));
+      const home = join(root, "home");
+      const tape = join(root, "tape.fxtape");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(tape, "");
+      writeFileSync(stderrPath, "");
+      execFileSync("chflags", ["uchg", tape]);
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+            FX_RECORD: tape,
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        spawnSync("chflags", ["-R", "nouchg", root]);
         rmSync(root, { recursive: true, force: true });
       }
     },

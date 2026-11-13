@@ -1436,6 +1436,9 @@ pub fn Runtime(comptime App: type) type {
                             },
                             .progress, .terminal, .turn_finished => {},
                         }
+                        if (comptime agents.hasAgentField(App, "child_run")) {
+                            app_agents_runtime.Runtime(App).noteChildToolLifecycle(app, agent, lifecycle);
+                        }
                         try applyToolLifecycle(app, agent, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
