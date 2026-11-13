@@ -258,8 +258,8 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
       name: "the --no-save shape: Ctrl+O is open while the previous cycle drops",
       steps: [
         E("turn_started"), E("block_finished", { id: 1 }), E("ctrlo_opened"), E("block_finished", { id: 2 }), E("turn_ended"),
-        E("compacted"), E("block_finished", { id: 3 }), E("ctrlo_scrolled", { dir: "newer" }), E("ctrlo_scrolled", { dir: "older" }),
-        E("saved_through", { seq: 99 }),
+        E("compacted"), E("turn_started"), E("block_finished", { id: 3 }), E("turn_ended"),
+        E("ctrlo_scrolled", { dir: "newer" }), E("ctrlo_scrolled", { dir: "older" }), E("saved_through", { seq: 99 }),
       ],
     },
   ];

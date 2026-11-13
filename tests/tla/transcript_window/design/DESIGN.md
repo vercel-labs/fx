@@ -66,7 +66,8 @@ current code.
   When no turn finished after the newest compaction, resume replays the cycle
   before it and then applies that compaction as a live one is applied: the
   screen shows what it showed before, a resize before the next turn end
-  reprints those entries, and after it they leave memory as they scroll off. For the model this is Resumed from a log without the newest
+  reprints those entries, and after it they leave memory as they scroll
+  off. For the model this is Resumed from a log without the newest
   compaction, then Compacted.
 - Ctrl+O does not run `ctrlo_*`, `read_log` or `log_read_*`: it pages by
   entries, 256 to a page. Its newest pages show the held cycle together with
