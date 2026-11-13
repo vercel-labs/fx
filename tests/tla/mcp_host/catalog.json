@@ -77,5 +77,14 @@
     "stress": "RefreshLease.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "ErrorData",
+    "smoke": "ErrorData.cfg",
+    "stress": "ErrorData.stress.cfg",
+    "findings": [
+      { "config": "ErrorData.findings.cfg", "invariant": "ErrorDataReachesModel" }
+    ],
+    "repair": []
   }
 ]

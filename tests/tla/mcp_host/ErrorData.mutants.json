@@ -1,0 +1,56 @@
+[
+  {
+    "description": "The cap is off by one: data one byte over the cap is held whole",
+    "old": "    /\\ form' = IF ~Carried(c, k) THEN \"none\" ELSE IF n <= Cap THEN \"whole\" ELSE \"cut\"",
+    "new": "    /\\ form' = IF ~Carried(c, k) THEN \"none\" ELSE IF n <= Cap + 1 THEN \"whole\" ELSE \"cut\"",
+    "invariant": "ErrorDataReachesModel"
+  },
+  {
+    "description": "A cut leaves out the marker that says the data was cut",
+    "old": "    /\\ marked' = (Carried(c, k) /\\ n > Cap)",
+    "new": "    /\\ marked' = FALSE",
+    "invariant": "ErrorDataReachesModel"
+  },
+  {
+    "description": "The cut falls inside a character",
+    "old": "    /\\ split' = FALSE",
+    "new": "    /\\ split' = (Carried(c, k) /\\ n > Cap)",
+    "invariant": "CutOnBoundary"
+  },
+  {
+    "description": "A -32042's data is kept, though its URLs are the user's to answer",
+    "old": "Carried(c, k) == Carry = \"data\" /\\ c = \"invalid_params\" /\\ k = \"text\"",
+    "new": "Carried(c, k) == Carry = \"data\" /\\ k = \"text\"",
+    "invariant": "Unchanged"
+  },
+  {
+    "description": "A null data is kept as data",
+    "old": "Carried(c, k) == Carry = \"data\" /\\ c = \"invalid_params\" /\\ k = \"text\"",
+    "new": "Carried(c, k) == Carry = \"data\" /\\ c = \"invalid_params\" /\\ k # \"none\"",
+    "invariant": "Unchanged"
+  },
+  {
+    "description": "The host keeps the whole data before it cuts it",
+    "old": "    /\\ held' = IF ~Carried(c, k) THEN 0 ELSE IF n <= Cap THEN n ELSE 2 + p + e",
+    "new": "    /\\ held' = IF ~Carried(c, k) THEN 0 ELSE n",
+    "invariant": "HeldBounded"
+  },
+  {
+    "description": "A log line carries the data",
+    "old": "    /\\ logged' = FALSE",
+    "new": "    /\\ logged' = Carried(c, k)",
+    "invariant": "NoDataInLogs"
+  },
+  {
+    "description": "The cap bounds the raw prefix and not its escaped form, so escapes push a cut past the cap",
+    "old": "    /\\ 2 + p + e <= Cap",
+    "new": "    /\\ p + 2 <= Cap",
+    "invariant": "Bounded"
+  },
+  {
+    "description": "A cut keeps far less than fits",
+    "old": "    /\\ 2 + p + e + MaxChar > Cap",
+    "new": "    /\\ TRUE",
+    "invariant": "KeepsMost"
+  }
+]

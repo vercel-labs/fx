@@ -846,7 +846,10 @@ fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtim
             try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"structuredContent\":{s},\"isError\":{s}}}}}", .{ r.content, structured, if (r.is_error) "true" else "false" })
         else
             try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"isError\":{s}}}}}", .{ r.content, if (r.is_error) "true" else "false" }),
-        .failure => |f| try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":{d},\"message\":{s}}}}}", .{ f.code, f.message }),
+        .failure => |f| if (f.data) |data|
+            try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":{d},\"message\":{s},\"data\":{s}}}}}", .{ f.code, f.message, data })
+        else
+            try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":{d},\"message\":{s}}}}}", .{ f.code, f.message }),
         .ended => |e| return try ended(arena, server, name, e, max_bytes, how),
         .unknown_server => return null,
     };
@@ -1199,4 +1202,97 @@ test "a search says why a server it names has no tools, and calls that end say h
     const slow_in_editor = try ended(a, "aside", "mcp_aside_repl", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = true }, 4096, .editor);
     try testing.expect(std.mem.find(u8, slow_in_editor.model_output, "fx stopped waiting for MCP server 'aside': it did not answer within its operation timeout.") != null);
     try testing.expect(std.mem.find(u8, slow_in_editor.model_output, "operation_timeout_ms") == null);
+}
+
+/// A protocol failure as the host holds it.
+fn failureWith(code: i64, message: []const u8, data: ?[]const u8) runtime_mod.CallResult {
+    return .{ .failure = .{ .code = code, .message = message, .data = data } };
+}
+
+fn renderedFailure(a: Allocator, code: i64, message: []const u8, data: ?[]const u8, max_bytes: usize) ![]const u8 {
+    const out = (try render(a, "srv", "mcp_srv_tool", failureWith(code, message, data), max_bytes, .terminal)).?;
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, out.status);
+    return out.model_output;
+}
+
+test "a protocol error's data reaches the model after its message, in the form a server wrote it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const violations = "{\"errors\":[{\"path\":[\"limit\"],\"expected\":\"number\",\"received\":\"string\"}]}";
+    try testing.expectEqualStrings(
+        "MCP protocol error -32602: Invalid params; data=" ++ violations,
+        try renderedFailure(a, -32602, "\"Invalid params\"", violations, 4096),
+    );
+    // Any other code is the same, and so is each kind of JSON value.
+    try testing.expectEqualStrings(
+        "MCP protocol error -32603: Internal error; data={\"trace\":\"id-7\"}",
+        try renderedFailure(a, -32603, "\"Internal error\"", "{\"trace\":\"id-7\"}", 4096),
+    );
+    const kinds = [_][2][]const u8{
+        .{ "\"why\"", "\"why\"" },
+        .{ "42", "42" },
+        .{ "true", "true" },
+        .{ "[1,\"a\",{\"b\":null}]", "[1,\"a\",{\"b\":null}]" },
+        .{ "{ \"a\" : [ 1 , 2 ] }", "{\"a\":[1,2]}" }, // written back without the server's spaces
+    };
+    for (kinds) |kind| {
+        const text = try renderedFailure(a, -32602, "\"Invalid params\"", kind[0], 4096);
+        try testing.expectEqualStrings(try a.print("MCP protocol error -32602: Invalid params; data={s}", .{kind[1]}), text);
+    }
+}
+
+test "a protocol error's data is sanitized: escapes stay escapes and no control byte reaches the model" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try renderedFailure(a, -32602, "\"Invalid params\"", "{\"note\":\"bell \\u0007 escape \\u001b[31m newline \\n tab \\t quote \\\" done\"}", 4096);
+    try testing.expect(std.mem.startsWith(u8, text, "MCP protocol error -32602: Invalid params; data={\"note\":\"bell \\u0007 escape \\u001b[31m"));
+    for (text) |byte| try testing.expect(byte >= 0x20 or byte == '\n');
+    try testing.expect(std.mem.find(u8, text, "\x1b") == null);
+}
+
+test "a protocol error's data is cut by the model's result cap when that is small, and the data the host keeps is already bounded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // What the host keeps of a server's huge data: one string literal, a prefix and the marker.
+    const prefix = try a.alloc(u8, 4000);
+    @memset(prefix, 'x');
+    const kept = try a.print("\"{s} ... [data truncated: 1048576 bytes, cap is 8192]\"", .{prefix});
+    const whole = try renderedFailure(a, -32602, "\"Invalid params\"", kept, 16 * 1024);
+    try testing.expect(std.mem.endsWith(u8, whole, "[data truncated: 1048576 bytes, cap is 8192]\""));
+    // The text is the message, the label and the data: nothing is added to the bound.
+    try testing.expectEqual("MCP protocol error -32602: Invalid params; data=".len + kept.len, whole.len);
+    // A result cap smaller than that cuts the text as it cuts every tool result.
+    const small = try renderedFailure(a, -32602, "\"Invalid params\"", kept, 1024);
+    try testing.expect(small.len <= 1024);
+    try testing.expect(std.mem.startsWith(u8, small, "MCP protocol error -32602: Invalid params; data=\"xxxx"));
+    try testing.expect(std.unicode.utf8ValidateSlice(small));
+}
+
+test "a protocol error's data keeps its nesting, up to the depth the host hands over" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const depth = 128;
+    const data = try a.alloc(u8, depth * 2);
+    @memset(data[0..depth], '[');
+    @memset(data[depth..], ']');
+    const text = try renderedFailure(a, -32602, "\"Invalid params\"", data, 4096);
+    try testing.expectEqualStrings(try a.print("MCP protocol error -32602: Invalid params; data={s}", .{data}), text);
+}
+
+test "what the model got before stays the same: an error without data, a -32042, and a result" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("MCP protocol error -32602: Invalid params", try renderedFailure(a, -32602, "\"Invalid params\"", null, 4096));
+    try testing.expectEqualStrings("MCP protocol error -32601: Method not found", try renderedFailure(a, -32601, "\"Method not found\"", null, 4096));
+    // A message with escapes is still the server's text, written as text.
+    try testing.expectEqualStrings("MCP protocol error -32603: line one\nline two", try renderedFailure(a, -32603, "\"line one\\nline two\"", null, 4096));
+    try testing.expectEqualStrings("MCP protocol error -32042: URL elicitation required", try renderedFailure(a, -32042, "\"URL elicitation required\"", null, 4096));
+    const ok = (try render(a, "srv", "mcp_srv_tool", .{ .result = .{ .content = "[{\"type\":\"text\",\"text\":\"hi\"}]", .structured = null, .is_error = false } }, 4096, .terminal)).?;
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.success, ok.status);
+    try testing.expectEqualStrings("{\"server\":\"srv\",\"tool\":\"mcp_srv_tool\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}", ok.model_output);
 }
