@@ -725,6 +725,7 @@ const RequestWorker = struct {
             return .{ .kind = .disconnected, .correlation_id = correlation_id };
         };
         if (self.cancelled.load(.acquire)) {
+            closeCancelledStart(alloc, backend, request, result.view());
             result.deinit(alloc);
             persistCancellation(backend, request);
             return .{ .kind = .cancelled, .correlation_id = correlation_id };
@@ -754,6 +755,64 @@ fn execute(
         } }),
         else => err,
     };
+}
+
+/// Force-closes the terminal a cancelled start created. The caller only
+/// learns `.cancelled`, never the session id, so without this the command
+/// would run unseen until fx exits. Only `start` creates a session; every
+/// other action works on one its caller already holds.
+fn closeCancelledStart(
+    alloc: Allocator,
+    backend: *Backend,
+    request: contracts.ActionRequest,
+    result: contracts.Result,
+) void {
+    const start = switch (request) {
+        .start => |value| value,
+        else => return,
+    };
+    const persistence = start.persistence orelse return;
+    const session_id = switch (result) {
+        .success => |success| switch (success) {
+            .start => |value| value.session.session_id,
+            else => return,
+        },
+        .failure => return,
+    };
+    var close_request: contracts.ActionRequest = .{ .close = .{
+        .session_id = session_id,
+        .policy = .force,
+        .authority = .{
+            .principal = persistence.grant.principal,
+            .actor = persistence.grant.actor,
+            .generation = persistence.grant.generation,
+            .proof = persistence.proof,
+        },
+    } };
+    operation.attachProcessOwner(&close_request, backend.process_owner);
+    // The start's own flag is set, so the close gets a fresh one.
+    const not_cancelled: std.atomic.Value(bool) = .init(false);
+    var closed = execute(alloc, backend, close_request, &not_cancelled) catch |err| {
+        debug_trace.logf(
+            "terminal_client",
+            "cancelled start close failed session={s} err={s}",
+            .{ session_id, @errorName(err) },
+        );
+        return;
+    };
+    defer closed.deinit(alloc);
+    switch (closed.view()) {
+        .success => debug_trace.logf(
+            "terminal_client",
+            "cancelled start closed session={s}",
+            .{session_id},
+        ),
+        .failure => |refused| debug_trace.logf(
+            "terminal_client",
+            "cancelled start close refused session={s} code={s}",
+            .{ session_id, @tagName(refused.code) },
+        ),
+    }
 }
 
 /// Clears the cancelled actor's attention and lease on the session, so a
@@ -1154,18 +1213,7 @@ const LiveTerminalFixture = struct {
         command: []const u8,
     ) ![]u8 {
         const alloc = std.testing.allocator;
-        if (fixture.persistence) |*previous| previous.deinit();
-        fixture.persistence = try operation.prepareStartPersistence(alloc, .{
-            .profile_user = "terminal-client-user",
-            .durable_session_id = owner_session_id,
-            .workspace_root = fixture.home,
-            .cwd = fixture.home,
-            .transport_role = .interactive,
-            .backend = .native,
-            .actor = .agent,
-            .controls = .full(),
-            .lifetime = .session,
-        });
+        try fixture.preparePersistence();
         var started = try fixture.run(.{ .start = .{
             .cwd = fixture.home,
             .command = command,
@@ -1185,6 +1233,64 @@ const LiveTerminalFixture = struct {
         };
         try std.testing.expectEqual(contracts.Lifecycle.running, value.session.lifecycle);
         return alloc.dupe(u8, value.session.session_id);
+    }
+
+    fn preparePersistence(fixture: *LiveTerminalFixture) !void {
+        if (fixture.persistence) |*previous| previous.deinit();
+        fixture.persistence = null;
+        fixture.persistence = try operation.prepareStartPersistence(std.testing.allocator, .{
+            .profile_user = "terminal-client-user",
+            .durable_session_id = owner_session_id,
+            .workspace_root = fixture.home,
+            .cwd = fixture.home,
+            .transport_role = .interactive,
+            .backend = .native,
+            .actor = .agent,
+            .controls = .full(),
+            .lifetime = .session,
+        });
+    }
+
+    /// Waits for the single terminal record a start writes and returns its
+    /// owned session id, for starts whose result the test never sees.
+    fn waitForOnlyRecordedSession(
+        fixture: *LiveTerminalFixture,
+        timeout_ms: i64,
+    ) ![]u8 {
+        const state_path = ".fx/sessions/" ++ owner_session_id ++ "/terminal/state";
+        const deadline = io_mod.milliTimestamp() + timeout_ms;
+        while (io_mod.milliTimestamp() < deadline) : (io_mod.sleep(10 * std.time.ns_per_ms)) {
+            var dir = fixture.tmp.dir.openDir(
+                std.testing.io,
+                state_path,
+                .{ .iterate = true },
+            ) catch continue;
+            defer dir.close(std.testing.io);
+            var it = dir.iterate();
+            while (try it.next(std.testing.io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.startsWith(u8, entry.name, "record-")) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+                const session_id = entry.name["record-".len .. entry.name.len - ".json".len];
+                return std.testing.allocator.dupe(u8, session_id);
+            }
+        }
+        return error.TestMissingTerminalRecord;
+    }
+
+    fn awaitCompletion(
+        fixture: *LiveTerminalFixture,
+        correlation_id: contracts.CorrelationId,
+        timeout_ms: i64,
+    ) !Completion {
+        const deadline = io_mod.milliTimestamp() + timeout_ms;
+        while (io_mod.milliTimestamp() < deadline) {
+            if (fixture.runtime.takeCompletionFor(correlation_id)) |completion| {
+                return completion;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+        return error.TestCompletionTimedOut;
     }
 
     fn claim(fixture: *const LiveTerminalFixture) contracts.AuthorityClaim {
@@ -1386,6 +1492,43 @@ test "in-process registry starts writes to and stops a real terminal" {
     try std.testing.expectEqual(
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(sleeper),
+    );
+}
+
+test "cancelling a start after its terminal launched closes that terminal" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    try fixture.preparePersistence();
+    const correlation_id = fixture.runtime.nextCorrelationId();
+    // The start waits for an exit that never comes on its own, so the
+    // cancel lands after the terminal launched and before the result.
+    try fixture.runtime.admit(alloc, correlation_id, .{ .start = .{
+        .cwd = fixture.home,
+        .command = "printf 'HELD%s\\n' START; sleep 30",
+        .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+        .backend = .native,
+        .return_when = .exit,
+        .wait_ceiling_ms = 15_000,
+        .persistence = fixture.persistence.?.view(),
+    } });
+    const session_id = try fixture.waitForOnlyRecordedSession(15_000);
+    defer alloc.free(session_id);
+    try fixture.waitForMatch(session_id, "HELDSTART");
+    const pid = try fixture.shellPid(session_id);
+
+    try std.testing.expect(fixture.runtime.cancel(correlation_id));
+    var completion = try fixture.awaitCompletion(correlation_id, 15_000);
+    defer completion.deinit();
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+
+    // The caller never learned the session id, so nothing else can end it.
+    try std.testing.expect(processGoneWithin(pid, 2_000));
+    try std.testing.expectEqual(
+        contracts.Lifecycle.closed,
+        try fixture.recordedLifecycle(session_id),
     );
 }
 
