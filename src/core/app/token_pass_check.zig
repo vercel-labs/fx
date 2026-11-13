@@ -158,12 +158,14 @@ pub const Check = struct {
                 var result = taken;
                 defer result.deinit();
                 const answer = answerOf(result.snapshot);
-                debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
                 if (answer) |fresh| {
                     self.has_pass = fresh == .has_pass;
                     token_pass.publishHasPass(self.has_pass);
                     if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
                 }
+                // Logged once the answer is saved, so a reader of the trace
+                // finds the file current.
+                debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
                 return;
             }
             if (io_mod.awakeMilliTimestamp() >= deadline) {
@@ -290,8 +292,8 @@ pub fn Runtime(comptime App: type) type {
             defer result.deinit();
             state.started_ms = null;
             const answer = answerOf(result.snapshot);
-            debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
             if (answer) |fresh| record(app, fresh, "credits_check");
+            debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
             try applyStartModel(app);
             state.start_settled = true;
             return true;
