@@ -372,6 +372,8 @@ pub const Runtime = struct {
         /// The profile it runs in. One started before subagents had a
         /// profile of their own runs as main.
         profile: []u8,
+        /// What it is for (`Child.purpose`), or empty when it has none.
+        purpose: []u8,
         /// How its last finished work ended, or null before it has finished
         /// one. Saved with the child, so a restart keeps it.
         last_outcome: ?child_state.Outcome = null,
@@ -404,7 +406,15 @@ pub const Runtime = struct {
             errdefer alloc.free(id);
             const name = try alloc.dupe(u8, child.agentName() orelse "");
             errdefer alloc.free(name);
-            listing[filled] = .{ .id = id, .name = name, .profile = try alloc.dupe(u8, child.profile orelse profiles.main_name), .last_outcome = child.last_outcome };
+            const profile = try alloc.dupe(u8, child.profile orelse profiles.main_name);
+            errdefer alloc.free(profile);
+            listing[filled] = .{
+                .id = id,
+                .name = name,
+                .profile = profile,
+                .purpose = try alloc.dupe(u8, child.purpose orelse ""),
+                .last_outcome = child.last_outcome,
+            };
             filled += 1;
         }
         return listing;
@@ -419,6 +429,7 @@ pub const Runtime = struct {
         alloc.free(entry.id);
         alloc.free(entry.name);
         alloc.free(entry.profile);
+        alloc.free(entry.purpose);
     }
 
     /// A child's saved conversation, read without opening it. The caller

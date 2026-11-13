@@ -97,10 +97,14 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
-/// A working subagent's current call, else its session's title.
+/// A working subagent's current call, else its session's title, else what a
+/// subagent is for, else `untitled`. The purpose is model-written text like
+/// the title, and `appendCell` draws all of them through the same escaping and
+/// display-width cut.
 fn titleOf(row: AgentsMenuRow) []const u8 {
     if (row.activity.len > 0) return row.activity;
-    return if (row.title.len > 0) row.title else untitled;
+    if (row.title.len > 0) return row.title;
+    return if (row.purpose.len > 0) row.purpose else untitled;
 }
 
 /// The model as the status line names it, then its effort, such as
@@ -566,6 +570,60 @@ test "a narrow agent list leaves out the profile, then the model, and cuts a lon
         "  main      Fix the lo…  working",
         "  ├ tester  Run the au…  needs approval",
         "  └ docs    new session  idle",
+    });
+}
+
+test "a row's title comes before what the subagent is for, which comes before new session, and a working call comes first" {
+    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
+    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
+    try std.testing.expectEqualStrings("Review the parser", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .state = "idle" }));
+    try std.testing.expectEqualStrings("You review the parser.", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .state = "idle" }));
+    try std.testing.expectEqualStrings(untitled, titleOf(.{ .name = "a", .title = "", .purpose = "", .state = "idle" }));
+}
+
+test "a subagent with no title shows what it is for in the title's place, and a row with a title or none keeps its text" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "", .state = "idle" },
+        .{ .name = "auditor", .subagent = true, .title = "", .purpose = "You audit the parser.", .state = "working", .state_tone = .active },
+        .{ .name = "writer", .subagent = true, .title = "Write the docs", .purpose = "You write the docs.", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .title = "", .purpose = "", .state = "idle" },
+    };
+    try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       new session            idle",
+        "  ├ auditor  You audit the parser.  working",
+        "  ├ writer   Write the docs         idle",
+        "  └ scout    new session            idle",
+    });
+}
+
+test "a purpose is drawn as a title is: control bytes, bidi overrides, and wide characters are escaped or counted, and a cut keeps whole characters" {
+    // An escape sequence, a right-to-left override, CJK, and an emoji.
+    const wide = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .title = "", .purpose = "Audit \x1b[2J\u{202e}日本語 \u{1F642} logic", .state = "working", .state_tone = .active },
+        .{ .name = "docs", .subagent = true, .title = "", .purpose = "Write", .state = "idle" },
+    };
+    // The state column starts under the same column on every row, so the wide
+    // characters count as the columns they take.
+    try expectRows(.{ .rows = &wide }, 80, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main     Fix the login bug                     idle",
+        "  ├ scout  Audit \\x1b[2J\\u{202e}日本語 \u{1F642} logic  working",
+        "  └ docs   Write                                 idle",
+    });
+    for ([_]u16{ 2, 3, 4 }) |row_index| {
+        const row = try testRow(.{ .rows = &wide }, row_index, 80, max_inline_rows);
+        defer std.testing.allocator.free(row.text);
+        try std.testing.expect(text_utils.isTerminalSafe(row.text));
+    }
+
+    // Too narrow for all of it: the cut lands between whole wide characters.
+    const long = [_]AgentsMenuRow{.{ .name = "scout", .subagent = true, .title = "", .purpose = "日本語日本語日本語日本語", .state = "idle" }};
+    try expectRows(.{ .rows = &long }, 30, 1, &.{
+        "  └ scout  日本語日本…   idle",
     });
 }
 
