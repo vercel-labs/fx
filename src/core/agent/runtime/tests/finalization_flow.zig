@@ -935,11 +935,95 @@ test "common Stop continues once with original history and joined presentation" 
     );
     try expectBodyContains(&follow_gateway, 0, "candidate");
     try expectBodyContains(&follow_gateway, 0, "final");
-    try expectBodyNotContains(
-        &follow_gateway,
-        0,
-        "Continue the turn. fx hook context",
+    // The hook's message was in the last request of the turn, so the saved
+    // turn keeps it where it was sent and the provider's prompt cache still
+    // covers that request.
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{
+        "candidate",
+        "Continue the turn. fx hook context:\\nverify the answer",
+        "final",
+    });
+    try test_support.expectPromptExtends(
+        gateway.request_bodies.items[1],
+        follow_gateway.request_bodies.items[0],
     );
+}
+
+test "the next turn extends the request that carried a Stop hook's message" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const provider_calls = [_]ToolCall{.{
+        .id = "call_search",
+        .name = "perplexity_search",
+        .arguments_json = "{}",
+        .provider_result = "search result",
+        .provenance = .provider_executed,
+    }};
+    const Case = struct {
+        name: []const u8,
+        completions: []const test_support.FakeCompletion,
+        /// The request that carries the hook's message, which ends the turn.
+        last_request: usize,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "after a tool step",
+            .completions = &.{
+                .{ .tool_calls = &calls },
+                .{ .chunks = &.{"candidate"}, .content = "candidate" },
+                .{ .content = "final" },
+            },
+            .last_request = 2,
+        },
+        .{
+            .name = "after a reply that ran a provider tool",
+            .completions = &.{
+                .{ .content = "candidate", .tool_calls = &provider_calls, .finish_reason = .stop },
+                .{ .content = "final" },
+            },
+            .last_request = 1,
+        },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        var fixture = PromptFixture{};
+        var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+        defer lifecycle_runtime.deinit();
+        var handler = StopTestHandler{
+            .alloc = alloc,
+            .action = .{ .continue_once = "verify the answer" },
+        };
+        defer handler.deinit();
+        const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
+
+        try runFakePromptWithLifecycle(
+            &gateway,
+            &deps,
+            fixture.config(),
+            fixture.job(),
+            testLifecycleContext(view, alloc, fixture.workspace_root),
+        );
+
+        try std.testing.expectEqual(case.last_request + 1, gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, case.last_request, "Continue the turn. fx hook context:\\nverify the answer");
+
+        var follow_gateway = FakeGateway.init(alloc, &.{.{ .content = "follow-up" }});
+        defer follow_gateway.deinit();
+        var follow_deps = FakeAgentRuntimeDeps.init(alloc);
+        defer follow_deps.deinit();
+        var follow_fixture = PromptFixture{};
+        var follow_job = follow_fixture.job();
+        follow_job.history = deps.history_turns.items;
+        try runFakePrompt(&follow_gateway, &follow_deps, follow_fixture.config(), follow_job);
+        try test_support.expectPromptExtends(
+            gateway.request_bodies.items[case.last_request],
+            follow_gateway.request_bodies.items[0],
+        );
+    }
 }
 
 test "common Stop continuation normalizes to allow without remaining budget" {
@@ -1960,16 +2044,20 @@ test "common Stop failure excludes a later call without a result" {
         &replay,
         deps.history_turns.items,
     );
-    try std.testing.expectEqual(@as(usize, 4), replay.items.len);
+    // The hook's message sat between the candidate and the next step in the
+    // request, so the saved turn keeps it there, as fx's own message.
+    try std.testing.expectEqual(@as(usize, 5), replay.items.len);
     try std.testing.expectEqualStrings("candidate", replay.items[1].content.?);
-    try std.testing.expectEqual(@as(usize, 1), replay.items[2].tool_calls.len);
+    try std.testing.expectEqualStrings("Continue the turn. fx hook context:\nverify", replay.items[2].content.?);
+    try std.testing.expect(replay.items[2].recovery_prompt);
+    try std.testing.expectEqual(@as(usize, 1), replay.items[3].tool_calls.len);
     try std.testing.expectEqualStrings(
         "call_completed",
-        replay.items[2].tool_calls[0].id,
+        replay.items[3].tool_calls[0].id,
     );
     try std.testing.expectEqualStrings(
         "call_completed",
-        replay.items[3].tool_call_id.?,
+        replay.items[4].tool_call_id.?,
     );
 }
 

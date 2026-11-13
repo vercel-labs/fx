@@ -2526,7 +2526,7 @@ pub const Runtime = struct {
         self.menu_index_ready = true;
     }
 
-    pub fn menuItemCount(self: Runtime) usize {
+    pub fn menuItemCount(self: *const Runtime) usize {
         if (self.menu_index_ready) return self.menu_index.count();
         return self.menu.filteredItemCount(self.items);
     }
@@ -2615,7 +2615,7 @@ pub const Runtime = struct {
         );
     }
 
-    pub fn selectedMenuSkill(self: Runtime) ?Skill {
+    pub fn selectedMenuSkill(self: *const Runtime) ?Skill {
         if (!self.menu.active) return null;
         const item_count = self.menuItemCount();
         if (item_count == 0) return null;
@@ -2629,7 +2629,7 @@ pub const Runtime = struct {
         return skillMenuSkillAtQuery(self.items, self.menu.source_filter, self.menu.query(), self.menu.selected_index % item_count);
     }
 
-    pub fn menuVisible(self: Runtime) bool {
+    pub fn menuVisible(self: *const Runtime) bool {
         if (!self.menu.active) return false;
         if (!self.menu.origin.isMention()) return true;
         return mentionMenuOpen(self.items, self.menu.query());

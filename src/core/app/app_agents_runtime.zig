@@ -24,6 +24,7 @@ const app_process_runtime = @import("app_process_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const profiles = @import("../profiles/profiles.zig");
+const worker_status = @import("../output/worker_status.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -37,6 +38,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
+const live_metrics = @import("../subagent/live_metrics.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 
 const Allocator = std.mem.Allocator;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
@@ -166,10 +169,14 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
+    /// Backs each subagent row's current call and its state with the call's
+    /// time, such as "working 12s". Owned.
+    activities: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
         self.rows.deinit(alloc);
         self.names.deinit(alloc);
+        self.activities.deinit(alloc);
         if (self.draft) |*draft| draft.deinit(alloc);
         self.* = .{};
     }
@@ -187,6 +194,9 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
+/// Room for a subagent row's current call, then its state with the call's
+/// time, such as "working 59m59s".
+const activity_bytes = live_metrics.max_label_bytes + 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
@@ -248,6 +258,28 @@ pub const Busiest = enum { needs_approval, has_question, needs_you, working, idl
 /// An agent that restarting fx, as an upgrade does, would stop, and what it
 /// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
 pub const BusyAgent = struct { name: []const u8, doing: Busiest };
+
+/// One subagent as `/trace` shows it (`Runtime.traceRows`): what the agent
+/// list says of it, and its status row. Every string but `status` borrows
+/// from the app, so a row is read on the main loop before anything changes.
+pub const TraceRow = struct {
+    /// Its session ID, the name of its folder in the session store.
+    id: []const u8,
+    /// The name its parent gave it, or empty for a one-off.
+    name: []const u8,
+    profile: []const u8,
+    title: []const u8,
+    /// What it is doing, as the agent list says, such as `needs_you`.
+    state: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    /// Its status row, such as a failed request that waits for the user, or
+    /// empty. Owned by the allocator `traceRows` was given.
+    status: []const u8,
+    /// The host that started it, whose registry holds its work, or null
+    /// before it is bound.
+    host: ?*subagent_tool_host.Runtime,
+};
 
 /// What an agent in `state` is doing for a state that stands for others,
 /// or null when it is idle. A finished turn counts as idle.
@@ -1681,12 +1713,16 @@ pub fn Runtime(comptime App: type) type {
             menu.rows.ensureTotalCapacity(app.alloc, order.items.len) catch return .{};
             menu.names.clearRetainingCapacity();
             menu.names.ensureTotalCapacity(app.alloc, order.items.len * instance_name_bytes) catch return .{};
+            menu.activities.clearRetainingCapacity();
+            menu.activities.ensureTotalCapacity(app.alloc, order.items.len * activity_bytes) catch return .{};
+            const now_ms = io_mod.milliTimestamp();
             for (order.items) |target| {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
+                const activity = rowActivity(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
@@ -1696,8 +1732,9 @@ pub fn Runtime(comptime App: type) type {
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = listedProfile(if (subagent) |child| child.profile else agent.profile.profile.name),
-                    .state = state.label(),
+                    .state = activity.state orelse state.label(),
                     .state_tone = state.tone(),
+                    .activity = activity.call,
                     .model = model,
                     .effort = effortLabel(app, agent, model),
                 });
@@ -2167,6 +2204,7 @@ pub fn Runtime(comptime App: type) type {
             if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
+            TranscriptRuntime.slotLeftScreen(&leaving.transcript);
             std.mem.swap(AssistantPacer, &app.pacer, &leaving.pacer);
             std.mem.swap(bool, &app.fast_mode, &leaving.fast_mode);
             app.shell.swapSlot(&arriving.transcript);
@@ -2194,8 +2232,60 @@ pub fn Runtime(comptime App: type) type {
             return if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
         }
 
+        /// The app's subagents in the order they started, for `/trace`.
+        /// Main loop only. `alloc` owns each row's `status`.
+        pub fn traceRows(app: *App, alloc: Allocator, out: *std.ArrayList(TraceRow)) !void {
+            for (app.child_agents.items) |child| {
+                const agent = &child.agent;
+                if (agent.role != .subagent) continue;
+                const model = provider_runtime.modelOf(app, agent);
+                try out.append(alloc, .{
+                    .id = child.id,
+                    .name = child.name,
+                    .profile = if (child.profile.len > 0) child.profile else profiles.main_name,
+                    .title = agent.session_title.items,
+                    .state = @tagName(stateOf(app, child)),
+                    .model = model,
+                    .effort = effortLabel(app, agent, model),
+                    .status = try statusText(app, child, alloc),
+                    .host = child.parent_host,
+                });
+            }
+        }
+
+        /// A copy of the label on agent `target`'s status row, or empty.
+        fn statusText(app: *App, target: ?*ChildAgent, alloc: Allocator) ![]const u8 {
+            const state: *const worker_status.State = if (target == app.agent_on_screen) blk: {
+                if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return "";
+                break :blk app.shell.worker_status_state();
+            } else &screenOf(app, target).transcript.notebook.worker_status;
+            const projection = state.projection() orelse return "";
+            return switch (projection) {
+                .turn_thinking => |row| try alloc.dupe(u8, row.label),
+                .none, .tool_slot => "",
+            };
+        }
+
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
+        }
+
+        const RowActivity = struct { call: []const u8 = "", state: ?[]const u8 = null };
+
+        /// A working subagent's current call and its state with that call's
+        /// time, such as "working 12s", from its host, written into `buf`;
+        /// nothing for any other row.
+        fn rowActivity(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) RowActivity {
+            if (state != .working) return .{};
+            const child = subagent orelse return .{};
+            const host = hostOf(app, child) orelse return .{};
+            const call = host.childCall(child.id) orelse return .{};
+            const label = call.label();
+            @memcpy(buf[0..label.len], label);
+            var writer = std.Io.Writer.fixed(buf[label.len..]);
+            writer.print("{s} ", .{state.label()}) catch return .{ .call = buf[0..label.len] };
+            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return .{ .call = buf[0..label.len] };
+            return .{ .call = buf[0..label.len], .state = writer.buffered() };
         }
 
         /// Whether the turn `child`'s worker has finished is still being
@@ -2966,6 +3056,46 @@ pub fn Runtime(comptime App: type) type {
             // The part the parent can use, without the keys for the user.
             const text = status.text.slice();
             host.noteChildWaiting(child.id, child.displayName(), if (std.mem.find(u8, text, " \u{b7} ")) |at| text[0..at] else text, resend);
+        }
+
+        /// A hosted subagent's tool events reach the app instead of its
+        /// turn: its current call goes to its host, for status and the agent
+        /// list, and a shell command that crossed the quiet limit is relayed
+        /// to its parent (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
+        pub fn noteChildToolLifecycle(app: *App, agent: *AppAgent, lifecycle: types.ToolLifecycleEvent) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            switch (lifecycle) {
+                .authoritative_started => |started| {
+                    var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+                    defer arena_state.deinit();
+                    const arena = arena_state.allocator();
+                    const call: types.ToolCall = .{
+                        .id = started.id.call_id,
+                        .name = started.tool_name,
+                        .arguments_json = started.arguments_json orelse "{}",
+                    };
+                    // The plain label, as fx ask names the call; the screen's
+                    // own rows are styled.
+                    const label = if (comptime @hasDecl(App, "toolRegistry") and @hasDecl(App, "resolveToolActionDisplayTarget")) label: {
+                        const target = app.resolveToolActionDisplayTarget(agent, arena, call) catch null;
+                        break :label tool_presentation.formatPlainAction(arena, .{
+                            .tool_registry = app.toolRegistry(agent),
+                            .call = call,
+                            .display_target = target,
+                        }) catch started.tool_name;
+                    } else started.tool_name;
+                    host.noteChildCall(child.id, started.id.call_id, label);
+                },
+                .terminal => |terminal| {
+                    host.noteChildCall(child.id, terminal.id.call_id, null);
+                    const memory = terminal.result_memory orelse return;
+                    const crossing = memory.quiet_crossing orelse return;
+                    host.noteChildQuiet(child.id, child.displayName(), crossing);
+                },
+                .provisional, .progress, .turn_finished => {},
+            }
         }
 
         /// Keeps a child's terminal provider error for the parent.

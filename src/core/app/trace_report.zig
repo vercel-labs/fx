@@ -57,7 +57,8 @@
 //!   {`status`, `reason`, `detail`}; `network_call`, for the newest 3 failed
 //!   calls, with `call` holding the `network_call` fields; `tool_call`, for
 //!   the newest 5 calls that did not succeed, with `call` {`at`, `name`,
-//!   `outcome`, `duration_ms`, `source`, `cause`}; `compaction` {`event`,
+//!   `outcome`, `duration_ms`, `source`, `cause`, `call_id`}, from the kept
+//!   failures that later successful calls do not remove; `compaction` {`event`,
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
 //!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
@@ -84,6 +85,39 @@
 //! - `session_title`: `setting`, `title` (masked; left out when there is
 //!   none), and `generation` {`status`, `session`, `model`, `reason`,
 //!   `detail`, `elapsed_ms`}.
+//! - `subagents`: `open`, the open subagents; `turns_retained` and
+//!   `turns_total`, the subagent turns the bounded ring holds and the ones
+//!   started this session; `registry_error`, when a host's registry could
+//!   not be read; `unmatched_subagent_ids`, the `subagent_id`s in the
+//!   tool-call window whose turn the ring no longer holds. Then a `subagent`
+//!   per open subagent, in the order they started, and per other subagent
+//!   session with retained turns, such as a closed one: `open`, `name` (left
+//!   out for a one-off), `session_id`, the name of its folder in the session
+//!   store, `profile`, `state` (what the agent list says: `needs_approval`,
+//!   `has_question`, `needs_you`, `working`, `finished`, or `idle`),
+//!   `activity` (its host's work phase: `idle`, `running`,
+//!   `awaiting_approval`, `interrupted`, `finished`, `closing`, or `unknown`
+//!   when its host's registry has no entry for it), `last_outcome`
+//!   (`completed`, `failed`, `cancelled`, `interrupted`, `lost`, `none`
+//!   before its first work ends, or `unknown`), `last_reason` (masked), why
+//!   that work failed, `model`, `effort`, `title` (masked), `status`
+//!   (masked), its status row, such as a failed request that waits for the
+//!   user, `task` (masked), the start of its newest retained turn's prompt:
+//!   at most 240 bytes, without the end of a word that cut would split (its
+//!   ASCII bytes, or the whole word when it holds `://`), and left out when
+//!   none of it is kept, and `task_bytes`, that prompt's whole length,
+//!   `turns_retained`,
+//!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
+//!   calls in the tool-call window. A subagent that is not open has only
+//!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
+//!   at 400 bytes; a cut `last_reason`, `title`, or `status` comes with
+//!   `<name>_bytes`, its whole masked length.
+//!   After each `subagent` comes a `subagent_turn` for each of its newest 8
+//!   retained turns, newest first: `session_id`, `source` with the
+//!   `subagent_id` that the turn's `tool_call`, `network_call`, and
+//!   `compaction_event` records carry, `outcome` (`running`, or how the turn
+//!   ended, such as `completed` or `failed`), `model`, `effort`,
+//!   `started_at`, and `duration_ms` once it ended.
 //! - `network`: `retained`, `ok`, `errors`, `avg_ms`, `min_ms`, `max_ms`;
 //!   `session` {`calls`, `ok`, `errors`, `total_ms`}, totals that the bounded
 //!   ring does not limit; `complete`, whether the ring holds every call, and
@@ -115,7 +149,10 @@
 //!   the `model_catalog` problems come from these.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
-//!   {`calls`, `outcomes`, `total_ms`}, `complete`, and `web_search_retained`.
+//!   {`calls`, `outcomes`, `total_ms`}, `complete`, `web_search_retained`,
+//!   `failed_retained`, the number of `failed_tool_call` records, and
+//!   `failed_complete`, whether they hold every call this session that did
+//!   not succeed.
 //!   Then a `tool_call` per retained local call, oldest first: `at`, `name`,
 //!   `outcome`, `duration_ms`, `source`, `cause` (only for a call that did not
 //!   succeed because an MCP server refused its parameters: which arguments it
@@ -123,14 +160,53 @@
 //!   its first useful line, at most 180 bytes) and `result_bytes`, and any
 //!   other call has `result` (masked), `result_bytes`, and
 //!   `result_omitted_bytes`. A `web_fetch` call has no arguments or result.
+//!   A call has `call_id`, the provider's ID for it, which the call's records
+//!   in the session's `log.jsonl` also carry, when the provider gave one. A
+//!   call that did not succeed has `failure_kept` (true) when the trace also
+//!   has its `failed_tool_call` record.
 //!   Then a `web_search_call` per provider-run search: `status` (`ok`, `err`,
 //!   or `pending`).
+//!   Then a `failed_tool_call` per kept failure, oldest first: the newest 32
+//!   calls that did not succeed, which later successful calls do not remove.
+//!   Each has `at`, `name`, `outcome`, `duration_ms`, `source`, `cause`, and
+//!   `call_id` as a `tool_call` has them; `dir`, the folder the tool ran
+//!   against, where a shell call runs when its arguments name no `cwd`; for a
+//!   `shell` run whose command ran with the startup files the snapshot holds,
+//!   which means admission resolves it to the user environment of the login
+//!   shell, as for the default profile, `redefined`, the entries of the
+//!   `shell` record's `redefined` list that its arguments name, left out when
+//!   there are none;
+//!   and `args` and `result` (each masked), with `args_bytes` and
+//!   `result_bytes`. Each keeps up to 8 KiB of its value: a longer value keeps
+//!   its first bytes in `args` or `result` and its last bytes in `args_tail`
+//!   or `result_tail` (masked), and counts the bytes between them in
+//!   `args_omitted_bytes` or `result_omitted_bytes`. A `web_fetch` call has no
+//!   arguments or result.
 //! - `permissions`: `grants`; then a `permission_grant` per grant: `tool`,
 //!   `target`.
 //! - `runtime_context`: `term`, `term_program`, `lang` (each left out when
 //!   unset), `tmux`, `cmux`, `mcp_servers`; then an `mcp_server` per server:
 //!   `name`, `state`, `transport`, `tools`, `signed_in`, `needs_login`,
 //!   `error` (masked).
+//! - `shell`: how fx starts the agent's shell commands in the user's own
+//!   environment, and what the user's startup files change in them.
+//!   `login_shell`, the configured login shell, left out when unknown;
+//!   `runs`, the shell fx runs them with, which differs when fx does not
+//!   support the login shell; `start`, how a command starts: `snapshot_replay`
+//!   (restored from the snapshot of the startup files' aliases and
+//!   functions), `recapture` (the next command captures the startup files
+//!   again, since they changed or a reload was asked), `full_startup` (every
+//!   command reads the startup files, since the capture failed), `capturing`
+//!   (the first command is capturing them), `not_started` (no command yet),
+//!   or `unavailable`, with `start_error`; `start_command`, the shell's
+//!   command line before `-c`; `snapshot` {`state` (`empty`, `capturing`,
+//!   `ready`, or `failed`), then `failure` when it failed, else `dirty` and
+//!   `names`, the number of aliases and functions}; and, only when the
+//!   snapshot is ready, `redefined`, the common commands such as `ls` or
+//!   `cat` that the startup files redefine, a list of {`name`, `kind`
+//!   (`alias` or `function`), `alias_of` (masked), the first word an alias
+//!   runs, left out when it is not plain text}. Alias and function bodies are
+//!   never in the trace.
 //! - `renderer_state`: `layout`, `cursor`, `transcript`, `projection`,
 //!   `replaceable`, and `shadow_grid` with `visible_rows`, a list of {`row`,
 //!   `text` (masked)}; `shadow_grid` is left out when fx has none.
@@ -163,12 +239,16 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_time = @import("../shared/local_time.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const mcp_tool_result = @import("../mcp/tool_result.zig");
 const permissions = @import("../permissions/permissions.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
@@ -358,6 +438,9 @@ pub fn build(app: anytype) ![]u8 {
     const agent = agents.screenAgentOf(app);
     const history = agent.session.agent.history.items;
     const permission_view = app_permission_runtime.Runtime(App).viewOf(app, agent);
+    // Taken once, so the failed calls and the shell record agree.
+    const shell_view = try arena.create(shell_snapshot.TraceView);
+    shell_view.* = shell_snapshot.processOwner().traceView();
 
     try writeHeader(r, App.app_version, io_mod.milliTimestamp());
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
@@ -367,11 +450,13 @@ pub fn build(app: anytype) ![]u8 {
     try writeCompaction(r);
     try writeInterruptedTurn(r, history);
     try writeSessionTitle(r, app);
+    try writeSubagents(r, app);
     try writeNetwork(r);
     try writeModelCatalog(r, app);
-    try writeToolCalls(r, history);
+    try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_view.grants.items);
     try writeRuntimeContext(r, app);
+    try writeShell(r, shell_view, shell_resolver.configuredLoginShellInto(try arena.alloc(u8, std.Io.Dir.max_path_bytes)));
     try writeRendererState(r, app);
     try writeRendererEvents(r);
     try writeTranscript(r, app.shell.notebook.entries.items);
@@ -715,19 +800,17 @@ fn writeNetworkProblems(p: *Records) !void {
     }
 }
 
+/// The newest failed calls come from the kept failures, not the window, so
+/// later successful calls never remove them.
 fn writeToolProblems(p: *Records) !void {
-    const calls = try p.arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
-    const count = diagnostics.snapshotToolCalls(calls);
-    var reported: usize = 0;
+    const calls = try p.arena.alloc(diagnostics.FailedToolCall, diagnostics.failed_tool_call_capacity);
+    const count = diagnostics.snapshotFailedToolCalls(calls);
     var index = count;
-    while (index > 0 and reported < tool_problems_shown) {
+    while (index > count -| tool_problems_shown) {
         index -= 1;
-        const call = &calls[index];
-        if (call.outcome == .succeeded) continue;
-        reported += 1;
         try beginProblem(p, "tool_call");
         try p.beginObject("call");
-        try writeToolCallFields(p, call);
+        try writeFailedToolCallFields(p, &calls[index]);
         try p.endObject();
         try p.end();
     }
@@ -936,6 +1019,212 @@ fn writeSessionTitle(r: *Records, app: anytype) !void {
     try r.end();
 }
 
+/// Turns written for one subagent, newest first.
+const subagent_turns_shown: usize = 8;
+/// Bytes kept of a subagent's masked title, status row, task, and failure
+/// reason.
+const subagent_text_max_bytes: usize = 400;
+
+/// What the subagent records read.
+const SubagentsInput = struct {
+    /// The app's subagents, in the order they started.
+    rows: []const app_agents_runtime.TraceRow = &.{},
+    /// Their hosts' registry entries.
+    registry: []const subagent_tool_host.Runtime.TraceChild = &.{},
+    /// Set when a host's registry could not be read.
+    registry_error: ?anyerror = null,
+    /// The retained subagent turns, oldest first.
+    turns: []const diagnostics.SubagentTurn = &.{},
+    turns_total: u64 = 0,
+    /// The tool-call window, oldest first.
+    calls: []const diagnostics.ToolCallMetric = &.{},
+};
+
+/// Each subagent with what the agent list and its host's registry say of
+/// it, and its newest turns, so the `subagent_id` of a tool or network call
+/// names one subagent.
+fn writeSubagents(r: *Records, app: anytype) !void {
+    const App = @TypeOf(app.*);
+    var input: SubagentsInput = .{};
+    if (comptime @hasField(App, "child_agents")) {
+        var rows: std.ArrayList(app_agents_runtime.TraceRow) = .empty;
+        try app_agents_runtime.Runtime(App).traceRows(app, r.arena, &rows);
+        input.rows = rows.items;
+        var hosts: std.ArrayList(*subagent_tool_host.Runtime) = .empty;
+        var registry: std.ArrayList(subagent_tool_host.Runtime.TraceChild) = .empty;
+        for (rows.items) |row| {
+            const host = row.host orelse continue;
+            if (std.mem.findScalar(*subagent_tool_host.Runtime, hosts.items, host) != null) continue;
+            try hosts.append(r.arena, host);
+            const listing = host.traceChildren(r.arena) catch |err| {
+                input.registry_error = err;
+                continue;
+            };
+            try registry.appendSlice(r.arena, listing);
+        }
+        input.registry = registry.items;
+    }
+    const turns = try r.arena.alloc(diagnostics.SubagentTurn, diagnostics.subagent_turn_capacity);
+    input.turns = turns[0..diagnostics.snapshotSubagentTurns(turns)];
+    input.turns_total = diagnostics.subagentTurnTotal();
+    const calls = try r.arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
+    input.calls = calls[0..diagnostics.snapshotToolCalls(calls)];
+    try writeSubagentRecords(r, input);
+}
+
+fn writeSubagentRecords(r: *Records, input: SubagentsInput) !void {
+    try r.begin("subagents");
+    try r.number("open", input.rows.len);
+    try r.number("turns_retained", input.turns.len);
+    try r.number("turns_total", input.turns_total);
+    if (input.registry_error) |err| try r.text("registry_error", @errorName(err));
+    var unmatched = false;
+    for (input.calls, 0..) |call, index| {
+        if (call.subagent_id == 0 or findSubagentTurn(input.turns, call.subagent_id) != null) continue;
+        if (subagentIdSeenBefore(input.calls[0..index], call.subagent_id)) continue;
+        if (!unmatched) try r.beginArray("unmatched_subagent_ids");
+        unmatched = true;
+        try r.json.write(call.subagent_id);
+    }
+    if (unmatched) try r.endArray();
+    try r.end();
+
+    for (input.rows) |row| {
+        try r.begin("subagent");
+        try r.boolean("open", true);
+        try r.optionalText("name", row.name);
+        try r.text("session_id", row.id);
+        try r.text("profile", row.profile);
+        try r.text("state", row.state);
+        if (findTraceChild(input.registry, row.id)) |child| {
+            try r.text("activity", if (child.closing) "closing" else @tagName(child.phase));
+            try r.text("last_outcome", if (child.last_outcome) |outcome| @tagName(outcome) else "none");
+            try writeSubagentText(r, "last_reason", child.last_failure);
+        } else {
+            try r.text("activity", "unknown");
+            try r.text("last_outcome", "unknown");
+        }
+        try r.optionalText("model", row.model);
+        try r.optionalText("effort", row.effort);
+        try writeSubagentText(r, "title", row.title);
+        try writeSubagentText(r, "status", row.status);
+        try endSubagentRecord(r, input, row.id);
+    }
+
+    // A session with retained turns and no open subagent, such as a closed
+    // one, listed once at its newest turn.
+    var index = input.turns.len;
+    while (index > 0) {
+        index -= 1;
+        const session_id = input.turns[index].sessionId();
+        if (findTraceRow(input.rows, session_id)) continue;
+        if (sessionListedAfter(input.turns, index, session_id)) continue;
+        try r.begin("subagent");
+        try r.boolean("open", false);
+        try r.text("session_id", session_id);
+        try endSubagentRecord(r, input, session_id);
+    }
+}
+
+/// Ends subagent `session_id`'s record with its task, its retained turns,
+/// and its calls in the tool-call window, then writes its newest turns,
+/// newest first.
+fn endSubagentRecord(r: *Records, input: SubagentsInput, session_id: []const u8) !void {
+    var retained: usize = 0;
+    var index = input.turns.len;
+    while (index > 0) {
+        index -= 1;
+        const turn = &input.turns[index];
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        if (retained == 0 and turn.prompt_total_bytes > 0) {
+            try r.optionalText("task", try maskedSubagentText(r, turn.prompt()));
+            try r.number("task_bytes", turn.prompt_total_bytes);
+        }
+        retained += 1;
+    }
+    try r.number("turns_retained", retained);
+    if (retained > subagent_turns_shown) try r.number("turns_omitted", retained - subagent_turns_shown);
+    var calls: usize = 0;
+    var not_succeeded: usize = 0;
+    for (input.calls) |call| {
+        if (call.subagent_id == 0) continue;
+        const turn = findSubagentTurn(input.turns, call.subagent_id) orelse continue;
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        calls += 1;
+        if (call.outcome != .succeeded) not_succeeded += 1;
+    }
+    try r.beginObject("tool_calls");
+    try r.number("retained", calls);
+    try r.number("not_succeeded", not_succeeded);
+    try r.endObject();
+    try r.end();
+
+    var shown: usize = 0;
+    index = input.turns.len;
+    while (index > 0 and shown < subagent_turns_shown) {
+        index -= 1;
+        const turn = &input.turns[index];
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        shown += 1;
+        try r.begin("subagent_turn");
+        try r.text("session_id", session_id);
+        try r.source(turn.subagent_id);
+        try r.text("outcome", turn.outcome());
+        try r.optionalText("model", turn.model());
+        try r.optionalText("effort", turn.effort());
+        try r.time("started_at", turn.started_at_ms);
+        if (turn.ended_at_ms != 0) try r.number("duration_ms", @max(turn.ended_at_ms - turn.started_at_ms, 0));
+        try r.end();
+    }
+}
+
+/// Writes `value` masked and cut, with `<name>_bytes` when it was cut, or
+/// nothing when it is empty.
+fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) !void {
+    if (value.len == 0) return;
+    const masked = try text_utils.maskSecrets(r.arena, value);
+    const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
+    try r.text(name, kept);
+    if (kept.len < masked.len) try r.number(name ++ "_bytes", masked.len);
+}
+
+/// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
+/// boundary. Masking comes first, so this cut never splits a secret the mask
+/// would have found. A task comes already cut from the turn ring, which
+/// leaves out the end of the word its own cut splits
+/// (`subagent_turn_metrics.keptPrompt`), so no part of a secret that cut
+/// shortened reaches the mask.
+fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
+    return text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(r.arena, value), subagent_text_max_bytes);
+}
+
+fn findTraceChild(registry: []const subagent_tool_host.Runtime.TraceChild, id: []const u8) ?*const subagent_tool_host.Runtime.TraceChild {
+    for (registry) |*child| if (std.mem.eql(u8, child.id, id)) return child;
+    return null;
+}
+
+fn findTraceRow(rows: []const app_agents_runtime.TraceRow, id: []const u8) bool {
+    for (rows) |row| if (std.mem.eql(u8, row.id, id)) return true;
+    return false;
+}
+
+fn findSubagentTurn(turns: []const diagnostics.SubagentTurn, subagent_id: u64) ?*const diagnostics.SubagentTurn {
+    for (turns) |*turn| if (turn.subagent_id == subagent_id) return turn;
+    return null;
+}
+
+/// Whether a turn newer than `index` ran for `session_id`, so that session
+/// is listed already.
+fn sessionListedAfter(turns: []const diagnostics.SubagentTurn, index: usize, session_id: []const u8) bool {
+    for (turns[index + 1 ..]) |*turn| if (std.mem.eql(u8, turn.sessionId(), session_id)) return true;
+    return false;
+}
+
+fn subagentIdSeenBefore(calls: []const diagnostics.ToolCallMetric, subagent_id: u64) bool {
+    for (calls) |call| if (call.subagent_id == subagent_id) return true;
+    return false;
+}
+
 fn writeNetworkCallFields(r: *Records, call: *const diagnostics.NetworkCall) !void {
     try r.time("at", call.started_at_ms);
     try r.text("model", call.model());
@@ -1139,6 +1428,16 @@ fn neutralized(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 fn writeToolCallFields(r: *Records, call: *const diagnostics.ToolCallMetric) !void {
+    try writeCallFields(r, call, call.result());
+}
+
+fn writeFailedToolCallFields(r: *Records, call: *const diagnostics.FailedToolCall) !void {
+    try writeCallFields(r, call, call.result.head());
+}
+
+/// The fields of a window or a kept call. `result` is the start of its
+/// result, where an MCP refusal names its cause.
+fn writeCallFields(r: *Records, call: anytype, result: []const u8) !void {
     try r.time("at", call.started_at_ms);
     try r.text("name", traceToolDisplayName(call.name()));
     try r.text("outcome", @tagName(call.outcome));
@@ -1147,8 +1446,10 @@ fn writeToolCallFields(r: *Records, call: *const diagnostics.ToolCallMetric) !vo
     if (call.outcome != .succeeded) {
         // Why an MCP server refused the call's parameters, so the call doesn't
         // read as a limit or a crash. `invalidParamsCause` masks it.
-        if (try mcp_tool_result.invalidParamsCause(r.arena, call.result())) |cause| try r.text("cause", cause);
+        if (try mcp_tool_result.invalidParamsCause(r.arena, result)) |cause| try r.text("cause", cause);
     }
+    // The provider's ID, the `call_id` of the call's session-log records.
+    try r.optionalText("call_id", call.callId());
 }
 
 fn writeOutcomeCounts(r: *Records, counts: []const u64) !void {
@@ -1223,11 +1524,17 @@ fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
     } else "pending";
 }
 
-noinline fn writeToolCalls(r: *Records, history: []const types.HistoryTurn) !void {
+noinline fn writeToolCalls(
+    r: *Records,
+    history: []const types.HistoryTurn,
+    shell_view: ?*const shell_snapshot.TraceView,
+) !void {
     const calls = try r.arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
     const count = diagnostics.snapshotToolCalls(calls);
     var provider_calls: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
     const provider_count = projectProviderToolCalls(history, &provider_calls);
+    const failed_buf = try r.arena.alloc(diagnostics.FailedToolCall, diagnostics.failed_tool_call_capacity);
+    const failed = failed_buf[0..diagnostics.snapshotFailedToolCalls(failed_buf)];
 
     var outcome_counts: [std.enums.values(diagnostics.ToolCallOutcome).len]u64 = @splat(0);
     var total_ms: u64 = 0;
@@ -1248,11 +1555,14 @@ noinline fn writeToolCalls(r: *Records, history: []const types.HistoryTurn) !voi
     try r.endObject();
     try r.boolean("complete", lifetime.total_calls <= count);
     try r.number("web_search_retained", provider_count);
+    try r.number("failed_retained", failed.len);
+    try r.boolean("failed_complete", lifetime.failureCount() <= failed.len);
     try r.end();
 
     for (calls[0..count]) |*call| {
         try r.begin("tool_call");
         try writeToolCallFields(r, call);
+        if (call.outcome != .succeeded and failureIsKept(failed, call)) try r.boolean("failure_kept", true);
         try writeToolPayload(r, "args", call.args(), call.args_len, call.args_total_bytes);
         if (call.outcome == .succeeded) {
             try writeToolResultPreview(r, call.result(), call.result_total_bytes);
@@ -1266,6 +1576,97 @@ noinline fn writeToolCalls(r: *Records, history: []const types.HistoryTurn) !voi
         try r.text("status", providerToolStatusLabel(call.status));
         try r.end();
     }
+    for (failed) |*call| try writeFailedToolCall(r, call, shell_view);
+}
+
+fn failureIsKept(failed: []const diagnostics.FailedToolCall, call: *const diagnostics.ToolCallMetric) bool {
+    if (call.callId().len == 0) return false;
+    for (failed) |*kept| {
+        if (kept.started_at_ms == call.started_at_ms and std.mem.eql(u8, kept.callId(), call.callId())) return true;
+    }
+    return false;
+}
+
+/// A kept failure, whole up to its head and tail cuts. Unlike the window,
+/// later successful calls never push these out.
+fn writeFailedToolCall(
+    r: *Records,
+    call: *const diagnostics.FailedToolCall,
+    shell_view: ?*const shell_snapshot.TraceView,
+) !void {
+    try r.begin("failed_tool_call");
+    try writeFailedToolCallFields(r, call);
+    try r.optionalText("dir", call.dir());
+    // Only a command that read the startup files ran their aliases.
+    if (shell_view) |view| {
+        if (call.reads_startup_files) try writeRedefinedWordsInCall(r, view, call);
+    }
+    try writeKeptText(r, "args", &call.args);
+    try writeKeptText(r, "result", &call.result);
+    try r.end();
+}
+
+/// Lists the common commands a failed shell call used that the user's
+/// startup files redefine, such as `ls` running eza.
+fn writeRedefinedWordsInCall(
+    r: *Records,
+    view: *const shell_snapshot.TraceView,
+    call: *const diagnostics.FailedToolCall,
+) !void {
+    var wrote = false;
+    for (view.redefined()) |*entry| {
+        if (!traceTextHasWord(call.args.head(), entry.name) and !traceTextHasWord(call.args.tail(), entry.name)) continue;
+        if (!wrote) try r.beginArray("redefined");
+        wrote = true;
+        try writeRedefinedCommand(r, entry);
+    }
+    if (wrote) try r.endArray();
+}
+
+fn writeRedefinedCommand(r: *Records, entry: *const shell_snapshot.RedefinedCommand) !void {
+    try r.beginItem();
+    try r.text("name", entry.name);
+    try r.text("kind", @tagName(entry.kind));
+    if (entry.aliasTarget()) |target| try r.masked("alias_of", target);
+    try r.endItem();
+}
+
+/// Whether `word` is a whole word of a tool call's JSON arguments. A JSON
+/// escape such as `\n` separates words, as the newline it stands for does.
+fn traceTextHasWord(text: []const u8, word: []const u8) bool {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\\') {
+            index += 2;
+            continue;
+        }
+        if (isTraceWordSeparator(text[index])) {
+            index += 1;
+            continue;
+        }
+        const start = index;
+        while (index < text.len and text[index] != '\\' and !isTraceWordSeparator(text[index])) index += 1;
+        if (std.mem.eql(u8, text[start..index], word)) return true;
+    }
+    return false;
+}
+
+fn isTraceWordSeparator(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\r', '\n', ';', '|', '&', '(', ')', '<', '>', '\'', '"', '`', '$', '{', '}', '!', ':', ',', '=', '[', ']' => true,
+        else => false,
+    };
+}
+
+/// Writes `<name>` (masked) and `<name>_bytes`, and for a value longer than
+/// the kept bytes, `<name>_omitted_bytes` and `<name>_tail` (masked).
+fn writeKeptText(r: *Records, comptime name: []const u8, kept: *const diagnostics.KeptText) !void {
+    if (kept.total_bytes == 0) return;
+    try r.masked(name, kept.head());
+    try r.number(name ++ "_bytes", kept.total_bytes);
+    if (kept.omittedBytes() == 0) return;
+    try r.number(name ++ "_omitted_bytes", kept.omittedBytes());
+    try r.optionalMasked(name ++ "_tail", kept.tail());
 }
 
 /// Writes `<name>` (masked), `<name>_bytes`, and `<name>_omitted_bytes` when
@@ -1353,6 +1754,84 @@ fn writeRuntimeContext(r: *Records, app: anytype) !void {
         if (s.last_error) |err| try r.masked("error", err);
         try r.end();
     }
+}
+
+/// How a `user` profile shell command starts, by the snapshot's state.
+const ShellStart = enum { snapshot_replay, recapture, full_startup, capturing, not_started };
+
+/// The `shell` record: how fx starts the agent's shell commands and what the
+/// user's startup files change in them, so a report can tell a shell setup
+/// from a bug.
+fn writeShell(r: *Records, view: *const shell_snapshot.TraceView, configured: ?[]const u8) !void {
+    try r.begin("shell");
+    if (configured) |path| try r.text("login_shell", path);
+    const is_ready = std.mem.eql(u8, view.state, "ready");
+    const is_failed = std.mem.eql(u8, view.state, "failed");
+    if (shellCommandLines(r.arena, configured)) |commands| {
+        try r.text("runs", commands.path);
+        const start: ShellStart = if (is_ready and !view.dirty)
+            .snapshot_replay
+        else if (is_ready)
+            .recapture
+        else if (is_failed)
+            .full_startup
+        else if (std.mem.eql(u8, view.state, "capturing"))
+            .capturing
+        else
+            .not_started;
+        try r.text("start", @tagName(start));
+        try r.text("start_command", if (start == .snapshot_replay) commands.replay else commands.full);
+    } else |err| {
+        try r.text("start", "unavailable");
+        try r.text("start_error", @errorName(err));
+    }
+    try r.beginObject("snapshot");
+    try r.text("state", view.state);
+    if (is_failed) {
+        if (view.failure) |reason| try r.text("failure", reason);
+    } else {
+        try r.boolean("dirty", view.dirty);
+        try r.number("names", view.names_total);
+    }
+    try r.endObject();
+    // Without a snapshot, which commands the startup files redefine is unknown.
+    if (is_ready) {
+        try r.beginArray("redefined");
+        for (view.redefined()) |*entry| try writeRedefinedCommand(r, entry);
+        try r.endArray();
+    }
+    try r.end();
+}
+
+const ShellCommandLines = struct {
+    path: []const u8,
+    /// A `user` profile command without a snapshot, up to its `-c`.
+    full: []const u8,
+    /// A `user` profile command restored from the snapshot, up to its `-c`.
+    replay: []const u8,
+};
+
+fn shellCommandLines(arena: std.mem.Allocator, configured: ?[]const u8) !ShellCommandLines {
+    const environment = try shell_resolver.environment(arena, configured, null);
+    const path = switch (environment) {
+        .user => |value| value,
+        else => return error.UnsupportedShell,
+    };
+    return .{
+        .path = path,
+        .full = try invocationBeforeCommand(arena, try shell_resolver.capturedInvocation(arena, environment, "")),
+        .replay = try invocationBeforeCommand(arena, try shell_resolver.snapshotInvocation(arena, path, "")),
+    };
+}
+
+fn invocationBeforeCommand(arena: std.mem.Allocator, invocation: shell_resolver.Invocation) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (invocation.argv()) |arg| {
+        if (std.mem.eql(u8, arg, "-c")) break;
+        if (out.written().len > 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(arg);
+    }
+    return out.toOwnedSlice();
 }
 
 noinline fn writeRendererState(r: *Records, app: anytype) !void {
@@ -2424,6 +2903,508 @@ test "trace session title reports the retained generation outcome" {
     try std.testing.expectEqual(@as(usize, 0), installed_trace.count("problem"));
 }
 
+fn testSubagentTurn(subagent_id: u64, session_id: []const u8, outcome: []const u8, prompt: []const u8) diagnostics.SubagentTurn {
+    var turn: diagnostics.SubagentTurn = .{ .subagent_id = subagent_id, .started_at_ms = 1_000 * @as(i64, @intCast(subagent_id)) };
+    @memcpy(turn.session_id_buf[0..session_id.len], session_id);
+    turn.session_id_len = @intCast(session_id.len);
+    @memcpy(turn.model_buf[0.."openai/gpt-5".len], "openai/gpt-5");
+    turn.model_len = "openai/gpt-5".len;
+    @memcpy(turn.effort_buf[0.."high".len], "high");
+    turn.effort_len = "high".len;
+    // A longer prompt goes through the ring's own cut (`testRingTurn`).
+    std.debug.assert(prompt.len <= turn.prompt_buf.len);
+    @memcpy(turn.prompt_buf[0..prompt.len], prompt);
+    turn.prompt_len = @intCast(prompt.len);
+    turn.prompt_total_bytes = @intCast(prompt.len);
+    if (outcome.len > 0) {
+        @memcpy(turn.outcome_buf[0..outcome.len], outcome);
+        turn.outcome_len = @intCast(outcome.len);
+        turn.ended_at_ms = turn.started_at_ms + 25;
+    }
+    return turn;
+}
+
+/// Subagent turn 1 of `session_id` with `prompt`, as the turn ring keeps
+/// it. Resets the trace's rings.
+fn testRingTurn(session_id: []const u8, prompt: []const u8) diagnostics.SubagentTurn {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = 1,
+        .session_id = session_id,
+        .model = "openai/gpt-5",
+        .effort = "high",
+        .prompt = prompt,
+        .started_at_ms = 1_000,
+    });
+    var turns: [1]diagnostics.SubagentTurn = undefined;
+    const kept = diagnostics.snapshotSubagentTurns(&turns);
+    std.debug.assert(kept == 1);
+    return turns[0];
+}
+
+fn testSubagentRow(id: []const u8, name: []const u8) app_agents_runtime.TraceRow {
+    return .{
+        .id = id,
+        .name = name,
+        .profile = "agent",
+        .title = "",
+        .state = "idle",
+        .model = "openai/gpt-5",
+        .effort = "high",
+        .status = "",
+        .host = null,
+    };
+}
+
+test "trace subagents record says when no subagent ran" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagentRecords(&w.records, .{});
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 1), trace.records.len);
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "turns_total"));
+    try expectAbsent(summary, "registry_error");
+    try expectAbsent(summary, "unmatched_subagent_ids");
+}
+
+test "trace subagent records name each subagent with its registry state and turns" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    const a = w.arena.allocator();
+    const secret = "sk-live-0123456789abcdef0123456789";
+    const registry = [_]subagent_tool_host.Runtime.TraceChild{
+        .{ .id = try a.dupe(u8, "child-cards"), .phase = .idle, .last_outcome = .completed, .last_failure = &.{}, .closing = false },
+        .{ .id = try a.dupe(u8, "child-ship"), .phase = .idle, .last_outcome = .failed, .last_failure = try a.dupe(u8, "model request failed:\nHTTP 400 token=" ++ secret), .closing = true },
+    };
+    var ship = testSubagentRow("child-ship", "ship");
+    ship.state = "needs_you";
+    ship.status = "\xe2\x9a\xa0 The provider rejected this request\n\xc2\xb7 press Esc";
+    ship.effort = "";
+    const rows = [_]app_agents_runtime.TraceRow{ testSubagentRow("child-cards", "cards"), ship, testSubagentRow("child-lost", "") };
+    const turns = [_]diagnostics.SubagentTurn{
+        testSubagentTurn(1, "child-cards", "completed", "check the card title"),
+        testSubagentTurn(2, "child-ship", "failed", "pin the\navatar"),
+        testSubagentTurn(3, "child-cards", "", "check it again"),
+    };
+    const calls = [_]diagnostics.ToolCallMetric{
+        .{ .subagent_id = 1, .outcome = .command_failed },
+        .{ .subagent_id = 3, .outcome = .succeeded },
+        .{ .subagent_id = 0, .outcome = .tool_failed },
+    };
+    try writeSubagentRecords(&w.records, .{
+        .rows = &rows,
+        .registry = &registry,
+        .registry_error = error.AccessDenied,
+        .turns = &turns,
+        .turns_total = 5,
+        .calls = &calls,
+    });
+    try expectNotIn(w.out.written(), secret);
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 5), try testInt(summary, "turns_total"));
+    try std.testing.expectEqualStrings("AccessDenied", try testString(summary, "registry_error"));
+    try expectAbsent(summary, "unmatched_subagent_ids");
+    // Each subagent comes with its turns, newest first.
+    const order = [_][]const u8{ "subagents", "subagent", "subagent_turn", "subagent_turn", "subagent", "subagent_turn", "subagent" };
+    try std.testing.expectEqual(order.len, trace.records.len);
+    for (order, trace.records) |want, record| try std.testing.expectEqualStrings(want, try testString(record, "type"));
+
+    const cards = try trace.nth("subagent", 0);
+    try std.testing.expect(try testBool(cards, "open"));
+    try std.testing.expectEqualStrings("cards", try testString(cards, "name"));
+    try std.testing.expectEqualStrings("child-cards", try testString(cards, "session_id"));
+    try std.testing.expectEqualStrings("agent", try testString(cards, "profile"));
+    try std.testing.expectEqualStrings("idle", try testString(cards, "state"));
+    try std.testing.expectEqualStrings("idle", try testString(cards, "activity"));
+    try std.testing.expectEqualStrings("completed", try testString(cards, "last_outcome"));
+    try expectAbsent(cards, "last_reason");
+    try std.testing.expectEqualStrings("openai/gpt-5", try testString(cards, "model"));
+    try std.testing.expectEqualStrings("high", try testString(cards, "effort"));
+    try expectAbsent(cards, "title");
+    try expectAbsent(cards, "status");
+    try std.testing.expectEqualStrings("check it again", try testString(cards, "task"));
+    try std.testing.expectEqual(@as(i64, 14), try testInt(cards, "task_bytes"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(cards, "turns_retained"));
+    try expectAbsent(cards, "turns_omitted");
+    const cards_calls = try testObject(cards, "tool_calls");
+    try std.testing.expectEqual(@as(i64, 2), try testInt(cards_calls, "retained"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(cards_calls, "not_succeeded"));
+
+    const running = try trace.nth("subagent_turn", 0);
+    try std.testing.expectEqualStrings("child-cards", try testString(running, "session_id"));
+    try std.testing.expectEqualStrings("subagent", try testString(running, "source"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(running, "subagent_id"));
+    try std.testing.expectEqualStrings("running", try testString(running, "outcome"));
+    try std.testing.expectEqualStrings("openai/gpt-5", try testString(running, "model"));
+    try std.testing.expectEqualStrings("high", try testString(running, "effort"));
+    try std.testing.expectEqualStrings("1970-01-01T00:00:03.000Z", try testString(running, "started_at"));
+    try std.testing.expectEqual(@as(i64, 3_000), try testInt(running, "started_at_ms"));
+    try expectAbsent(running, "duration_ms");
+    const ended = try trace.nth("subagent_turn", 1);
+    try std.testing.expectEqual(@as(i64, 1), try testInt(ended, "subagent_id"));
+    try std.testing.expectEqualStrings("completed", try testString(ended, "outcome"));
+    try std.testing.expectEqual(@as(i64, 25), try testInt(ended, "duration_ms"));
+
+    // A closing subagent, its failure masked, and its status row.
+    const ship_record = try trace.nth("subagent", 1);
+    try std.testing.expectEqualStrings("needs_you", try testString(ship_record, "state"));
+    try std.testing.expectEqualStrings("closing", try testString(ship_record, "activity"));
+    try std.testing.expectEqualStrings("failed", try testString(ship_record, "last_outcome"));
+    try expectStartsWith(try testString(ship_record, "last_reason"), "model request failed:\nHTTP 400 ");
+    try expectAbsent(ship_record, "effort");
+    try std.testing.expectEqualStrings(ship.status, try testString(ship_record, "status"));
+    try std.testing.expectEqualStrings("pin the\navatar", try testString(ship_record, "task"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.nth("subagent_turn", 2), "subagent_id"));
+
+    // A one-off with no registry entry and no retained turn.
+    const lost = try trace.nth("subagent", 2);
+    try expectAbsent(lost, "name");
+    try std.testing.expectEqualStrings("child-lost", try testString(lost, "session_id"));
+    try std.testing.expectEqualStrings("unknown", try testString(lost, "activity"));
+    try std.testing.expectEqualStrings("unknown", try testString(lost, "last_outcome"));
+    try expectAbsent(lost, "task");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(lost, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(try testObject(lost, "tool_calls"), "retained"));
+}
+
+test "trace subagent records list closed sessions and numbers with no retained turn" {
+    var turns: [subagent_turns_shown + 3]diagnostics.SubagentTurn = undefined;
+    for (&turns, 0..) |*turn, index| turn.* = testSubagentTurn(index + 10, "child-gone", "completed", "old work");
+    const calls = [_]diagnostics.ToolCallMetric{
+        .{ .subagent_id = 7, .outcome = .succeeded },
+        .{ .subagent_id = 12, .outcome = .rejected },
+        .{ .subagent_id = 7, .outcome = .tool_failed },
+        .{ .subagent_id = 4, .outcome = .succeeded },
+    };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagentRecords(&w.records, .{ .turns = &turns, .turns_total = turns.len, .calls = &calls });
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 11), try testInt(summary, "turns_retained"));
+    // Each number is listed once, in window order.
+    const unmatched = summary.get("unmatched_subagent_ids").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), unmatched.len);
+    try std.testing.expectEqual(@as(i64, 7), unmatched[0].integer);
+    try std.testing.expectEqual(@as(i64, 4), unmatched[1].integer);
+
+    // Listed once, with its newest turns and the older ones counted.
+    const gone = try trace.one("subagent");
+    try std.testing.expect(!try testBool(gone, "open"));
+    try std.testing.expectEqualStrings("child-gone", try testString(gone, "session_id"));
+    try expectAbsent(gone, "state");
+    try expectAbsent(gone, "activity");
+    try std.testing.expectEqualStrings("old work", try testString(gone, "task"));
+    try std.testing.expectEqual(@as(i64, 11), try testInt(gone, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(gone, "turns_omitted"));
+    const gone_calls = try testObject(gone, "tool_calls");
+    try std.testing.expectEqual(@as(i64, 1), try testInt(gone_calls, "retained"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(gone_calls, "not_succeeded"));
+    try std.testing.expectEqual(subagent_turns_shown, trace.count("subagent_turn"));
+    try std.testing.expectEqual(@as(i64, 20), try testInt(try trace.nth("subagent_turn", 0), "subagent_id"));
+    try std.testing.expectEqual(@as(i64, 13), try testInt(try trace.nth("subagent_turn", subagent_turns_shown - 1), "subagent_id"));
+}
+
+test "trace subagent text is cut on a character boundary and keeps control characters inside its line" {
+    const long_title = "x" ++ text_utils.repeat("\xc3\xa9", 300);
+    const long_task = "first words " ++ text_utils.repeat("\xc3\xa9", 200);
+    var row = testSubagentRow("child-long", "long");
+    row.title = long_title;
+    row.status = "a\x1b[31m red\r\n\ttabbed";
+    const turn = testRingTurn("child-long", long_task);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .turns = &.{turn}, .turns_total = 1 });
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(trace.records.len, std.mem.count(u8, w.out.written(), "\n"));
+    const record = try trace.one("subagent");
+    // 400 bytes would end inside an "é", so the cut leaves it out.
+    try std.testing.expectEqualStrings(long_title[0..399], try testString(record, "title"));
+    try std.testing.expectEqual(@as(i64, long_title.len), try testInt(record, "title_bytes"));
+    try std.testing.expectEqualStrings(row.status, try testString(record, "status"));
+    try expectAbsent(record, "status_bytes");
+    // The ring's cut at 240 bytes falls between two "é", and text that is
+    // not ASCII stays.
+    try std.testing.expectEqualStrings(long_task[0..240], try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, long_task.len), try testInt(record, "task_bytes"));
+}
+
+test "trace subagent records read the turn ring and the tool-call window" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = 9,
+        .session_id = "child-ring",
+        .model = "openai/gpt-5",
+        .effort = "low",
+        .prompt = "read the ring",
+        .started_at_ms = 1_700_000_000_000,
+    });
+    diagnostics.recordSubagentTurnEnd(9, "completed");
+    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 1_700_000_000_100, .outcome = .command_failed, .subagent_id = 9 };
+    call.setName("shell");
+    diagnostics.recordToolCall(call);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagents(&w.records, &struct {}{});
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "turns_total"));
+    const record = try trace.one("subagent");
+    try std.testing.expectEqualStrings("child-ring", try testString(record, "session_id"));
+    try std.testing.expectEqualStrings("read the ring", try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(try testObject(record, "tool_calls"), "not_succeeded"));
+    const turn = try trace.one("subagent_turn");
+    try std.testing.expectEqual(@as(i64, 9), try testInt(turn, "subagent_id"));
+    try std.testing.expectEqualStrings("completed", try testString(turn, "outcome"));
+    try std.testing.expectEqualStrings("low", try testString(turn, "effort"));
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), try testInt(turn, "started_at_ms"));
+}
+
+/// Bytes of a prompt the turn ring keeps.
+const ring_prompt_bytes = @typeInfo(@FieldType(diagnostics.SubagentTurn, "prompt_buf")).array.len;
+
+/// A secret the leak checks plant, and the length of its fixed start: a
+/// record that shows that start and the next byte shows part of the secret.
+/// Each body is capitals and digits, which `subagentFiller` never writes.
+const PlantedSecret = struct { text: []const u8, fixed: usize };
+
+const planted_secrets = [_]PlantedSecret{
+    .{ .text = "ghp_" ++ text_utils.repeat("Q7Z3", 9), .fixed = "ghp_".len },
+    .{ .text = "sk-" ++ text_utils.repeat("Q7Z3", 4), .fixed = "sk-".len },
+    .{ .text = "AKIA" ++ text_utils.repeat("Q7Z3", 4), .fixed = "AKIA".len },
+    .{ .text = "https://Q7Z3W9X2:V5T8R1N4Q7Z3@example.com", .fixed = "https://".len },
+    // A URL credential may hold raw UTF-8, here "ä", before its `@`.
+    .{ .text = "https://ADMIN:P\u{e4}7Z3W9X2Q7Z3@example.com", .fixed = "https://".len },
+};
+
+/// Fails, naming the secret, when a string anywhere in `trace` shows the
+/// fixed start of a planted secret and the byte after it.
+fn expectNoPlantedSecret(trace: *const TestTrace) !void {
+    for (trace.records) |record| try expectNoPlantedSecretIn(.{ .object = record });
+}
+
+fn expectNoPlantedSecretIn(value: std.json.Value) anyerror!void {
+    switch (value) {
+        .string => |text| for (planted_secrets) |secret| try expectNotIn(text, secret.text[0 .. secret.fixed + 1]),
+        .array => |items| for (items.items) |item| try expectNoPlantedSecretIn(item),
+        .object => |fields| {
+            var entries = fields.iterator();
+            while (entries.next()) |entry| try expectNoPlantedSecretIn(entry.value_ptr.*);
+        },
+        else => {},
+    }
+}
+
+/// `len` bytes of filler made from `fuzzed`, repeated as needed: each byte
+/// below 0x80 becomes a lowercase letter, a space, or a symbol, so the filler
+/// never holds a capital or a digit, and the other bytes stay as they are.
+fn subagentFiller(arena: std.mem.Allocator, fuzzed: []const u8, len: usize) ![]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz -_.=:/@\"'\\\n\r\t\x00\x1b\x7f";
+    const out = try arena.alloc(u8, len);
+    for (out, 0..) |*byte, index| {
+        const source: u8 = if (fuzzed.len == 0) 'a' else fuzzed[index % fuzzed.len];
+        byte.* = if (source < 0x80) alphabet[source % alphabet.len] else source;
+    }
+    return out;
+}
+
+/// `filler` cut to put `secret` across byte `cut`, `inside` bytes of it
+/// before the cut, with `separator` on each side.
+fn plantAcross(arena: std.mem.Allocator, filler: []const u8, secret: []const u8, separator: []const u8, cut: usize, inside: usize) ![]u8 {
+    return std.mem.concat(arena, u8, &.{ filler[0 .. cut - inside - separator.len], separator, secret, separator, filler[0..20] });
+}
+
+/// What the fuzz check puts on each side of a planted secret: a space, a
+/// line break, or CJK text with no space.
+const planted_separators = [_][]const u8{ " ", "\n", "\u{4e2d}\u{6587}" };
+
+/// The `task` a trace shows for one subagent turn whose prompt holds
+/// `secret` across the turn ring's cut, `inside` bytes of it before the cut.
+/// Fails when any record shows part of a planted secret.
+fn taskWithSecretAcrossCut(arena: std.mem.Allocator, secret: []const u8, inside: usize) ![]const u8 {
+    const filler = text_utils.repeat("plan the work ", 20);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    const prompt = try plantAcross(w.records.arena, filler, secret, " ", ring_prompt_bytes, inside);
+    const turn = testRingTurn("child-secret", prompt);
+    try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
+    var trace = try w.trace();
+    defer trace.deinit();
+    try expectNoPlantedSecret(&trace);
+    return arena.dupe(u8, try testString(try trace.one("subagent"), "task"));
+}
+
+test "trace subagent task never shows part of a secret the ring's cut split" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var leaks: usize = 0;
+    for (planted_secrets) |secret| {
+        for (1..secret.text.len + 1) |inside| {
+            _ = taskWithSecretAcrossCut(arena, secret.text, inside) catch {
+                std.debug.print("trace test: {s} leaks with {d} of its bytes before the cut\n", .{ secret.text, inside });
+                leaks += 1;
+                break;
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), leaks);
+
+    // The words before the secret stay; a secret that ends at the cut is
+    // kept whole and masked.
+    const words = text_utils.repeat("plan the work ", 20);
+    for (planted_secrets) |secret| {
+        for (1..secret.text.len + 1) |inside| {
+            const task = try taskWithSecretAcrossCut(arena, secret.text, inside);
+            const before = try std.mem.concat(arena, u8, &.{ words[0 .. ring_prompt_bytes - inside - 1], " " });
+            if (inside == secret.text.len) {
+                try expectStartsWith(task, before);
+                try std.testing.expect(task.len > before.len);
+            } else {
+                try std.testing.expectEqualStrings(before, task);
+            }
+        }
+    }
+}
+
+/// The one `subagent` record a trace writes for `turn`, a turn with no
+/// open subagent.
+fn testTaskRecord(w: *TestWriter, turn: diagnostics.SubagentTurn) !struct { TestTrace, std.json.ObjectMap } {
+    try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
+    var trace = try w.trace();
+    errdefer trace.deinit();
+    return .{ trace, try trace.one("subagent") };
+}
+
+test "trace subagent task keeps a CJK prompt up to a character boundary" {
+    // "中" is three bytes and "𠀀" four, so the cut at 240 bytes falls
+    // inside a "中", and the prompt has no space at all.
+    const prompt = text_utils.repeat("\u{4e2d}\u{20000}", 40);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var trace, const record = try testTaskRecord(w, testRingTurn("child-cjk", prompt));
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(text_utils.repeat("\u{4e2d}\u{20000}", 34), try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, prompt.len), try testInt(record, "task_bytes"));
+}
+
+test "trace subagent task is left out when the ring keeps none of the prompt" {
+    const prompt = text_utils.repeat("Q7Z3", 70);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var trace, const record = try testTaskRecord(w, testRingTurn("child-token", prompt));
+    defer trace.deinit();
+    try expectAbsent(record, "task");
+    try std.testing.expectEqual(@as(i64, prompt.len), try testInt(record, "task_bytes"));
+}
+
+/// Writes a subagent whose name, model, and effort are fuzzed filler, and
+/// whose task, title, status row, and failure reason hold each planted secret
+/// across the cut of the turn ring or of the trace. Checks that every record
+/// is one JSON line, that no record shows part of a secret, and what a reader
+/// gets back.
+fn checkSubagentText(fuzzed: []const u8) !void {
+    // Where each secret crosses the cut, and what is around it, follow
+    // from the input.
+    var choices = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, fuzzed));
+    const choice = choices.random();
+    for (planted_secrets) |secret| {
+        const w = try TestWriter.create();
+        defer w.destroy();
+        const a = w.records.arena;
+        const inside = 1 + choice.uintLessThan(usize, secret.text.len);
+        const separator = planted_separators[choice.uintLessThan(usize, planted_separators.len)];
+        const words = try subagentFiller(a, fuzzed, subagent_text_max_bytes);
+        const prompt = try plantAcross(a, words, secret.text, separator, ring_prompt_bytes, inside);
+        const text = try plantAcross(a, words, secret.text, separator, subagent_text_max_bytes, inside);
+        const name = try subagentFiller(a, fuzzed, fuzzed.len);
+        const registry = [_]subagent_tool_host.Runtime.TraceChild{
+            .{ .id = try a.dupe(u8, "child-fuzz"), .phase = .running, .last_outcome = .failed, .last_failure = text, .closing = false },
+        };
+        var row = testSubagentRow("child-fuzz", name);
+        row.title = text;
+        row.status = text;
+        row.model = name;
+        row.effort = name;
+        const turn = testRingTurn("child-fuzz", prompt);
+        // The ring keeps a start of the prompt that fits.
+        try std.testing.expect(std.mem.startsWith(u8, prompt, turn.prompt()));
+        try std.testing.expect(turn.prompt().len <= ring_prompt_bytes);
+        try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .registry = &registry, .turns = &.{turn}, .turns_total = 1 });
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, w.out.written(), "\n"));
+
+        var trace = try w.trace();
+        defer trace.deinit();
+        try expectNoPlantedSecret(&trace);
+        const ta = trace.arena.allocator();
+        const record = try trace.one("subagent");
+        inline for (.{ "name", "model", "effort" }) |field| {
+            if (name.len == 0) {
+                try expectAbsent(record, field);
+            } else {
+                try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, name), try testString(record, field));
+            }
+        }
+        const masked = try text_utils.maskSecrets(ta, text);
+        const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
+        inline for (.{ "last_reason", "title", "status" }) |field| {
+            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, kept), try testString(record, field));
+            if (kept.len < masked.len) {
+                try std.testing.expectEqual(@as(i64, @intCast(masked.len)), try testInt(record, field ++ "_bytes"));
+            } else try expectAbsent(record, field ++ "_bytes");
+        }
+        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, turn.prompt()), subagent_text_max_bytes);
+        if (task.len == 0) {
+            // The ring kept nothing, such as a first word that holds a URL.
+            try expectAbsent(record, "task");
+        } else {
+            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, task), try testString(record, "task"));
+        }
+        try std.testing.expectEqual(@as(i64, @intCast(prompt.len)), try testInt(record, "task_bytes"));
+        try std.testing.expectEqual(@as(i64, 1), try testInt(try trace.one("subagent_turn"), "subagent_id"));
+    }
+}
+
+fn fuzzSubagentText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try checkSubagentText(buffer[0..len]);
+}
+
+test "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text" {
+    try std.testing.fuzz({}, fuzzSubagentText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "plain text",
+            "two\nlines\r\n\ttabbed",
+            "\x1b[31mred\x1b[0m\x7f\xc2\x85",
+            "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
+            "token=\"open quote and spaces " ++ text_utils.repeat("\xc3\xa9", 210),
+        }) ++ @import("fuzz_corpus").subagent_task_line.*),
+    });
+}
+
 test "trace tool calls name why an MCP server refused the parameters" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -2434,17 +3415,19 @@ test "trace tool calls name why an MCP server refused the parameters" {
         .{ .outcome = .tool_failed, .result = "connection closed" },
         .{ .outcome = .succeeded, .result = refusal },
     };
-    for (fixtures, 0..) |fixture, index| {
-        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(1000 + index), .duration_ms = 1, .outcome = fixture.outcome };
-        call.setName("mcp__fixture__search");
-        call.setArgs("{\"limit\":\"40\"}");
-        call.setResult(fixture.result);
-        diagnostics.recordToolCall(call);
+    for (fixtures) |fixture| {
+        diagnostics.recordToolCallResult(.{
+            .name = "mcp__fixture__search",
+            .arguments_json = "{\"limit\":\"40\"}",
+            .model_output = fixture.result,
+            .outcome = fixture.outcome,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     try writeToolProblems(&w.records);
     var trace = try w.trace();
     defer trace.deinit();
@@ -2482,22 +3465,22 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
         .{ .name = "read_file", .outcome = .tool_failed, .args = "{}", .result = "missing" },
         .{ .name = "run_command", .outcome = .runtime_failed, .args = "{\"command\":\"AI_GATEWAY_API_KEY=abcdefghijklmnop zig build\"}", .result = "failed with PASSWORD=abcdefghijklmnop", .subagent_id = 3 },
     };
+    // Each call started `index + 1` seconds ago, so its duration in whole
+    // seconds is known while the clock runs.
     for (fixtures, 0..) |fixture, index| {
-        var call: diagnostics.ToolCallMetric = .{
-            .started_at_ms = @intCast(1000 + index),
-            .duration_ms = @intCast(index + 1),
+        diagnostics.recordToolCallResult(.{
+            .name = fixture.name,
+            .arguments_json = fixture.args,
+            .model_output = fixture.result,
             .outcome = fixture.outcome,
+            .started_at_ms = io_mod.milliTimestamp() - @as(i64, @intCast(index + 1)) * 1000,
             .subagent_id = fixture.subagent_id,
-        };
-        call.setName(fixture.name);
-        call.setArgs(fixture.args);
-        call.setResult(fixture.result);
-        diagnostics.recordToolCall(call);
+        });
     }
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     try writeToolProblems(&w.records);
     var trace = try w.trace();
     defer trace.deinit();
@@ -2509,10 +3492,15 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
     inline for (.{ "succeeded", "rejected", "command_failed", "tool_failed", "runtime_failed" }) |name| {
         try std.testing.expectEqual(@as(i64, 1), try testInt(outcomes, name));
     }
-    try std.testing.expectEqual(@as(i64, 15), try testInt(summary, "total_ms"));
+    const total_ms = try testInt(summary, "total_ms");
+    try std.testing.expectEqual(@as(i64, 15), @divFloor(total_ms, 1000));
     try std.testing.expectEqual(@as(i64, 5), try testInt(try testObject(summary, "session"), "calls"));
     try std.testing.expect(try testBool(summary, "complete"));
     try std.testing.expectEqual(@as(usize, 5), trace.count("tool_call"));
+    var duration_sum: i64 = 0;
+    for (0..5) |index| duration_sum += try testInt(try trace.nth("tool_call", index), "duration_ms");
+    try std.testing.expectEqual(total_ms, duration_sum);
+    try std.testing.expectEqual(@as(usize, 4), trace.count("failed_tool_call"));
 
     const first = try trace.nth("tool_call", 0);
     try std.testing.expectEqualStrings("read_file", try testString(first, "name"));
@@ -2527,7 +3515,7 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
     try std.testing.expectEqualStrings("runtime_failed", try testString(failed, "outcome"));
     try std.testing.expectEqualStrings("subagent", try testString(failed, "source"));
     try std.testing.expectEqual(@as(i64, 3), try testInt(failed, "subagent_id"));
-    try std.testing.expectEqual(@as(i64, 5), try testInt(failed, "duration_ms"));
+    try std.testing.expectEqual(@as(i64, 5), @divFloor(try testInt(failed, "duration_ms"), 1000));
     try expectStartsWith(try testString(failed, "args"), "{\"command\":\"AI_GATEWAY_API_KEY=[redacted]");
     try std.testing.expectEqualStrings("failed with PASSWORD=[redacted]", try testString(failed, "result"));
     try expectAbsent(failed, "result_preview");
@@ -2557,7 +3545,7 @@ test "trace successful tool calls keep only a short result preview" {
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
     const record = try trace.nth("tool_call", 0);
@@ -2577,18 +3565,21 @@ test "trace tool payloads cut at the ring's bound keep whole characters" {
     defer diagnostics.resetForTest();
     const exact: [tool_args_max_bytes]u8 = @splat('a');
     const over: [tool_args_max_bytes + 1]u8 = @splat('b');
-    // 1199 bytes of 'c', then a three-byte character that the ring cuts after its first byte.
+    // 1199 bytes of 'c', then a three-byte character that the ring's bound
+    // falls inside of, so the ring leaves the whole character out.
     const cut = text_utils.repeat("c", tool_args_max_bytes - 1) ++ "\xe2\x94\x80";
-    for ([_][]const u8{ &exact, &over, cut }, 0..) |args, index| {
-        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(10 + index), .outcome = .rejected };
-        call.setName("edit_file");
-        call.setArgs(args);
-        call.setResult("x");
-        diagnostics.recordToolCall(call);
+    for ([_][]const u8{ &exact, &over, cut }) |args| {
+        diagnostics.recordToolCallResult(.{
+            .name = "edit_file",
+            .arguments_json = args,
+            .model_output = "x",
+            .outcome = .rejected,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
 
@@ -2619,7 +3610,7 @@ test "trace web_fetch calls carry no URL or result" {
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
     const record = try trace.one("tool_call");
@@ -2671,7 +3662,7 @@ test "trace web search calls hide provider names and payloads" {
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &history);
+    try writeToolCalls(&w.records, &history, null);
     var trace = try w.trace();
     defer trace.deinit();
     const summary = try trace.one("tool_calls");
@@ -3056,19 +4047,28 @@ test "trace network section states complete coverage when nothing was evicted" {
 test "trace tool section reports session totals and window coverage" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
-    var i: u64 = 0;
+    // The first call fails the way a tool does; the later ones push it out of
+    // the window.
+    diagnostics.recordToolCallResult(.{
+        .name = "shell",
+        .arguments_json = "{}",
+        .model_output = "refused",
+        .outcome = .rejected,
+        .started_at_ms = io_mod.milliTimestamp() - 50,
+    });
+    var i: u64 = 1;
     while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
         var call: diagnostics.ToolCallMetric = .{
             .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 100,
             .duration_ms = 50,
-            .outcome = if (i == 0) .rejected else .succeeded,
+            .outcome = .succeeded,
         };
         call.setName("shell");
         diagnostics.recordToolCall(call);
     }
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
     const total = diagnostics.tool_call_ring_capacity + 2;
@@ -3079,7 +4079,10 @@ test "trace tool section reports session totals and window coverage" {
     try std.testing.expectEqual(@as(i64, total - 1), try testInt(session_outcomes, "succeeded"));
     try std.testing.expectEqual(@as(i64, 1), try testInt(session_outcomes, "rejected"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(session_outcomes, "runtime_failed"));
-    try std.testing.expectEqual(@as(i64, total * 50), try testInt(session, "total_ms"));
+    // The session total counts the failure the window no longer holds.
+    const failed_ms = try testInt(try trace.one("failed_tool_call"), "duration_ms");
+    try std.testing.expect(failed_ms >= 50);
+    try std.testing.expectEqual(@as(i64, (total - 1) * 50) + failed_ms, try testInt(session, "total_ms"));
     try std.testing.expect(!try testBool(summary, "complete"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(try testObject(summary, "outcomes"), "rejected"));
 
@@ -3089,10 +4092,281 @@ test "trace tool section reports session totals and window coverage" {
     diagnostics.recordToolCall(ok_call);
     const fresh = try TestWriter.create();
     defer fresh.destroy();
-    try writeToolCalls(&fresh.records, &.{});
+    try writeToolCalls(&fresh.records, &.{}, null);
     var fresh_trace = try fresh.trace();
     defer fresh_trace.deinit();
     try std.testing.expect(try testBool(try fresh_trace.one("tool_calls"), "complete"));
+}
+
+fn recordTraceTestCall(
+    name: []const u8,
+    outcome: diagnostics.ToolCallOutcome,
+    call_id: []const u8,
+    arguments_json: []const u8,
+    model_output: []const u8,
+) void {
+    diagnostics.recordToolCallResult(.{
+        .name = name,
+        .arguments_json = arguments_json,
+        .model_output = model_output,
+        .outcome = outcome,
+        .started_at_ms = io_mod.milliTimestamp(),
+        .call_id = call_id,
+        .dir = "/Users/example/project",
+    });
+}
+
+/// A failed shell run that `tool_runtime` resolved to the user's startup
+/// files, as it records one.
+fn recordTraceTestRun(call_id: []const u8, arguments_json: []const u8, model_output: []const u8) void {
+    diagnostics.recordToolCallResult(.{
+        .name = "shell",
+        .arguments_json = arguments_json,
+        .model_output = model_output,
+        .outcome = .command_failed,
+        .started_at_ms = io_mod.milliTimestamp(),
+        .call_id = call_id,
+        .dir = "/Users/example/project",
+        .reads_startup_files = true,
+    });
+}
+
+fn traceTestShellView(state: []const u8) shell_snapshot.TraceView {
+    var view: shell_snapshot.TraceView = .{ .state = state, .dirty = false, .names_total = 7 };
+    view.redefined_buf[0] = .{ .name = "cat", .kind = .function };
+    view.redefined_buf[1] = .{ .name = "ls", .kind = .alias };
+    @memcpy(view.redefined_buf[1].target_buf[0..3], "eza");
+    view.redefined_buf[1].target_len = 3;
+    view.redefined_len = 2;
+    return view;
+}
+
+/// A record's `redefined` list as `<name> <kind>[ <alias_of>];` entries.
+fn testRedefined(arena: std.mem.Allocator, record: std.json.ObjectMap) ![]const u8 {
+    const value = record.get("redefined") orelse return fieldProblem("redefined", error.TestFieldMissing);
+    if (value != .array) return fieldProblem("redefined", error.TestFieldNotArray);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (value.array.items) |item| {
+        try out.writer.print("{s} {s}", .{ try testString(item.object, "name"), try testString(item.object, "kind") });
+        if (item.object.get("alias_of")) |target| try out.writer.print(" {s}", .{target.string});
+        try out.writer.writeByte(';');
+    }
+    return out.written();
+}
+
+test "trace keeps a failed call whole in its own record after the window moves on" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Longer than the kept 8 KiB, so the record keeps its head and its tail.
+    const output = try std.mem.concat(alloc, u8, &.{ "no such dir \x1b[31mred\x1b[0m \xff\n", text_utils.repeat("z", 9000), "\nOUTPUT_TAIL_MARKER" });
+    defer alloc.free(output);
+    recordTraceTestRun(
+        "call_failed",
+        "{\"action\":\"run\",\"command\":\"ls -d missing\\ncat notes\\nAI_GATEWAY_API_KEY=abcdefghijklmnop exit 2\"}",
+        output,
+    );
+    for (0..diagnostics.tool_call_ring_capacity) |_| recordTraceTestCall("shell", .succeeded, "call_ok", "{}", "ok");
+
+    const view = traceTestShellView("ready");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, &view);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try expectNotIn(w.out.written(), "abcdefghijklmnop");
+    // JSON escapes the terminal escape, so no line holds an ESC byte.
+    try expectNotIn(w.out.written(), "\x1b");
+
+    const summary = try trace.one("tool_calls");
+    try std.testing.expect(!try testBool(summary, "complete"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "failed_retained"));
+    try std.testing.expect(try testBool(summary, "failed_complete"));
+
+    const failed = try trace.one("failed_tool_call");
+    _ = try testString(failed, "at");
+    try std.testing.expectEqualStrings("shell", try testString(failed, "name"));
+    try std.testing.expectEqualStrings("command_failed", try testString(failed, "outcome"));
+    try std.testing.expectEqualStrings("parent", try testString(failed, "source"));
+    try std.testing.expectEqualStrings("call_failed", try testString(failed, "call_id"));
+    try std.testing.expectEqualStrings("/Users/example/project", try testString(failed, "dir"));
+    // `cat` follows a JSON `\n` escape, which separates words.
+    try std.testing.expectEqualStrings("cat function;ls alias eza;", try testRedefined(trace.arena.allocator(), failed));
+    const args = try testString(failed, "args");
+    try std.testing.expect(std.mem.find(u8, args, "ls -d missing") != null);
+    try std.testing.expect(std.mem.find(u8, args, "AI_GATEWAY_API_KEY=[redacted]") != null);
+    try expectAbsent(failed, "args_omitted_bytes");
+    try expectAbsent(failed, "args_tail");
+    try expectStartsWith(try testString(failed, "result"), "no such dir \x1b[31mred\x1b[0m \\xff\nzzz");
+    try expectEndsWith(try testString(failed, "result_tail"), "zzz\nOUTPUT_TAIL_MARKER");
+    try std.testing.expectEqual(@as(i64, @intCast(output.len)), try testInt(failed, "result_bytes"));
+    const kept_bytes = @typeInfo(@FieldType(diagnostics.KeptText, "buf")).array.len;
+    try std.testing.expectEqual(@as(i64, @intCast(output.len - kept_bytes)), try testInt(failed, "result_omitted_bytes"));
+
+    // The window has moved past the failed call.
+    try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
+    for (0..diagnostics.tool_call_ring_capacity) |index| {
+        const call = try trace.nth("tool_call", index);
+        try std.testing.expectEqualStrings("call_ok", try testString(call, "call_id"));
+        try expectAbsent(call, "failure_kept");
+    }
+}
+
+test "trace marks a window call whose failure is kept" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("read_file", .tool_failed, "call_missing", "{\"path\":\"missing.txt\"}", "not found");
+    recordTraceTestCall("read_file", .succeeded, "call_ok", "{}", "ok");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, null);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const window_failure = try trace.nth("tool_call", 0);
+    try std.testing.expectEqualStrings("call_missing", try testString(window_failure, "call_id"));
+    try std.testing.expect(try testBool(window_failure, "failure_kept"));
+    const window_success = try trace.nth("tool_call", 1);
+    try std.testing.expectEqualStrings("call_ok", try testString(window_success, "call_id"));
+    try expectAbsent(window_success, "failure_kept");
+
+    const kept = try trace.one("failed_tool_call");
+    try std.testing.expectEqualStrings("call_missing", try testString(kept, "call_id"));
+    try std.testing.expectEqualStrings("{\"path\":\"missing.txt\"}", try testString(kept, "args"));
+    try std.testing.expectEqualStrings("not found", try testString(kept, "result"));
+    // Without a shell view, a failure names no redefined commands.
+    try expectAbsent(kept, "redefined");
+}
+
+test "trace names redefined commands only for a failed call recorded as reading the startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestRun("call_user", "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", "exit 1");
+    // `tool_runtime` records these as reading no startup files: a clean
+    // profile, a clean start, and an interact call, which runs no command.
+    // Each names `ls` all the same.
+    recordTraceTestCall("shell", .command_failed, "call_clean", "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", "exit 1");
+    recordTraceTestCall(
+        "shell",
+        .command_failed,
+        "call_named_shell",
+        "{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+        "exit 1",
+    );
+    recordTraceTestCall(
+        "shell",
+        .tool_failed,
+        "call_interact",
+        "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}",
+        "no such session",
+    );
+    const view = traceTestShellView("ready");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, &view);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), trace.count("failed_tool_call"));
+    const user = try trace.nth("failed_tool_call", 0);
+    try std.testing.expectEqualStrings("call_user", try testString(user, "call_id"));
+    try std.testing.expectEqualStrings("ls alias eza;", try testRedefined(trace.arena.allocator(), user));
+    for ([_][]const u8{ "call_clean", "call_named_shell", "call_interact" }, 1..) |call_id, index| {
+        const call = try trace.nth("failed_tool_call", index);
+        try std.testing.expectEqualStrings(call_id, try testString(call, "call_id"));
+        try expectAbsent(call, "redefined");
+    }
+}
+
+test "trace problems list a failure the window no longer holds" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("shell", .command_failed, "call_failed", "{}", "exit 2");
+    for (0..diagnostics.tool_call_ring_capacity) |_| recordTraceTestCall("shell", .succeeded, "call_ok", "{}", "ok");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const problem = try trace.one("problem");
+    try std.testing.expectEqualStrings("tool_call", try testString(problem, "kind"));
+    const call = try testObject(problem, "call");
+    _ = try testString(call, "at");
+    try std.testing.expectEqualStrings("shell", try testString(call, "name"));
+    try std.testing.expectEqualStrings("command_failed", try testString(call, "outcome"));
+    try std.testing.expectEqualStrings("call_failed", try testString(call, "call_id"));
+}
+
+test "trace shell record says how commands start and what startup files redefine" {
+    var ready = traceTestShellView("ready");
+    // An alias's first word can hold a secret, so `alias_of` is masked.
+    const secret_target = "AI_GATEWAY_API_KEY=abcdefghijklmnop";
+    ready.redefined_buf[2] = .{ .name = "curl", .kind = .alias };
+    @memcpy(ready.redefined_buf[2].target_buf[0..secret_target.len], secret_target);
+    ready.redefined_buf[2].target_len = secret_target.len;
+    ready.redefined_len = 3;
+    var failed = traceTestShellView("failed");
+    failed.failure = "the login shell exited before reporting its state";
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeShell(&w.records, &ready, "/bin/zsh");
+    try writeShell(&w.records, &failed, "/bin/bash");
+    try writeShell(&w.records, &ready, "/usr/bin/fish");
+    const starts = [_]struct { state: []const u8, dirty: bool, start: []const u8 }{
+        .{ .state = "ready", .dirty = true, .start = "recapture" },
+        .{ .state = "capturing", .dirty = false, .start = "capturing" },
+        .{ .state = "empty", .dirty = false, .start = "not_started" },
+    };
+    for (starts) |case| {
+        var view = traceTestShellView(case.state);
+        view.dirty = case.dirty;
+        try writeShell(&w.records, &view, "/bin/zsh");
+    }
+    var trace = try w.trace();
+    defer trace.deinit();
+    const arena = trace.arena.allocator();
+    try expectNotIn(w.out.written(), "abcdefghijklmnop");
+
+    const zsh = try trace.nth("shell", 0);
+    try std.testing.expectEqualStrings("/bin/zsh", try testString(zsh, "login_shell"));
+    try std.testing.expectEqualStrings("/bin/zsh", try testString(zsh, "runs"));
+    try std.testing.expectEqualStrings("snapshot_replay", try testString(zsh, "start"));
+    try std.testing.expectEqualStrings("/bin/zsh -f", try testString(zsh, "start_command"));
+    const zsh_snapshot = try testObject(zsh, "snapshot");
+    try std.testing.expectEqualStrings("ready", try testString(zsh_snapshot, "state"));
+    try std.testing.expect(!try testBool(zsh_snapshot, "dirty"));
+    try std.testing.expectEqual(@as(i64, 7), try testInt(zsh_snapshot, "names"));
+    try expectAbsent(zsh_snapshot, "failure");
+    try std.testing.expectEqualStrings(
+        "cat function;ls alias eza;curl alias AI_GATEWAY_API_KEY=[redacted];",
+        try testRedefined(arena, zsh),
+    );
+
+    const bash = try trace.nth("shell", 1);
+    try std.testing.expectEqualStrings("full_startup", try testString(bash, "start"));
+    try std.testing.expectEqualStrings("/bin/bash --login -O expand_aliases", try testString(bash, "start_command"));
+    const bash_snapshot = try testObject(bash, "snapshot");
+    try std.testing.expectEqualStrings("failed", try testString(bash_snapshot, "state"));
+    try std.testing.expectEqualStrings("the login shell exited before reporting its state", try testString(bash_snapshot, "failure"));
+    try expectAbsent(bash_snapshot, "dirty");
+    // Without a snapshot, which commands are redefined is unknown.
+    try expectAbsent(bash, "redefined");
+
+    const fish = try trace.nth("shell", 2);
+    try std.testing.expectEqualStrings("/usr/bin/fish", try testString(fish, "login_shell"));
+    try expectStartsWith(try testString(fish, "runs"), "/bin/");
+
+    for (starts, 3..) |case, index| {
+        const record = try trace.nth("shell", index);
+        try std.testing.expectEqualStrings(case.start, try testString(record, "start"));
+        if (!std.mem.eql(u8, case.state, "ready")) try expectAbsent(record, "redefined");
+    }
 }
 
 test "trace last shutdown reads a report or says why it cannot" {
@@ -3384,16 +4658,15 @@ test "trace stays well formed with every ring full and a long transcript" {
     // Compaction and catalog details hold internal values only and are not
     // masked, so their text has no secret.
     const plain_big = text_utils.repeat("\"quoted\" \\ \xff\xc3 \u{2028}\n", 30);
+    // Two of every three calls fail, more than the failure ring holds.
     for (0..diagnostics.tool_call_ring_capacity + 1) |index| {
-        var call: diagnostics.ToolCallMetric = .{
-            .started_at_ms = @intCast(1_000 + index),
-            .duration_ms = 7,
-            .outcome = if (index % 2 == 0) .succeeded else .tool_failed,
-        };
-        call.setName("shell");
-        call.setArgs(big);
-        call.setResult(big);
-        diagnostics.recordToolCall(call);
+        diagnostics.recordToolCallResult(.{
+            .name = "shell",
+            .arguments_json = big,
+            .model_output = big,
+            .outcome = if (index % 3 == 0) .succeeded else .tool_failed,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
     for (0..diagnostics.network_ring_capacity + 1) |index| {
         var call: diagnostics.NetworkCall = .{
@@ -3443,7 +4716,7 @@ test "trace stays well formed with every ring full and a long transcript" {
     try writeCompaction(&w.records);
     try writeNetwork(&w.records);
     try writeModelCatalog(&w.records, &struct {}{});
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     try writeRendererEvents(&w.records);
     try writeTranscript(&w.records, entries);
     try writeEnd(&w.records);
@@ -3453,6 +4726,8 @@ test "trace stays well formed with every ring full and a long transcript" {
     try expectNotIn(w.out.written(), "abcdefghijklmnop");
     try std.testing.expectEqual(@as(i64, @intCast(trace.records.len - 1)), try testInt(trace.records[trace.records.len - 1], "records"));
     try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
+    try std.testing.expectEqual(diagnostics.failed_tool_call_capacity, trace.count("failed_tool_call"));
+    try std.testing.expect(!try testBool(try trace.one("tool_calls"), "failed_complete"));
     try std.testing.expectEqual(diagnostics.network_ring_capacity, trace.count("network_call"));
     try std.testing.expectEqual(diagnostics.render_ring_capacity, trace.count("renderer_event"));
     try std.testing.expectEqual(diagnostics.compaction_ring_capacity, trace.count("compaction_event"));
