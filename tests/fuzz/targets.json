@@ -74,6 +74,7 @@
     {"name": "unsupported_tool_name", "module": "fx", "test": "an unsupported tool's name stays one run of visible text whatever bytes the model sends", "iterations": 300000},
     {"name": "network_error_message", "module": "fx", "test": "fuzzed gateway error messages stay one bounded line of UTF-8", "iterations": 2000000},
     {"name": "session_address", "module": "fx", "test": "an agent address parses or is refused on fuzzed bytes", "iterations": 5000000},
-    {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000}
+    {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000},
+    {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000}
   ]
 }
