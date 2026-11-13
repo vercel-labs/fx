@@ -27,8 +27,16 @@ pub const auth_file_name = profile_paths.auth_file_name;
 pub const kept_team_file_name = "vercel-team.json";
 const max_kept_team_file_bytes = 1024;
 
-/// What `Mutation.keepTeam` did with the kept team.
-pub const KeptTeamChange = enum { kept, forgotten, unchanged };
+/// True when a login has a team `Mutation.keepTeam` can keep: a team id or
+/// slug that is a valid team name.
+pub fn hasKeepableTeam(team_id: ?[]const u8, team_slug: ?[]const u8) bool {
+    return keepableTeamValue(team_id) != null or keepableTeamValue(team_slug) != null;
+}
+
+fn keepableTeamValue(value: ?[]const u8) ?[]const u8 {
+    const team = value orelse return null;
+    return if (types.validGatewayTeam(team)) team else null;
+}
 const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
@@ -467,13 +475,12 @@ const NativeMutation = struct {
     }
 
     /// Keeps the team of a login fx is about to retire, so a later sign-in
-    /// starts on it. A login without a valid team forgets the kept one.
-    pub fn keepTeam(self: *Mutation, alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !KeptTeamChange {
-        const text = (try stringifyKeptTeam(alloc, team_id, team_slug)) orelse
-            return if (try self.forgetTeam()) .forgotten else .unchanged;
+    /// starts on it. A login without a team to keep (`hasKeepableTeam`) is
+    /// refused; forget the kept team for it instead.
+    pub fn keepTeam(self: *Mutation, alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !void {
+        const text = (try stringifyKeptTeam(alloc, team_id, team_slug)) orelse return error.NoKeepableTeam;
         defer alloc.free(text);
         try io_mod.durableReplaceVerified(alloc, &self.fx_dir, kept_team_file_name, text);
-        return .kept;
     }
 
     /// Forgets the kept team, as a sign-out does. True when there was one.
@@ -629,9 +636,7 @@ const HostMutation = struct {
 
     /// A host keeps no files, so a sign-in there starts only on the saved
     /// login's team.
-    pub fn keepTeam(_: *HostMutation, _: Allocator, _: ?[]const u8, _: ?[]const u8) !KeptTeamChange {
-        return .unchanged;
-    }
+    pub fn keepTeam(_: *HostMutation, _: Allocator, _: ?[]const u8, _: ?[]const u8) !void {}
 
     pub fn forgetTeam(_: *HostMutation) !bool {
         return false;
@@ -1046,8 +1051,8 @@ fn keptTeamValue(object: std.json.ObjectMap, key: []const u8) error{InvalidKeptT
 /// The kept-team file for a team, or null when neither value is a valid team
 /// name.
 fn stringifyKeptTeam(alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !?[]u8 {
-    const id = if (team_id) |value| (if (types.validGatewayTeam(value)) value else null) else null;
-    const slug = if (team_slug) |value| (if (types.validGatewayTeam(value)) value else null) else null;
+    const id = keepableTeamValue(team_id);
+    const slug = keepableTeamValue(team_slug);
     if (id == null and slug == null) return null;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();

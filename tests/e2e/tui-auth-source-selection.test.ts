@@ -2876,6 +2876,30 @@ tmuxTest(
 );
 
 tmuxTest(
+  "a removed login without a team that cannot forget the kept team is still removed, and the trace says why",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-retire-no-team-not-forgotten-"));
+    gateway = refusingGateway();
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { rejectRefreshGrant: true, teams: KEEP_TEAM_TEAMS });
+    // An expired login without a team: fx refreshes it first, and the issuer
+    // refuses.
+    writeSeededFxLogin(home, Date.now() - 60 * 1000, oauth.issuerUrl, "team_456");
+    const authPath = join(home, ".fx", "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    delete auth.team_id;
+    delete auth.team_slug;
+    writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
+    // A directory where the kept team goes makes its removal fail.
+    mkdirSync(keptTeamPath(home), { mode: 0o700 });
+    await retireLoginWithFxAsk(home, gateway, oauth.issuerUrl);
+    const askTrace = readFileSync(join(home, "ask-trace.log"), "utf8");
+    expect(askTrace).toContain("kept team not forgotten reason=retired_login_has_no_team err=");
+    expect(askTrace).not.toContain("retired fx login team not kept");
+  },
+  60_000,
+);
+
+tmuxTest(
   "fx login starts on a kept team saved by its slug only",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-login-kept-slug-"));

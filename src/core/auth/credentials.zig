@@ -937,17 +937,33 @@ fn retire_fx_session(
     mutation: *oauth_session.Mutation,
     session: *const oauth_session.Session,
 ) !void {
-    // A later sign-in, in this fx process or another, starts on this login's
-    // team. Not keeping it only changes which team that sign-in starts on.
-    if (mutation.keepTeam(alloc, session.team_id, session.team_slug)) |change| switch (change) {
-        .kept => debug_trace.logf("auth", "retired fx login team kept", .{}),
-        .forgotten => debug_trace.logf("auth", "kept team forgotten reason=retired_login_has_no_team", .{}),
-        .unchanged => {},
-    } else |err| {
-        debug_trace.logf("auth", "retired fx login team not kept err={s}", .{@errorName(err)});
-    }
+    keepRetiredTeam(alloc, mutation, session);
     const result = mutation.delete(alloc) catch return error.OAuthSessionCleanupUncertain;
     if (result.local_cleanup_failed) return error.OAuthSessionCleanupUncertain;
+}
+
+/// A later sign-in, in this fx process or another, starts on the retired
+/// login's team; a login without one leaves no older team behind. A failure
+/// only changes which team that sign-in starts on, so it is traced, not
+/// returned.
+fn keepRetiredTeam(
+    alloc: std.mem.Allocator,
+    mutation: *oauth_session.Mutation,
+    session: *const oauth_session.Session,
+) void {
+    if (oauth_session.hasKeepableTeam(session.team_id, session.team_slug)) {
+        mutation.keepTeam(alloc, session.team_id, session.team_slug) catch |err| {
+            debug_trace.logf("auth", "retired fx login team not kept err={s}", .{@errorName(err)});
+            return;
+        };
+        debug_trace.logf("auth", "retired fx login team kept", .{});
+        return;
+    }
+    const forgotten = mutation.forgetTeam() catch |err| {
+        debug_trace.logf("auth", "kept team not forgotten reason=retired_login_has_no_team err={s}", .{@errorName(err)});
+        return;
+    };
+    if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=retired_login_has_no_team", .{});
 }
 
 fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?i64) Credential {
