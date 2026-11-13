@@ -661,11 +661,12 @@ const JsonField = union(enum) { string: []const u8, integer: i64, other };
 /// or, when it has a "request" field, among that object's fields only: a
 /// call can wrap its fields in {"request": {...}}, and core then reads
 /// nothing outside it, and nothing at all when "request" is not an object
-/// (src/core/tooling/tool_presentation.zig). It reads only as far as the key,
-/// skips the strings before it by jumping from quote to quote, and decodes
-/// only the key's own value, so a write_file call that holds a whole file
-/// costs one quick scan on each render, not a parse. It does not check the
-/// rest of the text. error.NotObject when `json` is not an object; null when
+/// (src/core/tooling/tool_presentation.zig). It reads the top-level field
+/// names to the end of the object, because a "request" field can come after
+/// the key, and it skips each value by jumping from quote to quote. It
+/// decodes only the key's own value, so a write_file call that holds a whole
+/// file costs one quick scan on each render, not a parse. It does not check
+/// the text after the object. error.NotObject when `json` is not an object; null when
 /// it has no such key.
 fn jsonObjectField(scratch: std.mem.Allocator, json: []const u8, key: []const u8) !?JsonField {
     const open = skipJsonSpace(json, 0);
@@ -700,10 +701,9 @@ fn objectField(scratch: std.mem.Allocator, json: []const u8, start: usize, key: 
         }
         if (top_match == null and std.mem.eql(u8, name, key)) {
             top_match = try fieldValue(scratch, json, index);
-            // A "request" field later in the object would take its place.
-            // When its name appears nowhere after here, there is none, so
-            // the scan stops.
-            if (!top or std.mem.find(u8, json[index..], "\"request\"") == null) return top_match;
+            // At the top, a "request" field later in the object would take
+            // its place, so the scan goes on over the other fields.
+            if (!top) return top_match;
         }
         index = skipJsonSpace(json, skipJsonValue(json, index) orelse return error.SyntaxError);
         if (index < json.len and json[index] == ',') index = skipJsonSpace(json, index + 1);
