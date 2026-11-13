@@ -77,5 +77,15 @@
     "stress": "RefreshLease.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "Connect",
+    "smoke": "Connect.cfg",
+    "stress": "Connect.stress.cfg",
+    "findings": [
+      { "config": "Connect.findings.cfg", "invariant": "NoFalseFailure" },
+      { "config": "Connect.findings-reissue.cfg", "invariant": "NoReissue" }
+    ],
+    "repair": []
   }
 ]
