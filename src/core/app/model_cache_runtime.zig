@@ -708,30 +708,21 @@ pub const Runtime = struct {
     pub fn adoptSavedTokenPass(self: *Self, saved: ?token_pass_mod.Answer) void {
         self.token_pass = token_pass_mod.Tracker.fromSaved(saved);
         if (saved != null) debug_trace.logf("catalog", "token pass status={t} source=saved", .{self.token_pass.status});
-        token_pass_team.publishHasPass(self.token_pass.hasPass());
+        token_pass_team.publishAnswer(saved, false);
     }
 
     /// Records what AI Gateway said about this team; `source` names how,
     /// for the trace.
     pub fn observeTokenPassAnswer(self: *Self, answer: token_pass_mod.Answer, source: []const u8) void {
+        // Published even when the status stays: an answer AI Gateway gives
+        // in this run outranks the catalog's marks from then on.
+        token_pass_team.publishAnswer(answer, !std.mem.eql(u8, source, token_pass_team.catalog_source));
         const changed = switch (answer) {
             .has_pass => self.token_pass.observeCredit(),
             .no_pass => self.token_pass.observeNoPass(),
         };
         if (!changed) return;
         debug_trace.logf("catalog", "token pass status={t} source={s}", .{ self.token_pass.status, source });
-        token_pass_team.publishHasPass(self.token_pass.hasPass());
-    }
-
-    /// Whether the loaded catalog marks any model as paid by the team's Token
-    /// Pass, which AI Gateway does only for a team with an active pass.
-    pub fn catalogMarksTokenPass(self: *Self) bool {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.catalog.items) |entry| {
-            if (entry.token_pass) return true;
-        }
-        return false;
     }
 
     pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
@@ -765,7 +756,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
-        _ = token_pass_team.publishCatalog(self.catalog.items);
+        token_pass_team.publishCatalog(self.catalog.items);
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
@@ -1086,7 +1077,7 @@ pub const Runtime = struct {
                     model_catalog.freeModelCatalog(self.alloc, &self.catalog);
                     self.catalog = catalog;
                     self.outcome = .{ .loaded = loaded.provenance };
-                    _ = token_pass_team.publishCatalog(self.catalog.items);
+                    token_pass_team.publishCatalog(self.catalog.items);
                 }
                 self.state = .ready;
                 return .{ .ready = .{

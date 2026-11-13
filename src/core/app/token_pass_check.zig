@@ -110,6 +110,8 @@ pub const Check = struct {
     named: Named,
     home: ?[]const u8,
     has_pass: bool = false,
+    /// Whether the credits check answered in this run.
+    answered: bool = false,
 
     /// Starts the check with the saved answer, or waits at most `wait_ms`
     /// for one when fx has none. Publishes whether the team has Token Pass
@@ -123,7 +125,7 @@ pub const Check = struct {
     ) void {
         const saved: ?token_pass.Answer = if (self.home) |dir| if (self.named.saved_as) |id| token_pass_memory.load(alloc, dir, &id) else null else null;
         self.has_pass = saved == .has_pass;
-        defer token_pass_team.publishHasPass(self.has_pass);
+        token_pass_team.publishAnswer(saved, false);
         if (comptime builtin.single_threaded) return;
         // A login that is due for renewal has no token yet; the saved answer
         // stands, and the next run asks.
@@ -144,10 +146,23 @@ pub const Check = struct {
         self.waitForAnswer(alloc, 0);
     }
 
+    /// Takes the catalog's Token Pass marks as the team's answer while AI
+    /// Gateway has given none in this run (`token_pass_team.catalogAnswers`),
+    /// and saves it. Returns true when it changed what fx knows.
+    pub fn observeCatalog(self: *Check, alloc: Allocator) bool {
+        if (self.has_pass or !token_pass_team.catalogAnswers()) return false;
+        self.has_pass = true;
+        token_pass_team.publishAnswer(.has_pass, false);
+        if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, .has_pass);
+        debug_trace.logf("token_pass", "check answered answer=has_pass source={s}", .{token_pass_team.catalog_source});
+        return true;
+    }
+
     /// Takes an answer that has arrived, then stops the check. `reason`
     /// names why, for the trace, when the check had not answered.
     pub fn finish(self: *Check, alloc: Allocator, reason: []const u8) void {
         self.waitForAnswer(alloc, 0);
+        _ = self.observeCatalog(alloc);
         if (self.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason={s}", .{reason});
         self.lookup.deinit();
     }
@@ -161,7 +176,8 @@ pub const Check = struct {
                 const answer = answerOf(result.snapshot);
                 if (answer) |fresh| {
                     self.has_pass = fresh == .has_pass;
-                    token_pass_team.publishHasPass(self.has_pass);
+                    self.answered = true;
+                    token_pass_team.publishAnswer(fresh, true);
                     if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
                 }
                 // Logged once the answer is saved, so a reader of the trace
@@ -317,12 +333,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// A catalog that marks Token Pass models, which AI Gateway sends only
-        /// to a team with an active pass.
+        /// to a team with an active pass: it answers for the team until AI
+        /// Gateway answers in this run (`token_pass_team.catalogAnswers`).
         pub fn observeCatalog(app: *App) void {
             if (comptime !@hasField(App, "model_cache") or !@hasField(App, "token_pass_check")) return;
             if (provider_runtime.provider(app) != .gateway) return;
-            if (!app.model_cache.catalogMarksTokenPass()) return;
-            record(app, .has_pass, "catalog");
+            if (app.model_cache.tokenPassStatus() == .active or !token_pass_team.catalogAnswers()) return;
+            record(app, .has_pass, token_pass_team.catalog_source);
             applyStartModel(app) catch |err| {
                 debug_trace.logf("token_pass", "start model not applied source=catalog err={s}", .{@errorName(err)});
             };

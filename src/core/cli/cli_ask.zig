@@ -1816,6 +1816,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 options.model_override == null and
                 ctx.requested_resume == null and
                 ctx.session.agent.history.items.len == 0;
+            // Without an answer, the catalog's Token Pass marks can answer for
+            // the team; the turn reuses the catalog this loads.
+            if (nothing_chose_model and !token_pass_run.?.has_pass and !token_pass_run.?.answered) {
+                _ = resolveModelCapabilities(&ctx, alloc, ctx.model) catch |err| {
+                    debug_trace.logf("token_pass", "catalog not loaded for the start model err={s}", .{@errorName(err)});
+                };
+                _ = token_pass_run.?.observeCatalog(alloc);
+            }
             if (token_pass_run.?.has_pass and nothing_chose_model) {
                 debug_trace.logf("token_pass", "start model={s}", .{token_pass.default_model});
                 ctx.model = token_pass.default_model;
@@ -2065,11 +2073,14 @@ fn maybeStartAskTitleTask(
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const provider_title_model = bundle.title_model orelse return null;
     // A Token Pass session of a team with Token Pass titles itself with a
-    // Token Pass model.
-    const title_model = if (ctx.provider == .gateway)
-        token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model)
-    else
-        provider_title_model;
+    // Token Pass model the catalog marks, so the title waits for the catalog
+    // the turn would load anyway.
+    const title_model = if (ctx.provider == .gateway) title: {
+        _ = resolveModelCapabilities(ctx, ctx.alloc, ctx.model) catch |err| {
+            debug_trace.logf("token_pass", "catalog not loaded for the title model err={s}", .{@errorName(err)});
+        };
+        break :title token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model);
+    } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     // A custom connection may need no key; its adapter checks the one it gets.

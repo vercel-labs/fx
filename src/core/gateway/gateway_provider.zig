@@ -460,7 +460,7 @@ pub const CapabilityResolver = struct {
 /// provider's catalog says nothing about the AI Gateway team.
 fn publishTokenPassModels(provider: model_catalog.Provider, entries: []const model_catalog.ModelCatalogEntry) void {
     if (provider.provider_id != .gateway) return;
-    _ = token_pass_team.publishCatalog(entries);
+    token_pass_team.publishCatalog(entries);
 }
 
 /// How long a request waits for a model catalog load to connect, for

@@ -2851,9 +2851,9 @@ fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: conf
 
 fn pollTokenPass(state: *ServerState) void {
     const check = if (state.token_pass_run) |*value| value else return;
-    if (check.lookup.task == null) return;
     const before = check.has_pass;
-    check.poll(state.alloc);
+    if (check.lookup.task != null) check.poll(state.alloc);
+    _ = check.observeCatalog(state.alloc);
     if (check.has_pass != before) applyTokenPassStartModel(state);
 }
 
@@ -3103,6 +3103,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .message = "Selected provider is unavailable in this host",
             });
         _ = try resolveSelectedModelCapabilities(state, startup_catalog);
+        // The catalog just loaded; its Token Pass marks can answer for the
+        // team when the credits check could not.
+        if (comptime !host_target.is_wasm) pollTokenPass(state);
     }
 
     if (state.cfg.effort_override) |raw| {

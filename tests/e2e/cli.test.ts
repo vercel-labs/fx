@@ -32,6 +32,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   startFakeGateway,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 import { onlySessionId, savedSession, savedText, sessionDir } from "./saved-sessions";
 import {
@@ -4731,6 +4732,48 @@ describe("cli: credits", () => {
         expect(saved()).toEqual(["no_pass"]);
         await ask([], "NO_PASS_ASK");
         expect(models()[3]).toBe("spacexai/grok-4.7");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask takes Token Pass from the model list's marks when the credits check fails",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace);
+      const gateway = startFakeGateway([fakeGatewayFinalText("CATALOG_PASS_ASK")], {
+        models: tokenPassCatalog(true),
+        titleResponses: [fakeGatewayFinalText("Catalog Pass Title")],
+        usage: (url) => url.pathname === "/coding-agent/v1/credits" ? new Response("unavailable", { status: 503 }) : null,
+      });
+      try {
+        const result = await runFx(["ask", "--json", "Which model answers?"], {
+          cwd: workspace,
+          env: {
+            AI_GATEWAY_API_KEY: "fake-catalog-pass-ask-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+          },
+          timeoutMs: TIMEOUT,
+        });
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toContain("CATALOG_PASS_ASK");
+        // The marks answer for the team: the run starts on the Token Pass
+        // default, titles itself with a Token Pass model, and saves the answer.
+        expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["deepseek/deepseek-v4.1-flash"]);
+        expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["zai/glm-5.3-flash"]);
+        expect(Object.values(JSON.parse(readFileSync(join(home, ".fx", "token-pass.json"), "utf8")).teams)).toEqual(["has_pass"]);
       } finally {
         gateway.stop();
         cleanupIsolatedTestHome(home);

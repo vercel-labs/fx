@@ -21,7 +21,7 @@ pub const default_model = "deepseek/deepseek-v4.1-flash";
 /// The most Token Pass models fx keeps for a team, and the longest model ID.
 /// A team's pass pays for a handful of models; a mark past either limit is
 /// dropped, and the trace says so.
-pub const max_team_models = 32;
+pub const max_team_models = 64;
 pub const max_model_id_len = 128;
 
 /// The models AI Gateway marks as paid by a team's Token Pass, in a fixed
