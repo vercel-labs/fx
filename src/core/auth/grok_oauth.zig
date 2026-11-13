@@ -9,6 +9,7 @@ const io_mod = @import("../shared/io.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,10 +30,14 @@ const e2e_revoke_url_env = "FX_TEST_GROK_REVOKE_URL";
 const browser_scope = "openid profile email offline_access grok-cli:access api:access";
 const browser_login_timeout_seconds: i64 = 5 * 60;
 
-pub const RefreshMode = enum {
+pub const RefreshMode = union(enum) {
     if_needed,
     force,
     stored,
+    /// xAI rejected this access token: rotate only as
+    /// `oauth.rejectedLoginRotates` decides, so a login another fx already
+    /// refreshed is used as it is.
+    replace_rejected: []const u8,
 };
 
 pub const Access = struct {
@@ -312,7 +317,7 @@ fn completeSignIn(
 ) !login_flow.SignInCompletion {
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
     const refresh_token = token.refresh_token orelse return error.GrokRefreshTokenMissing;
-    const account_id = try fetchAccountId(alloc, context.transport, token.access_token);
+    const account_id = try fetchAccountId(alloc, context.transport, token.access_token, false);
     errdefer alloc.free(account_id);
     const duration_ms = std.math.mul(i64, token.expires_in, std.time.ms_per_s) catch
         return error.InvalidGrokOAuthResponse;
@@ -430,6 +435,9 @@ const StdinManualCodeReader = struct {
 pub const LogoutResult = struct {
     deletion: grok_session.DeleteOutcome,
     revocation_failed: bool,
+    /// The unconfirmed revocation's token is kept, and fx revokes it later
+    /// (`pending_revocation`).
+    retry_kept: bool = false,
 };
 
 pub fn logout(
@@ -442,9 +450,14 @@ pub fn logout(
     var result = local.result;
     if (local.refresh_token) |token| {
         if (before_revocation) |notice| notice.run(notice.context);
-        revokeToken(alloc, transport, token) catch {
+        revokeToken(alloc, transport, token) catch |err| {
+            debug_trace.logf("auth", "Grok logout revocation failed err={s}", .{@errorName(err)});
             result.revocation_failed = true;
+            result.retry_kept = local.kept and pending_revocation.retryable(err);
+            if (local.kept and !result.retry_kept) pending_revocation.forget(alloc, .grok, token);
+            return result;
         };
+        if (local.kept) pending_revocation.forget(alloc, .grok, token);
     }
     return result;
 }
@@ -456,6 +469,9 @@ pub const LocalLogout = struct {
     /// Owned by the caller when set; release it with `secret.zeroAndFree`
     /// using the allocator passed to `logoutLocally`.
     refresh_token: ?[]u8 = null,
+    /// Whether `refresh_token` is kept to revoke later (`pending_revocation`).
+    /// Forget it once its revocation is confirmed.
+    kept: bool = false,
 };
 
 /// Deletes the saved Grok session without contacting xAI. Revoke the returned
@@ -470,6 +486,7 @@ pub fn logoutLocally(alloc: Allocator) !LocalLogout {
     var revocation_failed = false;
     var refresh_token: ?[]u8 = null;
     errdefer if (refresh_token) |token| secret.zeroAndFree(alloc, token);
+    var kept = false;
     const loaded_session = mutation.load(alloc) catch |err| blk: {
         debug_trace.logf("auth", "Grok logout could not load the saved credential err={s}", .{@errorName(err)});
         revocation_failed = true;
@@ -479,14 +496,38 @@ pub fn logoutLocally(alloc: Allocator) !LocalLogout {
         var session = loaded;
         defer session.deinit(alloc);
         refresh_token = try alloc.dupe(u8, session.refresh_token);
+        // Kept before the login is deleted, so a revocation that never
+        // completes still leaves the token for a later retry.
+        kept = pending_revocation.keep(alloc, .grok, .{ .refresh_token = session.refresh_token });
     }
+    const deletion = mutation.delete() catch |err| {
+        // The login is still saved, so its token must not be revoked later.
+        if (kept) pending_revocation.forget(alloc, .grok, refresh_token.?);
+        return err;
+    };
     return .{
         .result = .{
-            .deletion = try mutation.delete(),
+            .deletion = deletion,
             .revocation_failed = revocation_failed,
         },
         .refresh_token = refresh_token,
+        .kept = kept,
     };
+}
+
+/// Revokes the Grok sign-outs that earlier logouts kept because the provider
+/// did not confirm them (`pending_revocation.retry`).
+pub fn retryKeptSignOuts(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) pending_revocation.RetryOutcome {
+    return pending_revocation.retry(alloc, .grok, .{ .context = &transport, .run = revokeKept }, before_revocation);
+}
+
+fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
+    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
+    return revokeToken(alloc, transport.*, tokens.refresh_token);
 }
 
 pub fn sourceExists(alloc: Allocator) !bool {
@@ -511,8 +552,16 @@ pub fn loadAccess(
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
 
-    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+    const expired = session.expired(io_mod.milliTimestamp());
+    const rotate = switch (mode) {
+        .if_needed, .stored => expired,
+        .force => true,
+        .replace_rejected => |rejected| oauth.rejectedLoginRotates(session.access_token, rejected, expired),
+    };
+    if (rotate) {
         try refreshSession(alloc, transport, &mutation, &session);
+    } else if (mode == .replace_rejected) {
+        debug_trace.logf("auth", "Grok refresh skipped reason=saved_login_replaced", .{});
     }
     return takeAccess(&session);
 }
@@ -588,7 +637,7 @@ fn refreshReplacement(
     token: *RefreshTokenResponse,
     current: grok_session.Session,
 ) !grok_session.Session {
-    const account_id = try fetchAccountId(alloc, transport, token.access_token);
+    const account_id = try fetchAccountId(alloc, transport, token.access_token, true);
     errdefer alloc.free(account_id);
     if (!std.mem.eql(u8, account_id, current.account_id)) {
         return error.GrokAccountChanged;
@@ -642,6 +691,7 @@ fn requestRefreshToken(
         .method = .post_form,
         .url = endpoint_url,
         .payload = payload,
+        .outlives_cancel = true,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
@@ -737,10 +787,13 @@ fn requestAccepted(
     return requestAcceptedWithBounds(alloc, transport, method, url, payload, null, null);
 }
 
+/// `outlives_cancel` for a refresh, which has already retired the old
+/// refresh token by the time it asks (`oauth_transport.Request`).
 fn fetchAccountId(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     access_token: []const u8,
+    outlives_cancel: bool,
 ) ![]u8 {
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
@@ -750,6 +803,7 @@ fn fetchAccountId(
         .method = .get,
         .url = endpoint_url,
         .authorization = authorization,
+        .outlives_cancel = outlives_cancel,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) return error.GrokUserInfoRequestFailed;
@@ -901,6 +955,7 @@ test "Grok account identity comes from authenticated userinfo" {
         std.testing.allocator,
         .{ .context = &state, .execute_fn = State.execute },
         "access-token",
+        false,
     );
     defer std.testing.allocator.free(account_id);
     try std.testing.expect(state.authorization_seen);
@@ -919,6 +974,7 @@ test "Grok account identity rejects unsafe userinfo bytes" {
             std.testing.allocator,
             .{ .execute_fn = State.execute },
             "access-token",
+            false,
         ),
     );
 }
@@ -928,6 +984,7 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
         method: ?oauth_transport.Method = null,
         payload: [512]u8 = undefined,
         payload_len: usize = 0,
+        outlives_cancel: bool = false,
 
         fn execute(
             raw: ?*anyopaque,
@@ -937,6 +994,7 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             const payload = request.payload orelse &.{};
             self.method = request.method;
+            self.outlives_cancel = request.outlives_cancel;
             self.payload_len = @min(payload.len, self.payload.len);
             @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
             return .{
@@ -954,6 +1012,8 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(oauth_transport.Method.post_form, state.method.?);
+    // A cancel never cuts the token request off (`oauth_transport.Request`).
+    try std.testing.expect(state.outlives_cancel);
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "grant_type=refresh_token") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expectEqual(@as(?i64, 3600), response.expires_in);
@@ -1049,4 +1109,30 @@ test "Grok browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+test "a Grok refresh's account lookup is never cut off by a cancel" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        outlives_cancel: bool = false,
+
+        fn execute(raw: ?*anyopaque, a: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.outlives_cancel = request.outlives_cancel;
+            return .{ .disposition = .accepted, .body = try a.dupe(u8, "{\"sub\":\"acct\"}") };
+        }
+    };
+    var state = State{};
+    var token: RefreshTokenResponse = .{ .access_token = try alloc.dupe(u8, "new-access"), .refresh_token = null, .expires_in = 3600 };
+    defer token.deinit(alloc);
+    // A failed lookup here retires the session, whose refresh token the
+    // token request has already used up.
+    var replacement = try refreshReplacement(alloc, .{ .context = &state, .execute_fn = State.execute }, &token, .{
+        .access_token = @constCast("old-access"),
+        .refresh_token = @constCast("refresh"),
+        .expires_at_ms = 0,
+        .account_id = @constCast("acct"),
+    });
+    defer replacement.deinit(alloc);
+    try std.testing.expect(state.outlives_cancel);
 }

@@ -1640,6 +1640,38 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
+  for (const retriedLimit of [40, "forty"]) {
+    test(`a 2026 server that refuses a call's arguments with -32602 still answers the next call (${JSON.stringify(retriedLimit)})`, async () => {
+      const root = createRoot("typed-arguments-refused", MODERN_FIXTURE, { mode: "typed_arguments" });
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+        // Text that is not a number stays text, so the server refuses it.
+        fakeGatewayToolCall("refused_call", "toolbox", { run: TOOL_NAME, arguments: { limit: "forty" } }),
+        fakeGatewayToolCall("retried_call", "toolbox", { run: TOOL_NAME, arguments: { limit: retriedLimit } }),
+        fakeGatewayFinalText("Refused MCP arguments complete."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+      );
+
+      const wire = readWire(root.wireLogPath);
+      expect(result.code).toBe(0);
+      expect(toolResultText(gateway.requests[2]!.body, "refused_call")).toContain("-32602");
+      const retried = toolResultText(gateway.requests[3]!.body, "retried_call");
+      expect(retried).toContain(retriedLimit === 40 ? "TYPED_ARGUMENTS_OK" : "-32602");
+      expect(retried).not.toContain("unavailable");
+      // The refusal is about the arguments, so fx keeps the 2026 session.
+      expect(wire.filter((entry) => entry.message.method === "initialize")).toHaveLength(0);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(2);
+      expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
+
   test("typed MCP arguments the model wrote as text reach the server as their schema's types", async () => {
     const root = createRoot("typed-arguments-repaired", MODERN_FIXTURE, { mode: "typed_arguments" });
     gateway = startFakeGateway([
@@ -2437,8 +2469,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   test.skipIf(!tmuxAvailable())(
     "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
     async () => {
-      // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx
-      // negotiate the protocol again.
+      // A 2025 server, as Datadog's is. A 2026 server's -32602 on a call keeps its
+      // session ("a 2026 server that refuses a call's arguments with -32602 still
+      // answers the next call" in this file).
       const root = createRoot("tui-invalid-params", LEGACY_FIXTURE, {
         mode: "invalid_params",
         legacyVersion: "2025-06-18",
