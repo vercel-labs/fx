@@ -1363,8 +1363,9 @@ fn fallbackOutcome(alloc: Allocator, work_id: []const u8, outcome: child_state.O
 pub const profile_unavailable_code = "profile_unavailable";
 
 /// What works for a child that cannot load its profile. A profile cannot be
-/// given to a child that exists, so a new one is the only other way.
-const profile_next_step = "Restore the profile, or close this subagent and start a new one, which loses its conversation.";
+/// given to a child that exists, so a new one is the only other way. It has no
+/// final period: the report that carries the failure adds one.
+const profile_next_step = "Restore the profile, or close this subagent and start a new one, which loses its conversation";
 
 /// The outcome of a work whose admission could not be captured. When the child's
 /// profile could not be loaded, the failure says so, names the profile, and
@@ -1411,9 +1412,13 @@ test "an admission that failed for the child's profile names the profile, and an
     const named = admissionFailure(&owner, try alloc.dupe(u8, "work-1"), "kid", error.AdmissionFailed);
     defer named.deinit(alloc);
     try std.testing.expectEqual(child_state.Outcome.failed, named.outcome);
-    try std.testing.expect(std.mem.startsWith(u8, named.failure.?.view(), "profile_unavailable: no profile named 'reviewer'"));
-    // It says what works, though the profile's reason is cut to make room.
-    try std.testing.expect(std.mem.endsWith(u8, named.failure.?.view(), profile_next_step));
+    // The reason, then what works, and no period of its own: the report that
+    // carries it adds one.
+    try std.testing.expectEqualStrings(
+        "profile_unavailable: no profile named 'reviewer'. Profiles: agent, main; Restore the profile, or close this subagent and start a new one, which loses its conversation",
+        named.failure.?.view(),
+    );
+    try std.testing.expect(!std.mem.endsWith(u8, named.failure.?.view(), "."));
 
     const plain = admissionFailure(&owner, try alloc.dupe(u8, "work-2"), "other", error.AdmissionFailed);
     defer plain.deinit(alloc);

@@ -2357,6 +2357,10 @@ test "a spawn line saves what the profile set only when there is something to sa
         .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"started_with\":{\"v\":2,\"from\":\"home\"}}", .kept = null },
         .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"started_with\":{\"v\":1,\"from\":\"project\",\"permission_mode\":\"yolo\"}}", .kept = null },
         .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"started_with\":{\"v\":1,\"from\":\"home\"}}", .kept = null },
+        // A repeated key, in the block or in a field fx does not read, is data
+        // that does not parse: the child loads, and its block is not believed.
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"started_with\":{\"v\":1,\"from\":\"home\",\"from\":\"home\"}}", .kept = null },
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"extra\":1,\"extra\":2,\"started_with\":{\"v\":1,\"from\":\"home\"}}", .kept = null },
     };
     for (cases) |case| {
         const entry: session_adapter.Child = .{
@@ -2374,6 +2378,19 @@ test "a spawn line saves what the profile set only when there is something to sa
             try std.testing.expect(started_with_mod.eql(expected, child.started_with.?));
         } else try std.testing.expect(child.started_with == null);
     }
+
+    // A repeated key in a field fx reads fails the child's load, as it did
+    // before blocks, so the fallback to the profile's name does not cover it.
+    const repeated: session_adapter.Child = .{
+        .id = try arena.dupe(u8, "1786460757753-0002"),
+        .work_id = try arena.dupe(u8, "work"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = try arena.dupe(u8, "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"profile\":\"r\"}"),
+        .finish_data = null,
+        .seq = 1,
+    };
+    try std.testing.expectError(error.InvalidState, childFromFolded(alloc, repeated));
 
     // A block over its budget is left out of the line, not cut.
     var long: [40][]const u8 = undefined;

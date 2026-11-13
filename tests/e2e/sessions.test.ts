@@ -3267,7 +3267,8 @@ test("a subagent an earlier fx saved with only its profile's name fails with the
     expect(reports[1]).not.toContain("AdmissionFailed");
     // It says what works, and does not advise keeping a child that fails on
     // every message.
-    expect(reports[1]).toContain("Restore the profile, or close this subagent and start a new one, which loses its conversation.");
+    expect(reports[1]).toContain("Restore the profile, or close this subagent and start a new one, which loses its conversation. Earlier tool calls may have completed");
+    expect(reports[1]).not.toContain("..");
     expect(reports[1]).not.toContain("Keep it if related work may follow");
     expectWholeLog(fixture, id);
   } finally {
