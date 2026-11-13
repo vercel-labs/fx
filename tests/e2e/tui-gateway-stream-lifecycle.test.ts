@@ -5340,7 +5340,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => !isProcessAlive(commandPid),
         "interrupted tty command exit",
       );
-      expect(readFileSync(tracePath, "utf8")).toContain("outcome_kind=interrupted");
+      // fx can write the interrupt outcome after the command exits.
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes("outcome_kind=interrupted"),
+        "interrupted turn outcome",
+      );
       expect(escapeGateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
