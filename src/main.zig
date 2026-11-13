@@ -5767,6 +5767,89 @@ test "the tick visits only the child agents with work waiting" {
     try std.testing.expect(app.screenAgent() == &app.main_agent);
 }
 
+test "the tick leaves hidden agents' work for a later pass while a scrollback handoff is pending" {
+    const alloc = std.testing.allocator;
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const on_screen = try addTestChildAgent(&app, "on-screen");
+    const hidden = try addTestChildAgent(&app, "hidden");
+    try App.AgentsAppRuntime.show(&app, on_screen);
+    for ([_]*agents.Agent{ &app.main_agent, &hidden.agent }) |agent| {
+        try agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    }
+
+    const Visits = struct {
+        seen: std.ArrayList(*agents.Agent) = .empty,
+        fn record(self: *@This(), a: *App, agent: *agents.Agent) anyerror!void {
+            try self.seen.append(a.alloc, agent);
+            var events = agent.worker.takeEvents();
+            defer {
+                for (events.items) |event| worker_runtime.freeWorkerEvent(a.alloc, event);
+                events.deinit(a.alloc);
+            }
+        }
+    };
+    var visits: Visits = .{};
+    defer visits.seen.deinit(alloc);
+
+    // Swapping a hidden transcript in now would trip swapSlot's handoff
+    // assertion.
+    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, Visits.record);
+    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
+    try std.testing.expect(app.main_agent.worker.hasPendingEvents());
+    try std.testing.expect(hidden.agent.worker.hasPendingEvents());
+    try std.testing.expect(app.screenAgent() == &on_screen.agent);
+
+    // Once the handoff's rows are written, the next pass handles the work.
+    app.shell.pending_session_scrollback_handoff = null;
+    try App.AgentsAppRuntime.tickChildren(&app, &visits, Visits.record);
+    try std.testing.expectEqual(@as(usize, 2), visits.seen.items.len);
+    try std.testing.expect(visits.seen.items[0] == &app.main_agent);
+    try std.testing.expect(visits.seen.items[1] == &hidden.agent);
+    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
+    try std.testing.expect(!hidden.agent.worker.hasPendingEvents());
+    try std.testing.expect(app.screenAgent() == &on_screen.agent);
+}
+
+test "a run handed to a hidden agent waits while a scrollback handoff is pending" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    // The hand-off list uses the C allocator, as the slot threads do.
+    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
+    const child = try addTestChildAgent(&app, "child-1");
+
+    // Taking the run reads only the turn's child id and name.
+    var turn: subagent_execution.TurnContext = undefined;
+    turn.child_id = child.id;
+    turn.child_name = null;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var post: app_agents_runtime.Post = .{ .turn = &turn, .run = try testChildRun(alloc, &resolver, false, null) };
+    // A held run stays the post's own.
+    defer if (post.run) |*run| run.deinit(alloc);
+    try app.child_handoffs.posts.append(std.heap.c_allocator, &post);
+
+    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
+    defer app.shell.pending_session_scrollback_handoff = null;
+    App.AgentsAppRuntime.takePosts(&app);
+
+    try std.testing.expectEqual(app_agents_runtime.Post.State.posted, post.state.load(.acquire));
+    try std.testing.expect(post.held);
+    try std.testing.expectEqual(@as(usize, 1), app.child_handoffs.posts.items.len);
+    try std.testing.expect(app.child_handoffs.posts.items[0] == &post);
+    try std.testing.expect(child.agent.child_run == null);
+    try std.testing.expect(app.screenAgent() == &app.main_agent);
+}
+
 test "the agent list previews each agent by switching, keeps every draft where it was typed, Up on the first row closes it, and Esc goes back" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
