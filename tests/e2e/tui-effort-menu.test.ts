@@ -491,7 +491,7 @@ test.skipIf(!tmuxAvailable())("a model without levels opens no /effort column, a
   expect(columnViews(current, "plain-column")).toEqual([]);
 }, TIMEOUT);
 
-test.skipIf(!tmuxAvailable())("Ctrl+T steps through the model's levels lowest to highest and around again, and the next request carries the one in use", async () => {
+test.skipIf(!tmuxAvailable())("Ctrl+T steps through the model's levels in their order and around again, and the next request carries the one in use", async () => {
   const current = await launch();
   const { session, gateway } = current;
   // Over the open /effort menu, Ctrl+T closes it and steps from the level in
@@ -525,8 +525,10 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps through the model's levels lowest to
     .filter((request) => request.body.includes("keep this draft"))
     .map((request) => JSON.parse(request.body) as { reasoning?: string })[0];
   expect(sent?.reasoning).toBe("medium");
-  // Only the /effort command opened the menu.
-  expect(menuViews(current, "cycle").every((view) => view.menu.current === "default")).toBe(true);
+  // Only the /effort command opened the menu, before any level was chosen.
+  const views = menuViews(current, "cycle");
+  expect(views.length).toBeGreaterThan(0);
+  expect(views.every((view) => view.menu.current === "default")).toBe(true);
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("Ctrl+T on a model without levels says why and saves nothing", async () => {

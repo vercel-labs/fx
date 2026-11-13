@@ -1039,13 +1039,15 @@ pub fn Commands(comptime App: type) type {
             try applyEffort(app, agent, effort, .named, true);
         }
 
-        /// Ctrl+T: moves `agent`'s model to the next reasoning effort level it
-        /// offers, lowest to highest and from the highest back to the lowest.
+        /// Ctrl+T: moves `agent`'s model to the next reasoning effort level
+        /// in the order the model lists them, and from the last one back to
+        /// the first. The Gateway catalog lists levels lowest first.
         /// `default`, or a level the model does not offer, moves to the
-        /// lowest. Saves the level as `/effort` does and leaves the transcript
-        /// alone, as Shift+Tab does for the permission mode: the status line
-        /// names the level in use. A running turn keeps the effort it started
-        /// with. A model without levels gets the notice `/effort` gives.
+        /// first. Saves the level as `/effort` does and, unless saving fails
+        /// or leaves a warning, writes nothing to the transcript, as
+        /// Shift+Tab does for the permission mode: the status line names the
+        /// level in use. A running turn keeps the effort it started with. A
+        /// model without levels gets a notice saying so.
         pub fn cycleEffort(app: *App, agent: *AppAgent) !void {
             const model = provider_runtime.modelOf(app, agent);
             const capabilities = model_capabilities.resolveForApp(App, app, model);
@@ -2127,6 +2129,7 @@ const FakeApp = struct {
     fetch_ids: []const []const u8 = &.{},
     fail_fetch: bool = false,
     last_tone: ?types.NoticeTone = null,
+    model_cache_loading: bool = false,
     preference_commit_count: usize = 0,
     last_preference_model: std.ArrayList(u8) = .empty,
     last_preference_provider: ?model_provider.ProviderId = null,
@@ -2239,6 +2242,10 @@ const FakeApp = struct {
             }
         }
         return model_capabilities.capabilitiesForModel(model);
+    }
+
+    pub fn isModelCacheLoading(self: *const FakeApp) bool {
+        return self.model_cache_loading;
     }
 
     fn setGatewayControls(
@@ -3318,6 +3325,64 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     try std.testing.expectEqual(@as(usize, 1), app.agent().worker.effort_sync_count);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands /effort and ctrl+t say why a model offers no levels" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "provider/plain");
+    defer app.deinit();
+
+    try std.testing.expect(try Commands(FakeApp).handleEffort(&app, (&app).agent(), "") == .done);
+    try std.testing.expectEqualStrings("* effort: provider/plain has no levels to choose from\n", app.text());
+    app.clearTranscript();
+    try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+    try std.testing.expectEqualStrings("* effort: provider/plain has no levels to choose from\n", app.text());
+
+    // Until the catalog loads, each names what to try again.
+    app.model_cache_loading = true;
+    app.clearTranscript();
+    try std.testing.expect(try Commands(FakeApp).handleEffort(&app, (&app).agent(), "high") == .done);
+    try std.testing.expectEqualStrings(
+        "* effort: levels for provider/plain are still loading; try /effort again in a moment\n",
+        app.text(),
+    );
+    app.clearTranscript();
+    try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+    try std.testing.expectEqualStrings(
+        "* effort: levels for provider/plain are still loading; try ctrl+t again in a moment\n",
+        app.text(),
+    );
+
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.effort_sync_count);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "session_commands cycleEffort steps through the model's levels, syncs queued prompts, and saves each one" {
+    const alloc = std.testing.allocator;
+    const model = "provider/new-reasoning-model";
+    var app = try FakeApp.init(alloc, "/tmp/workspace", model);
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    app.setGatewayControls(model, &efforts, false);
+
+    // `default` steps to the first level, and the last one wraps to it.
+    for ([_]types.ReasoningEffort{ efforts[0], efforts[1], efforts[0] }, 1..) |effort, press| {
+        try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(@as(?types.ReasoningEffort, effort), app.agent().worker.synced_effort);
+        try std.testing.expectEqual(press, app.agent().worker.effort_sync_count);
+        try std.testing.expectEqual(@as(?types.ReasoningEffort, effort), app.last_preference_effort);
+        try std.testing.expectEqual(press, app.preference_commit_count);
+    }
+    // Only the effort is saved: the model stays the one in use.
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.last_preference_model.items);
+    try std.testing.expect(app.agent().worker.synced_model == null);
 }
 
 test "session_commands model selection clears fast mode when the selected model has no fast control" {

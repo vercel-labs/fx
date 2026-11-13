@@ -92,8 +92,8 @@ pub const Action = union(enum) {
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,
-    /// Ctrl+T: moves the current model to its next reasoning effort level,
-    /// lowest to highest and around again.
+    /// Ctrl+T: moves the current model to the next reasoning effort level it
+    /// lists, and from the last one back to the first.
     cycle_effort,
     /// Ctrl+X: opens the agent list whatever the composer holds, or goes
     /// back from it while it is open.

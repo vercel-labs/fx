@@ -128,6 +128,7 @@ test "composer shortcut table excludes app and terminal controls" {
         .clear_line,
         .toggle_full_transcript,
         .toggle_permission_mode,
+        .cycle_effort,
         .{ .mouse_wheel = .up },
         .{ .remapped_byte = 3 },
         .{ .remapped_byte = 15 },

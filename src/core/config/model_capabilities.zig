@@ -277,10 +277,12 @@ pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
     return if (capabilities.reasoning_efforts.len == 0) 0 else capabilities.reasoning_efforts.len + 1;
 }
 
-/// The level after `current` among the ones the model declares, which it
-/// lists lowest first: the next higher one, and from the highest back to the
-/// lowest. `default`, or a level the model does not declare, steps to the
-/// lowest. Null when the model declares no levels.
+/// The level after `current` in the order the model declares its levels,
+/// and from the last one back to the first. The Gateway catalog lists levels
+/// lowest first, so there this steps up and wraps to the lowest; a custom
+/// connection keeps the order of its settings. `default`, or a level the
+/// model does not declare, steps to the first. Null when the model declares
+/// no levels.
 pub fn nextReasoningEffort(capabilities: Capabilities, current: types.ReasoningEffort) ?types.ReasoningEffort {
     const levels = capabilities.reasoning_efforts.slice();
     if (levels.len == 0) return null;
@@ -432,7 +434,7 @@ test "reasoning effort picker helpers prepend default and preserve Gateway order
     try std.testing.expectEqual(@as(usize, 0), reasoningEffortIndex(capabilities, types.ReasoningEffort.literal("stale")));
 }
 
-test "next reasoning effort steps lowest to highest and wraps" {
+test "next reasoning effort steps through the declared levels in order and wraps" {
     const low = types.ReasoningEffort.literal("low");
     const medium = types.ReasoningEffort.literal("medium");
     const high = types.ReasoningEffort.literal("high");
