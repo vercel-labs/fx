@@ -843,14 +843,11 @@ pub const WorkerRuntime = struct {
 
     /// Cancels the turn in flight without stopping the worker, which goes on
     /// to run later turns, as a subagent's agent does: every wait wakes to
-    /// see the cancel, a permission request the turn is waiting on is
-    /// declined, and a question it is waiting on is cancelled.
+    /// see the cancel, and a permission request the turn is waiting on is
+    /// declined.
     pub fn requestTurnCancel(self: *WorkerRuntime) void {
         self.requestCancel();
         self.cancelApprovalTurn();
-        if (self.cancelPendingQuestionBatch()) {
-            debug_trace.logf("worker", "pending question cancelled reason=turn_cancel", .{});
-        }
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
@@ -8433,26 +8430,6 @@ test "a turn that waits for a question's answer says so until the wait ends, how
         try std.testing.expect(ended);
         try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
     }
-}
-
-test "cancelling a turn that waits for a question's answer ends the wait, as it does a permission's" {
-    const alloc = std.testing.allocator;
-    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
-    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-    var state = QuestionThreadState{};
-    const thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries });
-    var snapshot = try waitForQuestionSnapshot(&runtime);
-    snapshot.deinit(alloc);
-    runtime.requestTurnCancel();
-    const ended = userWaitEnds(&runtime);
-    // A wait that did not end is released, so the test fails instead of hanging.
-    if (!ended) runtime.requestStop();
-    thread.join();
-    defer freeAnswers(alloc, state.answers);
-    try std.testing.expect(ended);
-    try std.testing.expect(state.answers == null);
 }
 
 test "an MCP server's question waits for the user, and a request that waits for a sign-in does not count" {
