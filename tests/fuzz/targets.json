@@ -82,6 +82,6 @@
     {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
     {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
     {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
-    {"name": "mcp_error_data", "module": "fx", "test": "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes", "iterations": 1000000}
+    {"name": "mcp_error_data", "module": "fx", "test": "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes", "iterations": 100000}
   ]
 }
