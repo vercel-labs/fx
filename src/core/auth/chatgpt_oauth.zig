@@ -571,6 +571,7 @@ fn requestRefreshToken(
         .method = .post_json,
         .url = endpoint_url,
         .payload = payload,
+        .outlives_cancel = true,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
@@ -877,6 +878,7 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
         method: ?oauth_transport.Method = null,
         payload: [512]u8 = undefined,
         payload_len: usize = 0,
+        outlives_cancel: bool = false,
 
         fn execute(
             raw: ?*anyopaque,
@@ -886,6 +888,7 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             const payload = request.payload orelse &.{};
             self.method = request.method;
+            self.outlives_cancel = request.outlives_cancel;
             self.payload_len = @min(payload.len, self.payload.len);
             @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
             return .{
@@ -903,6 +906,8 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    // A cancel never cuts the token request off (`oauth_transport.Request`).
+    try std.testing.expect(state.outlives_cancel);
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expect(response.expires_in == null);

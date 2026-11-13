@@ -1841,3 +1841,45 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
 }
+
+/// Answers an fx login refresh. A cancel arrives while the token request is
+/// on the wire, and a request that carries the cancelled flag is cut off, as
+/// the real transport does.
+const CancelDuringFxLoginRefresh = struct {
+    cancel: *std.atomic.Value(bool),
+
+    fn provider(self: *CancelDuringFxLoginRefresh) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: std.mem.Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *CancelDuringFxLoginRefresh = @ptrCast(@alignCast(raw.?));
+        if (request.method == .get) return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}"),
+        };
+        self.cancel.store(true, .seq_cst);
+        if (request.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"access_token\":\"renewed-access\",\"refresh_token\":\"renewed-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}"),
+        };
+    }
+};
+
+test "a cancel while an fx login refresh is on the wire never cuts it off, and the new login is saved" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var issuer: CancelDuringFxLoginRefresh = .{ .cancel = &cancel };
+    var cancellable: oauth_transport.Cancellable = .{ .inner = issuer.provider(), .cancel_flag = &cancel };
+
+    var credential = (try refreshFxLoginCredential(alloc, cancellable.provider(), null)).?;
+    defer credential.deinit(alloc);
+    try std.testing.expect(cancel.load(.seq_cst));
+    try std.testing.expectEqualStrings("renewed-access", credential.token);
+    var persisted = (try oauth_session.load(alloc)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-refresh", persisted.refresh_token);
+}

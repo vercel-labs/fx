@@ -312,7 +312,7 @@ fn completeSignIn(
 ) !login_flow.SignInCompletion {
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
     const refresh_token = token.refresh_token orelse return error.GrokRefreshTokenMissing;
-    const account_id = try fetchAccountId(alloc, context.transport, token.access_token);
+    const account_id = try fetchAccountId(alloc, context.transport, token.access_token, false);
     errdefer alloc.free(account_id);
     const duration_ms = std.math.mul(i64, token.expires_in, std.time.ms_per_s) catch
         return error.InvalidGrokOAuthResponse;
@@ -588,7 +588,7 @@ fn refreshReplacement(
     token: *RefreshTokenResponse,
     current: grok_session.Session,
 ) !grok_session.Session {
-    const account_id = try fetchAccountId(alloc, transport, token.access_token);
+    const account_id = try fetchAccountId(alloc, transport, token.access_token, true);
     errdefer alloc.free(account_id);
     if (!std.mem.eql(u8, account_id, current.account_id)) {
         return error.GrokAccountChanged;
@@ -642,6 +642,7 @@ fn requestRefreshToken(
         .method = .post_form,
         .url = endpoint_url,
         .payload = payload,
+        .outlives_cancel = true,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
@@ -737,10 +738,13 @@ fn requestAccepted(
     return requestAcceptedWithBounds(alloc, transport, method, url, payload, null, null);
 }
 
+/// `outlives_cancel` for a refresh, which has already retired the old
+/// refresh token by the time it asks (`oauth_transport.Request`).
 fn fetchAccountId(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     access_token: []const u8,
+    outlives_cancel: bool,
 ) ![]u8 {
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
@@ -750,6 +754,7 @@ fn fetchAccountId(
         .method = .get,
         .url = endpoint_url,
         .authorization = authorization,
+        .outlives_cancel = outlives_cancel,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) return error.GrokUserInfoRequestFailed;
@@ -901,6 +906,7 @@ test "Grok account identity comes from authenticated userinfo" {
         std.testing.allocator,
         .{ .context = &state, .execute_fn = State.execute },
         "access-token",
+        false,
     );
     defer std.testing.allocator.free(account_id);
     try std.testing.expect(state.authorization_seen);
@@ -919,6 +925,7 @@ test "Grok account identity rejects unsafe userinfo bytes" {
             std.testing.allocator,
             .{ .execute_fn = State.execute },
             "access-token",
+            false,
         ),
     );
 }
@@ -928,6 +935,7 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
         method: ?oauth_transport.Method = null,
         payload: [512]u8 = undefined,
         payload_len: usize = 0,
+        outlives_cancel: bool = false,
 
         fn execute(
             raw: ?*anyopaque,
@@ -937,6 +945,7 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             const payload = request.payload orelse &.{};
             self.method = request.method;
+            self.outlives_cancel = request.outlives_cancel;
             self.payload_len = @min(payload.len, self.payload.len);
             @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
             return .{
@@ -954,6 +963,8 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(oauth_transport.Method.post_form, state.method.?);
+    // A cancel never cuts the token request off (`oauth_transport.Request`).
+    try std.testing.expect(state.outlives_cancel);
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "grant_type=refresh_token") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expectEqual(@as(?i64, 3600), response.expires_in);
@@ -1049,4 +1060,30 @@ test "Grok browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+test "a Grok refresh's account lookup is never cut off by a cancel" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        outlives_cancel: bool = false,
+
+        fn execute(raw: ?*anyopaque, a: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.outlives_cancel = request.outlives_cancel;
+            return .{ .disposition = .accepted, .body = try a.dupe(u8, "{\"sub\":\"acct\"}") };
+        }
+    };
+    var state = State{};
+    var token: RefreshTokenResponse = .{ .access_token = try alloc.dupe(u8, "new-access"), .refresh_token = null, .expires_in = 3600 };
+    defer token.deinit(alloc);
+    // A failed lookup here retires the session, whose refresh token the
+    // token request has already used up.
+    var replacement = try refreshReplacement(alloc, .{ .context = &state, .execute_fn = State.execute }, &token, .{
+        .access_token = @constCast("old-access"),
+        .refresh_token = @constCast("refresh"),
+        .expires_at_ms = 0,
+        .account_id = @constCast("acct"),
+    });
+    defer replacement.deinit(alloc);
+    try std.testing.expect(state.outlives_cancel);
 }
