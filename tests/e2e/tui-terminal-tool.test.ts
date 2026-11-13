@@ -229,9 +229,14 @@ function terminalRecord(home: string, sessionId: string): Record<string, unknown
 }
 
 /** The shell pid in a terminal record, or null before its launcher reports it. */
-function recordedPid(home: string, sessionId: string): number | null {
-  const pid = Number(terminalRecord(home, sessionId).pid);
+/** The shell pid a record holds, or null while its terminal is still starting. */
+function pidOf(record: Record<string, unknown>): number | null {
+  const pid = Number(record.pid);
   return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function recordedPid(home: string, sessionId: string): number | null {
+  return pidOf(terminalRecord(home, sessionId));
 }
 
 /** A running handle can return before the launcher records the shell pid. */
@@ -1193,7 +1198,7 @@ test("fx ask exit ends its TTY terminal within one second", async () => {
     if (!processAlive(pid)) continue;
     await waitUntilGone([pid], Math.max(0, 1_000 - (Date.now() - exitedAt)));
   }
-  expect(processAlive(shellPid)).toBe(false);
+  if (shellPid !== null) expect(processAlive(shellPid)).toBe(false);
   expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
   expectNoTerminalHostDaemon(fixture);
   expect(readFileSync(fixture.tracePath, "utf8")).toContain(
@@ -1347,7 +1352,7 @@ test("the full terminal budget starts, refuses one more, and ends together at ex
   expect(records).toHaveLength(budget);
   // A terminal still starting when fx exits has no shell pid yet; its
   // command is still found by name below.
-  const shellPids = records.map((record) => Number(record.pid)).filter((pid) => Number.isInteger(pid) && pid > 0);
+  const shellPids = records.flatMap((record) => pidOf(record) ?? []);
   await waitUntilGone(
     [...shellPids, ...processesMatching("sleep 45.75")],
     Math.max(0, 1_500 - (Date.now() - exitedAt)),
