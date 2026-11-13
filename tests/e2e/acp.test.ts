@@ -30,7 +30,7 @@ import {
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
-import { bearer, rotateFxLogin, startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
+import { bearer, rotateFxLogin, startFakeIssuer, storedFxLoginToken, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -1696,6 +1696,55 @@ describe("acp: model-independent", () => {
         expect(JSON.stringify(result.messages)).toContain("ACP Generated Title");
         expect(gateway.titleRequests.map((request) => bearer(request.headers))).toEqual(["other-fx-token"]);
         expect(issuer.refreshes).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP refreshes the login once and replays a rejected prompt when the store still holds the rejected token",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-401-refresh-");
+      const issuer = startFakeIssuer({ refresh: () => "refreshed-token" });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      let mainRequests = 0;
+      // The gateway rejects the first turn request, and no other fx renews the
+      // stored login in between.
+      const gateway = startDynamicFakeGateway(() => {
+        mainRequests += 1;
+        return mainRequests === 1 ? unauthorized() : finalText("ACP_MAIN_ANSWER_OK");
+      }, {
+        titleResponses: [() => finalText("ACP Generated Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Answer directly.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_MAIN_ANSWER_OK");
+        expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token", "refreshed-token"]);
+        expect(issuer.refreshes).toHaveLength(1);
+        expect(storedFxLoginToken(root.home)).toBe("refreshed-token");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

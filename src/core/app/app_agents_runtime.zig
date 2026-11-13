@@ -122,6 +122,13 @@ pub const ChildAgent = struct {
         if (self.agent.child_run) |*run| if (run.inFlight()) return true;
         return turnInFlight(&self.agent) or self.agent.worker.hasPendingEvents();
     }
+
+    /// Whether it has events for the loop to handle or assistant text left to
+    /// pace out in `pacer`, the pacer that holds its text: its own slot's
+    /// while it is hidden, the app's while it is on screen (`pacerOf`).
+    fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+    }
 };
 
 /// An agent in the switch list, such as the row Delete closes or the row
@@ -756,10 +763,10 @@ pub fn Runtime(comptime App: type) type {
             try body(context, app, agent);
         }
 
-        /// True when `child` has events for the loop to handle or assistant
-        /// text left to pace out.
+        /// True when the hidden `child` has events for the loop to handle or
+        /// assistant text left to pace out.
         pub fn hasPendingWork(child: *ChildAgent) bool {
-            return child.agent.worker.hasPendingEvents() or child.screen.pacer.hasPending();
+            return child.hasUnapplied(&child.screen.pacer);
         }
 
         /// Handles the work of every hidden agent that has any, each in its
@@ -1424,7 +1431,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// How many of the agent on screen's own subagents have a turn going
-        /// while its own turn has ended; 0 while it has a turn of its own.
+        /// while its own turn has ended; 0 while it has a turn of its own. A
+        /// subagent whose turn has ended but is not applied yet counts too,
+        /// as `stateOf` shows it working in the list.
         pub fn subagentWaitCount(app: *App) usize {
             const screen = agents.screenAgentOf(app);
             if (turnInFlight(screen)) return 0;
@@ -1432,7 +1441,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent) continue;
                 if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent)) count += 1;
+                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
             }
             return count;
         }
@@ -2176,23 +2185,46 @@ pub fn Runtime(comptime App: type) type {
         /// turn reads the run installed on the agent until its last event is
         /// applied, so nothing replaces that run before then.
         fn turnGoing(app: *App, child: *ChildAgent) bool {
-            const pacer = if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
-            return child.workGoing() or pacer.hasPending();
+            return child.workGoing() or pacerOf(app, child).hasPending();
+        }
+
+        /// The pacer that holds `child`'s assistant text: the app's while the
+        /// child is on screen, its own slot's otherwise.
+        fn pacerOf(app: *App, child: *ChildAgent) *AssistantPacer {
+            return if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
         }
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
+        /// Whether the turn `child`'s worker has finished is still being
+        /// applied: its events wait for the loop, or its pacer holds the
+        /// finish while the reply is shown. Its reply reaches the history
+        /// only after that.
+        fn resultPending(app: *App, child: *ChildAgent) bool {
+            return child.hasUnapplied(pacerOf(app, child));
+        }
+
         /// What agent `target`, null for the first instance, waits for or
         /// does. A subagent whose approval or question its instance's screen
-        /// shows for it still waits on it.
+        /// shows for it still waits on it. A subagent whose turn has ended
+        /// but is not applied yet is still working: the list places it by the
+        /// newest reply in its history, so its state and its place change
+        /// together, as `tests/tla/agents_menu/spec/RowOrder.tla`
+        /// PlaceChangesWithLabel requires.
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
             }
-            return instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const child = target orelse return state;
+            if (child.agent.role != .subagent) return state;
+            return switch (state) {
+                .idle, .finished => if (resultPending(app, child)) .working else state,
+                .working, .needs_approval, .has_question, .needs_you => state,
+            };
         }
 
         /// Whether agent `target`'s status row, null for the first instance,
