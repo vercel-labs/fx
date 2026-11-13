@@ -554,6 +554,17 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(events.some((event) => String(event.detail ?? "").includes("[redacted]"))).toBe(true);
       expect(report.text).not.toContain("abcdef0123456789xyz");
       expect(report.problems("compaction").length).toBeGreaterThan(0);
+      // The failures are also kept apart from the event window, so later
+      // events never push them out of the trace or its problems.
+      const kept = report.all("failed_compaction_event");
+      expect(kept.length).toBeGreaterThan(0);
+      expect(compaction.kept_failures).toBe(kept.length);
+      expect(compaction.session_failures).toBeGreaterThanOrEqual(kept.length);
+      const keptNames = kept.map((event) => event.event);
+      expect(keptNames).toContain("summary_transport_failed");
+      expect(keptNames).toContain("transaction_failed");
+      expect(kept.every((event) => event.failed === true)).toBe(true);
+      expect(report.problems("compaction").map((problem) => problem.event)).toContain("transaction_failed");
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
