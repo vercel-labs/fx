@@ -5375,6 +5375,7 @@ test {
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
+    _ = @import("core/workspace/auto_review_metrics.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");

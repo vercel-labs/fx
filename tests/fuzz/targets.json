@@ -70,6 +70,7 @@
     {"name": "request_wrapper_text", "module": "fx", "test": "request wrappers sent as JSON text unwrap as tool_args reads them", "iterations": 250000},
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
+    {"name": "trace_review_records", "module": "fx", "test": "trace review and setup records stay valid JSON lines for fuzzed text", "iterations": 12000},
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
     {"name": "subagent_task_line", "module": "fx", "test": "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text", "iterations": 1200},
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},

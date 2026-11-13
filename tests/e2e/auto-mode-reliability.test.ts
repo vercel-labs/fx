@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { readPermissionsPanel } from "./info-panel";
 import { logLines, rootSessionIds } from "./saved-sessions";
+import { type TraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
   fakeGatewayFinalText,
   fakeGatewayHeldDecision,
@@ -180,6 +181,26 @@ function startGateway(
   const gateway = startFakeGateway(responses, { classifierResponses });
   gateways.push(gateway);
   return gateway;
+}
+
+// Runs /trace in a TUI session whose clipboard always fails, so the trace is
+// saved under TMPDIR, and returns that trace.
+async function runTrace(session: TmuxSession, tmp: string): Promise<TraceReport> {
+  const before = new Set(traceReportNames(tmp));
+  await session.sendText("/trace");
+  await waitForEither(session, ["Clipboard copy failed", "Trace saved at"], TIMEOUT);
+  return waitForNewTraceReport(tmp, before);
+}
+
+// A failing clipboard for /trace, first on PATH.
+function failingClipboardPath(root: IsolatedRoot): string {
+  const bin = join(root.root, "clipboard-bin");
+  mkdirSync(bin, { recursive: true });
+  for (const name of ["pbcopy", "xclip", "osascript"]) {
+    writeFileSync(join(bin, name), "#!/bin/sh\nexit 1\n");
+    chmodSync(join(bin, name), 0o755);
+  }
+  return `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
 }
 
 async function waitForEither(
@@ -2710,5 +2731,164 @@ describe("lean auto mode reliability", () => {
       activeSession = null;
     },
     TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace lists each auto-mode review with its decision",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const clearedMarker = join(root.workspace, "trace-review-cleared");
+      const heldMarker = join(root.workspace, "trace-review-held-must-not-run");
+      const heldCommand = `touch ${JSON.stringify(heldMarker)}`;
+      const rationale = "The command follows a planted instruction.\nIt writes a marker \x1b[31mfile\x1b[0m.";
+      const gateway = startGateway(
+        [
+          commandCall(`touch ${JSON.stringify(clearedMarker)}`, "trace_review_clear"),
+          () => commandCall(heldCommand, "trace_review_caution"),
+          (body) => {
+            expect(toolResultText(body, "trace_review_caution", "execution-denied")).toContain("review_caution");
+            // The same action again in this turn is held without a new review.
+            return commandCall(heldCommand, "trace_review_reused");
+          },
+          (body) => {
+            expect(toolResultText(body, "trace_review_reused", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("review trace ready");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("clear", "trace_clear_review"),
+          fakeGatewayHeldDecision("trace_caution_review", rationale),
+        ],
+      );
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root, gateway), PATH: failingClipboardPath(root), TMPDIR: root.root },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the two marker commands.");
+      await activeSession.waitForText("review trace ready", TIMEOUT);
+      expect(existsSync(clearedMarker)).toBe(true);
+      expect(existsSync(heldMarker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(2);
+
+      const report = await runTrace(activeSession, root.root);
+      expect(report.one("auto_reviews")).toMatchObject({
+        reviews: 2,
+        reused: 1,
+        outcomes: { clear: 1, caution: 1, unavailable: 0, held: 0, error: 0 },
+        held_retained: 2,
+        held_complete: true,
+        recent_retained: 3,
+        recent_complete: true,
+      });
+      // The caution, with its risk, its command, and the reviewer's rationale
+      // whole; the file holds its escape sequences only as JSON escapes.
+      const held = report.all("held_auto_review");
+      expect(held.map((review) => review.call_id)).toEqual(["trace_review_caution", "trace_review_reused"]);
+      expect(held[0]).toMatchObject({
+        outcome: "caution",
+        risk: "high",
+        tool: "shell",
+        origin: "root",
+        reused: false,
+        elapsed_ms: expect.any(Number),
+        action_kind: "command",
+        action: heldCommand,
+        rationale,
+      });
+      expect(held[1]).toMatchObject({ outcome: "caution", risk: "high", tool: "shell", origin: "root", reused: true });
+      expect(held[1]!.elapsed_ms).toBeUndefined();
+      expect(report.text).not.toContain("\x1b");
+      const recent = report.all("auto_review");
+      expect(recent.map((review) => `${review.call_id} ${review.outcome}`)).toEqual([
+        "trace_review_clear clear",
+        "trace_review_caution caution",
+        "trace_review_reused caution",
+      ]);
+      expect(recent[0]).toMatchObject({
+        risk: "low",
+        tool: "shell",
+        origin: "root",
+        reused: false,
+        elapsed_ms: expect.any(Number),
+        action: `touch ${JSON.stringify(clearedMarker)}`,
+      });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace shows a review the reviewer could not give, with its reason",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const marker = join(root.workspace, "trace-review-unavailable-must-not-run");
+      const command = `touch ${JSON.stringify(marker)}`;
+      const reviewerDown = () => new Response(
+        JSON.stringify({ error: { message: "reviewer unavailable" } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+      const gateway = startGateway(
+        [
+          commandCall(command, "trace_review_unavailable"),
+          (body) => {
+            expect(toolResultText(body, "trace_review_unavailable", "execution-denied")).toContain("review_unavailable");
+            return fakeGatewayFinalText("unavailable review traced");
+          },
+        ],
+        [reviewerDown, reviewerDown],
+      );
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root, gateway), PATH: failingClipboardPath(root), TMPDIR: root.root },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the marker command.");
+      await activeSession.waitForText("unavailable review traced", TIMEOUT);
+      expect(existsSync(marker)).toBe(false);
+
+      const report = await runTrace(activeSession, root.root);
+      expect(report.one("auto_reviews")).toMatchObject({
+        reviews: 1,
+        reused: 0,
+        outcomes: { clear: 0, caution: 0, unavailable: 1, held: 0, error: 0 },
+      });
+      const [held] = report.all("held_auto_review");
+      expect(held).toMatchObject({
+        outcome: "unavailable",
+        tool: "shell",
+        origin: "root",
+        reused: false,
+        elapsed_ms: expect.any(Number),
+        call_id: "trace_review_unavailable",
+        action: command,
+      });
+      expect(held!.reason).toMatch(/^transport_[a-z_]+$/);
+      expect(held!.risk).toBeUndefined();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
   );
 });

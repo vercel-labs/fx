@@ -10910,7 +10910,7 @@ fn processQueuedPromptLoop(
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
-                    if (parallel_preserved_review_hold != null) {
+                    if (parallel_preserved_review_hold) |hold| {
                         debug_trace.eventf(
                             "permission",
                             "turn_permission_denial_preserved",
@@ -10918,6 +10918,7 @@ fn processQueuedPromptLoop(
                             "call_id={s} tool_name={s}",
                             .{ parallel_call.id, parallel_call.name },
                         );
+                        tooling_tool_admission.recordReusedReviewHold(parallel_call, hold, config.origin == .subagent);
                     }
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = if (parallel_preserved_review_hold) |outcome|
                         outcome
@@ -11894,6 +11895,10 @@ fn processQueuedPromptLoop(
                     "call_id={s} tool_name={s}",
                     .{ tool_call.id, tool_call.name },
                 );
+            }
+            // The review hold decides the call only when nothing before it does.
+            if (live_target_failure == null and preserved_denial == null) {
+                if (preserved_review_hold) |hold| tooling_tool_admission.recordReusedReviewHold(execution_call, hold, config.origin == .subagent);
             }
             const maybe_permission: ?command_admission.PermissionOutcome = if (live_target_failure) |failure|
                 .{ .tool_failure = failure }

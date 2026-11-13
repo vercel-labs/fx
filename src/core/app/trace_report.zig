@@ -184,6 +184,56 @@
 //!   arguments or result.
 //! - `permissions`: `grants`; then a `permission_grant` per grant: `tool`,
 //!   `target`.
+//! - `auto_reviews`: the auto-mode safety reviews this session. `reviews`
+//!   counts the reviews fx made or tried, `outcomes` {`clear`, `caution`,
+//!   `unavailable`, `held`, `error`} splits them, and `reused` counts the
+//!   holds fx reused from an earlier review in the same turn without a new
+//!   one; `held_retained`, `held_complete`, `recent_retained`,
+//!   `recent_complete`. Then a `held_auto_review` for each of the newest 32
+//!   reviews that did not clear, which cleared reviews never push out, and an
+//!   `auto_review` for each of the newest 64 reviews; a review can be in both
+//!   lists. Each, oldest first: `at`, `outcome`, `risk` (`low`, `medium`,
+//!   `high`, or `critical`, when the reviewer decided), `reason` (why no
+//!   decision came, or the error's name), `tool`, `origin` (`root` or
+//!   `subagent`), `reused`, `elapsed_ms` (left out for a reused hold),
+//!   `call_id`, `action_kind` (`command`, `shell_input`, `file_mutation`, or
+//!   `tool`; left out when no review started and the call's arguments stand
+//!   in for the action), `action` (masked; the first 240 bytes of the
+//!   command, file path, or tool arguments), `action_bytes`,
+//!   `action_omitted_bytes`, `rationale` (masked; the reviewer's, at most
+//!   1024 bytes), `rationale_bytes`, `rationale_omitted_bytes`. Reviews are
+//!   recorded even when `FX_TRACE` is off.
+//! - `git`: the workspace's git state, read through safe git within 3
+//!   seconds in all. `refused`, why fx won't run git here; or `error`:
+//!   `timeout` when the 3 seconds passed (with `timeout_ms`), `signal` when
+//!   a signal ended a git command (with `signal`, its number), or why git
+//!   could not run. With `timeout` or `signal`, `unfinished` maps each field
+//!   git did not finish to `timeout` or `signal`; a git command still
+//!   running at the limit is ended with its process group, the commands
+//!   after it do not start, and the record keeps what finished. Then
+//!   `repository` (left out when unfinished), and in a repository `branch`
+//!   (left out when HEAD is detached or unborn) and these lists of git's
+//!   lines, each left out when git printed nothing, failed, or printed more
+//!   than 1 MiB: `status` (`git status --short --branch`, at most 60
+//!   lines), `commits` (the last 5, one line each), `staged` and `unstaged`
+//!   (`git diff --stat`, at most 30 lines each). A list that was cut has
+//!   `<name>_lines_omitted`.
+//! - `settings`: what the settings files and `FX_*` variables set, as
+//!   `fx config list --show-origin` prints it. `set`, `omitted` past the
+//!   first 200, `unknown_keys`; or `unreadable`, the file fx could not parse,
+//!   with `reason`; or `error`. Then a `setting` per setting, lowest
+//!   precedence first: `key`, `value` (masked, as `fx config list` prints
+//!   it), `origin` (`global`, `workspace`, `project`, `env`, or `default`),
+//!   `file` or `variable`, and `workspace` for a workspace override. Then an
+//!   `unknown_setting` per key fx does not know: `key`, `file`.
+//! - `skills`: `found`, `omitted` past the first 400, `load_problems`. Then
+//!   a `skill` per skill fx found: `name` (masked), `source`; then a
+//!   `skill_problem` per skill or skills folder fx could not load: `scope`
+//!   (`candidate` or `root`), `path` (masked), `source`, `cause`
+//!   (`invalid_metadata`, `linked_candidate_unavailable`, `unreadable`, or
+//!   `oversized`), and for invalid metadata `metadata`, what is wrong with it.
+//!   Every git line, setting key and value, skill name, and path is cut to
+//!   400 bytes; a cut one ends in ` ... (<n> bytes)` with its full size.
 //! - `runtime_context`: `term`, `term_program`, `lang` (each left out when
 //!   unset), `tmux`, `cmux`, `mcp_servers`; then an `mcp_server` per server:
 //!   `name`, `state`, `transport`, `tools`, `signed_in`, `needs_login`,
@@ -247,6 +297,13 @@ const local_time = @import("../shared/local_time.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const mcp_tool_result = @import("../mcp/tool_result.zig");
 const permissions = @import("../permissions/permissions.zig");
+const cli_config = @import("../cli/cli_config.zig");
+const config_runtime = @import("../config/config_runtime.zig");
+const settings_entries = @import("../config/settings_entries.zig");
+const output_contracts = @import("../output/output_contracts.zig");
+const git_context = @import("../github/git_context.zig");
+const skill_runtime = @import("../skills/skill_runtime.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const display_width = @import("../shared/display_width.zig");
@@ -455,6 +512,10 @@ pub fn build(app: anytype) ![]u8 {
     try writeModelCatalog(r, app);
     try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_view.grants.items);
+    try writeAutoReviews(r);
+    try writeGit(r, app.workspace_root);
+    try writeSettings(r, app.workspace_root);
+    try writeSkills(r, app);
     try writeRuntimeContext(r, app);
     try writeShell(r, shell_view, shell_resolver.configuredLoginShellInto(try arena.alloc(u8, std.Io.Dir.max_path_bytes)));
     try writeRendererState(r, app);
@@ -1725,6 +1786,262 @@ fn writePermissions(r: *Records, grants: []const types.PermissionGrant) !void {
         try r.begin("permission_grant");
         try r.text("tool", traceToolDisplayName(grant.tool_name));
         try r.text("target", grant.target_path);
+        try r.end();
+    }
+}
+
+fn writeAutoReviews(r: *Records) !void {
+    const recent = try r.arena.alloc(diagnostics.AutoReview, diagnostics.auto_review_recent_capacity);
+    const held = try r.arena.alloc(diagnostics.AutoReview, diagnostics.auto_review_held_capacity);
+    try writeAutoReviewRecords(
+        r,
+        diagnostics.autoReviewCounts(),
+        recent[0..diagnostics.snapshotAutoReviews(recent)],
+        held[0..diagnostics.snapshotHeldAutoReviews(held)],
+    );
+}
+
+fn writeAutoReviewRecords(
+    r: *Records,
+    counts: diagnostics.AutoReviewCounts,
+    recent: []const diagnostics.AutoReview,
+    held: []const diagnostics.AutoReview,
+) !void {
+    const total = counts.reviews + counts.reused;
+    try r.begin("auto_reviews");
+    try r.number("reviews", counts.reviews);
+    try r.number("reused", counts.reused);
+    try r.beginObject("outcomes");
+    try r.number("clear", counts.clear);
+    try r.number("caution", counts.caution);
+    try r.number("unavailable", counts.unavailable);
+    try r.number("held", counts.held);
+    try r.number("error", counts.@"error");
+    try r.endObject();
+    try r.number("held_retained", held.len);
+    // Every review that did not clear, reused holds included, reaches the
+    // held ring.
+    try r.boolean("held_complete", total - counts.clear <= held.len);
+    try r.number("recent_retained", recent.len);
+    try r.boolean("recent_complete", total <= recent.len);
+    try r.end();
+    for (held) |*review| {
+        try r.begin("held_auto_review");
+        try writeAutoReviewFields(r, review);
+        try r.end();
+    }
+    for (recent) |*review| {
+        try r.begin("auto_review");
+        try writeAutoReviewFields(r, review);
+        try r.end();
+    }
+}
+
+fn writeAutoReviewFields(r: *Records, review: *const diagnostics.AutoReview) !void {
+    try r.time("at", review.at_ms);
+    try r.text("outcome", @tagName(review.outcome));
+    if (review.risk != .none) try r.text("risk", @tagName(review.risk));
+    try r.optionalText("reason", review.reason());
+    try r.text("tool", traceToolDisplayName(review.toolName()));
+    try r.text("origin", @tagName(review.origin));
+    try r.boolean("reused", review.reused);
+    if (!review.reused) try r.number("elapsed_ms", review.elapsed_ms);
+    try r.text("call_id", review.callId());
+    try r.optionalText("action_kind", review.actionKind());
+    try writeToolPayload(r, "action", review.action(), review.action_len, review.action_total_bytes);
+    try writeToolPayload(r, "rationale", review.rationale(), review.rationale_len, review.rationale_total_bytes);
+}
+
+/// Bytes of one git line, setting key or value, skill name, or skill path
+/// the trace keeps.
+const setup_line_max_bytes: usize = 400;
+const git_status_max_lines: usize = 60;
+const git_stat_max_lines: usize = 30;
+/// How long `/trace`, which runs on the terminal's thread, waits for git in
+/// all.
+const git_budget_ms: u32 = 3_000;
+const settings_shown_max: usize = 200;
+const skills_shown_max: usize = 400;
+
+/// `text` with secrets masked, cut to `setup_line_max_bytes` on a UTF-8
+/// boundary, and ending in its full size when it was cut.
+fn setupLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const masked = try text_utils.maskSecrets(arena, text);
+    const kept = text_utils.utf8PrefixByBytes(masked, setup_line_max_bytes);
+    if (kept.len == masked.len) return masked;
+    return arena.print("{s} ... ({d} bytes)", .{ kept, masked.len });
+}
+
+fn writeGit(r: *Records, workspace_root: []const u8) !void {
+    // The arena owns the parts.
+    const parts = git_context.queryParts(r.arena, workspace_root, git_budget_ms) catch |err| {
+        try r.begin("git");
+        try r.text("error", @errorName(err));
+        return r.end();
+    };
+    try writeGitParts(r, parts);
+}
+
+fn writeGitParts(r: *Records, parts: git_context.Parts) !void {
+    try r.begin("git");
+    if (parts.refused) |refusal| {
+        try r.text("refused", @tagName(refusal));
+        return r.end();
+    }
+    if (parts.timed_out) {
+        try r.text("error", "timeout");
+        try r.number("timeout_ms", git_budget_ms);
+    } else if (parts.signal != null) {
+        try r.text("error", "signal");
+    }
+    if (parts.signal) |signal| try r.number("signal", signal);
+    if (parts.unfinished.count() > 0) {
+        try r.beginObject("unfinished");
+        for (std.enums.values(git_context.Part)) |part| {
+            if (parts.unfinished.get(part)) |reason| try r.text(gitPartField(part), @tagName(reason));
+        }
+        try r.endObject();
+    }
+    const inside_known = !parts.unfinished.contains(.inside);
+    if (inside_known) try r.boolean("repository", parts.in_git_repo);
+    if (parts.in_git_repo or !inside_known) {
+        if (parts.branch) |branch| try r.text("branch", try setupLine(r.arena, branch));
+        try writeGitLines(r, "status", parts.status, git_status_max_lines);
+        try writeGitLines(r, "commits", parts.log, git_status_max_lines);
+        try writeGitLines(r, "staged", parts.staged, git_stat_max_lines);
+        try writeGitLines(r, "unstaged", parts.unstaged, git_stat_max_lines);
+    }
+    try r.end();
+}
+
+/// The `git` record's field for what a git query reports.
+fn gitPartField(part: git_context.Part) []const u8 {
+    return switch (part) {
+        .inside => "repository",
+        .branch => "branch",
+        .log => "commits",
+        .status => "status",
+        .staged => "staged",
+        .unstaged => "unstaged",
+    };
+}
+
+/// Writes `<name>`, the first `max_lines` lines git printed, and
+/// `<name>_lines_omitted`; nothing when git printed nothing.
+fn writeGitLines(r: *Records, comptime name: []const u8, text: ?[]const u8, max_lines: usize) !void {
+    const body = text orelse return;
+    try r.beginArray(name);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var shown: usize = 0;
+    var omitted: usize = 0;
+    while (lines.next()) |line| {
+        if (shown == max_lines) {
+            omitted += 1;
+            continue;
+        }
+        try r.itemText(try setupLine(r.arena, std.mem.trimEnd(u8, line, "\r")));
+        shown += 1;
+    }
+    try r.endArray();
+    if (omitted > 0) try r.number(name ++ "_lines_omitted", omitted);
+}
+
+fn writeSettings(r: *Records, workspace_root: []const u8) !void {
+    var paths = config_runtime.discoverPaths(r.arena, workspace_root) catch |err| {
+        try r.begin("settings");
+        try r.text("error", @errorName(err));
+        return r.end();
+    };
+    defer paths.deinit(r.arena);
+    try writeSettingsFrom(r, paths, workspace_root);
+}
+
+fn writeSettingsFrom(r: *Records, paths: config_runtime.Paths, workspace_root: []const u8) !void {
+    var failed_file: ?[]const u8 = null;
+    var loaded = cli_config.load(r.arena, paths, workspace_root, .all, &failed_file) catch |err| {
+        try r.begin("settings");
+        try r.text("unreadable", failed_file orelse "settings");
+        try r.text("reason", cli_config.loadFailureReason(err));
+        return r.end();
+    };
+    defer loaded.deinit(r.arena);
+    try writeSettingRecords(r, loaded.entries.items, loaded.unknown, workspace_root);
+}
+
+/// The settings in `fx config list --show-origin` order, each value as that
+/// command prints it.
+fn writeSettingRecords(
+    r: *Records,
+    entries: []const settings_entries.Entry,
+    unknown: []const output_contracts.ConfigUnknownSetting,
+    workspace_root: []const u8,
+) !void {
+    const shown = entries[0..@min(entries.len, settings_shown_max)];
+    try r.begin("settings");
+    try r.number("set", entries.len);
+    if (entries.len > shown.len) try r.number("omitted", entries.len - shown.len);
+    try r.number("unknown_keys", unknown.len);
+    try r.end();
+    for (shown) |*entry| {
+        const value: output_contracts.ConfigSnapshot = .{
+            .entries = entry[0..1],
+            .workspace_root = workspace_root,
+            .value_only = true,
+        };
+        try r.begin("setting");
+        try r.text("key", try setupLine(r.arena, entry.key));
+        try r.text("value", try setupLine(r.arena, std.mem.trimEnd(u8, try value.render(r.arena, .text), "\n")));
+        try r.text("origin", @tagName(entry.origin));
+        switch (entry.origin) {
+            .env => try r.text("variable", entry.variable.?),
+            .project => try r.text("file", ".fx.json"),
+            .global, .workspace => try r.text("file", profile_paths.displayText("~/.fx/settings.json")),
+            .default => {},
+        }
+        if (entry.origin == .workspace) try r.text("workspace", workspace_root);
+        try r.end();
+    }
+    for (unknown) |entry| {
+        try r.begin("unknown_setting");
+        const key = if (entry.key.parent) |parent| try r.arena.print("{s}.{s}", .{ parent, entry.key.name }) else entry.key.name;
+        try r.text("key", try setupLine(r.arena, key));
+        try r.text("file", entry.file);
+        try r.end();
+    }
+}
+
+fn writeSkills(r: *Records, app: anytype) !void {
+    if (comptime !@hasField(@TypeOf(app.*), "skills")) return;
+    try writeSkillRecords(r, app.skills.items, app.skills.diagnostics);
+}
+
+fn writeSkillRecords(
+    r: *Records,
+    skills: []const skill_runtime.Skill,
+    problems: []const skill_runtime.SkillDiagnostic,
+) !void {
+    const shown = skills[0..@min(skills.len, skills_shown_max)];
+    try r.begin("skills");
+    try r.number("found", skills.len);
+    if (skills.len > shown.len) try r.number("omitted", skills.len - shown.len);
+    try r.number("load_problems", problems.len);
+    try r.end();
+    for (shown) |skill| {
+        try r.begin("skill");
+        try r.text("name", try setupLine(r.arena, skill.name));
+        try r.text("source", skill_runtime.skillSourceLabel(skill.source));
+        try r.end();
+    }
+    for (problems) |problem| {
+        try r.begin("skill_problem");
+        try r.text("scope", @tagName(problem.scope));
+        try r.text("path", try setupLine(r.arena, problem.path));
+        try r.text("source", skill_runtime.skillSourceLabel(problem.source));
+        try r.text("cause", @tagName(std.meta.activeTag(problem.cause)));
+        switch (problem.cause) {
+            .invalid_metadata => |cause| try r.text("metadata", @tagName(cause)),
+            else => {},
+        }
         try r.end();
     }
 }
@@ -4521,6 +4838,453 @@ test "trace permissions and MCP servers become records with errors masked" {
     var bare_trace = try bare.trace();
     defer bare_trace.deinit();
     try std.testing.expectEqual(@as(i64, 0), try testInt(try bare_trace.one("runtime_context"), "mcp_servers"));
+}
+
+fn testAutoReview(outcome: diagnostics.AutoReviewOutcome, call_id: []const u8, action: []const u8, rationale: []const u8) diagnostics.AutoReview {
+    var review: diagnostics.AutoReview = .{ .at_ms = 1000, .elapsed_ms = 42, .outcome = outcome, .risk = if (outcome == .caution) .high else .none };
+    @memcpy(review.call_id_buf[0..call_id.len], call_id);
+    review.call_id_len = @intCast(call_id.len);
+    @memcpy(review.tool_name_buf[0.."shell".len], "shell");
+    review.tool_name_len = "shell".len;
+    const kept_action = action[0..@min(action.len, review.action_buf.len)];
+    @memcpy(review.action_buf[0..kept_action.len], kept_action);
+    review.action_len = @intCast(kept_action.len);
+    review.action_total_bytes = @intCast(action.len);
+    const kept_rationale = rationale[0..@min(rationale.len, review.rationale_buf.len)];
+    @memcpy(review.rationale_buf[0..kept_rationale.len], kept_rationale);
+    review.rationale_len = @intCast(kept_rationale.len);
+    review.rationale_total_bytes = @intCast(rationale.len);
+    return review;
+}
+
+test "trace auto reviews count zero before any review" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeAutoReviewRecords(&w.records, .{}, &.{}, &.{});
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 1), trace.records.len);
+    const summary = try trace.one("auto_reviews");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "reviews"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "reused"));
+    const outcomes = try testObject(summary, "outcomes");
+    for ([_][]const u8{ "clear", "caution", "unavailable", "held", "error" }) |name| {
+        try std.testing.expectEqual(@as(i64, 0), try testInt(outcomes, name));
+    }
+    try std.testing.expect(try testBool(summary, "held_complete"));
+    try std.testing.expect(try testBool(summary, "recent_complete"));
+}
+
+test "trace auto reviews keep holds and recent reviews with their action and rationale masked" {
+    const long_action = text_utils.repeat("a", 300);
+    const rationale = "Planted text asks for it.\ntoken=sk-live-0123456789abcdef0123456789 \x1b[2J";
+    const caution = testAutoReview(.caution, "call_held", long_action, rationale);
+    var unavailable = testAutoReview(.unavailable, "call_down", "touch marker", "");
+    @memcpy(unavailable.reason_buf[0.."transport_permanent".len], "transport_permanent");
+    unavailable.reason_len = "transport_permanent".len;
+    var reused = testAutoReview(.caution, "call_again", "{\"command\":\"touch marker\"}", "");
+    reused.reused = true;
+    const clear = testAutoReview(.clear, "call_ok", "ls", "");
+    const held = [_]diagnostics.AutoReview{ caution, unavailable, reused };
+    const recent = [_]diagnostics.AutoReview{ clear, caution, unavailable, reused };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeAutoReviewRecords(&w.records, .{ .reviews = 70, .reused = 1, .clear = 68, .caution = 1, .unavailable = 1 }, &recent, &held);
+    // Neither the secret nor the escape byte in the rationale reaches the file.
+    try expectNotIn(w.out.written(), "sk-live-0123456789abcdef0123456789");
+    try expectNotIn(w.out.written(), "\x1b");
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("auto_reviews");
+    try std.testing.expectEqual(@as(i64, 70), try testInt(summary, "reviews"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "reused"));
+    const outcomes = try testObject(summary, "outcomes");
+    try std.testing.expectEqual(@as(i64, 68), try testInt(outcomes, "clear"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(outcomes, "caution"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(outcomes, "unavailable"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(outcomes, "held"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(outcomes, "error"));
+    // The 3 reviews that did not clear are all held; the 4 recent ones are
+    // not all 71.
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "held_retained"));
+    try std.testing.expect(try testBool(summary, "held_complete"));
+    try std.testing.expectEqual(@as(i64, 4), try testInt(summary, "recent_retained"));
+    try std.testing.expect(!try testBool(summary, "recent_complete"));
+    try std.testing.expectEqual(@as(usize, 3), trace.count("held_auto_review"));
+    try std.testing.expectEqual(@as(usize, 4), trace.count("auto_review"));
+
+    const first = try trace.nth("held_auto_review", 0);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:01.000Z", try testString(first, "at"));
+    try std.testing.expectEqualStrings("caution", try testString(first, "outcome"));
+    try std.testing.expectEqualStrings("high", try testString(first, "risk"));
+    try expectAbsent(first, "reason");
+    try std.testing.expectEqualStrings("shell", try testString(first, "tool"));
+    try std.testing.expectEqualStrings("root", try testString(first, "origin"));
+    try std.testing.expect(!try testBool(first, "reused"));
+    try std.testing.expectEqual(@as(i64, 42), try testInt(first, "elapsed_ms"));
+    try std.testing.expectEqualStrings("call_held", try testString(first, "call_id"));
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 240), try testString(first, "action"));
+    try std.testing.expectEqual(@as(i64, 300), try testInt(first, "action_bytes"));
+    try std.testing.expectEqual(@as(i64, 60), try testInt(first, "action_omitted_bytes"));
+    const held_rationale = try testString(first, "rationale");
+    try expectStartsWith(held_rationale, "Planted text asks for it.\ntoken=");
+    try expectEndsWith(held_rationale, " \x1b[2J");
+    try std.testing.expectEqual(@as(i64, rationale.len), try testInt(first, "rationale_bytes"));
+    try expectAbsent(first, "rationale_omitted_bytes");
+
+    const down = try trace.nth("held_auto_review", 1);
+    try std.testing.expectEqualStrings("unavailable", try testString(down, "outcome"));
+    try expectAbsent(down, "risk");
+    try std.testing.expectEqualStrings("transport_permanent", try testString(down, "reason"));
+    try std.testing.expectEqualStrings("touch marker", try testString(down, "action"));
+    try expectAbsent(down, "rationale");
+
+    const again = try trace.nth("held_auto_review", 2);
+    try std.testing.expect(try testBool(again, "reused"));
+    try expectAbsent(again, "elapsed_ms");
+    try std.testing.expectEqualStrings("call_again", try testString(again, "call_id"));
+    try std.testing.expectEqualStrings("{\"command\":\"touch marker\"}", try testString(again, "action"));
+
+    const ok = try trace.nth("auto_review", 0);
+    try std.testing.expectEqualStrings("clear", try testString(ok, "outcome"));
+    try expectAbsent(ok, "risk");
+    try std.testing.expectEqualStrings("call_ok", try testString(ok, "call_id"));
+    try std.testing.expectEqualStrings("ls", try testString(ok, "action"));
+    // A recent review that did not clear carries its detail too.
+    try std.testing.expectEqualStrings("call_held", try testString(try trace.nth("auto_review", 1), "call_id"));
+    try std.testing.expectEqual(@as(i64, 300), try testInt(try trace.nth("auto_review", 1), "action_bytes"));
+}
+
+test "trace git record says when fx won't run git or the folder is not a repository" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeGitParts(&w.records, .{ .refused = .git_too_old });
+    try writeGitParts(&w.records, .{});
+    var trace = try w.trace();
+    defer trace.deinit();
+    const refused = try trace.nth("git", 0);
+    try std.testing.expectEqualStrings("git_too_old", try testString(refused, "refused"));
+    try expectAbsent(refused, "repository");
+    const outside = try trace.nth("git", 1);
+    try std.testing.expect(!try testBool(outside, "repository"));
+    try expectAbsent(outside, "branch");
+    try expectAbsent(outside, "status");
+}
+
+test "trace git record lists git's lines, masks them, and caps long output" {
+    var status: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer status.deinit();
+    try status.writer.writeAll("## main...origin/main [ahead 1]\n M src/a.zig\n?? token=sk-live-0123456789abcdef0123456789\n");
+    var index: usize = 0;
+    while (index < git_status_max_lines) : (index += 1) try status.writer.print("?? file-{d}.txt\r\n", .{index});
+    // 9 ASCII bytes and then 2-byte characters, so the cut at 400 bytes
+    // falls inside one.
+    const long_branch = "feature/x" ++ text_utils.repeat("\xc3\xa9", 250);
+    const parts: git_context.Parts = .{
+        .in_git_repo = true,
+        .branch = @constCast(long_branch),
+        .status = @constCast(std.mem.trimEnd(u8, status.written(), "\n")),
+        .log = @constCast("abc1234 Add a file"),
+        .unstaged = @constCast(" src/a.zig | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"),
+    };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeGitParts(&w.records, parts);
+    try expectNotIn(w.out.written(), "sk-live-0123456789abcdef0123456789");
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const git = try trace.one("git");
+    try std.testing.expect(try testBool(git, "repository"));
+    try std.testing.expectEqualStrings("feature/x" ++ text_utils.repeat("\xc3\xa9", 195) ++ " ... (509 bytes)", try testString(git, "branch"));
+    const lines = git.get("status").?.array.items;
+    try std.testing.expectEqual(git_status_max_lines, lines.len);
+    try std.testing.expectEqualStrings("## main...origin/main [ahead 1]", lines[0].string);
+    try std.testing.expectEqualStrings(" M src/a.zig", lines[1].string);
+    try expectStartsWith(lines[2].string, "?? token=");
+    try std.testing.expectEqualStrings("?? file-0.txt", lines[3].string);
+    try std.testing.expectEqual(@as(i64, 3), try testInt(git, "status_lines_omitted"));
+    const commits = git.get("commits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), commits.len);
+    try std.testing.expectEqualStrings("abc1234 Add a file", commits[0].string);
+    try expectAbsent(git, "commits_lines_omitted");
+    try expectAbsent(git, "staged");
+    const unstaged = git.get("unstaged").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), unstaged.len);
+    try std.testing.expectEqualStrings(" src/a.zig | 2 +-", unstaged[0].string);
+}
+
+test "trace git record says what git did not finish by the limit or because of a signal" {
+    var timed_out: git_context.Parts = .{
+        .in_git_repo = true,
+        .branch = @constCast("main"),
+        .log = @constCast("abc1234 Add a file"),
+        .timed_out = true,
+    };
+    for ([_]git_context.Part{ .status, .staged, .unstaged }) |part| timed_out.unfinished.put(part, .timeout);
+    var killed: git_context.Parts = .{ .in_git_repo = true, .branch = @constCast("main"), .signal = 9 };
+    killed.unfinished.put(.status, .signal);
+    var nothing: git_context.Parts = .{ .timed_out = true };
+    for (std.enums.values(git_context.Part)) |part| nothing.unfinished.put(part, .timeout);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeGitParts(&w.records, timed_out);
+    try writeGitParts(&w.records, killed);
+    try writeGitParts(&w.records, nothing);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const late = try trace.nth("git", 0);
+    try std.testing.expectEqualStrings("timeout", try testString(late, "error"));
+    try std.testing.expectEqual(@as(i64, git_budget_ms), try testInt(late, "timeout_ms"));
+    try expectAbsent(late, "signal");
+    const late_parts = try testObject(late, "unfinished");
+    try std.testing.expectEqual(@as(usize, 3), late_parts.count());
+    for ([_][]const u8{ "status", "staged", "unstaged" }) |name| {
+        try std.testing.expectEqualStrings("timeout", try testString(late_parts, name));
+    }
+    try std.testing.expect(try testBool(late, "repository"));
+    try std.testing.expectEqualStrings("main", try testString(late, "branch"));
+    try std.testing.expectEqualStrings("abc1234 Add a file", late.get("commits").?.array.items[0].string);
+    try expectAbsent(late, "status");
+
+    const ended = try trace.nth("git", 1);
+    try std.testing.expectEqualStrings("signal", try testString(ended, "error"));
+    try std.testing.expectEqual(@as(i64, 9), try testInt(ended, "signal"));
+    try expectAbsent(ended, "timeout_ms");
+    try std.testing.expectEqualStrings("signal", try testString(try testObject(ended, "unfinished"), "status"));
+    try std.testing.expectEqualStrings("main", try testString(ended, "branch"));
+
+    // Safe git's own checks ran out of time, so nothing about the folder is
+    // known, not even whether it is a repository.
+    const unknown = try trace.nth("git", 2);
+    try std.testing.expectEqualStrings("timeout", try testString(unknown, "error"));
+    const unknown_parts = try testObject(unknown, "unfinished");
+    try std.testing.expectEqual(@as(usize, 6), unknown_parts.count());
+    try std.testing.expectEqualStrings("timeout", try testString(unknown_parts, "repository"));
+    try std.testing.expectEqualStrings("timeout", try testString(unknown_parts, "commits"));
+    try expectAbsent(unknown, "repository");
+    try expectAbsent(unknown, "branch");
+}
+
+test "trace settings records keep each origin, mask values, and list unknown keys" {
+    const workspace = "/Users/example/project";
+    const secret = "sk-live-0123456789abcdef0123456789";
+    const entries = [_]settings_entries.Entry{
+        .{ .key = "collapse_tool_calls", .value = .{ .bool = false }, .origin = .global },
+        .{ .key = "auto_compact_percent", .value = .{ .integer = 50 }, .origin = .workspace },
+        .{ .key = "max_agent_steps", .value = .{ .integer = 40 }, .origin = .project },
+        .{ .key = "review_model", .value = .{ .string = "token=" ++ secret }, .origin = .env, .variable = "FX_REVIEW_MODEL" },
+    };
+    const unknown = [_]output_contracts.ConfigUnknownSetting{.{ .key = .{ .name = "colour", .parent = "statusLine", .known = &.{} }, .file = "~/.fx/settings.json" }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSettingRecords(&w.records, &entries, &unknown, workspace);
+    try expectNotIn(w.out.written(), secret);
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("settings");
+    try std.testing.expectEqual(@as(i64, 4), try testInt(summary, "set"));
+    try expectAbsent(summary, "omitted");
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "unknown_keys"));
+    try std.testing.expectEqual(@as(usize, 4), trace.count("setting"));
+
+    const global = try trace.nth("setting", 0);
+    try std.testing.expectEqualStrings("collapse_tool_calls", try testString(global, "key"));
+    try std.testing.expectEqualStrings("false", try testString(global, "value"));
+    try std.testing.expectEqualStrings("global", try testString(global, "origin"));
+    try std.testing.expectEqualStrings(profile_paths.displayText("~/.fx/settings.json"), try testString(global, "file"));
+    try expectAbsent(global, "variable");
+    try expectAbsent(global, "workspace");
+    const override = try trace.nth("setting", 1);
+    try std.testing.expectEqualStrings("50", try testString(override, "value"));
+    try std.testing.expectEqualStrings("workspace", try testString(override, "origin"));
+    try std.testing.expectEqualStrings(workspace, try testString(override, "workspace"));
+    const project = try trace.nth("setting", 2);
+    try std.testing.expectEqualStrings("project", try testString(project, "origin"));
+    try std.testing.expectEqualStrings(".fx.json", try testString(project, "file"));
+    const env = try trace.nth("setting", 3);
+    try std.testing.expectEqualStrings("env", try testString(env, "origin"));
+    try std.testing.expectEqualStrings("FX_REVIEW_MODEL", try testString(env, "variable"));
+    try expectAbsent(env, "file");
+    try expectStartsWith(try testString(env, "value"), "token=");
+
+    const key = try trace.one("unknown_setting");
+    try std.testing.expectEqualStrings("statusLine.colour", try testString(key, "key"));
+    try std.testing.expectEqualStrings("~/.fx/settings.json", try testString(key, "file"));
+}
+
+test "trace settings records count what is set and cap the list" {
+    var many: [settings_shown_max + 1]settings_entries.Entry = undefined;
+    for (&many) |*entry| entry.* = .{ .key = "max_agent_steps", .value = .{ .integer = 1 }, .origin = .default };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSettingRecords(&w.records, &.{}, &.{}, "/Users/example/project");
+    try writeSettingRecords(&w.records, &many, &.{}, "/Users/example/project");
+    var trace = try w.trace();
+    defer trace.deinit();
+    const empty = try trace.nth("settings", 0);
+    try std.testing.expectEqual(@as(i64, 0), try testInt(empty, "set"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(empty, "unknown_keys"));
+    const full = try trace.nth("settings", 1);
+    try std.testing.expectEqual(@as(i64, settings_shown_max + 1), try testInt(full, "set"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(full, "omitted"));
+    try std.testing.expectEqual(settings_shown_max, trace.count("setting"));
+    const default = try trace.nth("setting", 0);
+    try std.testing.expectEqualStrings("default", try testString(default, "origin"));
+    try expectAbsent(default, "file");
+}
+
+test "trace settings record names a settings file it can't parse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/settings.json", .data = "{ not json" });
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace);
+    var paths = try config_runtime.discoverPathsFromHome(std.testing.allocator, home, workspace);
+    defer paths.deinit(std.testing.allocator);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSettingsFrom(&w.records, paths, workspace);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const settings = try trace.one("settings");
+    try expectEndsWith(try testString(settings, "unreadable"), "settings.json");
+    try std.testing.expectEqualStrings("isn't valid JSON", try testString(settings, "reason"));
+    try expectAbsent(settings, "set");
+    try std.testing.expectEqual(@as(usize, 0), trace.count("setting"));
+}
+
+test "trace skills records list each skill with its source and each load problem" {
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "review", .description = "", .path = "/Users/example/.fx/skills/review/SKILL.md", .source = .global_fx },
+        .{ .name = "probe\nskill", .description = "", .path = "/Users/example/w/.agents/skills/probe/SKILL.md", .source = .workspace_agents },
+    };
+    const problems = [_]skill_runtime.SkillDiagnostic{
+        .{ .path = "/Users/example/w/.agents/skills/broken/SKILL.md", .source = .workspace_agents, .scope = .candidate, .cause = .{ .invalid_metadata = .missing_name } },
+        .{ .path = "/Users/example/w/.claude/skills", .source = .workspace_claude, .scope = .root, .cause = .unreadable },
+    };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSkillRecords(&w.records, &skills, &problems);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("skills");
+    try std.testing.expectEqual(@as(i64, 2), try testInt(summary, "found"));
+    try expectAbsent(summary, "omitted");
+    try std.testing.expectEqual(@as(i64, 2), try testInt(summary, "load_problems"));
+    const review = try trace.nth("skill", 0);
+    try std.testing.expectEqualStrings("review", try testString(review, "name"));
+    try std.testing.expectEqualStrings(skill_runtime.skillSourceLabel(.global_fx), try testString(review, "source"));
+    // The line break stays in the name and is escaped in the file.
+    try std.testing.expectEqualStrings("probe\nskill", try testString(try trace.nth("skill", 1), "name"));
+
+    const broken = try trace.nth("skill_problem", 0);
+    try std.testing.expectEqualStrings("candidate", try testString(broken, "scope"));
+    try std.testing.expectEqualStrings("/Users/example/w/.agents/skills/broken/SKILL.md", try testString(broken, "path"));
+    try std.testing.expectEqualStrings(skill_runtime.skillSourceLabel(.workspace_agents), try testString(broken, "source"));
+    try std.testing.expectEqualStrings("invalid_metadata", try testString(broken, "cause"));
+    try std.testing.expectEqualStrings("missing_name", try testString(broken, "metadata"));
+    const folder = try trace.nth("skill_problem", 1);
+    try std.testing.expectEqualStrings("root", try testString(folder, "scope"));
+    try std.testing.expectEqualStrings("unreadable", try testString(folder, "cause"));
+    try expectAbsent(folder, "metadata");
+}
+
+test "trace skills records cap the list of skills" {
+    var many: [skills_shown_max + 1]skill_runtime.Skill = undefined;
+    for (&many) |*skill| skill.* = .{ .name = "probe", .description = "", .path = "/Users/example/SKILL.md", .source = .workspace_fx };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSkillRecords(&w.records, &many, &.{});
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("skills");
+    try std.testing.expectEqual(@as(i64, skills_shown_max + 1), try testInt(summary, "found"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "omitted"));
+    try std.testing.expectEqual(skills_shown_max, trace.count("skill"));
+}
+
+/// Records one review with `input` in every text field, writes it and git,
+/// setting, and skill records that hold `input`, and checks each record is
+/// one valid JSON line with its text bounded.
+fn checkReviewAndSetupRecords(input: []const u8) !void {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const outcomes = std.enums.values(diagnostics.AutoReviewOutcome);
+    const outcome = outcomes[input.len % outcomes.len];
+    diagnostics.recordAutoReview(.{
+        .outcome = outcome,
+        .risk = if (outcome == .clear or outcome == .caution) .high else .none,
+        .reused = input.len % 2 == 1 and outcome == .caution,
+        .elapsed_ms = 7,
+        .call_id = input,
+        .tool_name = input,
+        .action_kind = input,
+        .action = input,
+        .reason = input,
+        .rationale = input,
+        .at_ms = 1_700_000_000_000,
+    });
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeAutoReviews(&w.records);
+    try writeGitParts(&w.records, .{ .in_git_repo = true, .branch = @constCast(input), .status = @constCast(input), .log = @constCast(input) });
+    const entries = [_]settings_entries.Entry{.{ .key = input, .value = .{ .string = input }, .origin = .env, .variable = "FX_MODEL" }};
+    try writeSettingRecords(&w.records, &entries, &.{}, input);
+    const skills = [_]skill_runtime.Skill{.{ .name = input, .description = "", .path = input, .source = .workspace_agents }};
+    const problems = [_]skill_runtime.SkillDiagnostic{.{ .path = input, .source = .workspace_agents, .scope = .candidate, .cause = .unreadable }};
+    try writeSkillRecords(&w.records, &skills, &problems);
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, if (outcome == .clear) 0 else 1), trace.count("held_auto_review"));
+    const review = try trace.nth("auto_review", 0);
+    // An escaped byte is at most 4 bytes of text.
+    try std.testing.expect((try testString(review, "call_id")).len <= 4 * 96);
+    if (review.get("action")) |action| {
+        try std.testing.expect(action.string.len <= 4 * 240);
+        try std.testing.expectEqual(@as(i64, @intCast(input.len)), try testInt(review, "action_bytes"));
+    }
+    const line_bound = 4 * setup_line_max_bytes + " ... ( bytes)".len + 20;
+    const git = try trace.one("git");
+    try std.testing.expect((try testString(git, "branch")).len <= line_bound);
+    const status = git.get("status").?.array.items;
+    try std.testing.expect(status.len <= git_status_max_lines);
+    for (status) |line| try std.testing.expect(line.string.len <= line_bound);
+    const omitted: usize = if (git.get("status_lines_omitted")) |value| @intCast(value.integer) else 0;
+    try std.testing.expectEqual(std.mem.count(u8, input, "\n") + 1, status.len + omitted);
+    const setting = try trace.one("setting");
+    try std.testing.expect((try testString(setting, "key")).len <= line_bound);
+    try std.testing.expect((try testString(setting, "value")).len <= line_bound);
+    try std.testing.expect((try testString(try trace.one("skill"), "name")).len <= line_bound);
+    try std.testing.expect((try testString(try trace.one("skill_problem"), "path")).len <= line_bound);
+}
+
+fn fuzzReviewAndSetupRecords(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [2048]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try checkReviewAndSetupRecords(buffer[0..len]);
+}
+
+test "trace review and setup records stay valid JSON lines for fuzzed text" {
+    try std.testing.fuzz({}, fuzzReviewAndSetupRecords, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "plain text",
+            "two\nlines\r\n\ttabbed",
+            "\x1b[31mred\x1b[0m\x7f\xc2\x85",
+            "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
+        }) ++ @import("fuzz_corpus").trace_review_records.*),
+    });
 }
 
 test "trace log tail keeps the newest lines, masked, and skips logs it cannot read" {
