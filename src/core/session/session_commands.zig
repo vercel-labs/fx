@@ -1087,6 +1087,7 @@ pub fn Commands(comptime App: type) type {
             ultrafast_mode: bool,
         ) !void {
             try setResolvedModelRuntime(app, agent, model);
+            settleStartModel(app);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.providerOf(app, agent),
                 .model = model,
@@ -1354,6 +1355,7 @@ pub fn Commands(comptime App: type) type {
         fn setResolvedModel(app: *App, agent: *AppAgent, resolved: []const u8, announce: bool) !void {
             const model_changed = !std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved);
             try setResolvedModelRuntime(app, agent, resolved);
+            settleStartModel(app);
             if (model_changed and app.fast_mode) {
                 try applyFastMode(app, agent, false, false, false);
             }
@@ -1464,6 +1466,12 @@ pub fn Commands(comptime App: type) type {
             app_session_runtime.Runtime(App).syncTerminalTitle(app, agent);
         }
 
+        /// A model the user chose keeps its place: the Token Pass check no
+        /// longer picks the start model (`src/core/app/token_pass_check.zig`).
+        fn settleStartModel(app: *App) void {
+            if (comptime @hasField(App, "token_pass_check")) app.token_pass_check.settle("model_choice");
+        }
+
         /// Puts `agent` on `model` at `fast_mode` for this run, without a
         /// notice and without saving either: the model a new session starts
         /// on for its team (`src/core/app/token_pass_check.zig`).
@@ -1503,7 +1511,7 @@ pub fn Commands(comptime App: type) type {
             if (comptime !provider_runtime.supported(App)) return false;
             if (comptime !@hasField(App, "model_cache")) return false;
             if (provider_runtime.providerOf(app, agent) != .gateway) return false;
-            return app.model_cache.tokenPassStatus() == .active and token_pass.isFeaturedModel(model);
+            return token_pass.paysFor(app.model_cache.tokenPassStatus() == .active, model);
         }
 
         /// Whether the agent's speed setting sends `model` at a speed Token

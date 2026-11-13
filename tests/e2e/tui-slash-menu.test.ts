@@ -3611,6 +3611,54 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "a model picked while the Token Pass check runs keeps its place when the check answers",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-pick-during-check-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const picked = "deepseek/deepseek-v4.1-flash";
+      gateway = startFakeGateway([fakeGatewayFinalText("PICKED_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false, 8_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // Before the check answers, pick the model a team with Token Pass
+      // would start on.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("deepseek");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(picked)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, `/model ${picked}`) && pane.includes("normal") && pane.includes("fast"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${picked}`, 5_000);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("check answered");
+
+      // The check then says the team has no Token Pass, and the pick stays.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("start model settled reason=model_choice");
+      expect(trace).not.toContain("start model=");
+      await session.sendText("Use the picked model.");
+      await session.waitForText("PICKED_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual([picked]);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "/credits shows the Token Pass balance, and a reply without Token Pass drops its headings",
     async () => {
       const fixture = createModelsMenuFixture();

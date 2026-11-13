@@ -1415,7 +1415,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// its models offer none, and the picker has no speed stage for them.
         fn pickerCapabilities(app: *App, model: []const u8) model_capabilities.Capabilities {
             var capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (isTeamTokenPassModel(app, model)) capabilities.supports_fast_mode = false;
+            capabilities.supports_fast_mode = token_pass.offersFastMode(teamHasTokenPass(app), model, capabilities.supports_fast_mode);
             return capabilities;
         }
 
@@ -1423,12 +1423,12 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// setting, but normal speed for a Token Pass model of a team with
         /// Token Pass.
         fn pickerFastMode(app: *App, model: []const u8) bool {
-            return if (isTeamTokenPassModel(app, model)) false else app.fast_mode;
+            return if (token_pass.paysFor(teamHasTokenPass(app), model)) false else app.fast_mode;
         }
 
-        fn isTeamTokenPassModel(app: *App, model: []const u8) bool {
+        fn teamHasTokenPass(app: *App) bool {
             if (comptime !@hasField(App, "model_cache")) return false;
-            return app.model_cache.tokenPassStatus() == .active and token_pass.isFeaturedModel(model);
+            return app.model_cache.tokenPassStatus() == .active;
         }
 
         pub fn beginExactModelSelection(app: *App, agent: *AppAgent, model: []const u8) !void {

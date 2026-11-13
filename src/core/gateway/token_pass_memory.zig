@@ -2,8 +2,10 @@
 //! profile as `token-pass.json`, so a session knows it from its first frame.
 //! A team is named by `token_pass.identity`, a hash that holds no secret.
 //! fx checks the answer again as each session starts and saves it when it
-//! changes. A missing or unreadable file means fx knows nothing yet.
+//! changes. A missing or unreadable file, or one that is not a regular
+//! file, means fx knows nothing yet.
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -45,7 +47,9 @@ pub fn save(alloc: Allocator, home: []const u8, id: []const u8, answer: token_pa
 }
 
 fn readFile(alloc: Allocator, path: []const u8) ?[]u8 {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
+    // A FIFO or device in its place must not stall startup, so only an
+    // existing regular file opens.
+    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .no_follow) catch |err| {
         if (err != error.FileNotFound) debug_trace.logf("token_pass", "saved answers unreadable err={s}", .{@errorName(err)});
         return null;
     };
@@ -204,4 +208,54 @@ test "token pass memory: a malformed file reads as no answer and is replaced" {
 
     try save(alloc, home, id, .has_pass);
     try std.testing.expectEqual(token_pass.Answer.has_pass, load(alloc, home, id).?);
+}
+
+test "token pass memory: a FIFO in place of the file reads as no answer" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(alloc, &tmp);
+    defer alloc.free(home);
+    const root = try profile_paths.rootDir(alloc, home);
+    defer alloc.free(root);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
+    const path = try profile_paths.rootPath(alloc, home, &.{file_name});
+    defer alloc.free(path);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_z = try std.mem.printSentinel(&path_buf, "{s}", .{path}, 0);
+    if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
+
+    var id_buf: [token_pass.identity_len]u8 = undefined;
+    const id = token_pass.identity(&id_buf, .api_key, "vck_example_key", null);
+    try std.testing.expect(load(alloc, home, id) == null);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "token pass memory: a saved-answers file reads and rewrites on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzSavedAnswers, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"teams\":{\"0123456789abcdef0123456789abcdef\":\"has_pass\"}}",
+            "{\"teams\":{\"0123456789abcdef0123456789abcdef\":\"maybe\",\"x\":\"no_pass\"}}",
+            "{\"teams\":[]}",
+            "not json",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").token_pass_memory.*),
+    });
+}
+
+fn fuzzSavedAnswers(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [max_file_bytes]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const id = "0123456789abcdef0123456789abcdef";
+    _ = answerIn(alloc, bytes, id);
+    const answer: token_pass.Answer = if (smith.value(bool)) .has_pass else .no_pass;
+    const text = try encodeWith(alloc, bytes, id, answer);
+    defer alloc.free(text);
+    // What fx writes reads back with the new answer and stays within what
+    // it reads.
+    try std.testing.expectEqual(answer, answerIn(alloc, text, id).?);
+    try std.testing.expect(text.len <= max_file_bytes);
 }

@@ -2,9 +2,9 @@
 //! When a session starts, fx takes the answer it saved for the team, then
 //! asks the credits endpoint in the background, as `/credits` does, and
 //! saves the new answer. A team with Token Pass starts a new session on the
-//! Token Pass default model when nothing else chose the model. The first
-//! prompt of a session waits up to `first_prompt_wait_ms` for an answer fx
-//! has not saved before.
+//! Token Pass default model when nothing else chose the model. Without a
+//! saved answer, the first prompt of a session waits up to
+//! `first_prompt_wait_ms` for the check.
 const std = @import("std");
 const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
@@ -36,7 +36,7 @@ pub const Named = struct {
 
 /// The name of the credential's team, or null when fx does not check it:
 /// a credential that is not for AI Gateway, or one a host manages.
-pub fn name(source: credentials.Source, api_key: ?[]const u8, account: ?[]const u8, team: ?[]const u8) ?Named {
+pub fn name(alloc: Allocator, source: credentials.Source, api_key: ?[]const u8, account: ?[]const u8, team: ?[]const u8) ?Named {
     var named: Named = .{ .asked = undefined, .saved_as = null };
     switch (source) {
         .fx_login => if (account) |id| {
@@ -50,10 +50,51 @@ pub fn name(source: credentials.Source, api_key: ?[]const u8, account: ?[]const 
             _ = token_pass.identity(&named.asked, .api_key, key, team);
             named.saved_as = named.asked;
         },
-        .vercel_oidc_token => _ = token_pass.identity(&named.asked, .session_token, "", team),
+        .vercel_oidc_token => {
+            const subject = if (api_key) |token| oidcSubject(alloc, token) else null;
+            defer if (subject) |value| alloc.free(value);
+            if (subject) |value| {
+                _ = token_pass.identity(&named.asked, .oidc, value, team);
+                named.saved_as = named.asked;
+            } else {
+                _ = token_pass.identity(&named.asked, .session_token, "", team);
+            }
+        },
         .chatgpt_subscription, .grok_subscription, .host_managed, .configured => return null,
     }
     return named;
+}
+
+/// The most bytes of OIDC claims fx decodes to name a token's team.
+const max_oidc_claims_bytes: usize = 8 * 1024;
+
+/// The team and project a Vercel OIDC token names in its `owner_id` and
+/// `project_id` claims, joined by a zero byte, or null when the token is not
+/// a JWT with both. The claims stay the same as the token renews. fx uses
+/// them only to name the saved answer, so it does not check the signature.
+/// Caller owns the result.
+fn oidcSubject(alloc: Allocator, token: []const u8) ?[]u8 {
+    var parts = std.mem.splitScalar(u8, token, '.');
+    _ = parts.next();
+    const encoded = std.mem.trimEnd(u8, parts.next() orelse return null, "=");
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const len = decoder.calcSizeForSlice(encoded) catch return null;
+    if (len > max_oidc_claims_bytes) return null;
+    const claims = alloc.alloc(u8, len) catch return null;
+    defer alloc.free(claims);
+    decoder.decode(claims, encoded) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, claims, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const owner = claimString(parsed.value.object, "owner_id") orelse return null;
+    const project = claimString(parsed.value.object, "project_id") orelse return null;
+    return alloc.print("{s}\x00{s}", .{ owner, project }) catch null;
+}
+
+fn claimString(claims: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = claims.get(key) orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return value.string;
 }
 
 /// What a credits reply says about the team's Token Pass, or null when it
@@ -65,9 +106,8 @@ pub fn answerOf(snapshot: output_contracts.CreditsSnapshot) ?token_pass.Answer {
     return null;
 }
 
-/// How long `fx ask` and ACP wait, after their work, for a check that
-/// refreshes a saved answer.
-pub const refresh_wait_ms: i64 = 500;
+/// How often a wait looks for the check's answer.
+const answer_poll_ms: u64 = 10;
 
 /// For `fx ask` and ACP: the answer saved for the team, refreshed by a
 /// credits check that runs while the session works. Without a saved answer,
@@ -105,10 +145,11 @@ pub const Check = struct {
         self.waitForAnswer(alloc, 0);
     }
 
-    /// Takes an answer that arrives within `wait_ms`, then stops the check.
-    pub fn finish(self: *Check, alloc: Allocator, wait_ms: i64) void {
-        self.waitForAnswer(alloc, wait_ms);
-        if (self.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason=finished wait_ms={d}", .{wait_ms});
+    /// Takes an answer that has arrived, then stops the check. `reason`
+    /// names why, for the trace, when the check had not answered.
+    pub fn finish(self: *Check, alloc: Allocator, reason: []const u8) void {
+        self.waitForAnswer(alloc, 0);
+        if (self.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason={s}", .{reason});
         self.lookup.deinit();
     }
 
@@ -127,8 +168,11 @@ pub const Check = struct {
                 }
                 return;
             }
-            if (io_mod.awakeMilliTimestamp() >= deadline) return;
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            if (io_mod.awakeMilliTimestamp() >= deadline) {
+                if (wait_ms > 0) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{wait_ms});
+                return;
+            }
+            io_mod.sleep(answer_poll_ms * std.time.ns_per_ms);
         }
     }
 };
@@ -164,8 +208,16 @@ pub const State = struct {
         self.lookup.deinit();
     }
 
+    /// Ends this run's start-model decision: once the user chooses a model,
+    /// fx no longer changes it, whatever the check answers later.
+    pub fn settle(self: *State, reason: []const u8) void {
+        if (self.start_settled) return;
+        self.start_settled = true;
+        debug_trace.logf("token_pass", "start model settled reason={s}", .{reason});
+    }
+
     /// Whether the session's first prompt waits for the running check.
-    pub fn holdsFirstPrompt(self: *const State, now_ms: i64) bool {
+    fn holdsFirstPrompt(self: *const State, now_ms: i64) bool {
         if (self.start_settled or self.had_saved) return false;
         const started = self.started_ms orelse return false;
         return now_ms - started < first_prompt_wait_ms;
@@ -190,7 +242,7 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("token_pass", "check deferred reason=credential_refresh_required", .{});
                 return;
             }
-            const named = name(credential.source, credential.api_key, credential.account orelse app.auth.accountId(), credential.gateway_team) orelse return;
+            const named = name(app.alloc, credential.source, credential.api_key, credential.account orelse app.auth.accountId(), credential.gateway_team) orelse return;
             const state = &app.token_pass_check;
             if (state.asked) |asked| if (std.mem.eql(u8, &asked, &named.asked)) {
                 // A new sign-in to the same team resets the status; its
@@ -201,6 +253,7 @@ pub fn Runtime(comptime App: type) type {
             };
 
             // A check for an earlier credential answers for another team.
+            if (state.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason=credential_changed", .{});
             state.lookup.deinit();
             state.asked = named.asked;
             state.saved_as = named.saved_as;
@@ -298,11 +351,9 @@ pub fn Runtime(comptime App: type) type {
             const agent = &app.main_agent;
             if (provider_runtime.providerOf(app, agent) != .gateway) return;
             if (agent.session.agent.history.items.len != 0) return;
-            const current = provider_runtime.modelOf(app, agent);
-            // A model the user switched to keeps its place.
-            if (!std.mem.eql(u8, current, seed.configured_model) and !std.mem.eql(u8, current, token_pass.default_model)) return;
             const has_pass = app.model_cache.tokenPassStatus() == .active;
-            const target = token_pass.startModel(seed.configured_model, has_pass);
+            const current = provider_runtime.modelOf(app, agent);
+            const target = token_pass.startModelFor(current, seed.configured_model, has_pass) orelse return;
             if (std.mem.eql(u8, current, target)) return;
             debug_trace.logf("token_pass", "start model={s}", .{target});
             // Token Pass credit pays only for standard speed; the built-in
@@ -313,21 +364,56 @@ pub fn Runtime(comptime App: type) type {
 }
 
 test "token pass check: a credential is named without its secret, and saved only when it lasts" {
-    const login = name(.fx_login, "token-that-renews", "account_example", "example-team").?;
+    const alloc = std.testing.allocator;
+    const login = name(alloc, .fx_login, "token-that-renews", "account_example", "example-team").?;
     try std.testing.expect(login.saved_as != null);
-    const renewed = name(.fx_login, "renewed-token", "account_example", "example-team").?;
+    const renewed = name(alloc, .fx_login, "renewed-token", "account_example", "example-team").?;
     try std.testing.expectEqualSlices(u8, &login.asked, &renewed.asked);
 
-    const key = name(.ai_gateway_api_key, "vck_example", null, null).?;
+    const key = name(alloc, .ai_gateway_api_key, "vck_example", null, null).?;
     try std.testing.expect(key.saved_as != null);
-    try std.testing.expectEqualSlices(u8, &key.asked, &name(.stored_key, "vck_example", null, null).?.asked);
-    try std.testing.expect(!std.mem.eql(u8, &key.asked, &name(.ai_gateway_api_key, "vck_other", null, null).?.asked));
+    try std.testing.expectEqualSlices(u8, &key.asked, &name(alloc, .stored_key, "vck_example", null, null).?.asked);
+    try std.testing.expect(!std.mem.eql(u8, &key.asked, &name(alloc, .ai_gateway_api_key, "vck_other", null, null).?.asked));
 
-    const oidc = name(.vercel_oidc_token, "oidc-token", null, "example-team").?;
-    try std.testing.expect(oidc.saved_as == null);
-    try std.testing.expect(name(.ai_gateway_api_key, null, null, null) == null);
-    try std.testing.expect(name(.host_managed, "host-token", null, null) == null);
-    try std.testing.expect(name(.chatgpt_subscription, "subscription", null, null) == null);
+    // An OIDC token without the team and project claims is asked about for
+    // this run only.
+    const opaque_token = name(alloc, .vercel_oidc_token, "oidc-token", null, "example-team").?;
+    try std.testing.expect(opaque_token.saved_as == null);
+    try std.testing.expect(name(alloc, .ai_gateway_api_key, null, null, null) == null);
+    try std.testing.expect(name(alloc, .host_managed, "host-token", null, null) == null);
+    try std.testing.expect(name(alloc, .chatgpt_subscription, "subscription", null, null) == null);
+}
+
+fn testOidcToken(buf: []u8, claims: []const u8) []const u8 {
+    const header = "eyJhbGciOiJSUzI1NiJ9";
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const payload_len = encoder.calcSize(claims.len);
+    @memcpy(buf[0..header.len], header);
+    buf[header.len] = '.';
+    _ = encoder.encode(buf[header.len + 1 ..][0..payload_len], claims);
+    const signature = ".c2lnbmF0dXJl";
+    @memcpy(buf[header.len + 1 + payload_len ..][0..signature.len], signature);
+    return buf[0 .. header.len + 1 + payload_len + signature.len];
+}
+
+test "token pass check: an OIDC token is saved under the team and project it names" {
+    const alloc = std.testing.allocator;
+    var first_buf: [512]u8 = undefined;
+    var renewed_buf: [512]u8 = undefined;
+    var other_buf: [512]u8 = undefined;
+    var partial_buf: [512]u8 = undefined;
+    const first = testOidcToken(&first_buf, "{\"owner_id\":\"team_example\",\"project_id\":\"prj_example\",\"exp\":1}");
+    const renewed = testOidcToken(&renewed_buf, "{\"owner_id\":\"team_example\",\"project_id\":\"prj_example\",\"exp\":2}");
+    const other = testOidcToken(&other_buf, "{\"owner_id\":\"team_other\",\"project_id\":\"prj_example\",\"exp\":1}");
+    const partial = testOidcToken(&partial_buf, "{\"owner_id\":\"team_example\",\"exp\":1}");
+
+    const named = name(alloc, .vercel_oidc_token, first, null, null).?;
+    try std.testing.expect(named.saved_as != null);
+    // A renewed token keeps its team's saved answer; another team has its own.
+    try std.testing.expectEqualSlices(u8, &named.saved_as.?, &name(alloc, .vercel_oidc_token, renewed, null, null).?.saved_as.?);
+    try std.testing.expect(!std.mem.eql(u8, &named.saved_as.?, &name(alloc, .vercel_oidc_token, other, null, null).?.saved_as.?));
+    try std.testing.expect(name(alloc, .vercel_oidc_token, partial, null, null).?.saved_as == null);
+    try std.testing.expect(name(alloc, .vercel_oidc_token, "header.%%%.sig", null, null).?.saved_as == null);
 }
 
 test "token pass check: a credits reply answers only when it names Token Pass" {

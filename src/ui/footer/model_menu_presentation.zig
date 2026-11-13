@@ -507,17 +507,17 @@ fn tokenCell(buf: *[32]u8, tokens: ?u32, digits: usize, label: []const u8) ![]co
     return buf[0 .. pad + text.len + label.len];
 }
 
-/// The speed options a model has, as one cell: `Fast` for a model that
-/// always runs fast, and `Fast mode` or `Ultrafast mode` for options it offers.
 /// The capabilities whose speed facts `item` shows. Token Pass credit does
 /// not pay for Fast mode, so for a team with Token Pass its models leave
 /// Fast mode out.
 fn itemSpeed(item: model_cache_runtime.ModelMenuItem, token_pass_team: bool) model_capabilities.Capabilities {
     var capabilities = item.capabilities;
-    if (token_pass_team and token_pass.isFeaturedModel(item.id)) capabilities.supports_fast_mode = false;
+    capabilities.supports_fast_mode = token_pass.offersFastMode(token_pass_team, item.id, capabilities.supports_fast_mode);
     return capabilities;
 }
 
+/// The speed options a model has, as one cell: `Fast` for a model that
+/// always runs fast, and `Fast mode` or `Ultrafast mode` for options it offers.
 fn speedFacts(buf: *[32]u8, capabilities: model_capabilities.Capabilities) []const u8 {
     var writer: std.Io.Writer = .fixed(buf);
     const facts = [_]struct { on: bool, text: []const u8 }{

@@ -396,7 +396,7 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
-        if (self.token_pass_run) |*check| check.finish(self.alloc, 0);
+        if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
@@ -2832,7 +2832,11 @@ fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: conf
     if (state.provider != .gateway) return;
     const source = state.credential_source orelse return;
     const api_key: ?[]const u8 = if (state.api_key.len > 0) state.api_key else null;
-    const named = token_pass_check.name(source, api_key, state.account_id, state.gateway_team) orelse return;
+    // A client that sends `initialize` again replaces the earlier check.
+    if (state.token_pass_run) |*earlier| earlier.finish(alloc, "initialize_retried");
+    state.token_pass_run = null;
+    state.token_pass_start = null;
+    const named = token_pass_check.name(alloc, source, api_key, state.account_id, state.gateway_team) orelse return;
     state.token_pass_run = .{ .named = named, .home = state.cfg.home_override orelse io_mod.homeDir() };
     state.token_pass_run.?.begin(
         alloc,
@@ -2858,9 +2862,7 @@ fn pollTokenPass(state: *ServerState) void {
 fn applyTokenPassStartModel(state: *ServerState) void {
     const profile = state.token_pass_start orelse return;
     const has_pass = if (state.token_pass_run) |check| check.has_pass else false;
-    if (!std.mem.eql(u8, state.selected_model, state.configured_model) and
-        !std.mem.eql(u8, state.selected_model, token_pass.default_model)) return;
-    const target = token_pass.startModel(state.configured_model, has_pass);
+    const target = token_pass.startModelFor(state.selected_model, state.configured_model, has_pass) orelse return;
     if (!std.mem.eql(u8, state.selected_model, target)) {
         const owned = state.alloc.dupe(u8, target) catch |err| {
             debug_trace.logf("token_pass", "start model not applied err={s}", .{@errorName(err)});

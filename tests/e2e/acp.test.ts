@@ -49,6 +49,7 @@ import {
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  localCreditsEnv,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -673,11 +674,11 @@ class AcpClient {
       }
     }
     const proc = nodeSpawn(FX_BIN, args, {
-      env: providerVersionTestEnv({
+      env: localCreditsEnv(providerVersionTestEnv({
         ...inheritedEnv,
         NO_COLOR: "1",
         PATH: inheritedEnv.PATH ?? "",
-      }),
+      })),
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });

@@ -575,6 +575,14 @@ export function startFakeGateway(
 // completion request is answered by the supplied callback instead of a
 // finite queue. For suites that replay one response indefinitely or switch
 // on their own state.
+// fx asks AI Gateway's credits endpoint whether the team has Token Pass. With
+// no fake gateway, that request would reach the real AI Gateway, so it goes to
+// a closed loopback port, where it fails at once.
+export function localCreditsEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (env.FX_GATEWAY_BASE_URL || env.FX_TEST_GATEWAY_CREDITS_URL) return env;
+  return { ...env, FX_TEST_GATEWAY_CREDITS_URL: "http://127.0.0.1:9/coding-agent/v1/credits" };
+}
+
 export function startDynamicFakeGateway(
   response: (body: string) => Response | Promise<Response>,
   options: FakeGatewayOptions = {},
@@ -679,7 +687,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = providerVersionTestEnv(requestedEnv);
+    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
 
     if (
       minimumHistoryLines !== undefined &&

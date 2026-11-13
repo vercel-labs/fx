@@ -1800,10 +1800,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // when nothing chose the model. The check refreshes the saved answer
     // while the turn runs, and waits for it only when fx has none.
     var token_pass_run: ?token_pass_check.Check = null;
-    defer if (token_pass_run) |*check| check.finish(alloc, token_pass_check.refresh_wait_ms);
+    defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
     const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
     if (token_pass_source) |source| {
-        if (token_pass_check.name(source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
+        if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
             token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
             token_pass_run.?.begin(
                 alloc,

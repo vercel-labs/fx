@@ -35,6 +35,27 @@ pub fn startModel(builtin_default: []const u8, has_pass: bool) []const u8 {
     return if (has_pass) default_model else builtin_default;
 }
 
+/// The start model for a session still on one of the two start models, or
+/// null when it runs another model, which keeps its place. The caller
+/// decides that nothing else chose the session's model.
+pub fn startModelFor(current: []const u8, builtin_default: []const u8, has_pass: bool) ?[]const u8 {
+    if (!std.mem.eql(u8, current, builtin_default) and !std.mem.eql(u8, current, default_model)) return null;
+    return startModel(builtin_default, has_pass);
+}
+
+/// Whether Token Pass credit pays for `model`, where `has_pass` says whether
+/// fx knows the team has Token Pass.
+pub fn paysFor(has_pass: bool, model: []const u8) bool {
+    return has_pass and isFeaturedModel(model);
+}
+
+/// Whether fx offers Fast mode for `model`, which `supports_fast_mode` says
+/// the model has. Token Pass credit does not pay for Fast mode, so a Token
+/// Pass model of a team with Token Pass offers none.
+pub fn offersFastMode(has_pass: bool, model: []const u8, supports_fast_mode: bool) bool {
+    return supports_fast_mode and !paysFor(has_pass, model);
+}
+
 /// How a credential names its team, for the saved answer.
 pub const IdentityKind = enum {
     /// fx login: the account and the team it chose. Its token changes as it
@@ -42,8 +63,12 @@ pub const IdentityKind = enum {
     login,
     /// An AI Gateway API key, which belongs to one team.
     api_key,
-    /// A token that changes often, such as a Vercel OIDC token: named by its
-    /// team alone, for one run, and fx saves no answer for it.
+    /// A Vercel OIDC token: the team and project its claims name. The token
+    /// renews often, and its claims stay the same.
+    oidc,
+    /// A token fx cannot name across renewals, such as an OIDC token without
+    /// those claims: named by its team alone, for one run, and fx saves no
+    /// answer for it.
     session_token,
 };
 
@@ -51,8 +76,9 @@ pub const IdentityKind = enum {
 pub const identity_len = 32;
 
 /// A name for the credential's team that holds no secret: a hash of `kind`,
-/// `subject` (the account ID for a login, the key for an API key), and the
-/// team fx sends with requests. Writes into `buf` and returns it.
+/// `subject` (the account ID for a login, the key for an API key, the team
+/// and project for an OIDC token), and the team fx sends with requests.
+/// Writes into `buf` and returns it.
 pub fn identity(buf: *[identity_len]u8, kind: IdentityKind, subject: []const u8, team: ?[]const u8) []const u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(@tagName(kind));
@@ -114,7 +140,7 @@ fn sideCallModel(call: SideCall) []const u8 {
 /// has Token Pass and the session runs a Token Pass model, so the whole
 /// session stays on Token Pass credit, and `fallback_model` otherwise.
 pub fn modelForSideCall(call: SideCall, session_model: []const u8, fallback_model: []const u8, has_pass: bool) []const u8 {
-    return if (has_pass and isFeaturedModel(session_model)) sideCallModel(call) else fallback_model;
+    return if (paysFor(has_pass, session_model)) sideCallModel(call) else fallback_model;
 }
 
 /// The Token Pass model of another family that retries a summary a Token
@@ -122,7 +148,7 @@ pub fn modelForSideCall(call: SideCall, session_model: []const u8, fallback_mode
 /// `primary` is not a Token Pass model, which leaves the choice to the
 /// compactor.
 pub fn compactionFallback(primary: []const u8, has_pass: bool) ?[]const u8 {
-    if (!has_pass or !isFeaturedModel(primary)) return null;
+    if (!paysFor(has_pass, primary)) return null;
     return if (std.ascii.startsWithIgnoreCase(primary, "zai/")) "deepseek/deepseek-v4.1-flash" else "zai/glm-5.3";
 }
 
@@ -146,11 +172,10 @@ pub fn processHasPass() bool {
 pub const Status = enum { unknown, active };
 
 /// The current credential's Token Pass status. It starts from the answer fx
-/// saved for the team, turns active when the credits endpoint reports Token
-/// Pass credit or a response names `token-pass` as the provider that served
-/// it, and back to unknown when AI Gateway says the team has no active Token
-/// Pass. Its owner resets it when the credential or the team changes. It is
-/// read and written on the main thread only.
+/// saved for the team, turns active when AI Gateway says the team has Token
+/// Pass, and back to unknown when it says the team has no active Token Pass.
+/// Its owner resets it when the credential or the team changes. It is read
+/// and written on the main thread only.
 pub const Tracker = struct {
     status: Status = .unknown,
 
@@ -163,15 +188,9 @@ pub const Tracker = struct {
         return self.status == .active;
     }
 
-    /// Records the provider that served a request. Returns true when the
-    /// status changed.
-    pub fn observeServedBy(self: *Tracker, served_by: []const u8) bool {
-        if (!isTokenPassProvider(served_by)) return false;
-        return self.markActive();
-    }
-
-    /// Records that the credits endpoint reported the team's Token Pass
-    /// credit. Returns true when the status changed.
+    /// Records that AI Gateway said the team has Token Pass: a credits reply
+    /// with Token Pass credit, or a response Token Pass served. Returns true
+    /// when the status changed.
     pub fn observeCredit(self: *Tracker) bool {
         return self.markActive();
     }
@@ -276,9 +295,30 @@ test "token pass: a compaction retry uses another Token Pass family" {
 }
 
 test "token pass: a team with Token Pass starts on the Token Pass default" {
+    const builtin_default = "spacexai/grok-4.7";
     try std.testing.expect(isFeaturedModel(default_model));
-    try std.testing.expectEqualStrings(default_model, startModel("spacexai/grok-4.7", true));
-    try std.testing.expectEqualStrings("spacexai/grok-4.7", startModel("spacexai/grok-4.7", false));
+    try std.testing.expectEqualStrings(default_model, startModel(builtin_default, true));
+    try std.testing.expectEqualStrings(builtin_default, startModel(builtin_default, false));
+
+    // A session on either start model takes the one for its team.
+    for ([_][]const u8{ builtin_default, default_model }) |current| {
+        try std.testing.expectEqualStrings(default_model, startModelFor(current, builtin_default, true).?);
+        try std.testing.expectEqualStrings(builtin_default, startModelFor(current, builtin_default, false).?);
+    }
+    // Any other model keeps its place.
+    try std.testing.expect(startModelFor("zai/glm-5.3", builtin_default, false) == null);
+    try std.testing.expect(startModelFor("openai/gpt-5.6-luna", builtin_default, true) == null);
+}
+
+test "token pass: only a team with Token Pass loses Fast mode on Token Pass models" {
+    try std.testing.expect(paysFor(true, "zai/glm-5.3"));
+    try std.testing.expect(!paysFor(false, "zai/glm-5.3"));
+    try std.testing.expect(!paysFor(true, "openai/gpt-5.6-luna"));
+
+    try std.testing.expect(!offersFastMode(true, "moonshotai/kimi-k3", true));
+    try std.testing.expect(offersFastMode(false, "moonshotai/kimi-k3", true));
+    try std.testing.expect(offersFastMode(true, "openai/gpt-5.6-luna", true));
+    try std.testing.expect(!offersFastMode(false, "openai/gpt-5.6-luna", false));
 }
 
 test "token pass: an identity names the team without the secret" {
@@ -295,6 +335,7 @@ test "token pass: an identity names the team without the secret" {
     var other: [identity_len]u8 = undefined;
     try std.testing.expect(!std.mem.eql(u8, named, identity(&other, .api_key, key, "example-team")));
     try std.testing.expect(!std.mem.eql(u8, named, identity(&other, .login, key, null)));
+    try std.testing.expect(!std.mem.eql(u8, named, identity(&other, .oidc, key, null)));
     try std.testing.expect(!std.mem.eql(u8, named, identity(&other, .api_key, "vck_other_key", null)));
 }
 
@@ -304,16 +345,10 @@ test "token pass: a tracker starts from the saved answer" {
     try std.testing.expect(!Tracker.fromSaved(null).hasPass());
 }
 
-test "token pass: the tracker turns active once on a token-pass response" {
-    var tracker: Tracker = .{};
-    try std.testing.expect(!tracker.observeServedBy("baseten"));
-    try std.testing.expectEqual(Status.unknown, tracker.status);
-    try std.testing.expect(tracker.observeServedBy("token-pass"));
-    try std.testing.expectEqual(Status.active, tracker.status);
-    try std.testing.expect(!tracker.observeServedBy("Token-Pass"));
-    // A later fallback to another provider does not end the subscription.
-    try std.testing.expect(!tracker.observeServedBy("baseten"));
-    try std.testing.expectEqual(Status.active, tracker.status);
+test "token pass: the tracker follows what AI Gateway says about the team" {
+    try std.testing.expect(isTokenPassProvider("token-pass"));
+    try std.testing.expect(isTokenPassProvider("Token-Pass"));
+    try std.testing.expect(!isTokenPassProvider("baseten"));
 
     var from_credits: Tracker = .{};
     try std.testing.expect(from_credits.observeCredit());
@@ -325,7 +360,7 @@ test "token pass: the tracker turns active once on a token-pass response" {
     try std.testing.expect(from_credits.observeNoPass());
     try std.testing.expectEqual(Status.unknown, from_credits.status);
     try std.testing.expect(!from_credits.observeNoPass());
-    try std.testing.expect(from_credits.observeServedBy("token-pass"));
+    try std.testing.expect(from_credits.observeCredit());
 }
 
 test "token pass: denied causes come from the documented messages" {
