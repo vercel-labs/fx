@@ -1639,7 +1639,7 @@ pub const Runtime = struct {
     }
 
     /// A message waiting for the child whose slot could not start, now ended
-    /// as a failed work.
+    /// as a failed work. `work_id` is owned by the caller.
     const FailedStart = struct {
         work_id: []u8,
         report_owed: bool,
@@ -4193,12 +4193,22 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
-/// `body` must hold `needle`; on a miss it prints the body, since a test that
-/// fails on a model-facing answer should show it.
+/// `body` must hold `needle`; a miss shows the needle beside the body, since a
+/// test that fails on a model-facing answer should show it.
 fn expectBodyHas(body: []const u8, needle: []const u8) !void {
-    if (std.mem.find(u8, body, needle) != null) return;
-    std.debug.print("expected \"{s}\" in: {s}\n", .{ needle, body });
-    return error.TestUnexpectedResult;
+    const at = std.mem.find(u8, body, needle) orelse return std.testing.expectEqualStrings(needle, body);
+    try std.testing.expectEqualStrings(needle, body[at..][0..needle.len]);
+}
+
+/// `actual` must equal `expected`; a miss names `where`, which for the sweep
+/// below is the allocation that failed.
+fn expectAt(where: []const u8, expected: []const u8, actual: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const want = try alloc.print("{s}: {s}", .{ where, expected });
+    defer alloc.free(want);
+    const got = try alloc.print("{s}: {s}", .{ where, actual });
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
 }
 
 /// An allocator for the thread that makes it, which fails one allocation:
@@ -4245,13 +4255,15 @@ const FaultAllocator = struct {
 
 /// `reviewer`'s phase in the registry, and whether the host counts it as
 /// busy. A child that is running in the registry and not busy has no slot.
+/// Read under the host's admission lock, as `status` reads them, so a slot
+/// that ends meanwhile cannot show a finished child as running and not busy.
 fn reviewerPhase(runtime: *Runtime, arena: Allocator) !struct { phase: child_state.Phase, busy: bool, outcome: ?child_state.Outcome, report_owed: bool, has_work: bool } {
+    runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+    defer runtime.admission_mutex.unlock(io_mod.getIo());
     var lock = runtime.managed.state_store.acquireLock();
     defer lock.release();
     var registry = try runtime.managed.state_store.load(arena);
     const child = registry.findPersistent("reviewer") orelse return error.ChildNotFound;
-    runtime.admission_mutex.lockUncancelable(io_mod.getIo());
-    defer runtime.admission_mutex.unlock(io_mod.getIo());
     return .{
         .phase = child.phase,
         .busy = runtime.isBusyLocked(child.id),
@@ -4276,10 +4288,8 @@ test "a start that fails after its work is saved answers that it failed, and end
 
     start_test_controls.test_fail_spawn = true;
     defer start_test_controls.test_fail_spawn = false;
-    const body = callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null) catch |err| {
-        std.debug.print("the failed start escaped the call as {s}\n", .{@errorName(err)});
-        return err;
-    };
+    // The failure comes back as the call's answer, not as an error.
+    const body = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
     try expectBodyHas(body, "\"ok\":false");
     try expectBodyHas(body, "\"error_code\":\"start_failed\"");
     try expectBodyHas(body, "reviewer did not start: fx could not start a thread for it. Your message did not run. reviewer is idle");
@@ -4474,15 +4484,16 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
         try waitUntilQuiet(runtime);
         return failed;
     };
+    const where = try alloc.print("allocation {d} of a {s} message", .{ fail_at, if (create) "creating" else "following" });
+    defer alloc.free(where);
     if ((found.phase == .running or found.phase == .awaiting_approval) and !found.busy) {
-        std.debug.print("allocation {d} of a {s} message failed: reviewer is running with no slot (call answered: {s})\n", .{ fail_at, if (create) "creating" else "following", copy });
-        return error.TestUnexpectedResult;
+        const stuck = try alloc.print("reviewer is running with no slot, and the call answered {s}", .{copy});
+        defer alloc.free(stuck);
+        try expectAt(where, "reviewer is idle or working", stuck);
     }
     const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
-    if (std.mem.find(u8, again, "Sent to reviewer") == null and std.mem.find(u8, again, "is busy") == null) {
-        std.debug.print("allocation {d} of a {s} message failed: the next message was refused: {s}\n", .{ fail_at, if (create) "creating" else "following", again });
-        return error.TestUnexpectedResult;
-    }
+    const taken = std.mem.find(u8, again, "Sent to reviewer") != null or std.mem.find(u8, again, "is busy") != null;
+    try expectAt(where, "the next message is taken", if (taken) "the next message is taken" else again);
     try waitUntilQuiet(runtime);
     try std.testing.expect(fixture.reportCount() > reports_before);
     try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], " completed DONE again");
@@ -6592,7 +6603,7 @@ fn startFailedResult(buf: []u8, agent: []const u8, cause: []const u8, ended: boo
 }
 
 /// A report's text for a work whose slot could not start: the message
-/// never ran.
+/// never ran. Allocated in `a`.
 fn startFailedReport(a: Allocator, cause: []const u8) ![]const u8 {
     return a.print("The subagent could not start the work your message made: {s}. It never ran. The subagent is idle, so send the message again if it is still needed.", .{cause});
 }
