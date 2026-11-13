@@ -1461,7 +1461,15 @@ pub const Runtime = struct {
         defer if (!posted) self.nudgeWaiter();
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
-        if (self.closingIndexLocked(child_id) != null) return;
+        if (self.closingIndexLocked(child_id) != null) {
+            // A closing child takes no next work, as when a slot's work ends
+            // (`endClosingWork`): what waits for it is dropped and it stops
+            // counting as working. The close is written below, once nothing
+            // of it runs, and the owner's `wait` is nudged after that.
+            _ = self.dropPendingLocked(child_id, "closed");
+            self.clearBusyLocked(child_id);
+            return;
+        }
         if (self.startNextPendingLocked(child_id)) {
             _ = self.managed.start(child_id) catch |err| {
                 debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} error={s}", .{ child_id, @errorName(err) });
@@ -3751,6 +3759,62 @@ test "a wait that starts as the user's turn on a subagent ends with nothing to r
     try std.testing.expect(std.mem.find(u8, text, "ended without a report") != null);
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+}
+
+/// One `wait` call on its own thread, with nothing held, returning what it
+/// said, which the caller frees. Fails with
+/// `error.WaitBlockedWhileNothingWorks` when it has not returned within
+/// `gap_wait_limit`; it is then cancelled so the test can finish.
+fn boundedWait(runtime: *Runtime, worker: *worker_runtime.WorkerRuntime) ![]u8 {
+    var gap = GapWait{ .runtime = runtime, .worker = worker };
+    const thread = try std.Thread.spawn(.{}, GapWait.run, .{&gap});
+    gap.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+        worker.requestCancel();
+        thread.join();
+        return error.WaitBlockedWhileNothingWorks;
+    };
+    thread.join();
+    return gap.body orelse error.WaitFailed;
+}
+
+test "a wait that starts after the user's turn on a closing subagent ends still returns" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    // Drop the report that work owed, so the wait below has nothing queued.
+    const first = worker.takeQueuedPrompt(alloc).?;
+    worker_runtime.freeQueuedPrompt(alloc, first);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    // The parent closes the subagent while the user's turn on it runs, and
+    // that turn then ends. Nothing of the subagent runs after that.
+    const closed = (try runtime.closeChild(child_id, .parent)).?;
+    try std.testing.expect(closed.stopped);
+    runtime.endUserWork(child_id, work_id, .cancelled, "");
+
+    const said = try boundedWait(runtime, &worker);
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "nothing more will arrive") != null);
+    // The turn's end wrote the close before it returned.
+    var lock = runtime.managed.state_store.acquireLock();
+    defer lock.release();
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expect(registry.findById(child_id) == null);
 }
 
 test "rebinding a moved host context moves its report sink too" {
