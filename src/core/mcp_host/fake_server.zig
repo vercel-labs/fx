@@ -8,7 +8,8 @@ const testing = std.testing;
 
 /// A 2025 MCP server in sh: discovery gets an error, so the engine falls back
 /// to `initialize`; it lists one `echo` tool and answers calls, except a call
-/// that mentions "slow", which never answers. A call that mentions
+/// that mentions "slow", which never answers but is noted in a file (`Fixture.slowCalls`).
+/// A call that mentions
 /// "withdraw" asks form question Q1, withdraws it, asks Q2, and once Q2 is
 /// answered, returns what reached each: "e1 " if Q1 got an answer, then
 /// "e2=" and Q2's `name`. A call that mentions "confirm" asks question c1
@@ -23,7 +24,7 @@ pub const script =
     \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
     \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
-    \\    *'"method":"tools/call"'*slow*) ;;
+    \\    *'"method":"tools/call"'*slow*) printf '%s\n' "$id" >> "$0.slow" ;;
     \\    *'"method":"tools/call"'*withdraw*)
     \\      call=$id
     \\      printf '{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"mode":"form","message":"Q1","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}\n'
@@ -68,6 +69,18 @@ pub const Fixture = struct {
         testing.allocator.free(f.server);
         testing.allocator.free(f.home);
         f.tmp.cleanup();
+    }
+
+    /// How many calls that mention "slow" the servers have received, which a test waits for
+    /// before it acts on a call that is out.
+    pub fn slowCalls(f: *const Fixture) usize {
+        const path = testing.allocator.print("{s}.slow", .{f.server}) catch return 0;
+        defer testing.allocator.free(path);
+        var file = std.Io.Dir.openFileAbsolute(testing.io, path, .{}) catch return 0;
+        defer file.close(testing.io);
+        const noted = io_mod.readFileToEnd(testing.allocator, &file, 4096) catch return 0;
+        defer testing.allocator.free(noted);
+        return std.mem.count(u8, noted, "\n");
     }
 
     pub fn options(f: *const Fixture) Options {

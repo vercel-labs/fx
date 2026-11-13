@@ -1134,6 +1134,25 @@ test "a reload keeps a kept server's list and the bindings made from it, until a
     try testing.expect(c.hasTool("mcp_late_echo", .unrestricted));
 }
 
+const ReadsPast = struct { reads: *const std.atomic.Value(usize), above: usize };
+
+fn readsPast(progress: ReadsPast) bool {
+    return progress.reads.load(.monotonic) > progress.above;
+}
+
+fn slowCallsOut(f: *const Fixture) bool {
+    return f.slowCalls() >= 2;
+}
+
+/// Waits for the event that makes `holds` true, for up to ten seconds.
+fn waitUntil(context: anytype, comptime holds: fn (@TypeOf(context)) bool) !void {
+    var waited_ms: u64 = 0;
+    while (!holds(context)) : (waited_ms += 5) {
+        try testing.expect(waited_ms < 10_000);
+        std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+}
+
 test "a reload beside a call that is out and a reader of the access view ends only the dropped server's call" {
     var f: Fixture = undefined;
     try f.init();
@@ -1200,20 +1219,23 @@ test "a reload beside a call that is out and a reader of the access view ends on
     const kept_thread = try std.Thread.spawn(.{}, Caller.run, .{&kept_call});
     const gone_thread = try std.Thread.spawn(.{}, Caller.run, .{&gone_call});
     const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
-    std.Io.sleep(testing.io, .fromMilliseconds(300), .awake) catch {};
+    // Both calls are out at their servers, and the reader has read once.
+    const fake: *const Fixture = &f;
+    try waitUntil(fake, slowCallsOut);
+    try waitUntil(ReadsPast{ .reads = &reader.reads, .above = 0 }, readsPast);
 
     // One server goes and one comes, as a session's reload with a working subagent does.
     const generation = c.currentGeneration();
+    const reads_at_reload = reader.reads.load(.monotonic);
     try c.reload(try r.reload(&.{ kept, late }, &f.inherited));
     gone_thread.join();
     try testing.expectEqual(@as(?anyerror, error.Cancelled), gone_call.err);
 
-    // The kept server's call is still out, and the reader read on through the reload.
-    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    // The reader reads on through the reload, and the kept server's call is still out.
+    try waitUntil(ReadsPast{ .reads = &reader.reads, .above = reads_at_reload }, readsPast);
     try testing.expect(!kept_call.done.load(.acquire));
     reader.stop.store(true, .release);
     reader_thread.join();
-    try testing.expect(reader.reads.load(.monotonic) > 0);
 
     // A server went, so the view the subagent was given holds no longer, and its next call is refused.
     try testing.expect(generation != c.currentGeneration());
