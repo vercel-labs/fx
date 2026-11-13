@@ -1,6 +1,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const profiles = @import("../profiles/profiles.zig");
+const started_with_mod = @import("../profiles/started_with.zig");
 const reports = @import("reports.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -160,6 +161,14 @@ pub const Child = struct {
     /// The agent profile the child started in, or null for fx's `agent`.
     /// Fixed when the child is created. Owned.
     profile: ?[]u8 = null,
+    /// What that profile set when the child started: its tools, MCP servers,
+    /// and mode. Fixed when the child is created, and recorded on each spawn
+    /// line, so the child keeps them across a restart, a resume elsewhere,
+    /// and an edit of the profile. Null for a child that started in no
+    /// profile, one from before it was saved, and one whose profile did not
+    /// fit (`started_with.max_bytes`); such a child reads its profile by
+    /// name again. Owned.
+    started_with: ?started_with_mod.StartedWith = null,
     /// What the child is for, as its parent sees it in its list of
     /// subagents: a short line from its first instructions or task
     /// (`purposeOf`). Fixed when the child is created, and
@@ -170,6 +179,7 @@ pub const Child = struct {
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.profile) |name| alloc.free(name);
+        if (self.started_with) |started| started_with_mod.free(alloc, started);
         if (self.purpose) |text| alloc.free(text);
         switch (self.kind) {
             .one_off => {},
@@ -195,6 +205,8 @@ pub const Child = struct {
         errdefer if (active) |*value| value.deinit(alloc);
         const profile = if (self.profile) |name| try alloc.dupe(u8, name) else null;
         errdefer if (profile) |name| alloc.free(name);
+        const started_with = if (self.started_with) |started| try started_with_mod.dupe(alloc, started) else null;
+        errdefer if (started_with) |started| started_with_mod.free(alloc, started);
         const purpose = if (self.purpose) |text| try alloc.dupe(u8, text) else null;
         errdefer if (purpose) |text| alloc.free(text);
         return .{
@@ -202,6 +214,7 @@ pub const Child = struct {
             .kind = kind,
             .phase = self.phase,
             .profile = profile,
+            .started_with = started_with,
             .purpose = purpose,
             .work_generation = self.work_generation,
             .active = active,
@@ -280,6 +293,14 @@ pub const Registry = struct {
         const child = self.findById(child_id) orelse return error.InvalidState;
         if (child.profile != null) return error.InvalidState;
         child.profile = try alloc.dupe(u8, name);
+    }
+
+    /// Records what the profile a new child started in set, which `setProfile`
+    /// named. A child keeps it for life. `started` is copied.
+    pub fn setStartedWith(self: *Registry, alloc: Allocator, child_id: []const u8, started: started_with_mod.StartedWith) !void {
+        const child = self.findById(child_id) orelse return error.InvalidState;
+        if (child.profile == null or child.started_with != null) return error.InvalidState;
+        child.started_with = try started_with_mod.dupe(alloc, started);
     }
 
     /// Records what a new child is for. A child keeps it for life.
@@ -774,8 +795,8 @@ const SpawnData = struct {
 /// A spawn line's data. `rule` is null only for a converted v1 session,
 /// whose works owe no report, and then the line is written as before
 /// report rules existed.
-fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy, purpose: ?[]const u8) ![]const u8 {
-    return stringifyAlloc(arena, SpawnData{
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy, purpose: ?[]const u8, started: ?started_with_mod.StartedWith) ![]const u8 {
+    const base = try stringifyAlloc(arena, SpawnData{
         .agent = agent,
         .fingerprint = fingerprint,
         .profile = profile,
@@ -783,6 +804,15 @@ fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, prof
         .by = if (by == .parent) null else @tagName(by),
         .purpose = purpose,
     });
+    const block = started orelse return base;
+    // What the profile set goes in after the rest, only when there is any, so
+    // a spawn of a child with none is written as before.
+    const text = try started_with_mod.encode(arena, block);
+    if (!started_with_mod.fits(text)) {
+        debug_trace.logf("subagent", "saved profile left out of a spawn line profile={s} bytes={d} limit={d}", .{ profile orelse "", text.len, started_with_mod.max_bytes });
+        return base;
+    }
+    return std.mem.concat(arena, u8, &.{ base[0 .. base.len - 1], ",\"" ++ started_with_mod.key ++ "\":", text, "}" });
 }
 
 /// The longest purpose a child keeps, its ellipsis included.
@@ -988,7 +1018,7 @@ fn closeLines(arena: Allocator, child: Child, work_id: []const u8) ![2]session_a
         .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent, null),
+            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent, null, child.started_with),
         } },
         .{ .finished = .{ .child = child.id, .work_id = work_id, .outcome = .ok, .data = "{\"closed\":true}" } },
     };
@@ -1155,14 +1185,38 @@ test "a spawn saves who started a work its parent didn't" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     for ([_]reports.StartedBy{ .user, .child, .parent }) |by| {
-        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by, null)));
+        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by, null, null)));
     }
     // The parent's own work names no one in `by`.
-    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null), "\"by\":\"") == null);
+    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null), "\"by\":\"") == null);
     // An older fx's line, a value this fx doesn't know, and no data read as the parent's.
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"fingerprint\":\"ab\",\"report\":\"final\"}"));
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"by\":\"robot\"}"));
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy(null));
+}
+
+/// What the profile of folded child `entry` set when it started, from its
+/// newest spawn line, in `alloc`. Null when the line has none, which is a
+/// child from before it was saved or one whose profile did not fit. A block fx
+/// would not have written, or one with no profile named beside it, is not
+/// believed: the child has none, reads its profile by name again, and a trace
+/// line says so. `scratch` holds only the parse.
+fn savedStartedWith(alloc: Allocator, scratch: Allocator, entry: session_adapter.Child, profile: ?[]const u8) !?started_with_mod.StartedWith {
+    const spawn = entry.spawn_data orelse return null;
+    switch (try started_with_mod.read(scratch, spawn)) {
+        .none => return null,
+        .invalid => {
+            debug_trace.logf("subagent", "saved profile ignored child={s} profile={s} reason=unreadable", .{ entry.id, profile orelse "" });
+            return null;
+        },
+        .started => |started| {
+            if (profile == null) {
+                debug_trace.logf("subagent", "saved profile ignored child={s} reason=no_profile_named", .{entry.id});
+                return null;
+            }
+            return try started_with_mod.dupe(alloc, started);
+        },
+    }
 }
 
 /// Pure: the registry a v2 parent's folded children describe. The
@@ -1233,10 +1287,13 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     // not have written, such as a long one or one with a line break or an
     // escape, is not fx's, and the child keeps none.
     const purpose = if (spawn.purpose) |text| if (savedPurpose(text)) try alloc.dupe(u8, text) else null else null;
+    errdefer if (purpose) |text| alloc.free(text);
+    const started_with = try savedStartedWith(alloc, sa, entry, profile);
     return .{
         .id = id,
         .kind = kind,
         .profile = profile,
+        .started_with = started_with,
         .purpose = purpose,
         .phase = switch (last_outcome) {
             .interrupted, .lost => .interrupted,
@@ -1285,7 +1342,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by, after.purpose),
+                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by, after.purpose, after.started_with),
                 } });
             }
         }
@@ -1319,7 +1376,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent, null),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent, null, null),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
@@ -2232,7 +2289,7 @@ test "a folded child keeps a saved purpose only when it is one line fx would wri
             .work_id = try arena.dupe(u8, "work"),
             .open = false,
             .outcome = .ok,
-            .spawn_data = try arena.dupe(u8, try spawnData(arena, "reviewer", &fingerprint, null, null, .parent, case.saved)),
+            .spawn_data = try arena.dupe(u8, try spawnData(arena, "reviewer", &fingerprint, null, null, .parent, case.saved, null)),
             .finish_data = null,
             .seq = 1,
         };
@@ -2249,7 +2306,7 @@ test "only open children count toward the registry's limit" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent, null);
+    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent, null, null);
     const folded = try arena.alloc(session_adapter.Child, max_children + 1);
     for (folded, 0..) |*entry, i| entry.* = .{
         .id = try arena.dupe(u8, try arena.print("1786460757753-{d:0>4}", .{i})),
@@ -2267,6 +2324,192 @@ test "only open children count toward the registry's limit" {
     try std.testing.expectEqual(@as(u64, max_children + 1), registry.generation);
     folded[0].finish_data = null;
     try std.testing.expectError(error.StateTooLarge, registryFromChildren(alloc, "1786460757753-parent", folded));
+}
+
+test "a spawn line saves what the profile set only when there is something to save, and reads it back only as fx wrote it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fingerprint = std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower);
+    const started: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .auto, .tools = &.{ "read_file", "!shell" }, .mcp_servers = &.{"github"} };
+
+    // A spawn without a block is written as it was before blocks.
+    const plain = try spawnData(arena, "reviewer", &fingerprint, "main", .final, .parent, null, null);
+    try std.testing.expect(std.mem.find(u8, plain, started_with_mod.key) == null);
+    // One with a block ends with it, and nothing else of the line changes.
+    const saved = try spawnData(arena, "reviewer", &fingerprint, "reviewer", .final, .parent, null, started);
+    try std.testing.expect(std.mem.endsWith(u8, saved, ",\"started_with\":{\"v\":1,\"from\":\"home\",\"permission_mode\":\"auto\",\"tools\":[\"read_file\",\"!shell\"],\"mcp_servers\":[\"github\"]}}"));
+    // The line stays JSON that a reader built before blocks takes, and the
+    // fingerprint and name it needs are where they were.
+    const Older = struct { agent: ?[]const u8 = null, fingerprint: []const u8, profile: ?[]const u8 = null, report: ?[]const u8 = null };
+    const older = try std.json.parseFromSliceLeaky(Older, arena, saved, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("reviewer", older.agent.?);
+    try std.testing.expectEqualStrings("reviewer", older.profile.?);
+    try std.testing.expectEqualStrings(&fingerprint, older.fingerprint);
+
+    const cases = [_]struct { spawn: []const u8, kept: ?started_with_mod.StartedWith }{
+        .{ .spawn = saved, .kept = started },
+        // From before blocks, and a child that started in no profile.
+        .{ .spawn = plain, .kept = null },
+        // Not what fx writes: a version it does not know, a repository's
+        // profile with a mode, and a block with no profile named beside it.
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"started_with\":{\"v\":2,\"from\":\"home\"}}", .kept = null },
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"started_with\":{\"v\":1,\"from\":\"project\",\"permission_mode\":\"yolo\"}}", .kept = null },
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"started_with\":{\"v\":1,\"from\":\"home\"}}", .kept = null },
+        // A repeated key, in the block or in a field fx does not read, is data
+        // that does not parse: the child loads, and its block is not believed.
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"started_with\":{\"v\":1,\"from\":\"home\",\"from\":\"home\"}}", .kept = null },
+        .{ .spawn = "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"extra\":1,\"extra\":2,\"started_with\":{\"v\":1,\"from\":\"home\"}}", .kept = null },
+    };
+    for (cases) |case| {
+        const entry: session_adapter.Child = .{
+            .id = try arena.dupe(u8, "1786460757753-0001"),
+            .work_id = try arena.dupe(u8, "work"),
+            .open = false,
+            .outcome = .ok,
+            .spawn_data = try arena.dupe(u8, case.spawn),
+            .finish_data = null,
+            .seq = 1,
+        };
+        var child = try childFromFolded(alloc, entry);
+        defer child.deinit(alloc);
+        if (case.kept) |expected| {
+            try std.testing.expect(started_with_mod.eql(expected, child.started_with.?));
+        } else try std.testing.expect(child.started_with == null);
+    }
+
+    // A repeated key in a field fx reads fails the child's load, as it did
+    // before blocks, so the fallback to the profile's name does not cover it.
+    const repeated: session_adapter.Child = .{
+        .id = try arena.dupe(u8, "1786460757753-0002"),
+        .work_id = try arena.dupe(u8, "work"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = try arena.dupe(u8, "{\"agent\":\"r\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":\"r\",\"profile\":\"r\"}"),
+        .finish_data = null,
+        .seq = 1,
+    };
+    try std.testing.expectError(error.InvalidState, childFromFolded(alloc, repeated));
+
+    // A block over its budget is left out of the line, not cut.
+    var long: [40][]const u8 = undefined;
+    for (&long, 0..) |*slot, index| slot.* = try arena.print("{s}{d}", .{ text_utils.repeat("t", 90), index });
+    const too_big = try spawnData(arena, "reviewer", &fingerprint, "reviewer", .final, .parent, null, .{ .source = .home, .tools = &long });
+    try std.testing.expect(std.mem.find(u8, too_big, started_with_mod.key) == null);
+    try std.testing.expect(too_big.len < 400);
+}
+
+test "a v2 child keeps what its profile set after a reopen, on each of its spawn lines" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const seed: session_adapter.Seed = .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    };
+    const parent = try session_adapter.Session.create(alloc, &store, "/w", .ask, seed);
+    var parent_open = true;
+    defer if (parent_open) parent.close();
+    try parent.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("delegate") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const parent_id = try alloc.dupe(u8, parent.id());
+    defer alloc.free(parent_id);
+    const started: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .yolo, .tools = &.{"read_file"} };
+    const saved_id = "1786460757753-new";
+    const named_id = "1786460757753-old";
+    {
+        var children = V2Children.init(alloc, parent, "/w");
+        defer children.deinit();
+        const state_store = Store{ .children = &children, .parent_id = parent_id };
+        var lock = state_store.acquireLock();
+        defer lock.release();
+        var registry = try state_store.load(alloc);
+        defer registry.deinit(alloc);
+        var first = try testWork(alloc, "work-1", 0x11);
+        defer first.deinit(alloc);
+        try registry.appendPersistent(alloc, saved_id, "reviewer", "", first);
+        // A block belongs to a profile that is named, and is set once.
+        try std.testing.expectError(error.InvalidState, registry.setStartedWith(alloc, saved_id, started));
+        try registry.setProfile(alloc, saved_id, "reviewer");
+        try registry.setStartedWith(alloc, saved_id, started);
+        try std.testing.expectError(error.InvalidState, registry.setStartedWith(alloc, saved_id, started));
+        // A child that saved only its profile's name, as the build before this did.
+        var second = try testWork(alloc, "work-2", 0x22);
+        defer second.deinit(alloc);
+        try registry.appendPersistent(alloc, named_id, "older", "", second);
+        try registry.setProfile(alloc, named_id, "older");
+        var copy = try registry.children[0].clone(alloc);
+        defer copy.deinit(alloc);
+        try std.testing.expect(started_with_mod.eql(started, copy.started_with.?));
+        try state_store.save(alloc, registry);
+        try registry.finish(alloc, saved_id, "work-1", .completed, null);
+        try registry.finish(alloc, named_id, "work-2", .completed, null);
+        try state_store.save(alloc, registry);
+    }
+    parent.close();
+    parent_open = false;
+
+    // Reopened, and then given more work, which writes each child's spawn
+    // line again: the block is on that line too.
+    for (0..2) |round| {
+        const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = parent_id }, "/w", .ask);
+        defer reopened.close();
+        var children = V2Children.init(alloc, reopened, "/w");
+        defer children.deinit();
+        const state_store = Store{ .children = &children, .parent_id = parent_id };
+        var lock = state_store.acquireLock();
+        defer lock.release();
+        var registry = try state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), registry.children.len);
+        const kept = registry.findById(saved_id).?;
+        try std.testing.expectEqualStrings("reviewer", kept.profile.?);
+        try std.testing.expect(started_with_mod.eql(started, kept.started_with.?));
+        const named = registry.findById(named_id).?;
+        try std.testing.expectEqualStrings("older", named.profile.?);
+        try std.testing.expect(named.started_with == null);
+        if (round == 1) break;
+        var more = try testWork(alloc, "work-3", 0x33);
+        defer more.deinit(alloc);
+        _ = try registry.startPersistentWork(alloc, "reviewer", null, more);
+        var more_named = try testWork(alloc, "work-4", 0x44);
+        defer more_named.deinit(alloc);
+        _ = try registry.startPersistentWork(alloc, "older", null, more_named);
+        try state_store.save(alloc, registry);
+        try registry.finish(alloc, saved_id, "work-3", .completed, null);
+        try registry.finish(alloc, named_id, "work-4", .completed, null);
+        try state_store.save(alloc, registry);
+    }
+}
+
+test "a fork's copy of a child carries what its profile set, byte for byte (D97)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const started: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .auto, .tools = &.{"read_file"} };
+    const fingerprint = std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower);
+    const spawn = try spawnData(arena, "helper", &fingerprint, "reviewer", .final, .parent, null, started);
+    const entry: session_adapter.Child = .{
+        .id = @constCast("kid"),
+        .work_id = @constCast("w1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = @constCast(spawn),
+        .finish_data = null,
+        .seq = 9,
+    };
+    const copy = try forkCopy(arena, entry);
+    try std.testing.expectEqualStrings(spawn, copy.spawn_data.?);
+    const folded: session_adapter.Child = .{ .id = @constCast(copy.id), .work_id = @constCast(copy.work_id), .open = false, .outcome = copy.outcome, .spawn_data = @constCast(copy.spawn_data.?), .finish_data = @constCast(copy.finish_data.?), .seq = 1 };
+    var child = try childFromFolded(std.testing.allocator, folded);
+    defer child.deinit(std.testing.allocator);
+    try std.testing.expect(started_with_mod.eql(started, child.started_with.?));
 }
 
 test "a v2 child keeps the profile it started in after a reopen" {

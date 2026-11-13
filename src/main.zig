@@ -5464,6 +5464,7 @@ test {
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/profiles/profiles.zig");
+    _ = @import("core/profiles/started_with.zig");
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
