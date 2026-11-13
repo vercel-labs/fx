@@ -2584,7 +2584,9 @@ const Date = struct {
 };
 
 fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]const u8 {
-    const cwd = currentWorkingDirectory(arena) catch "(unavailable)";
+    // The shell and the tools start in the workspace root, which an ACP session
+    // can set apart from the directory the process runs in.
+    const cwd = if (workspace_root.len > 0) workspace_root else currentWorkingDirectory(arena) catch "(unavailable)";
     const os_text = try host.operatingSystemText(arena);
     const date_text = try todayUtcText(arena);
     const shell = shellPath(arena) orelse "(unknown)";
@@ -3240,6 +3242,25 @@ test "turn context keeps branch metadata inside its field" {
     );
     try expectNotContains(fragment, "\ninjected_branch: yes");
     try expectNotContains(fragment, "\u{2028}unicode_branch: yes");
+}
+
+test "turn context names the workspace root as the current directory, not the process's" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try writeTestFile(tmp.dir, "workspace/note.txt", "x\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const process_directory = try currentWorkingDirectory(arena);
+    try std.testing.expect(!std.mem.eql(u8, workspace, process_directory));
+
+    const fragment = try buildTurnContextFragment(arena, workspace);
+    try expectContains(fragment, try arena.print("workspace_root: {s}\ncurrent_directory: {s}\n", .{ workspace, workspace }));
+    try expectNotContains(fragment, try arena.print("current_directory: {s}\n", .{process_directory}));
 }
 
 test "turn context emits bounded github repo identity without raw remote url" {
