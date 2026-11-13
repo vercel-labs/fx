@@ -91,6 +91,28 @@ function allReports(raw: string): Record<string, unknown>[] {
   }
   return out;
 }
+
+/// Waits until a root session's log holds a committed turn. The store and a
+/// log appear only with a session's first write, and a log fx is still
+/// writing can end in part of a line, so only whole lines count.
+async function waitForRootTurnCommitted(home: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const logs: string[] = [];
+    try {
+      for (const id of savedSessionIds(home)) logs.push(readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8"));
+    } catch {
+      // A session is still being created; look again.
+    }
+    for (const log of logs) {
+      const records = log.split("\n").slice(0, -1).map((line) => JSON.parse(line));
+      if (records[0]?.role !== "child" && records.some((record) => record.kind === "turn_committed")) return;
+    }
+    await Bun.sleep(20);
+  }
+  throw new Error("no root session committed a turn");
+}
+
 const DEFAULT_MODEL = "spacexai/grok-4.7";
 /** What fx says when it cannot connect to the model catalog and drops fast
  * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
@@ -9792,8 +9814,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
     let phase = 0;
-    const gateway = startDynamicFakeGateway((body) => {
-      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_SEED_DONE");
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // A report that arrives while the parent's first turn runs joins that
+        // turn, so the worker answers only once that turn is saved.
+        await waitForRootTurnCommitted(root.home);
+        return fakeGatewayFinalText("CHILD_SEED_DONE");
+      }
       if (phase === 0) {
         // The worker's report starts the seed run's second turn.
         if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_SEED_SENTINEL");
