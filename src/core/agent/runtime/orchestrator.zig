@@ -1003,6 +1003,7 @@ fn project_subagent_request_messages(
             if (try normalized_subagent_request_arguments(
                 alloc,
                 call.arguments_json,
+                false,
             )) |arguments| {
                 alloc.free(arguments);
                 needs_projection = true;
@@ -1084,6 +1085,7 @@ fn project_subagent_request_messages(
                     const arguments = (try normalized_subagent_request_arguments(
                         alloc,
                         call.arguments_json,
+                        false,
                     )) orelse try alloc.dupe(u8, call.arguments_json);
                     var copied = call;
                     copied.arguments_json = arguments;
@@ -1383,10 +1385,13 @@ fn managed_subagent_action(action: []const u8) ?[]const u8 {
 /// Returns the top-level arguments of an exact {"request":...} subagent call
 /// whose action is run or message, or null to keep the call as it was sent.
 /// The wrapper is read as `tool_args.unwrapRequest` reads it: an object, or
-/// JSON text of one within the depth limit.
+/// JSON text of one within the depth limit. Decode reads an object wrapper
+/// of any action but never a text one, so with `any_text_action` a text
+/// wrapper is unwrapped whatever it asks for, and decode judges the fields.
 fn normalized_subagent_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
+    any_text_action: bool,
 ) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1394,10 +1399,12 @@ fn normalized_subagent_request_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    if (parsed.value.object.get("request") == null) return null;
+    const wrapper = parsed.value.object.get("request") orelse return null;
     const request = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse return null;
-    const action = request.get("action") orelse return null;
-    if (action != .string or managed_subagent_action(action.string) == null) return null;
+    if (!(any_text_action and wrapper == .string)) {
+        const action = request.get("action") orelse return null;
+        if (action != .string or managed_subagent_action(action.string) == null) return null;
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1529,6 +1536,7 @@ fn normalize_subagent_request_tool_calls(
         const arguments_json = try normalized_subagent_request_arguments(
             alloc,
             call.arguments_json,
+            true,
         ) orelse continue;
         if (normalized == null) {
             normalized = alloc.dupe(ToolCall, source) catch |err| {
@@ -1563,10 +1571,13 @@ test "subagent intake unwraps an exact request wrapper" {
         // A wrapper the model wrote as JSON text is read like an object.
         .{ .id = "text-message", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"review\\\"}\"}" },
         .{ .id = "text-run", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":\\\"wrapped\\\"}\"}" },
+        // Decode never reads a text wrapper, so intake unwraps one whatever
+        // it asks for.
+        .{ .id = "text-wait", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}" },
+        .{ .id = "text-no-action", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"agent\\\":\\\"reviewer\\\"}\"}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
         .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
         .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"a\"},\"task\":\"b\"}" },
-        .{ .id = "text-wait", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}" },
         .{ .id = "text-array", .name = "subagent", .arguments_json = "{\"request\":\"[1]\"}" },
         .{ .id = "text-deep", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":" ++ text_utils.repeat("[", 70) ++ text_utils.repeat("]", 70) ++ "}\"}" },
     };
@@ -1586,10 +1597,12 @@ test "subagent intake unwraps an exact request wrapper" {
     try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[2].arguments_json);
     try std.testing.expectEqualStrings(normalized[1].arguments_json, normalized[3].arguments_json);
     try std.testing.expectEqualStrings(normalized[2].arguments_json, normalized[4].arguments_json);
-    // Anything but an exact wrapper around a known action, including text
-    // nested past the depth limit, reaches the decoder as sent, which names
-    // what is wrong with it.
-    for (calls[5..], normalized[5..]) |call, result| {
+    try std.testing.expectEqualStrings("{\"action\":\"wait\"}", normalized[5].arguments_json);
+    try std.testing.expectEqualStrings("{\"agent\":\"reviewer\"}", normalized[6].arguments_json);
+    // Anything else, an object wrapper of another action, a wrapper beside
+    // another field, and text that is no object or nests past the depth
+    // limit, reaches the decoder as sent, which names what is wrong with it.
+    for (calls[7..], normalized[7..]) |call, result| {
         try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
     }
     const ineligible = try normalize_subagent_request_tool_calls(
@@ -2219,16 +2232,20 @@ fn fuzzRequestWrapperText(_: void, smith: *std.testing.Smith) !void {
     defer if (shell) |json| alloc.free(json);
     try std.testing.expectEqual(expected == null, shell == null);
 
-    // Subagent intake and replay unwrap the same wrappers, of a run or a
-    // message, to the same arguments.
-    const subagent = try normalized_subagent_request_arguments(alloc, args_json);
-    defer if (subagent) |json| alloc.free(json);
+    // Subagent replay unwraps the same wrappers of a run or a message, and
+    // subagent intake every one, to the same arguments.
+    const replayed_subagent = try normalized_subagent_request_arguments(alloc, args_json, false);
+    defer if (replayed_subagent) |json| alloc.free(json);
     const managed = if (wrapped) |object| blk: {
         const action = object.get("action") orelse break :blk false;
         break :blk action == .string and managed_subagent_action(action.string) != null;
     } else false;
-    try std.testing.expectEqual(managed, subagent != null);
-    if (subagent) |json| try std.testing.expectEqualStrings(expected.?, json);
+    try std.testing.expectEqual(managed, replayed_subagent != null);
+    if (replayed_subagent) |json| try std.testing.expectEqualStrings(expected.?, json);
+    const subagent_intake = try normalized_subagent_request_arguments(alloc, args_json, true);
+    defer if (subagent_intake) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, subagent_intake == null);
+    if (subagent_intake) |json| try std.testing.expectEqualStrings(expected.?, json);
 }
 
 test "request wrappers sent as JSON text unwrap as tool_args reads them" {

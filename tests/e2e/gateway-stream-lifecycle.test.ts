@@ -7947,15 +7947,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const tracePath = join(root.root, "trace.log");
     const childBodies: string[] = [];
     let sentBody = "";
+    let statusBody = "";
     const gateway = startDynamicFakeGateway((body) => {
       if (!body.includes('"name":"subagent"')) {
         childBodies.push(body);
         return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
       }
       if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
+      if (body.includes("text-status")) {
+        statusBody = body;
+        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+      }
       if (body.includes("text-delegate")) {
         sentBody = body;
-        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+        // Every other action as JSON text is read too.
+        return fakeGatewayToolCall("text-status", "subagent", { request: JSON.stringify({ action: "status" }) });
       }
       return fakeGatewayToolCall("text-delegate", "subagent", {
         request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
@@ -7974,6 +7980,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         Array.isArray(message.content) ? message.content : []
       ) as Array<Record<string, unknown>>).find((part) => part.type === "tool-call" && part.toolCallId === "text-delegate");
       expect(call?.input).toEqual({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" });
+      const status = toolResultOutput(statusBody, "text-status");
+      expect(status).not.toContain("request must be an object");
+      expect(status).toContain("worker");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
