@@ -228,13 +228,13 @@ function terminalRecord(home: string, sessionId: string): Record<string, unknown
   return record;
 }
 
-/** The shell pid in a terminal record, or null before its launcher reports it. */
 /** The shell pid a record holds, or null while its terminal is still starting. */
 function pidOf(record: Record<string, unknown>): number | null {
   const pid = Number(record.pid);
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
+/** The shell pid in a terminal record, or null before its launcher reports it. */
 function recordedPid(home: string, sessionId: string): number | null {
   return pidOf(terminalRecord(home, sessionId));
 }
