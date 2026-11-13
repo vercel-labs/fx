@@ -2232,7 +2232,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 37) {
+            if (@typeInfo(Self).@"struct".field_names.len != 38) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
