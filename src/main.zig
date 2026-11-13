@@ -5907,12 +5907,12 @@ fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []
     const armed: ?*app_agents_runtime.ChildAgent = if (app.instances.agents_menu.close_armed) |listed| listed.agent else null;
     if (armed == expected) return;
     const alloc = std.testing.allocator;
-    const want = try std.fmt.allocPrint(alloc, "after {s}: a close is armed for {s}", .{
+    const want = try alloc.print("after {s}: a close is armed for {s}", .{
         step,
         if (expected) |child| child.displayName() else "nothing",
     });
     defer alloc.free(want);
-    const got = try std.fmt.allocPrint(alloc, "after {s}: a close is armed for {s}", .{
+    const got = try alloc.print("after {s}: a close is armed for {s}", .{
         step,
         if (armed) |child| child.displayName() else "nothing",
     });
@@ -5924,7 +5924,7 @@ fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []
 test "a run of Backspace presses that edited the agent list's search never arms a close, held or not, in any encoding, and another key ends the run" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
+    defer sink.close(std.testing.io);
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
@@ -6012,7 +6012,7 @@ test "a run of Backspace presses that edited the agent list's search never arms 
 test "a run of forward Delete presses that edited the agent list's search never arms a close either, and Delete after a Backspace run arms as on any list" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
+    defer sink.close(std.testing.io);
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
