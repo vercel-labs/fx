@@ -63,6 +63,13 @@ pub const AccessScope = struct {
         return .{ .primary_directory = primary_directory, .additional_directories = &.{} };
     }
 
+    /// The folder a tool runs against when its call names none, such as the
+    /// shell tool without `cwd`: the scope's primary directory, or
+    /// `workspace_root` when the caller has no scope.
+    pub fn primaryDirectoryOf(scope: ?AccessScope, workspace_root: []const u8) []const u8 {
+        return (scope orelse primaryOnly(workspace_root)).primary_directory;
+    }
+
     pub fn additionalRootForPath(self: AccessScope, absolute_path: []const u8) ?[]const u8 {
         for (self.additional_directories) |entry| {
             if (entry.active and pathing.pathInside(entry.path, absolute_path)) return entry.path;

@@ -261,7 +261,16 @@ pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS
 /// fx login session is refreshed first.
 pub const LoadMode = enum { stored, refresh_if_needed };
 
-const FxLoginRefreshMode = enum { if_needed, force };
+/// When `refreshFxLoginCredentialLocked` rotates the saved fx login.
+const FxLoginRefreshMode = union(enum) {
+    /// Only when the saved login is past its refresh deadline.
+    if_needed,
+    /// Whatever the saved login holds.
+    force,
+    /// The gateway rejected this access token: as `oauth.rejectedLoginRotates`
+    /// decides.
+    replace_rejected: []const u8,
+};
 
 pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
@@ -762,25 +771,41 @@ pub fn loadStoredSource(alloc: std.mem.Allocator, source: Source) !?Credential {
     };
 }
 
+/// Refreshes the saved fx login after the gateway rejected `rejected_token`.
+/// The login rotates only while it still holds that token or is past its
+/// refresh deadline; when another fx already replaced it, the saved login is
+/// returned as it is. Null rotates it whatever it holds.
 pub fn refreshFxLoginCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
 ) !?Credential {
-    return refreshFxLoginCredentialLocked(alloc, transport, .force);
+    const mode: FxLoginRefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return refreshFxLoginCredentialLocked(alloc, transport, mode);
 }
 
+/// Refreshes the saved Codex login after OpenAI rejected `rejected_token`,
+/// as `refreshFxLoginCredential` does for the fx login. Null rotates it
+/// whatever it holds.
 pub fn refreshChatGptCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
 ) !?Credential {
-    return loadChatGptCredential(alloc, transport, .force);
+    const mode: chatgpt_oauth.RefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return loadChatGptCredential(alloc, transport, mode);
 }
 
+/// Refreshes the saved Grok login after xAI rejected `rejected_token`, as
+/// `refreshFxLoginCredential` does for the fx login. Null rotates it
+/// whatever it holds.
 pub fn refreshGrokCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
 ) !?Credential {
-    return loadGrokCredential(alloc, transport, .force);
+    const mode: grok_oauth.RefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return loadGrokCredential(alloc, transport, mode);
 }
 
 fn refreshFxLoginCredentialLocked(
@@ -796,11 +821,23 @@ fn refreshFxLoginCredentialLocked(
     defer session.deinit(alloc);
 
     var refreshed_at_ms: ?i64 = null;
-    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+    if (fxLoginNeedsRotation(mode, session.access_token, session.expired(io_mod.milliTimestamp()))) {
         try refreshFxSession(alloc, transport, &mutation, &session);
         refreshed_at_ms = io_mod.milliTimestamp();
+    } else if (mode == .replace_rejected) {
+        debug_trace.logf("auth", "fx login refresh skipped reason=saved_login_replaced", .{});
     }
     return takeCredentialFromSession(&session, refreshed_at_ms);
+}
+
+/// Whether a refresh in `mode` rotates the saved login, which holds
+/// `saved_access_token` and is `saved_expired` when past its refresh deadline.
+fn fxLoginNeedsRotation(mode: FxLoginRefreshMode, saved_access_token: []const u8, saved_expired: bool) bool {
+    return switch (mode) {
+        .if_needed => saved_expired,
+        .force => true,
+        .replace_rejected => |rejected| oauth.rejectedLoginRotates(saved_access_token, rejected, saved_expired),
+    };
 }
 
 pub fn refreshFxSession(
@@ -828,12 +865,12 @@ pub fn refreshFxSession(
     ) catch |err| {
         if (err == error.InvalidOAuthResponse) {
             debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
-            try retire_fx_session(alloc, mutation);
+            try retire_fx_session(alloc, mutation, session);
             return error.NoRefreshToken;
         }
         if (refresh_rejection_requires_sign_in(err)) {
             debug_trace.logf("auth", "retiring terminal fx login session reason={s}", .{@errorName(err)});
-            try retire_fx_session(alloc, mutation);
+            try retire_fx_session(alloc, mutation, session);
         }
         return err;
     };
@@ -841,7 +878,7 @@ pub fn refreshFxSession(
 
     const rotated_refresh_token = refreshed.refresh_token orelse {
         debug_trace.logf("auth", "retiring fx login session reason=NoRefreshToken", .{});
-        try retire_fx_session(alloc, mutation);
+        try retire_fx_session(alloc, mutation, session);
         return error.NoRefreshToken;
     };
     const expires_at_ms = oauth.expiryTimestampMs(
@@ -849,7 +886,7 @@ pub fn refreshFxSession(
         refreshed.expires_in,
     ) catch |err| {
         debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
-        try retire_fx_session(alloc, mutation);
+        try retire_fx_session(alloc, mutation, session);
         return error.NoRefreshToken;
     };
 
@@ -866,7 +903,7 @@ pub fn refreshFxSession(
     };
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
-        retire_fx_session(alloc, mutation) catch |cleanup_err| {
+        retire_fx_session(alloc, mutation, session) catch |cleanup_err| {
             debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.OAuthSessionCleanupUncertain;
@@ -905,9 +942,35 @@ fn refresh_rejection_requires_sign_in(err: anyerror) bool {
 fn retire_fx_session(
     alloc: std.mem.Allocator,
     mutation: *oauth_session.Mutation,
+    session: *const oauth_session.Session,
 ) !void {
+    keepRetiredTeam(alloc, mutation, session);
     const result = mutation.delete(alloc) catch return error.OAuthSessionCleanupUncertain;
     if (result.local_cleanup_failed) return error.OAuthSessionCleanupUncertain;
+}
+
+/// A later sign-in, in this fx process or another, starts on the retired
+/// login's team; a login without one leaves no older team behind. A failure
+/// only changes which team that sign-in starts on, so it is traced, not
+/// returned.
+fn keepRetiredTeam(
+    alloc: std.mem.Allocator,
+    mutation: *oauth_session.Mutation,
+    session: *const oauth_session.Session,
+) void {
+    if (oauth_session.hasKeepableTeam(session.team_id, session.team_slug)) {
+        mutation.keepTeam(alloc, session.team_id, session.team_slug) catch |err| {
+            debug_trace.logf("auth", "retired fx login team not kept err={s}", .{@errorName(err)});
+            return;
+        };
+        debug_trace.logf("auth", "retired fx login team kept", .{});
+        return;
+    }
+    const forgotten = mutation.forgetTeam() catch |err| {
+        debug_trace.logf("auth", "kept team not forgotten reason=retired_login_has_no_team err={s}", .{@errorName(err)});
+        return;
+    };
+    if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=retired_login_has_no_team", .{});
 }
 
 fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?i64) Credential {
@@ -1481,41 +1544,8 @@ test "a failed fx-login refresh is still reported when nothing else resolves" {
 /// the issuer rejects, which is what an expired or revoked login looks like on
 /// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
 const ExpiredFxLoginFixture = struct {
-    alloc: std.mem.Allocator,
-    tmp: std.testing.TmpDir,
-    env: *CredentialTestEnv,
-    home: []u8,
-
-    fn install(alloc: std.mem.Allocator) !ExpiredFxLoginFixture {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
-        errdefer alloc.free(home);
-
-        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "auth.json" });
-        defer alloc.free(auth_path);
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
-            .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
-        });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(
-            io_mod.getIo(),
-            "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\"," ++
-                "\"access_token\":\"access\",\"refresh_token\":\"rejected-refresh\"," ++
-                "\"expires_at_ms\":1,\"scope\":\"openid offline_access\"," ++
-                "\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}",
-        );
-
-        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
-        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home };
-    }
-
-    fn deinit(self: *ExpiredFxLoginFixture) void {
-        self.env.deinit();
-        self.alloc.free(self.home);
-        self.tmp.cleanup();
+    fn install(alloc: std.mem.Allocator) !SavedLoginFixture {
+        return savedFxLogin(alloc, "access", "rejected-refresh", 1);
     }
 };
 
@@ -1587,6 +1617,306 @@ test "the stored fx login is read as saved, without a refresh" {
     }
 }
 
+/// A HOME holding one saved login file, as another fx would have left it:
+/// `login` written as JSON to `~/.fx/<file_name>`.
+const SavedLoginFixture = struct {
+    alloc: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    env: *CredentialTestEnv,
+    home: []u8,
+    auth_path: []u8,
+
+    fn install(alloc: std.mem.Allocator, file_name: []const u8, login: anytype) !SavedLoginFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+        errdefer alloc.free(home);
+        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", file_name });
+        errdefer alloc.free(auth_path);
+
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        try std.json.Stringify.value(login, .{}, &body.writer);
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), body.written());
+
+        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home, .auth_path = auth_path };
+    }
+
+    fn readSaved(self: *const SavedLoginFixture) ![]u8 {
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.auth_path, .{});
+        defer file.close(io_mod.getIo());
+        return io_mod.readFileToEnd(self.alloc, &file, 64 * 1024);
+    }
+
+    fn deinit(self: *SavedLoginFixture) void {
+        self.env.deinit();
+        self.alloc.free(self.auth_path);
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+};
+
+/// An fx login whose saved tokens and expiry the test chooses.
+fn savedFxLogin(alloc: std.mem.Allocator, access_token: []const u8, refresh_token: []const u8, expires_at_ms: i64) !SavedLoginFixture {
+    return SavedLoginFixture.install(alloc, profile_paths.auth_file_name, .{
+        .version = 1,
+        .issuer = "https://vercel.com",
+        .client_id = "client",
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at_ms = expires_at_ms,
+        .scope = "openid offline_access",
+        .token_type = "Bearer",
+        .team_slug = "team-slug",
+        .team_id = "team-id",
+    });
+}
+
+const rotated_fx_login_body = "{\"access_token\":\"rotated-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}";
+
+/// Forces a refresh of the fixture's login after the gateway rejected
+/// `rejected`, and checks that it rotated exactly when `rotates`: the issuer
+/// was asked and the new token returned and saved, or else the saved login
+/// was returned untouched.
+fn expectReplaceRejected(fixture: *const SavedLoginFixture, saved: []const u8, rejected: []const u8, rotates: bool) !void {
+    const alloc = fixture.alloc;
+    const before = try fixture.readSaved();
+    defer alloc.free(before);
+    var refresh = FxLoginRefreshProbe{ .token_disposition = .accepted, .token_body = rotated_fx_login_body };
+    var credential = (try refreshFxLoginCredential(alloc, refresh.provider(), rejected)) orelse return error.TestUnexpectedResult;
+    defer credential.deinit(alloc);
+    const after = try fixture.readSaved();
+    defer alloc.free(after);
+    if (rotates) {
+        try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+        try std.testing.expectEqualStrings("rotated-access", credential.token);
+        try std.testing.expect(std.mem.find(u8, after, "rotated-access") != null);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), refresh.calls);
+        try std.testing.expectEqualStrings(saved, credential.token);
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+const hour_ms: i64 = 60 * 60 * 1000;
+
+test "a forced fx login refresh after a 401 uses the login another fx saved" {
+    var fixture = try savedFxLogin(std.testing.allocator, "saved-by-another-fx", "saved-refresh", io_mod.milliTimestamp() + hour_ms);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, "saved-by-another-fx", "rejected-access", false);
+}
+
+test "a forced fx login refresh after a 401 rotates the saved login that holds the rejected token" {
+    var fixture = try savedFxLogin(std.testing.allocator, "rejected-access", "saved-refresh", io_mod.milliTimestamp() + hour_ms);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, "rejected-access", "rejected-access", true);
+}
+
+test "a forced fx login refresh after a 401 rotates a replaced login past its refresh deadline" {
+    // The refresh deadline is a minute before expiry (oauth_session expiry_skew_ms).
+    var fixture = try savedFxLogin(std.testing.allocator, "saved-by-another-fx", "saved-refresh", io_mod.milliTimestamp() + 30 * 1000);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, "saved-by-another-fx", "rejected-access", true);
+}
+
+/// A token from a two-letter alphabet, so that equal tokens, prefixes, and
+/// tokens one byte longer come up often.
+fn fuzzLoginToken(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    const len: usize = smith.valueRangeAtMost(u8, 1, @intCast(buf.len));
+    for (buf[0..len]) |*byte| byte.* = if (smith.value(bool)) 'a' else 'b';
+    return buf[0..len];
+}
+
+/// A saved login and the token its provider rejected, drawn for the
+/// replace-rejected fuzz targets. Its tokens point into its own buffers, so it
+/// is drawn in place and never copied.
+const FuzzRejectedLogin = struct {
+    saved_buf: [8]u8 = undefined,
+    rejected_buf: [9]u8 = undefined,
+    saved: []const u8 = "",
+    rejected: []const u8 = "",
+    expires_at_ms: i64 = 0,
+    expired: bool = false,
+
+    fn draw(self: *FuzzRejectedLogin, smith: *std.testing.Smith) void {
+        self.saved = fuzzLoginToken(smith, &self.saved_buf);
+        self.rejected = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => self.saved,
+            1 => self.saved[0..smith.valueRangeAtMost(u8, 0, @intCast(self.saved.len - 1))],
+            2 => blk: {
+                @memcpy(self.rejected_buf[0..self.saved.len], self.saved);
+                self.rejected_buf[self.saved.len] = if (smith.value(bool)) 'a' else 'b';
+                break :blk self.rejected_buf[0 .. self.saved.len + 1];
+            },
+            else => fuzzLoginToken(smith, &self.rejected_buf),
+        };
+        // Clear of the refresh deadline a minute before expiry, on either
+        // side, so the milliseconds the refresh itself takes can't move it.
+        self.expired = smith.value(bool);
+        const offset_ms: i64 = if (self.expired)
+            smith.valueRangeAtMost(i64, -hour_ms, 59 * 1000)
+        else
+            smith.valueRangeAtMost(i64, 61 * 1000, hour_ms);
+        self.expires_at_ms = io_mod.milliTimestamp() + offset_ms;
+    }
+
+    /// Whether a forced refresh after the 401 must rotate the saved login.
+    fn rotates(self: *const FuzzRejectedLogin) bool {
+        return self.expired or std.mem.eql(u8, self.saved, self.rejected);
+    }
+};
+
+fn fuzzFxLoginReplaceRejected(_: void, smith: *std.testing.Smith) !void {
+    var drawn: FuzzRejectedLogin = .{};
+    drawn.draw(smith);
+    var fixture = try savedFxLogin(std.testing.allocator, drawn.saved, "saved-refresh", drawn.expires_at_ms);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, drawn.saved, drawn.rejected, drawn.rotates());
+}
+
+test "a forced fx login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines" {
+    try std.testing.fuzz({}, fuzzFxLoginReplaceRejected, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            "abababababababababababab",
+        }) ++ @import("fuzz_corpus").fx_login_replace_rejected.*),
+    });
+}
+
+const Subscription = enum { codex, grok };
+
+/// A Codex or Grok subscription login whose saved access token and expiry the
+/// test chooses.
+fn savedSubscriptionLogin(alloc: std.mem.Allocator, which: Subscription, access_token: []const u8, expires_at_ms: i64) !SavedLoginFixture {
+    const file_name = switch (which) {
+        .codex => profile_paths.chatgpt_auth_file_name,
+        .grok => profile_paths.grok_auth_file_name,
+    };
+    return SavedLoginFixture.install(alloc, file_name, .{
+        .version = 1,
+        .access_token = access_token,
+        .refresh_token = "saved-refresh",
+        .expires_at_ms = expires_at_ms,
+        .account_id = "acct_fixture",
+    });
+}
+
+/// The Codex token the probe hands out: a JWT whose claim names acct_fixture.
+const rotated_codex_access = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9maXh0dXJlIn19.rotated";
+const rotated_grok_access = "grok-rotated";
+
+/// Answers a Codex or Grok refresh with a rotated login for acct_fixture, and
+/// Grok's userinfo with that account.
+const SubscriptionRefreshProbe = struct {
+    which: Subscription,
+    token_calls: usize = 0,
+
+    fn provider(self: *SubscriptionRefreshProbe) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn rotatedAccess(which: Subscription) []const u8 {
+        return switch (which) {
+            .codex => rotated_codex_access,
+            .grok => rotated_grok_access,
+        };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: std.mem.Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *SubscriptionRefreshProbe = @ptrCast(@alignCast(raw.?));
+        const body = switch (request.method) {
+            .get => try alloc.dupe(u8, "{\"sub\":\"acct_fixture\"}"),
+            .post_form, .post_json => blk: {
+                self.token_calls += 1;
+                break :blk try alloc.print(
+                    "{{\"access_token\":\"{s}\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600}}",
+                    .{rotatedAccess(self.which)},
+                );
+            },
+        };
+        return .{ .disposition = .accepted, .body = body };
+    }
+};
+
+/// Forces a refresh of the fixture's subscription login after the provider
+/// rejected `rejected`, and checks that it rotated exactly when `rotates`.
+fn expectSubscriptionReplaceRejected(fixture: *const SavedLoginFixture, which: Subscription, saved: []const u8, rejected: []const u8, rotates: bool) !void {
+    const alloc = fixture.alloc;
+    const before = try fixture.readSaved();
+    defer alloc.free(before);
+    var refresh = SubscriptionRefreshProbe{ .which = which };
+    var credential = (switch (which) {
+        .codex => try refreshChatGptCredential(alloc, refresh.provider(), rejected),
+        .grok => try refreshGrokCredential(alloc, refresh.provider(), rejected),
+    }) orelse return error.TestUnexpectedResult;
+    defer credential.deinit(alloc);
+    const after = try fixture.readSaved();
+    defer alloc.free(after);
+    if (rotates) {
+        try std.testing.expectEqual(@as(usize, 1), refresh.token_calls);
+        try std.testing.expectEqualStrings(SubscriptionRefreshProbe.rotatedAccess(which), credential.token);
+        try std.testing.expect(std.mem.find(u8, after, "rotated-refresh") != null);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), refresh.token_calls);
+        try std.testing.expectEqualStrings(saved, credential.token);
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+test "a forced Codex or Grok refresh after a 401 uses the login another fx saved" {
+    for ([_]Subscription{ .codex, .grok }) |which| {
+        var fixture = try savedSubscriptionLogin(std.testing.allocator, which, "saved-by-another-fx", io_mod.milliTimestamp() + hour_ms);
+        defer fixture.deinit();
+        try expectSubscriptionReplaceRejected(&fixture, which, "saved-by-another-fx", "rejected-access", false);
+    }
+}
+
+test "a forced Codex or Grok refresh after a 401 rotates the saved login that holds the rejected token" {
+    for ([_]Subscription{ .codex, .grok }) |which| {
+        var fixture = try savedSubscriptionLogin(std.testing.allocator, which, "rejected-access", io_mod.milliTimestamp() + hour_ms);
+        defer fixture.deinit();
+        try expectSubscriptionReplaceRejected(&fixture, which, "rejected-access", "rejected-access", true);
+    }
+}
+
+test "a forced Codex or Grok refresh after a 401 rotates a replaced login past its refresh deadline" {
+    // The refresh deadline is a minute before expiry (subscription_session expiry_skew_ms).
+    for ([_]Subscription{ .codex, .grok }) |which| {
+        var fixture = try savedSubscriptionLogin(std.testing.allocator, which, "saved-by-another-fx", io_mod.milliTimestamp() + 30 * 1000);
+        defer fixture.deinit();
+        try expectSubscriptionReplaceRejected(&fixture, which, "saved-by-another-fx", "rejected-access", true);
+    }
+}
+
+fn fuzzSubscriptionReplaceRejected(_: void, smith: *std.testing.Smith) !void {
+    const which: Subscription = if (smith.value(bool)) .codex else .grok;
+    var drawn: FuzzRejectedLogin = .{};
+    drawn.draw(smith);
+    var fixture = try savedSubscriptionLogin(std.testing.allocator, which, drawn.saved, drawn.expires_at_ms);
+    defer fixture.deinit();
+    try expectSubscriptionReplaceRejected(&fixture, which, drawn.saved, drawn.rejected, drawn.rotates());
+}
+
+test "a forced Codex or Grok refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines" {
+    try std.testing.fuzz({}, fuzzSubscriptionReplaceRejected, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            "abababababababababababab",
+        }) ++ @import("fuzz_corpus").subscription_replace_rejected.*),
+    });
+}
+
 test "an invalid fx login refresh retires the rejected session" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
@@ -1598,7 +1928,7 @@ test "an invalid fx login refresh retires the rejected session" {
 
     try std.testing.expectError(
         error.InvalidGrant,
-        refreshFxLoginCredential(alloc, refresh.provider()),
+        refreshFxLoginCredential(alloc, refresh.provider(), null),
     );
     try std.testing.expectEqual(@as(usize, 2), refresh.calls);
 
@@ -1616,7 +1946,7 @@ test "an fx login refresh without a rotated refresh token retires the session" {
         .token_body = "{\"access_token\":\"new-access\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
     };
 
-    if (refreshFxLoginCredential(alloc, refresh.provider())) |maybe_credential| {
+    if (refreshFxLoginCredential(alloc, refresh.provider(), null)) |maybe_credential| {
         if (maybe_credential) |credential_value| {
             var credential = credential_value;
             credential.deinit(alloc);
@@ -1643,7 +1973,7 @@ test "a malformed successful fx login refresh retires the session" {
 
     try std.testing.expectError(
         error.NoRefreshToken,
-        refreshFxLoginCredential(alloc, refresh.provider()),
+        refreshFxLoginCredential(alloc, refresh.provider(), null),
     );
     try std.testing.expectEqual(@as(usize, 2), refresh.calls);
 
@@ -1656,17 +1986,15 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
-    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
-    defer alloc.free(auth_path);
     var refresh = FxLoginRefreshProbe{
         .token_disposition = .accepted,
         .token_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
-        .auth_path_to_make_read_only = auth_path,
+        .auth_path_to_make_read_only = fixture.auth_path,
     };
 
     try std.testing.expectError(
         error.OAuthSessionCleanupUncertain,
-        refreshFxLoginCredential(alloc, refresh.provider()),
+        refreshFxLoginCredential(alloc, refresh.provider(), null),
     );
     try std.testing.expectEqual(@as(usize, 2), refresh.calls);
 
@@ -1694,4 +2022,46 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+/// Answers an fx login refresh. A cancel arrives while the token request is
+/// on the wire, and a request that carries the cancelled flag is cut off, as
+/// the real transport does.
+const CancelDuringFxLoginRefresh = struct {
+    cancel: *std.atomic.Value(bool),
+
+    fn provider(self: *CancelDuringFxLoginRefresh) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: std.mem.Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *CancelDuringFxLoginRefresh = @ptrCast(@alignCast(raw.?));
+        if (request.method == .get) return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}"),
+        };
+        self.cancel.store(true, .seq_cst);
+        if (request.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"access_token\":\"renewed-access\",\"refresh_token\":\"renewed-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}"),
+        };
+    }
+};
+
+test "a cancel while an fx login refresh is on the wire never cuts it off, and the new login is saved" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var issuer: CancelDuringFxLoginRefresh = .{ .cancel = &cancel };
+    var cancellable: oauth_transport.Cancellable = .{ .inner = issuer.provider(), .cancel_flag = &cancel };
+
+    var credential = (try refreshFxLoginCredential(alloc, cancellable.provider(), null)).?;
+    defer credential.deinit(alloc);
+    try std.testing.expect(cancel.load(.seq_cst));
+    try std.testing.expectEqualStrings("renewed-access", credential.token);
+    var persisted = (try oauth_session.load(alloc)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-refresh", persisted.refresh_token);
 }

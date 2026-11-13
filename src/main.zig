@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "0.0.16";
+pub const version = "0.0.17";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -975,7 +975,11 @@ const App = struct {
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
-        self.auth.stopProviderPreparation();
+        // Exit never waits, not even for a sign-in refresh, which is never cut
+        // off: a preparation or prompt refresh still running ends with the
+        // process.
+        self.auth.leaveProviderPreparationForExit();
+        self.auth.leavePromptRefreshesForExit();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);
@@ -1002,7 +1006,7 @@ const App = struct {
         };
         // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
-        self.credits_lookup.deinit();
+        self.credits_lookup.leaveForExit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Quitting from a subagent's screen resumes its instance.
@@ -4060,7 +4064,7 @@ fn rawEnvValue(raw_env: RawEnviron, comptime key: []const u8) ?[]const u8 {
 }
 
 fn topLevelHelpColumns(raw_env: RawEnviron) usize {
-    if (stdoutTerminalColumns()) |columns| return columns;
+    if (terminal_env.stdoutColumns()) |columns| return columns;
     if (rawEnvValue(raw_env, "COLUMNS")) |value| {
         if (parseColumnCount(value)) |columns| return columns;
     }
@@ -4075,26 +4079,11 @@ fn topLevelHelpColumns(raw_env: RawEnviron) usize {
 fn topLevelHelpStyle(raw_env: RawEnviron) command_specs.HelpStyle {
     const no_color = terminal_env.noColorValue(rawEnvValue(raw_env, "NO_COLOR"));
     const dumb_terminal = terminal_env.dumbTerminalValue(rawEnvValue(raw_env, "TERM"));
-    return topLevelHelpStyleForValues(stdoutIsTerminal(), no_color, dumb_terminal);
+    return topLevelHelpStyleForValues(terminal_env.stdoutIsTerminal(), no_color, dumb_terminal);
 }
 
 fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: bool) command_specs.HelpStyle {
     return if (is_terminal and !no_color and !dumb_terminal) .ansi else .plain;
-}
-
-fn stdoutIsTerminal() bool {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
-    return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
-}
-
-fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
-
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws);
-    if (rc == -1 or ws.col == 0) return null;
-    return @intCast(ws.col);
 }
 
 fn parseColumnCount(value: []const u8) ?usize {
@@ -5361,7 +5350,7 @@ test {
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
-    _ = @import("gateway/json_depth.zig");
+    _ = @import("core/shared/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("acp/server.zig");
@@ -5382,7 +5371,9 @@ test {
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
+    _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
     _ = @import("core/workspace/auto_review_metrics.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
@@ -5465,6 +5456,7 @@ test {
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
@@ -5507,6 +5499,7 @@ test {
     _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
+    _ = @import("core/output/session_list_text.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
@@ -5736,6 +5729,42 @@ test "visiting a child agent puts its context, transcript, and pacer on the scre
     try std.testing.expect(child.screen.pacer.hasPending());
 }
 
+test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    // Main's resume handed its flow to the commit anchor, and the next frame
+    // has not repainted it yet.
+    app.shell.resume_handoff_repaint_pending = true;
+
+    // A hidden agent's work swaps main's transcript out only until it
+    // returns, so main's rows are still on screen.
+    const Body = struct {
+        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
+            try std.testing.expect(!a.shell.resume_handoff_repaint_pending);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, {}, Body.run);
+    try std.testing.expect(app.shell.resume_handoff_repaint_pending);
+
+    // Showing the subagent takes main's rows off the screen. Main comes back
+    // before the checks, so a failed check never leaves the subagent on
+    // screen for the cleanup.
+    try App.AgentsAppRuntime.show(&app, child);
+    const shown = app.agent_on_screen;
+    const held_off_screen = app.main_screen.transcript.resume_handoff_repaint_pending;
+    try App.AgentsAppRuntime.show(&app, null);
+    try std.testing.expect(shown == child);
+    try std.testing.expect(!held_off_screen);
+    try std.testing.expect(!app.shell.resume_handoff_repaint_pending);
+}
+
 test "the tick visits only the child agents with work waiting" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
@@ -5889,6 +5918,138 @@ test "a search edit that makes the agent list show another agent keeps the curso
     try std.testing.expectEqualStrings("second", edit.input.items);
     try std.testing.expectEqual(@as(usize, 3), edit.cursor);
     try std.testing.expectEqual(@as(?usize, 1), edit.selection_anchor);
+}
+
+test "the agent list holds a subagent among the working ones until its finished turn is applied" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const reviewer = try addTestChildAgent(&app, "reviewer");
+    const tester = try addTestChildAgent(&app, "tester");
+    defer reviewer.agent.session.agent.history.deinit(alloc);
+    defer tester.agent.session.agent.history.deinit(alloc);
+    defer {
+        var left = tester.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+        left.deinit(alloc);
+    }
+    const user: types.UserTurn = .{ .text = @constCast("task") };
+    // The reviewer replied earlier, and its reply is in its history.
+    try reviewer.agent.session.agent.history.append(alloc, .{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("reviewed"),
+        .execution = .{ .turn_summary = .{ .completed_at_ms = 100 } },
+    } });
+    // The tester's worker has finished its turn, but the loop has not applied
+    // the finish yet, so its history holds no reply.
+    try tester.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    try std.testing.expect(!tester.agent.worker.isProcessing());
+
+    var order: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
+    defer order.deinit(alloc);
+    try runtime.switchList(&app, &order);
+    try std.testing.expectEqual(@as(usize, 3), order.items.len);
+    // It stays above the reviewer, as it will once its reply is in the
+    // history, instead of dropping below it for the frames in between.
+    try std.testing.expectEqualStrings("tester", order.items[1].?.id);
+    try std.testing.expectEqualStrings("reviewer", order.items[2].?.id);
+    try runtime.openMenu(&app);
+    const pending = runtime.menuProjection(&app);
+    try std.testing.expectEqualStrings("working", pending.rows[1].state);
+
+    // The loop applies the finish: its reply is in the history, and the list
+    // keeps the same order.
+    var events = tester.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try tester.agent.session.agent.history.append(alloc, .{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("tested"),
+        .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } },
+    } });
+    order.clearRetainingCapacity();
+    try runtime.switchList(&app, &order);
+    try std.testing.expectEqualStrings("tester", order.items[1].?.id);
+    try std.testing.expectEqualStrings("reviewer", order.items[2].?.id);
+    const applied = runtime.menuProjection(&app);
+    try std.testing.expectEqualStrings("idle", applied.rows[1].state);
+}
+
+/// What main's "waiting on N subagents" row counts, with `children` owned by
+/// main. The host is only compared, never read, so it is set for this call
+/// alone: the list reads a host it is given.
+fn waitCountOwnedByMain(app: *App, children: []const *app_agents_runtime.ChildAgent) usize {
+    var owner_host: subagent_tool_host.Runtime = undefined;
+    app.main_agent.session_persistence.subagent_host = &owner_host;
+    for (children) |child| child.parent_host = &owner_host;
+    defer {
+        app.main_agent.session_persistence.subagent_host = null;
+        for (children) |child| child.parent_host = null;
+    }
+    return App.AgentsAppRuntime.subagentWaitCount(app);
+}
+
+/// The state the agent list shows for the row named `name`. The list puts an
+/// agent that waits for the user first, so a row's place does not name it.
+fn menuRowState(projection: anytype, name: []const u8) ![]const u8 {
+    for (projection.rows) |row| if (std.mem.eql(u8, row.name, name)) return row.state;
+    return error.RowNotListed;
+}
+
+test "an idle agent's waiting row counts a subagent until its finished turn is applied" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const finishing = try addTestChildAgent(&app, "finishing");
+    const asking = try addTestChildAgent(&app, "asking");
+    const children = [_]*app_agents_runtime.ChildAgent{ finishing, asking };
+    defer finishing.agent.session.agent.history.deinit(alloc);
+    defer asking.agent.session.agent.history.deinit(alloc);
+    defer {
+        var left = finishing.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+        left.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
+
+    // The finishing subagent's worker has ended its turn, but the loop has not
+    // applied the finish yet. The list shows it working, so main's row counts
+    // it too.
+    try finishing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
+    try std.testing.expect(!finishing.agent.worker.isProcessing());
+    try runtime.openMenu(&app);
+    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(&app), "finishing"));
+    try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
+
+    // Once the loop has applied the finish, nothing is left to wait for.
+    var events = finishing.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try std.testing.expectEqualStrings("idle", try menuRowState(runtime.menuProjection(&app), "finishing"));
+    try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
+
+    // A subagent that waits for the user's approval is still one main waits on,
+    // though the list shows it as needing approval.
+    asking.agent.worker.worker_processing = true;
+    defer asking.agent.worker.worker_processing = false;
+    app.approval_lender = asking;
+    defer app.approval_lender = null;
+    try std.testing.expectEqualStrings("needs approval", try menuRowState(runtime.menuProjection(&app), "asking"));
+    try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 }
 
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {

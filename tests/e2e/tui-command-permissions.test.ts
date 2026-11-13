@@ -16,7 +16,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
@@ -1772,6 +1772,24 @@ describe("effect-aware command permissions", () => {
         expect.arrayContaining(["edit_file tool_failed", "shell command_failed"]),
       );
       expect(calls.filter((call) => call.outcome === "runtime_failed")).toEqual([]);
+      // Every call carries the provider's call ID.
+      const ids = calls.map((call) => `${call.name} ${call.outcome} ${String(call.call_id)}`);
+      expect(ids).toEqual(expect.arrayContaining([
+        "shell succeeded trace_child_command",
+        "subagent succeeded trace_child",
+        "shell command_failed trace_command_failed",
+        "edit_file tool_failed trace_edit_failed",
+      ]));
+      for (const call of calls.filter((call) => call.outcome !== "succeeded")) expect(call.failure_kept).toBe(true);
+      expect(failedCalls.map((call) => (call as { call_id?: string }).call_id)).toEqual(
+        expect.arrayContaining(["trace_command_failed", "trace_edit_failed"]),
+      );
+      // Both failures are also kept whole in their own records.
+      expect(report.one("tool_calls")).toMatchObject({ failed_retained: 2, failed_complete: true });
+      expect(report.all("failed_tool_call").map((call) => `${call.name} ${call.outcome} ${String(call.call_id)}`)).toEqual([
+        "edit_file tool_failed trace_edit_failed",
+        "shell command_failed trace_command_failed",
+      ]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -1780,6 +1798,398 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
     },
     TIMEOUT,
+  );
+
+  // Main messages two named subagents. cards runs a shell command that fails;
+  // ship answers, or, with `shipFails`, its model request gets HTTP 400 and
+  // ship waits for the user.
+  async function traceTwoSubagents(shipFails: boolean) {
+    const root = createIsolatedRoot();
+    const stderrPath = join(root.root, "stderr.log");
+    writeFileSync(stderrPath, "");
+    installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+    const rootPrompt = "Run the subagent trace fixture.";
+    const cardsTask = "cards task: check the card title";
+    const shipTask = "ship task: pin the avatar";
+    const reported = new Set<string>();
+    const gateway = startDynamicFakeGateway(async (body) => {
+      // A subagent never carries main's prompt.
+      if (!body.includes(rootPrompt)) {
+        if (body.includes(cardsTask)) {
+          if (!body.includes('"toolCallId":"cards_shell"')) return toolCall("echo cards-start; exit 3", {}, "cards_shell");
+          return finalText("cards done");
+        }
+        if (body.includes(shipTask)) {
+          if (shipFails) {
+            return new Response(JSON.stringify({ error: { message: "ship request rejected" } }), {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          return finalText("ship done");
+        }
+        return finalText("unexpected request");
+      }
+      // A failed ship tells main that its request waits; that message stays
+      // in main's history, so only the report itself names who reported.
+      const current = currentUserText(body);
+      if (current.startsWith("Subagent report")) {
+        for (const name of ["cards", "ship"]) {
+          if (current.includes(`"agent":"${name}"`)) reported.add(name);
+        }
+        return finalText(`report noted ${reported.size}`);
+      }
+      if (!body.includes('"toolCallId":"msg_cards"')) {
+        return gatewayToolCall("subagent", { request: { action: "message", agent: "cards", message: cardsTask } }, "msg_cards");
+      }
+      if (!body.includes('"toolCallId":"msg_ship"')) {
+        return gatewayToolCall("subagent", { request: { action: "message", agent: "ship", message: shipTask } }, "msg_ship");
+      }
+      return finalText("dispatched both");
+    });
+
+    activeSession = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: root.workspace,
+      env: gatewayEnv(root, gateway, {
+        PATH: hostilePath(root),
+        TMPDIR: root.root,
+        FX_PERMISSION_MODE: "yolo",
+        FX_TRACE: "0",
+        FX_TRACE_LOG: undefined,
+        FX_TRACE_STDERR: "0",
+      }),
+      stderrPath,
+      width: 120,
+      height: 40,
+    });
+    await activeSession.waitForComposer(TIMEOUT);
+    await activeSession.sendText(rootPrompt);
+    if (shipFails) {
+      await activeSession.waitForText("report noted 1", TIMEOUT * 2);
+      await activeSession.waitForText("ship needs you", TIMEOUT);
+    } else {
+      await activeSession.waitForText("report noted 2", TIMEOUT * 2);
+    }
+    await activeSession.waitForComposer(TIMEOUT);
+
+    await activeSession.sendText("/trace");
+    await activeSession.waitForText(
+      process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+      TIMEOUT,
+    );
+    const report = readTraceReport(latestTraceReportPath(root.root));
+    const summary = report.one("subagents");
+    expect(summary.open).toBe(2);
+    expect(summary.turns_total).toBeGreaterThanOrEqual(Number(summary.turns_retained));
+    // Both are open, so no closed session is listed.
+    const listed = report.all("subagent");
+    expect(listed.map((record) => record.name).sort()).toEqual(["cards", "ship"]);
+    const entry = (name: string) => listed.find((record) => record.name === name)!;
+    const turnsOf = (sessionId: unknown) => report.all("subagent_turn").filter((turn) => turn.session_id === sessionId);
+    const cards = entry("cards");
+    const ship = entry("ship");
+    expect(cards).toMatchObject({ open: true, task: cardsTask, last_outcome: "completed", tool_calls: { retained: 1, not_succeeded: 1 } });
+    expect(ship).toMatchObject({ open: true, task: shipTask });
+    expect(cards.state).toMatch(/^(idle|finished)$/);
+    expect(cards.profile).toEqual(expect.any(String));
+    expect(cards.activity).toEqual(expect.any(String));
+
+    // The number on cards' failed command is one of cards' turns.
+    // Not toMatchObject with expect.any: Bun writes the matcher into the
+    // record it checks.
+    const failedCall = report.all("tool_call").find((call) => call.name === "shell" && call.outcome === "command_failed");
+    expect(failedCall?.source).toBe("subagent");
+    const failedId = failedCall?.subagent_id;
+    expect(typeof failedId).toBe("number");
+    expect(turnsOf(cards.session_id).find((turn) => turn.subagent_id === failedId))
+      .toMatchObject({ source: "subagent", outcome: "completed", model: MODEL });
+    // Each subagent model request names exactly one listed turn.
+    const turnIds = report.all("subagent_turn").map((turn) => turn.subagent_id);
+    for (const call of report.all("network_call").filter((call) => call.source === "subagent")) {
+      expect(turnIds.filter((id) => id === call.subagent_id)).toHaveLength(1);
+    }
+
+    // Each session ID is that subagent's own session folder.
+    for (const subagent of [cards, ship]) {
+      expect(existsSync(join(storeRoot(root.home), String(subagent.session_id), "log.jsonl"))).toBe(true);
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    await activeSession.sendText("/quit");
+    expect(await activeSession.waitForSessionEnd()).toBe(true);
+    await activeSession.kill();
+    activeSession = null;
+    return { report, ship, shipTurns: turnsOf(ship.session_id) };
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace names each subagent, its task, its state, and its turns",
+    async () => {
+      const { ship, shipTurns } = await traceTwoSubagents(false);
+      expect(ship.state).toMatch(/^(idle|finished)$/);
+      expect(ship.last_outcome).toBe("completed");
+      expect(shipTurns.some((turn) => turn.outcome === "completed")).toBe(true);
+    },
+    TIMEOUT * 4,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace shows a subagent whose model request failed",
+    async () => {
+      const { report, ship, shipTurns } = await traceTwoSubagents(true);
+      // Its request failed and waits for the user, as the agent list says.
+      expect(ship).toMatchObject({ state: "needs_you", activity: "running", last_outcome: "none" });
+      expect(ship.status).toMatch(/\S/);
+      const running = shipTurns.filter((turn) => turn.outcome === "running");
+      expect(running).toHaveLength(1);
+      // The refused request carries the number of ship's running turn.
+      const refused = report.all("network_call").filter((call) => call.status === 400);
+      expect(refused.length).toBeGreaterThan(0);
+      for (const call of refused) expect(call).toMatchObject({ source: "subagent", subagent_id: running[0]!.subagent_id });
+    },
+    TIMEOUT * 4,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace says a session started no subagents",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const gateway = startDynamicFakeGateway(async () => finalText("nothing to delegate"));
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say hello.");
+      await activeSession.waitForText("nothing to delegate", TIMEOUT);
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      expect(report.one("subagents")).toMatchObject({ open: 0, turns_retained: 0, turns_total: 0 });
+      expect(report.all("subagent")).toEqual([]);
+      expect(report.all("subagent_turn")).toEqual([]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a failed call whole after later calls fill the window",
+    async () => {
+      const configuredShell = userInfo().shell ?? "";
+      if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The user's startup files replace `ls`, as eza users' do.
+      const startup = "alias ls='fx-eza-fixture --icons'\n";
+      writeFileSync(join(root.home, ".zshrc"), startup);
+      writeFileSync(join(root.home, ".bash_profile"), startup);
+      // Longer than the window's 1200-byte argument cut, with its marker at
+      // the end; its output is longer than the 2000-byte result cut.
+      const failing = `ls -d missing-dir; : ${"p".repeat(1500)}; i=0; ` +
+        `while [ $i -lt 120 ]; do echo "output line $i ${"y".repeat(40)}"; i=$((i+1)); done; ` +
+        "echo OUTPUT_TAIL_MARKER; exit 2 # COMMAND_TAIL_MARKER";
+      const successes = 70;
+      const rootPrompt = "Run the window fill fixture.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_failed_first"')) {
+          return toolCall(failing, {}, "trace_failed_first");
+        }
+        // Two more failures that name `ls` but never run the alias: a clean
+        // profile skips the startup files, and an interact call to a session
+        // that does not exist runs no command.
+        if (!body.includes('"toolCallId":"trace_failed_clean"')) {
+          return toolCall("ls -d missing-clean-dir .", { profile: "clean" }, "trace_failed_clean");
+        }
+        if (!body.includes('"toolCallId":"trace_failed_interact"')) {
+          return gatewayToolCall("shell", {
+            request: { action: "interact", session_id: "missing", chars: "ls -d missing-dir; exit 3\n" },
+          }, "trace_failed_interact");
+        }
+        const done = [...body.matchAll(/"toolCallId":"trace_ok_(\d+)"/g)].map((match) => Number(match[1]));
+        const next = done.length === 0 ? 0 : Math.max(...done) + 1;
+        if (next < successes) return toolCall("true", {}, `trace_ok_${next}`);
+        return finalText("window filled");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("window filled", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readTraceReport(latestTraceReportPath(root.root));
+
+      // The window has moved past the failed calls.
+      const failedIds = ["trace_failed_first", "trace_failed_clean", "trace_failed_interact"];
+      expect(report.one("tool_calls")).toMatchObject({
+        retained: 64,
+        session: { calls: successes + failedIds.length },
+        complete: false,
+        failed_retained: failedIds.length,
+        failed_complete: true,
+      });
+      const window = report.all("tool_call");
+      for (const id of failedIds) expect(window.map((call) => call.call_id)).not.toContain(id);
+      expect(window[window.length - 1]).toMatchObject({
+        name: "shell",
+        outcome: "succeeded",
+        source: "parent",
+        call_id: "trace_ok_69",
+      });
+
+      // The failed call is kept whole: its call ID, folder, whole command,
+      // and the end of its output, past the window's 1200 and 2000 bytes.
+      const kept = report.all("failed_tool_call");
+      expect(kept.map((call) => call.call_id)).toEqual(failedIds);
+      const failed = kept[0]!;
+      expect(failed).toMatchObject({
+        name: "shell",
+        outcome: "command_failed",
+        source: "parent",
+        call_id: "trace_failed_first",
+        dir: root.workspace,
+        redefined: [{ name: "ls", kind: "alias", alias_of: "fx-eza-fixture" }],
+      });
+      expect(failed.duration_ms).toEqual(expect.any(Number));
+      expect(failed.args_bytes as number).toBeGreaterThan(1200);
+      expect(String(failed.args)).toContain("COMMAND_TAIL_MARKER");
+      expect(failed.result_bytes as number).toBeGreaterThan(2000);
+      expect(`${String(failed.result)}${String(failed.result_tail ?? "")}`).toContain("OUTPUT_TAIL_MARKER");
+      // Only the run that read the startup files names their alias.
+      expect(kept[1]).toMatchObject({ outcome: "command_failed", call_id: "trace_failed_clean" });
+      expect(kept[2]).toMatchObject({ outcome: "tool_failed", call_id: "trace_failed_interact" });
+      for (const call of kept.slice(1)) {
+        expect(String(call.args)).toContain("ls -d missing");
+        expect(call.redefined).toBeUndefined();
+      }
+
+      const problems = report.problems("tool_call").map((problem) => problem.call as { call_id?: string });
+      expect(problems.map((call) => call.call_id)).toContain("trace_failed_first");
+
+      // The call ID finds the call in the session log.
+      const log = readFileSync(join(storeRoot(root.home), onlySessionId(root.home), "log.jsonl"), "utf8");
+      const records = log.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      expect(records.some((record) => record.type === "tool_call" && record.data?.call_id === "trace_failed_first"))
+        .toBe(true);
+
+      const shell = report.one("shell");
+      expect(shell).toMatchObject({ login_shell: configuredShell, start: "snapshot_replay", snapshot: { state: "ready" } });
+      expect(shell.redefined).toContainEqual({ name: "ls", kind: "alias", alias_of: "fx-eza-fixture" });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace says why the shell snapshot capture failed",
+    async () => {
+      const configuredShell = userInfo().shell ?? "";
+      if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The startup files end the shell before the capture can report.
+      writeFileSync(join(root.home, ".zshrc"), "exit 0\n");
+      writeFileSync(join(root.home, ".bash_profile"), "exit 0\n");
+      const rootPrompt = "Run the snapshot probe.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"snapshot_probe"')) return toolCall("echo probe", {}, "snapshot_probe");
+        return finalText("probe done");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("probe done", TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const shell = readTraceReport(latestTraceReportPath(root.root)).one("shell");
+      expect(shell).toMatchObject({
+        login_shell: configuredShell,
+        start: "full_startup",
+        snapshot: { state: "failed", failure: "the login shell exited before reporting its state" },
+      });
+      expect(String(shell.start_command).startsWith(configuredShell)).toBe(true);
+      // Without a snapshot, which commands are redefined is unknown.
+      expect(shell.redefined).toBeUndefined();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -1857,6 +2267,102 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
     },
     TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a failed network call and catalog load after later calls fill the window",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const failPrompt = "Trigger the kept network failure.";
+      const fillPrompt = "Fill the network call window.";
+      // More successful model calls than the 32-call window holds.
+      const fills = 40;
+      let catalogFetches = 0;
+      const gateway = startDynamicFakeGateway(async (body) => {
+        // The fill turn's history holds the failed prompt too, so it is checked first.
+        if (body.includes(fillPrompt)) {
+          const done = [...body.matchAll(/"toolCallId":"window_ok_(\d+)"/g)].map((match) => Number(match[1]));
+          const next = done.length === 0 ? 0 : Math.max(...done) + 1;
+          if (next < fills) return toolCall("true", {}, `window_ok_${next}`);
+          return finalText("network window filled");
+        }
+        if (body.includes(failPrompt)) {
+          return Response.json({ error: { message: "Synthetic upstream rejection" } }, { status: 400 });
+        }
+        return finalText("unexpected request");
+      }, {
+        // The first catalog load fails; the retry a prompt starts succeeds.
+        models: () => ++catalogFetches === 1
+          ? new Response("catalog unavailable", { status: 500 })
+          : [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateways.push(gateway);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(failPrompt);
+      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.sendText(fillPrompt);
+      await activeSession.waitForText("network window filled", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readTraceReport(latestTraceReportPath(root.root));
+
+      // The window has moved past the failed call, and the kept failures hold it.
+      const network = report.one("network");
+      expect(network.complete).toBe(false);
+      expect(network.retained).toBe(32);
+      expect((network.session as { errors?: number }).errors).toBe(1);
+      const windowCalls = report.all("network_call");
+      expect(windowCalls).toHaveLength(32);
+      expect(windowCalls.filter((call) => call.status === 400)).toEqual([]);
+      const networkFailures = report.all("failed_network_call");
+      expect(networkFailures).toHaveLength(1);
+      expect(network.kept_failures).toBe(1);
+      expect(networkFailures[0]).toMatchObject({
+        source: "parent",
+        status: 400,
+        gateway_error: "HTTP 400 · Synthetic upstream rejection",
+      });
+
+      const catalogFailures = report.all("failed_model_catalog_event");
+      expect(catalogFailures.length).toBeGreaterThan(0);
+      expect(report.one("model_catalog").kept_failures).toBe(catalogFailures.length);
+      const failedLoad = (record: { event?: unknown; detail?: unknown }) =>
+        record.event === "load" && String(record.detail).startsWith("outcome=failed ");
+      expect(catalogFailures.some((event) => event.failed === true && failedLoad(event))).toBe(true);
+
+      expect(report.problems("network_call").map((problem) => (problem.call as { status?: number }).status)).toContain(400);
+      expect(report.problems("model_catalog").some(failedLoad)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
   );
 
   test.skipIf(!tmuxAvailable())(

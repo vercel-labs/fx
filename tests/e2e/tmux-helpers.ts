@@ -31,6 +31,16 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
   "FX_HOME",
+  // A pane inherits the tmux server's environment, which a developer's shell
+  // may have filled: their terminal recording would start on every test's fx,
+  // and the bridge of the fx session that started the server would point
+  // `fx mcp call` at that session.
+  "FX_DEBUG_RECORD",
+  "FX_DEBUG_RECORD_SILENT_BANNER",
+  "FX_RECORD",
+  "FX_RECORD_INPUT",
+  "FX_MCP_CALL_SOCKET",
+  "FX_MCP_CALL_TOKEN",
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",

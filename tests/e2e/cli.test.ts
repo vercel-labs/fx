@@ -1308,9 +1308,8 @@ describe("cli: status", () => {
   }
 
   test("FX_HOME under a symlinked folder reads its own skills folder", async () => {
-    // macOS's $TMPDIR and /tmp are such folders. Before, fx read the profile's
-    // skills folder through the link but checked it against the resolved path,
-    // so doctor called it unreadable and its skills did not load.
+    // fx resolves a symlinked folder above FX_HOME, such as macOS's $TMPDIR,
+    // and reads the profile's skills folder at its real path.
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-link-")));
     try {
       const home = join(root, "home");
@@ -2552,6 +2551,8 @@ describe("cli: logout", () => {
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
+        // No retry could revoke it there, so nothing is kept.
+        expect(existsSync(join(home, ".fx", "auth-revocations.json"))).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
         ]);
@@ -2588,6 +2589,8 @@ describe("cli: logout", () => {
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
         expect(existsSync(authPath)).toBe(false);
+        // No retry could revoke it there, so nothing is kept.
+        expect(existsSync(join(home, ".fx", "auth-revocations.json"))).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
         ]);
@@ -2697,8 +2700,9 @@ describe("cli: logout", () => {
         const logout = await runFx(["logout"], { env });
         expect(logout.code).toBe(0);
         expect(logout.stdout).toBe("Signed out of fx.\n");
+        // The 500 may pass, so fx keeps the tokens to revoke them later.
         expect(logout.stderr).toBe(
-          "Warning: signed out locally, but the remote session could not be revoked.\n",
+          "Warning: signed out locally, but the remote session could not be revoked. fx will try again later.\n",
         );
         expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
         expect(issuer.requests).toEqual([
@@ -3324,7 +3328,7 @@ describe("cli: sessions", () => {
           turns: ["review the landing page"],
         });
 
-        // Updated times show in the local zone, fixed here at five and a half hours east of UTC.
+        // A session a week old shows the date it changed in the local zone, fixed here at five and a half hours east of UTC.
         const first = await runFx(["sessions"], {
           cwd: workspaceRoot,
           env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "IST-5:30" },
@@ -3332,15 +3336,11 @@ describe("cli: sessions", () => {
         });
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
-        expect(first.stdout).toContain(
-          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 05:30:00.003 IST",
-        );
-        expect(first.stdout).toContain(
-          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 05:30:00.002 IST",
-        );
-        expect(first.stdout).toContain(
-          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-15 03:43:20.123 IST",
-        );
+        expect(first.stdout).toMatch(/^TITLE +TURNS +UPDATED +SESSION ID$/m);
+        expect(first.stdout).toMatch(/^Investigate cache misses +2 +1970-01-01 +named-session$/m);
+        expect(first.stdout).toMatch(/^Untitled session +0 +1970-01-01 +unnamed-session$/m);
+        // 2023-11-14 22:13:20 UTC is already the 15th in that zone.
+        expect(first.stdout).toMatch(/^Review landing page +1 +2023-11-15 +script-only-session$/m);
         expect(first.stdout).not.toContain("updated_at_ms");
         expect(first.stdout).not.toContain("language=");
 
@@ -3370,9 +3370,7 @@ describe("cli: sessions", () => {
         });
         expect(renamed.code).toBe(0);
         expect(renamed.stderr).toBe("");
-        expect(renamed.stdout).toContain(
-          " - Investigate cache hits\n   id=named-session | 2 turns | English",
-        );
+        expect(renamed.stdout).toMatch(/^Investigate cache hits +2 +\S+ +named-session$/m);
         expect(renamed.stdout).not.toContain("Investigate cache misses");
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -3390,15 +3388,17 @@ describe("cli: sessions", () => {
         const workspace = join(root, "workspace");
         mkdirSync(workspace);
         const workspaceRoot = realpathSync(workspace);
-        // 2023-07-10 14:40:00 UTC, during daylight saving time.
+        // 2023-07-10 04:30 UTC, during daylight saving time: 00:30 EDT, but
+        // 23:30 the day before in EST.
         writeConversationSession(home, workspaceRoot, "summer-session", {
           title: "Summer session",
-          updatedAtMs: 1_689_000_000_000,
+          updatedAtMs: 1_688_963_400_000,
         });
-        // 2023-11-14 22:13:20.123 UTC, after daylight saving time ends.
+        // 2023-11-15 04:30 UTC, after daylight saving time ends: 23:30 EST
+        // the day before, but 00:30 in EDT.
         writeConversationSession(home, workspaceRoot, "winter-session", {
           title: "Winter session",
-          updatedAtMs: 1_700_000_000_123,
+          updatedAtMs: 1_700_022_600_000,
         });
 
         const listed = await runFx(["sessions"], {
@@ -3408,12 +3408,8 @@ describe("cli: sessions", () => {
         });
         expect(listed.code).toBe(0);
         expect(listed.stderr).toBe("");
-        expect(listed.stdout).toContain(
-          " - Summer session\n   id=summer-session | 0 turns | English | updated 2023-07-10 10:40:00.000 EDT",
-        );
-        expect(listed.stdout).toContain(
-          " - Winter session\n   id=winter-session | 0 turns | English | updated 2023-11-14 17:13:20.123 EST",
-        );
+        expect(listed.stdout).toMatch(/^Summer session +0 +2023-07-10 +summer-session$/m);
+        expect(listed.stdout).toMatch(/^Winter session +0 +2023-11-14 +winter-session$/m);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -4637,15 +4633,17 @@ describe("cli: credits", () => {
   );
 
   test(
-    "fx credits reports the team's Token Pass credit in text and JSON",
+    "fx credits reports the amount used and the team's Token Pass credit in text and JSON",
     async () => {
       const home = createIsolatedTestHome();
+      // AI Gateway names the amount spent `total_used`, which fx reports as used.
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         fetch: () =>
           Response.json({
             balance: "12.50",
+            total_used: "4.50",
             token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
           }),
       });
@@ -4661,13 +4659,16 @@ describe("cli: credits", () => {
         const json = await runFx(["credits", "--json"], { env });
         expect(json.code).toBe(0);
         expect(json.stderr).toBe("");
-        expect(JSON.parse(json.stdout.trim()).token_pass).toEqual({
+        const credits = JSON.parse(json.stdout.trim());
+        expect(credits.used).toBe("4.50");
+        expect(credits.token_pass).toEqual({
           remaining: "79.92906",
           resets_at: "2026-12-05T08:00:00.000Z",
         });
 
         const text = await runFx(["credits"], { env });
         expect(text.code).toBe(0);
+        expect(text.stdout).toContain("[credits] used=4.50\n");
         expect(text.stdout).toContain("[credits] token_pass_remaining=79.92906\n");
         expect(text.stdout).toContain("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n");
       } finally {

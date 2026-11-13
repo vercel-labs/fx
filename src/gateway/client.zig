@@ -17,7 +17,7 @@ const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
 const request_deadlines = @import("request_deadlines.zig");
-const json_depth = @import("json_depth.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
 const open_job = @import("open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -11845,7 +11845,9 @@ const UnpooledOpenFixture = struct {
         const zio = io_mod.getIo();
         var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
-        var stream = try self.server.accept(zio);
+        // A connection that is gone before the accept still arrived, and is
+        // no longer open.
+        var stream = (try testing_listener.acceptIfWaiting(&self.server, zio)) orelse return .closed;
         defer stream.close(zio);
         // The close fx already made can reach this end a moment after the
         // accept; a connection fx left open never reads end of stream.

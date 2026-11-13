@@ -808,11 +808,13 @@ pub fn resumeCheckpoint(
 }
 
 /// Forgets a response whose calls never reached the journal. After a
-/// response with calls, the progress saved marks their outcome uncertain, but
-/// only the calls' intent records them, and only a call that is safe to run
-/// twice starts before its intent is stored. With no intent after it, none of
-/// the response's calls with effects ran, so the model is asked again instead
-/// of being made to reconcile calls it cannot see. `running` is how many
+/// completed response with calls, the progress saved marks their outcome
+/// uncertain, but only the calls' intent records them, and only a call that
+/// is safe to run twice starts before its intent is stored. With no intent
+/// after it, none of the response's calls with effects ran, so the model is
+/// asked again instead of being made to reconcile calls it cannot see. A
+/// failed response whose calls are all local needs nothing here: fx never
+/// runs them, so its progress marks them unexecuted. `running` is how many
 /// calls the journal recorded and did not answer.
 fn forgetUnrecordedCalls(turn: *session_codec.RecoveryCheckpoint, running: usize) void {
     if (running > 0 or turn.tool_state != .uncertain) return;

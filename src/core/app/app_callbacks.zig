@@ -407,6 +407,7 @@ pub fn Bindings(comptime App: type) type {
             source: credentials.Source,
             mode: auth_runtime.CredentialRefreshMode,
             expected_account_id: ?[]const u8,
+            rejected_token: ?[]const u8,
         ) !?agent_runtime.RefreshedGatewayCredential {
             const agent: *AppAgent = @ptrCast(@alignCast(raw_ctx));
             const app = appOf(agent);
@@ -420,6 +421,7 @@ pub fn Bindings(comptime App: type) type {
                 source,
                 mode,
                 expected_account_id,
+                rejected_token,
             )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
@@ -1035,6 +1037,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 
@@ -1052,6 +1055,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .tool_failed,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 

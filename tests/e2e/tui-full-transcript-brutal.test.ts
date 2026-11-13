@@ -32,6 +32,9 @@ import { logLines, savedSessionIds, storeRoot } from "./saved-sessions";
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
 const BURST_NAVIGATION_EVENTS = 2_048;
+// Chat blocks leave a row or two between them; a scroll that outruns what a
+// frame writes leaves hundreds.
+const MAX_HISTORY_BLANK_ROWS = 12;
 const FULL_FOOTER = "esc close · pgup/pgdn scroll";
 const HISTORY_DONE = "CTRL_O_BRUTAL_HISTORY_DONE";
 const LIVE_START = "CTRL_O_BRUTAL_LIVE_0001";
@@ -131,6 +134,17 @@ function lastChatMarker(config: StressConfig): string {
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
+}
+
+/** The most consecutive empty rows in a pane capture. */
+function longestBlankRun(text: string): number {
+  let run = 0;
+  let longest = 0;
+  for (const line of text.split("\n")) {
+    run = line.trim() === "" ? run + 1 : 0;
+    longest = Math.max(longest, run);
+  }
+  return longest;
 }
 
 function committedAssistantOccurrences(home: string, assistant: string): number {
@@ -970,6 +984,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       compactToolMarker(totalTools - 1),
       TIMEOUT,
     );
+    expect(longestBlankRun(history)).toBeLessThanOrEqual(MAX_HISTORY_BLANK_ROWS);
     expect(countOccurrences(history, HISTORY_DONE)).toBe(1);
     expect(history).toContain(firstChatMarker(config));
     expect(history).toContain(lastChatMarker(config));
