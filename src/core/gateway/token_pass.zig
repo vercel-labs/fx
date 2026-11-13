@@ -4,8 +4,10 @@
 //! whatever credential the request uses. See
 //! https://vercel.com/docs/ai-gateway/token-pass.
 //!
-//! The model catalog does not mark the featured models, so fx keeps their
-//! list here. fx learns that a team has Token Pass when a response names
+//! AI Gateway's model catalog marks the featured models for a team that has
+//! Token Pass. fx keeps their list here for a catalog that marks none, and
+//! for the calls fx makes on its own, which choose a model without reading
+//! the catalog. fx learns that a team has Token Pass when a response names
 //! `token-pass` as the provider that served it, or when the credits endpoint
 //! reports the team's Token Pass credit. This file imports only the standard
 //! library.
@@ -29,7 +31,8 @@ pub const docs_url = "https://vercel.com/docs/ai-gateway/token-pass";
 /// reset date. Vercel fills in the signed-in team for `[team]`.
 pub const dashboard_url = "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Ftoken-pass";
 
-/// Whether Token Pass credit pays for `model` at standard speed.
+/// Whether fx's own list names `model` as one Token Pass credit pays for at
+/// standard speed. A loaded catalog answers through its entry's `token_pass`.
 pub fn isFeaturedModel(model: []const u8) bool {
     for (featured_models) |featured| {
         if (std.ascii.eqlIgnoreCase(model, featured)) return true;

@@ -2963,6 +2963,7 @@ fn parseSortedModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std
         };
     }
 
+    model_catalog.markBuiltInTokenPassModels(candidates.items);
     sort_utils.sort(ModelCatalogEntry, candidates.items, {}, model_catalog.compareModelCatalogEntries);
 
     return candidates;
@@ -3037,6 +3038,7 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
         .fast_variant_of = fast_variant_of,
+        .token_pass = if (entry.object.get("token_pass")) |value| value == .bool and value.bool else false,
     };
 }
 
@@ -3471,6 +3473,37 @@ test "gateway catalog keeps the base model a fast variant names through the pick
             try std.testing.expect(entry.fast_variant_of == null);
         }
     }
+}
+
+test "gateway catalog reads Token Pass models, and falls back to fx's own list when it marks none" {
+    const marked_json =
+        \\{"object":"list","data":[
+        \\  {"id":"zai/glm-5.3","type":"language"},
+        \\  {"id":"acme/new-pass-model","type":"language","token_pass":true},
+        \\  {"id":"acme/typed","type":"language","token_pass":"true"},
+        \\  {"id":"acme/off","type":"language","token_pass":false}
+        \\ ]}
+    ;
+    var marked = try parseModelCatalogForView(std.testing.allocator, marked_json, .picker);
+    defer freeModelCatalog(std.testing.allocator, &marked);
+    try std.testing.expectEqual(@as(usize, 4), marked.items.len);
+    try std.testing.expectEqualStrings("acme/new-pass-model", marked.items[0].id);
+    for (marked.items) |entry| {
+        try std.testing.expectEqual(std.mem.eql(u8, entry.id, "acme/new-pass-model"), entry.token_pass);
+    }
+
+    const unmarked_json =
+        \\{"object":"list","data":[
+        \\  {"id":"zai/glm-5.3","type":"language"},
+        \\  {"id":"acme/model","type":"language","token_pass":false}
+        \\ ]}
+    ;
+    var unmarked = try parseModelCatalogForView(std.testing.allocator, unmarked_json, .picker);
+    defer freeModelCatalog(std.testing.allocator, &unmarked);
+    try std.testing.expectEqual(@as(usize, 2), unmarked.items.len);
+    try std.testing.expectEqualStrings("zai/glm-5.3", unmarked.items[0].id);
+    try std.testing.expect(unmarked.items[0].token_pass);
+    try std.testing.expect(!unmarked.items[1].token_pass);
 }
 
 test "gateway catalog controls are explicit ordered and bounded" {

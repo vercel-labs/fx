@@ -3363,6 +3363,96 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "model picker takes Token Pass models from the catalog when it marks them",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const markedModel = "acme/new-pass-model";
+      // fx's own list names this model, but this team's catalog does not.
+      const unmarkedModel = "zai/glm-5.3";
+      const plainModel = "provider/plain-model";
+      const covers = "Token Pass covers this model: https://vercel.com/docs/ai-gateway/token-pass";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: markedModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+            token_pass: true,
+          },
+          {
+            id: unmarkedModel,
+            type: "language",
+            released: 300,
+            tags: ["tool-use"],
+            context_window: 200_000,
+          },
+          {
+            id: plainModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-token-pass-catalog-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: plainModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/model");
+      const menu = await waitForModelsMenu(session, 3);
+      const rowOf = (text: string) => menu.findIndex((line) => line.includes(text));
+      const tokenPassHeading = menu.findIndex((line) => /^\s*Token Pass\s+1\s*$/.test(line));
+      const allModelsHeading = menu.findIndex((line) => /^\s*All Models\s+2\s*$/.test(line));
+      expect(tokenPassHeading).toBeGreaterThan(-1);
+      expect(rowOf(markedModel)).toBe(tokenPassHeading + 1);
+      expect(allModelsHeading).toBeGreaterThan(rowOf(markedModel));
+      expect(rowOf(unmarkedModel)).toBeGreaterThan(allModelsHeading);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
+        5_000,
+      );
+
+      const coversCount = async () => (await session!.captureFullScrollback()).split(covers).length - 1;
+      await session.sendLiteralText(`/model ${markedModel}`);
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${markedModel}`, 5_000);
+      await session.waitForText(covers, 5_000);
+      expect(await coversCount()).toBe(1);
+
+      await session.sendLiteralText(`/model ${unmarkedModel}`);
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${unmarkedModel}`, 5_000);
+      await session.waitForComposer(5_000);
+      expect(await coversCount()).toBe(1);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "model picker keeps Token Pass models on Token Pass credit",
     async () => {
       const fixture = createModelsMenuFixture();

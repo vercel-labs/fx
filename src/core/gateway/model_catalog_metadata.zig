@@ -19,6 +19,7 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_web_search = entry.has_web_search,
         .supports_explicit_caching = entry.has_explicit_caching,
         .supports_implicit_caching = entry.has_implicit_caching,
+        .token_pass = entry.token_pass,
         .context_window = optionalPositiveU32(entry.context_window),
         .max_output_tokens = optionalPositiveU32(entry.max_tokens),
     };
@@ -42,6 +43,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
         .has_implicit_caching = true,
         .context_window = 256_000,
         .max_tokens = 32_000,
+        .token_pass = true,
     });
 
     try std.testing.expect(metadata.supports_reasoning);
@@ -53,6 +55,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
     try std.testing.expect(metadata.supports_web_search);
     try std.testing.expect(metadata.supports_explicit_caching);
     try std.testing.expect(metadata.supports_implicit_caching);
+    try std.testing.expect(metadata.token_pass);
     try std.testing.expectEqual(@as(?u32, 256_000), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), metadata.max_output_tokens);
 
