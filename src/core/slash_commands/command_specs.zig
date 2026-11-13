@@ -780,6 +780,9 @@ pub fn nthSlashCompletionCategory(registry: SlashRegistry, prefix: []const u8, n
 
 pub fn slashCompletionHasArgs(registry: SlashRegistry, command: []const u8) bool {
     if (allowlistCompletionHasArgs(command)) return true;
+    for (registry.argument_groups) |group| {
+        for (group) |entry| if (std.mem.eql(u8, entry.full, command)) return entry.has_args;
+    }
     if (std.mem.eql(u8, command, "/workspace add") or
         std.mem.eql(u8, command, "/workspace remove")) return true;
     for (registry.commands) |spec| {
@@ -2382,8 +2385,13 @@ test "app argument completions route each command to its own group" {
         .{ .full = "/launch main", .description = "gpt-5", .select_description = true },
         .{ .full = "/launch scout", .description = "haiku 4-5", .select_description = true },
     };
+    const loop = [_]mod_registry.ArgumentCompletion{
+        .{ .full = "/loop 1h", .description = "run a prompt now, then every hour", .has_args = true },
+        .{ .full = "/loop stop", .description = "end a loop, or all of them", .has_args = true },
+        .{ .full = "/loop stop 1", .description = "every 1h · say hi" },
+    };
     var registry: SlashRegistry = .{};
-    registry.argument_groups = .{ &mcp, &launch };
+    registry.argument_groups = .{ &mcp, &launch, &loop };
 
     try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/launch "));
     try std.testing.expectEqualStrings("main", nthSlashCompletionLabel(registry, "/launch ", 0).?);
@@ -2396,4 +2404,14 @@ test "app argument completions route each command to its own group" {
     try std.testing.expect(!nthSlashCompletionSelectsDescription(registry, "/mcp ", 0));
     // A command without a group, or without its space, completes nothing from the app.
     try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(registry, "/launchx "));
+
+    // The first word lists only one-word entries; a finished verb lists its names.
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/loop "));
+    try std.testing.expectEqualStrings("run a prompt now, then every hour", nthSlashCompletionDescription(registry, "/loop ", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/loop stop "));
+    try std.testing.expectEqualStrings("stop 1", nthSlashCompletionLabel(registry, "/loop stop ", 0).?);
+    // An entry that takes more input types a space and waits; a whole command does not.
+    try std.testing.expect(slashCompletionHasArgs(registry, "/loop 1h"));
+    try std.testing.expect(slashCompletionHasArgs(registry, "/loop stop"));
+    try std.testing.expect(!slashCompletionHasArgs(registry, "/loop stop 1"));
 }

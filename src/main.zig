@@ -464,7 +464,7 @@ const App = struct {
 
     pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
         var registry = builtin_commands.slash_registry;
-        registry.argument_groups = .{ self.mcp.host_completion, self.launch_completion.entries };
+        registry.argument_groups = .{ self.mcp.host_completion, self.launch_completion.entries, self.loop_completion.entries };
         return registry;
     }
 
@@ -624,6 +624,8 @@ const App = struct {
     mcp: app_mcp_runtime.State = .{},
     /// The profiles `/launch` completes.
     launch_completion: app_profile_runtime.LaunchCompletion = .{},
+    /// What `/loop` completes, from the loops of the agent on screen.
+    loop_completion: app_loop_runtime.LoopCompletion = .{},
     skills: skill_runtime.Runtime = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -1124,6 +1126,7 @@ const App = struct {
         self.mcp.deinit();
         shutdown_trace.mark("mcp_deinit");
         self.launch_completion.deinit();
+        self.loop_completion.deinit();
         self.skills.deinit(std.heap.c_allocator);
         main_agent.context_snapshot.deinit(self.alloc);
         self.main_agent.profile.deinit();
@@ -3300,6 +3303,9 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
         if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+        }
+        if (self.loop_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, &self.screenAgent().loops)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);

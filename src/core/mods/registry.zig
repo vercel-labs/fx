@@ -27,10 +27,13 @@ pub const ArgumentCompletion = struct {
     /// Selected, the whole row is drawn selected, its description included,
     /// as the agent list draws its rows. Otherwise the description stays dim.
     select_description: bool = false,
+    /// Takes more input, such as `/loop stop` before a loop id: choosing it
+    /// types a space after it and waits instead of replacing the input.
+    has_args: bool = false,
 };
 
 /// How many commands can take argument completions from the running app.
-const max_argument_groups = 2;
+const max_argument_groups = 3;
 
 pub fn CommandRegistry(comptime Command: type) type {
     return struct {
@@ -43,7 +46,8 @@ pub fn CommandRegistry(comptime Command: type) type {
 
         commands: []const Command = &.{},
         /// Argument completions the app supplies at run time, one group per
-        /// command, such as `/mcp`'s and `/launch`'s. An empty group is unused.
+        /// command, such as `/mcp`'s, `/launch`'s, and `/loop`'s. An empty
+        /// group is unused.
         argument_groups: [max_argument_groups][]const ArgumentCompletion = @splat(&.{}),
 
         pub fn lookup(self: Self, command: []const u8) ?*const Command {

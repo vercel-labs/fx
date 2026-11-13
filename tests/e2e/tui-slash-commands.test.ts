@@ -512,6 +512,39 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
   );
 
   test(
+    "loop menu offers intervals, then stop with each loop",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("MENU_REPLY"));
+      const { stderrPath } = await launchLoopTerminal("menu");
+
+      // With no loops, the menu offers only ways to start one.
+      await session!.sendLiteral("/loop ");
+      await session!.waitForText(/1h +run a prompt now, then every hour/, 5_000);
+      expect(await session!.capturePane()).not.toContain("end a loop, or all of them");
+      await session!.sendKeys("C-u");
+
+      await session!.sendText("/loop 1h say MENU");
+      await waitForCount("MENU_REPLY", 1, 10_000);
+      await session!.waitForComposer(5_000);
+
+      // A live loop adds stop; nothing is paused, so resume stays hidden.
+      await session!.sendLiteral("/loop ");
+      await session!.waitForText(/stop +end a loop, or all of them/, 5_000);
+      expect(await session!.capturePane()).not.toContain("restart a paused loop");
+      // Choosing stop types a space and lists the loops it can end.
+      await session!.sendLiteral("st");
+      await session!.sendKeys("Tab");
+      await session!.waitForText(/stop 1 +every 1h · say MENU/, 5_000);
+      await session!.waitForText(/stop all +end every loop/, 5_000);
+      await session!.sendLiteral("1");
+      await session!.sendKeys("Enter");
+      await session!.waitForText("Stopped loop 1.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "clear ends active loops with a notice",
     async () => {
       gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("CLEAR_REPLY"));

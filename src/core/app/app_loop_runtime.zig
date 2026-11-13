@@ -9,6 +9,7 @@ const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mod_registry = @import("../mods/registry.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -23,6 +24,86 @@ fn testWaitMs() ?u64 {
     const parsed = std.fmt.parseInt(u64, text, 10) catch return null;
     if (parsed < 100 or parsed > loops.min_interval_ms) return null;
     return parsed;
+}
+
+/// Longest prompt excerpt a `/loop` menu description shows.
+const max_menu_prompt_bytes: usize = 80;
+
+/// What `/loop <Tab>` offers, built when the composer starts `/loop` and
+/// released when it leaves the command, as `/launch` does. Loops that change
+/// while the composer stays on `/loop` show the next time it opens.
+pub const LoopCompletion = struct {
+    entries: []const mod_registry.ArgumentCompletion = &.{},
+    arena: ?std.heap.ArenaAllocator = null,
+    attempted: bool = false,
+
+    pub fn deinit(self: *LoopCompletion) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+
+    /// Returns whether the footer needs repainting after building or
+    /// releasing the snapshot.
+    pub fn refresh(self: *LoopCompletion, alloc: std.mem.Allocator, input: []const u8, set: *const loops.Loops) bool {
+        const command = std.mem.trimStart(u8, input, " \t");
+        const active = std.mem.startsWith(u8, command, "/loop") and
+            (command.len == "/loop".len or command["/loop".len] == ' ' or command["/loop".len] == '\t');
+        if (!active) {
+            const had_entries = self.entries.len > 0;
+            self.deinit();
+            return had_entries;
+        }
+        if (self.attempted) return false;
+        self.attempted = true;
+        var next: std.heap.ArenaAllocator = .init(alloc);
+        const entries = buildCompletion(next.allocator(), set) catch |err| {
+            next.deinit();
+            debug_trace.logf("loop", "completion failed err={s}", .{@errorName(err)});
+            return false;
+        };
+        self.arena = next;
+        self.entries = entries;
+        return true;
+    }
+};
+
+/// The interval starters first, since arming is what a new user came for,
+/// then `stop` and `resume` with the loops each one applies to. `stop` shows
+/// only with a loop to stop, and `resume` only with a paused one, so the menu
+/// never offers a command that can only fail. Allocates from `arena`.
+fn buildCompletion(arena: std.mem.Allocator, set: *const loops.Loops) ![]const mod_registry.ArgumentCompletion {
+    var out: std.ArrayList(mod_registry.ArgumentCompletion) = .empty;
+    try out.appendSlice(arena, &.{
+        .{ .full = "/loop 10m", .description = "run a prompt now, then every 10 minutes", .has_args = true },
+        .{ .full = "/loop 1h", .description = "run a prompt now, then every hour", .has_args = true },
+        .{ .full = "/loop 1d", .description = "run a prompt now, then every day", .has_args = true },
+    });
+    if (set.count() == 0) return out.items;
+    var any_paused = false;
+    for (set.items.items) |loop| any_paused = any_paused or loop.state == .paused;
+    try out.append(arena, .{ .full = "/loop stop", .description = "end a loop, or all of them", .has_args = true });
+    if (any_paused) try out.append(arena, .{ .full = "/loop resume", .description = "restart a paused loop", .has_args = true });
+    for (set.items.items) |loop| try out.append(arena, .{
+        .full = try arena.print("/loop stop {d}", .{loop.id}),
+        .description = try menuDescription(arena, loop),
+    });
+    try out.append(arena, .{ .full = "/loop stop all", .description = "end every loop" });
+    for (set.items.items) |loop| if (loop.state == .paused) try out.append(arena, .{
+        .full = try arena.print("/loop resume {d}", .{loop.id}),
+        .description = try menuDescription(arena, .{ .id = loop.id, .interval_ms = loop.interval_ms, .prompt = loop.prompt, .state = .waiting, .next_due_ms = 0 }),
+    });
+    return out.items;
+}
+
+/// "every 1h · say hi", with "paused · " before the prompt for a paused loop.
+fn menuDescription(arena: std.mem.Allocator, loop: loops.Loop) ![]const u8 {
+    var interval_buf: [32]u8 = undefined;
+    const shown = try text_utils.encodeTerminalSafe(arena, loop.prompt, max_menu_prompt_bytes);
+    return arena.print("every {s} · {s}{s}", .{
+        formatInterval(&interval_buf, loop.interval_ms),
+        if (loop.state == .paused) "paused · " else "",
+        shown.bytes,
+    });
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -352,4 +433,34 @@ test "noteTurnFinished reports each failed run, then the pause" {
     try Runtime(FakeApp).resumeLoop(&app, &app.main_agent, 1);
     try std.testing.expectEqualStrings("Resumed loop 1. It runs now, then every 1m.", app.notices.items[3]);
     try std.testing.expect(app.main_agent.loops.nextDue(app_permission_runtime.monotonicMillis()) != null);
+}
+
+test "loop completion offers starters, then stop and resume for live loops" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var set: loops.Loops = .{};
+    defer set.deinit(std.testing.allocator);
+
+    const starters = try buildCompletion(arena.allocator(), &set);
+    try std.testing.expectEqual(@as(usize, 3), starters.len);
+    try std.testing.expectEqualStrings("/loop 10m", starters[0].full);
+    try std.testing.expectEqualStrings("run a prompt now, then every 10 minutes", starters[0].description.?);
+    try std.testing.expect(starters[0].has_args);
+
+    _ = try set.arm(std.testing.allocator, 60 * 60_000, "say hi", 0);
+    _ = try set.arm(std.testing.allocator, 60_000, "p\x1b[31m", 0);
+    for (0..loops.pause_after_failures) |_| _ = set.noteAdmissionFailed(&set.items.items[1], 0);
+
+    const entries = try buildCompletion(arena.allocator(), &set);
+    const expected = [_][]const u8{ "/loop 10m", "/loop 1h", "/loop 1d", "/loop stop", "/loop resume", "/loop stop 1", "/loop stop 2", "/loop stop all", "/loop resume 2" };
+    try std.testing.expectEqual(expected.len, entries.len);
+    for (expected, entries) |full, entry| try std.testing.expectEqualStrings(full, entry.full);
+    try std.testing.expect(entries[3].has_args and entries[4].has_args);
+    try std.testing.expect(!entries[5].has_args);
+    try std.testing.expectEqualStrings("every 1h · say hi", entries[5].description.?);
+    try std.testing.expect(std.mem.startsWith(u8, entries[6].description.?, "every 1m · paused · p"));
+    // A prompt never reaches the menu with a raw escape byte.
+    try std.testing.expect(std.mem.findScalar(u8, entries[6].description.?, 0x1b) == null);
+    try std.testing.expectEqualStrings("end every loop", entries[7].description.?);
+    try std.testing.expect(std.mem.startsWith(u8, entries[8].description.?, "every 1m · p"));
 }
