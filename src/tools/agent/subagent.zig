@@ -493,10 +493,14 @@ test "decode ignores empty fields the action does not take" {
     try expectCorrection("{\"request\":{\"action\":\"wait\"},\"message\":\"\"}", "unknown_field", "message cannot sit beside request");
 }
 
-/// Decodes `args_json`, which must be an `action` request, and checks the agent
-/// it names: `expected`, or none. A refusal fails the test with its body in the
-/// string diff.
-fn expectAgentName(args_json: []const u8, action: model_contract.Action, expected: ?[]const u8) !void {
+/// Decodes `args_json`, which must be a request for `action`, and runs `check`
+/// on the request while it is alive. A refusal fails the test with its body in
+/// the string diff, so a failing test shows the code the model would have got.
+fn withRequest(
+    args_json: []const u8,
+    action: model_contract.Action,
+    comptime check: fn (model_contract.Request) anyerror!void,
+) !void {
     const alloc = std.testing.allocator;
     const result = try decode(.{ .allocator = alloc }, args_json);
     switch (result) {
@@ -509,54 +513,50 @@ fn expectAgentName(args_json: []const u8, action: model_contract.Action, expecte
             defer input.deinit(alloc);
             const request = input.as(Input).request;
             try std.testing.expectEqual(action, request.action());
-            if (expected) |name| {
-                try std.testing.expectEqualStrings(name, request.agentName().?);
-            } else {
-                try std.testing.expect(request.agentName() == null);
-            }
+            try check(request);
         },
     }
+}
+
+fn withMessage(args_json: []const u8, comptime check: fn (model_contract.Request) anyerror!void) !void {
+    return withRequest(args_json, .message, check);
+}
+
+fn checkNoAgent(request: model_contract.Request) anyerror!void {
+    try std.testing.expect(request.agentName() == null);
+}
+
+fn checkAgentIsReviewer(request: model_contract.Request) anyerror!void {
+    try std.testing.expectEqualStrings("reviewer", request.agentName().?);
 }
 
 test "an empty agent on status or wait means no agent, and a required agent is still refused" {
     // `agent` is optional for status: with none it lists every subagent. An
     // empty one asks for nothing more, so it is the same call.
-    try expectAgentName("{\"action\":\"status\"}", .status, null);
-    try expectAgentName("{\"action\":\"status\",\"agent\":\"\"}", .status, null);
-    try expectAgentName("{\"request\":{\"action\":\"status\",\"agent\":\"\"}}", .status, null);
-    try expectAgentName("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status, "reviewer");
-    // `wait` ignores its agent, so an empty one is the same call as none.
-    try expectAgentName("{\"action\":\"wait\",\"agent\":\"\"}", .wait, null);
-    // A present agent still has to be a name, and a field of spaces is not empty.
+    try withRequest("{\"action\":\"status\"}", .status, checkNoAgent);
+    try withRequest("{\"action\":\"status\",\"agent\":\"\"}", .status, checkNoAgent);
+    try withRequest("{\"request\":{\"action\":\"status\",\"agent\":\"\"}}", .status, checkNoAgent);
+    try withRequest("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status, checkAgentIsReviewer);
+    // `wait` does not check its agent: it ignores a string, whether empty, of
+    // spaces, or not a name. A value that is not a string is refused below.
+    try withRequest("{\"action\":\"wait\",\"agent\":\"\"}", .wait, checkNoAgent);
+    try withRequest("{\"action\":\"wait\",\"agent\":\"  \"}", .wait, checkNoAgent);
+    try withRequest("{\"action\":\"wait\",\"agent\":\"Not A Name\"}", .wait, checkNoAgent);
+    // Where the agent is checked, a field of spaces is not empty and is refused.
     try expectDecodeFailure("{\"action\":\"status\",\"agent\":\"  \"}", "invalid_agent");
     try expectDecodeFailure("{\"action\":\"status\",\"agent\":\"Not A Name\"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"  \",\"message\":\"next\"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"stop\",\"agent\":\"  \"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"close\",\"agent\":\"  \"}", "invalid_agent");
     // stop and close need an agent, so an empty one is a mistake.
     try expectDecodeFailure("{\"action\":\"stop\",\"agent\":\"\"}", "invalid_agent");
     try expectDecodeFailure("{\"action\":\"close\",\"agent\":\"\"}", "invalid_agent");
+    // A value that is not a string is still refused, as before.
+    try expectDecodeFailure("{\"action\":\"status\",\"agent\":null}", "invalid_field_type");
+    try expectDecodeFailure("{\"action\":\"wait\",\"agent\":7}", "invalid_field_type");
 }
 
 const optional_message_fields = [_][]const u8{ "instructions", "report", "model", "effort", "profile" };
-
-/// Decodes `args_json`, which must be a `message`, and runs `check` on the
-/// request while it is alive. A refusal fails the test with its body in the
-/// string diff, so a failing test shows the code the model would have got.
-fn withMessage(args_json: []const u8, comptime check: fn (model_contract.Request) anyerror!void) !void {
-    const alloc = std.testing.allocator;
-    const result = try decode(.{ .allocator = alloc }, args_json);
-    switch (result) {
-        .failure => |body| {
-            defer alloc.free(body);
-            try std.testing.expectEqualStrings("a request that decodes", body);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const request = input.as(Input).request;
-            try std.testing.expectEqual(model_contract.Action.message, request.action());
-            try check(request);
-        },
-    }
-}
 
 /// No optional field survived decoding, so the message plans as a plain one on
 /// every path: a new subagent, an idle or interrupted one, and one at work.
