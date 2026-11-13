@@ -295,6 +295,27 @@ test "reads a page: tools, an opaque cursor, and the TTL" {
     try testing.expectError(error.InvalidResult, parsePage("{\"tools\":[],\"nextCursor\":7}"));
 }
 
+test "a tool result's isError written with an escape is still the server's isError" {
+    const failed = classifyCall((try wire.decode("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[],\"i\\u0073Error\":true}}")).response.body);
+    try testing.expect(failed.result.is_error);
+    const fine = classifyCall((try wire.decode("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[],\"i\\u0073Error\":false}}")).response.body);
+    try testing.expect(!fine.result.is_error);
+    // A result with no isError is not an error.
+    const absent = classifyCall((try wire.decode("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[]}}")).response.body);
+    try testing.expect(!absent.result.is_error);
+    // The same result with the key written plainly.
+    const plain = classifyCall((try wire.decode("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[],\"isError\":true}}")).response.body);
+    try testing.expect(plain.result.is_error);
+}
+
+test "a page's nextCursor and ttlMs written with escapes are read" {
+    const page = try parsePage("{\"tools\":[],\"ne\\u0078tCursor\":\"c2\",\"tt\\u006cMs\":300000}");
+    try testing.expectEqualStrings("\"c2\"", page.next_cursor orelse "(no cursor)");
+    try testing.expectEqual(@as(u32, 300000), page.ttl_ms);
+    // A page whose `tools` name is written with an escape is a page.
+    try testing.expectEqualStrings("[]", (try parsePage("{\"too\\u006cs\":[]}")).tools);
+}
+
 test "gathers valid tools, skipping malformed ones and later duplicates" {
     var store: Store = .{};
     defer store.deinit(testing.allocator);

@@ -15,6 +15,12 @@ test "MCP wire decoding returns only whole JSON values from valid input" {
     });
 }
 
+test "the engine reads an object's field names as std.json decodes them" {
+    try testing.fuzz({}, fuzzMemberNames, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_object_fields.*),
+    });
+}
+
 const fuzz_keys = [_][]const u8{
     "\"jsonrpc\"", "\"id\"",      "\"method\"", "\"params\"",       "\"result\"", "\"error\"", "\"resultType\"",
     "\"code\"",    "\"message\"", "\"data\"",   "\"\\u006dethod\"", "\"x\"",
@@ -153,6 +159,179 @@ fn fuzzWellFormedWire(alloc: Allocator, smith: *testing.Smith) !void {
             try testing.expectEqualStrings(method[1 .. method.len - 1], message.request.method);
         },
     }
+}
+
+// ---- objectFields: the same name, written with different escapes ----
+
+/// A fuzz input is one byte string that this reads as a script: how many members
+/// the object has, and for each its name (one the reader asks for, a name that
+/// only looks like one, or an unasked name), how each letter is written, and its
+/// value.
+const MemberScript = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn next(s: *MemberScript) u8 {
+        if (s.at >= s.bytes.len) return 0;
+        defer s.at += 1;
+        return s.bytes[s.at];
+    }
+};
+
+/// The names the reader asks for, as the engine asks for them.
+const member_names = [_][]const u8{ "mode", "isError", "id", "requestState" };
+
+/// Values that stay one token however the object is scanned.
+const member_values = [_][]const u8{ "true", "false", "7", "\"s\"", "{\"a\":[1,{\"b\":null}]}", "[]", "\"\\u00e9\\\\\"" };
+
+/// Code points that make a name look like another one without being it: NUL,
+/// a letter that is none of the asked names', a dotless i, an accent, an
+/// astral code point.
+const member_marks = [_]u21{ 0x00, 'x', 0x131, 0xe9, 0x1f600 };
+
+fn appendMemberHex(alloc: Allocator, out: *std.ArrayList(u8), unit: u16, upper: bool) !void {
+    const digits = if (upper) "0123456789ABCDEF" else "0123456789abcdef";
+    try out.appendSlice(alloc, "\\u");
+    var shift: u4 = 12;
+    while (true) : (shift -= 4) {
+        try out.append(alloc, digits[(unit >> shift) & 0xf]);
+        if (shift == 0) break;
+    }
+}
+
+/// `points` as a JSON string token. A code point is written plainly when JSON
+/// allows it and the style says so, otherwise as a `\uXXXX` escape in either
+/// case of hex digit, or as a surrogate pair above U+FFFF.
+fn appendMemberName(alloc: Allocator, out: *std.ArrayList(u8), points: []const u21, s: *MemberScript) !void {
+    try out.append(alloc, '"');
+    for (points) |point| {
+        const style = s.next() % 4;
+        const plain_ok = point >= 0x20 and point != '"' and point != '\\';
+        if (style == 0 and plain_ok) {
+            var encoded: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(point, &encoded) catch unreachable;
+            try out.appendSlice(alloc, encoded[0..n]);
+        } else if (point >= 0x10000) {
+            const v = point - 0x10000;
+            try appendMemberHex(alloc, out, @intCast(0xd800 + (v >> 10)), style == 2);
+            try appendMemberHex(alloc, out, @intCast(0xdc00 + (v & 0x3ff)), style == 2);
+        } else try appendMemberHex(alloc, out, @intCast(point), style == 2);
+    }
+    try out.append(alloc, '"');
+}
+
+/// The fields `std.json` is asked for: it refuses a field written twice,
+/// however either one is spelled, and skips every other name.
+const MemberFields = struct {
+    mode: ?std.json.Value = null,
+    isError: ?std.json.Value = null,
+    id: ?std.json.Value = null,
+    requestState: ?std.json.Value = null,
+};
+
+fn fuzzMemberNames(_: void, smith: *testing.Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var script: MemberScript = .{ .bytes = buffer[0..len] };
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var object: std.ArrayList(u8) = .empty;
+    try object.append(arena, '{');
+    var counts: [member_names.len]u8 = @splat(0);
+    var wanted: [member_names.len]?[]const u8 = @splat(null);
+    const members = script.next() % 6 + 1;
+    for (0..members) |position| {
+        var points: [16]u21 = undefined;
+        var n: usize = 0;
+        const kind = script.next() % 6;
+        var asked: ?usize = null;
+        switch (kind) {
+            0...3 => {
+                asked = script.next() % member_names.len;
+                for (member_names[asked.?]) |c| {
+                    points[n] = c;
+                    n += 1;
+                }
+            },
+            4 => {
+                // A name that only looks like an asked one.
+                const base = member_names[script.next() % member_names.len];
+                const op = script.next() % 4;
+                const mark = member_marks[script.next() % member_marks.len];
+                const at = script.next() % base.len;
+                if (op == 0) {
+                    points[n] = mark;
+                    n += 1;
+                }
+                for (base, 0..) |c, i| {
+                    if (op == 2 and i == base.len - 1) break;
+                    if (op == 3 and i == at) {
+                        points[n] = mark;
+                    } else points[n] = c;
+                    n += 1;
+                }
+                if (op == 1) {
+                    points[n] = mark;
+                    n += 1;
+                }
+            },
+            else => {
+                points[0] = if (script.next() % 2 == 0) 'x' else 'y';
+                n = 1;
+            },
+        }
+        const value = member_values[script.next() % member_values.len];
+        if (position > 0) try object.append(arena, ',');
+        try object.appendSlice(arena, fuzz_spaces[script.next() % fuzz_spaces.len]);
+        try appendMemberName(arena, &object, points[0..n], &script);
+        try object.append(arena, ':');
+        try object.appendSlice(arena, value);
+        if (asked) |i| {
+            counts[i] += 1;
+            wanted[i] = value;
+        }
+    }
+    try object.append(arena, '}');
+
+    var duplicated = false;
+    for (counts) |c| duplicated = duplicated or c > 1;
+
+    var found: [member_names.len]?[]const u8 = undefined;
+    const engine: wire.DecodeError!void = wire.objectFields(object.items, &member_names, &found);
+
+    // The law: the engine refuses the object exactly when std.json refuses it for
+    // a field written twice, and otherwise reads each field as std.json decodes it.
+    const typed = std.json.parseFromSliceLeaky(MemberFields, arena, object.items, .{ .ignore_unknown_fields = true });
+    if (typed) |fields| {
+        if (engine) |_| {} else |err| return memberDisagrees(object.items, "refused ({s}) an object std.json reads", .{@errorName(err)});
+        if (duplicated) return memberDisagrees(object.items, "std.json read an object with a repeated name", .{});
+        const std_values = [member_names.len]?std.json.Value{ fields.mode, fields.isError, fields.id, fields.requestState };
+        for (std_values, found, wanted, member_names) |from_std, from_engine, want, name| {
+            if ((from_std == null) != (from_engine == null)) {
+                return memberDisagrees(object.items, "disagrees on whether {s} is there: engine {s}", .{ name, if (from_engine == null) "no" else "yes" });
+            }
+            if (from_engine) |raw| {
+                if (!std.mem.eql(u8, raw, want.?)) return memberDisagrees(object.items, "read {s} as {s}", .{ name, raw });
+                const again = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{});
+                const a = try std.json.Stringify.valueAlloc(arena, again, .{});
+                const b = try std.json.Stringify.valueAlloc(arena, from_std.?, .{});
+                if (!std.mem.eql(u8, a, b)) return memberDisagrees(object.items, "read {s} as a different value than std.json", .{name});
+            }
+        }
+    } else |std_err| {
+        if (std_err != error.DuplicateField) return memberDisagrees(object.items, "std.json refused it for another reason: {s}", .{@errorName(std_err)});
+        if (!duplicated) return memberDisagrees(object.items, "std.json refused an object with no repeated name", .{});
+        if (engine) |_| return memberDisagrees(object.items, "accepted an object std.json refuses for a repeated name", .{}) else |err| {
+            if (err != error.DuplicateField) return memberDisagrees(object.items, "refused with {s}, not DuplicateField", .{@errorName(err)});
+        }
+    }
+}
+
+fn memberDisagrees(object: []const u8, comptime what: []const u8, args: anytype) error{TestUnexpectedResult} {
+    std.debug.print("the engine " ++ what ++ ": object " ++ "{s}\n", args ++ .{object});
+    return error.TestUnexpectedResult;
 }
 
 fn fuzzWire(_: void, smith: *testing.Smith) !void {

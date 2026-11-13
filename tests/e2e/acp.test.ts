@@ -70,6 +70,11 @@ const MCP_STDIO_FIXTURE = join(
   "fixtures",
   "mcp-modern-stdio.mjs",
 );
+const MCP_LEGACY_STDIO_FIXTURE = join(
+  import.meta.dirname,
+  "fixtures",
+  "mcp-legacy-stdio.mjs",
+);
 const MCP_TOOL_NAME = "mcp_fixture_echo";
 
 function acpStdioServer(
@@ -5547,6 +5552,142 @@ describe("acp: model-independent", () => {
           rmSync(root.root, { recursive: true, force: true });
         }
       }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  /**
+   * Runs one MCP server through fx as an ACP agent, with some of the server's keys written with an escape
+   * (`FX_MCP_ESCAPE_KEYS`: mode becomes m\u006fde). The client answers what it is asked, as a user would.
+   */
+  async function driveEscapedKeys(opts: {
+    fixture: "modern" | "legacy";
+    mode: string;
+    keys: string[];
+    capabilities: Record<string, unknown>;
+  }) {
+    const root = createIsolatedRoot("fx-acp-mcp-escaped-keys-");
+    const pidPath = join(root.root, "mcp-escaped-keys.pid");
+    const wirePath = join(root.root, "mcp-escaped-keys.wire.jsonl");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("select_escaped", "toolbox", { open: MCP_TOOL_NAME }),
+      fakeGatewayToolCall("call_escaped", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "escaped-keys" } }),
+      finalText("ACP escaped keys complete"),
+    ]);
+    const shown: Array<Record<string, any>> = [];
+    try {
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "mcp" },
+      });
+      await client.request("initialize", { protocolVersion: 1, clientCapabilities: { elicitation: opts.capabilities } }, 1);
+      const escape = opts.keys.length > 0 ? { FX_MCP_ESCAPE_KEYS: opts.keys.join(",") } : {};
+      const declared = "form" in opts.capabilities && "url" in opts.capabilities ? "both" : "form" in opts.capabilities ? "form" : "url" in opts.capabilities ? "url" : "none";
+      const server = opts.fixture === "modern"
+        ? acpStdioServer("unused", pidPath, opts.mode, { FX_MCP_WIRE_LOG: wirePath, FX_MCP_EXPECT_ELICITATION: declared, ...escape })
+        : {
+          name: "fixture",
+          command: process.execPath,
+          args: [MCP_LEGACY_STDIO_FIXTURE],
+          env: Object.entries({
+            FX_MCP_RESULT_TEXT: "unused",
+            FX_MCP_PID_PATH: pidPath,
+            FX_MCP_MODE: opts.mode,
+            FX_MCP_LEGACY_VERSION: "2025-11-25",
+            FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND: "1",
+            FX_MCP_WIRE_LOG: wirePath,
+            ...escape,
+          }).map(([name, value]) => ({ name, value })),
+        };
+      const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
+      expect(created.error).toBeUndefined();
+      await client.readLine();
+      await client.request("session/set_mode", { modeId: "auto" }, 3);
+      client.setElicitationHandler((params) => {
+        shown.push(params);
+        if (params.mode === "url") return { action: "accept" };
+        const properties = params.requestedSchema?.properties ?? {};
+        return { action: "accept", content: "choice" in properties ? { choice: properties.choice.enum[0] } : { confirmed: true } };
+      });
+      let ended = true;
+      let messages: any[] = [];
+      try {
+        messages = (await runPrompt(client, "Call the supplied MCP tool.", 20_000)).messages;
+      } catch {
+        ended = false;
+      }
+      const trace = (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").split("\n").filter(Boolean);
+      const wire = (existsSync(wirePath) ? readFileSync(wirePath, "utf8") : "")
+        .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line).message as Record<string, any>);
+      const statuses = reportUpdatesFor(messages, "call_escaped").map((update: any) => update.params.update.status);
+      let toolText = "";
+      try {
+        toolText = acpToolResultText(gateway.requests[2]!.body, "call_escaped");
+      } catch {
+        toolText = "";
+      }
+      return { shown, ended, statuses, trace, wire, toolText };
+    } finally {
+      await client?.close();
+      if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  // A server may write a protocol key with a JSON escape (m\u006fde). The engine decodes it, as core and the ACP
+  // projection do with std.json, so every row below must come out as its plain row does: what the person is asked,
+  // and how the call ends. An escaped key must never turn into a prompt the server did not mean, or skip one.
+  const ESCAPED_KEY_CASES: Array<[label: string, probe: Parameters<typeof driveEscapedKeys>[0], asked: Array<[string, string | null]>, ended: string]> = [
+    ["a URL question, plain", { fixture: "modern", mode: "mrtr_url_required", keys: [], capabilities: { url: {} } }, [["url", "https://example.test/connect"]], "completed"],
+    ["a URL question with mode escaped", { fixture: "modern", mode: "mrtr_url_required", keys: ["mode"], capabilities: { url: {} } }, [["url", "https://example.test/connect"]], "completed"],
+    ["a URL question with url escaped", { fixture: "modern", mode: "mrtr_url_required", keys: ["url"], capabilities: { url: {} } }, [["url", "https://example.test/connect"]], "completed"],
+    ["a URL question with mode and url escaped", { fixture: "modern", mode: "mrtr_url_required", keys: ["mode", "url"], capabilities: { url: {} } }, [["url", "https://example.test/connect"]], "completed"],
+    ["a URL question to a client that takes forms only, plain", { fixture: "modern", mode: "mrtr_url_required", keys: [], capabilities: { form: {} } }, [], "the server asked for input fx can't give."],
+    ["a URL question to a client that takes forms only, mode escaped", { fixture: "modern", mode: "mrtr_url_required", keys: ["mode"], capabilities: { form: {} } }, [], "the server asked for input fx can't give."],
+    ["a form, plain", { fixture: "modern", mode: "mrtr_input_required", keys: [], capabilities: { form: {} } }, [["form", null]], "completed"],
+    ["a form with requestedSchema escaped", { fixture: "modern", mode: "mrtr_input_required", keys: ["requestedSchema"], capabilities: { form: {} } }, [["form", null]], "completed"],
+    ["a 2025 URL question, plain", { fixture: "legacy", mode: "url_required_error", keys: [], capabilities: { form: {}, url: {} } }, [["url", "https://example.test/authorize"]], "held"],
+    ["a 2025 URL question with mode escaped", { fixture: "legacy", mode: "url_required_error", keys: ["mode"], capabilities: { form: {}, url: {} } }, [["url", "https://example.test/authorize"]], "held"],
+    ["a 2025 URL question with url escaped", { fixture: "legacy", mode: "url_required_error", keys: ["url"], capabilities: { form: {}, url: {} } }, [["url", "https://example.test/authorize"]], "held"],
+    ["a 2025 URL question with elicitationId escaped", { fixture: "legacy", mode: "url_required_error", keys: ["elicitationId"], capabilities: { form: {}, url: {} } }, [["url", "https://example.test/authorize"]], "held"],
+    ["a 2025 form, plain", { fixture: "legacy", mode: "direct_form", keys: [], capabilities: { form: {}, url: {} } }, [["form", null]], "completed"],
+    ["a 2025 form with mode escaped", { fixture: "legacy", mode: "direct_form", keys: ["mode"], capabilities: { form: {}, url: {} } }, [["form", null]], "completed"],
+    ["a 2025 form with requestedSchema escaped", { fixture: "legacy", mode: "direct_form", keys: ["requestedSchema"], capabilities: { form: {}, url: {} } }, [["form", null]], "completed"],
+  ];
+  test(
+    "ACP asks about a URL or a form the same way whether the server writes a key plain or with an escape",
+    async () => {
+      for (const [label, probe, asked, ended] of ESCAPED_KEY_CASES) {
+        const run = await driveEscapedKeys(probe);
+        try {
+          expect(run.shown.map((request) => [request.mode, request.url ?? null])).toEqual(asked);
+          if (ended === "completed") expect(run.statuses.at(-1)).toBe("completed");
+          else if (ended === "held") expect(run.ended).toBe(false);
+          else if (ended === "failed") expect(run.statuses.at(-1)).toBe("failed");
+          else {
+            expect(run.statuses.at(-1)).toBe("failed");
+            expect(run.toolText).toContain(ended);
+          }
+        } catch (error) {
+          throw new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    },
+    600_000,
+  );
+
+  // A tool result that says isError with an escape is still the server saying so. fx reports what the server said.
+  test(
+    "ACP reports a tool result whose isError is written with an escape as failed, with isError true to the model",
+    async () => {
+      const plain = await driveEscapedKeys({ fixture: "modern", mode: "tool_failure", keys: [], capabilities: {} });
+      expect(plain.statuses.at(-1)).toBe("failed");
+      expect(plain.toolText).toContain('"isError":true');
+      const escaped = await driveEscapedKeys({ fixture: "modern", mode: "tool_failure", keys: ["isError"], capabilities: {} });
+      expect(escaped.statuses.at(-1)).toBe("failed");
+      expect(escaped.toolText).toContain('"isError":true');
     },
     LIVE_TIMEOUT,
   );
