@@ -138,10 +138,10 @@
 //!   Each has `at`, `name`, `outcome`, `duration_ms`, `source`, `cause`, and
 //!   `call_id` as a `tool_call` has them; `dir`, the folder the tool ran
 //!   against, where a shell call runs when its arguments name no `cwd`; for a
-//!   `shell` call that ran a command with the startup files, which means its
-//!   arguments have `action` `run`, leave `profile` unset or `user`, and name
-//!   no `shell`, `redefined`, the entries of the `shell` record's `redefined`
-//!   list that its arguments name, left out when there are none;
+//!   `shell` run whose command reads the startup files, which means admission
+//!   resolves its environment to the user's, as for the default profile,
+//!   `redefined`, the entries of the `shell` record's `redefined` list that
+//!   its arguments name, left out when there are none;
 //!   and `args` and `result` (each masked), with `args_bytes` and
 //!   `result_bytes`. Each keeps up to 8 KiB of its value: a longer value keeps
 //!   its first bytes in `args` or `result` and its last bytes in `args_tail`
@@ -3371,6 +3371,21 @@ fn recordTraceTestCall(
     });
 }
 
+/// A failed shell run that `tool_runtime` resolved to the user's startup
+/// files, as it records one.
+fn recordTraceTestRun(call_id: []const u8, arguments_json: []const u8, model_output: []const u8) void {
+    diagnostics.recordToolCallResult(.{
+        .name = "shell",
+        .arguments_json = arguments_json,
+        .model_output = model_output,
+        .outcome = .command_failed,
+        .started_at_ms = io_mod.milliTimestamp(),
+        .call_id = call_id,
+        .dir = "/Users/example/project",
+        .reads_startup_files = true,
+    });
+}
+
 fn traceTestShellView(state: []const u8) shell_snapshot.TraceView {
     var view: shell_snapshot.TraceView = .{ .state = state, .dirty = false, .names_total = 7 };
     view.redefined_buf[0] = .{ .name = "cat", .kind = .function };
@@ -3402,9 +3417,7 @@ test "trace keeps a failed call whole in its own record after the window moves o
     // Longer than the kept 8 KiB, so the record keeps its head and its tail.
     const output = try std.mem.concat(alloc, u8, &.{ "no such dir \x1b[31mred\x1b[0m \xff\n", text_utils.repeat("z", 9000), "\nOUTPUT_TAIL_MARKER" });
     defer alloc.free(output);
-    recordTraceTestCall(
-        "shell",
-        .command_failed,
+    recordTraceTestRun(
         "call_failed",
         "{\"action\":\"run\",\"command\":\"ls -d missing\\ncat notes\\nAI_GATEWAY_API_KEY=abcdefghijklmnop exit 2\"}",
         output,
@@ -3482,15 +3495,15 @@ test "trace marks a window call whose failure is kept" {
     try expectAbsent(kept, "redefined");
 }
 
-test "trace names redefined commands only for a shell call that read the startup files" {
+test "trace names redefined commands only for a failed call recorded as reading the startup files" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    recordTraceTestCall("shell", .command_failed, "call_user", "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", "exit 1");
-    // A clean profile starts the shell without the startup files, so their
-    // `ls` alias did not run.
+    recordTraceTestRun("call_user", "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", "exit 1");
+    // `tool_runtime` records these as reading no startup files: a clean
+    // profile, a clean start, and an interact call, which runs no command.
+    // Each names `ls` all the same.
     recordTraceTestCall("shell", .command_failed, "call_clean", "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", "exit 1");
-    // A named shell may be another shell or a clean start.
     recordTraceTestCall(
         "shell",
         .command_failed,
@@ -3498,7 +3511,6 @@ test "trace names redefined commands only for a shell call that read the startup
         "{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
         "exit 1",
     );
-    // Typing into a session that does not exist runs no command.
     recordTraceTestCall(
         "shell",
         .tool_failed,

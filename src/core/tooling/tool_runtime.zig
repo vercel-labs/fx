@@ -516,23 +516,39 @@ pub fn executeToolCallAuthorized(
             .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
             .call_id = request.call.id,
             .dir = call_dir,
+            .reads_startup_files = callReadsStartupFiles(execution_ctx, request.call_allocator, request.call),
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
+    const outcome = classifyReturnedToolCallOutcome(result);
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(result),
+        .outcome = outcome,
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
         .call_id = request.call.id,
         .dir = call_dir,
+        // Only kept failures use it, so a call that succeeded is not resolved again.
+        .reads_startup_files = outcome != .succeeded and
+            callReadsStartupFiles(execution_ctx, request.call_allocator, request.call),
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+/// Whether `call` is a run whose command reads the user's startup files: one
+/// that admission's `runCommandContext` resolves to the `user` environment, the
+/// same check its routine-command rule makes. `interact` and `stop` calls, a
+/// `clean` profile, a clean start, and a call that does not resolve read none.
+fn callReadsStartupFiles(ctx: Context, alloc: Allocator, call: ToolCall) bool {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const command = tool_admission.runCommandContext(ctx.admissionInput(), arena_state.allocator(), call) catch return false;
+    return command.environment == .user;
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
@@ -4345,6 +4361,39 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "a call reads the startup files only when admission resolves it to a user-profile run" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry };
+    defer rt.deinit(std.testing.allocator);
+    const cases = [_]struct { arguments_json: []const u8, reads: bool }{
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", .reads = false },
+        // A clean start skips the startup files of any shell.
+        .{
+            .arguments_json = "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+            .reads = false,
+        },
+        // `interact` types into a session, here one that does not exist, and
+        // `stop` ends one; neither starts a command.
+        .{ .arguments_json = "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}", .reads = false },
+        .{ .arguments_json = "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}", .reads = false },
+        // The orchestrator adds the action a call leaves out before the call
+        // is stored, so a stored call without one never ran.
+        .{ .arguments_json = "{\"command\":\"ls\"}", .reads = false },
+        .{ .arguments_json = "not json", .reads = false },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "case", .name = "shell", .arguments_json = case.arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("arguments: {s}\n", .{case.arguments_json});
+            return err;
+        };
+    }
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
+    try std.testing.expect(!callReadsStartupFiles(rt.context(), std.testing.allocator, read));
 }
 
 test "tool-call metrics retain caller identity across returned results" {

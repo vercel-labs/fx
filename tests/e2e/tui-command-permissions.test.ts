@@ -1825,6 +1825,17 @@ describe("effect-aware command permissions", () => {
         if (!body.includes('"toolCallId":"trace_failed_first"')) {
           return toolCall(failing, {}, "trace_failed_first");
         }
+        // Two more failures that name `ls` but never run the alias: a clean
+        // profile skips the startup files, and an interact call to a session
+        // that does not exist runs no command.
+        if (!body.includes('"toolCallId":"trace_failed_clean"')) {
+          return toolCall("ls -d missing-clean-dir .", { profile: "clean" }, "trace_failed_clean");
+        }
+        if (!body.includes('"toolCallId":"trace_failed_interact"')) {
+          return gatewayToolCall("shell", {
+            request: { action: "interact", session_id: "missing", chars: "ls -d missing-dir; exit 3\n" },
+          }, "trace_failed_interact");
+        }
         const done = [...body.matchAll(/"toolCallId":"trace_ok_(\d+)"/g)].map((match) => Number(match[1]));
         const next = done.length === 0 ? 0 : Math.max(...done) + 1;
         if (next < successes) return toolCall("true", {}, `trace_ok_${next}`);
@@ -1857,16 +1868,17 @@ describe("effect-aware command permissions", () => {
       );
       const report = readTraceReport(latestTraceReportPath(root.root));
 
-      // The window has moved past the failed call.
+      // The window has moved past the failed calls.
+      const failedIds = ["trace_failed_first", "trace_failed_clean", "trace_failed_interact"];
       expect(report.one("tool_calls")).toMatchObject({
         retained: 64,
-        session: { calls: successes + 1 },
+        session: { calls: successes + failedIds.length },
         complete: false,
-        failed_retained: 1,
+        failed_retained: failedIds.length,
         failed_complete: true,
       });
       const window = report.all("tool_call");
-      expect(window.map((call) => call.call_id)).not.toContain("trace_failed_first");
+      for (const id of failedIds) expect(window.map((call) => call.call_id)).not.toContain(id);
       expect(window[window.length - 1]).toMatchObject({
         name: "shell",
         outcome: "succeeded",
@@ -1876,7 +1888,9 @@ describe("effect-aware command permissions", () => {
 
       // The failed call is kept whole: its call ID, folder, whole command,
       // and the end of its output, past the window's 1200 and 2000 bytes.
-      const failed = report.one("failed_tool_call");
+      const kept = report.all("failed_tool_call");
+      expect(kept.map((call) => call.call_id)).toEqual(failedIds);
+      const failed = kept[0]!;
       expect(failed).toMatchObject({
         name: "shell",
         outcome: "command_failed",
@@ -1890,6 +1904,13 @@ describe("effect-aware command permissions", () => {
       expect(String(failed.args)).toContain("COMMAND_TAIL_MARKER");
       expect(failed.result_bytes as number).toBeGreaterThan(2000);
       expect(`${String(failed.result)}${String(failed.result_tail ?? "")}`).toContain("OUTPUT_TAIL_MARKER");
+      // Only the run that read the startup files names their alias.
+      expect(kept[1]).toMatchObject({ outcome: "command_failed", call_id: "trace_failed_clean" });
+      expect(kept[2]).toMatchObject({ outcome: "tool_failed", call_id: "trace_failed_interact" });
+      for (const call of kept.slice(1)) {
+        expect(String(call.args)).toContain("ls -d missing");
+        expect(call.redefined).toBeUndefined();
+      }
 
       const problems = report.problems("tool_call").map((problem) => problem.call as { call_id?: string });
       expect(problems.map((call) => call.call_id)).toContain("trace_failed_first");

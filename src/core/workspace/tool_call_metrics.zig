@@ -161,8 +161,7 @@ pub const FailedToolCall = struct {
     call_id_len: u8 = 0,
     dir_buf: [max_dir_len]u8 = @splat(0),
     dir_len: u16 = 0,
-    /// Whether this is a `shell` call whose command read the user's startup
-    /// files; see `shellArgsReadStartupFiles`.
+    /// See `ToolCallRecord.reads_startup_files`.
     reads_startup_files: bool = false,
     args: KeptText = .{},
     result: KeptText = .{},
@@ -232,6 +231,10 @@ pub const ToolCallRecord = struct {
     call_id: []const u8 = "",
     /// The folder the tool ran against; see `FailedToolCall.dir`.
     dir: []const u8 = "",
+    /// Whether the call is a shell run whose command reads the user's startup
+    /// files. The caller decides it from the resolved command, as admission
+    /// does, so the trace names redefined commands only for such a run.
+    reads_startup_files: bool = false,
 };
 
 pub fn omitsPayloadsForName(tool_name: []const u8) bool {
@@ -292,7 +295,7 @@ fn recordLocked(call: ToolCallMetric) void {
 
 /// Writes a failed call into the failure ring from its whole arguments and
 /// output. The slot is filled in place: a kept failure is about 17 KiB.
-fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32, reads_startup_files: bool) void {
+fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32) void {
     const slot = &failures[failures_head];
     failures_head = (failures_head + 1) % failure_ring_capacity;
     if (failures_stored < failure_ring_capacity) failures_stored += 1;
@@ -310,7 +313,7 @@ fn recordFailureLocked(input: ToolCallRecord, duration_ms: u32, reads_startup_fi
     const dir_len = utf8PrefixLen(input.dir, max_dir_len);
     @memcpy(slot.dir_buf[0..dir_len], input.dir[0..dir_len]);
     slot.dir_len = @intCast(dir_len);
-    slot.reads_startup_files = reads_startup_files;
+    slot.reads_startup_files = input.reads_startup_files;
     if (omitsPayloadsForName(input.name)) {
         slot.args.clear();
         slot.result.clear();
@@ -339,10 +342,6 @@ pub fn recordResult(input: ToolCallRecord) void {
     metric.setName(input.name);
     metric.setCallId(input.call_id);
     metric.setPayloadsForName(input.name, input.arguments_json, input.model_output);
-    // Read before the lock, since it walks the whole arguments.
-    const reads_startup_files = input.outcome != .succeeded and
-        std.mem.eql(u8, input.name, "shell") and
-        shellArgsReadStartupFiles(input.arguments_json);
 
     const zio = io_mod.getIo();
     mutex.lockUncancelable(zio);
@@ -350,51 +349,7 @@ pub fn recordResult(input: ToolCallRecord) void {
     // One lock for both rings, so a snapshot never sees a failure in the
     // window that the failure ring does not hold yet.
     recordLocked(metric);
-    if (input.outcome != .succeeded) recordFailureLocked(input, metric.duration_ms, reads_startup_files);
-}
-
-/// Whether a `shell` call's arguments started a command with the user's
-/// startup files: one JSON object whose top-level `action` is `run`, whose
-/// `profile` is absent or `user`, and that names no `shell`. `interact` and
-/// `stop` start no command, and a recorded call without an `action` never
-/// ran, since the orchestrator adds the action it infers before a call is
-/// stored. A `clean` profile starts the shell without the startup files, and
-/// a named shell may be another shell or a clean start. Any other value, even
-/// one the tool drops such as a `null` profile, and arguments it cannot read
-/// count as off, so a trace never blames startup files a command may not
-/// have read.
-fn shellArgsReadStartupFiles(arguments_json: []const u8) bool {
-    // Holds the scanner's nesting stack; deeper arguments count as off.
-    var stack: [256]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&stack);
-    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), arguments_json);
-    defer scanner.deinit();
-    if ((scanner.next() catch return false) != .object_begin) return false;
-    var runs = false;
-    while (true) {
-        const key = switch (scanner.next() catch return false) {
-            .object_end => return runs,
-            .string => |text| text,
-            else => return false,
-        };
-        if (std.mem.eql(u8, key, "shell")) return false;
-        if (std.mem.eql(u8, key, "action")) {
-            if (!nextStringIs(&scanner, "run")) return false;
-            runs = true;
-        } else if (std.mem.eql(u8, key, "profile")) {
-            if (!nextStringIs(&scanner, "user")) return false;
-        } else {
-            scanner.skipValue() catch return false;
-        }
-    }
-}
-
-/// Whether the scanner's next value is the string `expected`.
-fn nextStringIs(scanner: *std.json.Scanner, expected: []const u8) bool {
-    return switch (scanner.next() catch return false) {
-        .string => |text| std.mem.eql(u8, text, expected),
-        else => false,
-    };
+    if (input.outcome != .succeeded) recordFailureLocked(input, metric.duration_ms);
 }
 
 pub fn snapshot(out: []ToolCallMetric) usize {
@@ -668,51 +623,6 @@ test "a session reset clears the failure ring" {
     defer freeFailuresForTest(kept);
     try std.testing.expectEqual(@as(usize, 0), kept.len);
     try std.testing.expectEqual(@as(u64, 0), lifetimeStats().failureCount());
-}
-
-test "shell arguments read the startup files only on a user-profile run without a named shell" {
-    const reads = [_][]const u8{
-        "{\"action\":\"run\",\"command\":\"ls\"}",
-        "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"user\"}",
-        "{\"profile\":\"user\",\"command\":\"ls\",\"action\":\"run\"}",
-        // Words in a value are not keys.
-        "{\"action\":\"run\",\"command\":\"echo \\\"profile\\\":\\\"clean\\\" shell\",\"cwd\":{\"profile\":\"clean\"}}",
-    };
-    for (reads) |arguments| try std.testing.expect(shellArgsReadStartupFiles(arguments));
-
-    const skips = [_][]const u8{
-        // Only `run` starts a command; `interact` types into a session that
-        // may not exist, and `stop` ends one.
-        "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}",
-        "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}",
-        // The orchestrator adds the action a call leaves out before the call
-        // is stored, so a recorded call without one never ran.
-        "{\"command\":\"ls\"}",
-        "{}",
-        "{\"action\":null,\"command\":\"ls\"}",
-        "{\"action\":\"run\",\"command\":\"ls\",\"profile\":\"clean\"}",
-        "{\"profile\":\"clean\",\"command\":\"ls\"}",
-        "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\"}}",
-        "{\"profile\":null,\"command\":\"ls\"}",
-        // An escaped key is not read, so it counts as off.
-        "{\"pro\\u0066ile\":\"user\",\"command\":\"ls\"}",
-        "",
-        "not json",
-        "[\"profile\",\"user\"]",
-        "{\"command\":\"ls\"",
-    };
-    for (skips) |arguments| try std.testing.expect(!shellArgsReadStartupFiles(arguments));
-
-    // Nesting deeper than the scanner's stack counts as off, not as a crash.
-    const prefix = "{\"command\":";
-    const depth = 4096;
-    const deep = try std.testing.allocator.alloc(u8, prefix.len + 2 * depth + 1);
-    defer std.testing.allocator.free(deep);
-    @memcpy(deep[0..prefix.len], prefix);
-    @memset(deep[prefix.len..][0..depth], '[');
-    @memset(deep[prefix.len + depth ..][0..depth], ']');
-    deep[deep.len - 1] = '}';
-    try std.testing.expect(!shellArgsReadStartupFiles(deep));
 }
 
 test "the rings match a reference list on seeded random sequences" {
