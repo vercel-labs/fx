@@ -2592,6 +2592,36 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "a question whose options the model wrote as JSON text opens with those options",
+    async () => {
+      const options = [
+        { label: "Inspect repo state", description: "Review local files first." },
+        { label: "Run tests", description: "Start with verification." },
+      ];
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "question_text_options_1",
+            name: "ask_user_question",
+            input: { questions: [{ question: QUESTION_PROMPT, options: JSON.stringify(options) }] },
+          },
+        ]),
+        outerText("question text options handled"),
+      ]);
+      await ctx.session.sendText("Ask me which path to take.");
+      await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+      await expectQuestionSelection(ctx.session, 1, "Inspect repo state");
+
+      await resolveQuestionWithSecondOption(ctx.session);
+      await ctx.session.waitForText("question text options handled", TIMEOUT);
+      expect(requestContainsExactString(ctx.gateway.requests[1]?.body ?? "", "Run tests")).toBe(true);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "question freeform Ctrl+Y cannot yank into the hidden composer",
     async () => {
       const sentinel = "hidden question kill ring";

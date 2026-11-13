@@ -975,7 +975,11 @@ const App = struct {
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
-        self.auth.stopProviderPreparation();
+        // Exit never waits, not even for a sign-in refresh, which is never cut
+        // off: a preparation or prompt refresh still running ends with the
+        // process.
+        self.auth.leaveProviderPreparationForExit();
+        self.auth.leavePromptRefreshesForExit();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);
@@ -1002,7 +1006,7 @@ const App = struct {
         };
         // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
-        self.credits_lookup.deinit();
+        self.credits_lookup.leaveForExit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Quitting from a subagent's screen resumes its instance.
@@ -4060,7 +4064,7 @@ fn rawEnvValue(raw_env: RawEnviron, comptime key: []const u8) ?[]const u8 {
 }
 
 fn topLevelHelpColumns(raw_env: RawEnviron) usize {
-    if (stdoutTerminalColumns()) |columns| return columns;
+    if (terminal_env.stdoutColumns()) |columns| return columns;
     if (rawEnvValue(raw_env, "COLUMNS")) |value| {
         if (parseColumnCount(value)) |columns| return columns;
     }
@@ -4075,26 +4079,11 @@ fn topLevelHelpColumns(raw_env: RawEnviron) usize {
 fn topLevelHelpStyle(raw_env: RawEnviron) command_specs.HelpStyle {
     const no_color = terminal_env.noColorValue(rawEnvValue(raw_env, "NO_COLOR"));
     const dumb_terminal = terminal_env.dumbTerminalValue(rawEnvValue(raw_env, "TERM"));
-    return topLevelHelpStyleForValues(stdoutIsTerminal(), no_color, dumb_terminal);
+    return topLevelHelpStyleForValues(terminal_env.stdoutIsTerminal(), no_color, dumb_terminal);
 }
 
 fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: bool) command_specs.HelpStyle {
     return if (is_terminal and !no_color and !dumb_terminal) .ansi else .plain;
-}
-
-fn stdoutIsTerminal() bool {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
-    return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
-}
-
-fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
-
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws);
-    if (rc == -1 or ws.col == 0) return null;
-    return @intCast(ws.col);
 }
 
 fn parseColumnCount(value: []const u8) ?usize {
@@ -5382,7 +5371,9 @@ test {
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
+    _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");
@@ -5464,6 +5455,7 @@ test {
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
@@ -5506,6 +5498,7 @@ test {
     _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
+    _ = @import("core/output/session_list_text.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");

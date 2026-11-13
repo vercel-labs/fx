@@ -30,6 +30,11 @@
 # reads the stable instructions after it, which openai-current-context.cfg
 # shows fx did not before.
 #
+# p6-attach.cfg and p6-openai-attach.cfg add a user turn that attaches a file from a
+# folder with its own AGENTS.md, as an ACP client does: its rules ride on that turn's
+# own message. p6-mutant-attach-in-instructions.cfg puts them in the instructions for
+# that turn, as fx did, which MidSessionKeepsHistory catches.
+#
 # The openai-*.cfg configs check the same designs under OpenAI GPT-5.6 and later
 # rules (Family = "openai"). openai-mutant-explicit-only.cfg is the agent request
 # in explicit-only cache mode, which drops in-session reuse.
@@ -84,6 +89,9 @@ MCPromptCache p6-mutant-remind-old-result PreviousFullyReused -deadlock
 MCPromptCache p6-resume - -deadlock
 MCPromptCache p6-openai-resume - -deadlock
 MCPromptCache p6-mutant-stale-in-instructions MidSessionKeepsHistory -deadlock
+MCPromptCache p6-attach - -deadlock
+MCPromptCache p6-openai-attach - -deadlock
+MCPromptCache p6-mutant-attach-in-instructions MidSessionKeepsHistory -deadlock
 MCPromptCache p6-overlay - -deadlock
 MCPromptCache p6-openai-overlay - -deadlock
 MCPromptCache p6-mutant-overlay-rebuilt MidSessionKeepsHistory -deadlock
