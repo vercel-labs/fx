@@ -108,6 +108,11 @@ pub const Snapshot = struct {
     running_ms: ?u64 = null,
     quiet_ms: ?u64 = null,
     quiet_notice: bool = false,
+    /// Set when this snapshot ends a wait at the quiet crossing: the
+    /// command still runs and its quiet spell crossed the limit during this
+    /// wait. A spell crosses once, so a later wait in it leaves this false
+    /// (`tests/tla/managed_execution/QuietWait.tla`).
+    quiet_crossed: bool = false,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.execution_id);
@@ -936,7 +941,15 @@ pub const Runtime = struct {
             }
             const step = quiet_notice.poll(quiet_wait, io_mod.milliTimestamp(), last_output_ms, limit_ms);
             quiet_wait = step.wait;
-            if (step.end != null) break;
+            if (step.end) |end| {
+                if (end == .quiet) {
+                    var prepared = try self.prepareSnapshotForEntry(alloc, entry);
+                    // A command that ended as the wait crossed is no crossing.
+                    prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
+                    return prepared;
+                }
+                break;
+            }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);

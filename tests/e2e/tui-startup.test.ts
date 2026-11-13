@@ -918,8 +918,10 @@ describe.skipIf(SKIP_TMUX)("tui: standard terminal variables", () => {
         env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", TERM: "dumb" },
         remainOnExit: true,
       });
-      await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-      expect(session.paneStatus().status).toBe(1);
+      // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+      // the pane dead many seconds later.
+      await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+      expect(session.recordedExitStatus()).toBe(1);
       expect(await session.captureFullScrollback()).toContain(
         "fx: TERM=dumb can't show the interactive session; use fx ask, or run fx in a terminal that supports cursor movement",
       );
@@ -957,8 +959,10 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           stderrPath,
           remainOnExit: true,
         });
-        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
-        expect(session.paneStatus().status).toBe(1);
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
         expect(readFileSync(stderrPath, "utf8")).toBe("fx: session path unsafe\n");
         expect(readFileSync(tracePath, "utf8")).toContain("interactive error err=SessionPathUnsafe");
       } finally {

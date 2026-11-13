@@ -8,6 +8,7 @@ const transcript_store = @import("store.zig");
 const source_preparation = @import("source_preparation.zig");
 const frozen_prefix = @import("frozen_prefix.zig");
 const types = @import("../../core/shared/types.zig");
+const render_engine = @import("../render_engine.zig");
 
 const TranscriptRuntime = runtime_mod.TranscriptRuntime;
 const Allocator = std.mem.Allocator;
@@ -104,6 +105,74 @@ fn commitStableFrame(alloc: Allocator, runtime: *TranscriptRuntime) !void {
         .occupied_last_row_blank = prepared.selection.last_visible_row_blank,
         .layout_id = 1,
     } };
+}
+
+/// A frame the terminal accepted without scrolling.
+fn committedFrameResult() render_engine.terminal_diff.FrameCommitResult {
+    return .{
+        .bytes_written = 1,
+        .changed_cells = 1,
+        .full_repaint = false,
+        .terminal_scroll_rows_committed = 0,
+        .document_append_committed = false,
+        .committed_cursor_row = 1,
+        .committed_cursor_col = 1,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    };
+}
+
+/// How many of a frame's rows the terminal history holds after it.
+const ReleasedRows = enum { none, all };
+
+/// A frame that paints the runtime's entries. It paints `resume_flow`, the
+/// pending resume source it borrows, or with null the entries' own flow.
+fn transcriptFrame(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+    resume_flow: ?[]u8,
+    released: ReleasedRows,
+) !runtime_mod.TranscriptTransition {
+    var metrics: types.Metrics = .{};
+    var flow = try source_preparation.prepareRetentionSource(runtime, alloc);
+    defer flow.deinit(alloc);
+    try flow.ensureLineIndex(alloc);
+    const total = flow.transcript_visual_row_offsets[flow.transcript_visual_row_offsets.len - 1];
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(alloc, &metrics, &flow, .{ .top = 1, .bottom = 20 });
+    defer prepared.deinit(alloc);
+    var transition: runtime_mod.TranscriptTransition = .{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(24, 1),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = &.{},
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{ .terminal_rows = 24, .terminal_cols = 80 },
+        .selection = prepared.selection,
+        .visual_offset = total,
+        .history_visual_offset = switch (released) {
+            .none => 0,
+            .all => total,
+        },
+        .total_visual_rows = total,
+        .cursor_row = prepared.cursor.cursor_row,
+        .cursor_col = prepared.cursor.cursor_col,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 1,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 1,
+    };
+    if (resume_flow) |bytes| {
+        transition.target_flow = bytes;
+        transition.target_flow_owned = false;
+        return transition;
+    }
+    transition.target_flow = try alloc.dupe(u8, flow.bytes);
+    errdefer alloc.free(transition.target_flow);
+    transition.retention_identity = try source_preparation.RetentionIdentity.capture(runtime, alloc, &flow);
+    return transition;
 }
 
 test "the transcript window removes a compaction's closed cycle once the session log holds it" {
@@ -492,6 +561,105 @@ test "a resume that brings back the cycle before the newest compaction keeps it 
     try commitStableFrame(alloc, &runtime);
     const anchor = &runtime.transcript_commit_state.stable;
     anchor.history_visual_offset = anchor.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resume from the session picker keeps the cycle before the newest compaction through its screen reset" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    // The picker switches sessions with a terminal reset, which paints the
+    // prepared flow. The entries must outlive it, or the next frame, which
+    // paints from the entries, erases the rows the reset showed.
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+    // Painted and still on screen: the next sync keeps it.
+    if (runtime.notebook.pending_resume_source) |*source| source.deinit(alloc);
+    runtime.notebook.pending_resume_source = null;
+    try commitStableFrame(alloc, &runtime);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    // Scrolled into terminal history: the next sync drops it.
+    const anchor = &runtime.transcript_commit_state.stable;
+    anchor.history_visual_offset = anchor.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript keeps the rows it painted until a frame repaints them from the entries" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The first frame paints the resumed flow and hands it to the anchor,
+    // which stays invalid until the next frame.
+    var handoff = try transcriptFrame(alloc, &runtime, runtime.notebook.pending_resume_source.?.bytes, .none);
+    defer handoff.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &handoff, committedFrameResult());
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingResumeFlow().len);
+    try std.testing.expect(runtime.transcript_commit_state == .invalid);
+    // A turn that ends before the next frame keeps what is on screen.
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The next frame repaints from the entries, whose rows are now in
+    // terminal history: the next sync drops them.
+    var repaint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer repaint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &repaint, committedFrameResult());
+    try std.testing.expect(runtime.transcript_commit_state == .stable);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript that leaves the screen before its repaint lets its window drop" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    var handoff = try transcriptFrame(alloc, &runtime, runtime.notebook.pending_resume_source.?.bytes, .none);
+    defer handoff.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &handoff, committedFrameResult());
+
+    // Another agent comes on screen before the next frame, as `attach` does.
+    var hidden: runtime_mod.TranscriptSlot = .{};
+    defer TranscriptRuntime.deinitSlot(&hidden, alloc);
+    runtime.swapSlot(&hidden);
+    TranscriptRuntime.slotLeftScreen(&hidden);
+    // A turn it ends while hidden runs with its transcript swapped in, and
+    // none of its rows are on screen.
+    runtime.swapSlot(&hidden);
     try runtime.syncTranscriptWindow(alloc);
     try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
     try expectWindowMatchesEntries(&runtime);
