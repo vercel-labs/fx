@@ -4103,7 +4103,10 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
-            const outcome_decision = command_decision orelse terminal_action_decision;
+            // A shell run that returned its command running, captured or tty,
+            // has no exit status and reads "Still running", as it did live.
+            const outcome_decision = command_decision orelse terminal_action_decision orelse
+                try tool_presentation.runningCommandDecision(action_arena.allocator(), call, result.output);
             const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     agent,

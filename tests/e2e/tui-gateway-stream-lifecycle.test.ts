@@ -246,6 +246,9 @@ const GLM_MODEL = "zai/glm-5.2";
 const TURN_SUMMARY_WITH_TOKENS =
   /^ {2}(?:\d+s|\d+m \d+s|\d+h \d{2}m) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)$/m;
 const TIMEOUT = 30_000;
+// Steering waits behind a running shell command for this long before the
+// command returns running. Tests of steering that waits for a tool hold it.
+const STEER_HOLD_GRACE_MS = "600000";
 const SPLIT_BOUNDARY_WAIT_TIMEOUT = TIMEOUT * 3;
 const SPLIT_BOUNDARY_TEST_TIMEOUT = SPLIT_BOUNDARY_WAIT_TIMEOUT + 5_000;
 const CANONICAL_PRE_TOOL_TEXT =
@@ -4686,6 +4689,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-steering-tool-handoff-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_TEST_STEER_YIELD_GRACE_MS: STEER_HOLD_GRACE_MS,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
@@ -4784,6 +4788,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-cooperative-steering-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_TEST_STEER_YIELD_GRACE_MS: STEER_HOLD_GRACE_MS,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
@@ -4931,6 +4936,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-rich-steering-tool-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_TEST_STEER_YIELD_GRACE_MS: STEER_HOLD_GRACE_MS,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
@@ -5033,6 +5039,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-failed-tool-steering-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_TEST_STEER_YIELD_GRACE_MS: STEER_HOLD_GRACE_MS,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
@@ -5074,26 +5081,139 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
-  test(
-    "Escape interrupts a running tool and starts pending steering without review",
+  for (const tty of [false, true]) test(
+    `steering moves a running command to the background without stopping it with tty=${tty}`,
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-background-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-background-steering-tool");
+      const finishedPath = join(workspace, "background-finished");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        `printf BACKGROUND_STEERING_TOOL_DONE > ${JSON.stringify(finishedPath)}`;
+      const steering = "Look at the config while that command runs.";
+      const finalText = "BACKGROUND_STEERING_COMPLETE";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("background_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            tty,
+            command,
+          },
+        }),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-background-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Run the background steering fixture.");
+        await session.waitForText("Running while", TIMEOUT);
+        await session.sendText(steering);
+
+        // The turn takes the steering while the command still waits for its
+        // release, well before the command's 30 s wait would end.
+        await session.waitForText(finalText, TIMEOUT);
+        await waitForCondition(
+          () => steeringGateway.requests.length === 2,
+          "steering request while the command runs",
+        );
+        expect(existsSync(finishedPath)).toBe(false);
+        // The command has no exit status yet, so its row must not read "Ran".
+        const backgroundScrollback = await session.captureFullScrollback();
+        expect(backgroundScrollback).toContain("Still running while");
+        expect(backgroundScrollback).not.toContain("Ran while");
+        const continuedBody = steeringGateway.requests[1]!.body;
+        expect(continuedBody).toContain("<user_steering>");
+        expect(continuedBody).toContain(steering);
+        expect(continuedBody.indexOf("steering_notice")).toBeLessThan(
+          continuedBody.indexOf(steering),
+        );
+        // The shell result reports the command running under its session,
+        // with no exit status yet.
+        const toolMessages = (parseGatewayRequest(continuedBody).prompt as Array<{
+          role?: string;
+          content?: unknown;
+        }>).filter((message) => message.role === "tool");
+        expect(toolMessages).toHaveLength(1);
+        const toolResult = JSON.stringify(toolMessages[0]!.content);
+        expect(toolResult).toContain("steering_notice");
+        expect(toolResult).toContain("keeps running");
+        expect(toolResult).toContain("session_id");
+        expect(toolResult).toContain("running");
+        expect(toolResult).not.toContain("exit_code");
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain("event=steering_tool_yield_requested");
+        expect(trace).toContain("event=prompt_steering_consumed");
+        expect(trace).not.toContain("event=cancel_requested");
+
+        // The command was never stopped: released, it runs to its end.
+        writeFileSync(releasePath, "release\n");
+        await waitForCondition(() => existsSync(finishedPath), "background command completion");
+        expect(readFileSync(finishedPath, "utf8")).toBe("BACKGROUND_STEERING_TOOL_DONE");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(session.isAlive()).toBe(true);
+        expect(session.isPaneAlive()).toBe(true);
+      } finally {
+        writeFileSync(releasePath, "release\n");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  for (const tty of [false, true]) test(
+    `Escape interrupts a running tool and starts pending steering without review with tty=${tty}`,
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-immediate-steering-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "immediate-steering-tool.pid");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       const steering = "Apply IMMEDIATE_STEERING_SENTINEL now.";
       const finalText = "IMMEDIATE_STEERING_COMPLETE";
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
       const steeringGateway = startFakeGateway([
         fakeGatewayToolCall("immediate_steering_tool", "shell", {
           request: {
             action: "run",
             yield_time_ms: 30_000,
             timeout_ms: 600_000,
-            command: "sleep 30",
+            tty,
+            command,
           },
         }),
         fakeGatewayFinalText(finalText),
@@ -5109,6 +5229,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-immediate-steering-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_TEST_STEER_YIELD_GRACE_MS: STEER_HOLD_GRACE_MS,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
@@ -5123,7 +5244,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the immediate steering fixture.");
-      await session.waitForText("Running sleep 30", TIMEOUT);
+      await session.waitForText("Running printf", TIMEOUT);
+      await waitForCondition(
+        () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+        "immediate steering command pid",
+      );
+      const commandPid = Number(readTrimmed(pidPath));
+      expect(isProcessAlive(commandPid)).toBe(true);
       await session.sendText(steering);
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
@@ -5141,6 +5268,88 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).toContain(steering);
       expect(trace).toContain("steering_pending=true");
       expect(trace).toContain("outcome_kind=interrupted");
+      // The interrupt ends the command, so no process outlives its session.
+      await waitForCondition(
+        () => !isProcessAlive(commandPid),
+        "interrupted command exit",
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "Escape ends a running tty command with no steering",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tty-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "tty-escape-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
+      const escapeGateway = startFakeGateway([
+        fakeGatewayToolCall("tty_escape_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            tty: true,
+            command,
+          },
+        }),
+      ]);
+      gateway = escapeGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tty-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: escapeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: escapeGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: escapeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the tty escape fixture.");
+      await session.waitForText("Running printf", TIMEOUT);
+      await waitForCondition(
+        () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+        "tty escape command pid",
+      );
+      const commandPid = Number(readTrimmed(pidPath));
+      expect(isProcessAlive(commandPid)).toBe(true);
+
+      await session.sendInterruptEscapePair(TIMEOUT);
+      // The interrupt ends the command, so no process outlives its session.
+      await waitForCondition(
+        () => !isProcessAlive(commandPid),
+        "interrupted tty command exit",
+      );
+      // fx can write the interrupt outcome after the command exits.
+      await waitForCondition(
+        () => readFileSync(tracePath, "utf8").includes("outcome_kind=interrupted"),
+        "interrupted turn outcome",
+      );
+      expect(escapeGateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);

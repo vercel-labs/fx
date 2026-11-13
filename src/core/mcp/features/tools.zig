@@ -215,8 +215,8 @@ const RepairedArguments = struct {
 };
 
 /// Some models write a number, boolean, array, or object argument as JSON
-/// text, such as `"40"` for a `number` field, and a server that checks types
-/// rejects the call. For each top-level argument whose property schema has a
+/// text, such as `"40"` for a `number` field, and an MCP server or SDK host
+/// tool that checks types rejects the call. For each top-level argument whose property schema has a
 /// single `type` other than `string`, a string that is exactly a value of
 /// that type is sent as that value. A schema with such a `type` never accepts
 /// a string there, so no value the schema accepts changes. Every other value
@@ -226,7 +226,8 @@ const RepairedArguments = struct {
 /// caller sends the model's own bytes. Otherwise the arguments to send and
 /// the fields that changed, allocated in `arena`.
 /// (`tests/e2e/mcp-stdio.test.ts` "typed MCP arguments the model wrote as
-/// text reach the server as their schema's types")
+/// text reach the server as their schema's types", and
+/// `sdk/tests/test-host-tools.mjs` for host tools)
 pub fn repairArgumentTypes(arena: Allocator, input_schema_json: []const u8, arguments_json: []const u8) Allocator.Error!?RepairedArguments {
     const limits: Limits = .{};
     if (arguments_json.len > limits.max_argument_bytes or input_schema_json.len > limits.max_schema_bytes) return null;

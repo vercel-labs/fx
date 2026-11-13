@@ -916,6 +916,122 @@ test "an image from a folder with its own rules brings them as a note on the tur
     try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
+test "files attached by path bring their folders' rules as a note on the turn's message and leave the instructions alone (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/docs");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/docs/AGENTS.md", .data = "ATTACHED_FOLDER_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/docs/a.txt", .data = "a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/docs/b.txt", .data = "b" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const a_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/docs/a.txt");
+    defer alloc.free(a_path);
+    const b_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/docs/b.txt");
+    defer alloc.free(b_path);
+    const rules_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "docs", "AGENTS.md" });
+    defer alloc.free(rules_path);
+    const block = "<scoped-rules from=\"docs/AGENTS.md\" scope=\"docs\">\nATTACHED_FOLDER_RULE\n</scoped-rules>";
+    const omitted = "<project-rules-omitted from=\"https://example.test/doc.md\" reason=\"unsafe target\" />";
+    const reminder = "<scoped-rules-reminder from=\"docs/AGENTS.md\" scope=\"docs\">" ++
+        "The rules fx added earlier for this folder still apply.</scoped-rules-reminder>";
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const completions = [_]FakeCompletion{.{ .content = "Answer" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    // Turn 1 attaches nothing.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    var first = fixture.job();
+    first.prompt = @constCast("Hello there.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    try expectBodyNotContains(&first_gateway, 0, "ATTACHED_FOLDER_RULE");
+
+    // Turn 2 attaches a file from a folder the session has not seen and a
+    // source that is no file. The request opens with every message turn 1
+    // sent, and the folder's rules and the omission end the turn's message.
+    var history: std.ArrayList(HistoryTurn) = .empty;
+    defer history.deinit(alloc);
+    try history.append(alloc, first_hooks.history_turns.items[0]);
+    const second_targets = [_]context_contract.ApplicableTarget{.{ .path = a_path, .kind = .file }};
+    const second_omissions = [_]context_contract.ContextOmissionInput{.{ .source = "https://example.test/doc.md", .reason = .unsafe_target }};
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    var second = fixture.job();
+    second.prompt = @constCast("Look at this file.");
+    second.history = history.items;
+    second.attached_files = .{ .targets = &second_targets, .omissions = &second_omissions };
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    try expectPromptStartsWith(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try expectGatewayPromptFinalUserText(&second_gateway, 0, "Look at this file.\n\n" ++ block ++ "\n\n" ++ omitted);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(second_gateway.request_bodies.items[0], "ATTACHED_FOLDER_RULE"));
+    // The saved turn keeps the note at its start, with the file it delivered.
+    const saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(rules_path, saved.context_notes[0].sources[0].path);
+    try std.testing.expect(saved.context_notes[0].sources[0].stamp != 0);
+
+    // Turn 3 attaches another file from the same folder: turn 2's message
+    // comes back as it was and this one ends with the reminder line.
+    try history.append(alloc, second_hooks.history_turns.items[0]);
+    const third_targets = [_]context_contract.ApplicableTarget{.{ .path = b_path, .kind = .file }};
+    var third_gateway = FakeGateway.init(alloc, &completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.context_enabled = true;
+    third_hooks.context_registry = registry;
+    var third = fixture.job();
+    third.prompt = @constCast("And this one?");
+    third.history = history.items;
+    third.attached_files = .{ .targets = &third_targets };
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    try expectPromptStartsWith(alloc, second_gateway.request_bodies.items[0], third_gateway.request_bodies.items[0]);
+    try expectGatewayPromptFinalUserText(&third_gateway, 0, "And this one?\n\n" ++ reminder);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(third_gateway.request_bodies.items[0], "ATTACHED_FOLDER_RULE"));
+
+    // A turn that carries no attached files sends no such note, and the
+    // images stay out of it unless the host says they are workspace files.
+    var plain_gateway = FakeGateway.init(alloc, &completions);
+    defer plain_gateway.deinit();
+    var plain_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer plain_hooks.deinit();
+    plain_hooks.context_enabled = true;
+    plain_hooks.context_registry = registry;
+    var plain = fixture.job();
+    plain.prompt = @constCast("Nothing attached.");
+    try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain);
+    try expectBodyNotContains(&plain_gateway, 0, "ATTACHED_FOLDER_RULE");
+    try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+
+    // A host that registers no project instructions, as the libfx cores do,
+    // gets no note for the same attachments.
+    var empty_gateway = FakeGateway.init(alloc, &completions);
+    defer empty_gateway.deinit();
+    var empty_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer empty_hooks.deinit();
+    empty_hooks.context_enabled = true;
+    empty_hooks.context_registry = .{ .default_provider = context_contract.empty_provider };
+    var empty = fixture.job();
+    empty.prompt = @constCast("Look at this file.");
+    empty.attached_files = .{ .targets = &second_targets, .omissions = &second_omissions };
+    try runFakePrompt(&empty_gateway, &empty_hooks, fixture.config(), empty);
+    try expectBodyNotContains(&empty_gateway, 0, "ATTACHED_FOLDER_RULE");
+    try expectBodyNotContains(&empty_gateway, 0, "project-rules-omitted");
+    try std.testing.expectEqual(@as(usize, 0), empty_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+}
+
 test "processQueuedPrompt recovers when a model rejects post-Vision assistant prefill" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3820,6 +3936,80 @@ test "processQueuedPrompt compacts and retries one context overflow" {
     }
 }
 
+test "a turn's compaction renews a rejected login once and the turn sends the renewed one after it" {
+    const alloc = std.testing.allocator;
+    const model = "provider/compaction-login-renewal";
+    const overflow_body =
+        \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+    ;
+    const Case = struct {
+        // The tokens the host gives out: the turn's check before it sends,
+        // then the stored one after the 401, then a forced refresh.
+        tokens: []const []const u8,
+        modes: []const runtime_deps.CredentialRefreshMode,
+    };
+    const cases = [_]Case{
+        // Another fx process renewed the login: the stored one is sent.
+        .{ .tokens = &.{ "token-before", "token-after" }, .modes = &.{ .if_needed, .reload } },
+        // The store still holds the rejected token: one forced refresh.
+        .{ .tokens = &.{ "token-before", "token-before", "token-after" }, .modes = &.{ .if_needed, .reload, .force } },
+    };
+    for (cases) |case| {
+        const completions = [_]FakeCompletion{
+            .{ .status = .bad_request, .err_body = overflow_body },
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+            .{ .content = "Retain the completed prior turn and continue from it." },
+            .{ .content = "COMPACTION_LOGIN_RENEWED" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &.{.{
+            .model = model,
+            .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+        }};
+        hooks.credential_refresh_tokens = case.tokens;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.credential_source = .fx_login;
+        // A tool call leaves work to summarize, so the compaction asks the model.
+        var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+        var prior_results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("prior-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        }};
+        var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior user") },
+            .assistant = @constCast("prior assistant"),
+            .execution = .{ .tool_steps = &prior_steps },
+        } }};
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 2, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 3, "compacted_conversation");
+        try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+        try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[1]);
+        // The summary is sent once more with the renewed login, and the rest
+        // of the turn sends it too, with no second 401.
+        try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[2]);
+        try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[3]);
+        try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, case.modes, hooks.credential_refresh_modes.items);
+        try std.testing.expectEqualStrings("COMPACTION_LOGIN_RENEWED", hooks.finish_assistant_text.?);
+        try std.testing.expect(hooks.http_status == null);
+    }
+}
+
 test "processQueuedPrompt stops after one context overflow recovery" {
     const alloc = std.testing.allocator;
     const model = "provider/repeated-context-overflow";
@@ -5005,6 +5195,70 @@ test "processQueuedPrompt excludes assistant-authored subagent prompts from inpu
         .input_tokens = 0,
         .output_tokens = 5,
     }, hooks.finish_summary.?.token_progress);
+}
+
+/// Runs one fake turn as a subagent of session `session_id`.
+fn runFakeSubagentPrompt(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, fixture: *PromptFixture, session_id: []const u8) !void {
+    var config = fixture.config();
+    config.origin = .subagent;
+    var lifecycle = test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        hooks.alloc,
+        config.workspace_root,
+    );
+    lifecycle.scope.kind = .subagent;
+    lifecycle.scope.session_id = session_id;
+    try test_support.runFakePromptWithLifecycle(gateway, hooks, config, fixture.job(), lifecycle);
+}
+
+test "a subagent turn is recorded for the trace with its session, model, prompt, and outcome" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{ .{ .content = "done" }, .{ .content = "main done" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakeSubagentPrompt(&gateway, &hooks, &fixture, "child-trace");
+    // A main turn is not a subagent turn, so it is not recorded.
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var turns: [diagnostics.subagent_turn_capacity]diagnostics.SubagentTurn = undefined;
+    const n = diagnostics.snapshotSubagentTurns(&turns);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 1), diagnostics.subagentTurnTotal());
+    const turn = &turns[0];
+    try std.testing.expect(turn.subagent_id != 0);
+    try std.testing.expectEqualStrings("child-trace", turn.sessionId());
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", turn.model());
+    try std.testing.expectEqualStrings("user prompt", turn.prompt());
+    try std.testing.expectEqualStrings("completed", turn.outcome());
+    try std.testing.expect(turn.started_at_ms > 0);
+    try std.testing.expect(turn.ended_at_ms >= turn.started_at_ms);
+}
+
+test "a subagent turn whose request is rejected is recorded with how it ended" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"rejected\"}}" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    runFakeSubagentPrompt(&gateway, &hooks, &fixture, "child-rejected") catch {};
+
+    var turns: [diagnostics.subagent_turn_capacity]diagnostics.SubagentTurn = undefined;
+    const n = diagnostics.snapshotSubagentTurns(&turns);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("child-rejected", turns[0].sessionId());
+    try std.testing.expectEqualStrings("failed", turns[0].outcome());
+    try std.testing.expect(turns[0].ended_at_ms != 0);
 }
 
 test "processQueuedPrompt estimates raw reasoning and content independently of chunk boundaries" {
@@ -9723,11 +9977,27 @@ const empty_reply_prompt = "Your last reply had no text and no tool call.";
 const reasoning_only_state =
     "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]";
 
+/// What a two-turn check scripts for the first turn's tool calls: what each
+/// call hands back, and the feedback the user types as each one is approved.
+const TurnScript = struct {
+    exec_plans: []const test_support.FakeExecPlan = &.{},
+    permission_feedback: []const []const u8 = &.{},
+};
+
+fn expectNextTurnExtendsLastRequest(
+    completions: []const FakeCompletion,
+    last_request: usize,
+    prompt: []const u8,
+) !void {
+    try expectNextTurnExtendsLastRequestWith(.{}, completions, last_request, prompt);
+}
+
 /// Runs a turn on `completions`, whose request number `last_request` ends it
 /// and carries `prompt`. Then runs a second turn over the history the first
 /// saved, and fails unless the second turn's first request opens with all of
 /// that request: the provider's prompt cache still covers it.
-fn expectNextTurnExtendsLastRequest(
+fn expectNextTurnExtendsLastRequestWith(
+    script: TurnScript,
     completions: []const FakeCompletion,
     last_request: usize,
     prompt: []const u8,
@@ -9737,6 +10007,8 @@ fn expectNextTurnExtendsLastRequest(
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
+    hooks.exec_plans = script.exec_plans;
+    hooks.permission_feedback = script.permission_feedback;
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(unmarked_model);
@@ -9833,6 +10105,167 @@ test "the next turn extends the request that carried the empty-reply nudge after
         .{ .content = "Answer" },
     };
     try expectNextTurnExtendsLastRequest(&completions, 2, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried a tool's notice" {
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    const plans = [_]test_support.FakeExecPlan{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "continue with degraded visual evidence",
+    } }};
+    try expectNextTurnExtendsLastRequestWith(
+        .{ .exec_plans = &plans },
+        &completions,
+        1,
+        "continue with degraded visual evidence",
+    );
+}
+
+test "a tool's notice follows every result of its step, in the request and in the next turn" {
+    const calls = [_]ToolCall{
+        toolCall("call_1", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_2", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    // The first call raises the notice: it waits for the second call's result.
+    const plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "first output", .system_notice = "notice from the first call" } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    try expectNextTurnExtendsLastRequestWith(.{ .exec_plans = &plans }, &completions, 1, "notice from the first call");
+
+    var gateway = FakeGateway.init(std.testing.allocator, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer hooks.deinit();
+    hooks.exec_plans = &plans;
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "notice from the first call" });
+}
+
+test "a tool's notice and permission feedback keep one order in the request and in the next turn" {
+    const calls = [_]ToolCall{
+        toolCall("call_1", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_2", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    // The notice comes from the first call and the feedback is typed for the
+    // second, and the other way round.
+    const notice_first = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "first output", .system_notice = "notice from the first call" } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    try expectNextTurnExtendsLastRequestWith(
+        .{ .exec_plans = &notice_first, .permission_feedback = &.{ "", "feedback for the second call" } },
+        &completions,
+        1,
+        "notice from the first call",
+    );
+    const notice_second = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "first output" } },
+        .{ .result = .{ .model_output = "second output", .system_notice = "notice from the second call" } },
+    };
+    try expectNextTurnExtendsLastRequestWith(
+        .{ .exec_plans = &notice_second, .permission_feedback = &.{ "feedback for the first call", "" } },
+        &completions,
+        1,
+        "notice from the second call",
+    );
+}
+
+test "a tool's notice raised on the last step the limit allows is saved with the turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "notice on the last step",
+    } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 1;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+
+    var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_fixture = PromptFixture{};
+    var next_job = next_fixture.job();
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+    try runFakePrompt(&next_gateway, &next_hooks, next_fixture.config(), next_job);
+    try test_support.expectPromptExtends(gateway.request_bodies.items[0], next_gateway.request_bodies.items[0]);
+    try expectBodyContainsInOrder(&next_gateway, 0, &.{ "tool output", "notice on the last step", "second prompt" });
+}
+
+test "the next turn extends the request after any placement of notices and feedback in a step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var count: usize = 1;
+    while (count <= 3) : (count += 1) {
+        const calls = try arena.alloc(ToolCall, count);
+        for (calls, 0..) |*call, index| {
+            call.* = toolCall(
+                try arena.print("call_{d}", .{index}),
+                "read_file",
+                try arena.print("{{\"path\":\"file_{d}\"}}", .{index}),
+            );
+        }
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = calls },
+            .{ .content = "Done reading" },
+        };
+        const masks: usize = @as(usize, 1) << @intCast(count);
+        var notices: usize = 0;
+        while (notices < masks) : (notices += 1) {
+            var feedback: usize = 0;
+            while (feedback < masks) : (feedback += 1) {
+                const plans = try arena.alloc(test_support.FakeExecPlan, count);
+                const typed = try arena.alloc([]const u8, count);
+                var first_notice: []const u8 = "";
+                for (plans, typed, 0..) |*plan, *text, index| {
+                    const notice: ?[]const u8 = if (notices & (@as(usize, 1) << @intCast(index)) != 0)
+                        try arena.print("notice from call {d}", .{index})
+                    else
+                        null;
+                    if (notice != null and first_notice.len == 0) first_notice = notice.?;
+                    plan.* = .{ .result = .{
+                        .model_output = try arena.print("output of call {d}", .{index}),
+                        .system_notice = notice,
+                    } };
+                    text.* = if (feedback & (@as(usize, 1) << @intCast(index)) != 0)
+                        try arena.print("feedback for call {d}", .{index})
+                    else
+                        "";
+                }
+                try expectNextTurnExtendsLastRequestWith(
+                    .{ .exec_plans = plans, .permission_feedback = typed },
+                    &completions,
+                    1,
+                    first_notice,
+                );
+            }
+        }
+    }
 }
 
 test "completed assistant provider replay survives turn materialization" {

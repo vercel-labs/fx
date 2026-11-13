@@ -806,6 +806,7 @@ print('{{}}')""",
 
         for alignment in PROFILE_SECTION_ALIGNMENTS:
             self.assertIn(alignment, instrumented)
+        self.assertIn(f"-Wl,-map,{self.paths.logs / 'instrumented-link.map'}", instrumented)
         self.assertIn("-mmacosx-version-min=13.0", instrumented)
         self.assertIn(str(self.toolchain.tools.sdk), instrumented)
         self.assertIn(str(self.toolchain.profile_runtime), instrumented)
