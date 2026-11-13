@@ -305,6 +305,9 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
+    /// The usage of every turn the prompt ran, its own and each report turn
+    /// after it. The response reports it. Written by the prompt's own thread.
+    usage: types.Usage = .{},
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -2510,6 +2513,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         &active.msg,
         active.mode,
         active.permission_mode,
+        &active.usage,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -2604,14 +2608,10 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
         .stop_reason => |stop_reason| {
             var response: std.Io.Writer.Allocating = .init(active.alloc);
             defer response.deinit();
-            const usage = if (active.state.active_session) |*session|
-                session.session_rt.agent.turn_usage
-            else
-                types.Usage{};
             try acp_types.writePromptResponseWithUsage(
                 &response.writer,
                 stop_reason,
-                usage,
+                active.usage,
             );
             try active.state.writer.writeResponse(active.alloc, active.msg.id, response.writer.buffered());
         },
