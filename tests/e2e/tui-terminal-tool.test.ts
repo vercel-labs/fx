@@ -311,7 +311,8 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain('\\"state\\":\\"completed\\"');
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
+    // The run returned before the command ended, so its row has no exit status.
+    expect(scrollback).toContain("Still running sleep 2; printf CAPTURED_DONE");
     expect(scrollback).toContain("Observed sleep 2; printf CAPTURED_DONE");
     expect(scrollback).not.toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
@@ -687,7 +688,7 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
-    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("├ Still running ")).toBe(`├ Still running ${launchCommand}`);
     expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
     expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -886,7 +887,7 @@ test.skipIf(!tmuxAvailable())(
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
-    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("├ Still running ")).toBe(`├ Still running ${launchCommand}`);
     expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
