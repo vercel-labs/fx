@@ -110,6 +110,7 @@ test "composer shortcut table excludes app and terminal controls" {
         15,
         16,
         18,
+        20,
         22,
         24,
         '\r',

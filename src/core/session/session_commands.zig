@@ -990,7 +990,18 @@ pub fn Commands(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, announce: bool, persist: bool) !void {
+        /// What the transcript says about an applied effort.
+        const EffortReport = enum {
+            /// One line naming the level and the model.
+            named,
+            /// The settings line saying where the level was saved.
+            saved,
+            /// Nothing unless saving failed or left a warning: the caller
+            /// reports the change, or the status line alone names the level.
+            none,
+        };
+
+        fn applyEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, report: EffortReport, persist: bool) !void {
             agent.effort = effort;
             agent.worker.syncQueuedPromptEffort(agent.effort);
 
@@ -1000,11 +1011,11 @@ pub fn Commands(comptime App: type) type {
                     agent,
                     .{ .effort = agent.effort },
                     "effort",
-                    !announce,
+                    report == .saved,
                 );
             }
 
-            if (announce) try announceEffortSelection(app, agent);
+            if (report == .named) try announceEffortSelection(app, agent);
             app.shell.render_requests.request(.footer);
         }
 
@@ -1020,12 +1031,43 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn selectEffortFromSettings(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
-            try applyEffort(app, agent, effort, false, true);
+            try applyEffort(app, agent, effort, .saved, true);
         }
 
         /// Applies `effort` to `agent`'s model, saves it, and names it.
         pub fn selectEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
-            try applyEffort(app, agent, effort, true, true);
+            try applyEffort(app, agent, effort, .named, true);
+        }
+
+        /// Ctrl+T: moves `agent`'s model to the next reasoning effort level it
+        /// offers, lowest to highest and from the highest back to the lowest.
+        /// `default`, or a level the model does not offer, moves to the
+        /// lowest. Saves the level as `/effort` does and leaves the transcript
+        /// alone, as Shift+Tab does for the permission mode: the status line
+        /// names the level in use. A running turn keeps the effort it started
+        /// with. A model without levels gets the notice `/effort` gives.
+        pub fn cycleEffort(app: *App, agent: *AppAgent) !void {
+            const model = provider_runtime.modelOf(app, agent);
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const next = model_capabilities.nextReasoningEffort(capabilities, agent.effort) orelse {
+                try writeNoEffortLevelsNotice(app, model, "ctrl+t");
+                return;
+            };
+            // A model with one level that is already in use has nowhere to go.
+            if (next.eql(agent.effort)) return;
+            try applyEffort(app, agent, next, .none, true);
+        }
+
+        /// Says why `model` offers no levels: it has none, or its catalog
+        /// entry has not loaded, in which case `retry` names what to try again.
+        fn writeNoEffortLevelsNotice(app: *App, model: []const u8, retry: []const u8) !void {
+            const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
+            const message = if (loading)
+                try app.alloc.print("levels for {s} are still loading; try {s} again in a moment", .{ model, retry })
+            else
+                try app.alloc.print("{s} has no levels to choose from", .{model});
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
         }
 
         /// What `/effort` asks of the shell once its arguments are handled.
@@ -1043,13 +1085,7 @@ pub fn Commands(comptime App: type) type {
             const model = provider_runtime.modelOf(app, agent);
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len == 0) {
-                const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
-                const message = if (loading)
-                    try app.alloc.print("levels for {s} are still loading; try /effort again in a moment", .{model})
-                else
-                    try app.alloc.print("{s} has no levels to choose from", .{model});
-                defer app.alloc.free(message);
-                try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
+                try writeNoEffortLevelsNotice(app, model, "/effort");
                 return .done;
             }
             const level = std.mem.trim(u8, rest, " \t\r\n");
@@ -1093,7 +1129,7 @@ pub fn Commands(comptime App: type) type {
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len > 0) {
-                try applyEffort(app, agent, effort, false, false);
+                try applyEffort(app, agent, effort, .none, false);
                 patch.effort = effort;
             }
             const selected_ultrafast_mode = capabilities.supports_ultrafast_mode and ultrafast_mode;
