@@ -47,8 +47,15 @@ link execution and results to the issuing `model.end`. These aren't span IDs.
 | Permission | Whole admission evaluation and its decision/error, not an inferred human wait |
 | Input wait | Actual approval/question/MCP form or URL request, owning call, request identity, bounded content, and outcome |
 | MCP | Configured server and original tool/action, owning call, transport/correlation identity, and terminal status |
-| Delegation | Accepted dispatch, child session and durable work ID, replay/yield/completion/cancellation |
+| Delegation | Accepted dispatch, child session and durable work ID, replay/yield/completion/cancellation; only on a session that has the subagent tool, which `createFxAgent()` and `createFxEngine()` sessions don't |
 | Persistence | Restored position and open turn; validated append cursor and sequence range; failure/fencing |
+
+Delegation events report work the subagent tool starts. A session made by
+`createFxAgent()` or `createFxEngine()` starts with `libfx/new`, which doesn't
+enable the subagent host, so the model isn't offered the tool and the session
+emits no delegation events. They occur on ACP sessions that opt in to hooks with
+`_meta.fx.hooks` on `session/new`, `session/load`, or `session/resume`, when the
+model delegates work.
 
 The main model, compaction, review, vision, and title paths report distinct
 purposes without synthesizing user turns for auxiliary calls. Review retries
