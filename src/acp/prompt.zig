@@ -42,6 +42,7 @@ const file_mutation_contract = @import("../core/tooling/file_mutation_contract.z
 const catalog_state = @import("../core/mcp/catalog_state.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
+const mcp_tools = @import("../core/mcp/features/tools.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
@@ -672,11 +673,81 @@ const ResumeRerun = struct {
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
-    if (comptime host_target.is_wasm) return js_host_tools.provider();
     return .{
         .context = @ptrCast(state),
-        .call_fn = callHostTool,
+        .call_fn = callHostToolWithSchemaTypes,
     };
+}
+
+/// Calls a host tool on this backend with `hostToolArguments`, so both
+/// backends send the same input.
+fn callHostToolWithSchemaTypes(
+    raw_state: *anyopaque,
+    alloc: Allocator,
+    name: []const u8,
+    call_id: []const u8,
+    arguments_json: []const u8,
+    max_result_bytes: usize,
+    cancel_flag: ?*std.atomic.Value(bool),
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const sent = try hostToolArguments(arena_state.allocator(), state.host_tools.dynamic_tools, name, arguments_json);
+    if (comptime host_target.is_wasm) {
+        return js_host_tools.provider().call(alloc, name, call_id, sent, max_result_bytes, cancel_flag);
+    }
+    return callHostTool(raw_state, alloc, name, call_id, sent, max_result_bytes, cancel_flag);
+}
+
+/// The arguments to send host tool `name`. A value the model wrote as JSON
+/// text where the tool's `inputSchema` names another type is sent as that
+/// type, as MCP calls are (`src/core/mcp_host/model.zig`); otherwise the
+/// model's own bytes. Allocated in `arena`.
+fn hostToolArguments(
+    arena: Allocator,
+    tools: []const agent_stream_provider.DynamicFunctionTool,
+    name: []const u8,
+    arguments_json: []const u8,
+) Allocator.Error![]const u8 {
+    const tool = for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) break tool;
+    } else return arguments_json;
+    const schema_json = try std.json.Stringify.valueAlloc(arena, tool.input_schema, .{});
+    const repaired = (try mcp_tools.repairArgumentTypes(arena, schema_json, arguments_json)) orelse return arguments_json;
+    for (repaired.fields) |field| {
+        debug_trace.logf("acp", "host tool argument sent as its schema's type tool={s} field={s} type={t}", .{ name, field.name, field.json_type });
+    }
+    return repaired.arguments_json;
+}
+
+test "host tool arguments are sent as the types the tool's schema names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const schema = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        "{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\"},\"exact\":{\"type\":\"boolean\"},\"tags\":{\"type\":\"array\"},\"label\":{\"type\":\"string\"},\"any\":{}}}",
+        .{},
+    );
+    const tools = [_]agent_stream_provider.DynamicFunctionTool{.{ .name = "count", .description = "", .input_schema = schema }};
+
+    try std.testing.expectEqualStrings(
+        "{\"limit\":40,\"exact\":true,\"tags\":[\"a\"],\"label\":\"40\"}",
+        try hostToolArguments(arena, &tools, "count", "{\"limit\":\"40\",\"exact\":\"true\",\"tags\":\"[\\\"a\\\"]\",\"label\":\"40\"}"),
+    );
+    // Text that is not exactly a value of the field's type, a field with no
+    // single type, a tool with no registered schema, and arguments that are
+    // not an object are sent as the model wrote them.
+    for ([_]struct { tool: []const u8, arguments: []const u8 }{
+        .{ .tool = "count", .arguments = "{\"limit\":\"forty\"}" },
+        .{ .tool = "count", .arguments = "{\"any\":\"40\",\"label\":\"x\"}" },
+        .{ .tool = "missing", .arguments = "{\"limit\":\"40\"}" },
+        .{ .tool = "count", .arguments = "[\"40\"]" },
+    }) |case| {
+        try std.testing.expectEqual(case.arguments.ptr, (try hostToolArguments(arena, &tools, case.tool, case.arguments)).ptr);
+    }
 }
 
 fn callHostTool(
