@@ -440,6 +440,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-steer-retract-key",
           VERCEL_OIDC_TOKEN: undefined,
+          // Holds the steer behind the running command so it can be taken back.
+          FX_TEST_STEER_YIELD_GRACE_MS: "600000",
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",

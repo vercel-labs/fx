@@ -758,13 +758,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -1736,6 +1736,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         },
         .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .tool_yield_flag = &ctx.worker.tool_yield_requested,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
@@ -1771,6 +1772,7 @@ fn terminal_lease_cleanup_dispatch_context(
 ) tool_dispatch.DispatchContext {
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.cancel_flag = null;
+    dispatch.tool_yield_flag = null;
     return dispatch;
 }
 
@@ -3657,6 +3659,50 @@ test "removed tool names are not callable" {
         const expected = try arena.print("Unsupported tool: {s}", .{name});
         try std.testing.expectEqualStrings(expected, result.model_output);
     }
+}
+
+test "a call of a tool fx does not know names it as visible text in the result the model reads" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { name: []const u8, shown: []const u8 }{
+        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
+        .{ .name = "", .shown = "Unsupported tool: " },
+        .{ .name = "x\x1b]0;owned\x07y", .shown = "Unsupported tool: x&#x1b;]0;owned&#x07;y" },
+        .{ .name = "a\x00b\r\nc", .shown = "Unsupported tool: a&#x00;b&#x0d;&#x0a;c" },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" };
+        // The same text through the way a native call is run and the way a
+        // wasi host runs a workspace call.
+        const executed = try executeToolCall(rt.context(), arena, call);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, executed.status);
+        try std.testing.expectEqualStrings(case.shown, executed.model_output);
+        const workspace = try executeWorkspaceToolCallInner(rt.context(), arena, call, .ordinary, true);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, workspace.status);
+        try std.testing.expectEqualStrings(case.shown, workspace.model_output);
+    }
+}
+
+test "a workspace call of a tool that is not the one shell tool answers as an unsupported tool" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `read_file` is registered, but a workspace call runs only a registry
+    // of the shell tool alone.
+    const result = try executeWorkspaceToolCallInner(rt.context(), arena, .{
+        .id = "other-tool",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: read_file", result.model_output);
 }
 
 fn registryOwnedWebFetchCall(

@@ -12,6 +12,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -20,6 +21,22 @@ pub const client_id_env = "FX_OAUTH_CLIENT_ID";
 pub const default_client_id = "cl_zzh5hiOZbwJ9bfqEcYqPIJv3TaPaEYL0";
 const e2e_issuer_url_env = "FX_TEST_OAUTH_ISSUER_URL";
 pub const auth_file_name = profile_paths.auth_file_name;
+/// Keeps the Vercel team of the last fx login that fx retired, so a later
+/// sign-in in any fx process starts on the person's team. It holds the team's
+/// id and slug only, never a token.
+pub const kept_team_file_name = "vercel-team.json";
+const max_kept_team_file_bytes = 1024;
+
+/// True when a login has a team `Mutation.keepTeam` can keep: a team id or
+/// slug that is a valid team name.
+pub fn hasKeepableTeam(team_id: ?[]const u8, team_slug: ?[]const u8) bool {
+    return keepableTeamValue(team_id) != null or keepableTeamValue(team_slug) != null;
+}
+
+fn keepableTeamValue(value: ?[]const u8) ?[]const u8 {
+    const team = value orelse return null;
+    return if (types.validGatewayTeam(team)) team else null;
+}
 const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
@@ -457,6 +474,24 @@ const NativeMutation = struct {
         try io_mod.durableReplaceVerified(alloc, &self.fx_dir, auth_file_name, text);
     }
 
+    /// Keeps the team of a login fx is about to retire, so a later sign-in
+    /// starts on it. A login without a team to keep (`hasKeepableTeam`) is
+    /// refused; forget the kept team for it instead.
+    pub fn keepTeam(self: *Mutation, alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !void {
+        const text = (try stringifyKeptTeam(alloc, team_id, team_slug)) orelse return error.NoKeepableTeam;
+        defer alloc.free(text);
+        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, kept_team_file_name, text);
+    }
+
+    /// Forgets the kept team, as a sign-out does. True when there was one.
+    pub fn forgetTeam(self: *Mutation) !bool {
+        self.fx_dir.dir.deleteFile(io_mod.getIo(), kept_team_file_name) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn delete(self: *Mutation, alloc: Allocator) !DeleteResult {
         var result: DeleteResult = .{};
         if (self.backend == .macos_keychain) {
@@ -597,6 +632,14 @@ const HostMutation = struct {
         const revision = try self.store.commit(alloc, text, expected);
         defer alloc.free(revision);
         try self.captureStoredRevision(revision);
+    }
+
+    /// A host keeps no files, so a sign-in there starts only on the saved
+    /// login's team.
+    pub fn keepTeam(_: *HostMutation, _: Allocator, _: ?[]const u8, _: ?[]const u8) !void {}
+
+    pub fn forgetTeam(_: *HostMutation) !bool {
+        return false;
     }
 
     pub fn delete(self: *HostMutation, _: Allocator) !DeleteResult {
@@ -931,6 +974,137 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
         .team_slug = team_slug,
         .team_id = team_id,
     };
+}
+
+/// A team read back from `kept_team_file_name`: each value is a valid team
+/// name (`types.validGatewayTeam`), and at least one is set.
+pub const KeptTeam = struct {
+    id: ?[]u8 = null,
+    slug: ?[]u8 = null,
+
+    pub fn deinit(self: *KeptTeam, alloc: Allocator) void {
+        if (self.id) |value| alloc.free(value);
+        if (self.slug) |value| alloc.free(value);
+        self.* = .{};
+    }
+};
+
+/// The team `Mutation.keepTeam` kept, or null when there is none or it cannot
+/// be used; the trace says why, without the team. It reads without the login
+/// lock: `keepTeam` replaces the file in one rename, so a reader sees either
+/// the old file or the new one.
+pub fn loadKeptTeam(alloc: Allocator) ?KeptTeam {
+    if (comptime host_target.is_wasm) return null;
+    return readKeptTeam(alloc) catch |err| {
+        debug_trace.logf("auth", "kept team ignored reason={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+fn readKeptTeam(alloc: Allocator) !?KeptTeam {
+    const home = io_mod.homeDir() orelse return null;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer home_dir.close(io_mod.getIo());
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer fx_dir.close(io_mod.getIo());
+
+    var current = (try session_presence.openCurrent(fx_dir, kept_team_file_name)) orelse return null;
+    defer current.file.close(io_mod.getIo());
+    const stat = current.stat;
+    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) return error.InsecureKeptTeamFile;
+    const bytes = try io_mod.readFileToEnd(alloc, &current.file, max_kept_team_file_bytes);
+    defer alloc.free(bytes);
+    return try parseKeptTeam(alloc, bytes);
+}
+
+/// Reads a kept-team file. Every value must be a valid team name and at least
+/// one must be set; anything else is `error.InvalidKeptTeam`.
+fn parseKeptTeam(alloc: Allocator, bytes: []const u8) !KeptTeam {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidKeptTeam,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidKeptTeam;
+    const id = try keptTeamValue(parsed.value.object, "team_id");
+    const slug = try keptTeamValue(parsed.value.object, "team_slug");
+    if (id == null and slug == null) return error.InvalidKeptTeam;
+    const id_copy = if (id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (id_copy) |value| alloc.free(value);
+    const slug_copy = if (slug) |value| try alloc.dupe(u8, value) else null;
+    return .{ .id = id_copy, .slug = slug_copy };
+}
+
+fn keptTeamValue(object: std.json.ObjectMap, key: []const u8) error{InvalidKeptTeam}!?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value == .null) return null;
+    if (value != .string or !types.validGatewayTeam(value.string)) return error.InvalidKeptTeam;
+    return value.string;
+}
+
+/// The kept-team file for a team, or null when neither value is a valid team
+/// name.
+fn stringifyKeptTeam(alloc: Allocator, team_id: ?[]const u8, team_slug: ?[]const u8) !?[]u8 {
+    const id = keepableTeamValue(team_id);
+    const slug = keepableTeamValue(team_slug);
+    if (id == null and slug == null) return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{");
+    if (id) |value| {
+        try std.json.Stringify.value("team_id", .{}, writer);
+        try writer.writeAll(":");
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    if (slug) |value| {
+        if (id != null) try writer.writeAll(",");
+        try std.json.Stringify.value("team_slug", .{}, writer);
+        try writer.writeAll(":");
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeAll("}\n");
+    return try out.toOwnedSlice();
+}
+
+fn fuzzParseKeptTeam(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [max_kept_team_file_bytes]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var kept = parseKeptTeam(alloc, buffer[0..len]) catch |err| switch (err) {
+        error.InvalidKeptTeam => return,
+        else => return err,
+    };
+    defer kept.deinit(alloc);
+    try std.testing.expect(kept.id != null or kept.slug != null);
+    if (kept.id) |value| try std.testing.expect(types.validGatewayTeam(value));
+    if (kept.slug) |value| try std.testing.expect(types.validGatewayTeam(value));
+    // What fx writes for that team reads back as the same team.
+    const text = (try stringifyKeptTeam(alloc, kept.id, kept.slug)).?;
+    defer alloc.free(text);
+    var again = try parseKeptTeam(alloc, text);
+    defer again.deinit(alloc);
+    try std.testing.expectEqualDeep(kept.id, again.id);
+    try std.testing.expectEqualDeep(kept.slug, again.slug);
+}
+
+test "a kept team file reads as valid team names or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzParseKeptTeam, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"team_id\":\"team_456\",\"team_slug\":\"other-team\"}\n",
+            "{\"team_slug\":\"other-team\"}",
+            "{\"team_id\":\"team 456;\"}",
+            "{\"team_id\":null,\"team_slug\":null}",
+            "[\"team_456\"]",
+            "{\"team_id\":\"\xe2\x80\xaeteam\"}",
+        }) ++ @import("fuzz_corpus").kept_team_file.*),
+    });
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {

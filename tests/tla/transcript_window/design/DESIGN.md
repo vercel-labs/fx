@@ -52,8 +52,13 @@ current code.
   entry. An entry with a row still on screen is held
   (`applyTranscriptWindowDrops`) until it scrolls into terminal history or a
   resize clears the screen, because the painter repaints the live area from
-  the entries. Nothing trims the transcript by bytes any more, so command
-  output is bounded per command (`command_output_block_cap`, 1 MiB).
+  the entries. A resumed transcript holds every entry until a frame has
+  repainted it from the entries: its first paint is the prepared resume
+  flow, so the reset before that paint keeps them, and the paint leaves no
+  commit anchor to tell which rows are on screen. A transcript that another
+  agent's replaces on the screen after that first paint stops holding them.
+  Nothing trims the transcript by bytes any more, so command output is
+  bounded per command (`command_output_block_cap`, 1 MiB).
 - Resume replays the log from the newest compaction line, or from the start
   of the turn it splits: an overflow compacts after the prompt, and that
   turn shows whole in the cycle the compaction opens, as Ctrl+O shows it.

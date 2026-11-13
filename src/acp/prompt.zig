@@ -966,13 +966,9 @@ pub fn handlePrompt(
         };
     }
 
-    try refreshProjectContext(
-        state,
-        alloc,
-        prompt_input.targets,
-        prompt_input.omissions,
-        prompt_input.omission_summary,
-    );
+    // The prompt's attached files stay out of the instructions: the runtime
+    // delivers their folders' rules as a note on the turn's own message.
+    try refreshProjectContext(state, alloc);
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -1142,6 +1138,11 @@ pub fn handlePrompt(
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
+        .attached_files = .{
+            .targets = prompt_input.targets,
+            .omissions = prompt_input.omissions,
+            .omission_summary = prompt_input.omission_summary,
+        },
         .recovery_checkpoint = recovery_checkpoint,
         // An ACP client keeps what the turn sent before it stopped; an engine
         // in a new process says it holds none of it.
@@ -1373,9 +1374,6 @@ pub fn runSubagentChild(
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
-    targets: []const context_contract.ApplicableTarget,
-    omissions: []const context_contract.ContextOmissionInput,
-    omission_summary: ?context_contract.ContextOmissionSummary,
 ) context_contract.ProviderError!void {
     state.context_snapshot.deinit(alloc);
     if (!state.context_enabled) return;
@@ -1383,9 +1381,6 @@ fn refreshProjectContext(
     state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
-        .targets = targets,
-        .omissions = omissions,
-        .omission_summary = omission_summary,
         .context_limits = state.context_limits,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
@@ -3021,6 +3016,8 @@ fn runReportTurns(
         job.delivery = .continuation;
         job.images = &.{};
         job.authorized_image_catalog = &.{};
+        // The first turn's attachments have delivered their folders' rules.
+        job.attached_files = .{};
         job.history = history;
         job.unversioned_history_count = session.session_rt.unversionedHistoryEnd();
         job.recovery_checkpoint = null;
@@ -5179,19 +5176,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     state.context_enabled = false;
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
 
@@ -5199,7 +5196,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, alloc, &.{}, &.{}, null),
+        refreshProjectContext(&state, alloc),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
@@ -5239,7 +5236,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
 
     var ctx = AcpContext{
         .alloc = alloc,

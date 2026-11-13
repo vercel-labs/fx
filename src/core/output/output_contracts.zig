@@ -16,6 +16,7 @@ const session_display_metadata = @import("../session/session_display_metadata.zi
 const session_json = @import("../session/session_json.zig");
 const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
+const session_list_text = @import("session_list_text.zig");
 const usage = @import("../../usage/usage.zig");
 const local_time = @import("../shared/local_time.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -1442,12 +1443,17 @@ pub const ModelListSnapshot = struct {
     }
 };
 
+/// How `fx sessions` and `fx sessions --live` print their text: color and
+/// width for a terminal, and the clock and home folder rows read from.
+pub const ListStyle = session_list_text.Style;
+
 pub const SessionListSnapshot = struct {
     sessions: []const session_store.SessionSummary,
     has_more: bool = false,
     next_cursor: ?[]const u8 = null,
     skipped_invalid: usize = 0,
     all_workspaces: bool = false,
+    style: ListStyle = .{},
 
     pub fn render(self: SessionListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1457,41 +1463,15 @@ pub const SessionListSnapshot = struct {
     }
 
     pub fn renderText(self: SessionListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.sessions.len == 0 and self.skipped_invalid == 0) {
-            return alloc.print("[sessions] no saved sessions\n", .{});
-        }
-
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-
-        if (self.sessions.len == 0) {
-            try out.writer.writeAll("[sessions] no readable saved sessions\n");
-        } else {
-            try out.writer.print("[sessions] {d} saved\n", .{self.sessions.len});
-            for (self.sessions) |entry| {
-                try out.writer.writeAll(" - ");
-                try writeTerminalSafe(
-                    &out.writer,
-                    alloc,
-                    entry.title orelse session_display_metadata.fallback_title,
-                );
-                try out.writer.writeByte('\n');
-                try writeSessionListDetails(&out.writer, alloc, entry);
-            }
-        }
-        if (self.has_more) {
-            try out.writer.print(
-                "[sessions] more saved sessions; continue with `fx sessions {s}--cursor {s}`\n",
-                .{ if (self.all_workspaces) "--all " else "", self.next_cursor orelse "" },
-            );
-        }
-        if (self.skipped_invalid > 0) {
-            try out.writer.print(
-                "[sessions] warning: skipped {d} unreadable saved session{s}; run `fx doctor` for recovery guidance\n",
-                .{ self.skipped_invalid, if (self.skipped_invalid == 1) "" else "s" },
-            );
-        }
-
+        try session_list_text.writeSaved(&out.writer, alloc, .{
+            .sessions = self.sessions,
+            .has_more = self.has_more,
+            .next_cursor = self.next_cursor,
+            .skipped_invalid = self.skipped_invalid,
+            .all_workspaces = self.all_workspaces,
+        }, self.style);
         return try out.toOwnedSlice();
     }
 
@@ -1526,66 +1506,6 @@ pub const SessionListSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
-
-fn writeSessionListDetails(
-    writer: *std.Io.Writer,
-    alloc: Allocator,
-    entry: session_store.SessionSummary,
-) !void {
-    try writer.print(
-        "   id={s} | {d} turn{s}",
-        .{ entry.id, entry.history_len, if (entry.history_len == 1) "" else "s" },
-    );
-    if (sessionLanguageLabel(entry.conversation_language.view())) |label| {
-        try writer.writeAll(" | ");
-        try writeTerminalSafe(writer, alloc, label);
-    }
-    try writer.writeAll(" | updated ");
-    try writeLocalTimestamp(writer, entry.updated_at_ms);
-    try writer.writeByte('\n');
-}
-
-fn sessionLanguageLabel(tag: []const u8) ?[]const u8 {
-    if (std.ascii.eqlIgnoreCase(tag, "und")) return null;
-
-    if (tag.len > 4 and std.ascii.eqlIgnoreCase(tag[0..4], "und-")) {
-        const script = tag[4..];
-        if (std.ascii.eqlIgnoreCase(script, "Latn")) return "Latin script";
-        if (std.ascii.eqlIgnoreCase(script, "Hani")) return "Han script";
-        if (std.ascii.eqlIgnoreCase(script, "Arab")) return "Arabic script";
-        if (std.ascii.eqlIgnoreCase(script, "Hebr")) return "Hebrew script";
-        if (std.ascii.eqlIgnoreCase(script, "Cyrl")) return "Cyrillic script";
-        if (std.ascii.eqlIgnoreCase(script, "Grek")) return "Greek script";
-        if (std.ascii.eqlIgnoreCase(script, "Deva")) return "Devanagari script";
-        if (std.ascii.eqlIgnoreCase(script, "Thai")) return "Thai script";
-        return tag;
-    }
-
-    const separator = std.mem.findScalar(u8, tag, '-') orelse tag.len;
-    const primary = tag[0..separator];
-    if (std.ascii.eqlIgnoreCase(primary, "en")) return "English";
-    if (std.ascii.eqlIgnoreCase(primary, "es")) return "Spanish";
-    if (std.ascii.eqlIgnoreCase(primary, "fr")) return "French";
-    if (std.ascii.eqlIgnoreCase(primary, "de")) return "German";
-    if (std.ascii.eqlIgnoreCase(primary, "it")) return "Italian";
-    if (std.ascii.eqlIgnoreCase(primary, "pt")) return "Portuguese";
-    if (std.ascii.eqlIgnoreCase(primary, "ja")) return "Japanese";
-    if (std.ascii.eqlIgnoreCase(primary, "ko")) return "Korean";
-    if (std.ascii.eqlIgnoreCase(primary, "zh")) return "Chinese";
-    if (std.ascii.eqlIgnoreCase(primary, "ar")) return "Arabic";
-    if (std.ascii.eqlIgnoreCase(primary, "he")) return "Hebrew";
-    if (std.ascii.eqlIgnoreCase(primary, "ru")) return "Russian";
-    if (std.ascii.eqlIgnoreCase(primary, "el")) return "Greek";
-    if (std.ascii.eqlIgnoreCase(primary, "hi")) return "Hindi";
-    if (std.ascii.eqlIgnoreCase(primary, "th")) return "Thai";
-    return tag;
-}
-
-/// `2026-10-16 13:31:49.123 PDT` in local time, or `unknown`.
-fn writeLocalTimestamp(writer: *std.Io.Writer, timestamp_ms: i64) !void {
-    const reading = local_time.local(timestamp_ms) orelse return writer.writeAll("unknown");
-    try writer.print("{f}", .{reading});
-}
 
 pub const SessionSummarySnapshot = struct {
     summary: session_store.SessionSummary,
@@ -1838,6 +1758,7 @@ test "session detail text shows saved control bytes as escapes and keeps lines a
 pub const LiveSessionListSnapshot = struct {
     sessions: []const session_store.LiveSession,
     all_workspaces: bool = false,
+    style: ListStyle = .{},
 
     pub fn render(self: LiveSessionListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1847,26 +1768,9 @@ pub const LiveSessionListSnapshot = struct {
     }
 
     pub fn renderText(self: LiveSessionListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.sessions.len == 0) return alloc.dupe(u8, "[sessions] no live sessions\n");
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.print("[sessions] {d} live\n", .{self.sessions.len});
-        for (self.sessions) |entry| {
-            try out.writer.writeAll(" - ");
-            try writeTerminalSafe(&out.writer, alloc, entry.summary.title orelse session_display_metadata.fallback_title);
-            try out.writer.print("\n   id={s} | {s} | ", .{ entry.summary.id, @tagName(entry.state) });
-            try out.writer.writeAll("saved model ");
-            try writeTerminalSafe(&out.writer, alloc, entry.saved_model orelse "unknown");
-            try out.writer.writeAll(" | updated ");
-            try writeLocalTimestamp(&out.writer, entry.summary.updated_at_ms);
-            try out.writer.writeByte('\n');
-            if (self.all_workspaces) if (entry.summary.workspace_root) |root| {
-                try out.writer.writeAll("   workspace=");
-                try writeTerminalSafe(&out.writer, alloc, root);
-                try out.writer.writeByte('\n');
-            };
-            try writeLiveAgentsText(&out.writer, entry.agents, 3);
-        }
+        try session_list_text.writeLive(&out.writer, alloc, self.sessions, self.all_workspaces, self.style);
         return try out.toOwnedSlice();
     }
 
@@ -1892,17 +1796,6 @@ pub const LiveSessionListSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
-
-/// One line per subagent, `<indent>- <name> | <state> | <address>`, with
-/// its own subagents two spaces further in. Names and addresses are agent
-/// names and session ids, which never hold terminal control bytes.
-fn writeLiveAgentsText(writer: *std.Io.Writer, agents: []const session_store.LiveAgent, indent: usize) !void {
-    for (agents) |agent| {
-        try writer.splatByteAll(' ', indent);
-        try writer.print("- {s} | {s} | {s}\n", .{ agent.name, @tagName(agent.state), agent.address });
-        try writeLiveAgentsText(writer, agent.agents, indent + 2);
-    }
-}
 
 fn writeLiveAgentsJson(writer: *std.Io.Writer, agents: []const session_store.LiveAgent) !void {
     try writer.writeByte('[');
@@ -1932,10 +1825,10 @@ test "a live listing prints each subagent under the one that started it, and esc
     }};
     const text = try (LiveSessionListSnapshot{ .sessions = &sessions, .all_workspaces = true }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "[sessions] 1 live\n - Fix "));
+    try std.testing.expect(std.mem.startsWith(u8, text, "1 live session in all workspaces  ·  1 working\nModel openai/gpt-5\n\n"));
     try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
-    try std.testing.expect(std.mem.find(u8, text, "   id=abc | working | saved model openai/gpt-5 | updated ") != null);
-    try std.testing.expect(std.mem.endsWith(u8, text, "   workspace=/Users/example/w\n   - lead | idle | abc/lead\n     - helper | working | abc/lead/helper\n"));
+    try std.testing.expect(std.mem.find(u8, text, "\nFix \\x1b[31mred  working  just now  abc         /Users/example/w\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\n└─ lead          idle\n   └─ helper     working\n") != null);
     const json = try (LiveSessionListSnapshot{ .sessions = &sessions }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"agents\":[{\"name\":\"lead\",\"address\":\"abc/lead\",\"id\":\"l1\",\"state\":\"idle\",\"agents\":[{\"name\":\"helper\"") != null);
@@ -3342,7 +3235,11 @@ test "core session list snapshot text and json stay stable" {
     const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n",
+        "1 saved session in this workspace, newest first\n\n" ++
+            "TITLE          TURNS  UPDATED   SESSION ID\n" ++
+            "Session title      3  just now  abc\n\n" ++
+            "Read a session    fx session <session id> --tail 5\n" ++
+            "Running now       fx sessions --live\n",
         text,
     );
 
@@ -3360,8 +3257,12 @@ test "core session list snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(paged_text);
     try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n" ++
-            "[sessions] more saved sessions; continue with `fx sessions --cursor v1:2:abc`\n",
+        "Newest 1 saved session in this workspace\n\n" ++
+            "TITLE          TURNS  UPDATED   SESSION ID\n" ++
+            "Session title      3  just now  abc\n\n" ++
+            "More              fx sessions --cursor v1:2:abc\n" ++
+            "Read a session    fx session <session id> --tail 5\n" ++
+            "Running now       fx sessions --live\n",
         paged_text,
     );
 
@@ -3387,35 +3288,31 @@ test "core session list snapshot text and json stay stable" {
     };
     const fallback_text = try (SessionListSnapshot{ .sessions = &fallback_sessions }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(fallback_text);
-    try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - Untitled session\n   id=legacy | 0 turns | updated 1970-01-01 00:00:00.002 UTC\n",
-        fallback_text,
-    );
+    try std.testing.expect(std.mem.find(u8, fallback_text, "\nUntitled session      0  just now  legacy\n") != null);
 
     var script_session = fallback_sessions[0];
     script_session.conversation_language = types.ConversationLanguage.literal("und-Latn");
     script_session.history_len = 1;
     const script_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &script_session) }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(script_text);
-    try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - Untitled session\n   id=legacy | 1 turn | Latin script | updated 1970-01-01 00:00:00.002 UTC\n",
-        script_text,
-    );
+    // The language is in JSON only.
+    try std.testing.expect(std.mem.find(u8, script_text, "\nUntitled session      1  just now  legacy\n") != null);
+    try std.testing.expect(std.mem.find(u8, script_text, "Latin") == null);
 
     const long_title = text_utils.repeat("a", session_display_metadata.max_title_bytes);
     var long_session = sessions[0];
     long_session.title = @constCast(long_title);
     const long_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &long_session) }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(long_text);
-    try std.testing.expect(std.mem.startsWith(u8, long_text, "[sessions] 1 saved\n - " ++ long_title ++ "\n"));
-    try std.testing.expect(std.mem.find(u8, long_text, "\n   id=abc | 3 turns") != null);
+    // Outside a terminal a title prints whole.
+    try std.testing.expect(std.mem.find(u8, long_text, "\n" ++ long_title ++ "      3  just now  abc\n") != null);
 
     const warning_text = try (SessionListSnapshot{
         .sessions = &sessions,
         .skipped_invalid = 2,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(warning_text);
-    try std.testing.expect(std.mem.find(u8, warning_text, "skipped 2 unreadable saved sessions") != null);
+    try std.testing.expect(std.mem.endsWith(u8, warning_text, "\nSkipped 2 unreadable saved sessions; run `fx doctor` for recovery guidance\n"));
 
     const warning_json = try (SessionListSnapshot{
         .sessions = &.{},
@@ -3440,12 +3337,10 @@ test "core session list text reads updated times in the local zone" {
     };
     local_time.test_zone = .{ .offset_s = 5 * std.time.s_per_hour + 30 * std.time.s_per_min, .name = "IST" };
     defer local_time.test_zone = .utc;
-    const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
+    const text = try (SessionListSnapshot{ .sessions = &sessions, .style = .{ .now_ms = 1_800_000_000_000 } }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - Untitled session\n   id=local | 0 turns | updated 2023-11-15 03:43:20.123 IST\n",
-        text,
-    );
+    // 2023-11-14 22:13:20 UTC is already the 15th in IST.
+    try std.testing.expect(std.mem.find(u8, text, "\nUntitled session      0  2023-11-15  local\n") != null);
 }
 
 test "core session list text visibly escapes terminal controls in titles" {
@@ -3462,14 +3357,11 @@ test "core session list text visibly escapes terminal controls in titles" {
 
     const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - \\x1b[2Jbreak\\x0anext\n" ++
-            "   id=hostile-title | 0 turns | updated 1970-01-01 00:00:00.002 UTC\n",
-        text,
-    );
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, text, "\n\\x1b[2Jbreak\\x0anext      0  just now  hostile-title\n") != null);
 }
 
-test "core session list text visibly escapes terminal controls in unknown language tags" {
+test "core session list text leaves out the language, so a hostile tag never prints" {
     const sessions = [_]session_store.SessionSummary{
         .{
             .id = @constCast("hostile-language"),
@@ -3482,11 +3374,9 @@ test "core session list text visibly escapes terminal controls in unknown langua
 
     const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - Untitled session\n" ++
-            "   id=hostile-language | 0 turns | \\x1b[2J | updated 1970-01-01 00:00:00.002 UTC\n",
-        text,
-    );
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, text, "2J") == null);
+    try std.testing.expect(std.mem.find(u8, text, "\nUntitled session      0  just now  hostile-language\n") != null);
 }
 
 test "core session summary snapshot text and json stay stable" {
