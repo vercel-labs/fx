@@ -139,6 +139,7 @@ pub const Agent = struct {
         self.dropHistory(alloc);
         // A new conversation lists what the toolbox holds now.
         self.toolbox_menu = .{};
+        if (self.compaction_requested) debug_trace.logf("agent", "dropping the requested compaction: the conversation was cleared", .{});
         self.compaction_requested = false;
     }
 

@@ -47,27 +47,45 @@ pub const ProviderCompaction = model_capabilities.ProviderCompaction;
 /// sent before it. Claude 4.6 and later answer Anthropic's on-demand
 /// compaction (Claude 4.5 rejects it), and GPT-6 and later answer OpenAI's.
 pub fn providerCompaction(model: []const u8) ?ProviderCompaction {
-    if (versionAfter(model, "anthropic/claude-", true)) |version| {
-        if (version.major > 4 or (version.major == 4 and version.minor >= 6)) return .anthropic;
+    if (claudeVersion(model)) |version| {
+        if (version.atLeast(first_claude_compaction)) return .anthropic;
     }
-    if (versionAfter(model, "openai/gpt-", false)) |version| {
-        if (version.major >= 6) return .openai;
+    if (gptVersion(model)) |version| {
+        if (version.atLeast(first_gpt_compaction)) return .openai;
     }
     return null;
 }
 
-const ModelVersion = struct { major: u32, minor: u32 };
+const first_claude_compaction: ModelVersion = .{ .major = 4, .minor = 6 };
+const first_gpt_compaction: ModelVersion = .{ .major = 6, .minor = 0 };
 
-/// The version after `prefix` in `model`, past a family name when
-/// `after_family`: "anthropic/claude-opus-4.6" reads 4.6, and a version
-/// without a minor part reads as .0.
-fn versionAfter(model: []const u8, prefix: []const u8, after_family: bool) ?ModelVersion {
-    if (!std.mem.startsWith(u8, model, prefix)) return null;
-    var rest = model[prefix.len..];
-    if (after_family) {
-        const dash = std.mem.findScalar(u8, rest, '-') orelse return null;
-        rest = rest[dash + 1 ..];
+const ModelVersion = struct {
+    major: u32,
+    minor: u32,
+
+    fn atLeast(self: ModelVersion, first: ModelVersion) bool {
+        return self.major > first.major or (self.major == first.major and self.minor >= first.minor);
     }
+};
+
+/// "anthropic/claude-opus-4.6" reads 4.6: the version follows the family name.
+fn claudeVersion(model: []const u8) ?ModelVersion {
+    const prefix = "anthropic/claude-";
+    if (!std.mem.startsWith(u8, model, prefix)) return null;
+    const rest = model[prefix.len..];
+    const dash = std.mem.findScalar(u8, rest, '-') orelse return null;
+    return leadingVersion(rest[dash + 1 ..]);
+}
+
+/// "openai/gpt-6.1-sol" reads 6.1.
+fn gptVersion(model: []const u8) ?ModelVersion {
+    const prefix = "openai/gpt-";
+    if (!std.mem.startsWith(u8, model, prefix)) return null;
+    return leadingVersion(model[prefix.len..]);
+}
+
+/// The `major[.minor]` that `rest` starts with; no minor part reads as .0.
+fn leadingVersion(rest: []const u8) ?ModelVersion {
     var end: usize = 0;
     while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
     const major = std.fmt.parseUnsigned(u32, rest[0..end], 10) catch return null;
