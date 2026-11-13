@@ -1578,6 +1578,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   // The prompt's rows with trailing blanks cut, so a row can be matched whole.
   const promptRows = (pane: string) => pane.split("\n").map((row) => row.trimEnd());
 
+  // Waits until `label` shows in a prompt laid out `width` columns wide, and
+  // returns its rows. A divider row of exactly that width is what the layout
+  // from before a resize cannot hold, so the wait ends on the new layout, not
+  // on a sleep.
+  const waitForPromptAt = async (session: TmuxSession, width: number, label: string) =>
+    promptRows(await session.waitForPane((pane) => pane.includes(label) && promptRows(pane).includes("\u2500".repeat(width)), 10_000));
+
   test(
     "a subagent's session-wide options say they cover all agents, whole at 80 and 60 columns",
     async () => {
@@ -1608,21 +1615,24 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // Its file prompt, which main's screen shows, offers a session-wide
         // grant that main and every other agent read too.
         for (const width of [80, 60]) {
-          await session.resizeWindow(width, 40, 500);
-          const rows = promptRows(await session.waitForPane((pane) => pane.includes("Apply + allow workspace file access"), 10_000));
+          await session.resizeWindow(width, 40, 0);
+          const rows = await waitForPromptAt(session, width, "Apply + allow workspace file access");
           expect(rows).toContain("  ❯ 1  Apply once");
           expect(rows).toContain("    2  Apply + allow workspace file access for all agents");
           expect(rows).toContain("    3  Don't apply");
           expect(rows.join("\n")).not.toContain("for this session");
           expect(rows.join("\n")).not.toContain("resize to review");
         }
+        // A resized file prompt takes its answer once fx has committed its
+        // new frame, which nothing on screen shows, so the key waits a beat.
+        await Bun.sleep(500);
         await session.sendKeys("1");
         await until("the write", () => existsSync(join(workspace, "wide-child.txt")));
 
         // So does its command prompt.
         for (const width of [80, 60]) {
-          await session.resizeWindow(width, 40, 500);
-          const rows = promptRows(await session.waitForPane((pane) => pane.includes("exact command"), 10_000));
+          await session.resizeWindow(width, 40, 0);
+          const rows = await waitForPromptAt(session, width, "exact command");
           expect(rows).toContain("  ❯ 1. Yes");
           expect(rows).toContain("    2. Yes, and no agent asks again for this exact command");
           expect(rows).toContain("    3. No");
