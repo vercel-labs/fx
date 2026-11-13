@@ -10,7 +10,8 @@
 //!
 //! Blocks are numbered in finish order. The held blocks are
 //! `[heldFirst(), next_seq)`: the current compaction cycle, plus the previous
-//! one until the first turn end at which the session log holds it.
+//! one until the first turn end after the compaction, once the session log
+//! holds it.
 //!
 //! `tests/tla/transcript_window/spec/TranscriptWindow.tla` models this file
 //! action for action; `tests/tla/transcript_window/design/DESIGN.md` lists the
@@ -92,6 +93,10 @@ pub const State = struct {
     cycle_first: Seq = 0,
     /// First block of the previous cycles still held, or null.
     prev_first: ?Seq = null,
+    /// No turn has ended since the last compaction. The previous cycle stays
+    /// held until one does (D2), even when the log already holds it, as
+    /// after a resume, so a resize before then still reprints it.
+    prev_waits_turn_end: bool = false,
     next_seq: Seq = 0,
     /// Blocks below this number are in the session log.
     saved_through: Seq = 0,
@@ -181,6 +186,7 @@ fn reject(state: State, why: Rejection) Output {
 
 fn canDrop(state: *const State, prev_first: ?Seq, cycle_first: Seq, turn_open: bool, saved_through: Seq) bool {
     if (prev_first == null) return false;
+    if (state.prev_waits_turn_end) return false;
     if (turn_open) return false;
     return !state.config.saved or saved_through >= cycle_first;
 }
@@ -235,6 +241,7 @@ pub fn step(state: State, event: Event) Output {
             if (state.live.len != 0) return reject(state, .turn_has_live_blocks);
             var next = state;
             next.turn_open = false;
+            next.prev_waits_turn_end = false;
             return dropIfDone(next);
         },
         .block_opened => |id| {
@@ -270,6 +277,9 @@ pub fn step(state: State, event: Event) Output {
             var next = state;
             next.cycle = state.cycle + 1;
             next.prev_first = state.heldFirst();
+            // A compaction drops nothing: the previous cycle waits for the
+            // next turn end, so a resize before it still reprints it.
+            next.prev_waits_turn_end = true;
             next.cycle_first = state.next_seq;
             return dropIfDone(next);
         },
@@ -381,6 +391,7 @@ pub const Abstract = struct {
     cycleFirst: Seq,
     /// The model's `None` is `-1` here; the trace spec maps it.
     prevFirst: i64,
+    prevWaits: bool,
     nextSeq: Seq,
     savedThrough: Seq,
     liveCount: u16,
@@ -401,6 +412,7 @@ pub fn abstract(state: *const State) Abstract {
         .cycle = state.cycle,
         .cycleFirst = state.cycle_first,
         .prevFirst = if (state.prev_first) |first| first else -1,
+        .prevWaits = state.prev_waits_turn_end,
         .nextSeq = state.next_seq,
         .savedThrough = state.saved_through,
         .liveCount = state.live.len,
@@ -445,7 +457,7 @@ test "block change touches only that block" {
 
 test "a stale read reply changes nothing" {
     var state = finishBlocks(run(State.init(saved_config), &.{.turn_started}), 3);
-    state = run(state, &.{ .turn_ended, .{ .saved_through = 3 }, .compacted, .ctrlo_opened });
+    state = run(state, &.{ .turn_ended, .{ .saved_through = 3 }, .compacted, .turn_started, .turn_ended, .ctrlo_opened });
     try testing.expectEqual(@as(Seq, 3), state.ctrlo.lo);
     const asked = step(state, .{ .ctrlo_scrolled = .older });
     const token = asked.effect.?.read_log.token;
@@ -471,12 +483,33 @@ test "previous cycle stays held through a mid-turn compaction and drops at turn 
     try testing.expectEqual(Range{ .from = 2, .to = 3 }, ended.state.held());
 }
 
-test "a compaction between turns drops once saved and an empty cycle emits no drop" {
-    const empty = step(State.init(saved_config), .compacted);
-    try testing.expect(empty.effect == null);
-    try testing.expect(empty.state.prev_first == null);
-    const state = step(finishBlocks(State.init(saved_config), 2), .{ .saved_through = 2 }).state;
-    try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, step(state, .compacted).effect.?);
+test "a compaction between turns keeps the saved previous cycle until the next turn ends" {
+    const saved = step(finishBlocks(State.init(saved_config), 2), .{ .saved_through = 2 }).state;
+    const compacted = step(saved, .compacted);
+    try testing.expect(compacted.effect == null);
+    try testing.expectEqual(Range{ .from = 0, .to = 2 }, compacted.state.held());
+    // A resize before the next turn ends reprints the previous cycle too.
+    try testing.expectEqual(@as(Seq, 0), step(compacted.state, .resized).state.painted_through);
+    const ended = step(step(compacted.state, .turn_started).state, .turn_ended);
+    try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, ended.effect.?);
+    try testing.expectEqual(Range{ .from = 2, .to = 2 }, ended.state.held());
+    // An empty previous cycle emits no drop.
+    const empty = run(State.init(saved_config), &.{ .compacted, .turn_started });
+    const empty_ended = step(empty, .turn_ended);
+    try testing.expect(empty_ended.effect == null);
+    try testing.expect(empty_ended.state.prev_first == null);
+}
+
+test "a resume whose newest compaction followed its last turn holds the replayed cycle until the next turn ends" {
+    // As the shell resumes such a session: the cycle before the compaction,
+    // all in the log, and then the compaction.
+    var state = step(State.init(saved_config), .{ .resumed = .{ .cycle = 0, .cycle_first = 0, .next_seq = 2 } }).state;
+    while (state.reprinting) state = step(state, .reprint_tick).state;
+    const compacted = step(state, .compacted);
+    try testing.expect(compacted.effect == null);
+    try testing.expectEqual(Range{ .from = 0, .to = 2 }, compacted.state.held());
+    const ended = step(step(compacted.state, .turn_started).state, .turn_ended);
+    try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, ended.effect.?);
 }
 
 test "a drop waits for the log in a saved session" {
@@ -528,7 +561,7 @@ test "ctrl-o opens from memory and an unsaved session never reads" {
     var unsaved = saved_config;
     unsaved.saved = false;
     var state = finishBlocks(State.init(unsaved), 3);
-    state = step(state, .compacted).state;
+    state = run(state, &.{ .compacted, .turn_started, .turn_ended });
     state = finishBlocks(state, 1);
     const opened = step(state, .ctrlo_opened);
     try testing.expectEqual(Effect{ .ctrlo_show = .{ .from = 3, .to = 4 } }, opened.effect.?);
@@ -540,7 +573,7 @@ test "ctrl-o opens from memory and an unsaved session never reads" {
 
 test "a garbage reply count is clamped to what exists" {
     var state = finishBlocks(State.init(saved_config), 2);
-    state = run(state, &.{ .{ .saved_through = 2 }, .compacted, .ctrlo_opened });
+    state = run(state, &.{ .{ .saved_through = 2 }, .compacted, .turn_started, .turn_ended, .ctrlo_opened });
     const asked = step(state, .{ .ctrlo_scrolled = .older });
     const out = step(asked.state, .{ .log_read_done = .{ .token = asked.effect.?.read_log.token, .count = 99 } });
     try testing.expectEqual(Effect{ .ctrlo_show = .{ .from = 1, .to = 2 } }, out.effect.?);
