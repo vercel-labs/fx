@@ -795,11 +795,12 @@ jobs:
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
-          tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep main-mail main-mail-acp
+          tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep main-mail main-mail-acp quiet-relay quiet-relay-deep
           tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted live-holds live-simulate live-witness-stale live-witness-idle-parent live-witness-open-fails-on-scan
           bun tests/tla/drivers/subagent/driver.ts
           bun test ./tests/tla/drivers/subagent/stop-message.test.ts
           bun test ./tests/tla/drivers/subagent/main-mail.test.ts
+          bun test ./tests/tla/drivers/subagent/quiet-relay.test.ts
           bun test ./tests/tla/drivers/session/write.test.ts
           bun test ./tests/tla/drivers/session/live.test.ts
 

@@ -37,6 +37,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
+const live_metrics = @import("../subagent/live_metrics.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 
 const Allocator = std.mem.Allocator;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
@@ -127,6 +129,13 @@ pub const ChildAgent = struct {
         if (self.agent.child_run) |*run| if (run.inFlight()) return true;
         return turnInFlight(&self.agent) or self.agent.worker.hasPendingEvents();
     }
+
+    /// Whether it has events for the loop to handle or assistant text left to
+    /// pace out in `pacer`, the pacer that holds its text: its own slot's
+    /// while it is hidden, the app's while it is on screen (`pacerOf`).
+    fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+    }
 };
 
 /// An agent in the switch list, such as the row Delete closes or the row
@@ -164,10 +173,14 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
+    /// Backs each subagent row's current call and its state with the call's
+    /// time, such as "working 12s". Owned.
+    activities: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
         self.rows.deinit(alloc);
         self.names.deinit(alloc);
+        self.activities.deinit(alloc);
         if (self.draft) |*draft| draft.deinit(alloc);
         self.* = .{};
     }
@@ -185,6 +198,9 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
+/// Room for a subagent row's current call, then its state with the call's
+/// time, such as "working 59m59s".
+const activity_bytes = live_metrics.max_label_bytes + 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
@@ -777,10 +793,10 @@ pub fn Runtime(comptime App: type) type {
             try body(context, app, agent);
         }
 
-        /// True when `child` has events for the loop to handle or assistant
-        /// text left to pace out.
+        /// True when the hidden `child` has events for the loop to handle or
+        /// assistant text left to pace out.
         pub fn hasPendingWork(child: *ChildAgent) bool {
-            return child.agent.worker.hasPendingEvents() or child.screen.pacer.hasPending();
+            return child.hasUnapplied(&child.screen.pacer);
         }
 
         /// Handles the work of every hidden agent that has any, each in its
@@ -1446,7 +1462,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// How many of the agent on screen's own subagents have a turn going
-        /// while its own turn has ended; 0 while it has a turn of its own.
+        /// while its own turn has ended; 0 while it has a turn of its own. A
+        /// subagent whose turn has ended but is not applied yet counts too,
+        /// as `stateOf` shows it working in the list.
         pub fn subagentWaitCount(app: *App) usize {
             const screen = agents.screenAgentOf(app);
             if (turnInFlight(screen)) return 0;
@@ -1454,7 +1472,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent) continue;
                 if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent)) count += 1;
+                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
             }
             return count;
         }
@@ -1694,12 +1712,16 @@ pub fn Runtime(comptime App: type) type {
             menu.rows.ensureTotalCapacity(app.alloc, order.items.len) catch return .{};
             menu.names.clearRetainingCapacity();
             menu.names.ensureTotalCapacity(app.alloc, order.items.len * instance_name_bytes) catch return .{};
+            menu.activities.clearRetainingCapacity();
+            menu.activities.ensureTotalCapacity(app.alloc, order.items.len * activity_bytes) catch return .{};
+            const now_ms = io_mod.milliTimestamp();
             for (order.items) |target| {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
+                const activity = rowActivity(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
@@ -1710,8 +1732,9 @@ pub fn Runtime(comptime App: type) type {
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = listedProfile(if (subagent) |child| child.profile else agent.profile.profile.name),
-                    .state = state.label(),
+                    .state = activity.state orelse state.label(),
                     .state_tone = state.tone(),
+                    .activity = activity.call,
                     .model = model,
                     .effort = effortLabel(app, agent, model),
                 });
@@ -2181,6 +2204,7 @@ pub fn Runtime(comptime App: type) type {
             if (searching) putDraftBack(app);
             leaving.draft = composer_stash.State.capture(app.input_runtime.composerStashView());
             app.shell.swapSlot(&leaving.transcript);
+            TranscriptRuntime.slotLeftScreen(&leaving.transcript);
             std.mem.swap(AssistantPacer, &app.pacer, &leaving.pacer);
             std.mem.swap(bool, &app.fast_mode, &leaving.fast_mode);
             app.shell.swapSlot(&arriving.transcript);
@@ -2199,23 +2223,64 @@ pub fn Runtime(comptime App: type) type {
         /// turn reads the run installed on the agent until its last event is
         /// applied, so nothing replaces that run before then.
         fn turnGoing(app: *App, child: *ChildAgent) bool {
-            const pacer = if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
-            return child.workGoing() or pacer.hasPending();
+            return child.workGoing() or pacerOf(app, child).hasPending();
+        }
+
+        /// The pacer that holds `child`'s assistant text: the app's while the
+        /// child is on screen, its own slot's otherwise.
+        fn pacerOf(app: *App, child: *ChildAgent) *AssistantPacer {
+            return if (app.agent_on_screen == child) &app.pacer else &child.screen.pacer;
         }
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
+        const RowActivity = struct { call: []const u8 = "", state: ?[]const u8 = null };
+
+        /// A working subagent's current call and its state with that call's
+        /// time, such as "working 12s", from its host, written into `buf`;
+        /// nothing for any other row.
+        fn rowActivity(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) RowActivity {
+            if (state != .working) return .{};
+            const child = subagent orelse return .{};
+            const host = hostOf(app, child) orelse return .{};
+            const call = host.childCall(child.id) orelse return .{};
+            const label = call.label();
+            @memcpy(buf[0..label.len], label);
+            var writer = std.Io.Writer.fixed(buf[label.len..]);
+            writer.print("{s} ", .{state.label()}) catch return .{ .call = buf[0..label.len] };
+            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return .{ .call = buf[0..label.len] };
+            return .{ .call = buf[0..label.len], .state = writer.buffered() };
+        }
+
+        /// Whether the turn `child`'s worker has finished is still being
+        /// applied: its events wait for the loop, or its pacer holds the
+        /// finish while the reply is shown. Its reply reaches the history
+        /// only after that.
+        fn resultPending(app: *App, child: *ChildAgent) bool {
+            return child.hasUnapplied(pacerOf(app, child));
+        }
+
         /// What agent `target`, null for the first instance, waits for or
         /// does. A subagent whose approval or question its instance's screen
-        /// shows for it still waits on it.
+        /// shows for it still waits on it. A subagent whose turn has ended
+        /// but is not applied yet is still working: the list places it by the
+        /// newest reply in its history, so its state and its place change
+        /// together, as `tests/tla/agents_menu/spec/RowOrder.tla`
+        /// PlaceChangesWithLabel requires.
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
             }
-            return instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const child = target orelse return state;
+            if (child.agent.role != .subagent) return state;
+            return switch (state) {
+                .idle, .finished => if (resultPending(app, child)) .working else state,
+                .working, .needs_approval, .has_question, .needs_you => state,
+            };
         }
 
         /// Whether agent `target`'s status row, null for the first instance,
@@ -2961,6 +3026,46 @@ pub fn Runtime(comptime App: type) type {
             // The part the parent can use, without the keys for the user.
             const text = status.text.slice();
             host.noteChildWaiting(child.id, child.displayName(), if (std.mem.find(u8, text, " \u{b7} ")) |at| text[0..at] else text, resend);
+        }
+
+        /// A hosted subagent's tool events reach the app instead of its
+        /// turn: its current call goes to its host, for status and the agent
+        /// list, and a shell command that crossed the quiet limit is relayed
+        /// to its parent (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
+        pub fn noteChildToolLifecycle(app: *App, agent: *AppAgent, lifecycle: types.ToolLifecycleEvent) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            switch (lifecycle) {
+                .authoritative_started => |started| {
+                    var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+                    defer arena_state.deinit();
+                    const arena = arena_state.allocator();
+                    const call: types.ToolCall = .{
+                        .id = started.id.call_id,
+                        .name = started.tool_name,
+                        .arguments_json = started.arguments_json orelse "{}",
+                    };
+                    // The plain label, as fx ask names the call; the screen's
+                    // own rows are styled.
+                    const label = if (comptime @hasDecl(App, "toolRegistry") and @hasDecl(App, "resolveToolActionDisplayTarget")) label: {
+                        const target = app.resolveToolActionDisplayTarget(agent, arena, call) catch null;
+                        break :label tool_presentation.formatPlainAction(arena, .{
+                            .tool_registry = app.toolRegistry(agent),
+                            .call = call,
+                            .display_target = target,
+                        }) catch started.tool_name;
+                    } else started.tool_name;
+                    host.noteChildCall(child.id, started.id.call_id, label);
+                },
+                .terminal => |terminal| {
+                    host.noteChildCall(child.id, terminal.id.call_id, null);
+                    const memory = terminal.result_memory orelse return;
+                    const crossing = memory.quiet_crossing orelse return;
+                    host.noteChildQuiet(child.id, child.displayName(), crossing);
+                },
+                .provisional, .progress, .turn_finished => {},
+            }
         }
 
         /// Keeps a child's terminal provider error for the parent.

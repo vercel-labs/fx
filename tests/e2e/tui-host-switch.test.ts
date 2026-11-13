@@ -1723,7 +1723,11 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(oldest).not.toContain("Subagent first needs permission");
         await session.sendKeys("1");
         await session.waitForText("Subagent first needs permission", 15_000);
-        expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("second\n");
+        // The approval lets the second subagent write on its own thread, while
+        // main's screen already shows the next prompt: wait for the file.
+        const secondFile = join(workspace, "second.txt");
+        await until("the second subagent's file", () => existsSync(secondFile) && readFileSync(secondFile, "utf8") === "second\n");
+        expect(readFileSync(secondFile, "utf8")).toBe("second\n");
         expect(existsSync(join(workspace, "first.txt"))).toBe(false);
         await session.sendKeys("1");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
@@ -3328,6 +3332,65 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, (dir) => {
         home = dir;
       }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a working subagent's row names its current call and time, and its quiet command wakes main's wait",
+    async () => {
+      const command = "sh -c 'printf TUI-QUIET-READY; exec sleep 600'";
+      // The shell session the child's run started, from its result.
+      const sessionOf = (body: string) => /shell-\d+/.exec(body.slice(body.indexOf("TUI-QUIET-READY")))?.[0];
+      let childWaiting = false;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // The latest call comes first: every earlier call stays in the turn.
+          if (body.includes('"child_stop"')) return text("child_done", "TUI_QUIET_CHILD_DONE");
+          if (body.includes('"child_wait_2"')) {
+            return toolCall("child_stop", "shell", { request: { action: "stop", session_id: sessionOf(body) } });
+          }
+          if (body.includes('"child_wait_1"')) {
+            return toolCall("child_wait_2", "shell", {
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+            });
+          }
+          if (body.includes('"child_run"')) {
+            childWaiting = true;
+            return toolCall("child_wait_1", "shell", {
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+            });
+          }
+          return toolCall("child_run", "shell", { request: { action: "run", command, yield_time_ms: 300 } });
+        }
+        if (body.includes('"main_wait"')) {
+          const relayed = userTexts(body).some((text) =>
+            text.includes("Subagent message (untrusted agent output") && text.includes("no output for")
+          );
+          return text("main_seen", relayed ? "TUI_MAIN_SAW_RELAY" : "TUI_MAIN_NO_RELAY");
+        }
+        if (body.includes('"main_sub"')) return toolCall("main_wait", "subagent", { request: { action: "wait" } });
+        return toolCall("main_sub", "subagent", {
+          request: { action: "message", agent: "worker", message: "TUI_QUIET_TASK" },
+        });
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await until("the child's first wait", () => childWaiting);
+        // The row of the working subagent shows its current call and how
+        // long it has run.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        const list = await session.waitForPane((pane) =>
+          /^ {2}[\u251c\u2514] worker .*Waiting for sh -c .*\b\d+s\b/m.test(pane), 15_000);
+        expect(list).toMatch(/^ {2}[\u251c\u2514] worker .*TUI-QUIET-READY/m);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        // The child's command crosses the quiet limit while main waits, and
+        // fx's note wakes main's wait before the child ends.
+        const pane = await session.waitForPane((pane) =>
+          pane.includes("TUI_MAIN_SAW_RELAY") || pane.includes("TUI_MAIN_NO_RELAY"), 30_000);
+        expect(pane).toContain("TUI_MAIN_SAW_RELAY");
+      }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
     },
     TIMEOUT,
   );
