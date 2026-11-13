@@ -892,16 +892,17 @@ fn creditsSnapshotFromJsonValue(
     return snapshot;
 }
 
-/// The Token Pass credit in a credits reply, owned by the caller, or null
-/// when its amount is missing or malformed. The values reach the terminal,
-/// so only a plain amount and an ISO 8601 time are kept.
-fn tokenPassCreditFromJson(alloc: Allocator, credit: std.json.ObjectMap) !?output_contracts.CreditsSnapshot.TokenPassCredit {
-    const remaining = jsonString(credit.get("remaining")) orelse return null;
-    if (!isCreditAmount(remaining)) return null;
+/// The Token Pass credit in a credits reply, owned by the caller. AI Gateway
+/// sends the object to every team with an active Token Pass, with a
+/// `remaining` of "0" once the credit is used up and null when it cannot
+/// read the balance. The values reach the terminal, so only a plain amount
+/// and an ISO 8601 time are kept; anything else reads as unknown.
+fn tokenPassCreditFromJson(alloc: Allocator, credit: std.json.ObjectMap) !output_contracts.CreditsSnapshot.TokenPassCredit {
+    const remaining = if (jsonString(credit.get("remaining"))) |value| (if (isCreditAmount(value)) value else null) else null;
     const resets_at = if (jsonString(credit.get("resets_at"))) |value| (if (isIsoTime(value)) value else null) else null;
 
-    const owned_remaining = try alloc.dupe(u8, remaining);
-    errdefer alloc.free(owned_remaining);
+    const owned_remaining = if (remaining) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_remaining) |value| alloc.free(value);
     return .{
         .remaining = owned_remaining,
         .resets_at = if (resets_at) |value| try alloc.dupe(u8, value) else null,
@@ -950,29 +951,47 @@ test "built-in credits provider reads the Token Pass credit" {
     defer parsed.deinit();
     var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
     defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("79.92906", snapshot.token_pass.?.remaining);
+    try std.testing.expectEqualStrings("79.92906", snapshot.token_pass.?.remaining.?);
     try std.testing.expectEqualStrings("2026-12-05T08:00:00.000Z", snapshot.token_pass.?.resets_at.?);
     try std.testing.expect(!snapshot.no_token_pass);
 
-    const cases = [_]struct { body: []const u8, no_token_pass: bool }{
-        // An explicit null: the team has no active Token Pass.
+    // An explicit null: the team has no active Token Pass. A reply from
+    // before the field existed says nothing either way.
+    for ([_]struct { body: []const u8, no_token_pass: bool }{
         .{ .body = "{\"balance\":\"1\",\"token_pass\":null}", .no_token_pass = true },
-        // A reply from before the field existed says nothing either way.
         .{ .body = "{\"balance\":\"1\"}", .no_token_pass = false },
-        .{ .body = "{\"balance\":\"1\",\"token_pass\":{\"remaining\":79}}", .no_token_pass = false },
-        // Values that could forge lines or drive the terminal are refused.
-        .{ .body = "{\"token_pass\":{\"remaining\":\"79\\n[credits] balance=999999\"}}", .no_token_pass = false },
-        .{ .body = "{\"token_pass\":{\"remaining\":\"\\u001b]52;c;aGk=\\u0007\"}}", .no_token_pass = false },
-        .{ .body = "{\"token_pass\":{\"remaining\":\"1.2.3\"}}", .no_token_pass = false },
-        .{ .body = "{\"token_pass\":{\"remaining\":\"123456789012345678901234567890123\"}}", .no_token_pass = false },
-    };
-    for (cases) |case| {
+    }) |case| {
         var none = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
         defer none.deinit();
         var without = try creditsSnapshotFromJsonValue(std.testing.allocator, none.value);
         defer without.deinit(std.testing.allocator);
         try std.testing.expect(without.token_pass == null);
         try std.testing.expectEqual(case.no_token_pass, without.no_token_pass);
+    }
+
+    // An object means an active Token Pass whatever its amount says: used
+    // up is "0", and a balance the Gateway could not read, or a value that
+    // could forge lines or drive the terminal, reads as unknown.
+    for ([_]struct { body: []const u8, remaining: ?[]const u8 }{
+        .{ .body = "{\"token_pass\":{\"remaining\":\"0\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}", .remaining = "0" },
+        .{ .body = "{\"token_pass\":{\"remaining\":null,\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}", .remaining = null },
+        .{ .body = "{\"balance\":\"1\",\"token_pass\":{\"remaining\":79}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"79\\n[credits] balance=999999\"}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"\\u001b]52;c;aGk=\\u0007\"}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"1.2.3\"}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"123456789012345678901234567890123\"}}", .remaining = null },
+    }) |case| {
+        var active = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
+        defer active.deinit();
+        var with = try creditsSnapshotFromJsonValue(std.testing.allocator, active.value);
+        defer with.deinit(std.testing.allocator);
+        const credit = with.token_pass orelse return error.TestExpectedTokenPass;
+        if (case.remaining) |expected| {
+            try std.testing.expectEqualStrings(expected, credit.remaining.?);
+        } else {
+            try std.testing.expect(credit.remaining == null);
+        }
+        try std.testing.expect(!with.no_token_pass);
     }
 
     // A malformed reset time drops only the time.
@@ -985,7 +1004,7 @@ test "built-in credits provider reads the Token Pass credit" {
     defer bad_time.deinit();
     var without_time = try creditsSnapshotFromJsonValue(std.testing.allocator, bad_time.value);
     defer without_time.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("5", without_time.token_pass.?.remaining);
+    try std.testing.expectEqualStrings("5", without_time.token_pass.?.remaining.?);
     try std.testing.expect(without_time.token_pass.?.resets_at == null);
 }
 

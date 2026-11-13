@@ -87,6 +87,9 @@ pub const ModelMenuProjection = struct {
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+    /// Whether the team has Token Pass. Only then does the menu name Token
+    /// Pass and lead with its models.
+    token_pass: bool = false,
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
         return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
@@ -403,6 +406,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,
         .query = cache.menu.query(),
+        .token_pass = cache.tokenPassStatus() == .active,
     };
 }
 

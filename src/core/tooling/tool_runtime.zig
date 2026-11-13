@@ -1886,10 +1886,11 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
-        // A Token Pass session reads images with a Token Pass model.
-        // A custom connection reads images with its own vision_model.
+        // A Token Pass session of a team with Token Pass reads images with a
+        // Token Pass model. A custom connection reads images with its own
+        // vision_model.
         .model = if (state.runtime.provider == .gateway)
-            token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+            token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model, token_pass.processHasPass())
         else
             state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };

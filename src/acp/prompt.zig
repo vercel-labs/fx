@@ -1246,9 +1246,10 @@ fn maybeStartAcpTitleTask(
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
     const provider_title_model = bundle.title_model orelse return;
-    // A Token Pass session titles itself with a Token Pass model.
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model.
     const title_model = if (session.provider == .gateway)
-        token_pass.modelForSideCall(.title, session.model, provider_title_model)
+        token_pass.modelForSideCall(.title, session.model, provider_title_model, token_pass.processHasPass())
     else
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;

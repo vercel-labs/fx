@@ -13,6 +13,7 @@ const credentials = @import("../auth/credentials.zig");
 const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_check = @import("token_pass_check.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -1386,10 +1387,8 @@ pub fn Handlers(comptime App: type) type {
             }, true);
             if (comptime @hasField(App, "model_cache")) {
                 if (snapshot.err_message == null) {
-                    if (snapshot.token_pass != null) {
-                        app.model_cache.observeTokenPassCredit();
-                    } else if (snapshot.no_token_pass) {
-                        app.model_cache.observeNoTokenPass("credits");
+                    if (token_pass_check.answerOf(snapshot)) |answer| {
+                        token_pass_check.Runtime(App).record(app, answer, "credits");
                     } else if (app.model_cache.tokenPassStatus() == .active) {
                         // The team uses Token Pass, but this reply does not
                         // mention Token Pass: point at the tab that has it.

@@ -4682,6 +4682,66 @@ describe("cli: credits", () => {
     TIMEOUT,
   );
 
+  test(
+    "fx ask starts a team with Token Pass on the Token Pass default, keeps a chosen model, and saves the answer",
+    async () => {
+      const home = createIsolatedTestHome();
+      let hasPass = true;
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("TOKEN_PASS_ASK"),
+        fakeGatewayFinalText("CHOSEN_MODEL_ASK"),
+        fakeGatewayFinalText("SAVED_ANSWER_ASK"),
+        fakeGatewayFinalText("NO_PASS_ASK"),
+      ], {
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
+          : null,
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-token-pass-ask-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        };
+        const ask = async (args: string[], answer: string) => {
+          const result = await runFx(["ask", "--json", "--no-save", ...args, "Which model answers?"], { env, timeoutMs: TIMEOUT });
+          expect(result.code, result.stderr).toBe(0);
+          expect(result.stdout).toContain(answer);
+        };
+        const models = () => gateway.requests.map((request) => request.headers.get("ai-language-model-id"));
+        const saved = () => Object.values(JSON.parse(readFileSync(join(home, ".fx", "token-pass.json"), "utf8")).teams);
+
+        // No saved answer: fx waits for the check and starts on Token Pass.
+        await ask([], "TOKEN_PASS_ASK");
+        expect(models()).toEqual(["deepseek/deepseek-v4.1-flash"]);
+        expect(saved()).toEqual(["has_pass"]);
+
+        // A model the run names wins.
+        await ask(["--model", FAKE_GATEWAY_MODEL], "CHOSEN_MODEL_ASK");
+        expect(models()[1]).toBe(FAKE_GATEWAY_MODEL);
+
+        // The team loses Token Pass: this run still follows the saved
+        // answer, its check saves the new one, and the next run follows it.
+        hasPass = false;
+        await ask([], "SAVED_ANSWER_ASK");
+        expect(models()[2]).toBe("deepseek/deepseek-v4.1-flash");
+        expect(saved()).toEqual(["no_pass"]);
+        await ask([], "NO_PASS_ASK");
+        expect(models()[3]).toBe("spacexai/grok-4.7");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "fx credits --json returns credits JSON or exits non-zero",
     async () => {

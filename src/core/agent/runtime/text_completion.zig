@@ -248,8 +248,9 @@ pub const CompactorCaller = struct {
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,
-            // A Token Pass conversation retries its summary on Token Pass.
-            .fallback_model = if (self.provider == .gateway) token_pass.compactionFallback(self.model) else null,
+            // A Token Pass conversation of a team with Token Pass retries its
+            // summary on Token Pass.
+            .fallback_model = if (self.provider == .gateway) token_pass.compactionFallback(self.model, token_pass.processHasPass()) else null,
         };
     }
 

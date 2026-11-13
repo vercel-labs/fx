@@ -2638,13 +2638,14 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
-        /// The provider's title model, or a Token Pass model when the
-        /// agent's AI Gateway model is a Token Pass model.
+        /// The provider's title model, or a Token Pass model when the team
+        /// has Token Pass and the agent's AI Gateway model is a Token Pass
+        /// model.
         fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
             const default_model = provider_title_model orelse return null;
             if (comptime !provider_runtime.supported(App)) return default_model;
             if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
-            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model, token_pass.processHasPass());
         }
 
         /// Applies a finished background title generation on the main loop.

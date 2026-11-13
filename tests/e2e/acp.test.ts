@@ -199,6 +199,13 @@ function partialEofResponse(text: string): Response {
   );
 }
 
+/// A credits reply for a team with Token Pass, or for one without.
+function tokenPassCreditsReply(hasPass: boolean) {
+  return (url: URL) => url.pathname === "/coding-agent/v1/credits"
+    ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
+    : null;
+}
+
 function fakeGatewayEnv(
   root: ReturnType<typeof createIsolatedRoot>,
   gateway: ReturnType<typeof startFakeGateway>,
@@ -1628,6 +1635,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-token-pass-title-");
       const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
         titleResponses: [finalText("ACP Token Pass Title")],
+        usage: tokenPassCreditsReply(true),
       });
       try {
         client = await AcpClient.create({
@@ -1650,6 +1658,44 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP starts new sessions on the Token Pass default for a team with Token Pass and on the built-in default otherwise",
+    async () => {
+      for (const hasPass of [true, false]) {
+        const root = createIsolatedRoot("fx-acp-token-pass-start-");
+        const gateway = startDynamicFakeGateway(_raw => finalText("ACP_START_MODEL_OK"), {
+          titleResponses: [finalText("ACP Start Model Title")],
+          usage: tokenPassCreditsReply(hasPass),
+        });
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          await client.request("session/new", { mcpServers: [] }, 2);
+          await client.readLine();
+          const result = await runPrompt(client, "Which model answers?", TIMEOUT);
+          expect(result.promptResult.result.stopReason).toBe("end_turn");
+          expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id")))
+            .toEqual([hasPass ? "deepseek/deepseek-v4.1-flash" : "spacexai/grok-4.7"]);
+          expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
+            .toEqual([hasPass ? "zai/glm-5.3-flash" : "openai/gpt-5.6-luna"]);
+          // The answer is saved for the next run, and the model is not.
+          const saved = JSON.parse(readFileSync(join(root.home, ".fx", "token-pass.json"), "utf8"));
+          expect(Object.values(saved.teams)).toEqual([hasPass ? "has_pass" : "no_pass"]);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          client = undefined;
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
       }
     },
     TIMEOUT,

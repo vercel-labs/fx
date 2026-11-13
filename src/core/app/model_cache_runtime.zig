@@ -492,10 +492,12 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
-    /// Whether this credential's team has Token Pass, learned from the
-    /// provider that served its requests. It resets with the catalog, since
-    /// both belong to one credential and team. Main thread only, so the
-    /// mutex does not guard it.
+    /// Whether this credential's team has Token Pass: the answer fx saved
+    /// for the team, then the credits check, the provider that served its
+    /// requests, and Token Pass denials. It resets with the catalog, since
+    /// both belong to one credential and team, and every change is published
+    /// to `token_pass.publishHasPass`. Main thread only, so the mutex does not
+    /// guard it.
     token_pass: token_pass_mod.Tracker = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -695,33 +697,27 @@ pub const Runtime = struct {
             debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
         }
         self.token_pass = .{};
+        token_pass_mod.publishHasPass(false);
     }
 
-    /// Records the provider that served one of this credential's requests.
-    pub fn observeServedBy(self: *Self, served_by: []const u8) void {
-        if (self.token_pass.observeServedBy(served_by)) {
-            debug_trace.logf("catalog", "token pass status=active served_by={s}", .{served_by});
-        }
+    /// Starts this credential's status from the answer fx saved for its
+    /// team, before the credits check answers.
+    pub fn adoptSavedTokenPass(self: *Self, saved: ?token_pass_mod.Answer) void {
+        self.token_pass = token_pass_mod.Tracker.fromSaved(saved);
+        if (saved != null) debug_trace.logf("catalog", "token pass status={t} source=saved", .{self.token_pass.status});
+        token_pass_mod.publishHasPass(self.token_pass.hasPass());
     }
 
-    /// Records that the credits endpoint reported this team's Token Pass credit.
-    pub fn observeTokenPassCredit(self: *Self) void {
-        if (self.token_pass.observeCredit()) {
-            debug_trace.logf("catalog", "token pass status=active source=credits", .{});
-        }
-    }
-
-    /// Records that AI Gateway said this team has no active Token Pass;
-    /// `source` names how, for the trace.
-    pub fn observeNoTokenPass(self: *Self, source: []const u8) void {
-        if (self.token_pass.observeNoPass()) {
-            debug_trace.logf("catalog", "token pass status=unknown source={s}", .{source});
-        }
-    }
-
-    /// Reads an error the user sees for AI Gateway's Token Pass denial.
-    pub fn observeErrorText(self: *Self, text: []const u8) void {
-        if (token_pass_mod.deniedCause(text) == .no_active_pass) self.observeNoTokenPass("denied");
+    /// Records what AI Gateway said about this team; `source` names how,
+    /// for the trace.
+    pub fn observeTokenPassAnswer(self: *Self, answer: token_pass_mod.Answer, source: []const u8) void {
+        const changed = switch (answer) {
+            .has_pass => self.token_pass.observeCredit(),
+            .no_pass => self.token_pass.observeNoPass(),
+        };
+        if (!changed) return;
+        debug_trace.logf("catalog", "token pass status={t} source={s}", .{ self.token_pass.status, source });
+        token_pass_mod.publishHasPass(self.token_pass.hasPass());
     }
 
     pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
@@ -1136,7 +1132,7 @@ pub const Runtime = struct {
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.token_pass.hasPass()),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -1175,10 +1171,29 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
     };
 }
 
+fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry: model_catalog.ModelCatalogEntry) !void {
+    const id = try alloc.dupe(u8, entry.id);
+    const item: ModelMenuItem = .{
+        .id = id,
+        .provider = modelProvider(id),
+        .capabilities = model_capabilities.resolveCapabilities(
+            id,
+            model_catalog_metadata.fromCatalogEntry(entry),
+        ),
+    };
+    items.append(alloc, item) catch |err| {
+        item.deinit(alloc);
+        return err;
+    };
+}
+
+/// Fills `menu` from `catalog`, in catalog order. With `token_pass_first`,
+/// for a team that has Token Pass, the Token Pass models lead the list.
 fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    token_pass_first: bool,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -1187,23 +1202,18 @@ fn hydrateMenuSnapshot(
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
 
+    if (token_pass_first) {
+        for (token_pass_mod.featured_models) |featured| {
+            for (catalog) |entry| {
+                if (!std.ascii.eqlIgnoreCase(entry.id, featured)) continue;
+                try appendMenuItem(alloc, &items, entry);
+                break;
+            }
+        }
+    }
     for (catalog) |entry| {
-        const item = item: {
-            const id = try alloc.dupe(u8, entry.id);
-            errdefer alloc.free(id);
-            break :item ModelMenuItem{
-                .id = id,
-                .provider = modelProvider(id),
-                .capabilities = model_capabilities.resolveCapabilities(
-                    id,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                ),
-            };
-        };
-        items.append(alloc, item) catch |err| {
-            item.deinit(alloc);
-            return err;
-        };
+        if (token_pass_first and token_pass_mod.isFeaturedModel(entry.id)) continue;
+        try appendMenuItem(alloc, &items, entry);
     }
 
     // A revalidated catalog replaces rows under an open menu; keep the
@@ -2199,7 +2209,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -2249,7 +2259,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
     menu.active = true;
 
     menu.setQuery("gpt5");
@@ -2273,7 +2283,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     const revalidated = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
     } ++ entries;
-    try hydrateMenuSnapshot(alloc, &menu, &revalidated);
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, false);
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 }
@@ -2288,7 +2298,7 @@ test "a model's own name ranks it above longer ids that contain it" {
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
     menu.active = true;
 
     menu.setQuery("GPT-4o");
@@ -2345,7 +2355,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, false);
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -2361,7 +2371,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, false);
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -2377,14 +2387,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, false);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, false)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

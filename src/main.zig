@@ -22,6 +22,7 @@ const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage = @import("usage/usage.zig");
 const usage_host = @import("core/app/usage_host.zig");
 const credits_lookup = @import("core/app/credits_lookup.zig");
+const token_pass_check = @import("core/app/token_pass_check.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
@@ -417,6 +418,7 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
+    const TokenPassCheckRuntime = token_pass_check.Runtime(Self);
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const ProfileAppRuntime = app_profile_runtime.Runtime(Self);
@@ -556,6 +558,8 @@ const App = struct {
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
     /// The `/credits` lookup in flight, if any.
     credits_lookup: credits_lookup.Lookup = .{},
+    /// Whether the credential's team has Token Pass: the check that asks.
+    token_pass_check: token_pass_check.State = .{},
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -1003,6 +1007,7 @@ const App = struct {
         // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
         self.credits_lookup.deinit();
+        self.token_pass_check.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Quitting from a subagent's screen resumes its instance.
@@ -1084,6 +1089,7 @@ const App = struct {
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         self.credits_lookup.deinit();
+        self.token_pass_check.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Children close first: they borrow main's session store.
@@ -2172,6 +2178,13 @@ const App = struct {
         );
     }
 
+    /// Holds the first prompt of a session while the Token Pass check that
+    /// decides its model runs.
+    pub fn collectPendingTokenPass(self: *App, agent: *agents.Agent) token_pass_check.Readiness {
+        if (comptime host_target.is_wasm) return .current;
+        return TokenPassCheckRuntime.collectPendingPrompt(self, agent);
+    }
+
     pub fn collectPendingSkillRefresh(
         self: *App,
         pending: *input_submit_runtime.PendingSubmission,
@@ -2351,6 +2364,10 @@ const App = struct {
 
     pub fn startModelCacheWarmup(self: *App) void {
         self.loadModelCatalog(.activity);
+        // The same credential's team may have Token Pass; ask once per team.
+        if (comptime !host_profile.cooperative_agent) {
+            if (!AuthAppRuntime.startupCredentialPending(self)) TokenPassCheckRuntime.start(self);
+        }
     }
 
     /// Opening the model picker revalidates the catalog in the background;
@@ -3286,6 +3303,9 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         try app_commands.Handlers(App).collectCreditsFacts(self);
+        if (try TokenPassCheckRuntime.collect(self)) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+        }
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self, self.screenAgent());
             try AuthAppRuntime.collectSourceInventoryFacts(self, self.screenAgent());

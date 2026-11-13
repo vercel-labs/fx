@@ -53,9 +53,9 @@ fn reviewGateway(
     // other value stays on this gateway chat path with that model id. Every
     // composition site selects this provider, so the override covers
     // interactive, ask, and subagent reviews uniformly. Without one, a
-    // session on a Token Pass model is reviewed by a Token Pass model, so its
-    // reviews stay on Token Pass credit too.
-    const selected = selectedReviewerModel(input.reviewer_model, request.review_turn.model);
+    // session on a Token Pass model of a team with Token Pass is reviewed by
+    // a Token Pass model, so its reviews stay on Token Pass credit too.
+    const selected = selectedReviewerModel(input.reviewer_model, request.review_turn.model, token_pass.processHasPass());
     if (typesafe_permission_reviewer.isJevModelId(selected)) {
         debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
         return typesafe_permission_reviewer.review(null, alloc, input, request);
@@ -69,15 +69,17 @@ fn reviewGateway(
     }, alloc, request, selected);
 }
 
-fn selectedReviewerModel(override: []const u8, session_model: []const u8) []const u8 {
+fn selectedReviewerModel(override: []const u8, session_model: []const u8, has_pass: bool) []const u8 {
     if (override.len > 0) return override;
-    return token_pass.modelForSideCall(.review, session_model, reviewer_model);
+    return token_pass.modelForSideCall(.review, session_model, reviewer_model, has_pass);
 }
 
 test "the reviewer follows the override, then Token Pass, then the default" {
-    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "anthropic/claude-opus-4.8"));
-    try std.testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", selectedReviewerModel("", "zai/glm-5.3"));
-    try std.testing.expectEqualStrings("openai/gpt-6-sol", selectedReviewerModel("openai/gpt-6-sol", "zai/glm-5.3"));
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "anthropic/claude-opus-4.8", true));
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", selectedReviewerModel("", "zai/glm-5.3", true));
+    try std.testing.expectEqualStrings("openai/gpt-6-sol", selectedReviewerModel("openai/gpt-6-sol", "zai/glm-5.3", true));
+    // A team without Token Pass keeps the default reviewer.
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "zai/glm-5.3", false));
 }
 
 fn reviewGatewayConfig(

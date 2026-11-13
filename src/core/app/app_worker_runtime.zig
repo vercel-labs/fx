@@ -4,6 +4,7 @@ const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const token_pass_check = @import("token_pass_check.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1333,7 +1334,7 @@ pub fn Runtime(comptime App: type) type {
                     .model_call => |record| {
                         if (comptime @hasField(App, "model_cache")) {
                             if (record.outcome == .completed) {
-                                if (record.served_by) |served_by| app.model_cache.observeServedBy(served_by);
+                                if (record.served_by) |served_by| token_pass_check.Runtime(App).observeServedBy(app, served_by);
                             }
                         }
                         // After the text the call wrote. The line shows only
@@ -1620,7 +1621,7 @@ pub fn Runtime(comptime App: type) type {
         fn observeTokenPassDenial(app: *App, notice: types.SemanticNotice) void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (notice.tone != .warning and notice.tone != .@"error") return;
-            app.model_cache.observeErrorText(notice.body);
+            token_pass_check.Runtime(App).observeErrorText(app, notice.body);
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {

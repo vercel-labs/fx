@@ -47,6 +47,7 @@ const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -1795,6 +1796,35 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     }
 
+    // A team with Token Pass starts a new session on the Token Pass default
+    // when nothing chose the model. The check refreshes the saved answer
+    // while the turn runs, and waits for it only when fx has none.
+    var token_pass_run: ?token_pass_check.Check = null;
+    defer if (token_pass_run) |*check| check.finish(alloc, token_pass_check.refresh_wait_ms);
+    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    if (token_pass_source) |source| {
+        if (token_pass_check.name(source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
+            token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
+            token_pass_run.?.begin(
+                alloc,
+                cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+                .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
+                token_pass_check.first_prompt_wait_ms,
+            );
+            const nothing_chose_model = startup.model_source == .compiled_default and
+                options.model_override == null and
+                ctx.requested_resume == null and
+                ctx.session.agent.history.items.len == 0;
+            if (token_pass_run.?.has_pass and nothing_chose_model) {
+                debug_trace.logf("token_pass", "start model={s}", .{token_pass.default_model});
+                ctx.model = token_pass.default_model;
+                // Token Pass credit pays only for standard speed.
+                if (options.fast_override == null) ctx.fast_mode = false;
+                if (options.ultrafast_override == null) ctx.ultrafast_mode = false;
+            }
+        }
+    }
+
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
@@ -2033,9 +2063,10 @@ fn maybeStartAskTitleTask(
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const provider_title_model = bundle.title_model orelse return null;
-    // A Token Pass session titles itself with a Token Pass model.
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model.
     const title_model = if (ctx.provider == .gateway)
-        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
+        token_pass.modelForSideCall(.title, ctx.model, provider_title_model, token_pass.processHasPass())
     else
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;

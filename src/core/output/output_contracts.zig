@@ -2323,7 +2323,8 @@ pub const CreditsSnapshot = struct {
     err_message: ?[]const u8 = null,
 
     pub const TokenPassCredit = struct {
-        remaining: []const u8,
+        /// The credit left, or null when the Gateway could not read it.
+        remaining: ?[]const u8 = null,
         /// When the credit resets, as the Gateway writes it.
         resets_at: ?[]const u8 = null,
     };
@@ -2335,7 +2336,7 @@ pub const CreditsSnapshot = struct {
         if (self.used) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
         if (self.token_pass) |credit| {
-            alloc.free(credit.remaining);
+            if (credit.remaining) |value| alloc.free(value);
             if (credit.resets_at) |value| alloc.free(value);
         }
         if (self.err_message) |value| alloc.free(value);
@@ -2372,7 +2373,7 @@ pub const CreditsSnapshot = struct {
             try out.writer.print("[credits] plan={f}\n", .{text_utils.terminalSafe(p)});
         }
         if (self.token_pass) |credit| {
-            try out.writer.print("[credits] token_pass_remaining={f}\n", .{text_utils.terminalSafe(credit.remaining)});
+            if (credit.remaining) |remaining| try out.writer.print("[credits] token_pass_remaining={f}\n", .{text_utils.terminalSafe(remaining)});
             if (credit.resets_at) |resets_at| try out.writer.print("[credits] token_pass_resets_at={f}\n", .{text_utils.terminalSafe(resets_at)});
         }
 
@@ -2408,10 +2409,16 @@ pub const CreditsSnapshot = struct {
             wrote_field = true;
         }
         if (self.token_pass) |credit| {
-            if (wrote_field) try out.writer.writeByte('\n');
-            try out.writer.print("token_pass_remaining={f}", .{text_utils.terminalSafe(credit.remaining)});
-            if (credit.resets_at) |resets_at| try out.writer.print("\ntoken_pass_resets_at={f}", .{text_utils.terminalSafe(resets_at)});
-            wrote_field = true;
+            if (credit.remaining) |remaining| {
+                if (wrote_field) try out.writer.writeByte('\n');
+                try out.writer.print("token_pass_remaining={f}", .{text_utils.terminalSafe(remaining)});
+                wrote_field = true;
+            }
+            if (credit.resets_at) |resets_at| {
+                if (wrote_field) try out.writer.writeByte('\n');
+                try out.writer.print("token_pass_resets_at={f}", .{text_utils.terminalSafe(resets_at)});
+                wrote_field = true;
+            }
         }
         if (!self.hasFields()) {
             if (self.raw_json) |raw| {
@@ -3970,6 +3977,28 @@ test "core credits snapshot renders the Token Pass balance on every surface" {
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":null,\"plan\":null,\"token_pass\":{\"remaining\":\"79.92906\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}",
+        json,
+    );
+}
+
+test "core credits snapshot leaves out a Token Pass balance the Gateway could not read" {
+    const snapshot = CreditsSnapshot{
+        .token_pass = .{ .resets_at = "2026-12-05T08:00:00.000Z" },
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n", text);
+
+    const body = try snapshot.renderInteractiveBody(std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("token_pass_resets_at=2026-12-05T08:00:00.000Z", body);
+
+    // JSON keeps the object, so it still says the team has Token Pass.
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"credits\",\"balance\":null,\"used\":null,\"plan\":null,\"token_pass\":{\"remaining\":null,\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}",
         json,
     );
 }
