@@ -360,13 +360,16 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     }
 
     app.run() catch |err| {
+        // A terminal that is gone closes fx the same way whether fx sees its
+        // input end or a frame it can no longer write.
+        const terminal_closed = err == error.TerminalInputClosed or err == error.TerminalOutputClosed;
         // Before the terminal is released, which puts back SIGHUP's default
         // action: a closed window with a turn running ends fx here.
         if (comptime !cooperative and @hasDecl(App, "closeOnHangup")) {
-            if (err == error.TerminalInputClosed) app.closeOnHangup();
+            if (terminal_closed) app.closeOnHangup();
         }
         app.releaseTerminal();
-        if (err == error.TerminalInputClosed) {
+        if (terminal_closed) {
             app_needs_deinit = false;
             if (comptime cooperative) {
                 app.deinit();
@@ -1380,6 +1383,33 @@ test "app entry reports run errors before deinit and outer cleanup" {
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
+}
+
+test "app entry treats a terminal that can no longer take output like closed input" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalOutputClosed;
+    capture.record_stderr_event = true;
+    capture.resume_handoff_id = "session-123";
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
+    try expectEvents(&.{
+        "init:none",
+        "rebind-after-init",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "hangup-close",
+        "terminal-release",
+        "deinit",
+    });
 }
 
 test "app entry treats terminal input closure as abnormal cleanup without stderr" {
