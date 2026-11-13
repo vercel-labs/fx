@@ -107,10 +107,12 @@ const Read = union(enum) {
 /// block whose parsed value is what `encode` gives for what it says: the same
 /// keys in the same order with values fx can write. Another JSON spelling of
 /// that value, with spaces or `\u` escapes, reads the same. Anything else, such
-/// as a version fx does not know, an unknown or repeated key, a mode on a
-/// repository's profile, or data that holds the block's key but does not parse,
-/// reads as `.invalid`, and the child is treated as if it had none. The result
-/// belongs to `arena`.
+/// as a version fx does not know, an unknown key, a mode on a repository's
+/// profile, or a repeated key anywhere in the data, reads as `.invalid`, and
+/// the child is treated as if it had none. A repeated key is the one way saved
+/// data fails to parse and still gets here: data cut short breaks its log line,
+/// which fx refuses with the whole session, and a repeated key in a field the
+/// child's own load reads fails that load first. The result belongs to `arena`.
 pub fn read(arena: Allocator, spawn_data: []const u8) Allocator.Error!Read {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, spawn_data, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -291,6 +293,7 @@ test "a block fx would not write reads as invalid" {
         // The keys in the order fx writes them.
         "{\"from\":\"home\",\"v\":1}",
         // A repeated key, which the parser refuses, so the data does not parse.
+        // (The same data with a repeated key outside the block is checked below.)
         "{\"v\":1,\"from\":\"home\",\"tools\":[\"glob_files\"],\"tools\":[\"read_file\"]}",
         // Not an object.
         "[]",
@@ -304,10 +307,11 @@ test "a block fx would not write reads as invalid" {
     // A name longer than a profile may list.
     const long = try arena.print("{{\"started_with\":{{\"v\":1,\"from\":\"home\",\"tools\":[\"{s}\"]}}}}", .{text_utils.repeat("x", profiles.max_list_entry_bytes + 1)});
     try testing.expectEqual(Read.invalid, try read(arena, long));
-    // Data that holds the block's key but is cut short is a block fx did not
-    // write, not data with none. Data with no key stays without one.
-    try testing.expectEqual(Read.invalid, try read(arena, "{\"agent\":\"reviewer\",\"started_with\":{\"v\":1,\"from\":\"ho"));
-    try testing.expectEqual(Read.none, try read(arena, "{\"agent\":\"reviewer\",\"fingerprint\":\"ab"));
+    // A repeated key outside the block makes the data not parse too, so a block
+    // in it is not believed. Data that does not parse and has no block stays
+    // without one.
+    try testing.expectEqual(Read.invalid, try read(arena, "{\"extra\":1,\"extra\":2,\"started_with\":{\"v\":1,\"from\":\"home\"}}"));
+    try testing.expectEqual(Read.none, try read(arena, "{\"extra\":1,\"extra\":2}"));
 }
 
 test "a block spelled with spaces or escapes reads as the block it says, and is written back as fx writes it" {
