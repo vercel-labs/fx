@@ -195,7 +195,15 @@ for (const model of ["anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol", "fixtu
     return fakeGatewayFinalText(phase === "seed" ? `SEED_DONE\n${BIG_REPLY}` : `${phase.toUpperCase()}_DONE`);
   });
   expect(run.compactions).toBe(1);
-  expect(run.bodies.length).toBe(3);
+  // Claude 4.6 and later and GPT-6 and later first ask the provider for its
+  // compaction block with the request the turn was about to send, so with its
+  // menu too. This fake answers with text, and fx's own summary follows.
+  const providerRequests = run.bodies.filter((raw) => {
+    const body = JSON.parse(raw);
+    return body.providerOptions?.anthropic?.compaction !== undefined || body.providerOptions?.openai?.compactionTrigger === true;
+  }).length;
+  expect(providerRequests).toBe(model.startsWith("fixture/") ? 0 : 1);
+  expect(run.bodies.length).toBe(3 + providerRequests);
   expectMenuKept(run);
 }, 120_000);
 

@@ -3428,7 +3428,11 @@ const StreamedToolInputState = enum {
 
 const GatewayReplayBuilder = struct {
     const max_bytes = types.ProviderReplay.max_bytes;
-    const Kind = enum { text, reasoning, tool_call };
+    const Kind = enum { text, reasoning, tool_call, custom };
+    /// The `custom` parts a later request must send back, by kind: OpenAI's
+    /// compaction block. Other custom events, such as Anthropic's
+    /// `message_start`, describe the stream and are never replayed.
+    const replayed_custom_kinds = [_][]const u8{types.ProviderReplay.openai_compaction_kind};
     const Part = struct {
         kind: Kind,
         id: []u8,
@@ -3477,6 +3481,7 @@ const GatewayReplayBuilder = struct {
     /// belongs to no part, so a part's first text may follow it.
     fn observe(self: *GatewayReplayBuilder, root: std.json.Value, content_offset: usize, separated: bool) !void {
         const event = root.object.get("type").?.string;
+        if (std.mem.eql(u8, event, "custom")) return self.observeCustom(root);
         const kind: Kind = if (std.mem.startsWith(u8, event, "reasoning-"))
             .reasoning
         else if (std.mem.startsWith(u8, event, "text-"))
@@ -3541,6 +3546,27 @@ const GatewayReplayBuilder = struct {
         }
     }
 
+    /// Keeps a custom part a later request sends back, with its provider
+    /// metadata, as one whole part: the event carries no text of its own.
+    fn observeCustom(self: *GatewayReplayBuilder, root: std.json.Value) !void {
+        const kind_value = root.object.get("kind") orelse return;
+        if (kind_value != .string) return;
+        const replayed = for (replayed_custom_kinds) |candidate| {
+            if (std.mem.eql(u8, kind_value.string, candidate)) break true;
+        } else false;
+        if (!replayed) return;
+        const metadata = root.object.get("providerMetadata") orelse return error.InvalidProviderState;
+        if (metadata != .object) return error.InvalidProviderState;
+        for (metadata.object.values()) |options| if (options != .object) return error.InvalidProviderState;
+        const merged = try mergeReplayMetadata(self.alloc, null, metadata);
+        errdefer self.alloc.free(merged);
+        try self.reserve(@sizeOf(Part) + kind_value.string.len + merged.len);
+        const owned_kind = try self.alloc.dupe(u8, kind_value.string);
+        errdefer self.alloc.free(owned_kind);
+        try self.parts.append(self.alloc, .{ .kind = .custom, .id = owned_kind, .metadata = merged, .has_provider_metadata = true, .ended = true });
+        self.needed = true;
+    }
+
     fn finish(self: *GatewayReplayBuilder, content: []const u8, calls: []const types.ToolCall) !?[]u8 {
         if (!self.needed) return null;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -3591,6 +3617,10 @@ const GatewayReplayBuilder = struct {
                 .tool_call => {
                     try out.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
                     try std.json.Stringify.value(canonical_call.?.id, .{}, &out.writer);
+                },
+                .custom => {
+                    try out.writer.writeAll("{\"type\":\"custom\",\"kind\":");
+                    try std.json.Stringify.value(part.id, .{}, &out.writer);
                 },
             }
             if (metadata) |value| {
@@ -5256,7 +5286,10 @@ fn consumeSseStreamTraced(
     }
 
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
-    if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls) {
+    // Anthropic ends an on-demand compaction reply with its own stop reason,
+    // and the block it wrote is replayed like any finished reply.
+    const compaction_finish = finish_reason_holder == .other and std.mem.eql(u8, finish_raw.slice(), "compaction");
+    if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls or compaction_finish) {
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
     }
 
@@ -6494,6 +6527,51 @@ test "consumeSseStream traces every terminal cause" {
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=eof_without_finish") != null);
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=read_failure") != null);
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=cancellation") != null);
+}
+
+test "Gateway completion keeps each provider's compaction block for its replay" {
+    const alloc = std.testing.allocator;
+    const Noop = struct {
+        fn discard(_: *anyopaque, _: []const u8) void {}
+    };
+    // As AI Gateway streams on-demand compaction replies (recorded in
+    // tests/e2e/fixtures/provider-compaction/).
+    const openai =
+        "data: {\"type\":\"response-metadata\",\"id\":\"resp_1\",\"modelId\":\"gpt-6.1-sol\"}\n\n" ++
+        "data: {\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerMetadata\":{\"openai\":{\"type\":\"compaction\",\"itemId\":\"cmp_1\",\"encryptedContent\":\"sealed\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+    var openai_reader = std.Io.Reader.fixed(openai);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var openai_completion = try consumeSseStream(alloc, &openai_reader, undefined, Noop.discard, null, &cancelled);
+    defer deinitGatewayCompletion(alloc, &openai_completion);
+    try std.testing.expectEqualStrings("", openai_completion.content orelse "");
+    const openai_parts = try std.json.parseFromSlice(std.json.Value, alloc, openai_completion.provider_state_json orelse return error.TestExpectedOpenAiReplay, .{});
+    defer openai_parts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), openai_parts.value.array.items.len);
+    const block = openai_parts.value.array.items[0].object;
+    try std.testing.expectEqualStrings("custom", block.get("type").?.string);
+    try std.testing.expectEqualStrings("openai.compaction", block.get("kind").?.string);
+    try std.testing.expectEqualStrings("sealed", block.get("providerOptions").?.object.get("openai").?.object.get("encryptedContent").?.string);
+
+    const anthropic =
+        "data: {\"type\":\"custom\",\"kind\":\"anthropic.message_start\",\"providerMetadata\":{\"anthropic\":{\"id\":\"msg_1\"}}}\n\n" ++
+        "data: {\"type\":\"text-start\",\"id\":\"0\",\"providerMetadata\":{\"anthropic\":{\"type\":\"compaction\",\"signature\":\"signed\"}}}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"0\",\"delta\":\"The user asked for PLUM.\"}\n\n" ++
+        "data: {\"type\":\"text-end\",\"id\":\"0\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"other\",\"raw\":\"compaction\"}}\n\n";
+    var anthropic_reader = std.Io.Reader.fixed(anthropic);
+    var anthropic_completion = try consumeSseStream(alloc, &anthropic_reader, undefined, Noop.discard, null, &cancelled);
+    defer deinitGatewayCompletion(alloc, &anthropic_completion);
+    try std.testing.expectEqualStrings("The user asked for PLUM.", anthropic_completion.content orelse return error.TestExpectedAnthropicText);
+    const anthropic_parts = try std.json.parseFromSlice(std.json.Value, alloc, anthropic_completion.provider_state_json orelse return error.TestExpectedAnthropicReplay, .{});
+    defer anthropic_parts.deinit();
+    // The stream's message_start is not part of the reply.
+    try std.testing.expectEqual(@as(usize, 1), anthropic_parts.value.array.items.len);
+    const text = anthropic_parts.value.array.items[0].object;
+    try std.testing.expectEqualStrings("text", text.get("type").?.string);
+    const metadata = text.get("providerOptions").?.object.get("anthropic").?.object;
+    try std.testing.expectEqualStrings("compaction", metadata.get("type").?.string);
+    try std.testing.expectEqualStrings("signed", metadata.get("signature").?.string);
 }
 
 test "Gateway completion retains ordered continuation parts and final metadata" {

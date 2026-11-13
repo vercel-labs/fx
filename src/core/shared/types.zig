@@ -1809,6 +1809,9 @@ pub const ProviderReplay = struct {
     /// Joins distinct provider messages in assistant content. Replayed text
     /// spans exclude it, so each message returns to its provider unchanged.
     pub const message_separator = "\n\n";
+    /// The `custom` part kind of OpenAI's compaction item, which later
+    /// requests send back whole.
+    pub const openai_compaction_kind = "openai.compaction";
     source: @import("../config/model_provider.zig").ProviderSelection,
     parts_json: []const u8,
 
@@ -1870,6 +1873,11 @@ pub const ChatMessage = struct {
     /// prompt caching and the model honors such markers, and ignores it
     /// otherwise.
     cache_breakpoint: bool = false,
+    /// What a request to any model but the replay's own sends in place of
+    /// this message, as a user message: fx's exact text of the turns a
+    /// provider's compaction block stands for, which only the model that
+    /// wrote it can read (`tests/tla/compaction/ProviderCompaction.tla` Wire).
+    replay_fallback: ?[]const u8 = null,
 };
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
@@ -1885,8 +1893,25 @@ pub fn projectProviderReplay(
         if (replay.matches(source)) continue;
         if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
         projected.?[index].provider_replay = null;
+        if (message.replay_fallback) |text| projected.?[index] = .{ .role = .user, .content = text, .context_origin = message.context_origin };
     }
     return projected;
+}
+
+test "a compaction block another model cannot read goes as fx's text of the same turns" {
+    const alloc = std.testing.allocator;
+    const writer = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "anthropic/claude-fable-5.2" };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "block summary", .provider_replay = .{ .source = writer, .parts_json = "[]" }, .replay_fallback = "fx's exact text", .context_origin = .handoff },
+        .{ .role = .user, .content = "next" },
+    };
+    try std.testing.expect(try projectProviderReplay(alloc, &messages, writer) == null);
+    const projected = (try projectProviderReplay(alloc, &messages, .{ .provider = .gateway, .model = "openai/gpt-6.1-sol" })).?;
+    defer alloc.free(projected);
+    try std.testing.expectEqual(ChatRole.user, projected[0].role);
+    try std.testing.expectEqualStrings("fx's exact text", projected[0].content.?);
+    try std.testing.expect(projected[0].provider_replay == null);
+    try std.testing.expectEqualStrings("next", projected[1].content.?);
 }
 
 test "provider replay projection preserves matching origin and excludes other routes" {

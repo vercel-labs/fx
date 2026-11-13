@@ -4791,6 +4791,7 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     var from: sm.From = .start;
     var skip_offset: ?u64 = null;
     var covered: types.ContextHistoryCut = .{};
+    var keep_from_turn: ?u64 = null;
     if (state.compaction_offset) |offset| {
         const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
         var page = try src.read(sa, .{ .at = cursor }, 1);
@@ -4813,11 +4814,19 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
         from = .{ .at = cursor };
         if (compacted.keep_from_turn) |turn| from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
         covered = .{ .tool_steps = compacted.keep_tool_steps, .steering = compacted.keep_steering };
+        keep_from_turn = compacted.keep_from_turn;
     }
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
     try replay(src, alloc, sa, from, skip_offset, ReplaySink.init(&sink));
     if (numbers) |n| n.trim.* = .{};
-    if (covered.tool_steps != 0 or covered.steering != 0) {
+    // The cut covers steps of the turn the compaction names. When fx wrote
+    // that turn again afresh, superseding it, the copy holds only fx's view
+    // after the cut, and trimming it would drop steps the compaction never
+    // covered.
+    const cut_turn_kept = sink.first_turn == null or sink.first_turn.? == keep_from_turn;
+    if ((covered.tool_steps != 0 or covered.steering != 0) and !cut_turn_kept) {
+        debug_trace.logf("session", "event=sessions_v2_compaction_cut_superseded session={s} cut_turn={?d} first_kept_turn={?d} tool_steps={d} steering={d}", .{ src.id, keep_from_turn, sink.first_turn, covered.tool_steps, covered.steering });
+    } else if (covered.tool_steps != 0 or covered.steering != 0) {
         if (try trimFirstKept(alloc, sa, &history, covered, src.id)) {
             if (numbers) |n| n.trim.* = .{ .turn = n.list.items[1], .tool_steps = covered.tool_steps, .steering = covered.steering };
         }
@@ -4880,11 +4889,16 @@ const RestoreSink = struct {
     alloc: Allocator,
     history: *std.ArrayList(types.HistoryTurn),
     numbers: ?TurnNumbers,
+    /// The log turn the first restored turn came from.
+    first_turn: ?u64 = null,
+    restored_any: bool = false,
 
     fn turn(sink: *RestoreSink, value: types.HistoryTurn, number: ?u64) !void {
         errdefer types.freeHistoryTurn(sink.alloc, value);
         try sink.history.ensureUnusedCapacity(sink.alloc, 1);
         if (sink.numbers) |n| try n.list.append(n.alloc, number);
+        if (!sink.restored_any) sink.first_turn = number;
+        sink.restored_any = true;
         sink.history.appendAssumeCapacity(value);
     }
 

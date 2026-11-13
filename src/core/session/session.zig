@@ -15,6 +15,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const compactor = @import("../compactor/compactor.zig");
+const model_provider = @import("../config/model_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const command_replay_store = @import("command_replay_store.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -2246,6 +2247,47 @@ test "active context projects checkpoint before retained raw tail" {
     try std.testing.expectEqualStrings("later assistant", messages.items[4].content.?);
 }
 
+test "the turns a provider block kept send another model's reasoning as text, the last one too" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const claude: core_types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "anthropic/claude-fable-5.2" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"c\"}]" };
+    const gpt: core_types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "openai/gpt-6.1-sol" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"g\"}]" };
+    const block: HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("fx-compactor-v1\n{\"earlier\":\"e\",\"provider\":{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"parts_json\":\"[]\",\"kept_turns\":2}}"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    // GPT's block kept two of Claude's turns, the newest one last in the
+    // history, which fx projects on its own.
+    const kept = [_]HistoryTurn{
+        block,
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept one") }, .assistant = @constCast("a"), .provider_replay = claude } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept two") }, .assistant = @constCast("b"), .provider_replay = claude } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendHistoryChatMessages(arena, &messages, &kept);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expectEqualStrings("openai/gpt-6.1-sol", messages.items[0].provider_replay.?.source.model);
+    try std.testing.expect(messages.items[2].provider_replay == null);
+    try std.testing.expect(messages.items[4].provider_replay == null);
+
+    // The block's own model keeps its reasoning in a kept turn, and a turn
+    // written after the block keeps its own.
+    const later = [_]HistoryTurn{
+        block,
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept one") }, .assistant = @constCast("a"), .provider_replay = gpt } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept two") }, .assistant = @constCast("b"), .provider_replay = claude } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("after") }, .assistant = @constCast("c"), .provider_replay = claude } },
+    };
+    messages = .empty;
+    try appendHistoryChatMessages(arena, &messages, &later);
+    try std.testing.expectEqual(@as(usize, 7), messages.items.len);
+    try std.testing.expect(messages.items[2].provider_replay != null);
+    try std.testing.expect(messages.items[4].provider_replay == null);
+    try std.testing.expectEqualStrings("anthropic/claude-fable-5.2", messages.items[6].provider_replay.?.source.model);
+}
+
 test "active context rejects corrupt retained-tail accounting" {
     const history = [_]HistoryTurn{
         .{ .assistant = .{
@@ -2628,7 +2670,14 @@ fn appendHistoryRangeChatMessages(
     end: usize,
     trailing_projection: InterruptedChatProjection,
 ) !void {
+    // A range can start after the block, such as the trailing turn.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var kept = try keptBefore(scratch.allocator(), history, start);
     for (history[start..end], start..) |turn, index| {
+        const strip_for = if (turn == .compacted_summary) null else if (kept) |*after| after.next() else null;
+        const first_message = messages.items.len;
+        defer if (strip_for) |model| keepOnlyReplayOf(messages.items[first_message..], model);
         if (isSupersededResume(history, index)) continue;
         const interrupted_projection: InterruptedChatProjection = if (isResumedLater(history, index))
             .steering_continuation
@@ -2639,15 +2688,7 @@ fn appendHistoryRangeChatMessages(
         else
             null;
         switch (turn) {
-            .compacted_summary => |entry| {
-                const text = try formatCompactedContinuationMessage(alloc, entry.summary);
-                errdefer alloc.free(text);
-                try messages.append(alloc, .{
-                    .role = .user,
-                    .content = text,
-                    .context_origin = .handoff,
-                });
-            },
+            .compacted_summary => |entry| kept = try appendCompactedSummaryChatMessage(alloc, messages, entry.summary),
             .assistant => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
@@ -2709,6 +2750,82 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
         .thai => ConversationLanguage.literal("und-Thai"),
         .latin => ConversationLanguage.literal("und-Latn"),
     };
+}
+
+/// The whole turns a provider block kept right after it, and the model that
+/// wrote the block: their reasoning from any other model goes as text.
+const KeptAfterBlock = struct {
+    model: []const u8,
+    left: usize,
+
+    /// The block's model for the next raw turn while it is a kept one.
+    fn next(self: *KeptAfterBlock) ?[]const u8 {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return self.model;
+    }
+};
+
+/// What the newest provider block before `start` still keeps from `start` on.
+fn keptBefore(arena: Allocator, history: []const HistoryTurn, start: usize) !?KeptAfterBlock {
+    var index = start;
+    var raw: usize = 0;
+    while (index > 0) {
+        index -= 1;
+        const entry = switch (history[index]) {
+            .compacted_summary => |entry| entry,
+            else => {
+                raw += 1;
+                continue;
+            },
+        };
+        const block = (try compactor.providerBlock(arena, entry.summary)) orelse return null;
+        return .{ .model = block.model, .left = block.kept_turns -| raw };
+    }
+    return null;
+}
+
+/// Sends `projected`'s reasoning from any model but `model` as text: it
+/// followed what a block of `model` replaced, and only `model` reads that
+/// block (ProviderCompaction.tla KeptAfterBlock). The replay is borrowed, so
+/// nothing is freed.
+fn keepOnlyReplayOf(projected: []core_types.ChatMessage, model: []const u8) void {
+    for (projected) |*sent| {
+        const replay = sent.provider_replay orelse continue;
+        if (!std.mem.eql(u8, replay.source.model, model)) sent.provider_replay = null;
+    }
+}
+
+/// Appends a checkpoint as a request sends it. A provider's compaction block
+/// goes to the model that wrote it in place of the compacted turns, and any
+/// other model gets fx's exact text of them instead
+/// (`types.projectProviderReplay`). Otherwise fx's text is a user message.
+/// Returns what a provider block kept.
+fn appendCompactedSummaryChatMessage(alloc: Allocator, messages: *std.ArrayList(core_types.ChatMessage), summary: []const u8) !?KeptAfterBlock {
+    const text = try formatCompactedContinuationMessage(alloc, summary);
+    errdefer alloc.free(text);
+    if (std.mem.find(u8, summary, "\"provider\":{") != null) block: {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const block = (try compactor.providerBlock(scratch.allocator(), summary)) orelse break :block;
+        const provider = model_provider.parse(block.provider) orelse break :block;
+        const content = try alloc.dupe(u8, block.text);
+        errdefer alloc.free(content);
+        const model = try alloc.dupe(u8, block.model);
+        errdefer alloc.free(model);
+        const parts = try alloc.dupe(u8, block.parts_json);
+        errdefer alloc.free(parts);
+        try messages.append(alloc, .{
+            .role = .assistant,
+            .content = content,
+            .provider_replay = .{ .source = .{ .provider = provider, .model = model }, .parts_json = parts },
+            .replay_fallback = text,
+            .context_origin = .handoff,
+        });
+        return .{ .model = model, .left = block.kept_turns };
+    }
+    try messages.append(alloc, .{ .role = .user, .content = text, .context_origin = .handoff });
+    return null;
 }
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {

@@ -504,8 +504,10 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         if (!allows_openai) return error.UltrafastProviderRestricted;
     }
     const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
-    const openai_options = options.ultrafast or options.skip_cache_writes;
-    if (!gateway_options and !openai_options and options.parallel_tool_calls == null) return;
+    const openai_compaction = options.compaction == .openai;
+    const anthropic_options = options.compaction == .anthropic;
+    const openai_options = options.ultrafast or options.skip_cache_writes or openai_compaction;
+    if (!gateway_options and !openai_options and !anthropic_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
@@ -542,15 +544,41 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
             if (options.ultrafast) try writer.writeByte(',');
             try writer.writeAll("\"promptCacheOptions\":{\"mode\":\"explicit\"}");
         }
+        if (openai_compaction) {
+            if (options.ultrafast or options.skip_cache_writes) try writer.writeByte(',');
+            try writer.writeAll("\"compactionTrigger\":true");
+        }
         try writer.writeByte('}');
     }
-    if (options.parallel_tool_calls) |parallel_tool_calls| {
+    if (anthropic_options) {
         if (gateway_options or openai_options) try writer.writeByte(',');
+        try writer.writeAll("\"anthropic\":{\"compaction\":{\"type\":\"summarize\"}}");
+    }
+    if (options.parallel_tool_calls) |parallel_tool_calls| {
+        if (gateway_options or openai_options or anthropic_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
         try writer.writeAll(if (parallel_tool_calls) "true" else "false");
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+}
+
+test "a compaction request asks the provider for its own compaction block" {
+    var anthropic: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer anthropic.deinit();
+    try writeProviderOptions(&anthropic.writer, .{ .compaction = .anthropic });
+    try std.testing.expectEqualStrings(",\"providerOptions\":{\"anthropic\":{\"compaction\":{\"type\":\"summarize\"}}}", anthropic.written());
+
+    var openai: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer openai.deinit();
+    try writeProviderOptions(&openai.writer, .{ .compaction = .openai, .skip_cache_writes = true, .prompt_caching = true });
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, openai.written()[",\"providerOptions\":".len..], .{});
+    defer parsed.deinit();
+    const options = parsed.value.object.get("openai").?.object;
+    try std.testing.expect(options.get("compactionTrigger").?.bool);
+    try std.testing.expectEqualStrings("explicit", options.get("promptCacheOptions").?.object.get("mode").?.string);
+    try std.testing.expect(parsed.value.object.get("gateway") != null);
+    try std.testing.expect(parsed.value.object.get("anthropic") == null);
 }
 
 test "skipping cache writes asks OpenAI for explicit caching with no breakpoints" {
@@ -968,7 +996,9 @@ pub fn selectReplayParts(
         if (part != .object) return error.InvalidProviderState;
         const kind = part.object.get("type") orelse return error.InvalidProviderState;
         if (kind != .string) return error.InvalidProviderState;
-        const keep = if (std.mem.eql(u8, kind.string, "text")) include_text else if (std.mem.eql(u8, kind.string, "reasoning")) include_reasoning else if (std.mem.eql(u8, kind.string, "tool-call")) blk: {
+        // A custom part is a whole provider item, such as a compaction
+        // block, and goes wherever its message goes.
+        const keep = if (std.mem.eql(u8, kind.string, "custom")) true else if (std.mem.eql(u8, kind.string, "text")) include_text else if (std.mem.eql(u8, kind.string, "reasoning")) include_reasoning else if (std.mem.eql(u8, kind.string, "tool-call")) blk: {
             const id = part.object.get("toolCallId") orelse return error.InvalidProviderState;
             if (id != .string) return error.InvalidProviderState;
             break :blk findToolCallIndex(calls, id.string) != null;
@@ -1001,6 +1031,130 @@ test "split provider completion retains metadata with each canonical assistant u
     try std.testing.expectEqualStrings("signed", prompt[0].object.get("content").?.array.items[1].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
     try std.testing.expectEqual(@as(usize, 1), prompt[2].object.get("content").?.array.items.len);
     try std.testing.expectEqualStrings("text", prompt[2].object.get("content").?.array.items[0].object.get("providerOptions").?.object.get("openai").?.object.get("itemId").?.string);
+}
+
+/// The parts hold one provider compaction block and nothing else: an
+/// Anthropic text part marked `compaction` with its signature, or an OpenAI
+/// `openai.compaction` item with its ID. Anything else, such as a reply that
+/// answered instead of compacting, is not a block.
+pub fn holdsCompactionBlock(alloc: std.mem.Allocator, parts_json: []const u8) bool {
+    if (parts_json.len > types.ProviderReplay.max_bytes) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), parts_json, .{}) catch return false;
+    if (parsed != .array or parsed.array.items.len != 1) return false;
+    const part = parsed.array.items[0];
+    if (part != .object) return false;
+    const kind = part.object.get("type") orelse return false;
+    const options = part.object.get("providerOptions") orelse return false;
+    if (kind != .string or options != .object) return false;
+    if (std.mem.eql(u8, kind.string, "text")) {
+        const anthropic = options.object.get("anthropic") orelse return false;
+        if (anthropic != .object) return false;
+        const block_type = anthropic.object.get("type") orelse return false;
+        const signature = anthropic.object.get("signature") orelse return false;
+        return block_type == .string and std.mem.eql(u8, block_type.string, "compaction") and signature == .string and signature.string.len > 0;
+    }
+    if (std.mem.eql(u8, kind.string, "custom")) {
+        const custom_kind = part.object.get("kind") orelse return false;
+        const openai = options.object.get("openai") orelse return false;
+        if (custom_kind != .string or !std.mem.eql(u8, custom_kind.string, types.ProviderReplay.openai_compaction_kind) or openai != .object) return false;
+        const item = openai.object.get("itemId") orelse return false;
+        return item == .string and item.string.len > 0;
+    }
+    return false;
+}
+
+test "only one provider compaction block counts as a block" {
+    try std.testing.expect(holdsCompactionBlock(std.testing.allocator, "[{\"type\":\"text\",\"offset\":0,\"length\":4,\"providerOptions\":{\"anthropic\":{\"type\":\"compaction\",\"signature\":\"sig\"}}}]"));
+    try std.testing.expect(holdsCompactionBlock(std.testing.allocator, "[{\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerOptions\":{\"openai\":{\"itemId\":\"cmp_1\",\"encryptedContent\":\"x\"}}}]"));
+    for ([_][]const u8{
+        "[]",
+        "not json",
+        "[{\"type\":\"text\",\"offset\":0,\"length\":4}]",
+        "[{\"type\":\"text\",\"offset\":0,\"length\":4,\"providerOptions\":{\"anthropic\":{\"type\":\"compaction\",\"signature\":\"\"}}}]",
+        "[{\"type\":\"reasoning\",\"text\":\"r\",\"providerOptions\":{\"anthropic\":{\"signature\":\"s\"}}}]",
+        "[{\"type\":\"custom\",\"kind\":\"openai.other\",\"providerOptions\":{\"openai\":{\"itemId\":\"x\"}}}]",
+        "[{\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerOptions\":{\"openai\":{\"itemId\":\"a\"}}},{\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerOptions\":{\"openai\":{\"itemId\":\"b\"}}}]",
+    }) |parts| try std.testing.expect(!holdsCompactionBlock(std.testing.allocator, parts));
+}
+
+test "a provider compaction block fx accepts goes back whole on fuzzed parts" {
+    try std.testing.fuzz({}, fuzzCompactionBlock, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "[{\"type\":\"text\",\"offset\":0,\"length\":12,\"providerOptions\":{\"anthropic\":{\"type\":\"compaction\",\"signature\":\"sig\"}}}]",
+            "[{\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerOptions\":{\"openai\":{\"type\":\"compaction\",\"itemId\":\"cmp_1\",\"encryptedContent\":\"x\"}}}]",
+            "[{\"type\":\"text\",\"offset\":4,\"length\":40,\"providerOptions\":{\"anthropic\":{\"type\":\"compaction\",\"signature\":\"s\"}}}]",
+            "[{\"type\":\"reasoning\",\"text\":\"r\",\"providerOptions\":{\"anthropic\":{\"signature\":\"s\"}}}]",
+            "[]",
+            "\xff{",
+        }) ++ @import("fuzz_corpus").provider_compaction_block.*),
+    });
+}
+
+/// A reply fx takes for a block goes back to its provider as that block,
+/// with the identity the provider gave it, or fx refuses the parts as it
+/// refuses any bad replay: never a request without the block.
+fn fuzzCompactionBlock(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [2048]u8 = undefined;
+    const parts = buffer[0..@intCast(smith.slice(&buffer))];
+    if (!holdsCompactionBlock(arena, parts)) return;
+    const block = (try std.json.parseFromSliceLeaky(std.json.Value, arena, parts, .{})).array.items[0].object;
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = parts };
+    const selected = selectReplayParts(arena, replay, &.{}, true, false) catch |err| switch (err) {
+        error.InvalidProviderState, error.ProviderStateTooLarge => return,
+        else => return err,
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "summary text", .provider_replay = selected },
+        .{ .role = .user, .content = "next" },
+    };
+    const body = buildGatewayRequestBody(arena, "[]", &messages) catch |err| switch (err) {
+        error.InvalidProviderState, error.ProviderStateTooLarge => return,
+        else => return err,
+    };
+    const sent = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const content = sent.object.get("prompt").?.array.items[0].object.get("content").?.array.items;
+    const kind = block.get("type").?.string;
+    const custom = std.mem.eql(u8, kind, "custom");
+    const provider_key = if (custom) "openai" else "anthropic";
+    const id_key = if (custom) "itemId" else "signature";
+    const id = block.get("providerOptions").?.object.get(provider_key).?.object.get(id_key).?.string;
+    for (content) |part| {
+        if (part != .object) continue;
+        const part_kind = part.object.get("type") orelse continue;
+        if (part_kind != .string or !std.mem.eql(u8, part_kind.string, kind)) continue;
+        const options = part.object.get("providerOptions") orelse continue;
+        if (options != .object) continue;
+        const provider = options.object.get(provider_key) orelse continue;
+        if (provider != .object) continue;
+        const sent_id = provider.object.get(id_key) orelse continue;
+        if (sent_id == .string and std.mem.eql(u8, sent_id.string, id)) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "an OpenAI compaction block replays as the custom part it came as" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "openai/gpt-6.1-sol" }, .parts_json = "[{\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerOptions\":{\"openai\":{\"type\":\"compaction\",\"itemId\":\"cmp_1\",\"encryptedContent\":\"sealed\"}}}]" };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "", .provider_replay = try selectReplayParts(alloc, replay, &.{}, true, false) },
+        .{ .role = .user, .content = "next" },
+    };
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    const content = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("custom", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("openai.compaction", content[0].object.get("kind").?.string);
+    const options = content[0].object.get("providerOptions").?.object.get("openai").?.object;
+    try std.testing.expectEqualStrings("cmp_1", options.get("itemId").?.string);
+    try std.testing.expectEqualStrings("sealed", options.get("encryptedContent").?.string);
 }
 
 fn writeReplayContent(
@@ -1051,6 +1205,15 @@ fn writeReplayContent(
             text_end = offset + length;
             try writer.writeAll("{\"type\":\"text\",\"text\":");
             try std.json.Stringify.value(content[offset..text_end], .{}, writer);
+            try writeReplayMetadata(writer, metadata);
+            try writer.writeByte('}');
+        } else if (std.mem.eql(u8, kind.string, "custom")) {
+            // A provider item with no text of its own, such as OpenAI's
+            // compaction block, sent back as it came.
+            const custom_kind = part.object.get("kind") orelse return error.InvalidProviderState;
+            if (custom_kind != .string or metadata == null) return error.InvalidProviderState;
+            try writer.writeAll("{\"type\":\"custom\",\"kind\":");
+            try std.json.Stringify.value(custom_kind.string, .{}, writer);
             try writeReplayMetadata(writer, metadata);
             try writer.writeByte('}');
         } else if (std.mem.eql(u8, kind.string, "tool-call")) {

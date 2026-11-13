@@ -13,6 +13,10 @@ pub const Feedback = struct {
     publication: Publication = .not_published,
     /// Deliberately retains the original erased host/provider error, not text.
     err: ?anyerror = null,
+    /// `/compact` on a model whose provider writes the compaction block: the
+    /// compaction runs right before the next message is sent, the one request
+    /// fx can send to the provider exactly as before.
+    scheduled: bool = false,
 };
 
 pub fn failure(err: anyerror, stage: Stage, cancelled: bool) Feedback {

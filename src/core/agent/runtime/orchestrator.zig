@@ -3750,7 +3750,7 @@ fn build_provider_prompt_with_response_language_control(
     origin: runtime_config.TurnOrigin,
     enforce_response_language: bool,
     correction_attempted: bool,
-    compaction_handoff: ?[]const u8,
+    compaction_handoff: ?ChatMessage,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
@@ -3805,7 +3805,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
         .subagent,
         false,
         false,
-        "handoff",
+        .{ .role = .user, .content = "handoff", .context_origin = .handoff },
         &.{.{ .role = .assistant, .content = "retained tail" }},
         1,
     );
@@ -7058,7 +7058,7 @@ fn buildProviderPromptForCompactionWindow(
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
-    handoff: ?[]const u8,
+    handoff: ?ChatMessage,
     retained_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !runtime_prompt_context.ProviderPrompt {
@@ -7072,10 +7072,7 @@ fn buildProviderPromptForCompactionWindow(
     );
     var compacted_history: std.ArrayList(ChatMessage) = .empty;
     defer compacted_history.deinit(alloc);
-    try compacted_history.append(alloc, .{
-        .role = .user,
-        .content = handoff.?,
-    });
+    try compacted_history.append(alloc, handoff.?);
     try compacted_history.appendSlice(alloc, retained_history_tail);
     return runtime_prompt_context.buildProviderPrompt(
         alloc,
@@ -7085,6 +7082,14 @@ fn buildProviderPromptForCompactionWindow(
         current_user_message,
         within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
+}
+
+/// The runtime context's texts, which a provider's compaction block keeps
+/// (`compactor.Request.runtime_context`).
+fn runtimeContextTexts(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const []const u8 {
+    const texts = try arena.alloc([]const u8, messages.len);
+    for (messages, texts) |message, *text| text.* = message.content orelse "";
+    return texts;
 }
 
 fn commitContextCompaction(
@@ -7699,7 +7704,7 @@ fn processQueuedPromptLoop(
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
     defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
-    var active_compaction_handoff: ?[]const u8 = null;
+    var active_compaction_handoff: ?ChatMessage = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
     // The provider's count of the first request after a compaction is traced,
     // so its size can be checked against the room compaction had.
@@ -8499,7 +8504,7 @@ fn processQueuedPromptLoop(
                 if (just_rebuilt_request) compactor.traceLog(false, "request after compaction estimated_tokens={d} fixed_tokens={any} usable_tokens={any} after_tokens={d}", .{ request_cost.estimated_input_tokens, size.fixed_tokens, size.usable_tokens, size.afterTokens() });
                 const usable_tokens = size.usable_tokens;
                 const compact_at_tokens = size.compact_at_tokens;
-                const wants_compaction = has_new_compactable_context and (overflow_pending or size.due());
+                const wants_compaction = has_new_compactable_context and (overflow_pending or size.due() or agent.compaction_requested);
                 compactor.traceEventIf(
                     wants_compaction,
                     step_ctx,
@@ -8530,6 +8535,7 @@ fn processQueuedPromptLoop(
                         return error.ContextCapacityExceeded;
                     };
                 } else {
+                    agent.compaction_requested = false;
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
                         .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
@@ -8586,6 +8592,7 @@ fn processQueuedPromptLoop(
                             .records = if (config.session_child_capability) |capability| result_store.compactorStore(capability) else null,
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
+                            .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
                         },
                     }) catch |err| {
                         if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
@@ -8615,15 +8622,18 @@ fn processQueuedPromptLoop(
                         } else .{};
                         compacted_suffix_len += try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
                         explicit_note_index = try keepExplicitSkillNote(arena, &within_turn_suffix, skills.explicit, explicit_note_index, compacted_suffix_len);
-                        var retained_messages: std.ArrayList(ChatMessage) = .empty;
-                        try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
-                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);
-                        active_compaction_handoff = outcome.model_text;
-                        trace_count_after_compaction = true;
-                        active_compaction_history_tail = retained_messages.items;
                         const next_history = try arena.alloc(HistoryTurn, outcome.retained_history.len + 1);
                         next_history[0] = .{ .compacted_summary = outcome.checkpoint };
                         @memcpy(next_history[1..], outcome.retained_history);
+                        // The rest of the turn sends the checkpoint as every
+                        // later turn will: a provider's block to the model that
+                        // wrote it, fx's text otherwise, then the kept turns.
+                        var compacted_messages: std.ArrayList(ChatMessage) = .empty;
+                        try session_runtime.appendHistoryChatMessages(arena, &compacted_messages, next_history);
+                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, compacted_messages.items);
+                        active_compaction_handoff = compacted_messages.items[0];
+                        trace_count_after_compaction = true;
+                        active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
                         finalization.compacted_execution = .{
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
