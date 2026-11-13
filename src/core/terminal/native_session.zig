@@ -742,6 +742,33 @@ const SupportedRegistry = struct {
         return finished;
     }
 
+    /// Joins the backend threads that `closeAllForExit` left draining,
+    /// waiting until `deadline_ms`. Returns whether every backend finished.
+    /// Only tests call it: their process outlives the exit close, so they
+    /// can wait for a drain that missed `exit_join_ms` and then free the
+    /// registry.
+    pub fn joinDrainingBackendsBefore(self: *SupportedRegistry, deadline_ms: i64) bool {
+        const zio = io_mod.getIo();
+        var pinned: [max_sessions]?*Session = @splat(null);
+        self.mutex.lockUncancelable(zio);
+        for (&self.sessions, 0..) |*entry, index| {
+            const session = entry.* orelse continue;
+            self.references[index] += 1;
+            pinned[index] = session;
+        }
+        self.mutex.unlock(zio);
+        defer for (pinned, 0..) |maybe_session, index| {
+            const session = maybe_session orelse continue;
+            self.releaseReference(index, session);
+        };
+        var finished = true;
+        for (pinned) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (!session.finalizeBackendBefore(deadline_ms)) finished = false;
+        }
+        return finished;
+    }
+
     fn anyLive(pinned: *const [max_sessions]?*Session) bool {
         for (pinned) |maybe_session| {
             const session = maybe_session orelse continue;

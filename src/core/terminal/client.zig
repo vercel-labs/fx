@@ -439,6 +439,20 @@ pub const Runtime = struct {
         self.backend_drained = backend.registry.closeAllForExit();
     }
 
+    /// Waits until `timeout_ms` for backend threads that the exit close left
+    /// draining, so a test can free the backend. fx's own exit never waits
+    /// past its budget, and keeps such a backend allocated instead.
+    fn joinExitDrainForTest(self: *Runtime, timeout_ms: i64) void {
+        const zio = io_mod.getIo();
+        self.backend_mutex.lockUncancelable(zio);
+        defer self.backend_mutex.unlock(zio);
+        if (self.backend_drained) return;
+        const backend = self.backend orelse return;
+        self.backend_drained = backend.registry.joinDrainingBackendsBefore(
+            io_mod.milliTimestamp() + timeout_ms,
+        );
+    }
+
     pub fn deinit(self: *Runtime) void {
         self.closeOwnedTerminals();
         if (self.thread) |thread| thread.join();
@@ -1125,6 +1139,11 @@ const LiveTerminalFixture = struct {
     }
 
     fn deinit(fixture: *LiveTerminalFixture) void {
+        // Under load a backend can drain after the exit budget, and the
+        // runtime then keeps it allocated on purpose. The test process lives
+        // on, so wait for it here and free it.
+        fixture.runtime.closeOwnedTerminals();
+        fixture.runtime.joinExitDrainForTest(10_000);
         fixture.runtime.deinit();
         if (fixture.persistence) |*persistence| persistence.deinit();
         std.testing.allocator.free(fixture.home);
