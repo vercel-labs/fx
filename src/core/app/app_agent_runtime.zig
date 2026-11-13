@@ -1318,7 +1318,11 @@ pub fn Runtime(comptime App: type) type {
                 .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
+                // A sign-in another fx process renewed since `/compact`
+                // started gets one more send, as an agent turn does.
+                .renewal_deps = &deps,
             };
+            defer summary_model.deinit();
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
                 .activity_origin = .manual,
@@ -1890,12 +1894,10 @@ const test_prompt_policy = prompt_policy_contract.Policy{
 };
 
 var refresh_gather_calls: usize = 0;
-var refresh_named_target: bool = false;
 var refresh_gather_error: context_contract.ProviderError = error.WriteFailed;
 
 fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
     refresh_gather_calls += 1;
-    refresh_named_target = input.targets.len != 0;
     const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
@@ -2807,7 +2809,6 @@ test "subagent labels show named request and reply" {
 test "app agent runtime refreshes enabled project context through registry" {
     const alloc = std.testing.allocator;
     refresh_gather_calls = 0;
-    refresh_named_target = true;
     var app = RefreshContextApp{
         .alloc = alloc,
         .context_enabled = true,
@@ -2819,9 +2820,6 @@ test "app agent runtime refreshes enabled project context through registry" {
     try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
-    // The instructions' context never names a target; a turn's folders reach
-    // the model as notes.
-    try std.testing.expect(!refresh_named_target);
     const contribution = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.fresh_context", contribution.provider_id);
     try std.testing.expectEqualStrings("fresh:/tmp/workspace", contribution.content);

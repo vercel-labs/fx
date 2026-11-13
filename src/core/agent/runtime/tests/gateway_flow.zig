@@ -916,6 +916,122 @@ test "an image from a folder with its own rules brings them as a note on the tur
     try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
+test "files attached by path bring their folders' rules as a note on the turn's message and leave the instructions alone (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/docs");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/docs/AGENTS.md", .data = "ATTACHED_FOLDER_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/docs/a.txt", .data = "a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/docs/b.txt", .data = "b" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const a_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/docs/a.txt");
+    defer alloc.free(a_path);
+    const b_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/docs/b.txt");
+    defer alloc.free(b_path);
+    const rules_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "docs", "AGENTS.md" });
+    defer alloc.free(rules_path);
+    const block = "<scoped-rules from=\"docs/AGENTS.md\" scope=\"docs\">\nATTACHED_FOLDER_RULE\n</scoped-rules>";
+    const omitted = "<project-rules-omitted from=\"https://example.test/doc.md\" reason=\"unsafe target\" />";
+    const reminder = "<scoped-rules-reminder from=\"docs/AGENTS.md\" scope=\"docs\">" ++
+        "The rules fx added earlier for this folder still apply.</scoped-rules-reminder>";
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const completions = [_]FakeCompletion{.{ .content = "Answer" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    // Turn 1 attaches nothing.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    var first = fixture.job();
+    first.prompt = @constCast("Hello there.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    try expectBodyNotContains(&first_gateway, 0, "ATTACHED_FOLDER_RULE");
+
+    // Turn 2 attaches a file from a folder the session has not seen and a
+    // source that is no file. The request opens with every message turn 1
+    // sent, and the folder's rules and the omission end the turn's message.
+    var history: std.ArrayList(HistoryTurn) = .empty;
+    defer history.deinit(alloc);
+    try history.append(alloc, first_hooks.history_turns.items[0]);
+    const second_targets = [_]context_contract.ApplicableTarget{.{ .path = a_path, .kind = .file }};
+    const second_omissions = [_]context_contract.ContextOmissionInput{.{ .source = "https://example.test/doc.md", .reason = .unsafe_target }};
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    var second = fixture.job();
+    second.prompt = @constCast("Look at this file.");
+    second.history = history.items;
+    second.attached_files = .{ .targets = &second_targets, .omissions = &second_omissions };
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    try expectPromptStartsWith(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try expectGatewayPromptFinalUserText(&second_gateway, 0, "Look at this file.\n\n" ++ block ++ "\n\n" ++ omitted);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(second_gateway.request_bodies.items[0], "ATTACHED_FOLDER_RULE"));
+    // The saved turn keeps the note at its start, with the file it delivered.
+    const saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(rules_path, saved.context_notes[0].sources[0].path);
+    try std.testing.expect(saved.context_notes[0].sources[0].stamp != 0);
+
+    // Turn 3 attaches another file from the same folder: turn 2's message
+    // comes back as it was and this one ends with the reminder line.
+    try history.append(alloc, second_hooks.history_turns.items[0]);
+    const third_targets = [_]context_contract.ApplicableTarget{.{ .path = b_path, .kind = .file }};
+    var third_gateway = FakeGateway.init(alloc, &completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.context_enabled = true;
+    third_hooks.context_registry = registry;
+    var third = fixture.job();
+    third.prompt = @constCast("And this one?");
+    third.history = history.items;
+    third.attached_files = .{ .targets = &third_targets };
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    try expectPromptStartsWith(alloc, second_gateway.request_bodies.items[0], third_gateway.request_bodies.items[0]);
+    try expectGatewayPromptFinalUserText(&third_gateway, 0, "And this one?\n\n" ++ reminder);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(third_gateway.request_bodies.items[0], "ATTACHED_FOLDER_RULE"));
+
+    // A turn that carries no attached files sends no such note, and the
+    // images stay out of it unless the host says they are workspace files.
+    var plain_gateway = FakeGateway.init(alloc, &completions);
+    defer plain_gateway.deinit();
+    var plain_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer plain_hooks.deinit();
+    plain_hooks.context_enabled = true;
+    plain_hooks.context_registry = registry;
+    var plain = fixture.job();
+    plain.prompt = @constCast("Nothing attached.");
+    try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain);
+    try expectBodyNotContains(&plain_gateway, 0, "ATTACHED_FOLDER_RULE");
+    try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+
+    // A host that registers no project instructions, as the libfx cores do,
+    // gets no note for the same attachments.
+    var empty_gateway = FakeGateway.init(alloc, &completions);
+    defer empty_gateway.deinit();
+    var empty_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer empty_hooks.deinit();
+    empty_hooks.context_enabled = true;
+    empty_hooks.context_registry = .{ .default_provider = context_contract.empty_provider };
+    var empty = fixture.job();
+    empty.prompt = @constCast("Look at this file.");
+    empty.attached_files = .{ .targets = &second_targets, .omissions = &second_omissions };
+    try runFakePrompt(&empty_gateway, &empty_hooks, fixture.config(), empty);
+    try expectBodyNotContains(&empty_gateway, 0, "ATTACHED_FOLDER_RULE");
+    try expectBodyNotContains(&empty_gateway, 0, "project-rules-omitted");
+    try std.testing.expectEqual(@as(usize, 0), empty_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+}
+
 test "processQueuedPrompt recovers when a model rejects post-Vision assistant prefill" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6126,7 +6242,7 @@ test "processQueuedPrompt empty history recovery preserves validation and source
     }
 }
 
-test "processQueuedPrompt reconciles provider error before tool execution" {
+test "processQueuedPrompt regenerates a local tool call that a provider error left unexecuted" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -6149,10 +6265,36 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);
+}
+
+test "processQueuedPrompt runs the resend's tool call after a provider error left a local call unexecuted" {
+    const alloc = std.testing.allocator;
+    const failed = [_]ToolCall{toolCall("call_read_failed", "read_file", "{\"path\":\"a\"}")};
+    const resent = [_]ToolCall{toolCall("call_read_resent", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &failed, .finish_reason = .provider_error },
+        .{ .tool_calls = &resent },
+        .{ .content = "Read after the resend" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt stops for review when uncertain tool reconciliation returns another tool" {
@@ -6449,10 +6591,39 @@ test "processQueuedPrompt preserves the provider-executed subset of mixed failed
     );
 }
 
-test "processQueuedPrompt Esc while an uncertain tool request waits ends the turn without running it" {
+test "processQueuedPrompt reconciles local calls when the failed stream also started a provider tool" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("provider_search", "web_search", "{}")};
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .tool_calls = &calls, .finish_reason = .provider_error },
+        .{ .content = "Reconciled without tools" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The provider may have run its search, so the local call does not make
+    // the attempt unexecuted: the resend reconciles with tools off.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "Reconcile the available tool evidence");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(
+        session_codec.RecoveryToolState.uncertain,
+        hooks.recovery_checkpoints.items[1].tool_state,
+    );
+}
+
+test "processQueuedPrompt Esc while a resend after an unexecuted tool call waits ends the turn without running it" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
-        toolCall("uncertain_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
+        toolCall("unexecuted_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls, .finish_reason = .provider_error },
@@ -6477,7 +6648,7 @@ test "processQueuedPrompt Esc while an uncertain tool request waits ends the tur
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
-    try std.testing.expectEqual(session_codec.RecoveryToolState.uncertain, checkpoint.tool_state);
+    try std.testing.expectEqual(session_codec.RecoveryToolState.proven_unexecuted, checkpoint.tool_state);
     // Saving the cancelled turn as interrupted ends its checkpoint, so no
     // separate clear ends the turn a second time.
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);

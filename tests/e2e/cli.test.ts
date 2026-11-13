@@ -3328,7 +3328,7 @@ describe("cli: sessions", () => {
           turns: ["review the landing page"],
         });
 
-        // Updated times show in the local zone, fixed here at five and a half hours east of UTC.
+        // A session a week old shows the date it changed in the local zone, fixed here at five and a half hours east of UTC.
         const first = await runFx(["sessions"], {
           cwd: workspaceRoot,
           env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "IST-5:30" },
@@ -3336,15 +3336,11 @@ describe("cli: sessions", () => {
         });
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
-        expect(first.stdout).toContain(
-          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 05:30:00.003 IST",
-        );
-        expect(first.stdout).toContain(
-          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 05:30:00.002 IST",
-        );
-        expect(first.stdout).toContain(
-          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-15 03:43:20.123 IST",
-        );
+        expect(first.stdout).toMatch(/^TITLE +TURNS +UPDATED +SESSION ID$/m);
+        expect(first.stdout).toMatch(/^Investigate cache misses +2 +1970-01-01 +named-session$/m);
+        expect(first.stdout).toMatch(/^Untitled session +0 +1970-01-01 +unnamed-session$/m);
+        // 2023-11-14 22:13:20 UTC is already the 15th in that zone.
+        expect(first.stdout).toMatch(/^Review landing page +1 +2023-11-15 +script-only-session$/m);
         expect(first.stdout).not.toContain("updated_at_ms");
         expect(first.stdout).not.toContain("language=");
 
@@ -3374,9 +3370,7 @@ describe("cli: sessions", () => {
         });
         expect(renamed.code).toBe(0);
         expect(renamed.stderr).toBe("");
-        expect(renamed.stdout).toContain(
-          " - Investigate cache hits\n   id=named-session | 2 turns | English",
-        );
+        expect(renamed.stdout).toMatch(/^Investigate cache hits +2 +\S+ +named-session$/m);
         expect(renamed.stdout).not.toContain("Investigate cache misses");
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -3394,15 +3388,17 @@ describe("cli: sessions", () => {
         const workspace = join(root, "workspace");
         mkdirSync(workspace);
         const workspaceRoot = realpathSync(workspace);
-        // 2023-07-10 14:40:00 UTC, during daylight saving time.
+        // 2023-07-10 04:30 UTC, during daylight saving time: 00:30 EDT, but
+        // 23:30 the day before in EST.
         writeConversationSession(home, workspaceRoot, "summer-session", {
           title: "Summer session",
-          updatedAtMs: 1_689_000_000_000,
+          updatedAtMs: 1_688_963_400_000,
         });
-        // 2023-11-14 22:13:20.123 UTC, after daylight saving time ends.
+        // 2023-11-15 04:30 UTC, after daylight saving time ends: 23:30 EST
+        // the day before, but 00:30 in EDT.
         writeConversationSession(home, workspaceRoot, "winter-session", {
           title: "Winter session",
-          updatedAtMs: 1_700_000_000_123,
+          updatedAtMs: 1_700_022_600_000,
         });
 
         const listed = await runFx(["sessions"], {
@@ -3412,12 +3408,8 @@ describe("cli: sessions", () => {
         });
         expect(listed.code).toBe(0);
         expect(listed.stderr).toBe("");
-        expect(listed.stdout).toContain(
-          " - Summer session\n   id=summer-session | 0 turns | English | updated 2023-07-10 10:40:00.000 EDT",
-        );
-        expect(listed.stdout).toContain(
-          " - Winter session\n   id=winter-session | 0 turns | English | updated 2023-11-14 17:13:20.123 EST",
-        );
+        expect(listed.stdout).toMatch(/^Summer session +0 +2023-07-10 +summer-session$/m);
+        expect(listed.stdout).toMatch(/^Winter session +0 +2023-11-14 +winter-session$/m);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

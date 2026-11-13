@@ -277,6 +277,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_STEER_YIELD_GRACE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_END_HELD": {
       "job": "test",
       "stability": "internal"
