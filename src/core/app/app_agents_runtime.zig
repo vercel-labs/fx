@@ -34,6 +34,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const shared_theme = @import("../shared/theme.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
@@ -788,6 +789,41 @@ pub fn Runtime(comptime App: type) type {
                 if (child == app.agent_on_screen) continue;
                 if (!hasPendingWork(child) and !approvalOutOfDate(&child.agent, app.approval_lender == child)) continue;
                 try visit(app, child, context, body);
+            }
+        }
+
+        /// Rewrites every hidden agent's transcript and paced text from the
+        /// theme `from` to `to`, as the theme change does for the agent on
+        /// screen, so a hidden agent shows the new colors when it comes on
+        /// screen. An agent that fails keeps its old colors, and the others
+        /// still change. While a scrollback handoff is pending no transcript
+        /// may be swapped, so every hidden agent keeps its old colors.
+        pub fn retintHiddenScreens(app: *App, from: shared_theme.Theme, to: shared_theme.Theme) void {
+            if (app.shell.sessionScrollbackHandoffPending()) {
+                debug_trace.logf("theme", "hidden_retint_skipped reason=scrollback_handoff_pending kept=old_colors", .{});
+                return;
+            }
+            const Themes = struct {
+                from: shared_theme.Theme,
+                to: shared_theme.Theme,
+
+                fn retint(themes: @This(), visited: *App, agent: *agents.Agent) anyerror!void {
+                    _ = agent;
+                    try visited.shell.retintEntriesForTheme(visited.alloc, themes.from, themes.to);
+                    try visited.pacer.retintForTheme(visited.alloc, themes.from, themes.to);
+                }
+            };
+            const themes = Themes{ .from = from, .to = to };
+            if (app.agent_on_screen != null) {
+                visitScreen(app, &app.main_agent, &app.main_screen, themes, Themes.retint) catch |err| {
+                    debug_trace.logf("theme", "hidden_retint_failed agent=main err={s} kept=old_colors", .{@errorName(err)});
+                };
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen) continue;
+                visit(app, child, themes, Themes.retint) catch |err| {
+                    debug_trace.logf("theme", "hidden_retint_failed agent={s} err={s} kept=old_colors", .{ child.id, @errorName(err) });
+                };
             }
         }
 

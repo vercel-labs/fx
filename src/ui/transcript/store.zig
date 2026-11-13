@@ -21,6 +21,7 @@ const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
+const theme_retint = @import("../../core/shared/theme_retint.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -2954,8 +2955,8 @@ pub fn retintEntriesForTheme(
     if (from.light == to.light) return;
     try self.assertCanMutateTranscript();
 
-    var token_buf: [theme_retint_field_count]ThemeToken = undefined;
-    const tokens = retintTokens(from, to, &token_buf);
+    var token_buf: [theme_retint.max_tokens]theme_retint.Token = undefined;
+    const tokens = theme_retint.tokens(from, to, &token_buf);
     if (tokens.len == 0) return;
 
     var shadow = try cloneMutationState(self, alloc);
@@ -2965,18 +2966,29 @@ pub fn retintEntriesForTheme(
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
-                if (try retintThemeBytes(alloc, raw.bytes, tokens)) |replacement| {
+                if (try theme_retint.rewrite(alloc, raw.bytes, tokens)) |replacement| {
                     alloc.free(raw.bytes);
                     raw.bytes = replacement;
                 }
             },
             .assistant_turn => |*assistant| {
-                if (try retintThemeBytes(alloc, assistant.segments.text.items, tokens)) |replacement| {
+                if (try theme_retint.rewrite(alloc, assistant.segments.text.items, tokens)) |replacement| {
                     assistant.segments.text.deinit(alloc);
                     assistant.segments.text = .fromOwnedSlice(replacement);
                 }
             },
-            .semantic_notice, .user_turn, .assistant_table, .assistant_code_block, .assistant_thematic_rule => {},
+            // Cells hold inline code and links drawn in the theme of the
+            // moment the table finished.
+            .assistant_table => |*assistant| for (assistant.table.rows) |row| {
+                for (row.cells) |*cell| {
+                    if (try theme_retint.rewrite(alloc, cell.*, tokens)) |replacement| {
+                        alloc.free(cell.*);
+                        cell.* = replacement;
+                    }
+                }
+            },
+            // Drawn from their source when painted, in the active theme.
+            .semantic_notice, .user_turn, .assistant_code_block, .assistant_thematic_rule => {},
         }
     }
 
@@ -2993,29 +3005,6 @@ pub fn retintEntriesForTheme(
     );
 }
 
-const ThemeToken = struct {
-    from: []const u8,
-    to: []const u8,
-};
-
-const dark_to_light_theme_tokens = [_]ThemeToken{
-    .{ .from = "\x1b[1;38;5;255m", .to = "\x1b[1;38;5;235m" },
-    .{ .from = "\x1b[38;5;255m", .to = "\x1b[38;5;235m" },
-    .{ .from = "\x1b[1;38;5;252m", .to = "\x1b[1;38;5;238m" },
-    .{ .from = "\x1b[38;5;252m", .to = "\x1b[38;5;238m" },
-    .{ .from = "\x1b[38;5;250m", .to = "\x1b[38;5;241m" },
-    .{ .from = "\x1b[38;5;245m", .to = "\x1b[38;5;247m" },
-};
-
-const light_to_dark_theme_tokens = [_]ThemeToken{
-    .{ .from = "\x1b[1;38;5;235m", .to = "\x1b[1;38;5;255m" },
-    .{ .from = "\x1b[38;5;235m", .to = "\x1b[38;5;255m" },
-    .{ .from = "\x1b[1;38;5;238m", .to = "\x1b[1;38;5;252m" },
-    .{ .from = "\x1b[38;5;238m", .to = "\x1b[38;5;252m" },
-    .{ .from = "\x1b[38;5;241m", .to = "\x1b[38;5;250m" },
-    .{ .from = "\x1b[38;5;247m", .to = "\x1b[38;5;245m" },
-};
-
 fn themeOwnsRawEntry(class: RawEntryClass) bool {
     return switch (class) {
         .welcome,
@@ -3028,119 +3017,6 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         => true,
         .command_output, .unknown_raw => false,
     };
-}
-
-/// Build the escape rewrite map between two themes. Builtin-to-builtin flips
-/// keep the hand-pinned token table; any custom theme involved gets a dynamic
-/// map pairing every slot's old escape with its new one, longest first so
-/// combined forms match before their fg-only equivalents.
-fn retintTokens(
-    from: shared_theme.Theme,
-    to: shared_theme.Theme,
-    buf: *[theme_retint_field_count]ThemeToken,
-) []const ThemeToken {
-    const from_builtin = std.mem.eql(u8, from.name, shared_theme.fx_dark.name) or std.mem.eql(u8, from.name, shared_theme.fx_light.name);
-    const to_builtin = std.mem.eql(u8, to.name, shared_theme.fx_dark.name) or std.mem.eql(u8, to.name, shared_theme.fx_light.name);
-    if (from_builtin and to_builtin) {
-        return if (to.light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
-    }
-
-    var n: usize = 0;
-    for (0..theme_retint_field_count) |index| {
-        n = appendTokenPair(
-            buf,
-            n,
-            themeRetintField(&from, index),
-            themeRetintField(&to, index),
-        );
-    }
-    sortThemeTokensLongestFirst(buf[0..n]);
-    return buf[0..n];
-}
-
-const theme_retint_field_count: usize = blk: {
-    var count: usize = 0;
-    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
-    for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
-        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) count += 1;
-    }
-    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".field_types) |field_type| {
-        if (field_type == []const u8) count += 1;
-    }
-    break :blk count;
-};
-
-/// Keep field dispatch outside the admission loop so each theme slot does not
-/// expand another copy of duplicate detection and token insertion.
-noinline fn themeRetintField(theme: *const shared_theme.Theme, index: usize) []const u8 {
-    comptime var field_index: usize = 0;
-    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
-    inline for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
-        if (comptime field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
-            if (index == field_index) return @field(theme.*, field_name);
-            field_index += 1;
-        }
-    }
-    const syntax_palette_info = @typeInfo(shared_theme.SyntaxPalette).@"struct";
-    inline for (syntax_palette_info.field_names, syntax_palette_info.field_types) |field_name, field_type| {
-        if (comptime field_type == []const u8) {
-            if (index == field_index) return @field(theme.syntax, field_name);
-            field_index += 1;
-        }
-    }
-    unreachable;
-}
-
-fn appendTokenPair(buf: *[theme_retint_field_count]ThemeToken, n: usize, from: []const u8, to: []const u8) usize {
-    if (from.len == 0 or std.mem.eql(u8, from, to) or n >= buf.len) return n;
-    for (buf[0..n]) |existing| {
-        if (std.mem.eql(u8, existing.from, from)) return n;
-    }
-    buf[n] = .{ .from = from, .to = to };
-    return n + 1;
-}
-
-fn sortThemeTokensLongestFirst(tokens: []ThemeToken) void {
-    if (tokens.len < 2) return;
-    // The list is bounded by the theme's fields; a local insertion sort avoids
-    // pulling a general block-sort implementation into this cold path.
-    for (tokens[1..], 1..) |token, index| {
-        var insert_at = index;
-        while (insert_at > 0 and token.from.len > tokens[insert_at - 1].from.len) : (insert_at -= 1) {
-            tokens[insert_at] = tokens[insert_at - 1];
-        }
-        tokens[insert_at] = token;
-    }
-}
-
-fn retintThemeBytes(
-    alloc: Allocator,
-    bytes: []const u8,
-    tokens: []const ThemeToken,
-) !?[]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    var changed = false;
-    var index: usize = 0;
-    while (index < bytes.len) {
-        for (tokens) |token| {
-            if (!std.mem.startsWith(u8, bytes[index..], token.from)) continue;
-            try out.writer.writeAll(token.to);
-            index += token.from.len;
-            changed = true;
-            break;
-        } else {
-            try out.writer.writeByte(bytes[index]);
-            index += 1;
-        }
-    }
-
-    if (!changed) {
-        out.deinit();
-        return null;
-    }
-    return try out.toOwnedSlice();
 }
 
 pub fn appendReplaceableTranscriptLine(self: anytype, alloc: Allocator, metrics: *Metrics, text: []const u8) !u32 {

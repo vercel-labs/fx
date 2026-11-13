@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
+const theme_retint = @import("../../core/shared/theme_retint.zig");
 const types = @import("../../core/shared/types.zig");
 const HistoryTurn = types.HistoryTurn;
 const FinishedPrompt = types.FinishedPrompt;
@@ -54,7 +55,7 @@ pub const SgrState = struct {
     underline: bool = false,
     strike: bool = false,
     fg: Foreground = .none,
-    fg_buf: [24]u8 = undefined,
+    fg_buf: [shared_theme.max_restorable_open_bytes]u8 = undefined,
     fg_len: u8 = 0,
 
     pub fn isActive(self: SgrState) bool {
@@ -219,24 +220,30 @@ pub const AssistantPacer = struct {
 
     pub fn pause(_: *AssistantPacer, _: i128) void {}
 
-    pub fn rethemeInlineCode(self: *AssistantPacer, light: bool) void {
-        const from = shared_theme.builtin(!light).inline_code_open;
-        const to = shared_theme.builtin(light).inline_code_open;
-        // The rewrite is in place, so both builtin opens must be the same length.
-        comptime std.debug.assert(shared_theme.fx_dark.inline_code_open.len == shared_theme.fx_light.inline_code_open.len);
-
-        var index: usize = 0;
-        while (index + from.len <= self.pending.items.len) {
-            if (std.mem.startsWith(u8, self.pending.items[index..], from)) {
-                @memcpy(self.pending.items[index..][0..to.len], to);
-                index += to.len;
-            } else {
-                index += 1;
-            }
+    /// Rewrites the theme colors of the text not shown yet from `from` to
+    /// `to`, as the transcript's retint does for the text already shown.
+    pub fn retintForTheme(self: *AssistantPacer, alloc: Allocator, from: shared_theme.Theme, to: shared_theme.Theme) !void {
+        var token_buf: [theme_retint.max_tokens]theme_retint.Token = undefined;
+        const tokens = theme_retint.tokens(from, to, &token_buf);
+        if (tokens.len == 0) return;
+        if (try theme_retint.rewrite(alloc, self.pending.items, tokens)) |replacement| {
+            self.pending.deinit(alloc);
+            self.pending = .fromOwnedSlice(replacement);
         }
 
-        // Theme-owned opens re-emit from the active theme at restore time, so
-        // there is nothing to rewrite in the tracker itself.
+        // Inline code and link opens re-emit from the active theme at restore
+        // time; another theme color restores with its saved bytes.
+        if (self.sgr.fg == .other) {
+            if (theme_retint.mapped(self.sgr.fg_buf[0..self.sgr.fg_len], tokens)) |next| {
+                if (next.len <= self.sgr.fg_buf.len) {
+                    @memcpy(self.sgr.fg_buf[0..next.len], next);
+                    self.sgr.fg_len = @intCast(next.len);
+                } else {
+                    debug_trace.logf("pacer", "theme_retint_dropped_restore_color bytes={d} reason=too_long", .{next.len});
+                    self.sgr.fg = .none;
+                }
+            }
+        }
     }
 
     pub fn deferFinish(self: *AssistantPacer, alloc: Allocator, finished: FinishedPrompt) !bool {
@@ -1175,7 +1182,7 @@ test "theme change retints active code before the next block" {
     const previous = shared_theme.current();
     defer shared_theme.activate(previous);
     shared_theme.activate(shared_theme.fx_light);
-    pacer.rethemeInlineCode(true);
+    try pacer.retintForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light);
     try pacer.enqueue(alloc, "\x1b[39m");
     try pacer.tick(alloc, 1, cap.callbacks());
 
@@ -1192,11 +1199,38 @@ test "theme change retints a queued inline code opener before it is emitted" {
     defer cap.deinit();
 
     try pacer.enqueue(alloc, "x\x1b[38;5;235mcode\x1b[39m");
-    pacer.rethemeInlineCode(false);
+    try pacer.retintForTheme(alloc, shared_theme.fx_light, shared_theme.fx_dark);
     try pacer.tick(alloc, 0, cap.callbacks());
 
     try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;5;255m") != null);
     try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;5;235m") == null);
+}
+
+test "theme change retints queued custom inline code and links to their own colors" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    var dark = shared_theme.fx_dark;
+    dark.name = "probe-dark";
+    dark.inline_code_open = "\x1b[38;2;136;192;208m";
+    dark.link_style = "\x1b[38;2;129;161;193m";
+    var light = shared_theme.fx_light;
+    light.name = "probe-light";
+    light.inline_code_open = "\x1b[38;2;23;108;116m";
+    light.link_style = "\x1b[38;2;0;100;176m";
+
+    try pacer.enqueue(alloc, "x\x1b[38;2;136;192;208mcode\x1b[39m \x1b[38;2;129;161;193mlink\x1b[39m");
+    try pacer.retintForTheme(alloc, dark, light);
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try pacer.tick(alloc, 100_000_000, cap.callbacks());
+
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;2;23;108;116mcode") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;2;0;100;176mlink") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "136;192;208") == null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "129;161;193") == null);
 }
 
 test "underline style is restored across rendered blocks" {

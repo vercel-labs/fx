@@ -503,7 +503,13 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
                 return;
             };
-            app.pacer.rethemeInlineCode(light);
+            app.pacer.retintForTheme(app.alloc, prior_theme, target) catch |err| {
+                debug_trace.logf("theme", "theme_pending_retint_failed err={s} kept=old_colors", .{@errorName(err)});
+            };
+            // Each hidden agent keeps its own transcript and paced text.
+            if (comptime @hasField(App, "child_agents") and @hasField(App, "main_screen")) {
+                @import("app_agents_runtime.zig").Runtime(App).retintHiddenScreens(app, prior_theme, target);
+            }
             if (resolved_target) |resolved| {
                 ui_render.applyTheme(resolved, rgb);
             } else {

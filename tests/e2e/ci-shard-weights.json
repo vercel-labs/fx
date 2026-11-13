@@ -58,7 +58,7 @@
   { "file": "tui-render-live-stress.test.ts", "weight": 1 },
   { "file": "tui-render-replay.test.ts", "weight": 14 },
   { "file": "tui-render-stress.test.ts", "weight": 14 },
-  { "file": "tui-resize.test.ts", "weight": 187 },
+  { "file": "tui-resize.test.ts", "weight": 189 },
   { "file": "tui-resume-brutal.test.ts", "weight": 18 },
   { "file": "tui-host-switch.test.ts", "weight": 10 },
   { "file": "tui-mcp-http-many-servers.test.ts", "weight": 5 },

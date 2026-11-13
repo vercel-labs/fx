@@ -16496,6 +16496,56 @@ test "retint rewrites custom theme colors on a variant flip" {
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
 }
 
+test "retint rewrites inline code and links inside table cells" {
+    const alloc = std.testing.allocator;
+    const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+
+    var custom_dark = shared_theme.fx_dark;
+    custom_dark.name = "probe-dark";
+    custom_dark.inline_code_open = "\x1b[38;2;136;192;208m";
+    custom_dark.link_style = "\x1b[38;2;129;161;193m";
+    var custom_light = shared_theme.fx_light;
+    custom_light.name = "probe-light";
+    custom_light.inline_code_open = "\x1b[38;2;23;108;116m";
+    custom_light.link_style = "\x1b[38;2;0;100;176m";
+
+    // The table renders its cells in the theme active when it finishes.
+    const previous = shared_theme.current();
+    shared_theme.activate(custom_dark);
+    assistant_presentation.applyTheme(custom_dark);
+    defer {
+        shared_theme.activate(previous);
+        assistant_presentation.applyTheme(previous);
+    }
+    var table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Command | Docs |\n" ++
+            "|---------|------|\n" ++
+            "| `zig build` | [guide](https://example.com/guide) |\n",
+    );
+    _ = runtime.appendAssistantTableOwned(alloc, table) catch |err| {
+        table.deinit(alloc);
+        return err;
+    };
+    const drawn = runtime.notebook.transcript.items;
+    try std.testing.expect(std.mem.find(u8, drawn, "\x1b[38;2;136;192;208mzig build") != null);
+    try std.testing.expect(std.mem.find(u8, drawn, "\x1b[38;2;129;161;193m") != null);
+
+    try runtime.retintEntriesForTheme(alloc, custom_dark, custom_light);
+
+    const retinted = runtime.notebook.transcript.items;
+    try std.testing.expect(std.mem.find(u8, retinted, "\x1b[38;2;23;108;116mzig build") != null);
+    try std.testing.expect(std.mem.find(u8, retinted, "\x1b[38;2;0;100;176m") != null);
+    try std.testing.expect(std.mem.find(u8, retinted, "136;192;208") == null);
+    try std.testing.expect(std.mem.find(u8, retinted, "129;161;193") == null);
+}
+
 test "rewrite publication keeps the frozen prefix when a finished turn holds a hidden notice" {
     const alloc = std.testing.allocator;
     const source_preparation = @import("source_preparation.zig");
