@@ -231,9 +231,10 @@ pub const ToolCallRecord = struct {
     call_id: []const u8 = "",
     /// The folder the tool ran against; see `FailedToolCall.dir`.
     dir: []const u8 = "",
-    /// Whether the call is a shell run whose command reads the user's startup
-    /// files. The caller decides it from the resolved command, as admission
-    /// does, so the trace names redefined commands only for such a run.
+    /// Whether the call is a shell run whose command ran with the startup
+    /// files the shell snapshot holds. The caller decides it from the resolved
+    /// command, as admission does, so the trace names redefined commands only
+    /// for such a run.
     reads_startup_files: bool = false,
 };
 

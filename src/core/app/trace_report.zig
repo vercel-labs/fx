@@ -138,10 +138,11 @@
 //!   Each has `at`, `name`, `outcome`, `duration_ms`, `source`, `cause`, and
 //!   `call_id` as a `tool_call` has them; `dir`, the folder the tool ran
 //!   against, where a shell call runs when its arguments name no `cwd`; for a
-//!   `shell` run whose command reads the startup files, which means admission
-//!   resolves its environment to the user's, as for the default profile,
-//!   `redefined`, the entries of the `shell` record's `redefined` list that
-//!   its arguments name, left out when there are none;
+//!   `shell` run whose command ran with the startup files the snapshot holds,
+//!   which means admission resolves it to the user environment of the login
+//!   shell, as for the default profile, `redefined`, the entries of the
+//!   `shell` record's `redefined` list that its arguments name, left out when
+//!   there are none;
 //!   and `args` and `result` (each masked), with `args_bytes` and
 //!   `result_bytes`. Each keeps up to 8 KiB of its value: a longer value keeps
 //!   its first bytes in `args` or `result` and its last bytes in `args_tail`
