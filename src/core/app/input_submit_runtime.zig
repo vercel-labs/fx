@@ -936,7 +936,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (comptime !@hasDecl(App, "subagentOnScreen")) return false;
             if (!app.subagentOnScreen()) return false;
             switch (command.kind) {
-                .new_session, .resume_session, .fork_session, .clear_screen, .reset_session => {},
+                .new_session, .resume_session, .fork_session, .clear_screen, .reset_session, .loop => {},
                 else => return false,
             }
             var name_buf: [32]u8 = undefined;
@@ -1890,6 +1890,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             const count = command_specs.slashCompletionCount(registry, text);
             if (count == 0) return text;
             const idx = selected_index % count;
+            if (command_specs.nthSlashCompletionNeedsMoreInput(registry, text, idx)) return text;
             return command_specs.nthSlashCompletion(registry, text, idx) orelse text;
         }
 

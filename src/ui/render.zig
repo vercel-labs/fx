@@ -193,6 +193,8 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 
 pub const StatuslineItems = struct {
     ultrafast_indicator_active: bool = false,
+    /// How many `/loop` loops the agent on screen holds, paused included.
+    loop_count: usize = 0,
     workspace_label: []const u8 = "",
     git_branch: ?[]const u8 = null,
     context_used: u64 = 0,
@@ -400,6 +402,10 @@ fn appendSessionStatusSegments(
         appendStatusSegment(out, end, marker);
     } else if (fast_indicator_active) {
         appendStatusSegment(out, end, "⚡︎");
+    }
+    if (statusline.loop_count > 0) {
+        var loop_buf: [32]u8 = undefined;
+        appendStatusSegment(out, end, std.mem.print(&loop_buf, "{d} {s}", .{ statusline.loop_count, if (statusline.loop_count == 1) "loop" else "loops" }) catch "loops");
     }
     if (statusline.session_title) |title| {
         appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
@@ -1035,6 +1041,14 @@ test "buildHintLine uses one vivid yellow lightning marker for Ultrafast in both
             }
         }
     }
+}
+
+test "statusline shows the loop count" {
+    var buf: [128]u8 = undefined;
+    const effort = types.ReasoningEffort.literal("high");
+    try std.testing.expectEqualStrings("ask · gpt-5 · high", buildHintLine(false, true, "openai/gpt-5", .ask, false, effort, true, .{ .loop_count = 0 }, 80, &buf));
+    try std.testing.expectEqualStrings("ask · gpt-5 · high · 1 loop", buildHintLine(false, true, "openai/gpt-5", .ask, false, effort, true, .{ .loop_count = 1 }, 80, &buf));
+    try std.testing.expectEqualStrings("ask · gpt-5 · high · 2 loops", buildHintLine(false, true, "openai/gpt-5", .ask, false, effort, true, .{ .loop_count = 2 }, 80, &buf));
 }
 
 test "buildHintLine shows effort when active" {

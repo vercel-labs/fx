@@ -3196,6 +3196,7 @@ pub fn Runtime(comptime App: type) type {
             app.clearPendingImages(agent);
             agent.pending_images.deinit(app.alloc);
             agent.session_title.deinit(app.alloc);
+            agent.loops.deinit(app.alloc);
             app_session_runtime.Runtime(App).deinitPersistence(app, agent);
             agent.session.deinit(app.alloc);
             agent.approval_prompt.deinit(app.alloc);
