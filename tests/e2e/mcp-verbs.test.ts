@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { logLines, onlySessionId } from "./saved-sessions";
 import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -877,35 +878,35 @@ describe("/mcp in the shell", () => {
     await tui.waitForComposer(15_000);
 
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  3", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 3, 10_000);
     await tui.waitForText(/proj +waiting for approval +project/, 5_000);
     await tui.waitForText("↑↓ navigate     enter open     esc close", 5_000);
 
     // Typing filters; Enter connects the server and lists its tools.
     await tui.sendLiteral("fix");
-    await tui.waitForText("MCP servers  1 of 3", 5_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
-    await tui.waitForText("› Remove        /mcp remove fixture", 5_000);
+    await tui.waitForText("  Remove        /mcp remove fixture", 5_000);
     // Typing filters its tools, by name or description; the list's filter waits.
     await tui.sendLiteral("zz");
-    await tui.waitForText("No tools match.", 5_000);
+    await tui.waitForText("no matching tools.", 5_000);
     await tui.sendKeys("BSpace BSpace");
     await tui.sendLiteral("THROUGH");
-    await tui.waitForText("Tools 1 of 1", 5_000);
+    await tui.waitForText(/^ {2}Tools\s*$/m, 5_000);
     await tui.waitForText("Echo text through the modern MCP fixture", 5_000);
     // ↓ goes on into the tools, where Enter has nothing to run.
     await tui.sendKeys("Down");
     await tui.waitForText("↑↓ navigate     esc back", 5_000);
     // Esc goes back, then closes and clears the filter.
     await tui.sendKeys("Escape");
-    await tui.waitForText("MCP servers  1 of 3", 5_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 5_000);
     await tui.sendKeys("Escape");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("fix"), 5_000);
 
     // Ctrl+C closes the menu from a server's screen, without arming the exit.
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  3", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 3, 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
     // ← goes back to the list like Esc, and → opens the server like Enter.
@@ -919,10 +920,10 @@ describe("/mcp in the shell", () => {
 
     // A choice that changes something asks first; anything but Enter is no.
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  3", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 3, 10_000);
     await tui.sendKeys("Down Down Enter");
-    await tui.waitForText("› Approve       /mcp approve proj", 5_000);
-    await tui.waitForText("Its tools show here once you approve it.", 5_000);
+    await tui.waitForText("  Approve       /mcp approve proj", 5_000);
+    await tui.waitForText("its tools show here once you approve it.", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Approve proj for this project? It runs:", 5_000);
     await tui.waitForText("node proj.js --port 4100", 5_000);
@@ -937,29 +938,29 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("enter confirm     esc cancel", 5_000);
     await tui.sendKeys("Enter");
     // The reload follows, and the screen with it.
-    await tui.waitForText("› Reject        /mcp reject proj", 10_000);
+    await tui.waitForText("  Reject        /mcp reject proj", 10_000);
     expect(await tui.captureFullScrollback()).not.toContain("Approved proj");
 
     // Remove asks which file it edits; Esc keeps the server, Enter removes it.
     await tui.sendKeys("Escape");
-    await tui.waitForText("MCP servers  3", 5_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 3, 5_000);
     // Approved, proj works and sorts between fixture and web.
     await tui.sendKeys("Down Enter");
-    await tui.waitForText("› Remove        /mcp remove web", 5_000);
+    await tui.waitForText("  Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
     // It asks on Remove's own row, with its answers; the hint line stays.
-    await tui.waitForText("› Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
+    await tui.waitForText("  Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
     expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
     // → chooses no, and Enter on no keeps the server.
     await tui.sendKeys("Right Enter");
-    await tui.waitForText("› Remove        /mcp remove web", 5_000);
+    await tui.waitForText("  Remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeDefined();
     await tui.sendKeys("Enter");
     await tui.waitForText("Remove web from ~/.fx/mcp.json?", 5_000);
     await tui.sendKeys("Enter");
     // Its screen goes with it, back to the list, which no longer shows it.
-    await tui.waitForText("MCP servers  2", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 2, 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
     expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);

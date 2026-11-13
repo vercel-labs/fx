@@ -3309,7 +3309,7 @@ tmuxTest(
         !pane.includes("openai/gpt-5.6-sol"),
       TIMEOUT,
     );
-    expect(codexCatalog).toContain("[All]");
+    expect(codexCatalog).toContain("< All >");
     for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
       expect(codexCatalog).not.toContain(vendor);
     }
@@ -5758,7 +5758,7 @@ tmuxTest(
         (pane) => pane.includes("Models") && pane.includes("grok-4.20"),
         TIMEOUT,
       );
-      expect(grokCatalog).toContain("[All]");
+      expect(grokCatalog).toContain("< All >");
       for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
         expect(grokCatalog).not.toContain(vendor);
       }
@@ -9002,10 +9002,10 @@ for (const scenario of [
 
       await session.sendText("/model");
       const pane = await session.waitForPane(
-        (text) => text.includes("No models available.") && text.includes(scenario.status),
+        (text) => text.includes("no models.") && text.includes(scenario.status),
         TIMEOUT,
       );
-      expect(pane).toContain("No models available.");
+      expect(pane).toContain("no models.");
       expect(pane).toContain(scenario.status);
 
       expect(gateway.modelRequests).toHaveLength(scenario.authenticated ? 2 : 1);

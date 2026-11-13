@@ -15,7 +15,7 @@ import {
   createIsolatedTestHome,
   HAS_API_KEY,
 } from "../evals/eval-helpers";
-import { readTrace } from "./tui-render-assertions";
+import { catalogMenuItemCount, readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -497,11 +497,11 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         const before = await session.captureFullScrollback();
 
         await session.sendText("/mcp");
-        await session.waitForText("MCP servers  1", 5_000);
+        await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 5_000);
         await session.sendKeys("Enter");
         await session.waitForText("esc back", 5_000);
         await session.sendKeys("Escape");
-        await session.waitForText("MCP servers  1", 5_000);
+        await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 5_000);
         await session.sendKeys("Escape");
         const closed = await session.waitForPane(
           (pane) => !pane.includes("MCP servers"),
@@ -529,7 +529,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
     async () => {
       session = await launchAndWait();
       await session.sendText("/skills");
-      const pane = await session.waitForText(/Skills [0-9]+|No skills available|All [0-9]+/i, 5_000);
+      const pane = await session.waitForText(/^skills   < All >/m, 5_000);
       expect(pane).not.toContain("Visible skills (");
     },
     TIMEOUT,

@@ -17,6 +17,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
@@ -1504,11 +1505,11 @@ describe("MCP login", () => {
     await tui.waitForText("fixture needs login · /mcp", 15_000);
     expect(await tui.captureFullScrollback()).not.toContain("needs login: /mcp login fixture");
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     // Opening it shows the login as the next step.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Its tools show here once you log in.", 15_000);
-    await tui.waitForText("› Log in        /mcp login fixture", 5_000);
+    await tui.waitForText("its tools show here once you log in.", 15_000);
+    await tui.waitForText("  Log in        /mcp login fixture", 5_000);
 
     // /trace reports the MCP servers, and the one that waits for a login.
     await tui.sendKeys("C-c");
@@ -1519,13 +1520,13 @@ describe("MCP login", () => {
     expect(waiting.one("mcp_server")).toMatchObject({ name: "fixture", transport: "http", tools: 0, signed_in: false, needs_login: true });
 
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
     await tui.sendKeys("Enter");
     // Signed in, the screen loads the tools it couldn't before.
     await tui.waitForText("Echo text through the modern HTTP fixture", 15_000);
-    await tui.waitForText("› Log out       /mcp logout fixture", 5_000);
+    await tui.waitForText("  Log out       /mcp logout fixture", 5_000);
     // Up and signed in, the failure that asked for the login is gone.
     expect(await tui.capturePane()).not.toContain("it needs a login");
     expect(auth.tokenExchanges).toBe(1);
@@ -1557,16 +1558,16 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
     // No browser opens, so the sign-in waits, and the screen says what for in
     // one line, like the transcript: its label links the address.
     await tui.sendKeys("Enter");
     await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
     const pane = await tui.capturePane();
     expect(pane).not.toContain("/authorize?");
-    expect(pane).not.toContain("Its tools show here once you log in.");
+    expect(pane).not.toContain("its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
 
@@ -1586,9 +1587,9 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Signing in…", 1_500);
     expect(await tui.capturePane()).not.toContain("Waiting for the browser");
@@ -2192,9 +2193,9 @@ describe("MCP login", () => {
     // no sign-out of a login that's gone.
     await tui.waitForComposer(5_000);
     await tui.sendText("/mcp");
-    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 10_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.waitForText("  Log in        /mcp login fixture", 15_000);
     const screen = await tui.capturePane();
     expect(screen).toMatch(/ status +needs login/);
     expect(screen).not.toContain("signed in");

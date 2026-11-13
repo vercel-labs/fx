@@ -37,6 +37,34 @@ export function isDividerRow(line: string): boolean {
   return dividerChars >= Math.floor(normalized.length * 0.6);
 }
 
+/**
+ * Counts a catalog menu's items from its title row: the item rows it shows
+ * plus the hidden ones a `↓ N more` row reports. Empty-state messages and
+ * group headings are not items. Returns null when no row starts with `title`.
+ */
+export function catalogMenuItemCount(grid: string[], title: string): number | null {
+  const start = grid.findIndex((line) => {
+    const text = line.trimEnd();
+    return text === title || text.startsWith(`${title} `);
+  });
+  if (start < 0) return null;
+  let count = 0;
+  for (const line of grid.slice(start + 1)) {
+    if (isDividerRow(line)) break;
+    const text = line.trim();
+    if (text.length === 0) continue;
+    const more = /^↓ (\d+) more$/.exec(text);
+    if (more) {
+      count += Number(more[1]);
+      continue;
+    }
+    if (/^(no |add one |press tab |loading |unable to load )/.test(text)) continue;
+    if (/^(Token Pass|All Models|Needs attention|Tools)$/.test(text)) continue;
+    count += 1;
+  }
+  return count;
+}
+
 function isFooterHintRow(line: string): boolean {
   const normalized = normalizeGridLine(line).trim();
   return (

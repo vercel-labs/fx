@@ -21,6 +21,7 @@ const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
+const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
@@ -955,7 +956,10 @@ pub fn composeFooterFrame(
     else if (compact_command_menu) |menu|
         try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
     else if (input.show_picker and input.picker_kind == .skills)
-        try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+        try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, .{
+            .has_items = ctx.skills_menu.itemCount() > 0,
+            .can_tab = skill_runtime.skillMenuHasOtherSource(ctx.skills_menu.items, ctx.skills_menu.source_filter),
+        })
     else if (input.show_picker and input.picker_kind == .settings)
         try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .mcp and ctx.mcp_host_menu.active())
@@ -976,7 +980,10 @@ pub fn composeFooterFrame(
     else if (input.show_picker and input.picker_kind == .agents)
         try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, agents_menu_presentation.hintVariants(ctx.agents_menu))
     else if (input.show_picker and input.picker_kind == .models)
-        try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+        try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, .{
+            .has_items = ctx.model_menu.load_state == .ready and ctx.model_menu.filteredItemCount() > 0,
+            .can_tab = model_menu_presentation.hasOtherProvider(ctx.model_menu),
+        })
     else if (input.show_picker and input.picker_kind == .effort)
         try input_presentation.composeEffortMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
