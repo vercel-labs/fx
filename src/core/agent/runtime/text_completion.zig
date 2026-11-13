@@ -295,7 +295,7 @@ pub const CompactorCaller = struct {
                     const right = message.content orelse "";
                     return providerFailed(alloc, .provider, "kind=prefix_mismatch index={d} roles={s}/{s} content_bytes={d}/{d} first_diff={d} replay={}/{}", .{
                         index,                             @tagName(projected.role),        @tagName(message.role),
-                        left.len,                          right.len,                       std.mem.indexOfDiff(u8, left, right) orelse 0,
+                        left.len,                          right.len,                       std.mem.findDiff(u8, left, right) orelse 0,
                         projected.provider_replay != null, message.provider_replay != null,
                     });
                 }
