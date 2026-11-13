@@ -8480,9 +8480,11 @@ fn processQueuedPromptLoop(
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
+                        .renewal_deps = deps,
                     };
+                    defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
-                    const compacted = compactContext(arena, deps, .{
+                    const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
                         .before_summary = source.hook(),
@@ -8496,7 +8498,22 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
-                    }) catch |err| {
+                    });
+                    // A summary request the provider rejected with 401 renewed
+                    // the sign-in; the rest of the turn sends the renewed one.
+                    // Taken first: renewing can free the credential the turn
+                    // borrowed, such as ACP's.
+                    if (summary_model.takeRenewed()) |renewed| try adoptJobCredential(
+                        std.heap.c_allocator,
+                        &job,
+                        arena,
+                        renewed.mode,
+                        renewed.credential,
+                        &active_api_key,
+                        &owned_refreshed_api_key,
+                        step_ctx,
+                    );
+                    const compacted = compaction_result catch |err| {
                         if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(

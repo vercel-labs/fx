@@ -251,17 +251,29 @@ pub const CompactorCaller = struct {
     /// an agent turn does (`credential_renewal.renewRejected`). Null when the
     /// caller cannot renew it. Must outlive the compaction.
     renewal_deps: ?*const runtime_deps.AgentRuntimeDeps = null,
-    /// The renewed credential and team `api_key` and `gateway_team` point to
-    /// once renewed; `deinit` frees them.
-    renewed_api_key: ?[]u8 = null,
-    renewed_gateway_team: ?[]u8 = null,
+    /// The renewed credential `api_key` and `gateway_team` point to once
+    /// renewed, in `std.heap.c_allocator`, and how it was renewed. `deinit`
+    /// frees it unless `takeRenewed` took it.
+    renewed: ?Renewed = null,
     renewal_tried: bool = false,
 
+    pub const Renewed = struct {
+        credential: runtime_deps.RefreshedGatewayCredential,
+        mode: runtime_deps.CredentialRefreshMode,
+    };
+
     pub fn deinit(self: *CompactorCaller) void {
-        if (self.renewed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
-        self.renewed_api_key = null;
-        if (self.renewed_gateway_team) |team| std.heap.c_allocator.free(team);
-        self.renewed_gateway_team = null;
+        if (self.renewed) |renewed| credential_renewal.free(std.heap.c_allocator, renewed.credential);
+        self.renewed = null;
+    }
+
+    /// The renewed credential, now the caller's, in `std.heap.c_allocator`:
+    /// an agent turn sends it from then on. `api_key` and `gateway_team` still
+    /// point to it, so call this once the compaction is over.
+    pub fn takeRenewed(self: *CompactorCaller) ?Renewed {
+        const renewed = self.renewed orelse return null;
+        self.renewed = null;
+        return renewed;
     }
 
     /// Borrows `self`, which must outlive the compaction.
@@ -337,17 +349,11 @@ pub const CompactorCaller = struct {
             credential_renewal.free(alloc, newest);
             return false;
         }
-        if (newest.gateway_team_label) |label| alloc.free(label);
-        if (self.renewed_api_key) |old| secret.zeroAndFree(alloc, old);
-        self.renewed_api_key = newest.token;
+        self.renewed = .{ .credential = newest, .mode = if (renewal.forced != null) .force else .reload };
         self.api_key = newest.token;
         // A team the host now sends with the login, such as one the user
         // picked, goes with the next send too.
-        if (newest.gateway_team) |team| {
-            if (self.renewed_gateway_team) |old| alloc.free(old);
-            self.renewed_gateway_team = team;
-            self.gateway_team = team;
-        }
+        if (newest.gateway_team) |team| self.gateway_team = team;
         return true;
     }
 

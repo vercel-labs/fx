@@ -1779,6 +1779,78 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP renews a login the gateway rejects during a turn's compaction and the turn sends the renewed one after it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-compaction-401-");
+      writeFileSync(join(root.workspace, "notes.md"), "recorded notes ".repeat(400));
+      const issuer = startFakeIssuer({ refresh: () => "refreshed-token" });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      const kinds: string[] = [];
+      let turnRequests = 0;
+      // The token the gateway accepts. The launch token expires when the
+      // compaction asks for its summary, and the store still holds it.
+      let valid = "launch-token";
+      // The turn reads a file, then overflows the context, so it compacts.
+      const gateway = startDynamicFakeGateway((raw) => {
+        const sent = bearer(gateway.requests[gateway.requests.length - 1].headers);
+        const summary = JSON.parse(raw).toolChoice?.type === "none";
+        kinds.push(summary ? "summary" : "turn");
+        if (summary && valid === "launch-token") valid = "refreshed-token";
+        if (sent !== valid) return unauthorized();
+        if (summary) return finalText("Retain the notes the turn read.");
+        turnRequests += 1;
+        if (turnRequests === 1) return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.md" });
+        if (turnRequests === 2) {
+          return Response.json({ error: { message: "AI_APICallError: Your input exceeds the context window of this model." } }, { status: 400 });
+        }
+        return finalText("ACP_COMPACTED_ANSWER_OK");
+      }, {
+        titleResponses: [() => finalText("ACP Generated Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Read notes.md, then answer.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_COMPACTED_ANSWER_OK");
+        expect(kinds).toEqual(["turn", "turn", "summary", "summary", "turn"]);
+        // The summary is sent once more with the renewed login, and the rest
+        // of the turn sends it too.
+        expect(gateway.requests.map((request) => bearer(request.headers))).toEqual([
+          "launch-token",
+          "launch-token",
+          "launch-token",
+          "refreshed-token",
+          "refreshed-token",
+        ]);
+        expect(issuer.refreshes).toHaveLength(1);
+        expect(storedFxLoginToken(root.home)).toBe("refreshed-token");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP replies to the first prompt soon after its answer while the title request never answers",
     async () => {
       const root = createIsolatedRoot("fx-acp-title-hang-");
