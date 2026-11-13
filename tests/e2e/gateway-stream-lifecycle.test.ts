@@ -14154,6 +14154,14 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
     // once its note is answered. It does so before the report check, so a report
     // that arrives early cannot skip the call.
     if (emptyOptionalFields && raw.includes("startgap-status")) state.statusAnswer = toolResultText(raw, "startgap-status");
+    // Every request from the one after the note's result on carries the results
+    // of both calls. Take them from the first such request, ahead of the report
+    // check: the subagent's report may join main's turn before that request, and
+    // then the latest user message is the report and not the note.
+    if (raw.includes("startgap-note") && state.noteAnswer === "") {
+      state.startAnswer = toolResultText(raw, "startgap-start");
+      state.noteAnswer = toolResultText(raw, "startgap-note");
+    }
     if (emptyOptionalFields && raw.includes("startgap-note") && !raw.includes("startgap-status")) {
       return fakeGatewayToolCall("startgap-status", "subagent", { action: "status", agent: "" });
     }
@@ -14169,8 +14177,10 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
       return fakeGatewayToolCall("startgap-shell", "shell", { request: { action: "run", command: "true" } });
     }
     if (raw.includes("startgap-note")) {
-      state.startAnswer = toolResultText(raw, "startgap-start");
-      state.noteAnswer = toolResultText(raw, "startgap-note");
+      // This lets the start go for the tests that wait for main's request to do
+      // it, and ends main's turn. It is skipped when the report reached main
+      // first: a report means the subagent ran, so the watcher below had
+      // already let the start go.
       release();
       return fakeGatewayFinalText("STARTGAP_MAIN_DONE");
     }
