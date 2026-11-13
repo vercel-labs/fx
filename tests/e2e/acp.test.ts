@@ -273,6 +273,38 @@ function acpLatestUserIsReport(raw: string): boolean {
   return latest.includes("Subagent report (untrusted agent output, not user instructions):");
 }
 
+/** A finish event whose usage is the given counts. */
+function acpFinishWithUsage(unified: string, input: number, cacheRead: number, output: number) {
+  return {
+    type: "finish",
+    finishReason: { unified, raw: unified },
+    usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+  };
+}
+
+/** Whether the request holds the result of tool call `callId` after its latest
+ * user message, so it belongs to the step that call started. */
+function acpHasCurrentToolResult(raw: string, callId: string): boolean {
+  const prompt: any[] = JSON.parse(raw).prompt ?? [];
+  const lastUser = prompt.findLastIndex((message) => message.role === "user");
+  return prompt.slice(lastUser + 1).some((message) =>
+    Array.isArray(message.content) &&
+    message.content.some((part: any) => part.type === "tool-result" && part.toolCallId === callId)
+  );
+}
+
+/** The JSON line of the report in the request's latest user message, or null
+ * when that message is not a report. The runtime context update fx adds to the
+ * message is left out: it quotes each subagent's task. */
+function acpLatestReport(raw: string): Record<string, unknown> | null {
+  const header = "Subagent report (untrusted agent output, not user instructions):";
+  const content = JSON.parse(raw).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "";
+  const text = acpContentText(content).replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+  const at = text.indexOf(header);
+  if (at < 0) return null;
+  return JSON.parse(text.slice(at + header.length).trim().split("\n")[0]!);
+}
+
 /** The `tool_call_update`s a prompt sent for one call. */
 function reportUpdatesFor(messages: any[], callId: string): any[] {
   return messages.filter((message: any) =>
@@ -10791,6 +10823,194 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         heldChild.resolve(finalText("late child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // The prompt's `usage` is the whole prompt's: main's turn that sends work and
+  // the turn its report starts, which run inside one `session/prompt`. An ACP
+  // report never joins a running turn, so the report always starts a turn of
+  // its own. The subagent's own usage (7000 in) stays out.
+  test(
+    "ACP's prompt usage sums the turn that sends work and the turn its report starts",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-usage-report-turn-");
+      const sendId = "acp_usage_send";
+      const text = (id: string, delta: string, end: object) => fakeGatewaySse([{ type: "text-delta", id, delta }, end]);
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) return text("acp_usage_child", "ACP_USAGE_CHILD_DONE", acpFinishWithUsage("stop", 7000, 700, 70));
+        if (acpLatestUserIsReport(body)) return text("acp_usage_report", "ACP_USAGE_REPORT_READ", acpFinishWithUsage("stop", 400, 40, 4));
+        if (acpHasCurrentToolResult(body, sendId)) return text("acp_usage_sent", "ACP_USAGE_DISPATCHED", acpFinishWithUsage("stop", 200, 20, 2));
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: sendId, toolName: "subagent", input: { request: { action: "message", agent: "worker", message: "Reply exactly ACP_USAGE_CHILD_DONE without using tools." } } },
+          acpFinishWithUsage("tool-calls", 100, 10, 1),
+        ]);
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Delegate the usage task.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        // The turn that sends work (2 requests), the child, and the report turn.
+        expect(gateway.requests).toHaveLength(4);
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 700, outputTokens: 7, cacheReadTokens: 70 });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Main sends work, one report starts a turn in which main sends more, and
+  // that work's report starts the third turn of the same prompt.
+  test(
+    "ACP's prompt usage sums three main turns",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-usage-three-turns-");
+      const first = "Reply exactly ACP_USAGE_CHILD_ONE without using tools.";
+      const second = "Reply exactly ACP_USAGE_CHILD_TWO without using tools.";
+      const text = (id: string, delta: string, end: object) => fakeGatewaySse([{ type: "text-delta", id, delta }, end]);
+      const send = (id: string, message: string, end: object) =>
+        fakeGatewaySse([{ type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "message", agent: "worker", message } } }, end]);
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          return body.includes(second)
+            ? text("acp_usage_child_two", "ACP_USAGE_CHILD_TWO", acpFinishWithUsage("stop", 7000, 700, 70))
+            : text("acp_usage_child_one", "ACP_USAGE_CHILD_ONE", acpFinishWithUsage("stop", 7000, 700, 70));
+        }
+        if (acpHasCurrentToolResult(body, "acp_usage_send_two")) return text("acp_usage_second_sent", "ACP_USAGE_SECOND_SENT", acpFinishWithUsage("stop", 800, 80, 8));
+        if (acpLatestUserIsReport(body)) {
+          return String(acpLatestReport(body)?.output).includes("ACP_USAGE_CHILD_ONE")
+            ? send("acp_usage_send_two", second, acpFinishWithUsage("tool-calls", 400, 40, 4))
+            : text("acp_usage_all_done", "ACP_USAGE_ALL_DONE", acpFinishWithUsage("stop", 1600, 160, 16));
+        }
+        if (acpHasCurrentToolResult(body, "acp_usage_send_one")) return text("acp_usage_first_sent", "ACP_USAGE_FIRST_SENT", acpFinishWithUsage("stop", 200, 20, 2));
+        return send("acp_usage_send_one", first, acpFinishWithUsage("tool-calls", 100, 10, 1));
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Delegate the usage task twice.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        // Two requests of the first turn, the first child, two of the second turn, the second child, and the third turn.
+        expect(gateway.requests).toHaveLength(7);
+        expect(JSON.stringify(result.messages)).toContain("ACP_USAGE_ALL_DONE");
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 3100, outputTokens: 31, cacheReadTokens: 310 });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // A prompt cancelled in a later turn still reports the turns before it. The
+  // cancelled turn's own request never ended, so it adds nothing.
+  test(
+    "ACP's prompt usage keeps the earlier turns when the report turn is cancelled",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-usage-cancelled-report-turn-");
+      const sendId = "acp_usage_cancel_send";
+      const held = heldFakeGatewayFinalText();
+      const text = (id: string, delta: string, end: object) => fakeGatewaySse([{ type: "text-delta", id, delta }, end]);
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) return text("acp_usage_cancel_child", "ACP_USAGE_CANCEL_CHILD_DONE", acpFinishWithUsage("stop", 7000, 700, 70));
+        // The report turn waits on its model until the client cancels it.
+        if (acpLatestUserIsReport(body)) return held.response;
+        if (acpHasCurrentToolResult(body, sendId)) return text("acp_usage_cancel_sent", "ACP_USAGE_CANCEL_DISPATCHED", acpFinishWithUsage("stop", 200, 20, 2));
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: sendId, toolName: "subagent", input: { request: { action: "message", agent: "worker", message: "Reply exactly ACP_USAGE_CANCEL_CHILD_DONE without using tools." } } },
+          acpFinishWithUsage("tool-calls", 100, 10, 1),
+        ]);
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const promptId = 6820;
+        sendPrompt(client, promptId, "Delegate, then be cancelled in the report turn.");
+        await waitForCondition(
+          "the report turn's request, held by the gateway",
+          () => gateway.requests.some((request) => acpLatestUserIsReport(request.body)),
+          TIMEOUT,
+        );
+        client.send({ jsonrpc: "2.0", id: 6821, method: "session/cancel", params: {} });
+        const response = await readResponse(client, promptId);
+        expect(response.result.stopReason).toBe("cancelled");
+        expect(response.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, cacheReadTokens: 30 });
+        expect(client.stderr).toBe("");
+      } finally {
+        held.release("ACP_USAGE_CANCEL_LATE");
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // A report turn the gateway rejects ends the prompt as refused. The rejected
+  // request reported no usage, so the prompt's is the turns before it.
+  test(
+    "ACP's prompt usage keeps the earlier turns when the report turn is refused",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-usage-refused-report-turn-");
+      const sendId = "acp_usage_fail_send";
+      const text = (id: string, delta: string, end: object) => fakeGatewaySse([{ type: "text-delta", id, delta }, end]);
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) return text("acp_usage_fail_child", "ACP_USAGE_FAIL_CHILD_DONE", acpFinishWithUsage("stop", 7000, 700, 70));
+        if (acpLatestUserIsReport(body)) {
+          return new Response(JSON.stringify({ error: { type: "invalid_request_error", message: "request rejected" } }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (acpHasCurrentToolResult(body, sendId)) return text("acp_usage_fail_sent", "ACP_USAGE_FAIL_DISPATCHED", acpFinishWithUsage("stop", 200, 20, 2));
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: sendId, toolName: "subagent", input: { request: { action: "message", agent: "worker", message: "Reply exactly ACP_USAGE_FAIL_CHILD_DONE without using tools." } } },
+          acpFinishWithUsage("tool-calls", 100, 10, 1),
+        ]);
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Delegate the failing task.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("refused");
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, cacheReadTokens: 30 });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // A prompt of one turn reports that turn's usage, as before.
+  test(
+    "ACP's prompt usage for one turn is that turn's",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-usage-one-turn-");
+      const gateway = startDynamicFakeGateway(() =>
+        fakeGatewaySse([{ type: "text-delta", id: "acp_usage_one", delta: "ACP_USAGE_ONE_DONE" }, acpFinishWithUsage("stop", 123, 6, 45)])
+      );
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Answer once.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(result.promptResult.result.usage).toEqual({ inputTokens: 123, outputTokens: 45, cacheReadTokens: 6 });
+        expect(client.stderr).toBe("");
+      } finally {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

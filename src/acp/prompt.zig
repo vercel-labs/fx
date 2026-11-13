@@ -943,12 +943,16 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
 
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
+/// `usage_total` gets the usage of every turn the prompt runs, its own and
+/// each report turn after it, as each ends: the response reports the whole
+/// prompt's usage (`publishPromptOutcome` in `server.zig`).
 pub fn handlePrompt(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
+    usage_total: *types.Usage,
 ) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
@@ -1245,7 +1249,7 @@ pub fn handlePrompt(
     };
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
-    agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
+    const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
             .kind = .acp,
@@ -1253,7 +1257,12 @@ pub fn handlePrompt(
             .session_id = session.session_id,
         },
         .outcome_allocator = alloc,
-    }, agent_config, job) catch |err| {
+    }, agent_config, job);
+    // The next turn starts the agent's usage over, so this turn's is added to
+    // the prompt's now, however it ended. The agent's own count stays as it
+    // is: a checkpoint saves it.
+    usage_total.add(session.session_rt.agent.turn_usage);
+    first_turn catch |err| {
         if (err == error.TurnYielded) {
             // The journal keeps the turn open for a later resume; nothing
             // ends it here.
@@ -1279,7 +1288,7 @@ pub fn handlePrompt(
         }
     };
     try endJournalTurn(alloc, state.alloc, session);
-    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job)) |outcome| {
+    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
         prompt_input.retainImageSnapshots();
         return outcome;
     }
@@ -3029,7 +3038,7 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// shows on the subagent call that sent the work. A turn
 /// started this way is the child's, never the user's, so its root context
 /// stays the user's own request. Returns the prompt's outcome when a turn
-/// ends it early.
+/// ends it early. Each turn's usage is added to `usage_total` when it ends.
 fn runReportTurns(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
@@ -3038,6 +3047,7 @@ fn runReportTurns(
     deps: *const agent_runtime.AgentRuntimeDeps,
     agent_config: agent_runtime.Config,
     base: worker_runtime.QueuedPrompt,
+    usage_total: *types.Usage,
 ) !?TerminalOutcome {
     const tree = state.subagent_host orelse return null;
     while (true) {
@@ -3093,7 +3103,7 @@ fn runReportTurns(
         job.recovery_checkpoint = null;
         job.recovery_source_already_presented = false;
         debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
-        agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
+        const report_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
             .view = state.lifecycle_view,
             .scope = .{
                 .kind = .acp,
@@ -3101,7 +3111,9 @@ fn runReportTurns(
                 .session_id = session.session_id,
             },
             .outcome_allocator = alloc,
-        }, agent_config, job) catch |err| {
+        }, agent_config, job);
+        usage_total.add(session.session_rt.agent.turn_usage);
+        report_turn catch |err| {
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
@@ -5287,12 +5299,13 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         error.WriteFailed,
     };
 
+    var usage: types.Usage = .{};
     for (errors) |expected_error| {
         AcpContextRegistryFixture.reset();
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, alloc, &msg, "code", .ask),
+            handlePrompt(&state, alloc, &msg, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(state.active_session.?.pending_prompt_id == null);
