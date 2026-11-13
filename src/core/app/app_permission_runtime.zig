@@ -157,10 +157,45 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// The session approvals `agent`'s tool calls use.
-        pub fn grantsOf(app: anytype, agent: anytype) []const types.PermissionGrant {
+        /// The list of session approvals `agent`'s tool calls use. A subagent's
+        /// worker adds to it, which can move it, so only a caller that holds the
+        /// authority lock may use what this returns, and only until it lets go.
+        /// Every other reader takes a copy: `copyGrants`, `liveGrants`, or
+        /// `liveGrantCount`.
+        pub fn grantsLocked(app: anytype, agent: anytype) []const types.PermissionGrant {
             if (comptime per_instance) return permissionOwner(app, agent).session_grants.items;
             return app.permission_engine.grants.items;
+        }
+
+        /// A copy of `agent`'s session approvals in `alloc`, taken under the
+        /// authority lock that every write to the list holds. The caller owns it
+        /// and frees it with `types.freePermissionGrantSlice`, or with `alloc`
+        /// when that is an arena.
+        pub fn copyGrants(app: anytype, agent: anytype, alloc: std.mem.Allocator) ![]types.PermissionGrant {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            return types.dupePermissionGrantSlice(alloc, grantsLocked(app, agent));
+        }
+
+        /// How many of `agent`'s session approvals still apply, counted under
+        /// the authority lock.
+        pub fn liveGrantCount(app: anytype, agent: anytype) usize {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            return permissions.liveSessionGrantCount(grantsLocked(app, agent));
+        }
+
+        /// The session approvals that still apply, for display, copied in
+        /// `alloc` under the authority lock like `copyGrants`: the slice and
+        /// its strings are the caller's, to free with
+        /// `types.freePermissionGrantSlice`, or with `alloc` when that is an
+        /// arena.
+        pub fn liveGrants(app: anytype, agent: anytype, alloc: std.mem.Allocator) ![]types.PermissionGrant {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            const live = try permissions.liveSessionGrants(alloc, grantsLocked(app, agent));
+            defer alloc.free(live);
+            return types.dupePermissionGrantSlice(alloc, live);
         }
 
         /// Records an "always" approval from `agent`'s turn on its
@@ -206,17 +241,18 @@ pub fn Runtime(comptime App: type) type {
             agent.session_grants.deinit(app.alloc);
         }
 
-        /// The permission state `agent`'s screen reports: its permission
-        /// owner's mode and approvals over the host's rules. Borrowed;
-        /// never deinit it.
-        pub fn viewOf(app: anytype, agent: anytype) permissions.PermissionEngine {
-            if (comptime !per_instance) return app.permission_engine;
-            const owner = permissionOwner(app, agent);
-            return .{
-                .mode = instanceMode(app, owner),
-                .grants = owner.session_grants,
-                .rules = app.permission_engine.rules,
-            };
+        /// What `agent`'s screen reports of its permissions.
+        const View = struct {
+            /// Its permission owner's mode.
+            mode: types.PermissionMode,
+        };
+
+        /// The permission state `agent`'s screen reports. Its approvals are not
+        /// part of it, because a copy of the list's header would outlive the
+        /// lock; read them with `copyGrants` or `liveGrantCount`.
+        pub fn viewOf(app: anytype, agent: anytype) View {
+            if (comptime !per_instance) return .{ .mode = app.permission_engine.mode };
+            return .{ .mode = instanceMode(app, permissionOwner(app, agent)) };
         }
 
         /// Session-scoped mode change: applies the mode and syncs queued

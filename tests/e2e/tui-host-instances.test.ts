@@ -352,12 +352,22 @@ async function waitForAnswers(session: TmuxSession, answers: readonly string[], 
   return await session.waitForPane((pane) => JSON.stringify(shownAnswers(pane)) === JSON.stringify(answers), ms);
 }
 
-// The tool results the model has seen since the user's last message, so a
-// turn's own steps count from zero even when earlier turns ran tools.
-function turnResults(body: string): number {
+// The tool results the model has seen since the user message that matches
+// `marker`. A report from a subagent reaches its parent as a user message too,
+// and it can arrive in the middle of the parent's turn, so a count from the last
+// user message would start again.
+function resultsSince(body: string, marker: RegExp): number {
   const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
-  const roles = (request.prompt ?? []).map((message) => message.role);
-  return roles.slice(roles.lastIndexOf("user") + 1).filter((role) => role === "tool").length;
+  const prompt = request.prompt ?? [];
+  const users = userTexts(body);
+  let seen = -1;
+  let at = -1;
+  prompt.forEach((message, index) => {
+    if (message.role !== "user") return;
+    seen += 1;
+    if (marker.test(users[seen] ?? "")) at = index;
+  });
+  return at < 0 ? 0 : prompt.slice(at + 1).filter((message) => message.role === "tool").length;
 }
 
 // The turn the user typed last, which names itself GRANT_<n>, and the tool
@@ -391,7 +401,7 @@ function grantRuns(finished: Set<string>) {
   const shell = (id: string, command: string) =>
     call(id, "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command } });
   return (body: string): Response => {
-    const results = turnResults(body);
+    const results = resultsSince(body, /GRANT_TASK_\d+ /);
     const texts = userTexts(body);
     const task = texts.join("\n").match(/GRANT_TASK_(\d+) (RUN|FILE|MCP)\[(.*?)\]/);
     if (task) {
@@ -406,12 +416,29 @@ function grantRuns(finished: Set<string>) {
       finished.add(turn);
       return text(`sub_done_${turn}`, `GRANT_CHILD_DONE_${turn}`);
     }
+    // A lead starts its own subagent once, and its turn ends there.
+    const nest = texts.join("\n").match(/GRANT_NEST_(\d+) RUN\[(.*?)\]/);
+    if (nest) {
+      const [, turn, what] = nest as unknown as [string, string, string];
+      if (body.includes(`nest_${turn}`)) return text(`nest_done_${turn}`, `GRANT_NEST_SENT_${turn}`);
+      return call(`nest_${turn}`, "subagent", { request: { action: "message", agent: "inner", profile: "runner", message: `GRANT_TASK_${turn} RUN[${what}]` } });
+    }
     const typed = typedTurn(body);
     if (!typed) return text("ack", "GRANT_ACK");
     const turn = typed.text.match(/GRANT_(\d+)/)?.[1] ?? "0";
     const sub = typed.text.match(/SUB\[(\w+)\]/)?.[1];
+    const lead = typed.text.match(/LEAD\[(\w+)\]/)?.[1];
+    const again = typed.text.match(/AGAIN\[(\w+)\]/)?.[1];
     const work = typed.text.match(/(RUN|FILE|MCP)\[(.*?)\]/);
     const [kind, what] = [work?.[1] ?? "RUN", work?.[2] ?? "true"];
+    if (lead) {
+      if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: lead, profile: "lead", message: `GRANT_NEST_${turn} RUN[${what}]` } });
+    }
+    if (again) {
+      if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: again, message: `GRANT_TASK_${turn} ${kind}[${what}]` } });
+    }
     if (sub) {
       if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
       return call(`start_${turn}`, "subagent", { request: { action: "message", agent: sub, profile: "runner", message: `GRANT_TASK_${turn} ${kind}[${what}]` } });
@@ -837,6 +864,40 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_3 MCP[]");
         await session.waitForText("GRANT_DONE_3", 45_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a nested subagent's always approval is kept: its parent subagent and main are not asked again",
+    async () => {
+      const command = "echo RAN >> grant.log";
+      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        // `boss` may start subagents; `inner` runs the command.
+        writeProfile(home, "lead", { description: "Starts a subagent and runs a command", tools: ["shell", "subagent"], permission_mode: "ask" });
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "grant.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 LEAD[boss] RUN[${command}]`);
+        await waitShows(session, "inner's command prompt", (pane) => pane.includes("Subagent inner needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("the nested subagent's two runs", () => countLines(log) === 2, 30_000, session, () => `workspace: ${readdirSync(workspace).join(" ")}`);
+
+        // The subagent that started it runs the same command with no prompt.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_2 AGAIN[boss] RUN[${command}]`);
+        await waitUntil("the parent subagent's two runs", () => countLines(log) === 4, 30_000, session);
+
+        // So does main, which is in ask mode itself.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_3 RUN[${command}]`);
+        await session.waitForText("GRANT_DONE_3", 30_000);
+        expect(countLines(log)).toBe(5);
+
+        await session.sendText("/permissions");
+        const panel = await waitShows(session, "the session grants", (pane) => /^ {2}Session grants {2,}\S/m.test(pane), 15_000);
+        expect(panel).not.toMatch(/^ {2}Session grants {2,}none/m);
       });
     },
     TIMEOUT,

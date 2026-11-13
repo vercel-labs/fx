@@ -560,11 +560,9 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             snapshot: worker_runtime.PermissionSnapshot,
         ) !void {
-            try agent.worker.syncQueuedPromptPermissionState(
-                std.heap.c_allocator,
-                app_permission_runtime.Runtime(App).grantsOf(app, agent),
-                snapshot,
-            );
+            const grants = try app_permission_runtime.Runtime(App).copyGrants(app, agent, std.heap.c_allocator);
+            defer types.freePermissionGrantSlice(std.heap.c_allocator, grants);
+            try agent.worker.syncQueuedPromptPermissionState(std.heap.c_allocator, grants, snapshot);
         }
 
         pub fn propagateHistoryTurn(app: *App, agent: *AppAgent, turn: types.HistoryTurn, max_history_turns: usize) !void {

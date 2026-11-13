@@ -187,6 +187,21 @@ pub fn Runtime(comptime App: type) type {
             return if (agent.child_run) |*run| run else null;
         }
 
+        /// `ctx` with a copy of the session approvals `agent`'s tool calls use,
+        /// taken under the authority lock into `arena`. A subagent's worker adds
+        /// approvals to its instance's list while this thread works, and the
+        /// list moves when it grows, so a call that reads the approvals holds a
+        /// copy and never the list. A subagent's own tools carry its run's
+        /// approvals already. When the copy cannot be made the call sees none
+        /// and asks.
+        pub fn withLiveGrants(app: *App, agent: *AppAgent, arena: Allocator, ctx: tool_runtime.Context) tool_runtime.Context {
+            if (childToolAuthority(agent) != null) return ctx;
+            var with_grants = ctx;
+            const copy: []const PermissionGrant = app_permission_runtime.Runtime(App).copyGrants(app, agent, arena) catch &.{};
+            with_grants.permission_grants = copy;
+            return with_grants;
+        }
+
         /// A subagent's tools work under its run's admission, never main's
         /// permission engine.
         fn childToolAuthority(agent: *AppAgent) ?ToolAuthorityView {
@@ -344,10 +359,13 @@ pub fn Runtime(comptime App: type) type {
                 }
             else
                 app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent);
-            const permission_grants = if (authority) |snapshot|
+            // An agent without a run of its own has no approvals here: they sit in
+            // a list that a subagent's worker adds to, so a call that reads them
+            // takes a copy with `withLiveGrants`.
+            const permission_grants: []const PermissionGrant = if (authority) |snapshot|
                 snapshot.grants
             else
-                app_permission_runtime.Runtime(App).grantsOf(app, agent);
+                &.{};
             const permission_rules = if (authority) |snapshot|
                 snapshot.rules
             else
@@ -825,6 +843,7 @@ pub fn Runtime(comptime App: type) type {
             applyCredentialLease(app, agent, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             ctx.mcp_review_schema_json = mcp_review_schema_json;
+            ctx = withLiveGrants(app, agent, arena, ctx);
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return if (revalidation) |request| switch (request) {
                 .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
@@ -882,6 +901,7 @@ pub fn Runtime(comptime App: type) type {
             );
             applyCredentialLease(app, agent, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
+            ctx = withLiveGrants(app, agent, arena, ctx);
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
                 admission,
@@ -986,6 +1006,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.session_grants = request.session_grants;
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+            ctx = withLiveGrants(app, agent, request.call_allocator, ctx);
             return tool_runtime.executeToolCallAuthorized(ctx, request);
         }
 
@@ -2342,7 +2363,15 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expectEqualStrings("test-model", ctx.model);
     try std.testing.expect(ctx.tool_registry.lookup("web_search") != null);
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
-    try std.testing.expectEqual(@as(usize, 1), ctx.permission_grants.len);
+    // The approvals are not in the context itself: the list is another
+    // thread's to change, so a call that reads them takes a copy.
+    try std.testing.expectEqual(@as(usize, 0), ctx.permission_grants.len);
+    var copy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer copy_arena.deinit();
+    const with_grants = Runtime(FakeApp).withLiveGrants(&app, app.agent(), copy_arena.allocator(), ctx);
+    try std.testing.expectEqual(@as(usize, 1), with_grants.permission_grants.len);
+    try std.testing.expectEqualStrings("run_command", with_grants.permission_grants[0].tool_name);
+    try std.testing.expect(with_grants.permission_grants.ptr != app.permission_engine.grants.items.ptr);
     try std.testing.expect(ctx.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), ctx.effort);
     try std.testing.expect(!ctx.web_search_runtime_ready);

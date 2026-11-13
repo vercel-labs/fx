@@ -336,7 +336,7 @@ pub fn Commands(comptime App: type) type {
                 .settings_error = settings_error,
                 .fx_home = fx_home,
                 .history_turns = agent.session.historyLen(),
-                .session_permission_grants = permissions.liveSessionGrantCount(app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .session_permission_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
                 .agent_step_limit = app.agent_step_limit,
                 .ultrafast_requested = agent.worker.agent_turn_settings.ultrafast_mode,
             };
@@ -358,7 +358,7 @@ pub fn Commands(comptime App: type) type {
                     .unavailable => null,
                     .open => |open| open.saved,
                 } else null,
-                .session_grants = permissions.liveSessionGrantCount(app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .session_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
             } };
         }
 
@@ -372,7 +372,7 @@ pub fn Commands(comptime App: type) type {
             const snapshot: output_contracts.PermissionsSnapshot = .{
                 .workspace_root = app.workspace_root,
                 .mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
-                .grants = try permissions.liveSessionGrants(alloc, app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .grants = try app_permission_runtime.Runtime(App).liveGrants(app, agent, alloc),
                 .rules = app.permission_engine.rules,
                 .saved_rules = try savedPermissionRules(app, agent, alloc),
             };
@@ -390,7 +390,7 @@ pub fn Commands(comptime App: type) type {
         fn permissionsFacts(app: *App, agent: *AppAgent) info_panel.Facts {
             return .{ .permissions = .{
                 .mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
-                .session_grants = permissions.liveSessionGrantCount(app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .session_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
                 .configured_rules = app.permission_engine.rules.rules.len,
             } };
         }

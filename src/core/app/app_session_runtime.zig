@@ -4926,7 +4926,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, instance) else &.{},
+                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsLocked(app, instance) else &.{},
                 permission_state,
                 if (mcp_view) |*view| view else null,
             );
