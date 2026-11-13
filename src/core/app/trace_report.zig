@@ -57,7 +57,8 @@
 //!   {`status`, `reason`, `detail`}; `network_call`, for the newest 3 failed
 //!   calls, with `call` holding the `network_call` fields; `tool_call`, for
 //!   the newest 5 calls that did not succeed, with `call` {`at`, `name`,
-//!   `outcome`, `duration_ms`, `source`, `cause`}; `compaction` {`event`,
+//!   `outcome`, `duration_ms`, `source`, `cause`, `call_id`}, from the kept
+//!   failures that later successful calls do not remove; `compaction` {`event`,
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
 //!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
@@ -148,7 +149,10 @@
 //!   the `model_catalog` problems come from these.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
-//!   {`calls`, `outcomes`, `total_ms`}, `complete`, and `web_search_retained`.
+//!   {`calls`, `outcomes`, `total_ms`}, `complete`, `web_search_retained`,
+//!   `failed_retained`, the number of `failed_tool_call` records, and
+//!   `failed_complete`, whether they hold every call this session that did
+//!   not succeed.
 //!   Then a `tool_call` per retained local call, oldest first: `at`, `name`,
 //!   `outcome`, `duration_ms`, `source`, `cause` (only for a call that did not
 //!   succeed because an MCP server refused its parameters: which arguments it
@@ -156,14 +160,53 @@
 //!   its first useful line, at most 180 bytes) and `result_bytes`, and any
 //!   other call has `result` (masked), `result_bytes`, and
 //!   `result_omitted_bytes`. A `web_fetch` call has no arguments or result.
+//!   A call has `call_id`, the provider's ID for it, which the call's records
+//!   in the session's `log.jsonl` also carry, when the provider gave one. A
+//!   call that did not succeed has `failure_kept` (true) when the trace also
+//!   has its `failed_tool_call` record.
 //!   Then a `web_search_call` per provider-run search: `status` (`ok`, `err`,
 //!   or `pending`).
+//!   Then a `failed_tool_call` per kept failure, oldest first: the newest 32
+//!   calls that did not succeed, which later successful calls do not remove.
+//!   Each has `at`, `name`, `outcome`, `duration_ms`, `source`, `cause`, and
+//!   `call_id` as a `tool_call` has them; `dir`, the folder the tool ran
+//!   against, where a shell call runs when its arguments name no `cwd`; for a
+//!   `shell` run whose command ran with the startup files the snapshot holds,
+//!   which means admission resolves it to the user environment of the login
+//!   shell, as for the default profile, `redefined`, the entries of the
+//!   `shell` record's `redefined` list that its arguments name, left out when
+//!   there are none;
+//!   and `args` and `result` (each masked), with `args_bytes` and
+//!   `result_bytes`. Each keeps up to 8 KiB of its value: a longer value keeps
+//!   its first bytes in `args` or `result` and its last bytes in `args_tail`
+//!   or `result_tail` (masked), and counts the bytes between them in
+//!   `args_omitted_bytes` or `result_omitted_bytes`. A `web_fetch` call has no
+//!   arguments or result.
 //! - `permissions`: `grants`; then a `permission_grant` per grant: `tool`,
 //!   `target`.
 //! - `runtime_context`: `term`, `term_program`, `lang` (each left out when
 //!   unset), `tmux`, `cmux`, `mcp_servers`; then an `mcp_server` per server:
 //!   `name`, `state`, `transport`, `tools`, `signed_in`, `needs_login`,
 //!   `error` (masked).
+//! - `shell`: how fx starts the agent's shell commands in the user's own
+//!   environment, and what the user's startup files change in them.
+//!   `login_shell`, the configured login shell, left out when unknown;
+//!   `runs`, the shell fx runs them with, which differs when fx does not
+//!   support the login shell; `start`, how a command starts: `snapshot_replay`
+//!   (restored from the snapshot of the startup files' aliases and
+//!   functions), `recapture` (the next command captures the startup files
+//!   again, since they changed or a reload was asked), `full_startup` (every
+//!   command reads the startup files, since the capture failed), `capturing`
+//!   (the first command is capturing them), `not_started` (no command yet),
+//!   or `unavailable`, with `start_error`; `start_command`, the shell's
+//!   command line before `-c`; `snapshot` {`state` (`empty`, `capturing`,
+//!   `ready`, or `failed`), then `failure` when it failed, else `dirty` and
+//!   `names`, the number of aliases and functions}; and, only when the
+//!   snapshot is ready, `redefined`, the common commands such as `ls` or
+//!   `cat` that the startup files redefine, a list of {`name`, `kind`
+//!   (`alias` or `function`), `alias_of` (masked), the first word an alias
+//!   runs, left out when it is not plain text}. Alias and function bodies are
+//!   never in the trace.
 //! - `renderer_state`: `layout`, `cursor`, `transcript`, `projection`,
 //!   `replaceable`, and `shadow_grid` with `visible_rows`, a list of {`row`,
 //!   `text` (masked)}; `shadow_grid` is left out when fx has none.
@@ -204,6 +247,8 @@ const local_time = @import("../shared/local_time.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const mcp_tool_result = @import("../mcp/tool_result.zig");
 const permissions = @import("../permissions/permissions.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
@@ -393,6 +438,9 @@ pub fn build(app: anytype) ![]u8 {
     const agent = agents.screenAgentOf(app);
     const history = agent.session.agent.history.items;
     const permission_view = app_permission_runtime.Runtime(App).viewOf(app, agent);
+    // Taken once, so the failed calls and the shell record agree.
+    const shell_view = try arena.create(shell_snapshot.TraceView);
+    shell_view.* = shell_snapshot.processOwner().traceView();
 
     try writeHeader(r, App.app_version, io_mod.milliTimestamp());
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
@@ -405,9 +453,10 @@ pub fn build(app: anytype) ![]u8 {
     try writeSubagents(r, app);
     try writeNetwork(r);
     try writeModelCatalog(r, app);
-    try writeToolCalls(r, history);
+    try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_view.grants.items);
     try writeRuntimeContext(r, app);
+    try writeShell(r, shell_view, shell_resolver.configuredLoginShellInto(try arena.alloc(u8, std.Io.Dir.max_path_bytes)));
     try writeRendererState(r, app);
     try writeRendererEvents(r);
     try writeTranscript(r, app.shell.notebook.entries.items);
@@ -751,19 +800,17 @@ fn writeNetworkProblems(p: *Records) !void {
     }
 }
 
+/// The newest failed calls come from the kept failures, not the window, so
+/// later successful calls never remove them.
 fn writeToolProblems(p: *Records) !void {
-    const calls = try p.arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
-    const count = diagnostics.snapshotToolCalls(calls);
-    var reported: usize = 0;
+    const calls = try p.arena.alloc(diagnostics.FailedToolCall, diagnostics.failed_tool_call_capacity);
+    const count = diagnostics.snapshotFailedToolCalls(calls);
     var index = count;
-    while (index > 0 and reported < tool_problems_shown) {
+    while (index > count -| tool_problems_shown) {
         index -= 1;
-        const call = &calls[index];
-        if (call.outcome == .succeeded) continue;
-        reported += 1;
         try beginProblem(p, "tool_call");
         try p.beginObject("call");
-        try writeToolCallFields(p, call);
+        try writeFailedToolCallFields(p, &calls[index]);
         try p.endObject();
         try p.end();
     }
@@ -1381,6 +1428,16 @@ fn neutralized(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 fn writeToolCallFields(r: *Records, call: *const diagnostics.ToolCallMetric) !void {
+    try writeCallFields(r, call, call.result());
+}
+
+fn writeFailedToolCallFields(r: *Records, call: *const diagnostics.FailedToolCall) !void {
+    try writeCallFields(r, call, call.result.head());
+}
+
+/// The fields of a window or a kept call. `result` is the start of its
+/// result, where an MCP refusal names its cause.
+fn writeCallFields(r: *Records, call: anytype, result: []const u8) !void {
     try r.time("at", call.started_at_ms);
     try r.text("name", traceToolDisplayName(call.name()));
     try r.text("outcome", @tagName(call.outcome));
@@ -1389,8 +1446,10 @@ fn writeToolCallFields(r: *Records, call: *const diagnostics.ToolCallMetric) !vo
     if (call.outcome != .succeeded) {
         // Why an MCP server refused the call's parameters, so the call doesn't
         // read as a limit or a crash. `invalidParamsCause` masks it.
-        if (try mcp_tool_result.invalidParamsCause(r.arena, call.result())) |cause| try r.text("cause", cause);
+        if (try mcp_tool_result.invalidParamsCause(r.arena, result)) |cause| try r.text("cause", cause);
     }
+    // The provider's ID, the `call_id` of the call's session-log records.
+    try r.optionalText("call_id", call.callId());
 }
 
 fn writeOutcomeCounts(r: *Records, counts: []const u64) !void {
@@ -1465,11 +1524,17 @@ fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
     } else "pending";
 }
 
-noinline fn writeToolCalls(r: *Records, history: []const types.HistoryTurn) !void {
+noinline fn writeToolCalls(
+    r: *Records,
+    history: []const types.HistoryTurn,
+    shell_view: ?*const shell_snapshot.TraceView,
+) !void {
     const calls = try r.arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
     const count = diagnostics.snapshotToolCalls(calls);
     var provider_calls: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
     const provider_count = projectProviderToolCalls(history, &provider_calls);
+    const failed_buf = try r.arena.alloc(diagnostics.FailedToolCall, diagnostics.failed_tool_call_capacity);
+    const failed = failed_buf[0..diagnostics.snapshotFailedToolCalls(failed_buf)];
 
     var outcome_counts: [std.enums.values(diagnostics.ToolCallOutcome).len]u64 = @splat(0);
     var total_ms: u64 = 0;
@@ -1490,11 +1555,14 @@ noinline fn writeToolCalls(r: *Records, history: []const types.HistoryTurn) !voi
     try r.endObject();
     try r.boolean("complete", lifetime.total_calls <= count);
     try r.number("web_search_retained", provider_count);
+    try r.number("failed_retained", failed.len);
+    try r.boolean("failed_complete", lifetime.failureCount() <= failed.len);
     try r.end();
 
     for (calls[0..count]) |*call| {
         try r.begin("tool_call");
         try writeToolCallFields(r, call);
+        if (call.outcome != .succeeded and failureIsKept(failed, call)) try r.boolean("failure_kept", true);
         try writeToolPayload(r, "args", call.args(), call.args_len, call.args_total_bytes);
         if (call.outcome == .succeeded) {
             try writeToolResultPreview(r, call.result(), call.result_total_bytes);
@@ -1508,6 +1576,97 @@ noinline fn writeToolCalls(r: *Records, history: []const types.HistoryTurn) !voi
         try r.text("status", providerToolStatusLabel(call.status));
         try r.end();
     }
+    for (failed) |*call| try writeFailedToolCall(r, call, shell_view);
+}
+
+fn failureIsKept(failed: []const diagnostics.FailedToolCall, call: *const diagnostics.ToolCallMetric) bool {
+    if (call.callId().len == 0) return false;
+    for (failed) |*kept| {
+        if (kept.started_at_ms == call.started_at_ms and std.mem.eql(u8, kept.callId(), call.callId())) return true;
+    }
+    return false;
+}
+
+/// A kept failure, whole up to its head and tail cuts. Unlike the window,
+/// later successful calls never push these out.
+fn writeFailedToolCall(
+    r: *Records,
+    call: *const diagnostics.FailedToolCall,
+    shell_view: ?*const shell_snapshot.TraceView,
+) !void {
+    try r.begin("failed_tool_call");
+    try writeFailedToolCallFields(r, call);
+    try r.optionalText("dir", call.dir());
+    // Only a command that read the startup files ran their aliases.
+    if (shell_view) |view| {
+        if (call.reads_startup_files) try writeRedefinedWordsInCall(r, view, call);
+    }
+    try writeKeptText(r, "args", &call.args);
+    try writeKeptText(r, "result", &call.result);
+    try r.end();
+}
+
+/// Lists the common commands a failed shell call used that the user's
+/// startup files redefine, such as `ls` running eza.
+fn writeRedefinedWordsInCall(
+    r: *Records,
+    view: *const shell_snapshot.TraceView,
+    call: *const diagnostics.FailedToolCall,
+) !void {
+    var wrote = false;
+    for (view.redefined()) |*entry| {
+        if (!traceTextHasWord(call.args.head(), entry.name) and !traceTextHasWord(call.args.tail(), entry.name)) continue;
+        if (!wrote) try r.beginArray("redefined");
+        wrote = true;
+        try writeRedefinedCommand(r, entry);
+    }
+    if (wrote) try r.endArray();
+}
+
+fn writeRedefinedCommand(r: *Records, entry: *const shell_snapshot.RedefinedCommand) !void {
+    try r.beginItem();
+    try r.text("name", entry.name);
+    try r.text("kind", @tagName(entry.kind));
+    if (entry.aliasTarget()) |target| try r.masked("alias_of", target);
+    try r.endItem();
+}
+
+/// Whether `word` is a whole word of a tool call's JSON arguments. A JSON
+/// escape such as `\n` separates words, as the newline it stands for does.
+fn traceTextHasWord(text: []const u8, word: []const u8) bool {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\\') {
+            index += 2;
+            continue;
+        }
+        if (isTraceWordSeparator(text[index])) {
+            index += 1;
+            continue;
+        }
+        const start = index;
+        while (index < text.len and text[index] != '\\' and !isTraceWordSeparator(text[index])) index += 1;
+        if (std.mem.eql(u8, text[start..index], word)) return true;
+    }
+    return false;
+}
+
+fn isTraceWordSeparator(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\r', '\n', ';', '|', '&', '(', ')', '<', '>', '\'', '"', '`', '$', '{', '}', '!', ':', ',', '=', '[', ']' => true,
+        else => false,
+    };
+}
+
+/// Writes `<name>` (masked) and `<name>_bytes`, and for a value longer than
+/// the kept bytes, `<name>_omitted_bytes` and `<name>_tail` (masked).
+fn writeKeptText(r: *Records, comptime name: []const u8, kept: *const diagnostics.KeptText) !void {
+    if (kept.total_bytes == 0) return;
+    try r.masked(name, kept.head());
+    try r.number(name ++ "_bytes", kept.total_bytes);
+    if (kept.omittedBytes() == 0) return;
+    try r.number(name ++ "_omitted_bytes", kept.omittedBytes());
+    try r.optionalMasked(name ++ "_tail", kept.tail());
 }
 
 /// Writes `<name>` (masked), `<name>_bytes`, and `<name>_omitted_bytes` when
@@ -1595,6 +1754,84 @@ fn writeRuntimeContext(r: *Records, app: anytype) !void {
         if (s.last_error) |err| try r.masked("error", err);
         try r.end();
     }
+}
+
+/// How a `user` profile shell command starts, by the snapshot's state.
+const ShellStart = enum { snapshot_replay, recapture, full_startup, capturing, not_started };
+
+/// The `shell` record: how fx starts the agent's shell commands and what the
+/// user's startup files change in them, so a report can tell a shell setup
+/// from a bug.
+fn writeShell(r: *Records, view: *const shell_snapshot.TraceView, configured: ?[]const u8) !void {
+    try r.begin("shell");
+    if (configured) |path| try r.text("login_shell", path);
+    const is_ready = std.mem.eql(u8, view.state, "ready");
+    const is_failed = std.mem.eql(u8, view.state, "failed");
+    if (shellCommandLines(r.arena, configured)) |commands| {
+        try r.text("runs", commands.path);
+        const start: ShellStart = if (is_ready and !view.dirty)
+            .snapshot_replay
+        else if (is_ready)
+            .recapture
+        else if (is_failed)
+            .full_startup
+        else if (std.mem.eql(u8, view.state, "capturing"))
+            .capturing
+        else
+            .not_started;
+        try r.text("start", @tagName(start));
+        try r.text("start_command", if (start == .snapshot_replay) commands.replay else commands.full);
+    } else |err| {
+        try r.text("start", "unavailable");
+        try r.text("start_error", @errorName(err));
+    }
+    try r.beginObject("snapshot");
+    try r.text("state", view.state);
+    if (is_failed) {
+        if (view.failure) |reason| try r.text("failure", reason);
+    } else {
+        try r.boolean("dirty", view.dirty);
+        try r.number("names", view.names_total);
+    }
+    try r.endObject();
+    // Without a snapshot, which commands the startup files redefine is unknown.
+    if (is_ready) {
+        try r.beginArray("redefined");
+        for (view.redefined()) |*entry| try writeRedefinedCommand(r, entry);
+        try r.endArray();
+    }
+    try r.end();
+}
+
+const ShellCommandLines = struct {
+    path: []const u8,
+    /// A `user` profile command without a snapshot, up to its `-c`.
+    full: []const u8,
+    /// A `user` profile command restored from the snapshot, up to its `-c`.
+    replay: []const u8,
+};
+
+fn shellCommandLines(arena: std.mem.Allocator, configured: ?[]const u8) !ShellCommandLines {
+    const environment = try shell_resolver.environment(arena, configured, null);
+    const path = switch (environment) {
+        .user => |value| value,
+        else => return error.UnsupportedShell,
+    };
+    return .{
+        .path = path,
+        .full = try invocationBeforeCommand(arena, try shell_resolver.capturedInvocation(arena, environment, "")),
+        .replay = try invocationBeforeCommand(arena, try shell_resolver.snapshotInvocation(arena, path, "")),
+    };
+}
+
+fn invocationBeforeCommand(arena: std.mem.Allocator, invocation: shell_resolver.Invocation) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (invocation.argv()) |arg| {
+        if (std.mem.eql(u8, arg, "-c")) break;
+        if (out.written().len > 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(arg);
+    }
+    return out.toOwnedSlice();
 }
 
 noinline fn writeRendererState(r: *Records, app: anytype) !void {
@@ -3178,17 +3415,19 @@ test "trace tool calls name why an MCP server refused the parameters" {
         .{ .outcome = .tool_failed, .result = "connection closed" },
         .{ .outcome = .succeeded, .result = refusal },
     };
-    for (fixtures, 0..) |fixture, index| {
-        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(1000 + index), .duration_ms = 1, .outcome = fixture.outcome };
-        call.setName("mcp__fixture__search");
-        call.setArgs("{\"limit\":\"40\"}");
-        call.setResult(fixture.result);
-        diagnostics.recordToolCall(call);
+    for (fixtures) |fixture| {
+        diagnostics.recordToolCallResult(.{
+            .name = "mcp__fixture__search",
+            .arguments_json = "{\"limit\":\"40\"}",
+            .model_output = fixture.result,
+            .outcome = fixture.outcome,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     try writeToolProblems(&w.records);
     var trace = try w.trace();
     defer trace.deinit();
@@ -3226,22 +3465,22 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
         .{ .name = "read_file", .outcome = .tool_failed, .args = "{}", .result = "missing" },
         .{ .name = "run_command", .outcome = .runtime_failed, .args = "{\"command\":\"AI_GATEWAY_API_KEY=abcdefghijklmnop zig build\"}", .result = "failed with PASSWORD=abcdefghijklmnop", .subagent_id = 3 },
     };
+    // Each call started `index + 1` seconds ago, so its duration in whole
+    // seconds is known while the clock runs.
     for (fixtures, 0..) |fixture, index| {
-        var call: diagnostics.ToolCallMetric = .{
-            .started_at_ms = @intCast(1000 + index),
-            .duration_ms = @intCast(index + 1),
+        diagnostics.recordToolCallResult(.{
+            .name = fixture.name,
+            .arguments_json = fixture.args,
+            .model_output = fixture.result,
             .outcome = fixture.outcome,
+            .started_at_ms = io_mod.milliTimestamp() - @as(i64, @intCast(index + 1)) * 1000,
             .subagent_id = fixture.subagent_id,
-        };
-        call.setName(fixture.name);
-        call.setArgs(fixture.args);
-        call.setResult(fixture.result);
-        diagnostics.recordToolCall(call);
+        });
     }
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     try writeToolProblems(&w.records);
     var trace = try w.trace();
     defer trace.deinit();
@@ -3253,10 +3492,15 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
     inline for (.{ "succeeded", "rejected", "command_failed", "tool_failed", "runtime_failed" }) |name| {
         try std.testing.expectEqual(@as(i64, 1), try testInt(outcomes, name));
     }
-    try std.testing.expectEqual(@as(i64, 15), try testInt(summary, "total_ms"));
+    const total_ms = try testInt(summary, "total_ms");
+    try std.testing.expectEqual(@as(i64, 15), @divFloor(total_ms, 1000));
     try std.testing.expectEqual(@as(i64, 5), try testInt(try testObject(summary, "session"), "calls"));
     try std.testing.expect(try testBool(summary, "complete"));
     try std.testing.expectEqual(@as(usize, 5), trace.count("tool_call"));
+    var duration_sum: i64 = 0;
+    for (0..5) |index| duration_sum += try testInt(try trace.nth("tool_call", index), "duration_ms");
+    try std.testing.expectEqual(total_ms, duration_sum);
+    try std.testing.expectEqual(@as(usize, 4), trace.count("failed_tool_call"));
 
     const first = try trace.nth("tool_call", 0);
     try std.testing.expectEqualStrings("read_file", try testString(first, "name"));
@@ -3271,7 +3515,7 @@ test "trace tool calls keep outcomes and mask obvious secrets" {
     try std.testing.expectEqualStrings("runtime_failed", try testString(failed, "outcome"));
     try std.testing.expectEqualStrings("subagent", try testString(failed, "source"));
     try std.testing.expectEqual(@as(i64, 3), try testInt(failed, "subagent_id"));
-    try std.testing.expectEqual(@as(i64, 5), try testInt(failed, "duration_ms"));
+    try std.testing.expectEqual(@as(i64, 5), @divFloor(try testInt(failed, "duration_ms"), 1000));
     try expectStartsWith(try testString(failed, "args"), "{\"command\":\"AI_GATEWAY_API_KEY=[redacted]");
     try std.testing.expectEqualStrings("failed with PASSWORD=[redacted]", try testString(failed, "result"));
     try expectAbsent(failed, "result_preview");
@@ -3301,7 +3545,7 @@ test "trace successful tool calls keep only a short result preview" {
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
     const record = try trace.nth("tool_call", 0);
@@ -3321,18 +3565,21 @@ test "trace tool payloads cut at the ring's bound keep whole characters" {
     defer diagnostics.resetForTest();
     const exact: [tool_args_max_bytes]u8 = @splat('a');
     const over: [tool_args_max_bytes + 1]u8 = @splat('b');
-    // 1199 bytes of 'c', then a three-byte character that the ring cuts after its first byte.
+    // 1199 bytes of 'c', then a three-byte character that the ring's bound
+    // falls inside of, so the ring leaves the whole character out.
     const cut = text_utils.repeat("c", tool_args_max_bytes - 1) ++ "\xe2\x94\x80";
-    for ([_][]const u8{ &exact, &over, cut }, 0..) |args, index| {
-        var call: diagnostics.ToolCallMetric = .{ .started_at_ms = @intCast(10 + index), .outcome = .rejected };
-        call.setName("edit_file");
-        call.setArgs(args);
-        call.setResult("x");
-        diagnostics.recordToolCall(call);
+    for ([_][]const u8{ &exact, &over, cut }) |args| {
+        diagnostics.recordToolCallResult(.{
+            .name = "edit_file",
+            .arguments_json = args,
+            .model_output = "x",
+            .outcome = .rejected,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
 
@@ -3363,7 +3610,7 @@ test "trace web_fetch calls carry no URL or result" {
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
     const record = try trace.one("tool_call");
@@ -3415,7 +3662,7 @@ test "trace web search calls hide provider names and payloads" {
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &history);
+    try writeToolCalls(&w.records, &history, null);
     var trace = try w.trace();
     defer trace.deinit();
     const summary = try trace.one("tool_calls");
@@ -3800,19 +4047,28 @@ test "trace network section states complete coverage when nothing was evicted" {
 test "trace tool section reports session totals and window coverage" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
-    var i: u64 = 0;
+    // The first call fails the way a tool does; the later ones push it out of
+    // the window.
+    diagnostics.recordToolCallResult(.{
+        .name = "shell",
+        .arguments_json = "{}",
+        .model_output = "refused",
+        .outcome = .rejected,
+        .started_at_ms = io_mod.milliTimestamp() - 50,
+    });
+    var i: u64 = 1;
     while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
         var call: diagnostics.ToolCallMetric = .{
             .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 100,
             .duration_ms = 50,
-            .outcome = if (i == 0) .rejected else .succeeded,
+            .outcome = .succeeded,
         };
         call.setName("shell");
         diagnostics.recordToolCall(call);
     }
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     var trace = try w.trace();
     defer trace.deinit();
     const total = diagnostics.tool_call_ring_capacity + 2;
@@ -3823,7 +4079,10 @@ test "trace tool section reports session totals and window coverage" {
     try std.testing.expectEqual(@as(i64, total - 1), try testInt(session_outcomes, "succeeded"));
     try std.testing.expectEqual(@as(i64, 1), try testInt(session_outcomes, "rejected"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(session_outcomes, "runtime_failed"));
-    try std.testing.expectEqual(@as(i64, total * 50), try testInt(session, "total_ms"));
+    // The session total counts the failure the window no longer holds.
+    const failed_ms = try testInt(try trace.one("failed_tool_call"), "duration_ms");
+    try std.testing.expect(failed_ms >= 50);
+    try std.testing.expectEqual(@as(i64, (total - 1) * 50) + failed_ms, try testInt(session, "total_ms"));
     try std.testing.expect(!try testBool(summary, "complete"));
     try std.testing.expectEqual(@as(i64, 0), try testInt(try testObject(summary, "outcomes"), "rejected"));
 
@@ -3833,10 +4092,281 @@ test "trace tool section reports session totals and window coverage" {
     diagnostics.recordToolCall(ok_call);
     const fresh = try TestWriter.create();
     defer fresh.destroy();
-    try writeToolCalls(&fresh.records, &.{});
+    try writeToolCalls(&fresh.records, &.{}, null);
     var fresh_trace = try fresh.trace();
     defer fresh_trace.deinit();
     try std.testing.expect(try testBool(try fresh_trace.one("tool_calls"), "complete"));
+}
+
+fn recordTraceTestCall(
+    name: []const u8,
+    outcome: diagnostics.ToolCallOutcome,
+    call_id: []const u8,
+    arguments_json: []const u8,
+    model_output: []const u8,
+) void {
+    diagnostics.recordToolCallResult(.{
+        .name = name,
+        .arguments_json = arguments_json,
+        .model_output = model_output,
+        .outcome = outcome,
+        .started_at_ms = io_mod.milliTimestamp(),
+        .call_id = call_id,
+        .dir = "/Users/example/project",
+    });
+}
+
+/// A failed shell run that `tool_runtime` resolved to the user's startup
+/// files, as it records one.
+fn recordTraceTestRun(call_id: []const u8, arguments_json: []const u8, model_output: []const u8) void {
+    diagnostics.recordToolCallResult(.{
+        .name = "shell",
+        .arguments_json = arguments_json,
+        .model_output = model_output,
+        .outcome = .command_failed,
+        .started_at_ms = io_mod.milliTimestamp(),
+        .call_id = call_id,
+        .dir = "/Users/example/project",
+        .reads_startup_files = true,
+    });
+}
+
+fn traceTestShellView(state: []const u8) shell_snapshot.TraceView {
+    var view: shell_snapshot.TraceView = .{ .state = state, .dirty = false, .names_total = 7 };
+    view.redefined_buf[0] = .{ .name = "cat", .kind = .function };
+    view.redefined_buf[1] = .{ .name = "ls", .kind = .alias };
+    @memcpy(view.redefined_buf[1].target_buf[0..3], "eza");
+    view.redefined_buf[1].target_len = 3;
+    view.redefined_len = 2;
+    return view;
+}
+
+/// A record's `redefined` list as `<name> <kind>[ <alias_of>];` entries.
+fn testRedefined(arena: std.mem.Allocator, record: std.json.ObjectMap) ![]const u8 {
+    const value = record.get("redefined") orelse return fieldProblem("redefined", error.TestFieldMissing);
+    if (value != .array) return fieldProblem("redefined", error.TestFieldNotArray);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (value.array.items) |item| {
+        try out.writer.print("{s} {s}", .{ try testString(item.object, "name"), try testString(item.object, "kind") });
+        if (item.object.get("alias_of")) |target| try out.writer.print(" {s}", .{target.string});
+        try out.writer.writeByte(';');
+    }
+    return out.written();
+}
+
+test "trace keeps a failed call whole in its own record after the window moves on" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Longer than the kept 8 KiB, so the record keeps its head and its tail.
+    const output = try std.mem.concat(alloc, u8, &.{ "no such dir \x1b[31mred\x1b[0m \xff\n", text_utils.repeat("z", 9000), "\nOUTPUT_TAIL_MARKER" });
+    defer alloc.free(output);
+    recordTraceTestRun(
+        "call_failed",
+        "{\"action\":\"run\",\"command\":\"ls -d missing\\ncat notes\\nAI_GATEWAY_API_KEY=abcdefghijklmnop exit 2\"}",
+        output,
+    );
+    for (0..diagnostics.tool_call_ring_capacity) |_| recordTraceTestCall("shell", .succeeded, "call_ok", "{}", "ok");
+
+    const view = traceTestShellView("ready");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, &view);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try expectNotIn(w.out.written(), "abcdefghijklmnop");
+    // JSON escapes the terminal escape, so no line holds an ESC byte.
+    try expectNotIn(w.out.written(), "\x1b");
+
+    const summary = try trace.one("tool_calls");
+    try std.testing.expect(!try testBool(summary, "complete"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "failed_retained"));
+    try std.testing.expect(try testBool(summary, "failed_complete"));
+
+    const failed = try trace.one("failed_tool_call");
+    _ = try testString(failed, "at");
+    try std.testing.expectEqualStrings("shell", try testString(failed, "name"));
+    try std.testing.expectEqualStrings("command_failed", try testString(failed, "outcome"));
+    try std.testing.expectEqualStrings("parent", try testString(failed, "source"));
+    try std.testing.expectEqualStrings("call_failed", try testString(failed, "call_id"));
+    try std.testing.expectEqualStrings("/Users/example/project", try testString(failed, "dir"));
+    // `cat` follows a JSON `\n` escape, which separates words.
+    try std.testing.expectEqualStrings("cat function;ls alias eza;", try testRedefined(trace.arena.allocator(), failed));
+    const args = try testString(failed, "args");
+    try std.testing.expect(std.mem.find(u8, args, "ls -d missing") != null);
+    try std.testing.expect(std.mem.find(u8, args, "AI_GATEWAY_API_KEY=[redacted]") != null);
+    try expectAbsent(failed, "args_omitted_bytes");
+    try expectAbsent(failed, "args_tail");
+    try expectStartsWith(try testString(failed, "result"), "no such dir \x1b[31mred\x1b[0m \\xff\nzzz");
+    try expectEndsWith(try testString(failed, "result_tail"), "zzz\nOUTPUT_TAIL_MARKER");
+    try std.testing.expectEqual(@as(i64, @intCast(output.len)), try testInt(failed, "result_bytes"));
+    const kept_bytes = @typeInfo(@FieldType(diagnostics.KeptText, "buf")).array.len;
+    try std.testing.expectEqual(@as(i64, @intCast(output.len - kept_bytes)), try testInt(failed, "result_omitted_bytes"));
+
+    // The window has moved past the failed call.
+    try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
+    for (0..diagnostics.tool_call_ring_capacity) |index| {
+        const call = try trace.nth("tool_call", index);
+        try std.testing.expectEqualStrings("call_ok", try testString(call, "call_id"));
+        try expectAbsent(call, "failure_kept");
+    }
+}
+
+test "trace marks a window call whose failure is kept" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("read_file", .tool_failed, "call_missing", "{\"path\":\"missing.txt\"}", "not found");
+    recordTraceTestCall("read_file", .succeeded, "call_ok", "{}", "ok");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, null);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const window_failure = try trace.nth("tool_call", 0);
+    try std.testing.expectEqualStrings("call_missing", try testString(window_failure, "call_id"));
+    try std.testing.expect(try testBool(window_failure, "failure_kept"));
+    const window_success = try trace.nth("tool_call", 1);
+    try std.testing.expectEqualStrings("call_ok", try testString(window_success, "call_id"));
+    try expectAbsent(window_success, "failure_kept");
+
+    const kept = try trace.one("failed_tool_call");
+    try std.testing.expectEqualStrings("call_missing", try testString(kept, "call_id"));
+    try std.testing.expectEqualStrings("{\"path\":\"missing.txt\"}", try testString(kept, "args"));
+    try std.testing.expectEqualStrings("not found", try testString(kept, "result"));
+    // Without a shell view, a failure names no redefined commands.
+    try expectAbsent(kept, "redefined");
+}
+
+test "trace names redefined commands only for a failed call recorded as reading the startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestRun("call_user", "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", "exit 1");
+    // `tool_runtime` records these as reading no startup files: a clean
+    // profile, a clean start, and an interact call, which runs no command.
+    // Each names `ls` all the same.
+    recordTraceTestCall("shell", .command_failed, "call_clean", "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", "exit 1");
+    recordTraceTestCall(
+        "shell",
+        .command_failed,
+        "call_named_shell",
+        "{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+        "exit 1",
+    );
+    recordTraceTestCall(
+        "shell",
+        .tool_failed,
+        "call_interact",
+        "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}",
+        "no such session",
+    );
+    const view = traceTestShellView("ready");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolCalls(&w.records, &.{}, &view);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), trace.count("failed_tool_call"));
+    const user = try trace.nth("failed_tool_call", 0);
+    try std.testing.expectEqualStrings("call_user", try testString(user, "call_id"));
+    try std.testing.expectEqualStrings("ls alias eza;", try testRedefined(trace.arena.allocator(), user));
+    for ([_][]const u8{ "call_clean", "call_named_shell", "call_interact" }, 1..) |call_id, index| {
+        const call = try trace.nth("failed_tool_call", index);
+        try std.testing.expectEqualStrings(call_id, try testString(call, "call_id"));
+        try expectAbsent(call, "redefined");
+    }
+}
+
+test "trace problems list a failure the window no longer holds" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("shell", .command_failed, "call_failed", "{}", "exit 2");
+    for (0..diagnostics.tool_call_ring_capacity) |_| recordTraceTestCall("shell", .succeeded, "call_ok", "{}", "ok");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeToolProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const problem = try trace.one("problem");
+    try std.testing.expectEqualStrings("tool_call", try testString(problem, "kind"));
+    const call = try testObject(problem, "call");
+    _ = try testString(call, "at");
+    try std.testing.expectEqualStrings("shell", try testString(call, "name"));
+    try std.testing.expectEqualStrings("command_failed", try testString(call, "outcome"));
+    try std.testing.expectEqualStrings("call_failed", try testString(call, "call_id"));
+}
+
+test "trace shell record says how commands start and what startup files redefine" {
+    var ready = traceTestShellView("ready");
+    // An alias's first word can hold a secret, so `alias_of` is masked.
+    const secret_target = "AI_GATEWAY_API_KEY=abcdefghijklmnop";
+    ready.redefined_buf[2] = .{ .name = "curl", .kind = .alias };
+    @memcpy(ready.redefined_buf[2].target_buf[0..secret_target.len], secret_target);
+    ready.redefined_buf[2].target_len = secret_target.len;
+    ready.redefined_len = 3;
+    var failed = traceTestShellView("failed");
+    failed.failure = "the login shell exited before reporting its state";
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeShell(&w.records, &ready, "/bin/zsh");
+    try writeShell(&w.records, &failed, "/bin/bash");
+    try writeShell(&w.records, &ready, "/usr/bin/fish");
+    const starts = [_]struct { state: []const u8, dirty: bool, start: []const u8 }{
+        .{ .state = "ready", .dirty = true, .start = "recapture" },
+        .{ .state = "capturing", .dirty = false, .start = "capturing" },
+        .{ .state = "empty", .dirty = false, .start = "not_started" },
+    };
+    for (starts) |case| {
+        var view = traceTestShellView(case.state);
+        view.dirty = case.dirty;
+        try writeShell(&w.records, &view, "/bin/zsh");
+    }
+    var trace = try w.trace();
+    defer trace.deinit();
+    const arena = trace.arena.allocator();
+    try expectNotIn(w.out.written(), "abcdefghijklmnop");
+
+    const zsh = try trace.nth("shell", 0);
+    try std.testing.expectEqualStrings("/bin/zsh", try testString(zsh, "login_shell"));
+    try std.testing.expectEqualStrings("/bin/zsh", try testString(zsh, "runs"));
+    try std.testing.expectEqualStrings("snapshot_replay", try testString(zsh, "start"));
+    try std.testing.expectEqualStrings("/bin/zsh -f", try testString(zsh, "start_command"));
+    const zsh_snapshot = try testObject(zsh, "snapshot");
+    try std.testing.expectEqualStrings("ready", try testString(zsh_snapshot, "state"));
+    try std.testing.expect(!try testBool(zsh_snapshot, "dirty"));
+    try std.testing.expectEqual(@as(i64, 7), try testInt(zsh_snapshot, "names"));
+    try expectAbsent(zsh_snapshot, "failure");
+    try std.testing.expectEqualStrings(
+        "cat function;ls alias eza;curl alias AI_GATEWAY_API_KEY=[redacted];",
+        try testRedefined(arena, zsh),
+    );
+
+    const bash = try trace.nth("shell", 1);
+    try std.testing.expectEqualStrings("full_startup", try testString(bash, "start"));
+    try std.testing.expectEqualStrings("/bin/bash --login -O expand_aliases", try testString(bash, "start_command"));
+    const bash_snapshot = try testObject(bash, "snapshot");
+    try std.testing.expectEqualStrings("failed", try testString(bash_snapshot, "state"));
+    try std.testing.expectEqualStrings("the login shell exited before reporting its state", try testString(bash_snapshot, "failure"));
+    try expectAbsent(bash_snapshot, "dirty");
+    // Without a snapshot, which commands are redefined is unknown.
+    try expectAbsent(bash, "redefined");
+
+    const fish = try trace.nth("shell", 2);
+    try std.testing.expectEqualStrings("/usr/bin/fish", try testString(fish, "login_shell"));
+    try expectStartsWith(try testString(fish, "runs"), "/bin/");
+
+    for (starts, 3..) |case, index| {
+        const record = try trace.nth("shell", index);
+        try std.testing.expectEqualStrings(case.start, try testString(record, "start"));
+        if (!std.mem.eql(u8, case.state, "ready")) try expectAbsent(record, "redefined");
+    }
 }
 
 test "trace last shutdown reads a report or says why it cannot" {
@@ -4128,16 +4658,15 @@ test "trace stays well formed with every ring full and a long transcript" {
     // Compaction and catalog details hold internal values only and are not
     // masked, so their text has no secret.
     const plain_big = text_utils.repeat("\"quoted\" \\ \xff\xc3 \u{2028}\n", 30);
+    // Two of every three calls fail, more than the failure ring holds.
     for (0..diagnostics.tool_call_ring_capacity + 1) |index| {
-        var call: diagnostics.ToolCallMetric = .{
-            .started_at_ms = @intCast(1_000 + index),
-            .duration_ms = 7,
-            .outcome = if (index % 2 == 0) .succeeded else .tool_failed,
-        };
-        call.setName("shell");
-        call.setArgs(big);
-        call.setResult(big);
-        diagnostics.recordToolCall(call);
+        diagnostics.recordToolCallResult(.{
+            .name = "shell",
+            .arguments_json = big,
+            .model_output = big,
+            .outcome = if (index % 3 == 0) .succeeded else .tool_failed,
+            .started_at_ms = io_mod.milliTimestamp(),
+        });
     }
     for (0..diagnostics.network_ring_capacity + 1) |index| {
         var call: diagnostics.NetworkCall = .{
@@ -4187,7 +4716,7 @@ test "trace stays well formed with every ring full and a long transcript" {
     try writeCompaction(&w.records);
     try writeNetwork(&w.records);
     try writeModelCatalog(&w.records, &struct {}{});
-    try writeToolCalls(&w.records, &.{});
+    try writeToolCalls(&w.records, &.{}, null);
     try writeRendererEvents(&w.records);
     try writeTranscript(&w.records, entries);
     try writeEnd(&w.records);
@@ -4197,6 +4726,8 @@ test "trace stays well formed with every ring full and a long transcript" {
     try expectNotIn(w.out.written(), "abcdefghijklmnop");
     try std.testing.expectEqual(@as(i64, @intCast(trace.records.len - 1)), try testInt(trace.records[trace.records.len - 1], "records"));
     try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
+    try std.testing.expectEqual(diagnostics.failed_tool_call_capacity, trace.count("failed_tool_call"));
+    try std.testing.expect(!try testBool(try trace.one("tool_calls"), "failed_complete"));
     try std.testing.expectEqual(diagnostics.network_ring_capacity, trace.count("network_call"));
     try std.testing.expectEqual(diagnostics.render_ring_capacity, trace.count("renderer_event"));
     try std.testing.expectEqual(diagnostics.compaction_ring_capacity, trace.count("compaction_event"));
