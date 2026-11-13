@@ -3912,12 +3912,34 @@ if (durabilityKind === "queue") {
 }
 
 if (durabilityKind === "world") {
-  test("Workflow replay reaches the app World's real in-process queue handler", async () => {
-    const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
-    const dir = await mkdtemp(join(tmpdir(), "libfx-local-replay-"));
+  test("an app World's standard Workflow handler keeps its own deliveries", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-shared-workflow-"));
     dirs.push(dir);
     const durability = await appWorldAt(dir);
     const stored = durability.world();
+    let received = false;
+    stored.registerHandler("__wkf_workflow_", stored.createQueueHandler("__wkf_workflow_", async () => { received = true; }));
+    const agent = createAgent({ durability });
+    try {
+      await agent.session().prompt("libfx").result;
+      await stored.queue("__wkf_workflow_app/flow", { runId: "wrun_0123456789ABCDEFGHIJK" });
+      const deadline = Date.now() + 1000;
+      while (!received && Date.now() < deadline) await sleep(20);
+      assert.equal(received, true, "libfx does not replace the app's Workflow handler");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "local") {
+  test("Workflow replay reaches the local World's real in-process queue handler", async () => {
+    const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-local-replay-"));
+    dirs.push(dir);
+    const settings = local({ dir });
+    const stored = settings.world();
+    const durability = world(() => stored, settings);
     const agent = createAgent({ durability });
     try {
       const original = agent.session();
@@ -3929,7 +3951,7 @@ if (durabilityKind === "world") {
       const ended = async () => (await log.read()).some(({ entry }) => entry.k === "record" && entry.marks?.some((mark) => mark.end));
       const deadline = Date.now() + 15_000;
       while (!await ended() && Date.now() < deadline) await sleep(20);
-      assert.equal(await ended(), true, "the app World's queue delivered the Workflow replay");
+      assert.equal(await ended(), true, "the local World's queue delivered the Workflow replay");
       const lines = await readLines(agent.session(replayed).stream(0), 5);
       assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join("").trim(), "local-replay-0 local-replay-1 local-replay-2");
     } finally {
@@ -3987,8 +4009,9 @@ if (durabilityKind === "queue") {
     const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
     const dir = await mkdtemp(join(tmpdir(), "libfx-workflow-replay-"));
     dirs.push(dir);
-    const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
-    const stored = durability.world();
+    const { durability: supplied, broker } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
+    const stored = supplied.world();
+    const durability = world(() => stored, supplied);
     const { agent, seen } = recordingAgent(durability);
     const internals = agent[Symbol.for("libfx.durableInternals")];
     const until = async (check, message) => {

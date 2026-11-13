@@ -261,6 +261,8 @@ export const agent = createFxAgent({
 
 A World that delivers queue messages over HTTP needs `agent.wakeHandler()`, or `wakeHandler()` for several agents, at the address it posts to. Workflow's Postgres World 5.0.2 posts every message to `/.well-known/workflow/v1/flow` on your app. `world()` takes options for what libfx can't learn from the World itself, such as how long a lease lasts and whether the queue keeps a message across crashes. The `WorldOptions` type documents each one.
 
+Dashboard replay works with `local()`, `vercel()`, and Worlds that deliver replay messages through `wakeHandler()`. An app-supplied World that delivers in process retains its standard Workflow handler; libfx does not register dashboard replay on that shared handler.
+
 On a World with Workflow's in-band writer fence, libfx writes each claim and record so that the World itself refuses a write from a worker another has replaced, and nothing of it is stored. libfx finds the fence in the World's capabilities, so there's nothing to configure. On a World without it, libfx detects the replaced worker after its write instead, and the session's log ignores what that worker wrote.
 
 ## Tools

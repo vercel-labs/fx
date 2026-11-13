@@ -1544,7 +1544,7 @@ function createWorldBackend(world, durability) {
           if (listeners.size === 0) return deliverTo(null, message, meta);
           throw noAgentNamed(named);
         }));
-        if (workflowCodec) world.registerHandler(workflowQueuePrefix, world.createQueueHandler(workflowQueuePrefix, handleMessage));
+        if (workflowCodec && owned) world.registerHandler(workflowQueuePrefix, world.createQueueHandler(workflowQueuePrefix, handleMessage));
       }
       const group = joinGroup(listeners, name, fn);
       return () => {
