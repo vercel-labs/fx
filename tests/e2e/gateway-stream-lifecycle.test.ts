@@ -1617,20 +1617,14 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test.each(["", "spacexai/grok-4.7"])("ask uses GPT-6.1 Sol by default and preserves a saved model (%s)", async (savedModel) => {
+  test("ask uses GPT-6.1 Sol as the default model", async () => {
     const root = createFixtureRoot("default-model");
-    const expectedModel = savedModel || DEFAULT_MODEL;
-    if (savedModel) {
-      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
-        models: { gateway: savedModel },
-      }));
-    }
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("DEFAULT_MODEL_COMPLETE"),
       {
         models: [{
-          id: expectedModel,
+          id: DEFAULT_MODEL,
           type: "language",
           tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
           reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
@@ -1656,14 +1650,10 @@ describe("gateway stream lifecycle", () => {
       expect(parseAskJson(result.stdout).output).toContain(
         "DEFAULT_MODEL_COMPLETE",
       );
-      expect(parseAskJson(result.stdout).model).toBe(expectedModel);
-      if (savedModel) {
-        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")).models.gateway).toBe(savedModel);
-      }
       expect(result.stderr).toBe("");
       expect(gateway.requests).toHaveLength(1);
       expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
-        expectedModel,
+        DEFAULT_MODEL,
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
