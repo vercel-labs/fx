@@ -83,6 +83,33 @@ export function rootSessionIds(home: string): string[] {
   });
 }
 
+/// How many turns the saved root sessions have committed. A session fx is
+/// still creating counts as none yet.
+export function committedRootTurns(home: string): number {
+  try {
+    return rootSessionIds(home).reduce(
+      (sum, id) => sum + logLines(home, id).filter((line) => line.kind === "turn_committed").length,
+      0,
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/// Waits until the saved root sessions hold more than `after` committed
+/// turns. A fake model holds a child's answer on it: a report that arrives
+/// while the parent's turn still runs joins that turn (`postMail` in
+/// `src/core/agent/worker_runtime.zig`), so the receipt never gets its own
+/// step.
+export async function waitForRootTurnCommitted(home: string, after = 0, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (committedRootTurns(home) > after) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`no root session committed more than ${after} turns`);
+}
+
 /// The parent's lines about its children, with fx's data parsed.
 export function childLines(home: string, id: string): any[] {
   return (readLog(home, id) as any[])
