@@ -1335,9 +1335,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn collectProviderPreparationFacts(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
             if (pendingPromptNeedsAdoption(app, agent)) return;
-            const task = app.auth.takeProviderPreparation() orelse return;
-            defer task.deinit();
-            if (task.cancel_requested.load(.seq_cst)) {
+            // A cancelled preparation ends at once, even one in the middle of
+            // a sign-in refresh, which keeps running until it saves the login.
+            if (app.auth.takeCancelledProviderPreparation()) {
                 holdPromptAfterPreparationFailure(app, agent);
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1346,6 +1346,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            const task = app.auth.takeProviderPreparation() orelse return;
+            defer task.deinit();
             const applied = switch (task.input.intent) {
                 .provider => try finishProviderSwitch(app, agent, task),
                 .team => try finishTeamPreparation(app, agent, task),

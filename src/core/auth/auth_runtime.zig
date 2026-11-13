@@ -1361,6 +1361,92 @@ test "provider preparation at exit is cancelled and left running instead of wait
     task.deinit();
 }
 
+test "a cancelled provider switch ends at once while its sign-in refresh finishes and saves the new login" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    errdefer runtime.deinit(alloc);
+    // Released before a failed check waits for the task.
+    defer transport.release.store(true, .seq_cst);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .preferred_source = .fx_login,
+    });
+    try waitForPreparationTest(&transport.token_request_seen);
+
+    // Esc while the token request is on the wire: the switch ends at once,
+    // and the refresh, which is never cut off, keeps running.
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expectEqual(@as(usize, 1), runtime.cancelled_provider_preparations.items.len);
+    try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+
+    // A full shutdown waits for it, and the new login is saved.
+    transport.release.store(true, .seq_cst);
+    runtime.deinit(alloc);
+    var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-token", stored.token);
+}
+
+test "a cancelled provider preparation that already finished is freed at once" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    try std.testing.expect(!runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+}
+
+test "process exit leaves a cancelled provider preparation running instead of waiting for it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{ .ignores_cancel = true };
+    // Released before a failed check waits for the task.
+    defer catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&catalog.entered);
+    const task = runtime.provider_preparation.?;
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+
+    runtime.leaveProviderPreparationForExit();
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    catalog.release.store(true, .release);
+    try waitForPreparationTest(&task.done);
+    task.deinit();
+}
+
 test "provider preparation retains cancellation when a result wins the transport race" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -2011,6 +2097,12 @@ pub const Runtime = struct {
     /// the new login; finished ones are freed as the prompt refresh is used,
     /// `deinit` waits for the rest, and process exit leaves them.
     abandoned_prompt_refreshes: std.ArrayList(*PromptCredentialRefreshTask) = .empty,
+    /// Preparations the user cancelled that still run, such as one in the
+    /// middle of a sign-in refresh, which is never cut off. The switch ends at
+    /// once (`takeCancelledProviderPreparation`); finished ones are freed as
+    /// preparations start, a full shutdown waits for the rest, and process
+    /// exit leaves them.
+    cancelled_provider_preparations: std.ArrayList(*ProviderPreparation) = .empty,
     /// Revocations of signed-out sessions still talking to their issuer.
     remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
     team_list_task: ?*TeamListTask = null,
@@ -2060,7 +2152,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 36) {
+            if (@typeInfo(Self).@"struct".field_names.len != 37) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -2096,6 +2188,7 @@ pub const Runtime = struct {
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.abandoned_prompt_refreshes = .empty;
+        storage.cancelled_provider_preparations = .empty;
         storage.remote_revocation_tasks = .empty;
         storage.team_list_task = null;
         storage.provider_preparation = null;
@@ -2355,6 +2448,7 @@ pub const Runtime = struct {
 
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
         if (self.provider_preparation != null) return error.ProviderPreparationInProgress;
+        self.freeFinishedProviderPreparations();
         self.cancelPromptCredentialRefresh();
         self.provider_preparation = try ProviderPreparation.start(alloc, self, input);
     }
@@ -2369,6 +2463,40 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Ends a cancelled preparation for the app at once and returns whether
+    /// there was one. One still running, such as one in the middle of a
+    /// sign-in refresh, which is never cut off (`oauth_transport.Request`
+    /// `outlives_cancel`), is kept until it ends, so nothing waits for it.
+    pub fn takeCancelledProviderPreparation(self: *Self) bool {
+        const task = self.provider_preparation orelse return false;
+        if (!task.cancel_requested.load(.seq_cst)) return false;
+        self.provider_preparation = null;
+        if (task.done.load(.acquire)) {
+            task.deinit();
+            return true;
+        }
+        self.cancelled_provider_preparations.append(std.heap.c_allocator, task) catch {
+            debug_trace.logf("auth", "cancelled provider preparation awaited reason=no_memory_to_keep_it", .{});
+            task.deinit();
+            return true;
+        };
+        debug_trace.logf("auth", "cancelled provider preparation left running target={t}", .{task.input.target()});
+        return true;
+    }
+
+    fn freeFinishedProviderPreparations(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.cancelled_provider_preparations.items.len) {
+            const task = self.cancelled_provider_preparations.items[i];
+            if (!task.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            _ = self.cancelled_provider_preparations.swapRemove(i);
+            task.deinit();
+        }
+    }
+
     pub fn takeProviderPreparation(self: *Self) ?*ProviderPreparation {
         const task = self.provider_preparation orelse return null;
         if (!task.done.load(.acquire)) return null;
@@ -2378,7 +2506,10 @@ pub const Runtime = struct {
         return task;
     }
 
+    /// Waits for every preparation, cancelled ones too, and frees them.
     pub fn stopProviderPreparation(self: *Self) void {
+        for (self.cancelled_provider_preparations.items) |task| task.deinit();
+        self.cancelled_provider_preparations.clearAndFree(std.heap.c_allocator);
         const task = self.provider_preparation orelse return;
         self.provider_preparation = null;
         task.deinit();
@@ -2390,9 +2521,15 @@ pub const Runtime = struct {
     /// `outlives_cancel`), is cancelled and left to end with the process. It
     /// holds only its own copies and static providers.
     pub fn leaveProviderPreparationForExit(self: *Self) void {
+        for (self.cancelled_provider_preparations.items) |task| leavePreparationForExit(task);
+        self.cancelled_provider_preparations.clearAndFree(std.heap.c_allocator);
         const task = self.provider_preparation orelse return;
-        if (task.done.load(.acquire)) return self.stopProviderPreparation();
         self.provider_preparation = null;
+        leavePreparationForExit(task);
+    }
+
+    fn leavePreparationForExit(task: *ProviderPreparation) void {
+        if (task.done.load(.acquire)) return task.deinit();
         task.requestCancel();
         debug_trace.logf("auth", "provider preparation left running reason=process_exit target={t}", .{task.input.target()});
         if (task.thread) |thread| thread.detach();
