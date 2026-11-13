@@ -6,6 +6,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
+const app_lifecycle = @import("app_lifecycle.zig");
 const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -1320,7 +1321,7 @@ pub fn Handlers(comptime App: type) type {
             };
             var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
-            try writeCreditsNotice(app, snapshot, true);
+            try writeCreditsNotice(app, snapshot, .current_credential);
         }
 
         const CreditsLookupArgs = struct {
@@ -1373,7 +1374,7 @@ pub fn Handlers(comptime App: type) type {
 
         /// Writes the `/credits` result once its background lookup finishes,
         /// after adopting a credential the lookup renewed.
-        pub fn collectCreditsFacts(app: *App) !void {
+        pub fn collectCreditsFacts(app: *App, default_model: []const u8) !void {
             if (comptime !@hasField(App, "credits_lookup")) return;
             var result = app.credits_lookup.take() orelse return;
             defer result.deinit();
@@ -1383,7 +1384,7 @@ pub fn Handlers(comptime App: type) type {
             const current = result.epoch == tokenPassEpoch(app);
             if (!current) debug_trace.logf("credits", "token pass reply ignored reason=credential_changed quiet={}", .{result.quiet});
             if (!result.quiet) {
-                try writeCreditsNotice(app, result.snapshot, current);
+                try writeCreditsNotice(app, result.snapshot, if (current) .current_credential else .earlier_credential);
             } else if (current) {
                 observeTokenPass(app, result.snapshot);
             }
@@ -1394,7 +1395,7 @@ pub fn Handlers(comptime App: type) type {
                     // ask again for this credential.
                     if (state.* == .checking) {
                         state.* = .unchecked;
-                        try startTokenPassDefaultCheck(app);
+                        try startTokenPassDefaultCheck(app, default_model);
                     }
                 } else if (app.model_cache.tokenPassStatus() == .active) {
                     if (state.* != .settled) state.* = .pending;
@@ -1423,10 +1424,11 @@ pub fn Handlers(comptime App: type) type {
         /// Asks once per credential, in the background, whether the team has
         /// Token Pass, when the answer could change the model. Call it after
         /// the model catalog loads, when the credential is ready.
-        pub fn startTokenPassDefaultCheck(app: *App) !void {
+        /// `default_model` is AI Gateway's built-in default.
+        pub fn startTokenPassDefaultCheck(app: *App, default_model: []const u8) !void {
             if (comptime !@hasField(App, "credits_lookup") or !@hasField(App, "model_cache") or @import("builtin").single_threaded) return;
             if (app.model_cache.token_pass_default != .unchecked) return;
-            if (!usesBuiltInModelDefault(app)) {
+            if (!usesBuiltInModelDefault(app, default_model)) {
                 app.model_cache.token_pass_default = .settled;
                 return;
             }
@@ -1449,16 +1451,16 @@ pub fn Handlers(comptime App: type) type {
         /// Moves the main agent to the Token Pass default model once the
         /// team is known to have Token Pass and the agent is idle. The
         /// choice lasts for this run and is not saved, so the user still has
-        /// no chosen model.
-        pub fn applyTokenPassDefault(app: *App) !void {
+        /// no chosen model. `default_model` is AI Gateway's built-in default.
+        pub fn applyTokenPassDefault(app: *App, default_model: []const u8) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (app.model_cache.token_pass_default != .pending) return;
             if (comptime agents.hasAgentField(App, "stream") and agents.hasAgentField(App, "worker")) {
                 if (app.main_agent.stream.active or app.main_agent.worker.queuedPromptCount() > 0) return;
             }
             app.model_cache.token_pass_default = .settled;
-            if (!usesBuiltInModelDefault(app)) return;
-            if (std.ascii.eqlIgnoreCase(provider_runtime.modelOf(app, &app.main_agent), token_pass.pass_default_model)) return;
+            if (std.mem.eql(u8, default_model, token_pass.pass_default_model)) return;
+            if (!usesBuiltInModelDefault(app, default_model)) return;
             try provider_runtime.replaceModel(app, token_pass.pass_default_model);
             if (comptime agents.hasAgentField(App, "worker")) {
                 try app.main_agent.worker.syncQueuedPromptModel(std.heap.c_allocator, provider_runtime.modelOf(app, &app.main_agent));
@@ -1474,26 +1476,36 @@ pub fn Handlers(comptime App: type) type {
         }
 
         /// Whether the main agent on screen runs AI Gateway's built-in
-        /// default: no saved Gateway model, and no `--model`, `--provider`,
-        /// or `FX_MODEL` for this run.
-        fn usesBuiltInModelDefault(app: *App) bool {
+        /// `default_model` because nothing chose another: no saved Gateway
+        /// model, no `--model`, `--provider`, or `FX_MODEL` for this run,
+        /// and no model restored from a resumed session.
+        fn usesBuiltInModelDefault(app: *App, default_model: []const u8) bool {
             if (provider_runtime.providerOf(app, &app.main_agent) != .gateway) return false;
             if (comptime @hasField(App, "screen_owner")) {
                 if (agents.screenAgentOf(app) != &app.main_agent) return false;
             }
-            if (config_runtime.modelEnvOverride() != null) return false;
+            if (!std.mem.eql(u8, provider_runtime.modelOf(app, &app.main_agent), default_model)) return false;
             if (provider_runtime.runsProcessModel(app, &app.main_agent)) return false;
             var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
                 debug_trace.logf("credits", "token pass default skipped reason=settings err={s}", .{@errorName(err)});
                 return false;
             };
             defer settings.deinit(app.alloc);
-            return settings.models.get(.gateway) == null;
+            return app_lifecycle.ModelOrigin.of(&settings, .gateway, config_runtime.modelEnvOverride()) == .default;
         }
 
-        /// Writes the credits notice. `current` says the reply belongs to
-        /// the credential fx uses now, so it may update the Token Pass state.
-        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot, current: bool) !void {
+        /// Which credential a credits reply belongs to.
+        const ReplyFor = enum {
+            /// The credential fx uses now: the reply may update Token Pass state.
+            current_credential,
+            /// An earlier credential: show the reply, but it says nothing
+            /// about the current team.
+            earlier_credential,
+        };
+
+        /// Writes the credits notice, and records what it says about Token
+        /// Pass when it belongs to the current credential.
+        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot, reply_for: ReplyFor) !void {
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
@@ -1508,7 +1520,7 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
-            if (!current) return;
+            if (reply_for == .earlier_credential) return;
             observeTokenPass(app, snapshot);
             if (comptime @hasField(App, "model_cache")) {
                 const mentions_token_pass = snapshot.token_pass != null or snapshot.no_token_pass;

@@ -388,7 +388,7 @@ fn modelMenuDisplayIndex(
     return modelMenuRanking(items, provider_filter, query).rankOf(position);
 }
 
-pub const TokenPassDefault = enum {
+const TokenPassDefault = enum {
     /// fx has not asked whether this team has Token Pass.
     unchecked,
     /// A quiet credits lookup is asking.
