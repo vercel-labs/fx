@@ -11,6 +11,7 @@ const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const ui_render = @import("../render.zig");
 const input_presentation = @import("input_presentation.zig");
+const menu_frame = @import("menu_frame.zig");
 const row_text = @import("row_text.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -700,6 +701,9 @@ pub fn updateEdgeScrollPickerWindowStart(current_start: usize, count: usize, sel
 
 pub const SlashMenuLayout = struct {
     row_count: u16,
+    /// Rows under the header, including the `↓ N more` row.
+    list_rows: u16,
+    /// Rows that show items.
     selectable_rows: u16,
     show_header: bool,
     selected: usize,
@@ -764,21 +768,19 @@ fn slashMenuLayoutForCounts(
     if (result_count == 0) return null;
 
     const row_budget = inlinePickerRowBudget(terminal_rows, input_extra, banner_rows);
-    const show_header = row_budget > 2;
-    const header_rows: u16 = if (show_header) 2 else 0;
-    const selectable_rows = row_budget - header_rows;
+    const list_cap = if (row_budget > 2) row_budget - 2 else row_budget;
     const selected = selection_index % result_count;
-    const window_start = updateEdgeScrollPickerWindowStart(current_window_start, result_count, selected, selectable_rows);
-    const window = edgeScrollPickerWindowFromStart(result_count, window_start, selectable_rows);
+    const frame = menu_frame.listLayout(result_count, selected, current_window_start, list_cap, row_budget);
 
     return .{
-        .row_count = selectable_rows + header_rows,
-        .selectable_rows = selectable_rows,
-        .show_header = show_header,
+        .row_count = frame.row_count,
+        .list_rows = frame.list_rows,
+        .selectable_rows = frame.visible_items,
+        .show_header = frame.show_header,
         .selected = selected,
         .command_count = command_count,
         .result_count = result_count,
-        .window = window,
+        .window = .{ .start = frame.window_start, .end = frame.window_start + frame.visible_items },
     };
 }
 
@@ -1232,55 +1234,10 @@ fn mixedSlashCompletionLabel(registry: command_specs.SlashRegistry, prefix: []co
     };
 }
 
-pub fn composeSlashMenuHeaderRow(
-    alloc: Allocator,
-    prefix: []const u8,
-    layout: SlashMenuLayout,
-    width: u16,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    if (width == 0) return row;
-
-    const noun = if (layout.command_count == layout.result_count) "Commands" else "Results";
-    var left_buf: [96]u8 = undefined;
-    const left = if (std.mem.eql(u8, prefix, "/"))
-        std.mem.print(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
-    else
-        std.mem.print(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
-
-    var range_buf: [48]u8 = undefined;
-    const range = if (layout.result_count > layout.selectable_rows)
-        std.mem.print(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
-    else
-        "";
-
-    const content_width: usize = @as(usize, width) -| 1;
-    const range_width = display_width.visibleWidth(range);
-    const left_width = if (range_width > 0 and content_width > range_width + 2)
-        content_width - range_width - 2
-    else
-        content_width;
-
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(alloc, &row, left, left_width);
-    if (range_width > 0 and content_width > range_width + 2) {
-        try appendSpacesToVisibleWidth(alloc, &row, content_width - range_width);
-        try row.appendSlice(alloc, range);
-    }
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
 const SlashMenuRowContent = struct {
     label: []const u8,
     description: []const u8,
     metadata: []const u8,
-};
-
-pub const SlashMenuColumnWidths = struct {
-    label: usize,
-    metadata: usize,
 };
 
 fn slashMenuRowContent(
@@ -1329,125 +1286,44 @@ fn preparedSlashMenuRowContent(
     };
 }
 
-pub fn mixedSlashMenuColumnWidths(
-    registry: command_specs.SlashRegistry,
-    prefix: []const u8,
-    skills: []const skill_runtime.Skill,
-    window: PickerWindow,
+/// The slash menu's cells for the shared menu frame: the command or skill,
+/// its description, and, when categories are on, its category or source.
+pub const SlashMenuFrame = struct {
+    prepared: ?*const PreparedSlashMenu = null,
+    registry: command_specs.SlashRegistry = .{},
+    prefix: []const u8 = "",
+    skills: []const skill_runtime.Skill = &.{},
     include_metadata: bool,
-) SlashMenuColumnWidths {
-    var widths: SlashMenuColumnWidths = .{ .label = 0, .metadata = 0 };
-    var match_idx = window.start;
-    while (match_idx < window.end) : (match_idx += 1) {
-        const content = slashMenuRowContent(registry, prefix, skills, match_idx, include_metadata) orelse continue;
-        widths.label = @max(widths.label, display_width.visibleWidth(content.label));
-        widths.metadata = @max(widths.metadata, display_width.visibleWidth(content.metadata));
+
+    fn content(self: *const SlashMenuFrame, index: usize) ?SlashMenuRowContent {
+        if (self.prepared) |prepared| return preparedSlashMenuRowContent(prepared, index, self.include_metadata);
+        return slashMenuRowContent(self.registry, self.prefix, self.skills, index, self.include_metadata);
     }
-    return widths;
-}
 
-pub fn preparedSlashMenuColumnWidths(
-    prepared: *const PreparedSlashMenu,
-    window: PickerWindow,
-    include_metadata: bool,
-) SlashMenuColumnWidths {
-    var widths: SlashMenuColumnWidths = .{ .label = 0, .metadata = 0 };
-    var match_idx = window.start;
-    while (match_idx < window.end) : (match_idx += 1) {
-        const content = preparedSlashMenuRowContent(prepared, match_idx, include_metadata) orelse continue;
-        widths.label = @max(widths.label, display_width.visibleWidth(content.label));
-        widths.metadata = @max(widths.metadata, display_width.visibleWidth(content.metadata));
+    fn cell(ctx: *const anyopaque, item: usize, column: usize, _: []u8) []const u8 {
+        const self: *const SlashMenuFrame = @ptrCast(@alignCast(ctx));
+        const row = self.content(item) orelse return "";
+        return switch (column) {
+            0 => row.label,
+            1 => row.description,
+            else => row.metadata,
+        };
     }
-    return widths;
-}
 
-pub noinline fn composeSlashMenuOptionRow(
-    alloc: Allocator,
-    registry: command_specs.SlashRegistry,
-    prefix: []const u8,
-    skills: []const skill_runtime.Skill,
-    match_idx: usize,
-    selected: bool,
-    column_widths: SlashMenuColumnWidths,
-    width: u16,
-    include_metadata: bool,
-) !std.ArrayList(u8) {
-    const content = slashMenuRowContent(registry, prefix, skills, match_idx, include_metadata) orelse return .empty;
-    return composeSlashMenuRow(alloc, content, selected, column_widths, width);
-}
-
-pub noinline fn composePreparedSlashMenuOptionRow(
-    alloc: Allocator,
-    prepared: *const PreparedSlashMenu,
-    match_idx: usize,
-    selected: bool,
-    column_widths: SlashMenuColumnWidths,
-    width: u16,
-    include_metadata: bool,
-) !std.ArrayList(u8) {
-    const content = preparedSlashMenuRowContent(prepared, match_idx, include_metadata) orelse return .empty;
-    return composeSlashMenuRow(alloc, content, selected, column_widths, width);
-}
-
-fn composeSlashMenuRow(
-    alloc: Allocator,
-    content: SlashMenuRowContent,
-    selected: bool,
-    column_widths: SlashMenuColumnWidths,
-    width: u16,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    if (width == 0) return row;
-
-    // Selection is signaled by brightness alone (like the model picker); no
-    // caret marker. The two-column indent stays fixed so rows stay aligned.
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row.appendSlice(alloc, "  ");
-
-    const content_width: usize = @as(usize, width) -| 1;
-    const marker_width: usize = 2;
-    if (content_width <= marker_width) {
-        try row.appendSlice(alloc, ui_render.reset_style);
-        return row;
+    pub fn spec(self: *const SlashMenuFrame, layout: SlashMenuLayout) menu_frame.Spec {
+        return .{
+            .title = if (layout.command_count == layout.result_count) "commands" else "results",
+            .ctx = self,
+            .item_count = layout.result_count,
+            .column_count = if (self.include_metadata) 3 else 2,
+            .cell = cell,
+            .flex_column = 1,
+            .selected = layout.selected,
+            .window_start = layout.window.start,
+            .list_cap = layout.list_rows,
+        };
     }
-    try row_text.appendSingleLineEllipsized(alloc, &row, content.label, content_width - marker_width);
-
-    const label_width = display_width.visibleWidth(content.label);
-    const column_gap: usize = 3;
-    const description_start = @min(content_width, marker_width + @max(column_widths.label, label_width) + column_gap);
-    try appendSpacesToVisibleWidth(alloc, &row, description_start);
-
-    const metadata_width = display_width.visibleWidth(content.metadata);
-    const min_description_width: usize = 24;
-    const metadata_start = content_width -| column_widths.metadata;
-    const metadata_fits = metadata_width > 0 and column_widths.metadata > 0 and column_widths.metadata <= content_width;
-    const show_metadata = if (content.description.len > 0)
-        metadata_fits and metadata_start >= description_start + min_description_width + column_gap
-    else
-        metadata_fits and metadata_start >= description_start + column_gap;
-    const description_width = if (show_metadata)
-        metadata_start - description_start - column_gap
-    else
-        content_width - description_start;
-
-    if (content.description.len > 0 and description_width > 0) {
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row_text.appendSingleLineEllipsized(alloc, &row, content.description, description_width);
-    }
-    if (show_metadata) {
-        try appendSpacesToVisibleWidth(alloc, &row, metadata_start);
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row.appendSlice(alloc, content.metadata);
-    }
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
-fn appendSpacesToVisibleWidth(alloc: Allocator, row: *std.ArrayList(u8), target_width: usize) !void {
-    var visible = display_width.visibleWidthIgnoringAnsi(row.items);
-    while (visible < target_width) : (visible += 1) try row.append(alloc, ' ');
-}
+};
 
 pub fn composeSlashCompletionOptionRow(
     alloc: Allocator,
@@ -1579,16 +1455,17 @@ test "footer composes slash completions as vertical described rows" {
     try std.testing.expect(saw_model_row);
 }
 
-test "slash menu layout keeps six selectable rows below its header" {
+test "slash menu layout reserves a more row under its header" {
     const first = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 0, 0, 24, 0, 0).?;
     try std.testing.expect(first.show_header);
     try std.testing.expectEqual(@as(u16, 8), first.row_count);
-    try std.testing.expectEqual(@as(u16, 6), first.selectable_rows);
+    try std.testing.expectEqual(@as(u16, 6), first.list_rows);
+    try std.testing.expectEqual(@as(u16, 5), first.selectable_rows);
     try std.testing.expectEqual(@as(usize, 0), first.window.start);
-    try std.testing.expectEqual(@as(usize, 6), first.window.end);
+    try std.testing.expectEqual(@as(usize, 5), first.window.end);
 
     const scrolled = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 6, 0, 24, 0, 0).?;
-    try std.testing.expectEqual(@as(usize, 1), scrolled.window.start);
+    try std.testing.expectEqual(@as(usize, 2), scrolled.window.start);
     try std.testing.expectEqual(@as(usize, 7), scrolled.window.end);
 }
 
@@ -1614,8 +1491,8 @@ test "slash menu layout prioritizes selection at short heights and excludes argu
     const compact = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 5, 0, 16, 0, 0).?;
     try std.testing.expect(compact.show_header);
     try std.testing.expectEqual(@as(u16, 6), compact.row_count);
-    try std.testing.expectEqual(@as(u16, 4), compact.selectable_rows);
-    try std.testing.expectEqual(@as(usize, 2), compact.window.start);
+    try std.testing.expectEqual(@as(u16, 3), compact.selectable_rows);
+    try std.testing.expectEqual(@as(usize, 3), compact.window.start);
     try std.testing.expectEqual(@as(usize, 6), compact.window.end);
 
     const short = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 4, 0, 6, 0, 0).?;
@@ -1627,43 +1504,51 @@ test "slash menu layout prioritizes selection at short heights and excludes argu
     try std.testing.expect(slashMenuLayout(picker_test_slash_registry, "/permissions ", &.{}, 0, 0, 24, 0, 0) == null);
 }
 
-test "slash menu header reports command totals and visible range" {
-    const layout = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 0, 0, 24, 0, 0).?;
-    var row = try composeSlashMenuHeaderRow(std.testing.allocator, "/", layout, 80);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "Commands 7 · type to filter") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "1–6") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 80);
+fn testSlashMenuRow(source: *const SlashMenuFrame, layout: SlashMenuLayout, index: u16, width: u16) !std.ArrayList(u8) {
+    return menu_frame.composeRow(std.testing.allocator, source.spec(layout), index, width, layout.row_count);
 }
 
-test "slash menu rows prioritize marker label description and category by width" {
-    const wide_layout = slashMenuLayout(picker_test_slash_registry, "/m", &.{}, 0, 0, 24, 0, 0).?;
-    const column_widths = mixedSlashMenuColumnWidths(picker_test_slash_registry, "/m", &.{}, wide_layout.window, true);
+test "slash menu shows a plain title and counts hidden commands below" {
+    const layout = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 0, 0, 24, 0, 0).?;
+    const source: SlashMenuFrame = .{ .registry = picker_test_slash_registry, .prefix = "/", .include_metadata = true };
 
-    var wide = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 0, true, column_widths, 100, true);
+    var title = try testSlashMenuRow(&source, layout, 0, 80);
+    defer title.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, title.items, "commands") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "7") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "type to filter") == null);
+
+    var more = try testSlashMenuRow(&source, layout, layout.row_count - 1, 80);
+    defer more.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, more.items, "↓ 2 more") != null);
+}
+
+test "slash menu rows align label, description, and category columns" {
+    const layout = slashMenuLayout(picker_test_slash_registry, "/m", &.{}, 0, 0, 24, 0, 0).?;
+    const source: SlashMenuFrame = .{ .registry = picker_test_slash_registry, .prefix = "/m", .include_metadata = true };
+
+    var wide = try testSlashMenuRow(&source, layout, 2, 100);
     defer wide.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.startsWith(u8, wide.items, ui_render.selected_completion_style));
-    try std.testing.expect(std.mem.find(u8, wide.items, ui_render.system_notice_label_style) == null);
+    try std.testing.expect(std.mem.find(u8, wide.items, ui_render.dim_style) == null);
     try std.testing.expect(std.mem.find(u8, wide.items, "❯") == null);
     try std.testing.expect(std.mem.find(u8, wide.items, "/model") != null);
     try std.testing.expect(std.mem.find(u8, wide.items, "Model") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide.items) < 100);
 
-    const description_offset = std.mem.find(u8, wide.items, "choose what model") orelse return error.TestExpectedDescription;
-    try std.testing.expectEqual(column_widths.label + 5, display_width.visibleWidthIgnoringAnsi(wide.items[0..description_offset]));
-    const model_offset = std.mem.find(u8, wide.items, "Model") orelse return error.TestExpectedMetadata;
-    const model_column = display_width.visibleWidthIgnoringAnsi(wide.items[0..model_offset]);
-
-    var extensions = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 1, false, column_widths, 100, true);
+    var extensions = try testSlashMenuRow(&source, layout, 3, 100);
     defer extensions.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, extensions.items, ui_render.dim_style));
+    const model_offset = std.mem.find(u8, wide.items, "Model") orelse return error.TestExpectedMetadata;
     const extensions_offset = std.mem.find(u8, extensions.items, "Extensions") orelse return error.TestExpectedMetadata;
-    try std.testing.expectEqual(model_column, display_width.visibleWidthIgnoringAnsi(extensions.items[0..extensions_offset]));
-    try std.testing.expectEqual(@as(usize, 99), display_width.visibleWidthIgnoringAnsi(extensions.items));
+    try std.testing.expectEqual(
+        display_width.visibleWidthIgnoringAnsi(wide.items[0..model_offset]),
+        display_width.visibleWidthIgnoringAnsi(extensions.items[0..extensions_offset]),
+    );
 
-    var narrow = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 0, true, column_widths, 42, true);
+    // Narrow: the category drops so the description stays readable.
+    var narrow = try testSlashMenuRow(&source, layout, 2, 42);
     defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "❯") == null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "/model") != null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "Model") == null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "…") != null);
@@ -1673,9 +1558,8 @@ test "slash menu rows prioritize marker label description and category by width"
 
 test "slash menu hides metadata for commands and skills" {
     const command_layout = slashMenuLayout(picker_test_slash_registry, "/m", &.{}, 0, 0, 24, 0, 0).?;
-    const command_widths = mixedSlashMenuColumnWidths(picker_test_slash_registry, "/m", &.{}, command_layout.window, false);
-
-    var command = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 0, true, command_widths, 60, false);
+    const commands: SlashMenuFrame = .{ .registry = picker_test_slash_registry, .prefix = "/m", .include_metadata = false };
+    var command = try testSlashMenuRow(&commands, command_layout, 2, 60);
     defer command.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, command.items, "/model") != null);
     try std.testing.expect(std.mem.find(u8, command.items, "choose what model") != null);
@@ -1688,8 +1572,8 @@ test "slash menu hides metadata for commands and skills" {
         .source = .global_codex,
     }};
     const skill_layout = slashMenuLayout(picker_test_slash_registry, "/fx-test", &skills, 0, 0, 24, 0, 0).?;
-    const skill_widths = mixedSlashMenuColumnWidths(picker_test_slash_registry, "/fx-test", &skills, skill_layout.window, false);
-    var skill = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/fx-test", &skills, 0, true, skill_widths, 64, false);
+    const skill_source: SlashMenuFrame = .{ .registry = picker_test_slash_registry, .prefix = "/fx-test", .skills = &skills, .include_metadata = false };
+    var skill = try testSlashMenuRow(&skill_source, skill_layout, 2, 64);
     defer skill.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, skill.items, "choose focused regression coverage") != null);
     try std.testing.expect(std.mem.find(u8, skill.items, "codex") == null);
@@ -1706,18 +1590,18 @@ test "slash menu keeps matching skill source labels" {
     try std.testing.expectEqual(@as(usize, 0), layout.command_count);
     try std.testing.expectEqual(@as(usize, 1), layout.result_count);
 
-    var header = try composeSlashMenuHeaderRow(std.testing.allocator, "/fx-test", layout, 80);
-    defer header.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, header.items, "Results 1") != null);
+    const source: SlashMenuFrame = .{ .registry = picker_test_slash_registry, .prefix = "/fx-test", .skills = &skills, .include_metadata = true };
+    var title = try testSlashMenuRow(&source, layout, 0, 80);
+    defer title.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, title.items, "results") != null);
 
-    const column_widths = mixedSlashMenuColumnWidths(picker_test_slash_registry, "/fx-test", &skills, layout.window, true);
-    var row = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/fx-test", &skills, 0, true, column_widths, 64, true);
+    var row = try testSlashMenuRow(&source, layout, 2, 64);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "fx-test-strategy") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "choose focused") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "…") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "codex") != null);
-    try std.testing.expectEqual(@as(usize, 63), display_width.visibleWidthIgnoringAnsi(row.items));
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 63);
     try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
 }
 
@@ -1828,11 +1712,11 @@ test "prepared slash menu preserves command-first relevance order" {
 
     try std.testing.expectEqual(@as(usize, 1), prepared.commandCount());
     try std.testing.expectEqual(@as(usize, 2), prepared.resultCount());
-    const window = edgeScrollPickerWindow(prepared.resultCount(), 0, 6);
-    const column_widths = preparedSlashMenuColumnWidths(&prepared, window, true);
-    var command_row = try composePreparedSlashMenuOptionRow(std.testing.allocator, &prepared, 0, true, column_widths, 80, true);
+    const layout = preparedSlashMenuLayout(&prepared, 0, 0, 24, 0, 0).?;
+    const source: SlashMenuFrame = .{ .prepared = &prepared, .include_metadata = true };
+    var command_row = try testSlashMenuRow(&source, layout, 2, 80);
     defer command_row.deinit(std.testing.allocator);
-    var skill_row = try composePreparedSlashMenuOptionRow(std.testing.allocator, &prepared, 1, false, column_widths, 80, true);
+    var skill_row = try testSlashMenuRow(&source, layout, 3, 80);
     defer skill_row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, command_row.items, "/rename") != null);
     try std.testing.expect(std.mem.find(u8, skill_row.items, "workflow-helper") != null);
