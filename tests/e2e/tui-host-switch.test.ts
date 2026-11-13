@@ -1723,7 +1723,11 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(oldest).not.toContain("Subagent first needs permission");
         await session.sendKeys("1");
         await session.waitForText("Subagent first needs permission", 15_000);
-        expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("second\n");
+        // The approval lets the second subagent write on its own thread, while
+        // main's screen already shows the next prompt: wait for the file.
+        const secondFile = join(workspace, "second.txt");
+        await until("the second subagent's file", () => existsSync(secondFile) && readFileSync(secondFile, "utf8") === "second\n");
+        expect(readFileSync(secondFile, "utf8")).toBe("second\n");
         expect(existsSync(join(workspace, "first.txt"))).toBe(false);
         await session.sendKeys("1");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
