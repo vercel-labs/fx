@@ -183,6 +183,9 @@ function askEnv(
 }
 
 function processAlive(pid: number): boolean {
+  // Signal 0 to pid 0 or below reaches a whole process group, which is
+  // always alive, so only a real pid can be checked.
+  if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
   try {
     process.kill(pid, 0);
     return true;
@@ -1342,7 +1345,9 @@ test("the full terminal budget starts, refuses one more, and ends together at ex
 
   const records = terminalRecords(fixture.home);
   expect(records).toHaveLength(budget);
-  const shellPids = records.map((record) => Number(record.pid));
+  // A terminal still starting when fx exits has no shell pid yet; its
+  // command is still found by name below.
+  const shellPids = records.map((record) => Number(record.pid)).filter((pid) => Number.isInteger(pid) && pid > 0);
   await waitUntilGone(
     [...shellPids, ...processesMatching("sleep 45.75")],
     Math.max(0, 1_500 - (Date.now() - exitedAt)),

@@ -5096,8 +5096,8 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     // The run returned at once, so the record may not hold the shell's pid
     // until the shell has started.
     let shellPid = 0;
-    const started = Date.now() + TIMEOUT;
-    while (Date.now() < started) {
+    const pidDeadline = Date.now() + TIMEOUT;
+    while (Date.now() < pidDeadline) {
       shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid ?? 0);
       if (shellPid > 0) break;
       await Bun.sleep(10);
