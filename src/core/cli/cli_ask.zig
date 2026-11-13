@@ -2176,7 +2176,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
 
 /// What each subagent that did work in this run has used so far, a copy for
 /// the result. On a run that ends early a subagent may still be at work; it
-/// shows the replies it has finished.
+/// shows the replies it has finished. The caller owns the copy and frees it
+/// with `subagent_usage.freeEntries`, as `PromptRunResult.deinit` does.
 fn takeSubagentUsage(ctx: *AskContext, alloc: Allocator) ![]subagent_usage.Entry {
     const tree = ctx.subagent_host orelse return &.{};
     return tree.usageSnapshot(alloc);

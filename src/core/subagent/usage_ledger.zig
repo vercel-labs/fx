@@ -27,6 +27,7 @@ pub const Entry = struct {
     /// A count no reply reported stays null, as in a result's own `usage`.
     usage: types.Usage = .{},
 
+    /// A copy whose strings the caller owns and frees with `deinit`.
     fn clone(self: Entry, alloc: Allocator) Allocator.Error!Entry {
         const id = try alloc.dupe(u8, self.id);
         errdefer alloc.free(id);
