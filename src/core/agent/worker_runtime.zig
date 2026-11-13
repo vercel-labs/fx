@@ -856,14 +856,24 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
-        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        self.markExplicitCancellation();
+        // The worker sets `worker_processing` under this lock as it takes and
+        // ends turns, so the trace reads it under the lock too.
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const processing = if (self.worker_processing) "true" else "false";
+        const queued = self.queuedWorkCountLocked();
+        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ processing, queued });
+        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ processing, queued });
+        self.markExplicitCancellationLocked();
     }
 
     fn markExplicitCancellation(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        self.markExplicitCancellationLocked();
+    }
+
+    fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
@@ -5392,6 +5402,39 @@ test "steering behind a running tool asks the tool to yield instead of cancellin
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+}
+
+test "a parent's steering into a subagent asks its running tool to yield and a child's report does not" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_shell" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } } });
+
+    var report = try makePrompt(alloc, "child report", "model");
+    report.author = .child;
+    if (!try runtime.admitActiveSteering(alloc, report)) {
+        freeQueuedPrompt(alloc, report);
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    var from_parent = try makePrompt(alloc, "stop and check the logs", "model");
+    from_parent.author = .parent;
+    if (!try runtime.admitActiveSteering(alloc, from_parent)) {
+        freeQueuedPrompt(alloc, from_parent);
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
 }
 
 test "steering during a tool-producing step asks the coming tool to yield" {
