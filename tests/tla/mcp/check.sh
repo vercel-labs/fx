@@ -18,3 +18,13 @@ set -eu
 cd "$(dirname "$0")"
 python3 run.py check "$@"
 python3 run.py mutate "$@"
+
+# A property the model of today's code is known to break must stay broken until the code is
+# repaired: WireDepth.findings.cfg states that every writer can write whatever an entry
+# point accepts, which fails while there is no limit but the engine's. Each verdict is
+# required (../lib/tlc.sh). #1914 and #1953 add findings blocks to this file too: when two
+# land, merge them into one tlc_verdicts block.
+. ../lib/tlc.sh
+tlc_verdicts <<'EOF_FINDINGS'
+WireDepth WireDepth.findings NoWriterOverflow
+EOF_FINDINGS

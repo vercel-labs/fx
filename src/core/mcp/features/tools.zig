@@ -3,6 +3,7 @@ const testing_allocator = @import("../../shared/testing_allocator.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
+const json_depth = @import("../json_depth.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -51,6 +52,7 @@ pub const Error = error{
     InvalidJson,
     InvalidInputRequired,
     MetadataLimitExceeded,
+    NestingTooDeep,
 } || mrtr.Error || Allocator.Error || std.Io.Writer.Error;
 
 pub const Tool = struct {
@@ -138,6 +140,7 @@ pub fn parseCallOutcome(
     }
     const result = parsed.value.object.get("result") orelse return error.InvalidCallResult;
     if (result != .object) return error.InvalidCallResult;
+    try json_depth.require(result, .result);
     const result_type = result.object.get("resultType");
     if (result_type) |value| {
         if (value != .string) return error.InvalidCallResult;
@@ -349,6 +352,7 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
     if (value.object.get("outputSchema")) |output_schema| {
         try prepareSchema(output_schema, false);
     }
+    try json_depth.require(value, .tool);
     if (value.object.get("icons")) |icons| try validateIcons(icons, limits);
     if (value.object.get("annotations")) |annotations| try validateToolAnnotations(annotations, limits);
     if (value.object.get("_meta")) |metadata| if (metadata != .object) return error.InvalidTool;
@@ -408,10 +412,11 @@ fn parseProtocolError(alloc: Allocator, value: std.json.Value, limits: Limits) E
     }
     const owned_message = try alloc.dupe(u8, message.string);
     errdefer mem_utils.free(alloc, owned_message);
-    const data_json = if (value.object.get("data")) |data|
-        try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes)
-    else
-        null;
+    const data_json = if (value.object.get("data")) |data| data_json: {
+        if (json_depth.within(data, json_depth.max_server_json_depth)) break :data_json try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes);
+        json_depth.traceRefused(.data);
+        break :data_json null;
+    } else null;
     return .{ .code = parsed_code, .message = owned_message, .data_json = data_json };
 }
 
@@ -1019,4 +1024,323 @@ test "MCP argument repair keeps its laws on fuzzed schemas and arguments" {
             "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
         }) ++ @import("fuzz_corpus").mcp_argument_repair.*),
     });
+}
+
+// A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so a
+// result or a listed tool nested past 128 levels is refused (`src/core/mcp/json_depth.zig`).
+
+const depth_testing = @import("../json_depth_testing.zig");
+
+fn expectResultRefused(response: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var outcome = parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{}) catch |err| {
+        try std.testing.expectEqualStrings("NestingTooDeep", @errorName(err));
+        return;
+    };
+    outcome.deinit(alloc);
+    return error.TestUnexpectedResult;
+}
+
+fn expectResultAccepted(response: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .complete);
+    try std.testing.expect(std.mem.find(u8, outcome.complete.result_json, "\"text\":\"ok") != null);
+}
+
+fn expectToolRefused(json: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var tool = parseToolJson(alloc, json, .{}) catch |err| {
+        try std.testing.expectEqualStrings("NestingTooDeep", @errorName(err));
+        return;
+    };
+    tool.deinit(alloc);
+    return error.TestUnexpectedResult;
+}
+
+const depth_shapes = [_]depth_testing.Shape{ .objects, .arrays, .mixed };
+const result_sites = [_]depth_testing.Site{ .structured, .content_meta, .content_annotations };
+const tool_sites = [_]depth_testing.Site{ .tool_meta, .tool_annotations, .tool_icons };
+
+test "a result nested one level past the limit is refused whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (result_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const response = try depth_testing.response(alloc, site, depth, shape);
+        defer alloc.free(response);
+        try expectResultRefused(response);
+    };
+}
+
+test "a result nested 300 levels deep is refused and does not abort" {
+    const alloc = std.testing.allocator;
+    // 257 levels or more abort `std.json.Stringify` in a safe build: this test dies there today.
+    for (result_sites) |site| for ([_]usize{ 257, 300, 2000 }) |depth| {
+        const response = try depth_testing.response(alloc, site, depth, .objects);
+        defer alloc.free(response);
+        try expectResultRefused(response);
+    };
+}
+
+test "a result nested 127 and 128 levels deep is accepted whole whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (result_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 4, 64, 127, 128 }) |depth| {
+        const response = try depth_testing.response(alloc, site, depth, shape);
+        defer alloc.free(response);
+        try expectResultAccepted(response);
+    };
+}
+
+test "a listed tool nested one level past the limit is refused whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (tool_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const json = try depth_testing.tool(alloc, site, depth, shape);
+        defer alloc.free(json);
+        try expectToolRefused(json);
+    };
+}
+
+test "a listed tool nested 300 levels deep is refused and does not abort" {
+    const alloc = std.testing.allocator;
+    // 257 levels or more abort `std.json.Stringify` in a safe build: this test dies there today.
+    for (tool_sites) |site| for ([_]usize{ 258, 300, 2000 }) |depth| {
+        const json = try depth_testing.tool(alloc, site, depth, .objects);
+        defer alloc.free(json);
+        try expectToolRefused(json);
+    };
+}
+
+test "a listed tool nested 127 and 128 levels deep is kept whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (tool_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 4, 64, 127, 128 }) |depth| {
+        const json = try depth_testing.tool(alloc, site, depth, shape);
+        defer alloc.free(json);
+        var tool = try parseToolJson(alloc, json, .{});
+        defer tool.deinit(alloc);
+        try std.testing.expectEqualStrings("deep", tool.name);
+    };
+}
+
+test "an input schema nested past 64 levels is still refused as a schema, ahead of the depth limit" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 65, 129, 300 }) |depth| {
+        const schema = try depth_testing.text(alloc, depth, .objects, true);
+        defer alloc.free(schema);
+        const json = try std.fmt.allocPrint(alloc, "{{\"name\":\"deep\",\"inputSchema\":{{\"type\":\"object\",\"x\":{s}}}}}", .{schema});
+        defer alloc.free(json);
+        try std.testing.expectError(error.SchemaLimitExceeded, parseToolJson(alloc, json, .{}));
+    }
+}
+
+test "nesting inside a string is not nesting, and a wide shallow result is unchanged" {
+    const alloc = std.testing.allocator;
+    const brackets = try alloc.alloc(u8, 5000);
+    defer alloc.free(brackets);
+    @memset(brackets, '[');
+    const in_string = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}]}}}}",
+        .{brackets},
+    );
+    defer alloc.free(in_string);
+    try expectResultAccepted(in_string);
+
+    const filler = try alloc.alloc(u8, 1024 * 1024 - 4096);
+    defer alloc.free(filler);
+    @memset(filler, 'w');
+    const wide = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}]}}}}",
+        .{filler},
+    );
+    defer alloc.free(wide);
+    var outcome = try parseCallOutcome(alloc, wide, .legacy, null, 4 * 1024 * 1024, .{});
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome.complete.result_json.len > filler.len);
+    try std.testing.expect(std.mem.endsWith(u8, outcome.complete.result_json, "\"}]}"));
+}
+
+test "a successful result at depth 3 gives the same bytes as before the limit" {
+    const alloc = std.testing.allocator;
+    var outcome = try parseCallOutcome(
+        alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok","annotations":{"audience":["user"]}}],"structuredContent":{"a":[1,2]}}}
+    ,
+        .legacy,
+        null,
+        64 * 1024,
+        .{},
+    );
+    defer outcome.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        \\{"content":[{"type":"text","text":"ok","annotations":{"audience":["user"]}}],"structuredContent":{"a":[1,2]}}
+    , outcome.complete.result_json);
+}
+
+test "many results at the limit and 1 MiB wide, and many refused ones, in a row keep memory bounded" {
+    const alloc = std.testing.allocator;
+    const filler = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(filler);
+    @memset(filler, 'w');
+    // The wide part sits in the text, and the nesting is the structured content: the result is at the limit.
+    const nested = try depth_testing.text(alloc, 127, .objects, true);
+    defer alloc.free(nested);
+    const wide = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}],\"structuredContent\":{s}}}}}",
+        .{ filler, nested },
+    );
+    defer alloc.free(wide);
+    const refused = try depth_testing.response(alloc, .structured, 2000, .objects);
+    defer alloc.free(refused);
+    for (0..60) |round| {
+        // Each call frees what it holds when it ends, accepted or refused (the testing allocator checks).
+        var outcome = try parseCallOutcome(alloc, wide, .legacy, null, 4 * 1024 * 1024, .{});
+        outcome.deinit(alloc);
+        if (round % 2 == 0) try expectResultRefused(refused);
+    }
+}
+
+const DepthScript = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn next(s: *DepthScript) u8 {
+        if (s.at >= s.bytes.len) return 0;
+        defer s.at += 1;
+        return s.bytes[s.at];
+    }
+};
+
+/// A fuzzed server JSON of a chosen site, shape and depth reaches its entry point. Whatever depth it has, the
+/// entry returns, never aborts, refuses it past 128 levels as nested too deep, and keeps it up to 128.
+fn fuzzJsonDepth(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [8]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var script: DepthScript = .{ .bytes = buffer[0..len] };
+    const alloc = std.testing.allocator;
+    const site_number = script.next() % 7;
+    const shape: depth_testing.Shape = @fromBackingInt(@intCast(script.next() % 3));
+    const low: usize = script.next();
+    const high: usize = script.next();
+    const depth = 4 + (low | high << 8) % 3000;
+    const expected_refused = depth > 128;
+
+    switch (site_number) {
+        0...2 => {
+            const response = try depth_testing.response(alloc, @fromBackingInt(@intCast(site_number)), depth, shape);
+            defer alloc.free(response);
+            if (expected_refused) try expectResultRefused(response) else try expectResultAccepted(response);
+        },
+        3...5 => {
+            const json = try depth_testing.tool(alloc, @fromBackingInt(@intCast(site_number)), depth, shape);
+            defer alloc.free(json);
+            if (expected_refused) try expectToolRefused(json) else {
+                var tool = try parseToolJson(alloc, json, .{});
+                tool.deinit(alloc);
+            }
+        },
+        else => {
+            const elicitation = @import("../elicitation.zig");
+            const params = try depth_testing.elicitationMeta(alloc, depth, shape);
+            defer alloc.free(params);
+            var request = elicitation.parseRequest(alloc, .modern_mcp, params, .{}) catch |err| {
+                try std.testing.expect(expected_refused);
+                try std.testing.expectEqualStrings("LimitExceeded", @errorName(err));
+                return;
+            };
+            defer request.deinit(alloc);
+            try std.testing.expect(!expected_refused);
+        },
+    }
+}
+
+test "a server's JSON is refused past 128 levels and kept up to it, whatever its site, shape and depth, on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzJsonDepth, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_json_depth.*),
+    });
+}
+
+test "an error's data nested past the limit is left out and the error is kept, whatever its shape" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const response = try depth_testing.errorResponse(alloc, depth, shape);
+        defer alloc.free(response);
+        var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+        defer outcome.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, -32602), outcome.protocol_failure.code);
+        try std.testing.expectEqualStrings("bad", outcome.protocol_failure.message);
+        try std.testing.expect(outcome.protocol_failure.data_json == null);
+    };
+}
+
+test "an error's data nested 300 levels deep is left out and does not abort" {
+    const alloc = std.testing.allocator;
+    // 257 levels or more abort `std.json.Stringify` in a safe build: this test dies there today.
+    for ([_]usize{ 2000, 300, 257 }) |depth| {
+        const response = try depth_testing.errorResponse(alloc, depth, .objects);
+        defer alloc.free(response);
+        var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+        defer outcome.deinit(alloc);
+        try std.testing.expect(outcome.protocol_failure.data_json == null);
+    }
+}
+
+test "an error's data nested 127 and 128 levels deep is kept whole whatever its shape" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 1, 64, 127, 128 }) |depth| {
+        const response = try depth_testing.errorResponse(alloc, depth, shape);
+        defer alloc.free(response);
+        var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+        defer outcome.deinit(alloc);
+        const data = outcome.protocol_failure.data_json orelse return error.TestUnexpectedResult;
+        const nested = try depth_testing.text(alloc, depth, shape, false);
+        defer alloc.free(nested);
+        try std.testing.expectEqualStrings(nested, data);
+    };
+}
+
+test "a refused result, tool and error data each leave one trace line with the code, the limit and the place, and no server text" {
+    const alloc = std.testing.allocator;
+    var capture = try depth_testing.TraceCapture.start(alloc);
+    defer capture.stop();
+    // Server text in the places a careless line could copy it from.
+    const marker = "SERVER_TEXT_MARKER";
+    const nested = try depth_testing.text(alloc, 200, .objects, true);
+    defer alloc.free(nested);
+    const result = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"structuredContent\":{s}}}}}",
+        .{ marker, nested },
+    );
+    defer alloc.free(result);
+    try expectResultRefused(result);
+    const tool = try std.fmt.allocPrint(
+        alloc,
+        "{{\"name\":\"{s}\",\"description\":\"{s}\",\"inputSchema\":{{\"type\":\"object\"}},\"_meta\":{s}}}",
+        .{ marker, marker, nested },
+    );
+    defer alloc.free(tool);
+    try expectToolRefused(tool);
+    const failure = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32602,\"message\":\"{s}\",\"data\":{s}}}}}",
+        .{ marker, nested },
+    );
+    defer alloc.free(failure);
+    var outcome = try parseCallOutcome(alloc, failure, .legacy, null, 4 * 1024 * 1024, .{});
+    outcome.deinit(alloc);
+
+    var lines = try capture.lines("JSON refused");
+    defer {
+        for (lines.items) |line| alloc.free(line);
+        lines.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=result", lines.items[0]);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=tool", lines.items[1]);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=data", lines.items[2]);
+    const trace = try capture.read();
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, marker) == null);
 }

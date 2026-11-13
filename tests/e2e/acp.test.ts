@@ -71,6 +71,11 @@ const MCP_STDIO_FIXTURE = join(
   "mcp-modern-stdio.mjs",
 );
 const MCP_TOOL_NAME = "mcp_fixture_echo";
+const MCP_LEGACY_FIXTURE = join(
+  import.meta.dirname,
+  "fixtures",
+  "mcp-legacy-stdio.mjs",
+);
 
 function acpStdioServer(
   resultText: string,
@@ -5343,6 +5348,108 @@ describe("acp: model-independent", () => {
             ? { methods: ["server/discover", "initialize"] }
             : {}),
         })));
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so fx
+  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/json_depth.zig`). The same
+  // cases through `fx mcp` are in mcp-stdio.test.ts.
+  for (const [site, depth, listsDeepTool] of [
+    ["structured", 258, false],
+    ["content_meta", 258, false],
+    ["tool_meta", 258, true],
+    ["tool_icons", 129, true],
+  ] as const) {
+    test(
+      `a server's ${site} nested ${depth} levels deep is refused and the ACP session goes on`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-deep-");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("select", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hi" } }),
+          ...(listsDeepTool ? [fakeGatewayToolCall("select_deep", "toolbox", { open: "mcp_fixture_deep" })] : []),
+          finalText("deep done"),
+        ]);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await client.request("session/new", {
+            cwd: root.workspace,
+            mcpServers: [{
+              name: "fixture",
+              command: process.execPath,
+              args: [MCP_LEGACY_FIXTURE],
+              env: [
+                { name: "FX_MCP_LEGACY_VERSION", value: "2025-11-25" },
+                { name: "FX_MCP_DEEP_SITE", value: site },
+                { name: "FX_MCP_DEEP_DEPTH", value: String(depth) },
+              ],
+            }],
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          const prompt = await runPrompt(client, "Call the supplied MCP echo tool.", TIMEOUT);
+          // Not a panic: fx aborts on these today and the prompt never ends.
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(client.stderr).toBe("");
+          expect(gateway.requests).toHaveLength(listsDeepTool ? 4 : 3);
+          if (listsDeepTool) {
+            expect(acpToolResultText(gateway.requests[3]!.body, "select_deep")).toContain("Nothing named mcp_fixture_deep is in the toolbox menu");
+            expect(acpToolResultText(gateway.requests[3]!.body, "call")).toContain("LEGACY_MCP_TOOL_RESULT");
+          } else {
+            expect(acpToolResultText(gateway.requests[2]!.body, "call")).toContain(
+              "MCP protocol failure: the server's reply is nested deeper than fx accepts (128 levels)",
+            );
+          }
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "a server's structured result nested 128 levels deep reaches the model through ACP as before",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-deep-ok-");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hi" } }),
+        finalText("deep ok done"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", {
+          cwd: root.workspace,
+          mcpServers: [{
+            name: "fixture",
+            command: process.execPath,
+            args: [MCP_LEGACY_FIXTURE],
+            env: [
+              { name: "FX_MCP_LEGACY_VERSION", value: "2025-11-25" },
+              { name: "FX_MCP_DEEP_SITE", value: "structured" },
+              { name: "FX_MCP_DEEP_DEPTH", value: "128" },
+            ],
+          }],
+        }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const prompt = await runPrompt(client, "Call the supplied MCP echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(acpToolResultText(gateway.requests[2]!.body, "call")).toContain("LEGACY_MCP_TOOL_RESULT");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

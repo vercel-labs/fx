@@ -102,6 +102,16 @@ const malformedCases: Case[] = [
   raw("unknown fields are ignored", '{"jsonrpc":"2.0","id":3,"extra":{"id":9},"result":{"resultType":"input_required"}}', response("3", "input_required")),
 ];
 
+// The host refuses a result, a tool or a form nested past 128 levels (src/core/mcp/json_depth.zig), because
+// std.json.Stringify aborts past 256. The engine hands the host any message up to 2,584 levels deep
+// (scan_stack_bytes), which is why the host's limit is the one that counts (tests/tla/mcp/WireDepth.tla).
+// `deep(levels)` is a message `levels + 2` deep.
+const depthCases: Case[] = [
+  ...[127, 128, 129, 255, 256, 257, 2000].map((depth) => raw(`a message ${depth} levels deep`, deep(depth - 2), response("1"))),
+  raw("a message 2,584 levels deep, the deepest the engine decodes", deep(2582), response("1")),
+  raw("a message 2,585 levels deep", deep(2583), failure("TooDeep")),
+];
+
 const bigString = "x".repeat(8 * 1024 * 1024);
 const manyFields = Array.from({ length: 100_000 }, (_, i) => `"f${i}":${i}`).join(",");
 const oversizedCases: Case[] = [
@@ -143,6 +153,7 @@ function wireScenario(name: string, description: string, cases: () => Case[], mi
 export const scenarios: Scenario[] = [
   // The frozen snapshot holds 36 such examples (four more use "..." and aren't JSON).
   wireScenario("u01-spec-examples", "Every JSON-RPC example in the spec snapshot decodes as JSON.parse reads it", specExamples, 36),
+  wireScenario("u01-depth", "The engine decodes a message up to 2,584 levels deep and refuses a deeper one as TooDeep, so the host's limit of 128 is the one that counts", () => depthCases, depthCases.length),
   wireScenario("u01-ids", "String and number ids: which ones match the client's, and which are rejected", () => idCases, idCases.length),
   wireScenario("u01-malformed", "Malformed, ambiguous, and too-deep messages fail with the exact error", () => malformedCases, malformedCases.length),
   wireScenario("u01-oversized", "Multi-megabyte messages and 100,000 fields decode without a hidden limit", () => oversizedCases, oversizedCases.length, 60_000),
