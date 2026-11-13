@@ -21,7 +21,6 @@ const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_host = @import("../mcp_host/host.zig");
-const mcp_health = @import("../mcp/health.zig");
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");

@@ -412,6 +412,87 @@ test "read returns a file's text, follows a symlink, and refuses a fifo without 
     try testing.expectError(error.DurablePathUnsafe, read(alloc, fifo));
 }
 
+test "the profile is replaced durably: a held descriptor keeps the old file, the new one is private, and nothing else is left" {
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original = "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}";
+    try tmp.dir.createDirPath(io, "home/.fx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.fx/mcp.json", .data = original });
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mcp.json");
+    defer alloc.free(path);
+
+    var fx_dir = try tmp.dir.openDir(io, "home/.fx", .{ .iterate = true });
+    defer fx_dir.close(io);
+
+    // Seed a group-readable mode so the 0600 assertion below cannot pass just
+    // because the developer's umask already produced it.
+    {
+        var seed = try fx_dir.openFile(io, "mcp.json", .{ .mode = .read_write });
+        defer seed.close(io);
+        try seed.setPermissions(io, std.Io.File.Permissions.fromMode(0o644));
+    }
+
+    // Hold the pre-save file open. A rename-over leaves this descriptor on the
+    // old, unlinked inode; an in-place truncate would empty it instead, which
+    // is the failure this save must not have.
+    var held = try fx_dir.openFile(io, "mcp.json", .{});
+    defer held.close(io);
+
+    const text = "{\"mcpServers\":{}}";
+    try write(alloc, .profile, path, text);
+
+    const held_stat = try held.stat(io);
+    try testing.expectEqual(@as(u64, 0), held_stat.nlink);
+    const held_bytes = try io_mod.readFileToEnd(alloc, &held, 4096);
+    defer alloc.free(held_bytes);
+    try testing.expectEqualStrings(original, held_bytes);
+
+    const written = try tmp.dir.readFileAlloc(io, "home/.fx/mcp.json", alloc, .limited(256));
+    defer alloc.free(written);
+    try testing.expectEqualStrings(text, written);
+
+    const stat = try fx_dir.statFile(io, "mcp.json", .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+
+    var it = fx_dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(io)) |entry| {
+        entries += 1;
+        try testing.expectEqualStrings("mcp.json", entry.name);
+    }
+    try testing.expectEqual(@as(usize, 1), entries);
+}
+
+test "a symlinked profile is refused, and the file it points to is left as it was" {
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const external = "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}";
+    try tmp.dir.createDirPath(io, "home/.fx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/external.json", .data = external });
+    const external_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/external.json");
+    defer alloc.free(external_path);
+    try tmp.dir.symLink(io, external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+
+    const path = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(external_path).?, ".fx", "mcp.json" });
+    defer alloc.free(path);
+
+    // The durable helper refuses a target that is not a plain private file, so
+    // a symlinked config fails the save rather than writing through the link.
+    try testing.expectError(error.DurablePathUnsafe, write(alloc, .profile, path, "{\"mcpServers\":{}}"));
+
+    const untouched = try tmp.dir.readFileAlloc(io, "home/external.json", alloc, .limited(256));
+    defer alloc.free(untouched);
+    try testing.expectEqualStrings(external, untouched);
+}
+
 test "the profile's first write creates ~/.fx readable only by its owner" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();

@@ -378,12 +378,6 @@ fn loadProfileDocumentFromPath(
     return project_config.parseProfileDocument(alloc, json_text);
 }
 
-fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpServerConfig) !void {
-    const json = try renderConfigJson(alloc, configs);
-    defer alloc.free(json);
-    try config_file.replaceProfile(alloc, path, json);
-}
-
 fn freeConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
     for (configs.items) |config| {
         var mutable = config;
@@ -405,128 +399,6 @@ noinline fn logConfigFailure(action: []const u8, path: []const u8, err: anyerror
         "failed to {s} config {s}: {s}",
         .{ action, path, @errorName(err) },
     );
-}
-
-fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{\"mcp\":{");
-    for (configs, 0..) |config, i| {
-        if (i > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(config.name, .{}, &out.writer);
-        try out.writer.writeAll(":{");
-
-        switch (config.transport) {
-            .stdio => {
-                try out.writer.writeAll("\"type\":\"local\",\"command\":[");
-                try std.json.Stringify.value(try config.stdioCommand(), .{}, &out.writer);
-                for (config.args) |arg| {
-                    try out.writer.writeByte(',');
-                    try std.json.Stringify.value(arg, .{}, &out.writer);
-                }
-                try out.writer.writeByte(']');
-            },
-            .sse => {
-                try out.writer.writeAll("\"type\":\"sse\",\"url\":");
-                try std.json.Stringify.value(try config.remoteUrl(), .{}, &out.writer);
-            },
-            .http => {
-                try out.writer.writeAll("\"type\":\"http\",\"url\":");
-                try std.json.Stringify.value(try config.remoteUrl(), .{}, &out.writer);
-            },
-        }
-
-        try out.writer.print(",\"enabled\":{s}", .{if (config.enabled) "true" else "false"});
-        if (config.required) try out.writer.writeAll(",\"required\":true");
-        if (config.transport == .stdio or
-            config.transport == .http or
-            config.transport == .sse)
-        {
-            try out.writer.print(
-                ",\"startup_timeout_ms\":{d},\"operation_timeout_ms\":{d}",
-                .{ config.startup_timeout_ms, config.operation_timeout_ms },
-            );
-        }
-        if (config.transport == .stdio) {
-            try out.writer.print(",\"restart_limit\":{d}", .{config.restart_limit});
-        }
-        if (config.headers.len > 0) {
-            try out.writer.writeAll(",\"headers\":{");
-            for (config.headers, 0..) |header, header_i| {
-                if (header_i > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(header.name, .{}, &out.writer);
-                try out.writer.writeByte(':');
-                try std.json.Stringify.value(header.value, .{}, &out.writer);
-            }
-            try out.writer.writeByte('}');
-        }
-        if (config.header_env.len > 0) {
-            try out.writer.writeAll(",\"header_env\":{");
-            for (config.header_env, 0..) |ref, ref_i| {
-                if (ref_i > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(ref.name, .{}, &out.writer);
-                try out.writer.writeByte(':');
-                try std.json.Stringify.value(ref.env, .{}, &out.writer);
-            }
-            try out.writer.writeByte('}');
-        }
-        if (config.bearer_token_env) |env_name| {
-            try out.writer.writeAll(",\"bearer_token_env\":");
-            try std.json.Stringify.value(env_name, .{}, &out.writer);
-        }
-        if (config.auth) |auth| {
-            try out.writer.writeAll(",\"oauth\":{");
-            var first_auth = true;
-            if (auth.resource) |field| try writeOptionalJsonField(&out.writer, &first_auth, "resource", field);
-            if (auth.issuer) |field| try writeOptionalJsonField(&out.writer, &first_auth, "issuer", field);
-            if (auth.client_id) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_id", field);
-            if (auth.client_secret_env) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_secret_env", field);
-            if (auth.client_metadata_url) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_metadata_url", field);
-            if (auth.scopes_configured or auth.scopes.len > 0) {
-                if (!first_auth) try out.writer.writeByte(',');
-                first_auth = false;
-                try out.writer.writeAll("\"scopes\":[");
-                for (auth.scopes, 0..) |scope, scope_i| {
-                    if (scope_i > 0) try out.writer.writeByte(',');
-                    try std.json.Stringify.value(scope, .{}, &out.writer);
-                }
-                try out.writer.writeByte(']');
-            }
-            if (auth.callback_port) |port| {
-                if (!first_auth) try out.writer.writeByte(',');
-                first_auth = false;
-                try out.writer.print("\"callback_port\":{d}", .{port});
-            }
-            try out.writer.writeByte('}');
-        }
-        if (config.env.len > 0) {
-            try out.writer.writeAll(",\"environment\":{");
-            for (config.env, 0..) |entry, env_i| {
-                if (env_i > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(entry.key, .{}, &out.writer);
-                try out.writer.writeByte(':');
-                try std.json.Stringify.value(entry.value, .{}, &out.writer);
-            }
-            try out.writer.writeByte('}');
-        }
-        try out.writer.writeByte('}');
-    }
-    try out.writer.writeAll("}}");
-    return try out.toOwnedSlice();
-}
-
-fn writeOptionalJsonField(
-    writer: *std.Io.Writer,
-    first: *bool,
-    key: []const u8,
-    value: []const u8,
-) !void {
-    if (!first.*) try writer.writeByte(',');
-    first.* = false;
-    try std.json.Stringify.value(key, .{}, writer);
-    try writer.writeByte(':');
-    try std.json.Stringify.value(value, .{}, writer);
 }
 
 const TestHome = struct {
@@ -613,58 +485,6 @@ test "a server whose name a terminal can't show is skipped with a note that esca
         defer alloc.free(note);
         try std.testing.expectEqualStrings(want, note);
     }
-}
-
-test "saving MCP config replaces the file durably" {
-    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const original = "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}";
-    try writeTempFile(&tmp, "home/.fx/mcp.json", original);
-    const path = try tmpDirPath(alloc, tmp.dir, "home/.fx/mcp.json");
-    defer alloc.free(path);
-
-    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
-    defer fx_dir.close(io_mod.getIo());
-
-    // Seed a group-readable mode so the 0600 assertion below cannot pass just
-    // because the developer's umask already produced it.
-    {
-        var seed = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{ .mode = .read_write });
-        defer seed.close(io_mod.getIo());
-        try seed.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o644));
-    }
-
-    // Hold the pre-save file open. A rename-over leaves this descriptor on the
-    // old, unlinked inode; an in-place truncate would empty it instead, which
-    // is the failure this save must not have.
-    var held = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{});
-    defer held.close(io_mod.getIo());
-
-    try saveConfigsToPath(alloc, path, &.{});
-
-    const held_stat = try held.stat(io_mod.getIo());
-    try std.testing.expectEqual(@as(u64, 0), held_stat.nlink);
-    const held_bytes = try io_mod.readFileToEnd(alloc, &held, 4096);
-    defer alloc.free(held_bytes);
-    try std.testing.expectEqualStrings(original, held_bytes);
-
-    const written = try readFileForTest(alloc, path);
-    defer alloc.free(written);
-    try std.testing.expect(std.mem.find(u8, written, "stale") == null);
-
-    const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
-
-    var it = fx_dir.iterate();
-    var entries: usize = 0;
-    while (try it.next(io_mod.getIo())) |entry| {
-        entries += 1;
-        try std.testing.expectEqualStrings("mcp.json", entry.name);
-    }
-    try std.testing.expectEqual(@as(usize, 1), entries);
 }
 
 fn tmpDirPath(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
@@ -847,31 +667,6 @@ test "fx mcp approve saves the approval of a project server" {
     try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
 }
 
-test "saving MCP config refuses a symlinked target" {
-    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const external = "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}";
-    try writeTempFile(&tmp, "home/external.json", external);
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
-    defer alloc.free(external_path);
-    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
-
-    const path = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(external_path).?, ".fx", "mcp.json" });
-    defer alloc.free(path);
-
-    // The durable helper refuses a target that is not a plain private file, so
-    // a symlinked config fails the save rather than writing through the link.
-    try std.testing.expectError(error.DurablePathUnsafe, saveConfigsToPath(alloc, path, &.{}));
-
-    const untouched = try readFileForTest(alloc, external_path);
-    defer alloc.free(untouched);
-    try std.testing.expectEqualStrings(external, untouched);
-}
-
 test "a profile config fx can't read fails with an error named for the file" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -957,7 +752,7 @@ test "loadConfigFromJson parses stdio type as stdio" {
     try std.testing.expectEqualStrings("node", try configs.items[0].stdioCommand());
 }
 
-test "profile required policy defaults optional and roundtrips canonically" {
+test "profile required policy defaults to optional" {
     const alloc = std.testing.allocator;
     var configs = try loadConfigFromJson(
         alloc,
@@ -970,15 +765,6 @@ test "profile required policy defaults optional and roundtrips canonically" {
     try std.testing.expect(required_config.required);
     try std.testing.expectEqual(mcp_contract.ConfigSource.profile, optional_config.source);
     try std.testing.expectEqual(mcp_contract.ConfigScope.profile, optional_config.scope);
-
-    const rendered = try renderConfigJson(alloc, configs.items);
-    defer alloc.free(rendered);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "\"required\":true"));
-
-    var reparsed = try loadConfigFromJson(alloc, rendered);
-    defer freeConfigs(alloc, &reparsed);
-    try std.testing.expect(!findConfig(reparsed.items, "optional").?.required);
-    try std.testing.expect(findConfig(reparsed.items, "required").?.required);
 }
 
 test "profile config reports invalid required policy" {
@@ -1160,7 +946,7 @@ test "loadConfigFromJson parses mixed stdio and sse configs" {
     try std.testing.expectEqualStrings("remote", configs.items[1].name);
 }
 
-test "save and reload preserves mixed stdio and sse configs" {
+test "a profile file with stdio and sse servers loads their transports, commands, urls and enabled flags" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1170,12 +956,9 @@ test "save and reload preserves mixed stdio and sse configs" {
     const path = try tmpPath(alloc, root, "mcp.json");
     defer alloc.free(path);
 
-    var configs = try loadConfigFromJson(alloc,
+    try writeTempFile(&tmp, "mcp.json",
         \\{"mcp":{"local":{"type":"local","command":["node","server.js"],"enabled":false},"remote":{"type":"sse","url":"https://mcp.example.com","enabled":true}}}
     );
-    defer freeConfigs(alloc, &configs);
-
-    try saveConfigsToPath(alloc, path, configs.items);
 
     var reloaded = try loadConfigFromPath(alloc, path);
     defer freeConfigs(alloc, &reloaded);
@@ -1188,7 +971,7 @@ test "save and reload preserves mixed stdio and sse configs" {
     try std.testing.expectEqualStrings("https://mcp.example.com", try reloaded.items[1].remoteUrl());
 }
 
-test "save and reload preserves HTTP identity and headers" {
+test "a profile file with an http server loads its identity and headers" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1198,18 +981,9 @@ test "save and reload preserves HTTP identity and headers" {
     const path = try tmpPath(alloc, root, "mcp.json");
     defer alloc.free(path);
 
-    var configs = try loadConfigFromJson(alloc,
+    try writeTempFile(&tmp, "mcp.json",
         \\{"mcp":{"local":{"type":"local","command":["node"]},"remote":{"type":"http","url":"https://api.example.com/mcp","headers":{"X-Workspace":"one"}}}}
     );
-    defer freeConfigs(alloc, &configs);
-
-    try saveConfigsToPath(alloc, path, configs.items);
-
-    const rendered = try readFileForTest(alloc, path);
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "\"type\":\"http\"") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "\"type\":\"sse\"") == null);
-    try std.testing.expect(std.mem.find(u8, rendered, "\"X-Workspace\":\"one\"") != null);
 
     var reloaded = try loadConfigFromPath(alloc, path);
     defer freeConfigs(alloc, &reloaded);
@@ -1257,7 +1031,7 @@ test "loadConfigFromJson reports non-string environment values" {
     );
 }
 
-test "stdio lifecycle policy parses defaults and roundtrips explicit values" {
+test "stdio lifecycle policy parses defaults and explicit values" {
     const alloc = std.testing.allocator;
     var defaults = try loadConfigFromJson(
         alloc,
@@ -1285,12 +1059,6 @@ test "stdio lifecycle policy parses defaults and roundtrips explicit values" {
     try std.testing.expectEqual(@as(u32, 125), explicit.items[0].startup_timeout_ms);
     try std.testing.expectEqual(@as(u32, 250), explicit.items[0].operation_timeout_ms);
     try std.testing.expectEqual(@as(u8, 2), explicit.items[0].restart_limit);
-
-    const rendered = try renderConfigJson(alloc, explicit.items);
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "\"startup_timeout_ms\":125") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "\"operation_timeout_ms\":250") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "\"restart_limit\":2") != null);
 }
 
 test "invalid stdio lifecycle policy reports its field" {
