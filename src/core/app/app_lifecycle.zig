@@ -1019,7 +1019,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.fx_version,
     ) catch |err| {
         debug_trace.logf("record", "startup recording failed err={s}", .{@errorName(err)});
-        return error.RecordingStartFailed;
+        return record_tape.startFailure(err);
     };
 
     // The shadow VT is load-bearing: frame commit diffs the target

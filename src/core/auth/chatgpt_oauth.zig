@@ -30,10 +30,14 @@ const browser_scope = "openid profile email offline_access api.connectors.read a
 const browser_callback_ports = [_]u16{ 1455, 1457 };
 const browser_login_timeout_seconds: i64 = 5 * 60;
 
-pub const RefreshMode = enum {
+pub const RefreshMode = union(enum) {
     if_needed,
     force,
     stored,
+    /// OpenAI rejected this access token: rotate only as
+    /// `oauth.rejectedLoginRotates` decides, so a login another fx already
+    /// refreshed is used as it is.
+    replace_rejected: []const u8,
 };
 
 pub const Access = struct {
@@ -441,8 +445,16 @@ pub fn loadAccess(
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
 
-    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+    const expired = session.expired(io_mod.milliTimestamp());
+    const rotate = switch (mode) {
+        .if_needed, .stored => expired,
+        .force => true,
+        .replace_rejected => |rejected| oauth.rejectedLoginRotates(session.access_token, rejected, expired),
+    };
+    if (rotate) {
         try refreshSession(alloc, transport, &mutation, &session);
+    } else if (mode == .replace_rejected) {
+        debug_trace.logf("auth", "Codex refresh skipped reason=saved_login_replaced", .{});
     }
     return takeAccess(&session);
 }
@@ -571,6 +583,7 @@ fn requestRefreshToken(
         .method = .post_json,
         .url = endpoint_url,
         .payload = payload,
+        .outlives_cancel = true,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
@@ -877,6 +890,7 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
         method: ?oauth_transport.Method = null,
         payload: [512]u8 = undefined,
         payload_len: usize = 0,
+        outlives_cancel: bool = false,
 
         fn execute(
             raw: ?*anyopaque,
@@ -886,6 +900,7 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             const payload = request.payload orelse &.{};
             self.method = request.method;
+            self.outlives_cancel = request.outlives_cancel;
             self.payload_len = @min(payload.len, self.payload.len);
             @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
             return .{
@@ -903,6 +918,8 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    // A cancel never cuts the token request off (`oauth_transport.Request`).
+    try std.testing.expect(state.outlives_cancel);
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expect(response.expires_in == null);
