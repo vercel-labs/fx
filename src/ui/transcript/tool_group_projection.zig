@@ -2716,6 +2716,7 @@ const known_multiword_labels = [_][]const u8{
     "Safety caution",
     "Review unavailable",
     "Timed out",
+    "Still running",
 };
 
 fn knownLabelPrefix(phrase: []const u8) ?usize {

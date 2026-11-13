@@ -311,8 +311,10 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain('\\"state\\":\\"completed\\"');
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    // The session's rows show its launch command's steps in short form.
-    expect(scrollback).toContain("Ran sleep, printf");
+    // The run returned before the command ended, so its row has no exit
+    // status, and the session's rows show its launch command's steps in short
+    // form.
+    expect(scrollback).toContain("Still running sleep, printf");
     expect(scrollback).toContain("Observed sleep, printf");
     expect(scrollback).not.toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
@@ -689,7 +691,7 @@ test.skipIf(!tmuxAvailable())(
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     // The session's input and its stop share one row with its latest state.
-    expect(row("├ Ran ")).toBe("├ Ran echo, sleep");
+    expect(row("├ Still running ")).toBe("├ Still running echo, sleep");
     expect(row("├ Observed ")).toBeUndefined();
     expect(row("└ Stopped ")).toBe("└ Stopped echo, sleep · 2 calls");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -888,7 +890,7 @@ test.skipIf(!tmuxAvailable())(
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     // The session's input and its stop share one row with its latest state.
-    expect(row("├ Ran ")).toBe("├ Ran echo, sleep");
+    expect(row("├ Still running ")).toBe("├ Still running echo, sleep");
     expect(row("├ Observed ")).toBeUndefined();
     expect(row("└ Stopped ")).toBe("└ Stopped echo, sleep · 2 calls");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");

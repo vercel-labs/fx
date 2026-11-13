@@ -8,6 +8,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -973,6 +974,22 @@ pub const RemoteRevocation = union(enum) {
         };
     }
 
+    fn keptSource(self: RemoteRevocation) pending_revocation.Source {
+        return switch (self) {
+            .fx_login => .fx_login,
+            .grok => .grok,
+            .codex => .codex,
+        };
+    }
+
+    /// Identifies the sign-out in `pending_revocation`.
+    fn refreshToken(self: RemoteRevocation) []const u8 {
+        return switch (self) {
+            .fx_login => |session| session.refresh_token,
+            .grok, .codex => |token| token,
+        };
+    }
+
     pub fn deinit(self: *RemoteRevocation) void {
         const alloc = std.heap.c_allocator;
         switch (self.*) {
@@ -986,6 +1003,8 @@ pub const RemoteRevocation = union(enum) {
 const RemoteRevocationOutcome = struct {
     source: credentials.Source,
     failed: bool,
+    /// The failed revocation's tokens are kept, and fx revokes them later.
+    retry_kept: bool,
 };
 
 /// How long shutdown waits for revocations in flight before cancelling them.
@@ -999,13 +1018,17 @@ const RemoteRevocationTask = struct {
     done: std.Io.Event = .unset,
     cancel: std.atomic.Value(bool) = .init(false),
     failed: bool = false,
+    /// Whether `target`'s tokens are kept (`pending_revocation`): a
+    /// confirmed revocation forgets them, and any other end leaves them for a
+    /// later retry.
+    kept: bool,
 
     /// Takes ownership of `target` only when the task starts.
-    fn start(transport: oauth_transport.Provider, target: RemoteRevocation) !*RemoteRevocationTask {
+    fn start(transport: oauth_transport.Provider, target: RemoteRevocation, kept: bool) !*RemoteRevocationTask {
         const alloc = std.heap.c_allocator;
         const task = try alloc.create(RemoteRevocationTask);
         errdefer alloc.destroy(task);
-        task.* = .{ .transport = transport, .target = target };
+        task.* = .{ .transport = transport, .target = target, .kept = kept };
         task.future = try io_mod.getIo().concurrent(workerMain, .{task});
         return task;
     }
@@ -1019,19 +1042,68 @@ const RemoteRevocationTask = struct {
             .codex => |token| chatgpt_oauth.revokeToken(alloc, transport.provider(), token),
         };
         revoked catch |err| {
-            debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });
+            debug_trace.logf("auth", "remote revocation failed source={t} err={s} kept={}", .{ self.target.source(), @errorName(err), self.kept });
             self.failed = true;
+            if (self.kept and !pending_revocation.retryable(err)) {
+                // A retry could never revoke it, so nothing stays kept.
+                pending_revocation.forget(alloc, self.target.keptSource(), self.target.refreshToken());
+                self.kept = false;
+            }
         };
+        if (!self.failed and self.kept) pending_revocation.forget(alloc, self.target.keptSource(), self.target.refreshToken());
         self.done.set(io_mod.getIo());
     }
 
     /// Awaits the task, releases it, and returns its outcome.
     fn finish(self: *RemoteRevocationTask) RemoteRevocationOutcome {
         self.future.await(io_mod.getIo());
-        const outcome: RemoteRevocationOutcome = .{ .source = self.target.source(), .failed = self.failed };
+        const outcome: RemoteRevocationOutcome = .{
+            .source = self.target.source(),
+            .failed = self.failed,
+            .retry_kept = self.failed and self.kept,
+        };
         self.target.deinit();
         std.heap.c_allocator.destroy(self);
         return outcome;
+    }
+};
+
+/// Revokes, on a worker, the sign-outs that earlier logouts kept because their
+/// provider did not confirm them (`pending_revocation`). The TUI starts one at
+/// launch, and shutdown cancels it: what it did not revoke stays kept.
+const KeptSignOutRetryTask = struct {
+    transport: oauth_transport.Provider,
+    future: std.Io.Future(void) = undefined,
+    cancel: std.atomic.Value(bool) = .init(false),
+
+    fn start(transport: oauth_transport.Provider) !*KeptSignOutRetryTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(KeptSignOutRetryTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .transport = transport };
+        task.future = try io_mod.getIo().concurrent(workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *KeptSignOutRetryTask) void {
+        const alloc = std.heap.c_allocator;
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        const codex = chatgpt_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const grok = grok_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const fx_login = login_flow.retryKeptSignOuts(alloc, transport.provider(), null);
+        if (codex.revoked + grok.revoked + fx_login.revoked == 0 and !(codex.failed or grok.failed or fx_login.failed)) return;
+        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} failed={}", .{
+            codex.revoked,
+            grok.revoked,
+            fx_login.revoked,
+            codex.failed or grok.failed or fx_login.failed,
+        });
+    }
+
+    fn stop(self: *KeptSignOutRetryTask) void {
+        self.cancel.store(true, .seq_cst);
+        self.future.await(io_mod.getIo());
+        std.heap.c_allocator.destroy(self);
     }
 };
 
@@ -1353,6 +1425,98 @@ test "provider preparation at exit is cancelled and left running instead of wait
     runtime.leaveProviderPreparationForExit();
     try std.testing.expect(!runtime.providerPreparationPending());
     try std.testing.expect(task.cancel_requested.load(.seq_cst));
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    catalog.release.store(true, .release);
+    try waitForPreparationTest(&task.done);
+    task.deinit();
+}
+
+test "a cancelled provider switch ends at once while its sign-in refresh finishes and saves the new login" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    errdefer runtime.deinit(alloc);
+    // Released before a failed check waits for the task.
+    defer transport.release.store(true, .seq_cst);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .preferred_source = .fx_login,
+    });
+    try waitForPreparationTest(&transport.token_request_seen);
+
+    // Esc while the token request is on the wire: the switch ends at once,
+    // and the refresh, which is never cut off, keeps running.
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expectEqual(@as(usize, 1), runtime.cancelled_provider_preparations.items.len);
+    try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+    // The refresh can hold the login's lock until it ends.
+    try std.testing.expect(runtime.signInRefreshFinishing());
+
+    // Once it ends, the new login is saved and the runtime frees it.
+    const task = runtime.cancelled_provider_preparations.items[0];
+    transport.release.store(true, .seq_cst);
+    try waitForPreparationTest(&task.done);
+    try std.testing.expect(!runtime.signInRefreshFinishing());
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+    runtime.deinit(alloc);
+    var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-token", stored.token);
+}
+
+test "a cancelled provider preparation that already finished is freed at once" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    try std.testing.expect(!runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+}
+
+test "process exit leaves a cancelled provider preparation running instead of waiting for it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{ .ignores_cancel = true };
+    // Released before a failed check waits for the task.
+    defer catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&catalog.entered);
+    const task = runtime.provider_preparation.?;
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+
+    runtime.leaveProviderPreparationForExit();
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
     try std.testing.expect(!task.done.load(.acquire));
 
     // The process would end here; the test lets the task finish and frees it.
@@ -2011,8 +2175,16 @@ pub const Runtime = struct {
     /// the new login; finished ones are freed as the prompt refresh is used,
     /// `deinit` waits for the rest, and process exit leaves them.
     abandoned_prompt_refreshes: std.ArrayList(*PromptCredentialRefreshTask) = .empty,
+    /// Preparations the user cancelled that still run, such as one in the
+    /// middle of a sign-in refresh, which is never cut off. The switch ends at
+    /// once (`takeCancelledProviderPreparation`); finished ones are freed as
+    /// preparations start, a full shutdown waits for the rest, and process
+    /// exit leaves them.
+    cancelled_provider_preparations: std.ArrayList(*ProviderPreparation) = .empty,
     /// Revocations of signed-out sessions still talking to their issuer.
     remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
+    /// The launch's retry of kept sign-outs (`beginKeptSignOutRetry`).
+    kept_sign_out_retry_task: ?*KeptSignOutRetryTask = null,
     team_list_task: ?*TeamListTask = null,
     provider_preparation: ?*ProviderPreparation = null,
     startup_credential_task: ?*StartupCredentialTask = null,
@@ -2060,7 +2232,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 36) {
+            if (@typeInfo(Self).@"struct".field_names.len != 38) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -2096,7 +2268,9 @@ pub const Runtime = struct {
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.abandoned_prompt_refreshes = .empty;
+        storage.cancelled_provider_preparations = .empty;
         storage.remote_revocation_tasks = .empty;
+        storage.kept_sign_out_retry_task = null;
         storage.team_list_task = null;
         storage.provider_preparation = null;
         storage.startup_credential_task = null;
@@ -2111,6 +2285,8 @@ pub const Runtime = struct {
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        if (self.kept_sign_out_retry_task) |task| task.stop();
+        self.kept_sign_out_retry_task = null;
         for (self.abandoned_prompt_refreshes.items) |task| task.deinit();
         self.abandoned_prompt_refreshes.deinit(std.heap.c_allocator);
         self.abandoned_prompt_refreshes = .empty;
@@ -2136,7 +2312,7 @@ pub const Runtime = struct {
                 };
             }
             if (!task.done.isSet()) {
-                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t}", .{task.target.source()});
+                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t} kept={}", .{ task.target.source(), task.kept });
                 task.cancel.store(true, .seq_cst);
             }
             _ = task.finish();
@@ -2355,6 +2531,7 @@ pub const Runtime = struct {
 
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
         if (self.provider_preparation != null) return error.ProviderPreparationInProgress;
+        self.freeFinishedProviderPreparations();
         self.cancelPromptCredentialRefresh();
         self.provider_preparation = try ProviderPreparation.start(alloc, self, input);
     }
@@ -2369,6 +2546,50 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Ends a cancelled preparation for the app at once and returns whether
+    /// there was one. One still running, such as one in the middle of a
+    /// sign-in refresh, which is never cut off (`oauth_transport.Request`
+    /// `outlives_cancel`), is kept until it ends, so nothing waits for it.
+    pub fn takeCancelledProviderPreparation(self: *Self) bool {
+        const task = self.provider_preparation orelse return false;
+        if (!task.cancel_requested.load(.seq_cst)) return false;
+        self.provider_preparation = null;
+        if (task.done.load(.acquire)) {
+            task.deinit();
+            return true;
+        }
+        self.cancelled_provider_preparations.append(std.heap.c_allocator, task) catch {
+            debug_trace.logf("auth", "cancelled provider preparation awaited reason=no_memory_to_keep_it", .{});
+            task.deinit();
+            return true;
+        };
+        debug_trace.logf("auth", "cancelled provider preparation left running target={t}", .{task.input.target()});
+        return true;
+    }
+
+    /// Whether a sign-in refresh that nothing waits for still runs: a
+    /// cancelled provider preparation or a refresh a prompt stopped waiting
+    /// for. It can hold the sign-in's lock, so the input loop must not take
+    /// that lock, as a logout or a team change does, until it ends.
+    pub fn signInRefreshFinishing(self: *Self) bool {
+        self.freeFinishedProviderPreparations();
+        self.freeFinishedPromptRefreshes();
+        return self.cancelled_provider_preparations.items.len > 0 or self.abandoned_prompt_refreshes.items.len > 0;
+    }
+
+    fn freeFinishedProviderPreparations(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.cancelled_provider_preparations.items.len) {
+            const task = self.cancelled_provider_preparations.items[i];
+            if (!task.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            _ = self.cancelled_provider_preparations.swapRemove(i);
+            task.deinit();
+        }
+    }
+
     pub fn takeProviderPreparation(self: *Self) ?*ProviderPreparation {
         const task = self.provider_preparation orelse return null;
         if (!task.done.load(.acquire)) return null;
@@ -2378,7 +2599,10 @@ pub const Runtime = struct {
         return task;
     }
 
+    /// Waits for every preparation, cancelled ones too, and frees them.
     pub fn stopProviderPreparation(self: *Self) void {
+        for (self.cancelled_provider_preparations.items) |task| task.deinit();
+        self.cancelled_provider_preparations.clearAndFree(std.heap.c_allocator);
         const task = self.provider_preparation orelse return;
         self.provider_preparation = null;
         task.deinit();
@@ -2390,9 +2614,15 @@ pub const Runtime = struct {
     /// `outlives_cancel`), is cancelled and left to end with the process. It
     /// holds only its own copies and static providers.
     pub fn leaveProviderPreparationForExit(self: *Self) void {
+        for (self.cancelled_provider_preparations.items) |task| leavePreparationForExit(task);
+        self.cancelled_provider_preparations.clearAndFree(std.heap.c_allocator);
         const task = self.provider_preparation orelse return;
-        if (task.done.load(.acquire)) return self.stopProviderPreparation();
         self.provider_preparation = null;
+        leavePreparationForExit(task);
+    }
+
+    fn leavePreparationForExit(task: *ProviderPreparation) void {
+        if (task.done.load(.acquire)) return task.deinit();
         task.requestCancel();
         debug_trace.logf("auth", "provider preparation left running reason=process_exit target={t}", .{task.input.target()});
         if (task.thread) |thread| thread.detach();
@@ -3290,8 +3520,9 @@ pub const Runtime = struct {
 
     /// Revokes a signed-out session's tokens on a worker and takes ownership
     /// of `target`. Returns false, after releasing `target`, when the worker
-    /// cannot start; the revocation then did not happen.
-    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation) bool {
+    /// cannot start; the revocation then did not happen. `kept` says whether
+    /// `target`'s tokens are kept to revoke later (`pending_revocation`).
+    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation, kept: bool) bool {
         var owned = target;
         if (comptime builtin.single_threaded) {
             owned.deinit();
@@ -3301,13 +3532,25 @@ pub const Runtime = struct {
             owned.deinit();
             return false;
         };
-        const task = RemoteRevocationTask.start(self.oauth_transport, owned) catch |err| {
+        const task = RemoteRevocationTask.start(self.oauth_transport, owned, kept) catch |err| {
             debug_trace.logf("auth", "remote revocation task unavailable source={t} err={s}", .{ owned.source(), @errorName(err) });
             owned.deinit();
             return false;
         };
         self.remote_revocation_tasks.appendAssumeCapacity(task);
         return true;
+    }
+
+    /// Starts revoking, on a worker, the sign-outs that earlier logouts kept
+    /// because their provider did not confirm them. A host that manages
+    /// credentials keeps none.
+    pub fn beginKeptSignOutRetry(self: *Self) void {
+        if (comptime builtin.single_threaded) return;
+        if (self.kept_sign_out_retry_task != null or self.authMode() == .host_managed) return;
+        self.kept_sign_out_retry_task = KeptSignOutRetryTask.start(self.oauth_transport) catch |err| blk: {
+            debug_trace.logf("auth", "kept sign-out retry unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
     }
 
     /// Returns one finished revocation's outcome, or null when none finished.
@@ -5784,7 +6027,7 @@ test "auth runtime revokes a signed-out Grok session on a worker" {
         defer runtime.deinit(std.testing.allocator);
 
         const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
-        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }, false));
         const outcome = while (true) {
             if (runtime.takeRemoteRevocation()) |finished| break finished;
             std.Thread.yield() catch {};
@@ -5802,7 +6045,7 @@ test "auth runtime shutdown waits for a remote revocation in flight" {
     var runtime: Runtime = .{ .oauth_transport = transport.provider() };
 
     const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
-    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }, false));
     runtime.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
@@ -5857,6 +6100,7 @@ test "a prompt that leaves during its credential refresh lets the refresh finish
     try std.testing.expect(runtime.prompt_credential_refresh_task == null);
     try std.testing.expectEqual(@as(usize, 1), runtime.abandoned_prompt_refreshes.items.len);
     try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+    try std.testing.expect(runtime.signInRefreshFinishing());
 
     // A full shutdown waits for it, and the new login is saved.
     transport.release.store(true, .seq_cst);

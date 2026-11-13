@@ -1252,7 +1252,8 @@ pub fn finishExecutedToolStatus(
     if (!status_started) return;
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     const command_decision = if (activity_kind == .command)
-        try commandOutcomeDecision(arena, result_memory.command_process_presentation)
+        (try commandOutcomeDecision(arena, result_memory.command_process_presentation)) orelse
+            try runningCommandDecision(arena, call, result.model_output)
     else
         null;
     const terminal_action_decision = if (std.mem.eql(u8, call.name, "shell"))
@@ -1448,6 +1449,52 @@ pub fn commandOutcomeDecision(
             .label = "Output capture failed",
         },
     };
+}
+
+/// The label of a shell `run` whose command was still running when the call
+/// returned, such as when steering moved it to the background or its
+/// `yield_time_ms` ran out. It has no exit status, so it must not read "Ran".
+pub const still_running_label = "Still running";
+
+/// The outcome of a shell `run` call whose result `output` reports
+/// `"state":"running"`, or null for any other call or result.
+pub fn runningCommandDecision(
+    arena: Allocator,
+    call: ToolCall,
+    output: []const u8,
+) !?ToolOutcomeDecision {
+    if (!std.mem.eql(u8, call.name, "shell")) return null;
+    if (std.mem.find(u8, output, "\"running\"") == null) return null;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
+    const action = tool_args.optionalStringArg(args, "action") orelse "run";
+    if (!std.mem.eql(u8, action, "run")) return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch return null;
+    if (parsed != .object) return null;
+    const state = parsed.object.get("state") orelse return null;
+    if (state != .string or !std.mem.eql(u8, state.string, "running")) return null;
+    return .{ .outcome = .completed, .label = still_running_label };
+}
+
+test "a shell run that returns its command running reads Still running" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"steering_notice\":\"New steering arrived\"}";
+    const decision = (try runningCommandDecision(arena, run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, decision.outcome);
+
+    const no_action = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"command\":\"sleep 30\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, no_action, running)) != null);
+
+    const finished = "{\"session_id\":\"shell-1\",\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"running\"}";
+    try std.testing.expect((try runningCommandDecision(arena, run, finished)) == null);
+    const interact = ToolCall{ .id = "i", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, interact, running)) == null);
+    const read = ToolCall{ .id = "r", .name = "read_file", .arguments_json = "{}" };
+    try std.testing.expect((try runningCommandDecision(arena, read, running)) == null);
+    try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
 }
 
 pub fn terminalActionOutcomeDecision(

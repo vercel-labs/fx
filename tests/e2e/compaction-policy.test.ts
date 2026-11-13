@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { compactionRecordPath, logLines, sessionDir } from "./saved-sessions";
+import { compactionRecordPath, logLines, logLinesAfterCompaction, sessionDir } from "./saved-sessions";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway } = await import("./tmux-helpers");
@@ -130,7 +130,7 @@ const BIG_REPLY = Array.from({ length: 14_000 }, (_, n) => `Reference line ${n}:
 
 type Script = (request: any, raw: string, phase: string) => Response;
 
-async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script) {
+async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script, readLog = logLines) {
   const root = mkdtempSync(join(tmpdir(), "fx-toolbox-menu-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
@@ -152,6 +152,7 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
   let sessionId = "";
+  const outputs: string[] = [];
   let passed = false;
   try {
     for (const step of phases) {
@@ -161,14 +162,16 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
       const child = Bun.spawn([binary, ...args], { cwd, env: { ...env, ...step.env }, stdin: "ignore", stdout: Bun.file(out), stderr: Bun.file(err) });
       const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
       try { expect(await child.exited).toBe(0); } finally { clearTimeout(timer); }
-      if (!step.resume) sessionId = JSON.parse(readFileSync(out, "utf8")).session_id;
+      const answer = JSON.parse(readFileSync(out, "utf8"));
+      outputs.push(answer.output);
+      if (!step.resume) sessionId = answer.session_id;
     }
     const menus = agentBodies.map((raw) => {
       const request = JSON.parse(raw);
       const found = request.prompt.find((message: any) => message.role === "system" && typeof message.content === "string" && message.content.startsWith(TOOLBOX_MENU));
       return found?.content ?? null;
     });
-    const result = { home, sessionId, bodies: agentBodies, menus, compactions: logLines(home, sessionId).filter((line: any) => line.kind === "compacted").length };
+    const result = { home, sessionId, bodies: agentBodies, menus, outputs, compactions: readLog(home, sessionId).filter((line: any) => line.kind === "compacted").length };
     passed = true;
     return result;
   } finally {
@@ -228,5 +231,42 @@ test("overflow recovery in the middle of a turn keeps the toolbox menu the conve
   });
   expect(run.compactions).toBe(1);
   expect(attempt).toBe(2);
+  expectMenuKept(run);
+}, 120_000);
+
+// A tool call's arguments stay in the conversation, so one larger than the
+// model's whole window leaves only compaction, whose request clips them to
+// fit. That compaction folds the turn's own call, so the streamed turn is
+// written again once (tests/tla/session/TurnStream.tla SupersedeExplained),
+// and the turn ends either way.
+for (const refuseFirst of [false, true]) test(`automatic compaction clips a tool call argument larger than the context window${refuseFirst ? " after the provider refuses the first compaction request" : ""}`, async () => {
+  const content = "BIG_ARGUMENT_START\n" + "x".repeat(1_000_000) + "\nBIG_ARGUMENT_END";
+  const summaries: string[] = [];
+  let agentRequests = 0;
+  const run = await toolboxRun("fixture/compaction", `big argument${refuseFirst ? " refused" : ""}`, [
+    { phase: "seed", prompt: "Write big.txt.", resume: false },
+  ], (_request, raw, phase) => {
+    if (phase === "summary") {
+      summaries.push(raw);
+      if (refuseFirst && summaries.length === 1) return Response.json({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "This model's maximum context length is 128000 tokens. The request exceeds the context window." } }, { status: 400 });
+      return fakeGatewayFinalText("Turn 1\nIn between: none");
+    }
+    agentRequests += 1;
+    return agentRequests === 1 ? fakeGatewayToolCall("big-write", "write_file", { path: "big.txt", content }) : fakeGatewayFinalText("BIG_ARGUMENT_DONE");
+  }, logLinesAfterCompaction);
+  expect(run.outputs).toEqual(["BIG_ARGUMENT_DONE"]);
+  expect(run.compactions).toBe(1);
+  // A refused compaction request is sent again; the one accepted keeps the
+  // argument's start and end around a note saying what it left out.
+  expect(summaries.length).toBe(refuseFirst ? 2 : 1);
+  const accepted = summaries.at(-1)!;
+  expect(accepted.length).toBeLessThan(content.length / 2);
+  expect(accepted).toContain("bytes left out here");
+  expect(accepted).toContain("BIG_ARGUMENT_START");
+  expect(accepted).toContain("BIG_ARGUMENT_END");
+  // The request after the compaction no longer carries the argument.
+  expect(run.bodies.length).toBe(2);
+  expect(run.bodies.at(-1)!.length).toBeLessThan(100_000);
+  expect(run.bodies.at(-1)!).not.toContain("x".repeat(10_000));
   expectMenuKept(run);
 }, 120_000);

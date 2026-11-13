@@ -338,6 +338,9 @@ test "the transcript window shell drops at the turn end of an unsaved session wi
     const first = [_]TranscriptEntry{ user(1), rawEntry(2, .turn_summary, false) };
     try shell.sync(alloc, &first, &drops);
     try shell.compacted(alloc, &first, &drops);
+    // Nothing goes at the compaction itself: the closed cycle waits for the
+    // next turn end.
+    try testing.expectEqual(@as(usize, 0), drops.items.len);
     const second = first ++ [_]TranscriptEntry{ user(3), rawEntry(4, .turn_summary, false) };
     try shell.sync(alloc, &second, &drops);
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, drops.items);
@@ -352,6 +355,7 @@ test "the transcript window shell ends a cancelled turn without confirming a sav
     const first = [_]TranscriptEntry{ user(1), rawEntry(2, .turn_summary, false) };
     try shell.sync(alloc, &first, &drops);
     try shell.compacted(alloc, &first, &drops);
+    try testing.expectEqual(@as(usize, 0), drops.items.len);
     const cancelled = first ++ [_]TranscriptEntry{ user(3), rawEntry(4, .turn_cancellation, false) };
     try shell.sync(alloc, &cancelled, &drops);
     // The closed cycle is saved (the first summary), so it drops at the

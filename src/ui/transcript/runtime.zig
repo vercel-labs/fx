@@ -7115,7 +7115,8 @@ pub const TranscriptRuntime = struct {
     /// `holds_previous_cycle` when they are the cycle before the newest
     /// compaction, which had no turn since (`Session.visitHistorySinceCompaction`).
     /// Then the window applies that compaction as it applies a live one: the
-    /// entries stay on screen and leave memory as they scroll off.
+    /// entries stay on screen, a resize before the next turn end reprints
+    /// them, and after it they leave memory as they scroll off.
     pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator, holds_previous_cycle: bool) !void {
         // Which cycle is "one back" changed with the session.
         self.discardTranscriptArchive();
@@ -7783,7 +7784,8 @@ pub const TranscriptRuntime = struct {
     }
 
     /// Whether the transcript window still holds the cycle before the newest
-    /// compaction, which it does until the first turn end the log holds.
+    /// compaction, which it does until the first turn end after it, once the
+    /// log holds that cycle.
     pub fn transcriptWindowHoldsPreviousCycle(self: *const TranscriptRuntime) bool {
         const window = if (self.transcript_window) |*value| value else return false;
         return window.state.prev_first != null;
