@@ -1746,6 +1746,70 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
   }, TIMEOUT * 2);
 
+  test("a malformed tool call shows that fx asked the model to try again, then the answer", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-malformed-call-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    writeFileSync(join(workspacePath, "notes.txt"), "malformed call fixture\n");
+    const workspace = realpathSync(workspacePath);
+    // Gemini ends a reply with MALFORMED_FUNCTION_CALL after a local tool call.
+    const queuedGateway = startFakeGateway(
+      [
+        fakeGatewaySse([
+          { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+          { type: "tool-call", toolCallId: "read_malformed", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+        ]),
+        fakeGatewaySse([
+          { type: "tool-call", toolCallId: "read_again", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+        ]),
+        fakeGatewayFinalText("MALFORMED_RECOVERY_DONE"),
+      ],
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] },
+    );
+    gateway = queuedGateway;
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 120,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-malformed-call-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Read notes.txt.");
+    await session.waitForText("MALFORMED_RECOVERY_DONE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    const scrollback = (await session.captureFullScrollback()).replace(/\s+/g, " ");
+    expect(scrollback).toContain(
+      "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
+    );
+    expect(scrollback).not.toContain("next try in");
+    expect(scrollback).not.toContain("Tool state needs review");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  }, TIMEOUT * 2);
+
   test("trace report explains a rejected image when the model catalog is unavailable", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-trace-catalog-")));
     const home = join(root, "home");
