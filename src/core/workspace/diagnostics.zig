@@ -6,9 +6,11 @@
 
 const network_metrics = @import("network_metrics.zig");
 const tool_call_metrics = @import("tool_call_metrics.zig");
+const subagent_turn_metrics = @import("subagent_turn_metrics.zig");
 const render_metrics = @import("render_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
+const io_mod = @import("../shared/io.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
@@ -23,6 +25,9 @@ pub const network_ring_capacity = network_metrics.ring_capacity;
 pub const tool_call_ring_capacity = tool_call_metrics.ring_capacity;
 pub const RenderEvent = render_metrics.Event;
 pub const render_ring_capacity = render_metrics.ring_capacity;
+pub const SubagentTurn = subagent_turn_metrics.Turn;
+pub const SubagentTurnStart = subagent_turn_metrics.Start;
+pub const subagent_turn_capacity = subagent_turn_metrics.ring_capacity;
 pub const CompactionEvent = compactor.TraceEvent;
 pub const compaction_ring_capacity = compactor.trace_ring_capacity;
 pub const ModelCatalogEvent = model_catalog_metrics.Event;
@@ -116,9 +121,31 @@ pub fn toolCallLifetimeStats() ToolCallLifetimeStats {
     return tool_call_metrics.lifetimeStats();
 }
 
+/// Records a subagent turn as it starts, so `/trace` can say which subagent
+/// a `subagent_id` belongs to.
+pub fn recordSubagentTurnStart(start: SubagentTurnStart) void {
+    subagent_turn_metrics.recordStart(start);
+}
+
+/// Records how subagent turn `subagent_id` ended.
+pub fn recordSubagentTurnEnd(subagent_id: u64, outcome: []const u8) void {
+    subagent_turn_metrics.recordEnd(subagent_id, outcome, io_mod.milliTimestamp());
+}
+
+/// Copies the kept subagent turns, oldest first.
+pub fn snapshotSubagentTurns(out: []SubagentTurn) usize {
+    return subagent_turn_metrics.snapshot(out);
+}
+
+/// Subagent turns started this session, including ones no longer kept.
+pub fn subagentTurnTotal() u64 {
+    return subagent_turn_metrics.totalTurns();
+}
+
 pub fn resetSession() void {
     network_metrics.reset();
     tool_call_metrics.reset();
+    subagent_turn_metrics.reset();
     render_metrics.reset();
     compactor.resetTrace();
     model_catalog_metrics.reset();
