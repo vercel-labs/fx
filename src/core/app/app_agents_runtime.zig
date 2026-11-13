@@ -3217,7 +3217,7 @@ test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches th
     try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
 }
 
-test "main's cancel while it waits on a subagent's run ends the question that run waits on" {
+test "the cancel a run's wait repeats ends the question that run waits on" {
     const alloc = std.testing.allocator;
     var worker = worker_runtime.WorkerRuntime{};
     defer worker.deinit(alloc);
@@ -3227,7 +3227,13 @@ test "main's cancel while it waits on a subagent's run ends the question that ru
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
 
     const Side = struct {
-        fn ask(runtime: *worker_runtime.WorkerRuntime, batch: []const types.QuestionBatchEntry, answered: *std.atomic.Value(bool)) void {
+        fn ask(
+            runtime: *worker_runtime.WorkerRuntime,
+            batch: []const types.QuestionBatchEntry,
+            answered: *std.atomic.Value(bool),
+            returned: *std.Io.Event,
+        ) void {
+            defer returned.set(io_mod.getIo());
             const answers = (runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, batch) catch return) orelse return;
             for (answers) |answer| std.testing.allocator.free(answer);
             std.testing.allocator.free(answers);
@@ -3243,28 +3249,39 @@ test "main's cancel while it waits on a subagent's run ends the question that ru
             outcome.* = waitForCompletion(done, flag, runtime);
         }
 
-        /// Whether the question is open (or closed) within a bounded time, so a
-        /// question that does not end fails its test instead of hanging it.
-        fn questionIs(runtime: *worker_runtime.WorkerRuntime, open: bool) bool {
+        /// Whether the question opens within a bounded time. Nothing signals it, so
+        /// it is polled; the end of the wait is waited for on an event.
+        fn questionOpens(runtime: *worker_runtime.WorkerRuntime) bool {
             for (0..2000) |_| {
                 var snapshot = runtime.snapshotPendingQuestionBatch(std.testing.allocator) catch return false;
                 if (snapshot) |*batch| {
                     batch.deinit(std.testing.allocator);
-                    if (open) return true;
-                } else if (!open) return true;
+                    return true;
+                }
                 io_mod.sleep(1 * std.time.ns_per_ms);
             }
             return false;
         }
+
+        /// Whether the thread that asked has returned, so a question that does
+        /// not end fails the test instead of hanging it.
+        fn askerReturned(event: *std.Io.Event) bool {
+            event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(5000),
+            } }) catch return false;
+            return true;
+        }
     };
 
     var answered = std.atomic.Value(bool).init(false);
-    const asker = try std.Thread.spawn(.{}, Side.ask, .{ &worker, &entries, &answered });
+    var returned: std.Io.Event = .unset;
+    const asker = try std.Thread.spawn(.{}, Side.ask, .{ &worker, &entries, &answered, &returned });
     var outcome: agents.ChildRunCompletion.Outcome = .completed;
     const waiter = try std.Thread.spawn(.{}, Side.wait, .{ &completion, &cancel, &worker, &outcome });
-    const opened = Side.questionIs(&worker, true);
+    const opened = Side.questionOpens(&worker);
     cancel.store(true, .seq_cst);
-    const ended = opened and Side.questionIs(&worker, false);
+    const ended = opened and Side.askerReturned(&returned);
     // A question that stayed open is released, so the test fails instead of hanging.
     if (!ended) worker.requestStop();
     completion.finish(.cancelled);
