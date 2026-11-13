@@ -2530,6 +2530,138 @@ test "credits command renders through the composed provider" {
     try std.testing.expectEqualStrings("balance=10", app.notice_body.items);
 }
 
+/// An app whose background credits lookup answers that the team has Token
+/// Pass, for the startup Token Pass check in `collectCreditsFacts`.
+const TokenPassCheckFakeApp = struct {
+    const FakeAuth = struct {
+        fn queuedPromptCredential(_: *const FakeAuth) ?auth_runtime.GatewayCredential {
+            return null;
+        }
+
+        fn credentialSource(_: *const FakeAuth) ?credentials.Source {
+            return null;
+        }
+
+        fn credentialNeedsRefresh(_: *const FakeAuth) bool {
+            return false;
+        }
+
+        fn oauthTransport(_: *const FakeAuth) @import("../auth/oauth_transport.zig").Provider {
+            unreachable;
+        }
+
+        fn accountId(_: *const FakeAuth) ?[]const u8 {
+            return null;
+        }
+    };
+
+    const FakeModelCache = struct {
+        token_pass_default: enum { unchecked, checking, pending, settled } = .unchecked,
+        token_pass_epoch: u32 = 0,
+        status: token_pass.Status = .unknown,
+
+        fn tokenPassStatus(self: *const FakeModelCache) token_pass.Status {
+            return self.status;
+        }
+
+        fn observeTokenPassCredit(self: *FakeModelCache) void {
+            self.status = .active;
+        }
+
+        fn observeNoTokenPass(self: *FakeModelCache, _: []const u8) void {
+            self.status = .unknown;
+        }
+    };
+
+    alloc: std.mem.Allocator,
+    auth: FakeAuth = .{},
+    credits_lookup: credits_lookup.Lookup = .{},
+    model_cache: FakeModelCache = .{},
+    main_agent: struct {} = .{},
+    selected_provider: @import("../config/model_provider.zig").ProviderId = .gateway,
+    selected_model: std.ArrayList(u8) = .empty,
+    workspace_root: []const u8 = "/Users/example/workspace",
+    fetches: std.atomic.Value(usize) = .init(0),
+
+    fn deinit(self: *TokenPassCheckFakeApp) void {
+        self.credits_lookup.deinit();
+        self.selected_model.deinit(self.alloc);
+    }
+
+    fn creditsProvider(self: *TokenPassCheckFakeApp) gateway_provider.CreditsProvider {
+        return .{ .context = self, .fetch_fn = fetchCredits };
+    }
+
+    fn fetchCredits(
+        raw: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        _: gateway_provider.CreditsLookupInput,
+    ) output_contracts.CreditsSnapshot {
+        const self: *TokenPassCheckFakeApp = @ptrCast(@alignCast(raw.?));
+        _ = self.fetches.fetchAdd(1, .seq_cst);
+        return .{
+            .balance = alloc.dupe(u8, "10") catch null,
+            .token_pass = .{ .remaining = alloc.dupe(u8, "79.9") catch "" },
+        };
+    }
+
+    fn adoptRenewedCredential(_: *TokenPassCheckFakeApp, _: *const credentials.Credential) !void {}
+
+    fn writeDomainNotice(_: *TokenPassCheckFakeApp, _: types.SemanticNotice, _: bool) !void {}
+
+    /// Starts the quiet startup check for the current credential, as
+    /// `startTokenPassDefaultCheck` does.
+    fn startQuietCheck(self: *TokenPassCheckFakeApp) !void {
+        try std.testing.expectEqual(credits_lookup.Start.started, try self.credits_lookup.startQuiet(
+            self.creditsProvider(),
+            .{ .credential = null, .tenant = null },
+            null,
+            self.model_cache.token_pass_epoch,
+        ));
+        self.model_cache.token_pass_default = .checking;
+    }
+
+    /// Runs the event loop's credits step until the lookup's reply is taken.
+    fn collectReply(self: *TokenPassCheckFakeApp) !void {
+        while (self.credits_lookup.task != null) {
+            try Handlers(TokenPassCheckFakeApp).collectCreditsFacts(self, "builtin/default");
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+test "a Token Pass reply for an earlier credential does not speak for the current one" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var app = TokenPassCheckFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    // The user picked another model, so the restarted check settles without
+    // asking AI Gateway again.
+    try app.selected_model.appendSlice(app.alloc, "provider/chosen");
+
+    try app.startQuietCheck();
+    // A login or team change while the check runs moves to a new epoch.
+    app.model_cache.token_pass_epoch += 1;
+    try app.collectReply();
+
+    try std.testing.expectEqual(token_pass.Status.unknown, app.model_cache.tokenPassStatus());
+    try std.testing.expect(app.model_cache.token_pass_default != .pending);
+    try std.testing.expectEqual(@as(usize, 1), app.fetches.load(.seq_cst));
+}
+
+test "a Token Pass reply for the current credential marks the team and queues the default" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var app = TokenPassCheckFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    try app.selected_model.appendSlice(app.alloc, "builtin/default");
+
+    try app.startQuietCheck();
+    try app.collectReply();
+
+    try std.testing.expectEqual(token_pass.Status.active, app.model_cache.tokenPassStatus());
+    try std.testing.expect(app.model_cache.token_pass_default == .pending);
+    try std.testing.expectEqual(@as(usize, 1), app.fetches.load(.seq_cst));
+}
+
 test "app_commands routes clear through carry-forward session reset" {
     var app = ClearCommandFakeApp{};
 
