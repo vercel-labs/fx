@@ -1489,11 +1489,11 @@ pub const Runtime = struct {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (self.closingIndexLocked(child_id) != null) {
-            // The turn that ended was the last thing holding the closing
-            // child, so it is no longer busy and its close can be written
-            // (`settleClose`, after this lock is released). Left marked, the
-            // close would wait on a work that already ended and never be
-            // written: the child would come back after a restart.
+            // A closing child takes no next work, as when a slot's work ends
+            // (`endClosingWork`): what waits for it is dropped and it stops
+            // counting as working. The close is written below, once nothing
+            // of it runs.
+            _ = self.dropPendingLocked(child_id, "closed");
             self.clearBusyLocked(child_id);
             return;
         }
