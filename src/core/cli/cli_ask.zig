@@ -3075,7 +3075,13 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const questions_value = parsed.value.object.get("questions") orelse return null;
+    var questions_value = parsed.value.object.get("questions") orelse return null;
+    // The tool reads the batch from JSON text too, so the record names the
+    // same question.
+    tool_args.normalizeCompositeArrayValue(parsed.arena.allocator(), &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (questions_value != .array or questions_value.array.items.len == 0) return null;
     const first = questions_value.array.items[0];
     if (first != .object) return null;
@@ -4800,8 +4806,6 @@ const TestContextRegistryFixture = struct {
     var gather_calls: usize = 0;
     var process_calls: usize = 0;
     var gather_error: ?context_contract.ProviderError = null;
-    var expected_target_paths: []const []const u8 = &.{};
-    var targets_match: bool = false;
     var expected_queued_image: ?[]const u8 = null;
     var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
@@ -4812,8 +4816,6 @@ const TestContextRegistryFixture = struct {
         gather_calls = 0;
         process_calls = 0;
         gather_error = null;
-        expected_target_paths = &.{};
-        targets_match = false;
         expected_queued_image = null;
         queued_image_folder_rules = false;
         expected_static_context = expected_static;
@@ -4821,17 +4823,8 @@ const TestContextRegistryFixture = struct {
         transient_permission_mode = null;
     }
 
-    fn gather(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
+    fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
         gather_calls += 1;
-        targets_match = input.targets.len == expected_target_paths.len;
-        if (targets_match) {
-            for (input.targets, expected_target_paths) |target, expected_path| {
-                if (target.kind != .file or !std.mem.eql(u8, target.path, expected_path)) {
-                    targets_match = false;
-                    break;
-                }
-            }
-        }
         if (gather_error) |err| return err;
         var result: context_contract.ProviderContext = .{
             .content = try alloc.dupe(u8, test_registry_static_context),
@@ -4871,7 +4864,6 @@ const TestContextRegistryFixture = struct {
         process_calls += 1;
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
-        if (expected_gather_calls > 0) try std.testing.expect(targets_match);
         queued_image_folder_rules = deps.image_folder_rules;
         if (expected_queued_image) |path| {
             try std.testing.expectEqual(@as(usize, 1), job.images.len);
@@ -8431,6 +8423,30 @@ test "fx ask JSON records ask_user_question text for matching assertions" {
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
 }
 
+test "fx ask JSON names the question of a batch sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const call = struct {
+        fn of(arguments_json: []const u8) ToolCall {
+            return .{ .id = "question", .name = "ask_user_question", .arguments_json = arguments_json };
+        }
+    }.of;
+
+    const text = (try questionTextForAskCall(alloc, call("{\"questions\":\"[{\\\"question\\\":\\\" Which path? \\\"}]\"}"))).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Which path?", text);
+
+    // Text that does not hold a batch names no question, including a batch
+    // encoded twice.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "[{\"question\":\"Twice?\"}]", .{});
+    for ([_][]const u8{ "not json", "{}", "[]", "[1]", twice }) |questions_text| {
+        const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = questions_text }, .{});
+        try std.testing.expect((try questionTextForAskCall(alloc, call(arguments_json))) == null);
+    }
+}
+
 test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
     const alloc = std.testing.allocator;
     var question_bytes: [257]u8 = undefined;
@@ -8612,10 +8628,9 @@ test "default fx ask keeps image paths out of the initial context and has the ru
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
-    // The instructions' context names no target, so an image never changes
-    // them; the turn carries the image's path and the runtime delivers its
-    // folder's rules as a note.
-    try std.testing.expect(TestContextRegistryFixture.targets_match);
+    // The instructions' context cannot name a target, so an image never
+    // changes them; the turn carries the image's path and the runtime
+    // delivers its folder's rules as a note.
     try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 

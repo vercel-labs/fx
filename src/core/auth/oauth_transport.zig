@@ -24,6 +24,12 @@ pub const Request = struct {
     /// Overrides the transport's response size limit for a request whose
     /// body is expected to be larger than an OAuth response.
     max_response_bytes: ?usize = null,
+    /// Set on a refresh's requests, from its token request until it saves the
+    /// new tokens. Once sent, `Cancellable` never cuts one off: an issuer
+    /// that rotates refresh tokens has retired the stored one by the time it
+    /// answers, so a dropped answer would sign out every fx process that
+    /// shares the sign-in. Only the request's deadline ends it.
+    outlives_cancel: bool = false,
 };
 
 pub const Disposition = enum {
@@ -68,7 +74,9 @@ pub const Provider = struct {
 };
 
 /// Sends every request through `inner` with `cancel_flag` set, so the owner
-/// of a background request can stop it. Must outlive the requests it sends.
+/// of a background request can stop it. A request that `outlives_cancel` is
+/// not sent once cancelled, and runs to the end once sent. Must outlive the
+/// requests it sends.
 pub const Cancellable = struct {
     inner: Provider,
     cancel_flag: *std.atomic.Value(bool),
@@ -79,6 +87,10 @@ pub const Cancellable = struct {
 
     fn execute(raw: ?*anyopaque, alloc: Allocator, request: Request) !Response {
         const self: *Cancellable = @ptrCast(@alignCast(raw.?));
+        if (request.outlives_cancel) {
+            if (self.cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return self.inner.execute(alloc, request);
+        }
         var bounded = request;
         bounded.cancel_flag = self.cancel_flag;
         return self.inner.execute(alloc, bounded);
@@ -111,6 +123,17 @@ test "cancellable transport adds its cancel flag to every request" {
     };
     var response = try cancellable.provider().execute(std.testing.allocator, .{ .method = .get, .url = "https://issuer.test" });
     defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(&cancel, recorder.seen.?);
+
+    // A refresh's request runs without the flag, so a cancel never cuts it off.
+    recorder.seen = &cancel;
+    var refresh = try cancellable.provider().execute(std.testing.allocator, .{ .method = .post_form, .url = "https://issuer.test/token", .outlives_cancel = true });
+    defer refresh.deinit(std.testing.allocator);
+    try std.testing.expect(recorder.seen == null);
+    // Once cancelled, it is never sent.
+    recorder.seen = &cancel;
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, cancellable.provider().execute(std.testing.allocator, .{ .method = .post_form, .url = "https://issuer.test/token", .outlives_cancel = true }));
     try std.testing.expectEqual(&cancel, recorder.seen.?);
 }
 

@@ -150,8 +150,10 @@ const SelectionOptions = struct {
     delivered_sources: []const []const u8 = &.{},
     evaluated_endpoints: []const []const u8 = &.{},
     remind_sources: []const []const u8 = &.{},
-    initial_omissions: []const context_contract.ContextOmissionInput = &.{},
-    initial_omission_summary: ?context_contract.ContextOmissionSummary = null,
+    /// Omissions the host carried in with a turn's attachments: the ones that
+    /// were not usable as files.
+    attached_omissions: []const context_contract.ContextOmissionInput = &.{},
+    attached_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
     initial: bool,
     instruction_files: context_contract.InstructionFiles = .filesystem,
@@ -241,9 +243,8 @@ fn gatherProjectContextWithHome(
 ) context_contract.ProviderError!ProviderContext {
     return selectProjectContext(alloc, .{
         .workspace_root = input.workspace_root,
-        .targets = input.targets,
-        .initial_omissions = input.omissions,
-        .initial_omission_summary = input.omission_summary,
+        // The instructions name no file a turn attaches.
+        .targets = &.{},
         .home = home,
         .initial = true,
         .instruction_files = input.instruction_files,
@@ -258,6 +259,8 @@ fn selectApplicableProjectContext(alloc: Allocator, input: LaterContextInput) co
         .delivered_sources = input.delivered_sources,
         .evaluated_endpoints = input.evaluated_endpoints,
         .remind_sources = input.remind_sources,
+        .attached_omissions = input.omissions,
+        .attached_omission_summary = input.omission_summary,
         .initial = false,
         .instruction_files = input.instruction_files,
         .context_limits = input.context_limits,
@@ -273,10 +276,10 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         .remind_sources = options.remind_sources,
     };
 
-    for (options.initial_omissions) |omission| {
+    for (options.attached_omissions) |omission| {
         try scratch.addOmission(omission.source, omission.reason);
     }
-    if (options.initial_omission_summary) |summary| scratch.omission_summary.merge(summary);
+    if (options.attached_omission_summary) |summary| scratch.omission_summary.merge(summary);
 
     var global_rule: ?LoadedRule = null;
     var global_source_path: ?[]const u8 = null;
@@ -1495,7 +1498,7 @@ test "initial gather omits a global AGENTS symlink that leaves home" {
     try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
 }
 
-test "initial gather orders global ancestors workspace and exact hidden and build target scopes" {
+test "initial gather orders global ancestors and workspace scopes and names no target scope" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1506,11 +1509,42 @@ test "initial gather orders global ancestors workspace and exact hidden and buil
     try writeTestFile(tmp.dir, "home/projects/work/.github/AGENTS.md", "RULE_HIDDEN");
     try writeTestFile(tmp.dir, "home/projects/work/build/AGENTS.md", "RULE_BUILD");
     try writeTestFile(tmp.dir, "home/projects/work/dist/AGENTS.md", "RULE_UNRELATED");
-    try writeTestFile(tmp.dir, "home/projects/work/.github/workflows/ci.yml", "");
-    try writeTestFile(tmp.dir, "home/projects/work/build/generated/out.zig", "");
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/work");
+    defer alloc.free(workspace);
+
+    var context = try gatherProjectContextWithHome(alloc, .{ .workspace_root = workspace }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    const global_index = std.mem.find(u8, visible, "RULE_GLOBAL") orelse return error.TestExpectedEqual;
+    const parent_index = std.mem.find(u8, visible, "RULE_PARENT") orelse return error.TestExpectedEqual;
+    const workspace_index = std.mem.find(u8, visible, "RULE_WORKSPACE") orelse return error.TestExpectedEqual;
+    try std.testing.expect(global_index < parent_index);
+    try std.testing.expect(parent_index < workspace_index);
+    // The instructions hold no folder a turn's files bring: those arrive as a note.
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_HIDDEN") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_BUILD") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_UNRELATED") == null);
+    try std.testing.expect(std.mem.find(u8, visible, project_instruction_guidance) != null);
+    try std.testing.expectEqual(@as(usize, 3), context.delivered_sources.len);
+    try std.testing.expectEqual(@as(usize, 1), context.evaluated_endpoints.len);
+}
+
+test "later selection orders the exact hidden and build target scopes and leaves the unrelated one out" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/projects/work/AGENTS.md", "RULE_WORKSPACE");
+    try writeTestFile(tmp.dir, "home/projects/work/.github/AGENTS.md", "RULE_HIDDEN");
+    try writeTestFile(tmp.dir, "home/projects/work/build/AGENTS.md", "RULE_BUILD");
+    try writeTestFile(tmp.dir, "home/projects/work/dist/AGENTS.md", "RULE_UNRELATED");
+    try writeTestFile(tmp.dir, "home/projects/work/.github/workflows/ci.yml", "");
+    try writeTestFile(tmp.dir, "home/projects/work/build/generated/out.zig", "");
+
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/work");
     defer alloc.free(workspace);
     const hidden_target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/work/.github/workflows/ci.yml");
@@ -1518,29 +1552,26 @@ test "initial gather orders global ancestors workspace and exact hidden and buil
     const build_target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/work/build/generated/out.zig");
     defer alloc.free(build_target);
 
-    var context = try gatherProjectContextWithHome(alloc, .{
+    var context = try selectApplicableProjectContext(alloc, .{
         .workspace_root = workspace,
         .targets = &.{
             .{ .path = build_target, .kind = .file },
             .{ .path = hidden_target, .kind = .file },
         },
-    }, home);
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
     defer context.deinit(alloc);
     const visible = context.modelVisibleBytes();
 
-    const global_index = std.mem.find(u8, visible, "RULE_GLOBAL") orelse return error.TestExpectedEqual;
-    const parent_index = std.mem.find(u8, visible, "RULE_PARENT") orelse return error.TestExpectedEqual;
-    const workspace_index = std.mem.find(u8, visible, "RULE_WORKSPACE") orelse return error.TestExpectedEqual;
     const hidden_index = std.mem.find(u8, visible, "RULE_HIDDEN") orelse return error.TestExpectedEqual;
     const build_index = std.mem.find(u8, visible, "RULE_BUILD") orelse return error.TestExpectedEqual;
-    try std.testing.expect(global_index < parent_index);
-    try std.testing.expect(parent_index < workspace_index);
-    try std.testing.expect(workspace_index < hidden_index);
     try std.testing.expect(hidden_index < build_index);
     try std.testing.expect(std.mem.find(u8, visible, "RULE_UNRELATED") == null);
-    try std.testing.expect(std.mem.find(u8, visible, project_instruction_guidance) != null);
-    try std.testing.expectEqual(@as(usize, 5), context.delivered_sources.len);
-    try std.testing.expectEqual(@as(usize, 3), context.evaluated_endpoints.len);
+    // The workspace's own rules are the instructions' business, never a note's.
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_WORKSPACE") == null);
+    try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
+    try std.testing.expectEqual(@as(usize, 2), context.evaluated_endpoints.len);
 }
 
 test "initial gather renders an identical global and workspace source once" {
@@ -1599,17 +1630,17 @@ test "scoped selection keeps the nearest readable cap and reports unusable and c
     defer alloc.free(target_path);
     try writeTestFile(tmp.dir, target_path, "");
 
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
     defer alloc.free(workspace);
     const target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, target_path);
     defer alloc.free(target);
 
-    var context = try gatherProjectContextWithHome(alloc, .{
+    var context = try selectApplicableProjectContext(alloc, .{
         .workspace_root = workspace,
         .targets = &.{.{ .path = target, .kind = .file }},
-    }, home);
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
     defer context.deinit(alloc);
     const visible = context.modelVisibleBytes();
 
@@ -2164,6 +2195,172 @@ test "host instruction files load scoped rules for later targets" {
     try std.testing.expectEqual(@as(usize, 1), FakeInstructionHost.reads);
 }
 
+test "a later selection reports the omissions a host carried in with the rules it delivers" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{
+        .{ .path = "/workspace/AGENTS.md", .content = "PROJECT_HOST_RULE" },
+        .{ .path = "/workspace/src/AGENTS.md", .content = "SCOPED_HOST_RULE" },
+    });
+    defer FakeInstructionHost.reset(&.{});
+    const omissions = [_]context_contract.ContextOmissionInput{.{ .source = "https://example.test/doc.md", .reason = .unsafe_target }};
+    var summary: context_contract.ContextOmissionSummaryBuilder = .{};
+    summary.add("https://example.test/more.md", .unsafe_target);
+
+    var later = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{.{ .path = "/workspace/src/main.zig", .kind = .file }},
+        .delivered_sources = &.{"/workspace/AGENTS.md"},
+        .evaluated_endpoints = &.{"/workspace"},
+        .omissions = &omissions,
+        .omission_summary = summary.finish(),
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer later.deinit(alloc);
+
+    const visible = later.modelVisibleBytes();
+    try std.testing.expect(std.mem.startsWith(u8, visible, "<scoped-rules from=\"src/AGENTS.md\""));
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted from=\"https://example.test/doc.md\" reason=\"unsafe target\" />") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted-summary omitted_count=\"1\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), later.delivered_sources.len);
+    // The user hears of the retained record, as for a tool call's selection.
+    try std.testing.expectEqual(@as(usize, 2), later.notices.len);
+}
+
+const fuzz_attached_rule_files = [_]FakeInstructionHost.File{
+    .{ .path = "/workspace/AGENTS.md", .content = "ROOT_RULE" },
+    .{ .path = "/workspace/a/AGENTS.md", .content = "A_RULE" },
+    .{ .path = "/workspace/a/b/AGENTS.md", .content = "AB_RULE" },
+    .{ .path = "/workspace/c/AGENTS.md", .content = "C_RULE" },
+    .{ .path = "/workspace/d/AGENTS.md", .content = " \n" },
+};
+
+/// Pieces of attached paths and URIs, in and out of the workspace, with the
+/// shapes a client sends: relative and remote sources, doubled and trailing
+/// separators, and bytes outside ASCII.
+const fuzz_attached_pieces = [_][]const u8{
+    "/workspace", "/a", "/b", "/c",   "/d",      "/e",                   "/x.md",  "/AGENTS.md",
+    "//",         "/",  "~",  "docs", "file://", "https://example.test", "\u{e9}", " ",
+};
+
+/// Draws for `driveAttachedSelection` from a fuzzer, with one hash per draw
+/// site so the fuzzer tells the draws apart.
+const AttachedFuzzDraws = struct {
+    smith: *std.testing.Smith,
+
+    fn below(self: AttachedFuzzDraws, n: usize, site: u32) usize {
+        return self.smith.indexWithHash(n, site);
+    }
+
+    fn flag(self: AttachedFuzzDraws, site: u32) bool {
+        return self.smith.valueWithHash(bool, site);
+    }
+};
+
+/// Draws for `driveAttachedSelection` from a seeded generator.
+const AttachedSeededDraws = struct {
+    random: std.Random,
+
+    fn below(self: AttachedSeededDraws, n: usize, _: u32) usize {
+        return self.random.uintLessThan(usize, n);
+    }
+
+    fn flag(self: AttachedSeededDraws, _: u32) bool {
+        return self.random.boolean();
+    }
+};
+
+/// Attaches the files and carried-in omissions `draws` chooses, as a host
+/// that names them by absolute path would, and checks what the selection for
+/// a turn's attachments must keep: rules come only from folders inside the
+/// workspace, each once, what it says stays bounded, the carried-in omissions
+/// are reported, and the same attachments again deliver no rule twice.
+fn driveAttachedSelection(draws: anytype) !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    FakeInstructionHost.reset(&fuzz_attached_rule_files);
+    defer FakeInstructionHost.reset(&.{});
+
+    const targets = try arena.alloc(context_contract.ApplicableTarget, draws.below(9, 1));
+    for (targets) |*target| {
+        var path: std.ArrayList(u8) = .empty;
+        for (0..1 + draws.below(5, 2)) |_| {
+            try path.appendSlice(arena, fuzz_attached_pieces[draws.below(fuzz_attached_pieces.len, 3)]);
+        }
+        target.* = .{ .path = path.items, .kind = if (draws.flag(4)) .file else .directory };
+    }
+    // As a host that keeps `project_omission_records` records and sums up the rest.
+    const omitted = draws.below(40, 5);
+    const kept = @min(omitted, retained_omission_count);
+    const omissions = try arena.alloc(context_contract.ContextOmissionInput, kept);
+    var summary: context_contract.ContextOmissionSummaryBuilder = .{};
+    for (0..omitted) |index| {
+        const source = fuzz_attached_pieces[draws.below(fuzz_attached_pieces.len, 6)];
+        if (index < kept) omissions[index] = .{ .source = source, .reason = .unsafe_target } else summary.add(source, .unsafe_target);
+    }
+
+    var first = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = targets,
+        .delivered_sources = &.{"/workspace/AGENTS.md"},
+        .evaluated_endpoints = &.{"/workspace"},
+        .omissions = omissions,
+        .omission_summary = summary.finish(),
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer first.deinit(alloc);
+
+    for (first.delivered_sources, 0..) |source, index| {
+        try std.testing.expect(std.mem.startsWith(u8, source, "/workspace/"));
+        try std.testing.expect(std.mem.endsWith(u8, source, "/AGENTS.md"));
+        try std.testing.expect(!std.mem.eql(u8, source, "/workspace/AGENTS.md"));
+        for (first.delivered_sources[0..index]) |earlier| try std.testing.expect(!std.mem.eql(u8, earlier, source));
+    }
+    const visible = first.modelVisibleBytes();
+    try std.testing.expect(visible.len < 256 * 1024);
+    try std.testing.expect(std.mem.count(u8, visible, "<project-rules-omitted from=") <= retained_omission_count);
+    if (omitted > 0) try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted") != null);
+
+    var delivered: std.ArrayList([]const u8) = .empty;
+    try delivered.append(arena, "/workspace/AGENTS.md");
+    for (first.delivered_sources) |source| try delivered.append(arena, source);
+    var evaluated: std.ArrayList([]const u8) = .empty;
+    try evaluated.append(arena, "/workspace");
+    for (first.evaluated_endpoints) |endpoint| try evaluated.append(arena, endpoint);
+    var again = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = targets,
+        .delivered_sources = delivered.items,
+        .evaluated_endpoints = evaluated.items,
+        .remind_sources = first.delivered_sources,
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), again.delivered_sources.len);
+    for (again.reminded_sources) |source| {
+        var delivered_before = false;
+        for (first.delivered_sources) |earlier| delivered_before = delivered_before or std.mem.eql(u8, earlier, source);
+        try std.testing.expect(delivered_before);
+    }
+}
+
+fn fuzzAttachedSelection(_: void, smith: *std.testing.Smith) !void {
+    try driveAttachedSelection(AttachedFuzzDraws{ .smith = smith });
+}
+
+test "attached files and carried-in omissions keep the selection bounded and inside the workspace" {
+    try std.testing.fuzz({}, fuzzAttachedSelection, .{
+        // Empty input draws the smallest values: no attachment at all.
+        .corpus = &(.{""} ++ @import("fuzz_corpus").attached_selection.*),
+    });
+}
+
+test "attached files and carried-in omissions keep the selection's rules on seeded random draws" {
+    var prng: std.Random.DefaultPrng = .init(20261110);
+    for (0..2000) |_| try driveAttachedSelection(AttachedSeededDraws{ .random = prng.random() });
+}
+
 test "host rule classification matches filesystem size and encoding rules" {
     const limit: context_limits.Resolved = .{ .value = .{ .bytes = 8 }, .source = .command_line };
     const unbounded = std.math.maxInt(usize);
@@ -2211,17 +2408,27 @@ test "host rule classification matches filesystem size and encoding rules" {
     }
 }
 
-test "hosts without instruction files keep client omissions and skip home probes" {
+test "hosts without instruction files skip home probes and still report carried-in omissions" {
     const alloc = std.testing.allocator;
+    var initial = try selectProjectContext(alloc, .{
+        .workspace_root = "/repo",
+        .targets = &.{},
+        .home = "/repo",
+        .initial = true,
+        .instruction_files = .none,
+    });
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), initial.modelVisibleBytes().len);
+    try std.testing.expectEqual(@as(usize, 0), initial.notices.len);
+
     var context = try selectProjectContext(alloc, .{
         .workspace_root = "/repo",
         .targets = &.{},
-        .initial_omissions = &.{.{
+        .attached_omissions = &.{.{
             .source = "https://example.test/context.txt",
             .reason = .unsafe_target,
         }},
-        .home = "/repo",
-        .initial = true,
+        .initial = false,
         .instruction_files = .none,
     });
     defer context.deinit(alloc);
@@ -2288,17 +2495,17 @@ test "applicable symlinked rules are omitted without exposing their target" {
     try createSymlinkOrSkip(tmp.dir, secret, "home/work/src/AGENTS.md");
     try writeTestFile(tmp.dir, "home/work/src/main.zig", "");
 
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
     defer alloc.free(workspace);
     const target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work/src/main.zig");
     defer alloc.free(target);
 
-    var context = try gatherProjectContextWithHome(alloc, .{
+    var context = try selectApplicableProjectContext(alloc, .{
         .workspace_root = workspace,
         .targets = &.{.{ .path = target, .kind = .file }},
-    }, home);
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
     defer context.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "DO_NOT_EXPOSE") == null);
     try std.testing.expect(std.mem.find(
@@ -2343,23 +2550,24 @@ test "a rules file cannot close its block or forge a runtime context update (D93
     );
 }
 
-test "initial omissions remain model visible without snapshot side state" {
+test "carried-in omissions remain model visible without snapshot side state" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "home/work");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
     defer alloc.free(workspace);
 
-    var context = try gatherProjectContextWithHome(alloc, .{
+    var context = try selectApplicableProjectContext(alloc, .{
         .workspace_root = workspace,
+        .targets = &.{},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
         .omissions = &.{.{
             .source = "https://example.test/a&b",
             .reason = .unsafe_target,
         }},
-    }, home);
+    });
     defer context.deinit(alloc);
 
     try std.testing.expect(std.mem.find(
@@ -2374,8 +2582,6 @@ test "project omission consequences bound oversized sources independently of the
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "home/work");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
     defer alloc.free(workspace);
 
@@ -2395,14 +2601,17 @@ test "project omission consequences bound oversized sources independently of the
     for (total_limits) |total_limit| {
         var limits = context_limits.Values{};
         limits.project_instructions_total_bytes = total_limit;
-        var context = try gatherProjectContextWithHome(alloc, .{
+        var context = try selectApplicableProjectContext(alloc, .{
             .workspace_root = workspace,
+            .targets = &.{},
+            .delivered_sources = &.{},
+            .evaluated_endpoints = &.{},
             .omissions = &.{.{
                 .source = oversized_source,
                 .reason = .unsafe_target,
             }},
             .context_limits = limits,
-        }, home);
+        });
         defer context.deinit(alloc);
 
         try std.testing.expect(context.modelVisibleBytes().len < 4096);
@@ -2424,8 +2633,6 @@ test "project omission consequences stay bounded across many sources" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "home/work");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
     defer alloc.free(workspace);
 
@@ -2448,11 +2655,14 @@ test "project omission consequences stay bounded across many sources" {
     for (total_limits) |total_limit| {
         var limits = context_limits.Values{};
         limits.project_instructions_total_bytes = total_limit;
-        var context = try gatherProjectContextWithHome(alloc, .{
+        var context = try selectApplicableProjectContext(alloc, .{
             .workspace_root = workspace,
+            .targets = &.{},
+            .delivered_sources = &.{},
+            .evaluated_endpoints = &.{},
             .omissions = omissions,
             .context_limits = limits,
-        }, home);
+        });
         defer context.deinit(alloc);
 
         try std.testing.expect(context.modelVisibleBytes().len < 64 * 1024);
