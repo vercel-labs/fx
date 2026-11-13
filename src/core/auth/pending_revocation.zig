@@ -380,6 +380,9 @@ fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) anyerror!void {
     _ = try native_keychain.deleteOAuthPendingRevocations(alloc);
 }
 
+/// Whether opening a record may create the profile folder.
+const Open = enum { existing, create };
+
 /// Where a source's record is.
 const Place = struct {
     source: Source,
@@ -396,8 +399,8 @@ const Place = struct {
         return .{ .source = source, .keychain = if (in_keychain) native_keychain_backend else null };
     }
 
-    /// The profile folder, or null when there is none and `create` is false.
-    fn openProfile(self: Place, create: bool) !?io_mod.VerifiedDir {
+    /// The profile folder, or null when there is none and `open` is `.existing`.
+    fn openProfile(self: Place, open: Open) !?io_mod.VerifiedDir {
         if (comptime host_target.is_wasm) return null;
         var opened: ?std.Io.Dir = null;
         defer if (opened) |dir| dir.close(io_mod.getIo());
@@ -409,7 +412,7 @@ const Place = struct {
             };
             break :blk opened.?;
         };
-        if (create) return try io_mod.openOrCreateVerifiedPrivateDirFromDir(parent, profile_paths.rootName());
+        if (open == .create) return try io_mod.openOrCreateVerifiedPrivateDirFromDir(parent, profile_paths.rootName());
         var verified_parent: io_mod.VerifiedDir = .{ .dir = parent };
         return subscription_session.openExistingPrivateFxDir(&verified_parent) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -420,7 +423,7 @@ const Place = struct {
     /// Whether a record seems to exist, checked without the lock: a record
     /// that another fx writes at the same time waits for the next retry.
     fn recordExists(self: Place) !bool {
-        var fx_dir = (try self.openProfile(false)) orelse return false;
+        var fx_dir = (try self.openProfile(.existing)) orelse return false;
         defer fx_dir.close();
         const name = if (self.keychain != null) keychain_marker else self.source.files().record;
         var current = (try session_presence.openCurrent(fx_dir.dir, name)) orelse return false;
@@ -439,8 +442,8 @@ const Mutation = struct {
     /// Set by `load` when it dropped a record it could not read.
     dropped_unreadable: bool = false,
 
-    fn begin(place: Place, create: bool) !?Mutation {
-        var fx_dir = (try place.openProfile(create)) orelse return null;
+    fn begin(place: Place, open: Open) !?Mutation {
+        var fx_dir = (try place.openProfile(open)) orelse return null;
         errdefer fx_dir.close();
         const files = place.source.files();
         const taken = try leased_lock.acquire(&fx_dir, files.lock, io_mod.awakeMilliTimestamp(), lock_wait_ms, .{}, "auth", files.label);
@@ -540,7 +543,7 @@ pub fn keep(alloc: Allocator, source: Source, tokens: Tokens) bool {
 
 fn keepAt(alloc: Allocator, place: Place, tokens: Tokens, now_ms: i64, lease: ?Lease) !void {
     if (!tokens.valid()) return error.InvalidKeptSignOut;
-    var mutation = (try Mutation.begin(place, true)) orelse return error.KeptSignOutsUnavailable;
+    var mutation = (try Mutation.begin(place, .create)) orelse return error.KeptSignOutsUnavailable;
     defer mutation.deinit();
     var list = try mutation.load(alloc);
     defer list.deinit(alloc);
@@ -560,7 +563,7 @@ pub fn forget(alloc: Allocator, source: Source, refresh_token: []const u8) void 
 }
 
 fn forgetAt(alloc: Allocator, place: Place, refresh_token: []const u8) !void {
-    var mutation = (try Mutation.begin(place, false)) orelse return;
+    var mutation = (try Mutation.begin(place, .existing)) orelse return;
     defer mutation.deinit();
     var list = try mutation.load(alloc);
     defer list.deinit(alloc);
@@ -612,7 +615,7 @@ pub fn retry(alloc: Allocator, source: Source, revoker: Revoker, before: ?oauth.
 fn retryAt(alloc: Allocator, place: Place, now_ms: i64, revoker: Revoker, before: ?oauth.BeforeRevocation) !RetryOutcome {
     if (!try place.recordExists()) return .{};
     var kept = blk: {
-        var mutation = (try Mutation.begin(place, false)) orelse return .{};
+        var mutation = (try Mutation.begin(place, .existing)) orelse return .{};
         defer mutation.deinit();
         var list = try mutation.load(alloc);
         defer list.deinit(alloc);
@@ -670,7 +673,7 @@ fn testPlace(tmp: *testing.TmpDir, source: Source) Place {
 /// The refresh tokens kept at `place`, oldest first. The caller frees the
 /// outer slice and each token.
 fn keptTokens(alloc: Allocator, place: Place) ![][]u8 {
-    var mutation = (try Mutation.begin(place, false)) orelse return &.{};
+    var mutation = (try Mutation.begin(place, .existing)) orelse return &.{};
     defer mutation.deinit();
     var list = try mutation.load(alloc);
     defer list.deinit(alloc);
@@ -916,7 +919,7 @@ test "the fx login's sign-out keeps its issuer, client id, and both tokens" {
     defer tmp.cleanup();
     const place = testPlace(&tmp, .fx_login);
     try keepAt(testing.allocator, place, .{ .refresh_token = "refresh", .access_token = "access", .issuer = "https://vercel.com", .client_id = "cl_1" }, 1, null);
-    var mutation = (try Mutation.begin(place, false)).?;
+    var mutation = (try Mutation.begin(place, .existing)).?;
     defer mutation.deinit();
     var list = try mutation.load(testing.allocator);
     defer list.deinit(testing.allocator);
