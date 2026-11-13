@@ -1039,15 +1039,14 @@ pub fn Commands(comptime App: type) type {
             try applyEffort(app, agent, effort, .named, true);
         }
 
-        /// Ctrl+T: moves `agent`'s model to the next reasoning effort level
-        /// in the order the model lists them, and from the last one back to
-        /// the first. The Gateway catalog lists levels lowest first.
-        /// `default`, or a level the model does not offer, moves to the
-        /// first. Saves the level as `/effort` does and, unless saving fails
-        /// or leaves a warning, writes nothing to the transcript, as
-        /// Shift+Tab does for the permission mode: the status line names the
-        /// level in use. A running turn keeps the effort it started with. A
-        /// model without levels gets a notice saying so.
+        /// Ctrl+T: moves `agent`'s model to the next effort in the cycle
+        /// `default`, then each level the model lists in its order, then
+        /// `default` again (`model_capabilities.nextReasoningEffort`). Saves
+        /// the effort as `/effort` does and, unless saving fails or leaves a
+        /// warning, writes nothing to the transcript, as Shift+Tab does for
+        /// the permission mode: the status line names the level in use. A
+        /// running turn keeps the effort it started with. A model without
+        /// levels gets a notice saying so.
         pub fn cycleEffort(app: *App, agent: *AppAgent) !void {
             const model = provider_runtime.modelOf(app, agent);
             const capabilities = model_capabilities.resolveForApp(App, app, model);
@@ -1055,8 +1054,6 @@ pub fn Commands(comptime App: type) type {
                 try writeNoEffortLevelsNotice(app, model, "ctrl+t");
                 return;
             };
-            // A model with one level that is already in use has nowhere to go.
-            if (next.eql(agent.effort)) return;
             try applyEffort(app, agent, next, .none, true);
         }
 
@@ -3358,7 +3355,7 @@ test "session_commands /effort and ctrl+t say why a model offers no levels" {
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "session_commands cycleEffort steps through the model's levels, syncs queued prompts, and saves each one" {
+test "session_commands cycleEffort steps through default and the model's levels, syncs queued prompts, and saves each one" {
     const alloc = std.testing.allocator;
     const model = "provider/new-reasoning-model";
     var app = try FakeApp.init(alloc, "/tmp/workspace", model);
@@ -3369,8 +3366,8 @@ test "session_commands cycleEffort steps through the model's levels, syncs queue
     };
     app.setGatewayControls(model, &efforts, false);
 
-    // `default` steps to the first level, and the last one wraps to it.
-    for ([_]types.ReasoningEffort{ efforts[0], efforts[1], efforts[0] }, 1..) |effort, press| {
+    // `default` steps to the first level, and the last one back to `default`.
+    for ([_]types.ReasoningEffort{ efforts[0], efforts[1], .auto, efforts[0] }, 1..) |effort, press| {
         try Commands(FakeApp).cycleEffort(&app, (&app).agent());
 
         try std.testing.expectEqual(effort, app.agent().effort);

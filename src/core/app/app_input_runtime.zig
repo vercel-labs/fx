@@ -9090,7 +9090,7 @@ const routing_cycle_efforts = [_]types.ReasoningEffort{
     types.ReasoningEffort.literal("high"),
 };
 
-test "app_input_runtime ctrl+t steps through the model's effort levels in order and around again" {
+test "app_input_runtime ctrl+t steps from default through the model's effort levels and back to default" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9099,8 +9099,8 @@ test "app_input_runtime ctrl+t steps through the model's effort levels in order 
     app.input_runtime.edit_state.cursor = 4;
 
     // From `default` the first press takes the first level the model lists,
-    // and the press after the last one goes back to it.
-    const expected = routing_cycle_efforts ++ [_]types.ReasoningEffort{routing_cycle_efforts[0]};
+    // and the press after the last one goes back to `default`.
+    const expected = routing_cycle_efforts ++ [_]types.ReasoningEffort{ .auto, routing_cycle_efforts[0] };
     for (expected, 1..) |effort, press| {
         app.shell.render_requests.clearReason(.footer);
         try feedRoutingBytes(&app, "\x14");
@@ -9136,7 +9136,7 @@ test "app_input_runtime ctrl+t reported as a key or after a bare escape still cy
     try std.testing.expectEqual(@as(usize, 2), app.preference_commit_count);
 }
 
-test "app_input_runtime ctrl+t moves a level the model does not offer to its first and stays on an only level" {
+test "app_input_runtime ctrl+t moves a level the model does not offer to default and toggles an only level" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9144,14 +9144,17 @@ test "app_input_runtime ctrl+t moves a level the model does not offer to its fir
     app.agent().effort = types.ReasoningEffort.literal("saved-for-another-model");
 
     try feedRoutingBytes(&app, "\x14");
-    try std.testing.expectEqual(routing_cycle_efforts[0], app.agent().effort);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.last_preference_effort.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
 
-    // One level already in use has nowhere to go, so nothing is saved again.
+    // A model with one level switches between it and `default`.
     app.setGatewayControls("test/model", routing_cycle_efforts[0..1], false);
-    try feedRoutingBytes(&app, "\x14");
-    try std.testing.expectEqual(routing_cycle_efforts[0], app.agent().effort);
-    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    for ([_]types.ReasoningEffort{ routing_cycle_efforts[0], .auto }, 2..) |effort, commits| {
+        try feedRoutingBytes(&app, "\x14");
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(commits, app.preference_commit_count);
+    }
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
 }
 

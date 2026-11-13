@@ -1,6 +1,6 @@
 // `/effort` opens a footer menu of the current model's reasoning effort
 // levels, like the `/model` menu, and `/effort <level>` applies one directly.
-// Ctrl+T steps to the model's next level without opening anything.
+// Ctrl+T steps through default and the model's levels without opening anything.
 // Every view of the menu is read back from the recorded tape through
 // `fx replay`, and the highlight from the bytes fx wrote for it, so these
 // tests check what the terminal showed, not the live pane alone.
@@ -491,7 +491,7 @@ test.skipIf(!tmuxAvailable())("a model without levels opens no /effort column, a
   expect(columnViews(current, "plain-column")).toEqual([]);
 }, TIMEOUT);
 
-test.skipIf(!tmuxAvailable())("Ctrl+T steps through the model's levels in their order and around again, and the next request carries the one in use", async () => {
+test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's levels and back to default, and the next request carries the one in use", async () => {
   const current = await launch();
   const { session, gateway } = current;
   // Over the open /effort menu, Ctrl+T closes it and steps from the level in
@@ -503,12 +503,18 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps through the model's levels in their 
   await session.waitForPane((pane) => !pane.includes("Effort 5") && pane.includes("auto · thinker · low"), 5_000);
   expect(savedEffort(current)).toBe("low");
 
-  // The status line names each level, and the draft stays as typed.
+  // The status line names each level, and the draft stays as typed. After
+  // the highest level comes default, which the status line leaves out.
   await session.sendLiteral("keep this draft");
-  for (const level of ["medium", "high", "xhigh", "low", "medium"]) {
+  for (const level of ["medium", "high", "xhigh", "default", "low", "medium"]) {
     await session.sendKeys("C-t");
-    await session.waitForText(`auto · thinker · ${level}`, 5_000);
-    expect(savedEffort(current)).toBe(level);
+    if (level === "default") {
+      await session.waitForPane((pane) => /^auto · thinker *$/m.test(pane), 5_000);
+      expect(savedEffort(current)).toBe("auto");
+    } else {
+      await session.waitForText(`auto · thinker · ${level}`, 5_000);
+      expect(savedEffort(current)).toBe(level);
+    }
   }
   const pane = await session.capturePane();
   expect(pane).toMatch(/^┃ keep this draft$/m);
