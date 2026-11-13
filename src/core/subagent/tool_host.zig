@@ -20,6 +20,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const profiles = @import("../profiles/profiles.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
@@ -4208,16 +4209,6 @@ fn askQuestionThread(worker: *worker_runtime.WorkerRuntime, returned: *std.Io.Ev
     }
 }
 
-/// Whether the thread that asked has returned, waited for on the event it sets,
-/// so a wait that does not end fails its test instead of hanging it.
-fn askerReturned(event: *std.Io.Event) bool {
-    event.waitTimeout(io_mod.getIo(), .{ .duration = .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(5000),
-    } }) catch return false;
-    return true;
-}
-
 test "the parent's stop ends a question that waits in a turn the user typed on a hosted subagent's screen" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4246,7 +4237,7 @@ test "the parent's stop ends a question that waits in a turn the user typed on a
     const thread = try std.Thread.spawn(.{}, askQuestionThread, .{ &hosted, &returned });
     try waitForBlockedOnUser(&hosted);
     _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-2", null);
-    const ended = askerReturned(&returned);
+    const ended = testing_event.setInTime(&returned);
     // A wait that stayed open is released, so the test fails instead of hanging.
     if (!ended) hosted.requestStop();
     thread.join();
