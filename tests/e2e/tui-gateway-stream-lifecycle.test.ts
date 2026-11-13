@@ -5148,6 +5148,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           "steering request while the command runs",
         );
         expect(existsSync(finishedPath)).toBe(false);
+        // The command has no exit status yet, so its row must not read "Ran".
+        const backgroundScrollback = await session.captureFullScrollback();
+        expect(backgroundScrollback).toContain("Still running while");
+        expect(backgroundScrollback).not.toContain("Ran while");
         const continuedBody = steeringGateway.requests[1]!.body;
         expect(continuedBody).toContain("<user_steering>");
         expect(continuedBody).toContain(steering);
