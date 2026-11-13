@@ -9792,8 +9792,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
     let phase = 0;
+    // A report that arrives while the parent's turn runs joins that turn
+    // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn), so the worker's
+    // reply waits until the seed run's first turn has finished.
+    const workerReply = heldFakeGatewayFinalText();
     const gateway = startDynamicFakeGateway((body) => {
-      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_SEED_DONE");
+      if (!body.includes('"name":"subagent"')) return phase === 0 ? workerReply.response : fakeGatewayFinalText("CHILD_SEED_DONE");
       if (phase === 0) {
         // The worker's report starts the seed run's second turn.
         if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_SEED_SENTINEL");
@@ -9804,11 +9808,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (phase === 2) expect(body).toContain("PARENT_CONTINUATION_SAVED");
       return fakeGatewayFinalText(phase === 1 ? "PARENT_CONTINUATION_SAVED" : "PARENT_REOPENED");
     }, { classifierDecision: "clear" });
-    const env = { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "subagent,session" };
+    const env = { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "subagent,session,worker" };
     try {
-      const seeded = await runFx(["ask", "--json", "--auto", "Start a saved conversation with a worker."], {
+      const seeding = runFx(["ask", "--json", "--auto", "Start a saved conversation with a worker."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
+      const firstTurnFinished = await waitUntil(() => mainTurnFinished(tracePath), 10_000);
+      workerReply.release("CHILD_SEED_DONE");
+      const seeded = await seeding;
+      expect(firstTurnFinished).toBe(true);
       expect(seeded.code).toBe(0);
       const id = parseAskJson(seeded.stdout).session_id;
       expect(id).not.toBe("");
@@ -9841,6 +9849,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(parseAskJson(reopened.stdout).session_id).toBe(id);
       expect(parseAskJson(reopened.stdout).final_output).toBe("PARENT_REOPENED");
     } finally {
+      workerReply.dispose();
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
@@ -13985,6 +13994,18 @@ async function waitUntil(done: () => boolean, timeoutMs: number): Promise<boolea
   const deadline = Date.now() + timeoutMs;
   while (!done() && Date.now() < deadline) await Bun.sleep(5);
   return done();
+}
+
+/** Whether the trace at `tracePath`, written with the `worker` scope, shows
+ * that main's first turn has finished. Main's worker is the one whose turn
+ * begins first; each subagent's turn runs on a worker of its own
+ * (`tests/tla/drivers/subagent/main-mail.test.ts`). */
+function mainTurnFinished(tracePath: string): boolean {
+  const lines = existsSync(tracePath) ? readFileSync(tracePath, "utf8").split("\n") : [];
+  const begun = lines.find((line) => line.includes("[worker] event=processing_begun "));
+  const worker = begun ? / worker=([0-9a-f]+)/.exec(begun)?.[1] : undefined;
+  return worker !== undefined &&
+    lines.some((line) => line.includes("[worker] event=processing_finished ") && line.includes(` worker=${worker} `));
 }
 
 function stopCall(id: string) {
