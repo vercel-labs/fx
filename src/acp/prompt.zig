@@ -31,6 +31,7 @@ const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
+const mcp_host = @import("../core/mcp_host/host.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
@@ -265,6 +266,19 @@ const AcpContext = struct {
     /// never opened steering cancels nothing this way.
     saw_host_steering_open: bool = false,
     closed_host_steering: bool = false,
+    /// The MCP host a subagent's turn uses, read once with its mode under the
+    /// authority lock, since a reload that keeps the subagent running may set
+    /// the session's host. Null for a prompt's own context: a reload joins
+    /// the prompt first, so it reads the session's.
+    captured_mcp_host: ?struct { host: ?*mcp_host.Host } = null,
+
+    /// The MCP host this turn's tools and approvals use.
+    fn mcpHost(self: *const AcpContext) ?*mcp_host.Host {
+        if (comptime host_target.is_wasm) return null;
+        if (self.captured_mcp_host) |captured| return captured.host;
+        const session = if (self.state.active_session) |*active| active else return null;
+        return session.mcp_host;
+    }
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -335,8 +349,7 @@ const AcpContext = struct {
 
     fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?catalog_state.ToolIdentity {
         if (comptime host_target.is_wasm) return null;
-        const session = if (self.state.active_session) |*active| active else return null;
-        const h = session.mcp_host orelse return null;
+        const h = self.mcpHost() orelse return null;
         return h.catalog.toolIdentity(arena, name) catch |err| {
             debug_trace.logf("acp", "tool call MCP identity unavailable tool={s} err={s}", .{ name, @errorName(err) });
             return null;
@@ -588,7 +601,7 @@ const AcpContext = struct {
             },
         };
         if (comptime !host_target.is_wasm) {
-            if (session.mcp_host) |h| h.catalog.wire(&tc);
+            if (self.mcpHost()) |h| h.catalog.wire(&tc);
         }
         return tc;
     }
@@ -1319,6 +1332,10 @@ pub fn runSubagentChild(
     };
     const session_id = active.session_id;
     const captured_mode = active.mode;
+    // A reload that keeps this child running sets both under this lock, so
+    // the turn reads each here once.
+    const captured_hooks = active.observer_hooks;
+    const captured_host = active.mcp_host;
     state.subagent_authority_mutex.unlock(io_mod.getIo());
     var ctx = AcpContext{
         .alloc = alloc,
@@ -1326,10 +1343,11 @@ pub fn runSubagentChild(
         .session_id = session_id,
         .captured_mode = captured_mode,
         .captured_permission_mode = admission.permission_mode,
+        .captured_mcp_host = .{ .host = captured_host },
     };
     defer ctx.deinitPublishedToolCalls();
     var child_bridge: libfx_hooks.Bridge = undefined;
-    if (active.observer_hooks) |hook_config| {
+    if (captured_hooks) |hook_config| {
         child_bridge.init(alloc, &state.writer, turn.child_id orelse session_id, message.id, hook_config);
         child_bridge.root_session_id = session_id;
         child_bridge.parent_session_id = admission.parent_id;
@@ -2569,11 +2587,10 @@ fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCal
 
 fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertised_dynamic_tool_names: []const []const u8) bool {
     if (comptime host_target.is_wasm) return false;
-    const session = if (ctx.state.active_session) |*active| active else null;
-    if (session) |s| if (s.mcp_host) |h| {
+    if (ctx.mcpHost()) |h| {
         const capabilities = h.catalog.runtimeCapabilities();
         return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, capabilities.context, capabilities.has_tool, .unrestricted);
-    };
+    }
     return false;
 }
 
@@ -3615,7 +3632,7 @@ fn requestAcpElicitation(
     var transition_state: mcp_elicitation.RequestState = .pending;
     // The MCP engine ties an answer to the call that asked, and drops it once that
     // call has ended, so its server counts as live here.
-    const host_session = if (responder.acp.state.active_session) |*active| active.mcp_host != null else false;
+    const host_session = responder.acp.mcpHost() != null;
     const transition = mcp_elicitation.decideTransition(
         transition_state,
         bindingForAcpInput(responder, origin),

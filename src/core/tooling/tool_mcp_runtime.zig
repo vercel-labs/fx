@@ -11,6 +11,8 @@ const access_policy = @import("../mcp/access_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
+/// Whether `access` is a subagent's view of servers that have changed since it was given, which allows nothing now.
+pub const AccessChangedFn = *const fn (*anyopaque, Access) bool;
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
 pub const SearchRequest = capability_retrieval.Request;

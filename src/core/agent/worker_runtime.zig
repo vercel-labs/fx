@@ -2911,6 +2911,16 @@ pub const WorkerRuntime = struct {
         return response;
     }
 
+    /// Whether a turn of this worker waits for the answer to a permission
+    /// request, and has not been stopped. It reads under the lock a request
+    /// holds while its observer registers it, so a request that is being
+    /// registered counts once it is.
+    pub fn permissionWaiting(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.permissionRequestAwaitedLocked();
+    }
+
     pub fn submitPermissionResponse(
         self: *WorkerRuntime,
         expected_request_id: u64,

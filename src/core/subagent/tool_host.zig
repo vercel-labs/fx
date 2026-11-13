@@ -321,6 +321,16 @@ pub const Runtime = struct {
         debug_trace.eventf("mailbox", "tree_closed", .{}, "owner={s}", .{self.ownerName()});
     }
 
+    /// Ends the turns of the children that wait on an approval, as a quit
+    /// ends them: each work ends interrupted and owes its report, which the
+    /// sink posts. The other children go on. Returns how many turns it ended.
+    /// For a host whose approvals reach no one, so none waits for ever.
+    pub fn interruptApprovalWaits(self: *Runtime) usize {
+        const count = self.managed.interruptApprovalWaits();
+        debug_trace.eventf("mailbox", "approval_waits_interrupted", .{}, "owner={s} count={d}", .{ self.ownerName(), count });
+        return count;
+    }
+
     pub fn rebindHost(
         self: *Runtime,
         host_context: ?*anyopaque,

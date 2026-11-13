@@ -3905,6 +3905,13 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     const provider = catalogProviderFor(state, active.provider) orelse return;
     std.debug.assert(state.active_prompt == null);
+    // A refresh replaces the catalog's entries, and a subagent that works
+    // reads them as it goes (`CapabilityResolver.refreshWithin`: the owner
+    // keeps readers out). So the catalog stays as it is until none works.
+    if (state.subagent_host) |subagents| if (!subagents.quiet()) {
+        debug_trace.logf("acp", "event=model_catalog_refresh_skipped session={s} reason=subagents_working", .{active.session_id});
+        return;
+    };
     // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
     try state.capability_resolver.refreshWithin(state.alloc, provider, .{

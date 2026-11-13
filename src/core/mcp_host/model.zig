@@ -166,6 +166,7 @@ pub const Catalog = struct {
     pub fn wire(c: *Catalog, tc: *tool_runtime.Context) void {
         tc.mcp_ctx = c;
         tc.mcp_has_tool = hasToolFn;
+        tc.mcp_access_changed = accessChangedFn;
         tc.mcp_validate_tool = validateToolFn;
         tc.mcp_call_tool = callToolFn;
         tc.mcp_search_tools = searchToolsFn;
@@ -556,6 +557,15 @@ pub const Catalog = struct {
         return epoch == c.runtime.toolsEpoch(server);
     }
 
+    /// Whether `access` is a subagent's view from before the servers last
+    /// changed: a server dropped since, so the view allows nothing now.
+    pub fn accessChanged(c: *const Catalog, access: Access) bool {
+        return switch (access) {
+            .scoped => |scope| scope.captured.runtime_generation != c.currentGeneration(),
+            .unrestricted, .servers, .disabled => false,
+        };
+    }
+
     /// False when `access` can allow nothing here: no MCP, or a subagent's
     /// view from another host. Checked before a list is loaded.
     fn mayAllow(c: *const Catalog, access: Access) bool {
@@ -928,6 +938,10 @@ fn hasToolFn(raw: *anyopaque, name: []const u8, access: Access) bool {
     return catalog(raw).hasTool(name, access);
 }
 
+fn accessChangedFn(raw: *anyopaque, access: Access) bool {
+    return catalog(raw).accessChanged(access);
+}
+
 fn validateToolFn(raw: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: Access) anyerror!tool_mcp_runtime.ValidationResult {
     return catalog(raw).validateTool(arena, name, arguments_json, access);
 }
@@ -1217,8 +1231,24 @@ test "a reload beside a call that is out and a reader of the access view ends on
     var gone_call: Caller = .{ .catalog = &c, .tool = "mcp_gone_echo", .access = child };
     var reader: Reader = .{ .catalog = &c };
     const kept_thread = try std.Thread.spawn(.{}, Caller.run, .{&kept_call});
+    var kept_joined = false;
+    // A failed wait stops and joins what still runs before the catalog and the runtime they use go.
+    errdefer if (!kept_joined) {
+        kept_call.cancel.store(true, .release);
+        kept_thread.join();
+    };
     const gone_thread = try std.Thread.spawn(.{}, Caller.run, .{&gone_call});
+    var gone_joined = false;
+    errdefer if (!gone_joined) {
+        gone_call.cancel.store(true, .release);
+        gone_thread.join();
+    };
     const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    errdefer if (!reader_joined) {
+        reader.stop.store(true, .release);
+        reader_thread.join();
+    };
     // Both calls are out at their servers, and the reader has read once.
     const fake: *const Fixture = &f;
     try waitUntil(fake, slowCallsOut);
@@ -1229,6 +1259,7 @@ test "a reload beside a call that is out and a reader of the access view ends on
     const reads_at_reload = reader.reads.load(.monotonic);
     try c.reload(try r.reload(&.{ kept, late }, &f.inherited));
     gone_thread.join();
+    gone_joined = true;
     try testing.expectEqual(@as(?anyerror, error.Cancelled), gone_call.err);
 
     // The reader reads on through the reload, and the kept server's call is still out.
@@ -1236,12 +1267,16 @@ test "a reload beside a call that is out and a reader of the access view ends on
     try testing.expect(!kept_call.done.load(.acquire));
     reader.stop.store(true, .release);
     reader_thread.join();
+    reader_joined = true;
 
     // A server went, so the view the subagent was given holds no longer, and its next call is refused.
     try testing.expect(generation != c.currentGeneration());
+    try testing.expect(c.accessChanged(child));
+    try testing.expect(!c.accessChanged(.unrestricted));
     try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_kept_echo", "{}", 4096, .{ .access = child }));
     kept_call.cancel.store(true, .release);
     kept_thread.join();
+    kept_joined = true;
     try testing.expectEqual(@as(?anyerror, error.Cancelled), kept_call.err);
 }
 

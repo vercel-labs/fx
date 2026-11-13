@@ -557,6 +557,7 @@ pub const TurnContext = struct {
             try self.transitionPhase(work_id, .running);
             return err;
         };
+        debug_trace.eventf("subagent", "approval_wait_registered", .{}, "child={s} work_id={s}", .{ child_id, work_id });
     }
 
     fn transitionPhase(

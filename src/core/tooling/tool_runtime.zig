@@ -218,6 +218,7 @@ pub const Context = struct {
     tracker: ?*change_tracker.ChangeTracker = null,
     mcp_ctx: ?*anyopaque = null,
     mcp_has_tool: ?tool_mcp_runtime.HasToolFn = null,
+    mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_validate_tool: ?tool_mcp_runtime.ValidateToolFn = null,
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
@@ -1120,8 +1121,19 @@ fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerr
     return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
         .rejected => |why| why,
         .found => arena.print("{f} is available now; run it again with toolbox.", .{model_context_encoding.scalar(tool)}),
-        .missing => arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)}),
+        .missing => if (mcpAccessChanged(ctx))
+            arena.print("{f} is not available to this work: the session's MCP servers changed after it began. Work that starts later sees the current servers.", .{model_context_encoding.scalar(tool)})
+        else
+            arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)}),
     };
+}
+
+/// Whether this run's MCP view is one the session's servers have changed
+/// under since it was given.
+fn mcpAccessChanged(ctx: Context) bool {
+    const changed = ctx.mcp_access_changed orelse return false;
+    const runtime_context = ctx.mcp_ctx orelse return false;
+    return changed(runtime_context, ctx.mcp_access);
 }
 
 /// The review schema a selected MCP tool would carry: its name,
