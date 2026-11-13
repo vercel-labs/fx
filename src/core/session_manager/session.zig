@@ -2318,12 +2318,103 @@ pub const Verified = struct {
     bad_snapshots: u64,
     /// Blobs a line names that are missing or fail their hash (D39).
     bad_blobs: u64 = 0,
+    /// Offset of the first line left unchecked because the caller stopped
+    /// the check; null when the check reached the end of the log.
+    stopped_at: ?u64 = null,
+};
+
+pub const VerifyOptions = struct {
+    /// `hash` reads each blob and checks its bytes against its name.
+    /// `exists` only checks that each blob is a regular file, which costs
+    /// one `stat` in place of an open, a read, and a hash per blob.
+    blobs: enum { hash, exists } = .hash,
+    /// Asked before each line; when it says stop, the check ends there and
+    /// `Verified.stopped_at` names the line.
+    stop: ?Stop = null,
+
+    pub const Stop = struct {
+        context: *anyopaque,
+        requested: *const fn (context: *anyopaque) bool,
+    };
+};
+
+/// The blobs folder of the session being verified, opened on first use, and
+/// the blobs already checked, so each is checked once however many lines
+/// name it.
+const BlobChecker = struct {
+    s: storage.Storage,
+    session_dir: storage.Dir,
+    mode: @FieldType(VerifyOptions, "blobs"),
+    folder: union(enum) { unopened, missing, open: storage.Dir } = .unopened,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    names: std.heap.ArenaAllocator,
+
+    fn init(gpa: std.mem.Allocator, s: storage.Storage, session_dir: storage.Dir, mode: @FieldType(VerifyOptions, "blobs")) BlobChecker {
+        return .{ .s = s, .session_dir = session_dir, .mode = mode, .names = .init(gpa) };
+    }
+
+    fn deinit(c: *BlobChecker, gpa: std.mem.Allocator) void {
+        if (c.folder == .open) c.s.closeDir(c.folder.open);
+        c.seen.deinit(gpa);
+        c.names.deinit();
+    }
+
+    /// Whether the blob is present and, in `hash` mode, matches its name.
+    /// A blob already checked counts as whole: its first check reported it.
+    fn whole(c: *BlobChecker, gpa: std.mem.Allocator, hash: []const u8) (error{OutOfMemory} || storage.IoFault)!bool {
+        if (c.seen.contains(hash)) return true;
+        try c.seen.put(gpa, try c.names.allocator().dupe(u8, hash), {});
+        if (!schema.validBlobHash(hash)) return false;
+        const blobs = switch (c.folder) {
+            .open => |dir| dir,
+            .missing => return false,
+            .unopened => blk: {
+                const dir = c.s.openDir(c.session_dir, "blobs") catch |err| switch (err) {
+                    error.NotFound => {
+                        c.folder = .missing;
+                        return false;
+                    },
+                    else => return error.Io,
+                };
+                c.folder = .{ .open = dir };
+                break :blk dir;
+            },
+        };
+        switch (c.mode) {
+            .exists => {
+                const st = c.s.stat(blobs, hash) catch |err| switch (err) {
+                    error.NotFound => return false,
+                    else => return error.Io,
+                };
+                return st.kind == .file;
+            },
+            .hash => {
+                const file = c.s.openFile(blobs, hash, .read_only) catch |err| switch (err) {
+                    error.NotFound => return false,
+                    else => return error.Io,
+                };
+                defer c.s.closeFile(file);
+                const len = c.s.length(file) catch |io_err| return storage.ioFault(io_err);
+                if (len > max_blob_bytes) return false;
+                const bytes = try gpa.alloc(u8, @intCast(len));
+                defer gpa.free(bytes);
+                if ((c.s.readAt(file, bytes, 0) catch |io_err| return storage.ioFault(io_err)) != bytes.len) return error.Io;
+                const actual = schema.blobHash(bytes);
+                return std.mem.eql(u8, &actual, hash);
+            },
+        }
+    }
 };
 
 /// Reads a whole log without its lock: every line's frame, checksum and
 /// seq, and every snapshot against the fold at its position (a snapshot is
 /// a cache that must equal what it replaces).
 pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
+    return verifySessionWith(env, id_, .{});
+}
+
+/// `verifySession`, with the blob check and the stop `options` choose.
+pub fn verifySessionWith(env: *const Env, id_: []const u8, options: VerifyOptions) OpenError!Verified {
     const s = env.s;
     const gpa = env.gpa;
     if (!schema.validId(id_)) return error.NotFound;
@@ -2339,9 +2430,15 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
     defer state.deinit(gpa);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
+    var blobs = BlobChecker.init(gpa, s, dir, options.blobs);
+    defer blobs.deinit(gpa);
     var result: Verified = .{ .lines = 0, .damaged_at = null, .bad_snapshots = 0 };
     var fork_seq: u64 = 0;
     while (true) {
+        if (options.stop) |stop| if (stop.requested(stop.context)) {
+            result.stopped_at = reader.buf_offset + reader.pos;
+            break;
+        };
         const line = (reader.next() catch |err| switch (err) {
             error.Corrupt => {
                 result.damaged_at = reader.damaged_at;
@@ -2358,7 +2455,7 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
             break;
         };
         for (body.blobRefs()) |hash| {
-            if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
+            if (!try blobs.whole(gpa, hash)) result.bad_blobs += 1;
         }
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,

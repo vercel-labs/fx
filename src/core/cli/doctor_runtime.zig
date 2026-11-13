@@ -69,6 +69,10 @@ const CollectOptions = struct {
     /// Old side folders whose session is gone: counted, or removed with
     /// `fx doctor --fix`.
     orphans: session_adapter.OrphanSweep = .count,
+    /// `later` leaves out the slow local checks, the saved sessions and the
+    /// skills, for the caller to run with `appendStateChecksWith` and
+    /// `appendSkillChecks` while it waits on the network checks.
+    slow_checks: enum { now, later } = .now,
     version: []const u8 = "",
     channel: []const u8 = "",
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
@@ -125,9 +129,9 @@ pub fn collect(
         try appendMcpIssueChecks(&checks, alloc, mcp_issues);
         try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, options.orphans);
+        if (options.slow_checks == .now) try appendStateChecks(&checks, alloc, options.orphans);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
-        try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
+        if (options.slow_checks == .now) try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
         snapshot.checks = try checks.toOwnedSlice(alloc);
         return snapshot;
@@ -159,9 +163,9 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, options.orphans);
+    if (options.slow_checks == .now) try appendStateChecks(&checks, alloc, options.orphans);
     snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
-    try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
+    if (options.slow_checks == .now) try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
     return snapshot;
@@ -398,14 +402,41 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
 
 /// Reports damaged sessions, and counts side folders whose session is gone
 /// or removes them, as `orphans` says (D36). Rebuilds nothing.
+/// How doctor checks the saved sessions.
+pub const StateOptions = struct {
+    orphans: session_adapter.OrphanSweep = .count,
+    /// Plain `fx doctor` uses `exists`; `fx doctor --deep` reads and hashes
+    /// every blob.
+    blobs: @FieldType(session_adapter.DoctorOptions, "blobs") = .hash,
+    stop: @FieldType(session_adapter.DoctorOptions, "stop") = null,
+    progress: @FieldType(session_adapter.DoctorOptions, "progress") = null,
+    /// The limit `stop` enforces, in milliseconds, for the report; 0 when
+    /// there is none.
+    limit_ms: i64 = 0,
+};
+
 fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: session_adapter.OrphanSweep) !void {
+    return appendStateChecksWith(checks, alloc, .{ .orphans = orphans });
+}
+
+/// The saved-session checks, which `collect` leaves out when
+/// `CollectOptions.sessions` is `later`, so the caller can run them beside
+/// the network checks.
+pub fn appendStateChecksWith(checks: *std.ArrayList(Check), alloc: Allocator, options: StateOptions) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
         try appendStateFailure(checks, alloc, status, err);
         return;
     };
     defer store.deinit(alloc);
-    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), orphans) catch |err| {
+    var report = session_adapter.doctorWith(&store, alloc, .{
+        .limit = default_session_diagnostics_limit,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = options.orphans,
+        .blobs = options.blobs,
+        .stop = options.stop,
+        .progress = options.progress,
+    }) catch |err| {
         try appendStateFailure(checks, alloc, .fail, err);
         return;
     };
@@ -420,8 +451,22 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: s
         const detail = try alloc.print("session {s}, a subagent an older fx saved, is kept as it is: {s}", .{ kept.id, kept.reason });
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
     }
+    if (report.unfinished > 0) {
+        const detail = if (options.limit_ms > 0)
+            try alloc.print("{d} of {d} session(s) were not checked to the end in doctor's {d} s limit; fx doctor --deep checks them all", .{ report.unfinished, report.checked + report.unfinished, @divTrunc(options.limit_ms + 999, 1000) })
+        else
+            try alloc.print("{d} session(s) were not checked to the end", .{report.unfinished});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    if (report.v1_incomplete) {
+        const detail = if (options.limit_ms > 0)
+            try alloc.print("sessions saved by an older fx were not all read in doctor's {d} s limit; fx doctor --deep reads them all", .{@divTrunc(options.limit_ms + 999, 1000)})
+        else
+            try alloc.dupe(u8, "sessions saved by an older fx were not all read");
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
     // The limit covers v1's unconverted sessions too (D73).
-    if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    if (report.checked + report.unfinished < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked + report.unfinished);
     if (report.removable > 0) {
         const detail = try alloc.print("{d} old terminal or side folder(s) whose session is gone can be removed", .{report.removable});
         try appendCheckOwnedFix(checks, alloc, "session", .warn, detail, try alloc.dupe(u8, "fx doctor --fix"));
@@ -608,7 +653,7 @@ fn appendEnvChecks(
 }
 
 /// Skill files that skill discovery skips, with their paths.
-fn appendSkillChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8, root_policy: skill_contract.RootPolicy) !void {
+pub fn appendSkillChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8, root_policy: skill_contract.RootPolicy) !void {
     var loaded = try app_runtime_setup.loadSkills(alloc, workspace_root, root_policy);
     defer loaded.deinit(alloc);
     for (loaded.diagnostics) |diagnostic| {

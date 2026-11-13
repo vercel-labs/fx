@@ -1448,7 +1448,7 @@ describe("custom connection errors name the setting", () => {
       metadata(f).request = { messages: [] };
       f.save();
       const doctor = await runFx(["doctor"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
-      expect(doctor.stdout).toContain(`[fail] config: failed to load config: ${settingsFile}: providers.local.model_metadata.local-model.request.messages: ${owned}`);
+      expect(doctor.stdout).toContain(`  \u2717 config     failed to load config: ${settingsFile}: providers.local.model_metadata.local-model.request.messages: ${owned}`);
       expect(f.requests).toHaveLength(0);
     } finally { f.close(); }
   }, 15000);

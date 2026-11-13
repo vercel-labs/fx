@@ -4158,6 +4158,47 @@ test("doctor reports a session whose blob went missing, and recover copies the t
   }
 }, TIMEOUT * 3);
 
+test("plain doctor only checks that each blob is there, --deep reads it, and the time limit is reported", async () => {
+  const fixture = createFixture("fx-v2-doctor-deep-");
+  const big = "DEEP_BLOB_START " + "blob-body ".repeat(30_000) + "DEEP_BLOB_END";
+  const gateway = startFakeGateway([fakeGatewayFinalText(big), fakeGatewayFinalText("DEEP_TURN_TWO")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Deep question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Deep question two."])).code).toBe(0);
+    const [name] = blobNames(fixture, id);
+    expect(name).toBeDefined();
+    // Other bytes under the blob's name: the file is there, but its hash no
+    // longer matches.
+    const blob = join(storeRoot(fixture.home), id, "blobs", name!);
+    const bytes = Buffer.from(readFileSync(blob));
+    bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+    rmSync(blob);
+    writeFileSync(blob, bytes, { mode: 0o400 });
+    const damaged = `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`;
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+
+    const plain = await command(fixture, gateway, ["doctor", "--json"]);
+    expect(plain.stderr).toBe("");
+    expect(named(JSON.parse(plain.stdout).checks, "session")).toEqual([]);
+    const deep = await command(fixture, gateway, ["doctor", "--json", "--deep"]);
+    expect(deep.stderr).toBe("");
+    expect(named(JSON.parse(deep.stdout).checks, "session")).toEqual([damaged]);
+
+    // Past doctor's limit, plain doctor says what it did not check, and
+    // --deep, which has no limit, still checks it.
+    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "1" }, timeoutMs: TIMEOUT };
+    const cut = JSON.parse((await runFx(["doctor", "--json"], limited)).stdout).checks;
+    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 1 s limit; fx doctor --deep checks them all");
+    expect(named(cut, "session")).toEqual([]);
+    const whole = JSON.parse((await runFx(["doctor", "--json", "--deep"], limited)).stdout).checks;
+    expect(named(whole, "sessions").filter((line) => line.includes("not checked"))).toEqual([]);
+    expect(named(whole, "session")).toEqual([damaged]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 // ---------------------------------------------------------------------------
 // Flows v1's suites check only through v1 files: a blob-sized piece, a
 // compacted app session, steering and cancelling an app turn.

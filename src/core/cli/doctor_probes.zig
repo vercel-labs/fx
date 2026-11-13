@@ -355,7 +355,8 @@ fn recordStopSignal(sig: std.posix.SIG) callconv(.c) void {
     _ = stop_signal.cmpxchgStrong(0, @backingInt(sig), .seq_cst, .seq_cst);
 }
 
-fn stopRequested() bool {
+/// Whether an ending signal reached doctor while its handler was in place.
+pub fn stopRequested() bool {
     return stop_signal.load(.seq_cst) != 0;
 }
 
@@ -412,7 +413,7 @@ pub const ServerChecks = struct {
     /// drops the rest, so a check the limit cuts has had at least its share
     /// of it; then at an ending signal and the deadline. Doctor's own thread
     /// only.
-    fn startMore(self: *ServerChecks, waiters: *std.Io.Group, deadline: i64) void {
+    pub fn startMore(self: *ServerChecks, waiters: *std.Io.Group, deadline: i64) void {
         while (self.next < self.probes.len and self.running() < self.cap) {
             if (io_mod.milliTimestamp() >= self.last_start) return self.dropQueued(.cutoff);
             if (stopRequested() or io_mod.milliTimestamp() >= deadline) return;

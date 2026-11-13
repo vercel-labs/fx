@@ -129,6 +129,25 @@ const Root = struct {
 /// root. Fails only when v1's sessions folder itself cannot be listed.
 /// Caller owns the ids and the slice.
 pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
+    var complete = true;
+    return rootIdsUntil(alloc, home, null, &complete);
+}
+
+/// Asked before each folder a scan reads; true ends the scan there.
+pub const Stop = struct {
+    context: *anyopaque,
+    requested: *const fn (context: *anyopaque) bool,
+
+    fn now(stop: ?Stop) bool {
+        const s = stop orelse return false;
+        return s.requested(s.context);
+    }
+};
+
+/// `rootIds`, ended early when `stop` says so; `complete` is then false and
+/// the roots are those read before it.
+pub fn rootIdsUntil(alloc: Allocator, home: []const u8, stop: ?Stop, complete: *bool) ![]Root {
+    complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     var roots: std.ArrayList(Root) = .empty;
@@ -138,6 +157,10 @@ pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
     }
     var candidates = store.readOnlyCandidates();
     while (true) {
+        if (Stop.now(stop)) {
+            complete.* = false;
+            break;
+        }
         try roots.ensureUnusedCapacity(alloc, 1);
         const id = (try candidates.nextId(alloc, null)) orelse break;
         errdefer alloc.free(id);
@@ -183,6 +206,14 @@ pub const Stray = struct {
 /// is left out; `rootIds` reports the first. Fails only when v1's sessions
 /// folder cannot be listed. Caller owns the result.
 pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
+    var complete = true;
+    return strayChildrenUntil(alloc, home, null, &complete);
+}
+
+/// `strayChildren`, ended early when `stop` says so; `complete` is then
+/// false and the children are those found before it.
+pub fn strayChildrenUntil(alloc: Allocator, home: []const u8, stop: ?Stop, complete: *bool) ![]Stray {
+    complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     var strays: std.ArrayList(Stray) = .empty;
@@ -191,7 +222,12 @@ pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
         strays.deinit(alloc);
     }
     var candidates = store.readOnlyCandidates();
-    while (try candidates.nextId(alloc, null)) |id| {
+    while (true) {
+        if (Stop.now(stop)) {
+            complete.* = false;
+            break;
+        }
+        const id = (try candidates.nextId(alloc, null)) orelse break;
         defer alloc.free(id);
         if ((kindOf(&store, alloc, id) catch continue) != .child) continue;
         const parent = parentOf(&store, alloc, id) catch |err| switch (err) {

@@ -2207,42 +2207,117 @@ pub const DoctorSnapshot = struct {
     }
 
     pub fn renderText(self: DoctorSnapshot, alloc: Allocator) ![]u8 {
+        return self.renderTextStyled(alloc, .{});
+    }
+
+    pub const TextStyle = struct {
+        /// Colors the status marks, headings, and fixes; for a terminal
+        /// that allows color.
+        color: bool = false,
+    };
+
+    /// The report a person reads: what doctor ran with, then each check
+    /// under its group, then the totals.
+    pub fn renderTextStyled(self: DoctorSnapshot, alloc: Allocator, style: TextStyle) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
+        const w = &out.writer;
+        const paint: DoctorPaint = .{ .color = style.color };
 
-        const counts = countDoctorChecks(self.checks);
-        try out.writer.print(
-            "[doctor] ok={d} warn={d} fail={d}\n",
-            .{ counts.ok, counts.warn, counts.fail },
-        );
-        if (self.version.len > 0) try out.writer.print("[doctor] version={s}\n", .{self.version});
-        try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
-        try out.writer.print("[doctor] model={s}\n", .{self.model});
+        try paint.begin(w, .bold);
+        try w.writeAll("fx doctor");
+        try paint.end(w);
+        if (self.version.len > 0) {
+            try w.writeAll("  ");
+            try paint.begin(w, .dim);
+            try w.writeAll("fx ");
+            try writeTerminalSafe(w, alloc, self.version);
+            try paint.end(w);
+        }
+        try w.writeAll("\n\n");
+
+        try writeDoctorField(w, alloc, "Workspace", self.workspace_root);
+        try writeDoctorFieldLabel(w, "Model");
+        try writeTerminalSafe(w, alloc, self.model);
         if (self.provider != .gateway) {
-            try out.writer.print("[doctor] model_source={s}\n", .{providerDisplayName(&self.provider)});
+            try w.writeAll(" via ");
+            try writeTerminalSafe(w, alloc, providerDisplayName(&self.provider));
         }
-        try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
-        try out.writer.print("[doctor] auth_refreshable={}\n", .{self.auth.refreshable()});
-        if (self.auth.expired) try out.writer.writeAll("[doctor] auth_expired=true\n");
+        try w.writeByte('\n');
+        try writeDoctorFieldLabel(w, "Auth");
+        try writeTerminalSafe(w, alloc, self.auth.activeSourceLabel());
         if (self.auth.team) |team| {
-            try out.writer.print("[doctor] team={s}\n", .{team});
+            try w.writeAll(" \u{00b7} team ");
+            try writeTerminalSafe(w, alloc, team);
         }
-        try out.writer.print("[doctor] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
-        try out.writer.print("[doctor] agent_step_limit={d}\n", .{self.agent_step_limit});
-        if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "doctor");
+        if (self.auth.expired) try w.writeAll(" \u{00b7} expired");
+        try w.writeByte('\n');
+        try writeDoctorField(w, alloc, "Permissions", permissions.permissionModeDisplayLabel(self.permission_mode));
+        try writeDoctorFieldLabel(w, "Step limit");
+        if (self.agent_step_limit == 0) try w.writeAll("none\n") else try w.print("{d}\n", .{self.agent_step_limit});
+        if (self.mcp) |mcp| {
+            try writeDoctorFieldLabel(w, "MCP");
+            try w.print("{d} server{s}", .{ mcp.servers.len, if (mcp.servers.len == 1) "" else "s" });
+            if (mcp.configuration_issues.len > 0) try w.print(" \u{00b7} {d} config issue{s}", .{ mcp.configuration_issues.len, if (mcp.configuration_issues.len == 1) "" else "s" });
+            if (mcp.inspection_error) |error_name| {
+                try w.writeAll(" \u{00b7} could not be read: ");
+                try writeTerminalSafe(w, alloc, error_name);
+            }
+            try w.writeByte('\n');
+        }
 
-        for (self.checks) |entry| {
-            try out.writer.print("[{s}] ", .{checkStatusLabel(entry.status)});
-            try writeTerminalSafe(&out.writer, alloc, entry.name);
-            try out.writer.writeAll(": ");
-            try writeTerminalSafe(&out.writer, alloc, entry.detail);
-            try out.writer.writeByte('\n');
-            if (entry.fix) |fix| {
-                try out.writer.writeAll("  fix: ");
-                try writeTerminalSafe(&out.writer, alloc, fix);
-                try out.writer.writeByte('\n');
+        for (std.enums.values(DoctorGroup)) |group| {
+            var shown = false;
+            for (self.checks) |entry| {
+                if (DoctorGroup.of(entry.name) != group) continue;
+                // The header already names the workspace.
+                if (std.mem.eql(u8, entry.name, "workspace") and entry.status == .ok) continue;
+                if (!shown) {
+                    try w.writeByte('\n');
+                    try paint.begin(w, .bold);
+                    try w.writeAll(group.title());
+                    try paint.end(w);
+                    try w.writeByte('\n');
+                    shown = true;
+                }
+                try w.writeAll("  ");
+                try paint.begin(w, switch (entry.status) {
+                    .ok => .green,
+                    .warn => .yellow,
+                    .fail => .red,
+                });
+                try w.writeAll(doctorStatusMark(entry.status));
+                try paint.end(w);
+                try w.writeByte(' ');
+                try paint.begin(w, .dim);
+                try writeTerminalSafe(w, alloc, entry.name);
+                try paint.end(w);
+                try w.splatByteAll(' ', @max(1, doctor_name_width -| entry.name.len));
+                try writeTerminalSafe(w, alloc, entry.detail);
+                try w.writeByte('\n');
+                if (entry.fix) |fix| {
+                    try w.splatByteAll(' ', doctor_detail_column);
+                    try paint.begin(w, .dim);
+                    try w.writeAll("fix:");
+                    try paint.end(w);
+                    try w.writeByte(' ');
+                    try writeTerminalSafe(w, alloc, fix);
+                    try w.writeByte('\n');
+                }
             }
         }
+
+        const counts = countDoctorChecks(self.checks);
+        try w.writeByte('\n');
+        try w.print("{d} ok \u{00b7} ", .{counts.ok});
+        if (counts.warn > 0) try paint.begin(w, .yellow);
+        try w.print("{d} warning{s}", .{ counts.warn, if (counts.warn == 1) "" else "s" });
+        if (counts.warn > 0) try paint.end(w);
+        try w.writeAll(" \u{00b7} ");
+        if (counts.fail > 0) try paint.begin(w, .red);
+        try w.print("{d} failure{s}", .{ counts.fail, if (counts.fail == 1) "" else "s" });
+        if (counts.fail > 0) try paint.end(w);
+        try w.writeByte('\n');
 
         return try out.toOwnedSlice();
     }
@@ -2641,6 +2716,101 @@ fn countDoctorChecks(checks: []const doctor_runtime.Check) DoctorCheckCounts {
     }
     return counts;
 }
+
+/// The groups `fx doctor` shows its checks under, in this order.
+const DoctorGroup = enum {
+    install,
+    config,
+    auth,
+    sessions,
+    mcp,
+    tools,
+    other,
+
+    fn of(check_name: []const u8) DoctorGroup {
+        const names = [_]struct { []const u8, DoctorGroup }{
+            .{ "workspace", .install },
+            .{ "install", .install },
+            .{ "config", .config },
+            .{ "env", .config },
+            .{ "startup", .config },
+            .{ "mcp_config", .mcp },
+            .{ "auth", .auth },
+            .{ "login", .auth },
+            .{ "provider", .auth },
+            .{ "model", .auth },
+            .{ "state", .sessions },
+            .{ "session", .sessions },
+            .{ "sessions", .sessions },
+            .{ "mcp", .mcp },
+            .{ "git", .tools },
+            .{ "gh", .tools },
+            .{ "skills", .tools },
+        };
+        for (names) |entry| if (std.mem.eql(u8, entry[0], check_name)) return entry[1];
+        return .other;
+    }
+
+    fn title(group: DoctorGroup) []const u8 {
+        return switch (group) {
+            .install => "Install",
+            .config => "Config",
+            .auth => "Auth and model",
+            .sessions => "Sessions",
+            .mcp => "MCP servers",
+            .tools => "Tools",
+            .other => "Other",
+        };
+    }
+};
+
+fn doctorStatusMark(status: doctor_runtime.CheckStatus) []const u8 {
+    return switch (status) {
+        .ok => "\u{2713}",
+        .warn => "!",
+        .fail => "\u{2717}",
+    };
+}
+
+const doctor_field_width = 13;
+/// The check name column, wide enough for `mcp_config`.
+const doctor_name_width = 11;
+/// Where a check's detail starts: two spaces, the mark, a space, the name.
+const doctor_detail_column = 4 + doctor_name_width;
+
+fn writeDoctorFieldLabel(w: *std.Io.Writer, label: []const u8) !void {
+    try w.writeAll("  ");
+    try w.writeAll(label);
+    try w.splatByteAll(' ', doctor_field_width -| label.len);
+}
+
+fn writeDoctorField(w: *std.Io.Writer, alloc: Allocator, label: []const u8, value: []const u8) !void {
+    try writeDoctorFieldLabel(w, label);
+    try writeTerminalSafe(w, alloc, value);
+    try w.writeByte('\n');
+}
+
+/// SGR codes for the doctor report, written only when color is on.
+const DoctorPaint = struct {
+    color: bool,
+
+    const Tone = enum { bold, dim, green, yellow, red };
+
+    fn begin(paint: DoctorPaint, w: *std.Io.Writer, tone: Tone) !void {
+        if (!paint.color) return;
+        try w.writeAll(switch (tone) {
+            .bold => "\x1b[1m",
+            .dim => "\x1b[2m",
+            .green => "\x1b[32m",
+            .yellow => "\x1b[33m",
+            .red => "\x1b[31m",
+        });
+    }
+
+    fn end(paint: DoctorPaint, w: *std.Io.Writer) !void {
+        if (paint.color) try w.writeAll("\x1b[0m");
+    }
+};
 
 fn checkStatusLabel(status: doctor_runtime.CheckStatus) []const u8 {
     return switch (status) {
@@ -3147,12 +3317,9 @@ test "doctor's MCP rows say what doctor found for each server it checked" {
     };
     const text = try doctor.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    for ([_][]const u8{
-        "[doctor] mcp_connection_check=checked\n",
-        "[doctor] mcp_server=docs source=profile scope=profile admission=not_applicable transport=stdio connection=ready authentication=ok\n",
-        "[doctor] mcp_server=slow source=profile scope=profile admission=not_applicable transport=http connection=timed_out authentication=not_checked\n",
-        "[doctor] mcp_server=unapproved source=workspace scope=profile admission=pending transport=stdio connection=not_checked authentication=not_checked\n",
-    }) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);
+    // The text names how many servers there are; each server's own result
+    // is a check line, and the JSON carries every field.
+    try std.testing.expect(std.mem.find(u8, text, "  MCP          3 servers\n") != null);
     const json = try doctor.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     for ([_][]const u8{
@@ -3830,9 +3997,30 @@ test "core doctor snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[doctor] ok=1 warn=1 fail=0\n[doctor] version=0.0.16\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n  fix: install gh from https://cli.github.com\n",
+        "fx doctor  fx 0.0.16\n" ++
+            "\n" ++
+            "  Workspace    /tmp/fx\n" ++
+            "  Model        alpha\n" ++
+            "  Auth         AI_GATEWAY_API_KEY\n" ++
+            "  Permissions  ask\n" ++
+            "  Step limit   24\n" ++
+            "\n" ++
+            "Auth and model\n" ++
+            "  \u{2713} auth       AI_GATEWAY_API_KEY is configured\n" ++
+            "\n" ++
+            "Tools\n" ++
+            "  ! gh         GitHub CLI not found in PATH\n" ++
+            "               fix: install gh from https://cli.github.com\n" ++
+            "\n" ++
+            "1 ok \u{00b7} 1 warning \u{00b7} 0 failures\n",
         text,
     );
+
+    const colored = try snapshot.renderTextStyled(std.testing.allocator, .{ .color = true });
+    defer std.testing.allocator.free(colored);
+    try std.testing.expect(std.mem.find(u8, colored, "\x1b[1mfx doctor\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, colored, "  \x1b[32m\u{2713}\x1b[0m \x1b[2mauth\x1b[0m       AI_GATEWAY_API_KEY is configured\n") != null);
+    try std.testing.expect(std.mem.find(u8, colored, "  \x1b[33m!\x1b[0m \x1b[2mgh\x1b[0m         GitHub CLI not found in PATH\n") != null);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
