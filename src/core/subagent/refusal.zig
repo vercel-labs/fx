@@ -149,9 +149,13 @@ const Unavailable = union(enum) {
 };
 
 const QueueFault = enum {
-    /// The subagent already holds as many of the caller's messages as it takes.
+    /// The subagent already has as many messages waiting for its next turn as
+    /// the host queues for one subagent. Only the agent that started the
+    /// subagent can message it, so they are all the caller's own.
     subagent,
-    /// The caller's parent already holds as many of the caller's messages as it takes.
+    /// The caller's parent already has as many messages from its subagents
+    /// waiting as its queue takes. The cap counts every subagent's messages,
+    /// not the caller's alone.
     parent,
 };
 
