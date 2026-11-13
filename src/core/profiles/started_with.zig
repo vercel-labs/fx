@@ -91,7 +91,7 @@ pub fn fits(encoded: []const u8) bool {
     return encoded.len <= max_bytes;
 }
 
-pub const Read = union(enum) {
+const Read = union(enum) {
     /// The data has no block: a child from before blocks, or one a profile
     /// did not start.
     none,

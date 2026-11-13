@@ -2315,7 +2315,7 @@ pub const Runtime = struct {
                 // Without one named it runs in fx's own main, which sets
                 // nothing, so it has what its parent has.
                 try registry.setProfile(alloc, child_id, request.override().profile orelse profiles.main_name);
-                if (started_with) |started| try recordStartedWith(alloc, &registry, child_id, request.override().profile.?, started);
+                if (started_with) |started| if (request.override().profile) |name| try recordStartedWith(alloc, &registry, child_id, name, started);
                 // What it is for, in its parent's list of subagents.
                 if (try child_state.purposeOf(alloc, message.instructions, message.message)) |purpose| {
                     defer alloc.free(purpose);
