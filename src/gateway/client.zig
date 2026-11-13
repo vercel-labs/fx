@@ -3432,7 +3432,7 @@ const GatewayReplayBuilder = struct {
     /// The `custom` parts a later request must send back, by kind: OpenAI's
     /// compaction block. Other custom events, such as Anthropic's
     /// `message_start`, describe the stream and are never replayed.
-    const replayed_custom_kinds = [_][]const u8{"openai.compaction"};
+    const replayed_custom_kinds = [_][]const u8{types.ProviderReplay.openai_compaction_kind};
     const Part = struct {
         kind: Kind,
         id: []u8,

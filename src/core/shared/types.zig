@@ -1790,6 +1790,9 @@ pub const ProviderReplay = struct {
     /// Joins distinct provider messages in assistant content. Replayed text
     /// spans exclude it, so each message returns to its provider unchanged.
     pub const message_separator = "\n\n";
+    /// The `custom` part kind of OpenAI's compaction item, which later
+    /// requests send back whole.
+    pub const openai_compaction_kind = "openai.compaction";
     source: @import("../config/model_provider.zig").ProviderSelection,
     parts_json: []const u8,
 

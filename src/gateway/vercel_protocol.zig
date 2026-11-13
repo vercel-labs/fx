@@ -1058,7 +1058,7 @@ pub fn holdsCompactionBlock(alloc: std.mem.Allocator, parts_json: []const u8) bo
     if (std.mem.eql(u8, kind.string, "custom")) {
         const custom_kind = part.object.get("kind") orelse return false;
         const openai = options.object.get("openai") orelse return false;
-        if (custom_kind != .string or !std.mem.eql(u8, custom_kind.string, "openai.compaction") or openai != .object) return false;
+        if (custom_kind != .string or !std.mem.eql(u8, custom_kind.string, types.ProviderReplay.openai_compaction_kind) or openai != .object) return false;
         const item = openai.object.get("itemId") orelse return false;
         return item == .string and item.string.len > 0;
     }
