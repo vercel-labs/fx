@@ -10,6 +10,10 @@
 //! `tests/tla/drivers/subagent/stop-message.test.ts`). Only those tests set
 //! the controls, so the libfx artifacts leave them out.
 //!
+//! Every hold reads two paths from the environment and uses them only when
+//! both are absolute (`holdFiles`): the file calls take no other kind, and a
+//! relative path would otherwise crash fx or put a marker in the workspace.
+//!
 //! A second hold sits in the host, after it has told the owner of any work's
 //! end and before it settles the child's busy flag (`holdBeforeSettle`). With
 //! `FX_TEST_SUBAGENT_SETTLE_HELD` and `FX_TEST_SUBAGENT_SETTLE_RELEASE` set,
@@ -39,7 +43,7 @@ pub var test_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void e
 pub fn armed() bool {
     if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold != null;
-    return io_mod.getenv("FX_TEST_SUBAGENT_END_HELD") != null and io_mod.getenv("FX_TEST_SUBAGENT_END_RELEASE") != null;
+    return holdFiles("FX_TEST_SUBAGENT_END_HELD", "FX_TEST_SUBAGENT_END_RELEASE") != null;
 }
 
 /// Called by the slot of `child_id` once a work that `by` stopped has ended,
@@ -50,20 +54,8 @@ pub fn holdStoppedEnd(child_id: []const u8, by: []const u8) void {
         if (test_hold) |hold| hold(child_id);
         return;
     }
-    const held = io_mod.getenv("FX_TEST_SUBAGENT_END_HELD") orelse return;
-    const release = io_mod.getenv("FX_TEST_SUBAGENT_END_RELEASE") orelse return;
-    const n = holds.fetchAdd(1, .seq_cst) + 1;
-    var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ held, n }) catch return;
-    var own_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
-    var contents_buf: [256]u8 = undefined;
-    const contents = std.mem.print(&contents_buf, "stopped_end child={s} by={s}", .{ child_id, by }) catch return;
-    writeMarker(marker, contents) catch return;
-    const deadline = io_mod.milliTimestamp() + max_hold_ms;
-    while (!pathExists(release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
+    const files = holdFiles("FX_TEST_SUBAGENT_END_HELD", "FX_TEST_SUBAGENT_END_RELEASE") orelse return;
+    holdOnFiles(&holds, files, "stopped_end child={s} by={s}", .{ child_id, by });
 }
 
 var settle_holds = std.atomic.Value(u32).init(0);
@@ -77,7 +69,7 @@ pub var test_settle_hold: if (builtin.is_test) ?*const fn (child_id: []const u8)
 pub fn settleArmed() bool {
     if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_settle_hold != null;
-    return io_mod.getenv("FX_TEST_SUBAGENT_SETTLE_HELD") != null and io_mod.getenv("FX_TEST_SUBAGENT_SETTLE_RELEASE") != null;
+    return holdFiles("FX_TEST_SUBAGENT_SETTLE_HELD", "FX_TEST_SUBAGENT_SETTLE_RELEASE") != null;
 }
 
 /// Called by the host for `child_id` once it has told the owner of a work's
@@ -88,18 +80,40 @@ pub fn holdBeforeSettle(child_id: []const u8) void {
         if (test_settle_hold) |hold| hold(child_id);
         return;
     }
-    const held = io_mod.getenv("FX_TEST_SUBAGENT_SETTLE_HELD") orelse return;
-    const release = io_mod.getenv("FX_TEST_SUBAGENT_SETTLE_RELEASE") orelse return;
-    const n = settle_holds.fetchAdd(1, .seq_cst) + 1;
+    const files = holdFiles("FX_TEST_SUBAGENT_SETTLE_HELD", "FX_TEST_SUBAGENT_SETTLE_RELEASE") orelse return;
+    holdOnFiles(&settle_holds, files, "settle child={s}", .{child_id});
+}
+
+/// The two paths of a hold's file controls.
+pub const HoldFiles = struct { held: []const u8, release: []const u8 };
+
+/// The paths that `held_var` and `release_var` name, or null unless both are
+/// set to absolute paths. A hold with any other value is not armed.
+pub fn holdFiles(held_var: []const u8, release_var: []const u8) ?HoldFiles {
+    return usableHoldFiles(io_mod.getenv(held_var), io_mod.getenv(release_var));
+}
+
+fn usableHoldFiles(held: ?[]const u8, release: ?[]const u8) ?HoldFiles {
+    const held_path = held orelse return null;
+    const release_path = release orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(held_path) or !std.Io.Dir.path.isAbsolute(release_path)) return null;
+    return .{ .held = held_path, .release = release_path };
+}
+
+/// Writes `<held>.<n>` with the text `fmt` makes, for the n-th hold counted
+/// in `counter`, then waits until `<release>` or `<release>.<n>` exists, for
+/// at most `max_hold_ms`.
+fn holdOnFiles(counter: *std.atomic.Value(u32), files: HoldFiles, comptime fmt: []const u8, args: anytype) void {
+    const n = counter.fetchAdd(1, .seq_cst) + 1;
     var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ held, n }) catch return;
+    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ files.held, n }) catch return;
     var own_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
+    const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
-    const contents = std.mem.print(&contents_buf, "settle child={s}", .{child_id}) catch return;
+    const contents = std.mem.print(&contents_buf, fmt, args) catch return;
     writeMarker(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
-    while (!pathExists(release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
+    while (!pathExists(files.release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
 }
@@ -131,4 +145,16 @@ test "a test build holds the host before it settles an ended work only through i
     try std.testing.expect(!settleArmed());
     holdBeforeSettle("child");
     try std.testing.expectEqual(@as(u32, 0), settle_holds.load(.seq_cst));
+}
+
+test "a hold is armed only when both of its paths are absolute" {
+    const files = usableHoldFiles("/tmp/held", "/tmp/release").?;
+    try std.testing.expectEqualStrings("/tmp/held", files.held);
+    try std.testing.expectEqualStrings("/tmp/release", files.release);
+    try std.testing.expect(usableHoldFiles(null, "/tmp/release") == null);
+    try std.testing.expect(usableHoldFiles("/tmp/held", null) == null);
+    try std.testing.expect(usableHoldFiles("held", "/tmp/release") == null);
+    try std.testing.expect(usableHoldFiles("/tmp/held", "release") == null);
+    try std.testing.expect(usableHoldFiles("./held", "../release") == null);
+    try std.testing.expect(usableHoldFiles("", "") == null);
 }
