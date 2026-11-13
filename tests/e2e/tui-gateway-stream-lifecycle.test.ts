@@ -7093,7 +7093,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         if (parentStep < 4) {
           parentStep += 1;
-          releaseChild();
           return fakeGatewayToolCall(`joined_wait_${parentStep}`, "subagent", { request: { action: "wait" } });
         }
         return fakeGatewayFinalText("REPORT_NEVER_JOINED");
@@ -7115,6 +7114,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
+        // The child answers only once main's wait runs. A child that
+        // finished first would leave the wait no subagent to name.
+        await session.waitForText(/waiting for helper/i, TIMEOUT);
+        releaseChild();
         await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
         await session.waitForText(row, TIMEOUT);
         const live = await session.captureFullScrollback();
