@@ -5136,7 +5136,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Run the background steering fixture.");
-        await session.waitForText("Running while", TIMEOUT);
+        await session.waitForText("Running sleep, printf", TIMEOUT);
         await session.sendText(steering);
 
         // The turn takes the steering while the command still waits for its
