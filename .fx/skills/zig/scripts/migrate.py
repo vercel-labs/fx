@@ -23,6 +23,8 @@ import re
 import sys
 from collections import Counter
 
+# Running a script must leave no __pycache__ next to it in the user's tree.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from zig_source import (  # noqa: E402
     ASCII_RENAMES, MEM_RENAMES, START, STD_RENAMES, Lines, aliases, code_mask, display,

@@ -19,6 +19,8 @@ import os
 import re
 import sys
 
+# Running a script must leave no __pycache__ next to it in the user's tree.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from zig_source import (  # noqa: E402
     ASCII_RENAMES, MEM_RENAMES, START, Lines, aliases, code_mask, display, read_source, zig_files,
@@ -48,7 +50,6 @@ MODULE_RULES = [
     ("std.heap", r"DebugAllocator(?:Config)?", "std.heap.SafeAllocator (a separate implementation; or init.gpa from main(init: std.process.Init))", "deprecated"),
     ("std.heap", r"(?:StackFallbackAllocator|stackFallback)", "std.heap.BufferFirstAllocator.init(buffer, fallback)", "removed"),
     ("std.heap", r"Check", "(deprecated; no replacement)", "deprecated"),
-    ("std.ascii", r"indexOfIgnoreCase\w*", "std.ascii.findIgnoreCase*", "removed"),
     ("std.tar", r"pipeToFileSystem", "std.tar.extract", "deprecated"),
     ("std.tar", r"PipeOptions", "std.tar.ExtractOptions", "deprecated"),
     ("std.zig", r"allocPrintCmd", "(deprecated)", "deprecated"),

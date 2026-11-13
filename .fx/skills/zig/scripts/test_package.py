@@ -24,7 +24,7 @@ def description(skill):
 
 def zig_017():
     try:
-        version = subprocess.run(["zig", "version"], capture_output=True, text=True).stdout.strip()
+        version = subprocess.run(["zig", "version"], capture_output=True, text=True, timeout=120).stdout.strip()
     except FileNotFoundError:
         return None
     return version if version.startswith("0.17.") else None
@@ -114,7 +114,8 @@ class Package(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cache:
             r = subprocess.run(
                 ["zig", "test", os.path.join(ROOT, "references", "examples.zig"), "--cache-dir", cache, "--global-cache-dir", cache],
-                capture_output=True, text=True,
+                # A cold cache compiles std's test runner: minutes, not hours.
+                capture_output=True, text=True, timeout=600,
             )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
