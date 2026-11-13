@@ -2223,6 +2223,21 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The request that waits for a sign-in took a login another fx
+        /// process saved: the sign-in fx opened for it here, still waiting
+        /// for its code, is no longer needed.
+        pub fn closeRecoverySignInForStoredLogin(app: *App) !void {
+            if (!app.auth.signInEntryActive()) return;
+            debug_trace.logf("auth", "sign-in closed: the waiting request took the login another fx saved, and this sign-in's device code is dropped", .{});
+            _ = app.auth.popPickerStage(app.alloc);
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "Signed in from another fx session. Continuing with that login.",
+            });
+            app.shell.render_requests.request(.footer);
+        }
+
         fn recoverPromptCredentialRefreshFailure(app: *App, agent: *AppAgent, err: anyerror) !bool {
             const active_source = app.auth.credentialSource();
             const source = if (active_source) |active|

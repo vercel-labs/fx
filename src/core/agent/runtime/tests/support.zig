@@ -649,6 +649,10 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_error: ?anyerror = null,
     /// A forced refresh finds nothing, as when the refresh token is rejected.
     credential_refresh_fail_force: bool = false,
+    /// The login a `.stored` read finds, as another fx process saves one;
+    /// those reads are counted here and nowhere else.
+    credential_stored_token: ?[]const u8 = null,
+    credential_stored_reads: usize = 0,
     /// Only this many forced refreshes work; later ones find nothing, as
     /// when the refresh token is revoked during the turn.
     credential_refresh_force_successes: ?usize = null,
@@ -919,6 +923,12 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) !?runtime_deps.RefreshedGatewayCredential {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (mode == .stored) {
+            self.credential_stored_reads += 1;
+            const stored = self.credential_stored_token orelse return null;
+            if (rejected_token) |rejected| if (std.mem.eql(u8, stored, rejected)) return null;
+            return .{ .token = try alloc.dupe(u8, stored) };
+        }
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
         try self.credential_refresh_rejected.ensureUnusedCapacity(self.alloc, 1);

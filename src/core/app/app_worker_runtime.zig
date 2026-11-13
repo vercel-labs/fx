@@ -1395,7 +1395,15 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     },
                     .credential_refreshed => |credential| {
+                        // During a wait for a sign-in, a credential comes only
+                        // from a login another fx process saved, which the
+                        // request now sends instead of this session's own
+                        // sign-in.
+                        const waited_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
                         try handlers.credential_refreshed(handlers.ctx, credential);
+                        if (waited_for_sign_in) if (comptime @hasDecl(App, "closeRecoverySignInForStoredLogin")) {
+                            if (agent == app.screenAgent()) try app.closeRecoverySignInForStoredLogin();
+                        };
                     },
                     .command_output => |chunk| {
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);
