@@ -720,6 +720,7 @@ const Runtime = struct {
             .chat_url = builtin_gateway.provider.chat_url,
         };
         var providers = provider_set.gateway_only(.{
+            .capabilities = .{ .gateway_prompt_caching = true },
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
