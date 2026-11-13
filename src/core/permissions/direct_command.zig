@@ -203,7 +203,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
 
 /// What a direct plan wrote to stdout, for a caller that reads the output
 /// itself instead of showing it to the model.
-pub const DirectCapture = struct {
+const DirectCapture = struct {
     /// With control characters and bytes that are not UTF-8 written as
     /// visible escapes. Owned by the allocator given to
     /// `captureDirectReadOnly`.
