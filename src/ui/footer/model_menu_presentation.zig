@@ -129,7 +129,7 @@ fn tokenPassLeadCount(projection: ModelMenuProjection, match_count: usize) ?usiz
     var count: usize = 0;
     while (count < match_count) : (count += 1) {
         const item = projection.itemAt(count) orelse break;
-        if (!token_pass.isFeaturedModel(item.id)) break;
+        if (!item.token_pass) break;
     }
     if (count == 0 or count == match_count) return null;
     return count;
@@ -401,7 +401,7 @@ const FactColumns = struct {
         for (projection.items) |item| {
             if (!model_cache_runtime.modelProviderFilterKeeps(item, filter)) continue;
             longest_id = @max(longest_id, display_width.visibleWidth(item.id));
-            if (projection.token_pass and token_pass.isFeaturedModel(item.id)) tab_has_token_pass = true;
+            if (projection.token_pass and item.token_pass) tab_has_token_pass = true;
             var buf: [32]u8 = undefined;
             if (item.capabilities.context_window) |tokens| {
                 const text: []const u8 = formatTokenCount(&buf, tokens) catch "";
@@ -462,7 +462,7 @@ const FactColumns = struct {
     fn appendCells(self: FactColumns, alloc: Allocator, out: *std.ArrayList(u8), item: model_cache_runtime.ModelMenuItem) !void {
         var cells: CellWriter = .{ .alloc = alloc, .out = out };
         if (self.token_pass) {
-            try cells.cell(if (token_pass.isFeaturedModel(item.id)) token_pass_fact else "", token_pass_fact.len);
+            try cells.cell(if (item.token_pass) token_pass_fact else "", token_pass_fact.len);
         }
         var buf: [32]u8 = undefined;
         if (self.context_digits > 0) {
@@ -512,7 +512,7 @@ fn tokenCell(buf: *[32]u8, tokens: ?u32, digits: usize, label: []const u8) ![]co
 /// Fast mode out.
 fn itemSpeed(item: model_cache_runtime.ModelMenuItem, token_pass_team: bool) model_capabilities.Capabilities {
     var capabilities = item.capabilities;
-    capabilities.supports_fast_mode = token_pass.offersFastMode(token_pass_team, item.id, capabilities.supports_fast_mode);
+    capabilities.supports_fast_mode = token_pass.offersFastMode(token_pass_team and item.token_pass, capabilities.supports_fast_mode);
     return capabilities;
 }
 
@@ -1162,6 +1162,7 @@ test "model menu tags Token Pass models for a team with Token Pass and leaves th
             .id = @constCast("zai/glm-5.3"),
             .provider = "zai",
             .capabilities = .{ .context_window = 200_000, .supports_fast_mode = true },
+            .token_pass = true,
         },
         .{
             .id = @constCast("zai/glm-5.3-fast"),
@@ -1238,8 +1239,8 @@ fn gridColumnOf(alloc: Allocator, grid: *vt_emulator.Grid, row: u16, needle: []c
 }
 
 const column_test_items = [_]model_cache_runtime.ModelMenuItem{
-    .{ .id = @constCast("moonshotai/kimi-k3"), .provider = "moonshotai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_072, .supports_fast_mode = true } },
-    .{ .id = @constCast("zai/glm-5.3-flash"), .provider = "zai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_000 } },
+    .{ .id = @constCast("moonshotai/kimi-k3"), .provider = "moonshotai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_072, .supports_fast_mode = true }, .token_pass = true },
+    .{ .id = @constCast("zai/glm-5.3-flash"), .provider = "zai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_000 }, .token_pass = true },
     .{ .id = @constCast("openai/gpt-6.1-terra"), .provider = "openai", .capabilities = .{ .context_window = 1_050_000, .max_output_tokens = 128_000, .supports_fast_mode = true } },
     .{ .id = @constCast("amazon/nova-pro"), .provider = "amazon", .capabilities = .{ .context_window = 300_000, .max_output_tokens = 8_192 } },
     .{ .id = @constCast("anthropic/claude-opus-5.5-fast"), .provider = "anthropic", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 128_000, .intrinsic_fast = true } },
@@ -1358,7 +1359,7 @@ test "model menu groups Token Pass models under their own heading until a search
             2 => @constCast("zai/glm-5.3-flash"),
             else => try std.mem.print(&ids[index - 3], "acme/model-{d:0>2}", .{index - 3}),
         };
-        item.* = .{ .id = id, .provider = "other", .capabilities = .{} };
+        item.* = .{ .id = id, .provider = "other", .capabilities = .{}, .token_pass = index < 3 };
     }
     var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items, .token_pass = true };
 

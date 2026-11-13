@@ -16,6 +16,7 @@ const gateway_provider = @import("../gateway/gateway_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const token_pass = @import("../gateway/token_pass.zig");
 const token_pass_memory = @import("../gateway/token_pass_memory.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const credits_lookup = @import("credits_lookup.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const session_commands = @import("../session/session_commands.zig");
@@ -112,7 +113,7 @@ pub const Check = struct {
 
     /// Starts the check with the saved answer, or waits at most `wait_ms`
     /// for one when fx has none. Publishes whether the team has Token Pass
-    /// with `token_pass.publishHasPass`.
+    /// to `token_pass_team`.
     pub fn begin(
         self: *Check,
         alloc: Allocator,
@@ -122,7 +123,7 @@ pub const Check = struct {
     ) void {
         const saved: ?token_pass.Answer = if (self.home) |dir| if (self.named.saved_as) |id| token_pass_memory.load(alloc, dir, &id) else null else null;
         self.has_pass = saved == .has_pass;
-        defer token_pass.publishHasPass(self.has_pass);
+        defer token_pass_team.publishHasPass(self.has_pass);
         if (comptime builtin.single_threaded) return;
         // A login that is due for renewal has no token yet; the saved answer
         // stands, and the next run asks.
@@ -160,7 +161,7 @@ pub const Check = struct {
                 const answer = answerOf(result.snapshot);
                 if (answer) |fresh| {
                     self.has_pass = fresh == .has_pass;
-                    token_pass.publishHasPass(self.has_pass);
+                    token_pass_team.publishHasPass(self.has_pass);
                     if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
                 }
                 // Logged once the answer is saved, so a reader of the trace
@@ -216,9 +217,11 @@ pub const State = struct {
         debug_trace.logf("token_pass", "start model settled reason={s}", .{reason});
     }
 
-    /// Whether the session's first prompt waits for the running check.
+    /// Whether the session's first prompt waits for the running check: only
+    /// while fx knows nothing of the team, from a saved answer or from AI
+    /// Gateway, such as a catalog that marks Token Pass models.
     fn holdsFirstPrompt(self: *const State, now_ms: i64) bool {
-        if (self.start_settled or self.had_saved) return false;
+        if (self.start_settled or self.had_saved or self.answer != null) return false;
         const started = self.started_ms orelse return false;
         return now_ms - started < first_prompt_wait_ms;
     }
@@ -295,7 +298,9 @@ pub fn Runtime(comptime App: type) type {
             if (answer) |fresh| record(app, fresh, "credits_check");
             debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
             try applyStartModel(app);
-            state.start_settled = true;
+            // A check that failed leaves the start model open for another
+            // answer, such as the catalog's, until the first prompt.
+            if (answer != null) state.start_settled = true;
             return true;
         }
 
@@ -309,6 +314,18 @@ pub fn Runtime(comptime App: type) type {
             if (state.answer == answer) return;
             state.answer = answer;
             if (state.saved_as) |id| if (io_mod.homeDir()) |home| saveAnswer(app.alloc, home, &id, answer);
+        }
+
+        /// A catalog that marks Token Pass models, which AI Gateway sends only
+        /// to a team with an active pass.
+        pub fn observeCatalog(app: *App) void {
+            if (comptime !@hasField(App, "model_cache") or !@hasField(App, "token_pass_check")) return;
+            if (provider_runtime.provider(app) != .gateway) return;
+            if (!app.model_cache.catalogMarksTokenPass()) return;
+            record(app, .has_pass, "catalog");
+            applyStartModel(app) catch |err| {
+                debug_trace.logf("token_pass", "start model not applied source=catalog err={s}", .{@errorName(err)});
+            };
         }
 
         /// A response that names `token-pass` as the provider that served it.
@@ -333,7 +350,9 @@ pub fn Runtime(comptime App: type) type {
                 return .current;
             }
             if (state.holdsFirstPrompt(io_mod.awakeMilliTimestamp())) return .pending;
-            if (state.started_ms != null) {
+            // The wait ran out with nothing known of the team; an answer from
+            // another source, such as the catalog, needs no wait.
+            if (state.started_ms != null and state.answer == null) {
                 debug_trace.logf("token_pass", "first prompt sent before the check answered wait_ms={d}", .{first_prompt_wait_ms});
             }
             state.start_settled = true;
@@ -431,6 +450,10 @@ test "token pass check: the first prompt waits only for an answer fx has not sav
     try std.testing.expect(state.holdsFirstPrompt(1_000 + first_prompt_wait_ms - 1));
     try std.testing.expect(!state.holdsFirstPrompt(1_000 + first_prompt_wait_ms));
     state.had_saved = true;
+    try std.testing.expect(!state.holdsFirstPrompt(1_000));
+    // An answer from AI Gateway, such as a catalog's Token Pass marks, ends
+    // the wait too.
+    state = .{ .started_ms = 1_000, .answer = .has_pass };
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
     state = .{ .started_ms = 1_000, .start_settled = true };
     try std.testing.expect(!state.holdsFirstPrompt(1_000));

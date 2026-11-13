@@ -388,6 +388,9 @@ export type FakeGatewayTitleResponse =
 export type FakeGatewayModel = {
   id: string;
   type?: string;
+  // AI Gateway marks a model the team's Token Pass pays for, only for a team
+  // with an active pass.
+  token_pass?: boolean;
   owned_by?: string;
   released?: number;
   tags?: string[];
@@ -579,6 +582,21 @@ export function startFakeGateway(
     }
     return typeof next === "function" ? await next(body) : next;
   }, options);
+}
+
+// The Token Pass models of a coding-agent catalog as AI Gateway sends them: a
+// team with an active pass gets `token_pass: true` on each, and any other team
+// gets the same models without the mark.
+export function tokenPassCatalog(hasPass: boolean): FakeGatewayModel[] {
+  return [
+    { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+    ...["moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"].map((id) => ({
+      id,
+      type: "language",
+      tags: ["tool-use"],
+      ...(hasPass ? { token_pass: true } : {}),
+    })),
+  ];
 }
 
 // fx asks AI Gateway's credits endpoint whether the team has Token Pass. With

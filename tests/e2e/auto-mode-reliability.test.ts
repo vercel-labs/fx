@@ -25,6 +25,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -726,6 +727,7 @@ describe("lean auto mode reliability", () => {
           ],
           [fakeGatewayPermissionDecision("clear", "token_pass_deploy_clear")],
           {
+            models: tokenPassCatalog(hasPass),
             usage: (url) => url.pathname === "/coding-agent/v1/credits"
               ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
               : null,

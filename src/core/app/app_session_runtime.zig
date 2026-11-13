@@ -23,6 +23,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -2645,7 +2646,7 @@ pub fn Runtime(comptime App: type) type {
             const default_model = provider_title_model orelse return null;
             if (comptime !provider_runtime.supported(App)) return default_model;
             if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
-            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model, token_pass.processHasPass());
+            return token_pass_team.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
         }
 
         /// Applies a finished background title generation on the main loop.

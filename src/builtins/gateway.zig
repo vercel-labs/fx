@@ -3054,6 +3054,9 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .context_window = context_window,
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
+        // AI Gateway marks the models a team's Token Pass pays for, only for
+        // a team with an active pass.
+        .token_pass = if (entry.object.get("token_pass")) |value| value == .bool and value.bool else false,
     };
 }
 
@@ -3501,4 +3504,23 @@ test "an OAuth request stops at once when cancelled during a lookup that hangs" 
         .cancel_flag = &cancel,
     }));
     try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
+}
+
+test "gateway catalog reads the Token Pass marks and nothing else as one" {
+    const json =
+        \\{"object":"list","data":[
+        \\  {"id":"zai/glm-5.3","type":"language","tags":["tool-use"],"token_pass":true},
+        \\  {"id":"acme/new-pass-model","type":"language","tags":["tool-use"],"token_pass":true},
+        \\  {"id":"acme/typed","type":"language","tags":["tool-use"],"token_pass":"true"},
+        \\  {"id":"acme/off","type":"language","tags":["tool-use"],"token_pass":false},
+        \\  {"id":"acme/plain","type":"language","tags":["tool-use"]}
+        \\ ]}
+    ;
+    var catalog = try parseModelCatalogForView(std.testing.allocator, json, .picker);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 5), catalog.items.len);
+    for (catalog.items) |entry| {
+        const marked = std.mem.eql(u8, entry.id, "zai/glm-5.3") or std.mem.eql(u8, entry.id, "acme/new-pass-model");
+        try std.testing.expectEqual(marked, entry.token_pass);
+    }
 }

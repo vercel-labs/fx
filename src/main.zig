@@ -3295,6 +3295,7 @@ const App = struct {
         InstancesAppRuntime.syncRecord(self);
 
         if (try self.model_cache.pollLoadTransition()) {
+            TokenPassCheckRuntime.observeCatalog(self);
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {

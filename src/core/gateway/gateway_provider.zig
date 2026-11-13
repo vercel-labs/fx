@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const model_catalog = @import("model_catalog.zig");
 const model_catalog_metadata = @import("model_catalog_metadata.zig");
+const token_pass_team = @import("token_pass_team.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -253,6 +254,7 @@ pub const CapabilityResolver = struct {
                     if (self.catalog.items.len > 0) debug_trace.logf("gateway", "dropping model catalog after access changed entries={d}", .{self.catalog.items.len});
                     model_catalog.freeModelCatalog(alloc, &self.catalog);
                     self.catalog = .empty;
+                    publishTokenPassModels(provider, self.catalog.items);
                 }
                 if (self.catalog.items.len == 0) self.state = .failed;
                 debug_trace.logf("gateway", "model catalog refresh failed category={t} retained={}", .{ failed.failure.category, self.state == .ready });
@@ -261,6 +263,7 @@ pub const CapabilityResolver = struct {
         };
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = loaded.catalog;
+        publishTokenPassModels(provider, self.catalog.items);
         self.state = .ready;
         self.last_attempt_ms = attempt_ms;
         self.requested_access = requested;
@@ -444,12 +447,21 @@ pub const CapabilityResolver = struct {
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
+        publishTokenPassModels(provider, self.catalog.items);
         self.state = .ready;
         self.last_attempt_ms = model_catalog.clockMs();
         self.requested_access = .init(access);
         self.provider_id = provider.provider_id;
     }
 };
+
+/// Hands an AI Gateway catalog's Token Pass marks to `token_pass_team`, for
+/// `fx ask` and ACP, which resolve models through this catalog. Another
+/// provider's catalog says nothing about the AI Gateway team.
+fn publishTokenPassModels(provider: model_catalog.Provider, entries: []const model_catalog.ModelCatalogEntry) void {
+    if (provider.provider_id != .gateway) return;
+    _ = token_pass_team.publishCatalog(entries);
+}
 
 /// How long a request waits for a model catalog load to connect, for
 /// `CapabilityResolver.resolveWithin` and `refreshWithin`. A healthy network

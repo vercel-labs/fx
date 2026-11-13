@@ -16,6 +16,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -1505,13 +1506,12 @@ pub fn Commands(comptime App: type) type {
         }
 
         /// Whether Token Pass credit can pay for `model` on the agent's
-        /// provider: only AI Gateway serves Token Pass, and only for a team
-        /// that has it.
+        /// provider: only AI Gateway serves Token Pass, and only for a model
+        /// the team's catalog marks.
         fn isGatewayTokenPassModel(app: *App, agent: *AppAgent, model: []const u8) bool {
             if (comptime !provider_runtime.supported(App)) return false;
-            if (comptime !@hasField(App, "model_cache")) return false;
             if (provider_runtime.providerOf(app, agent) != .gateway) return false;
-            return token_pass.paysFor(app.model_cache.tokenPassStatus() == .active, model);
+            return token_pass_team.paysFor(model);
         }
 
         /// Whether the agent's speed setting sends `model` at a speed Token

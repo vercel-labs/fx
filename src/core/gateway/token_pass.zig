@@ -4,27 +4,62 @@
 //! whatever credential the request uses. See
 //! https://vercel.com/docs/ai-gateway/token-pass.
 //!
-//! The model catalog does not mark the featured models, so fx keeps their
-//! list here. fx learns that a team has Token Pass from the credits endpoint,
-//! which it asks when a session starts, and from a response that names
-//! `token-pass` as the provider that served it. Until then, and for a team
-//! without Token Pass, fx shows nothing about Token Pass. This file imports
-//! only the standard library.
+//! AI Gateway marks each model a team's Token Pass pays for with
+//! `token_pass: true` in the coding-agent model catalog, and only for a team
+//! with an active pass, so fx keeps no list of its own. fx learns that a team
+//! has Token Pass from those marks, from the credits endpoint, which it asks
+//! when a session starts, and from a response that names `token-pass` as the
+//! provider that served it. Until then, and for a team without Token Pass, fx
+//! shows nothing about Token Pass. This file imports only the standard
+//! library; `token_pass_team.zig` holds what the process knows of its team.
 const std = @import("std");
-
-/// The featured models Token Pass credit pays for. Vercel can change this
-/// set; it matches the Token Pass documentation.
-pub const featured_models = [_][]const u8{
-    "moonshotai/kimi-k3",
-    "moonshotai/kimi-k3.1-pro",
-    "zai/glm-5.3",
-    "zai/glm-5.3-flash",
-    "deepseek/deepseek-v4.1-flash",
-};
 
 /// The model an AI Gateway session starts on when the team has Token Pass
 /// and nothing else chose the model.
 pub const default_model = "deepseek/deepseek-v4.1-flash";
+
+/// The most Token Pass models fx keeps for a team, and the longest model ID.
+/// A team's pass pays for a handful of models; a mark past either limit is
+/// dropped, and the trace says so.
+pub const max_team_models = 32;
+pub const max_model_id_len = 128;
+
+/// The models AI Gateway marks as paid by a team's Token Pass, in a fixed
+/// buffer so any thread can take a copy without allocating.
+pub const TeamModels = struct {
+    ids: [max_team_models][max_model_id_len]u8 = undefined,
+    lens: [max_team_models]u8 = @splat(0),
+    count: u8 = 0,
+
+    /// Adds `id`. Returns false when the set is full or `id` is too long.
+    pub fn add(self: *TeamModels, id: []const u8) bool {
+        if (self.contains(id)) return true;
+        if (self.count == max_team_models or id.len == 0 or id.len > max_model_id_len) return false;
+        @memcpy(self.ids[self.count][0..id.len], id);
+        self.lens[self.count] = @intCast(id.len);
+        self.count += 1;
+        return true;
+    }
+
+    pub fn contains(self: *const TeamModels, id: []const u8) bool {
+        for (0..self.count) |index| {
+            if (std.ascii.eqlIgnoreCase(self.ids[index][0..self.lens[index]], id)) return true;
+        }
+        return false;
+    }
+};
+
+/// What fx knows of a team's Token Pass: whether the team has one, and the
+/// models AI Gateway marks as paid by it.
+pub const Team = struct {
+    has_pass: bool = false,
+    models: TeamModels = .{},
+
+    /// Whether Token Pass credit pays for `model` for this team.
+    pub fn paysFor(self: *const Team, model: []const u8) bool {
+        return self.has_pass and self.models.contains(model);
+    }
+};
 
 /// What AI Gateway last said about a team's Token Pass.
 pub const Answer = enum { has_pass, no_pass };
@@ -43,17 +78,11 @@ pub fn startModelFor(current: []const u8, builtin_default: []const u8, has_pass:
     return startModel(builtin_default, has_pass);
 }
 
-/// Whether Token Pass credit pays for `model`, where `has_pass` says whether
-/// fx knows the team has Token Pass.
-pub fn paysFor(has_pass: bool, model: []const u8) bool {
-    return has_pass and isFeaturedModel(model);
-}
-
-/// Whether fx offers Fast mode for `model`, which `supports_fast_mode` says
-/// the model has. Token Pass credit does not pay for Fast mode, so a Token
-/// Pass model of a team with Token Pass offers none.
-pub fn offersFastMode(has_pass: bool, model: []const u8, supports_fast_mode: bool) bool {
-    return supports_fast_mode and !paysFor(has_pass, model);
+/// Whether fx offers Fast mode for a model that `supports_fast_mode`, where
+/// `paid_by_pass` says the team's Token Pass pays for it. Token Pass credit
+/// does not pay for Fast mode, so such a model offers none.
+pub fn offersFastMode(paid_by_pass: bool, supports_fast_mode: bool) bool {
+    return supports_fast_mode and !paid_by_pass;
 }
 
 /// How a credential names its team, for the saved answer.
@@ -99,14 +128,6 @@ const provider_slug = "token-pass";
 /// reset date. Vercel fills in the signed-in team for `[team]`.
 pub const dashboard_url = "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Ftoken-pass";
 
-/// Whether Token Pass credit pays for `model` at standard speed.
-pub fn isFeaturedModel(model: []const u8) bool {
-    for (featured_models) |featured| {
-        if (std.ascii.eqlIgnoreCase(model, featured)) return true;
-    }
-    return false;
-}
-
 /// Whether `provider` is the one AI Gateway names for a request Token Pass
 /// served.
 pub fn isTokenPassProvider(provider: []const u8) bool {
@@ -136,35 +157,23 @@ fn sideCallModel(call: SideCall) []const u8 {
     };
 }
 
-/// The model for an AI Gateway side call: a Token Pass model when the team
-/// has Token Pass and the session runs a Token Pass model, so the whole
-/// session stays on Token Pass credit, and `fallback_model` otherwise.
-pub fn modelForSideCall(call: SideCall, session_model: []const u8, fallback_model: []const u8, has_pass: bool) []const u8 {
-    return if (paysFor(has_pass, session_model)) sideCallModel(call) else fallback_model;
+/// The model for an AI Gateway side call: fx's Token Pass model for the call
+/// when the team's Token Pass pays for both it and the session's model, so
+/// the whole session stays on Token Pass credit, and `fallback_model`
+/// otherwise.
+pub fn modelForSideCall(call: SideCall, session_model: []const u8, fallback_model: []const u8, team: *const Team) []const u8 {
+    const chosen = sideCallModel(call);
+    return if (team.paysFor(session_model) and team.paysFor(chosen)) chosen else fallback_model;
 }
 
 /// The Token Pass model of another family that retries a summary a Token
-/// Pass model could not write. Null when the team has no Token Pass or
-/// `primary` is not a Token Pass model, which leaves the choice to the
+/// Pass model could not write. Null when the team's Token Pass does not pay
+/// for `primary` or for that model, which leaves the choice to the
 /// compactor.
-pub fn compactionFallback(primary: []const u8, has_pass: bool) ?[]const u8 {
-    if (!paysFor(has_pass, primary)) return null;
-    return if (std.ascii.startsWithIgnoreCase(primary, "zai/")) "deepseek/deepseek-v4.1-flash" else "zai/glm-5.3";
-}
-
-/// Whether the team of the process's AI Gateway credential has Token Pass,
-/// for side calls that run off the main thread, such as permission reviews
-/// and the vision tool. A process has one AI Gateway credential at a time, so
-/// one value serves all its sessions. Its owner on the main thread publishes
-/// every change, and any thread may read it.
-var process_has_pass: std.atomic.Value(bool) = .init(false);
-
-pub fn publishHasPass(has_pass: bool) void {
-    process_has_pass.store(has_pass, .release);
-}
-
-pub fn processHasPass() bool {
-    return process_has_pass.load(.acquire);
+pub fn compactionFallback(primary: []const u8, team: *const Team) ?[]const u8 {
+    if (!team.paysFor(primary)) return null;
+    const fallback = if (std.ascii.startsWithIgnoreCase(primary, "zai/")) "deepseek/deepseek-v4.1-flash" else "zai/glm-5.3";
+    return if (team.paysFor(fallback)) fallback else null;
 }
 
 /// What fx knows of the current team's Token Pass. `unknown` covers a team
@@ -244,59 +253,86 @@ pub fn deniedHint(cause: DeniedCause) []const u8 {
     return switch (cause) {
         .credit_used_up => "This API key spends only Token Pass credit, so it does not fall back to AI Gateway credits. " ++
             "Wait for the next billing period, or use a standard API key or fx login.",
-        .scoped_key_model => "This API key works only with Token Pass models at standard speed: " ++
-            featured_list ++ ". Choose one, or use a standard API key.",
+        .scoped_key_model => "This API key works only with Token Pass models at standard speed. " ++
+            "Choose one under Token Pass in /models, or use a standard API key.",
         .no_active_pass => "Subscribe in the Token Pass tab at " ++ dashboard_url ++
             ", or switch to the team that has Token Pass with fx teams or /login.",
     };
 }
 
-const featured_list = blk: {
-    var text: []const u8 = "";
-    for (featured_models, 0..) |model, index| {
-        text = text ++ (if (index == 0) "" else ", ") ++ model;
-    }
-    break :blk text;
-};
+/// A team with Token Pass whose catalog marks `ids`, for tests.
+fn testTeam(ids: []const []const u8) Team {
+    var team: Team = .{ .has_pass = true };
+    for (ids) |id| std.debug.assert(team.models.add(id));
+    return team;
+}
 
-test "token pass: featured models match exactly and ignore case" {
-    for (featured_models) |model| try std.testing.expect(isFeaturedModel(model));
-    try std.testing.expect(isFeaturedModel("ZAI/GLM-5.3"));
-    try std.testing.expect(!isFeaturedModel("zai/glm-5.3-fast"));
-    try std.testing.expect(!isFeaturedModel("moonshotai/kimi-k3.1-pro-highspeed"));
-    try std.testing.expect(!isFeaturedModel("glm-5.3"));
-    try std.testing.expect(!isFeaturedModel("openai/gpt-5.6-luna"));
-    try std.testing.expect(!isFeaturedModel(""));
+const test_pass_models = [_][]const u8{ "moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash" };
+
+test "token pass: a team's models match exactly, ignore case, and need the pass" {
+    var team = testTeam(&test_pass_models);
+    try std.testing.expect(team.paysFor("ZAI/GLM-5.3"));
+    try std.testing.expect(!team.paysFor("zai/glm-5.3-fast"));
+    try std.testing.expect(!team.paysFor("glm-5.3"));
+    try std.testing.expect(!team.paysFor("openai/gpt-5.6-luna"));
+    try std.testing.expect(!team.paysFor(""));
+    team.has_pass = false;
+    try std.testing.expect(!team.paysFor("zai/glm-5.3"));
+
+    // The set refuses what it cannot hold and keeps each ID once.
+    var models: TeamModels = .{};
+    try std.testing.expect(models.add("zai/glm-5.3"));
+    try std.testing.expect(models.add("ZAI/GLM-5.3"));
+    try std.testing.expectEqual(@as(u8, 1), models.count);
+    try std.testing.expect(!models.add(""));
+    const too_long: [max_model_id_len + 1]u8 = @splat('x');
+    try std.testing.expect(!models.add(&too_long));
+    var index: usize = 1;
+    while (index < max_team_models) : (index += 1) {
+        var buf: [16]u8 = undefined;
+        try std.testing.expect(models.add(try std.mem.print(&buf, "acme/m{d}", .{index})));
+    }
+    try std.testing.expect(!models.add("acme/one-too-many"));
 }
 
 test "token pass: side calls stay on Token Pass models in a Token Pass session" {
     const fallback_model = "openai/gpt-5.6-luna";
-    for (featured_models) |session_model| {
+    const team = testTeam(&test_pass_models);
+    const no_pass: Team = .{ .models = team.models };
+    for (test_pass_models) |session_model| {
         inline for (.{ SideCall.review, SideCall.title, SideCall.vision }) |call| {
-            const chosen = modelForSideCall(call, session_model, fallback_model, true);
-            try std.testing.expect(isFeaturedModel(chosen));
+            const chosen = modelForSideCall(call, session_model, fallback_model, &team);
+            try std.testing.expect(team.paysFor(chosen));
             // A team without Token Pass keeps the usual side-call model.
-            try std.testing.expectEqualStrings(fallback_model, modelForSideCall(call, session_model, fallback_model, false));
+            try std.testing.expectEqualStrings(fallback_model, modelForSideCall(call, session_model, fallback_model, &no_pass));
         }
     }
-    try std.testing.expectEqualStrings(fallback_model, modelForSideCall(.review, "anthropic/claude-opus-4.8", fallback_model, true));
-    try std.testing.expectEqualStrings(fallback_model, modelForSideCall(.title, "zai/glm-5.3-fast", fallback_model, true));
+    try std.testing.expectEqualStrings(fallback_model, modelForSideCall(.review, "anthropic/claude-opus-4.8", fallback_model, &team));
+    try std.testing.expectEqualStrings(fallback_model, modelForSideCall(.title, "zai/glm-5.3-fast", fallback_model, &team));
+
+    // A side-call model the team's pass does not pay for is not used.
+    const without_reviewer = testTeam(&.{ "zai/glm-5.3", "zai/glm-5.3-flash" });
+    try std.testing.expectEqualStrings(fallback_model, modelForSideCall(.review, "zai/glm-5.3", fallback_model, &without_reviewer));
+    try std.testing.expectEqualStrings("zai/glm-5.3-flash", modelForSideCall(.title, "zai/glm-5.3", fallback_model, &without_reviewer));
 }
 
 test "token pass: a compaction retry uses another Token Pass family" {
-    for (featured_models) |primary| {
-        const fallback = compactionFallback(primary, true).?;
-        try std.testing.expect(isFeaturedModel(fallback));
+    const team = testTeam(&test_pass_models);
+    const no_pass: Team = .{ .models = team.models };
+    for (test_pass_models) |primary| {
+        const fallback = compactionFallback(primary, &team).?;
+        try std.testing.expect(team.paysFor(fallback));
         const family = primary[0 .. std.mem.findScalar(u8, primary, '/').? + 1];
         try std.testing.expect(!std.mem.startsWith(u8, fallback, family));
-        try std.testing.expect(compactionFallback(primary, false) == null);
+        try std.testing.expect(compactionFallback(primary, &no_pass) == null);
     }
-    try std.testing.expect(compactionFallback("anthropic/claude-opus-4.8", true) == null);
+    try std.testing.expect(compactionFallback("anthropic/claude-opus-4.8", &team) == null);
+    // Without a Token Pass model of another family, the compactor chooses.
+    try std.testing.expect(compactionFallback("zai/glm-5.3", &testTeam(&.{ "zai/glm-5.3", "zai/glm-5.3-flash" })) == null);
 }
 
 test "token pass: a team with Token Pass starts on the Token Pass default" {
     const builtin_default = "spacexai/grok-4.7";
-    try std.testing.expect(isFeaturedModel(default_model));
     try std.testing.expectEqualStrings(default_model, startModel(builtin_default, true));
     try std.testing.expectEqualStrings(builtin_default, startModel(builtin_default, false));
 
@@ -310,15 +346,10 @@ test "token pass: a team with Token Pass starts on the Token Pass default" {
     try std.testing.expect(startModelFor("openai/gpt-5.6-luna", builtin_default, true) == null);
 }
 
-test "token pass: only a team with Token Pass loses Fast mode on Token Pass models" {
-    try std.testing.expect(paysFor(true, "zai/glm-5.3"));
-    try std.testing.expect(!paysFor(false, "zai/glm-5.3"));
-    try std.testing.expect(!paysFor(true, "openai/gpt-5.6-luna"));
-
-    try std.testing.expect(!offersFastMode(true, "moonshotai/kimi-k3", true));
-    try std.testing.expect(offersFastMode(false, "moonshotai/kimi-k3", true));
-    try std.testing.expect(offersFastMode(true, "openai/gpt-5.6-luna", true));
-    try std.testing.expect(!offersFastMode(false, "openai/gpt-5.6-luna", false));
+test "token pass: a model the pass pays for offers no Fast mode" {
+    try std.testing.expect(!offersFastMode(true, true));
+    try std.testing.expect(offersFastMode(false, true));
+    try std.testing.expect(!offersFastMode(false, false));
 }
 
 test "token pass: an identity names the team without the secret" {
@@ -380,8 +411,7 @@ test "token pass: denied causes come from the documented messages" {
     try std.testing.expect(deniedCause("") == null);
 }
 
-test "token pass: the scoped-key hint names every featured model" {
-    const hint = deniedHint(.scoped_key_model);
-    for (featured_models) |model| try std.testing.expect(std.mem.find(u8, hint, model) != null);
+test "token pass: the hints point at the picker and the dashboard" {
+    try std.testing.expect(std.mem.find(u8, deniedHint(.scoped_key_model), "Token Pass in /models") != null);
     try std.testing.expect(std.mem.find(u8, deniedHint(.no_active_pass), dashboard_url) != null);
 }

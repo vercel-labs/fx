@@ -9,6 +9,7 @@ const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const token_pass_mod = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
@@ -252,6 +253,8 @@ pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    /// Whether the catalog marks this model as paid by the team's Token Pass.
+    token_pass: bool = false,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -496,8 +499,8 @@ pub const Runtime = struct {
     /// for the team, then the credits check, the provider that served its
     /// requests, and Token Pass denials. It resets with the catalog, since
     /// both belong to one credential and team, and every change is published
-    /// to `token_pass.publishHasPass`. Main thread only, so the mutex does not
-    /// guard it.
+    /// to `token_pass_team`. Main thread only, so the mutex does not guard
+    /// it.
     token_pass: token_pass_mod.Tracker = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -697,7 +700,7 @@ pub const Runtime = struct {
             debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
         }
         self.token_pass = .{};
-        token_pass_mod.publishHasPass(false);
+        token_pass_team.clear();
     }
 
     /// Starts this credential's status from the answer fx saved for its
@@ -705,7 +708,7 @@ pub const Runtime = struct {
     pub fn adoptSavedTokenPass(self: *Self, saved: ?token_pass_mod.Answer) void {
         self.token_pass = token_pass_mod.Tracker.fromSaved(saved);
         if (saved != null) debug_trace.logf("catalog", "token pass status={t} source=saved", .{self.token_pass.status});
-        token_pass_mod.publishHasPass(self.token_pass.hasPass());
+        token_pass_team.publishHasPass(self.token_pass.hasPass());
     }
 
     /// Records what AI Gateway said about this team; `source` names how,
@@ -717,7 +720,18 @@ pub const Runtime = struct {
         };
         if (!changed) return;
         debug_trace.logf("catalog", "token pass status={t} source={s}", .{ self.token_pass.status, source });
-        token_pass_mod.publishHasPass(self.token_pass.hasPass());
+        token_pass_team.publishHasPass(self.token_pass.hasPass());
+    }
+
+    /// Whether the loaded catalog marks any model as paid by the team's Token
+    /// Pass, which AI Gateway does only for a team with an active pass.
+    pub fn catalogMarksTokenPass(self: *Self) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.catalog.items) |entry| {
+            if (entry.token_pass) return true;
+        }
+        return false;
     }
 
     pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
@@ -751,6 +765,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
+        _ = token_pass_team.publishCatalog(self.catalog.items);
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
@@ -1071,6 +1086,7 @@ pub const Runtime = struct {
                     model_catalog.freeModelCatalog(self.alloc, &self.catalog);
                     self.catalog = catalog;
                     self.outcome = .{ .loaded = loaded.provenance };
+                    _ = token_pass_team.publishCatalog(self.catalog.items);
                 }
                 self.state = .ready;
                 return .{ .ready = .{
@@ -1180,6 +1196,7 @@ fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry:
             id,
             model_catalog_metadata.fromCatalogEntry(entry),
         ),
+        .token_pass = entry.token_pass,
     };
     items.append(alloc, item) catch |err| {
         item.deinit(alloc);
@@ -1188,7 +1205,8 @@ fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry:
 }
 
 /// Fills `menu` from `catalog`, in catalog order. With `token_pass_first`,
-/// for a team that has Token Pass, the Token Pass models lead the list.
+/// for a team that has Token Pass, the models the catalog marks as paid by
+/// its Token Pass lead the list, in catalog order.
 fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
@@ -1203,16 +1221,12 @@ fn hydrateMenuSnapshot(
     try items.ensureTotalCapacity(alloc, catalog.len);
 
     if (token_pass_first) {
-        for (token_pass_mod.featured_models) |featured| {
-            for (catalog) |entry| {
-                if (!std.ascii.eqlIgnoreCase(entry.id, featured)) continue;
-                try appendMenuItem(alloc, &items, entry);
-                break;
-            }
+        for (catalog) |entry| {
+            if (entry.token_pass) try appendMenuItem(alloc, &items, entry);
         }
     }
     for (catalog) |entry| {
-        if (token_pass_first and token_pass_mod.isFeaturedModel(entry.id)) continue;
+        if (token_pass_first and entry.token_pass) continue;
         try appendMenuItem(alloc, &items, entry);
     }
 
@@ -2247,6 +2261,30 @@ test "model menu owns resolved catalog state and filters without changing catalo
     const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings("standalone", selected);
+}
+
+test "model menu leads with the models the catalog marks as Token Pass, for a team with Token Pass" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language") },
+        .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .token_pass = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language") },
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .token_pass = true },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+
+    // The marks, not a list in fx, pick the models, in catalog order.
+    try hydrateMenuSnapshot(alloc, &menu, &entries, true);
+    const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6", "deepseek/deepseek-v4.1-flash" };
+    for (led, menu.items.items) |id, item| {
+        try std.testing.expectEqualStrings(id, item.id);
+        try std.testing.expectEqual(std.mem.eql(u8, id, "acme/new-pass-model") or std.mem.eql(u8, id, "zai/glm-5.3"), item.token_pass);
+    }
+
+    // Without Token Pass the catalog order stands.
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    for (entries, menu.items.items) |entry, item| try std.testing.expectEqualStrings(entry.id, item.id);
 }
 
 test "model menu ranks fuzzy matches below verbatim ones and keeps the selection" {

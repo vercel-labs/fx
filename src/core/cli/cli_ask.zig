@@ -47,6 +47,7 @@ const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const token_pass_check = @import("../app/token_pass_check.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
@@ -2066,7 +2067,7 @@ fn maybeStartAskTitleTask(
     // A Token Pass session of a team with Token Pass titles itself with a
     // Token Pass model.
     const title_model = if (ctx.provider == .gateway)
-        token_pass.modelForSideCall(.title, ctx.model, provider_title_model, token_pass.processHasPass())
+        token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model)
     else
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;

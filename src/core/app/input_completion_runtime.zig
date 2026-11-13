@@ -13,6 +13,7 @@ const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const session_commands = @import("../session/session_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -1415,7 +1416,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// its models offer none, and the picker has no speed stage for them.
         fn pickerCapabilities(app: *App, model: []const u8) model_capabilities.Capabilities {
             var capabilities = model_capabilities.resolveForApp(App, app, model);
-            capabilities.supports_fast_mode = token_pass.offersFastMode(teamHasTokenPass(app), model, capabilities.supports_fast_mode);
+            capabilities.supports_fast_mode = token_pass.offersFastMode(token_pass_team.paysFor(model), capabilities.supports_fast_mode);
             return capabilities;
         }
 
@@ -1423,12 +1424,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// setting, but normal speed for a Token Pass model of a team with
         /// Token Pass.
         fn pickerFastMode(app: *App, model: []const u8) bool {
-            return if (token_pass.paysFor(teamHasTokenPass(app), model)) false else app.fast_mode;
-        }
-
-        fn teamHasTokenPass(app: *App) bool {
-            if (comptime !@hasField(App, "model_cache")) return false;
-            return app.model_cache.tokenPassStatus() == .active;
+            return if (token_pass_team.paysFor(model)) false else app.fast_mode;
         }
 
         pub fn beginExactModelSelection(app: *App, agent: *AppAgent, model: []const u8) !void {

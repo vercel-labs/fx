@@ -50,6 +50,7 @@ import {
   TmuxSession,
   tmuxAvailable,
   localCreditsEnv,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -1674,6 +1675,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-token-pass-title-");
       const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
         titleResponses: [finalText("ACP Token Pass Title")],
+        models: tokenPassCatalog(true),
         usage: tokenPassCreditsReply(true),
       });
       try {
@@ -1709,6 +1711,7 @@ describe("acp: model-independent", () => {
         const root = createIsolatedRoot("fx-acp-token-pass-start-");
         const gateway = startDynamicFakeGateway(_raw => finalText("ACP_START_MODEL_OK"), {
           titleResponses: [finalText("ACP Start Model Title")],
+          models: tokenPassCatalog(hasPass),
           usage: tokenPassCreditsReply(hasPass),
         });
         try {

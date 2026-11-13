@@ -476,6 +476,14 @@ const tokenPassPickerModels = [
   { id: "provider/plain-model", type: "language", released: 100, tags: ["tool-use"], context_window: 128_000 },
 ];
 
+/// The picker catalog as AI Gateway sends it to a team with Token Pass: GLM
+/// 5.3 and DeepSeek V4.1 Flash carry `token_pass: true` while `marked` says
+/// the team has an active pass.
+function markedPickerModels(marked: () => boolean = () => true) {
+  const paid = ["zai/glm-5.3", "deepseek/deepseek-v4.1-flash"];
+  return () => tokenPassPickerModels.map((model) => marked() && paid.includes(model.id) ? { ...model, token_pass: true } : model);
+}
+
 /// A credits reply for a team with Token Pass, or for one without
 /// (`token_pass: null`), after `delayMs`.
 function tokenPassCredits(hasPass: () => boolean, delayMs = 0, onRequest?: () => void) {
@@ -3416,14 +3424,20 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const apiKey = "fake-token-pass-picker-key";
       const tracePath = join(fixture.home, "trace.log");
       const fastWarning = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.";
+      // The team loses its pass with the 403 below, and its catalog loses
+      // the marks with it.
+      let denied = false;
       gateway = startFakeGateway([
         fakeGatewayFinalText("TOKEN_PASS_REPLY"),
-        Response.json(
-          { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
-          { status: 403 },
-        ),
+        () => {
+          denied = true;
+          return Response.json(
+            { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
+            { status: 403 },
+          );
+        },
       ], {
-        models: tokenPassPickerModels,
+        models: markedPickerModels(() => !denied),
         usage: tokenPassCredits(() => true),
         titleResponses: [fakeGatewayFinalText("Token Pass title")],
       });
@@ -3436,14 +3450,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
 
-      // The first prompt waits for the check, so it goes out on the Token
-      // Pass default, and so does the session's title.
+      // The first prompt goes out on the Token Pass default. The catalog does
+      // not mark GLM 5.3 Flash, fx's Token Pass title model, so the title
+      // keeps fx's usual model.
       await session.sendText("Use Token Pass.");
       await session.waitForText("TOKEN_PASS_REPLY", 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
       const titleDeadline = Date.now() + 5_000;
       while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
-      expect(gateway.titleRequests.map(chatModelOf)).toEqual(["zai/glm-5.3-flash"]);
+      expect(gateway.titleRequests.map(chatModelOf)).toEqual(["openai/gpt-5.6-luna"]);
       expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
       // fx starts the model for this run only: nothing in settings chose it.
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models).toBeUndefined();
@@ -3594,12 +3609,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
       expect(readFileSync(tracePath, "utf8")).toContain("first prompt sent before the check answered");
 
-      // The late answer still counts for the menu and the next session.
+      // The late answer still counts for the next session. This catalog
+      // marks no model, so the menu has no Token Pass group.
       await waitForTokenPassAnswer(tracePath, "has_pass");
       expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
       await session.sendKeys("C-p");
       const menu = await waitForModelsMenu(session, 4);
-      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      expect(menu.join("\n")).not.toContain("All Models");
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -3659,6 +3675,99 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "the catalog's Token Pass marks decide the Token Pass group",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-catalog-marks-key";
+      const tracePath = join(fixture.home, "trace.log");
+      // AI Gateway marks GLM 5.3 and a model fx has never heard of, and not
+      // DeepSeek V4.1 Flash.
+      const paid = ["zai/glm-5.3", "provider/plain-model"];
+      gateway = startFakeGateway([], {
+        models: tokenPassPickerModels.map((model) => paid.includes(model.id) ? { ...model, token_pass: true } : model),
+        usage: tokenPassCredits(() => true),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: { ...tokenPassEnv(fixture, gateway, apiKey, tracePath), FX_MODEL: "provider/fast-model" },
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      const index = (model: string) => menu.findIndex((line) => !isComposerLine(line) && line.split(/\s+/).includes(model));
+      const tokenPassHeading = menu.findIndex((line) => /^\s*Token Pass\s+2\s*$/.test(line));
+      const allModelsHeading = menu.findIndex((line) => /^\s*All Models\s+2\s*$/.test(line));
+      expect(tokenPassHeading).toBeGreaterThanOrEqual(0);
+      expect(allModelsHeading).toBeGreaterThan(tokenPassHeading);
+      for (const model of paid) {
+        expect(index(model)).toBeGreaterThan(tokenPassHeading);
+        expect(index(model)).toBeLessThan(allModelsHeading);
+      }
+      // DeepSeek is not marked, so it sits with the other models and keeps
+      // Fast mode.
+      expect(index("deepseek/deepseek-v4.1-flash")).toBeGreaterThan(allModelsHeading);
+      expect(menu[index("deepseek/deepseek-v4.1-flash")]).toContain("Fast mode");
+      expect(menu[index("zai/glm-5.3")]).not.toContain("Fast");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a catalog with Token Pass marks tells fx the team has Token Pass when the credits check fails",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-catalog-only-key";
+      const tracePath = join(fixture.home, "trace.log");
+      gateway = startFakeGateway([fakeGatewayFinalText("CATALOG_PASS_REPLY")], {
+        models: markedPickerModels(),
+        // The credits endpoint fails at once, before the catalog loads.
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? new Response("unavailable", { status: 503 })
+          : null,
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      const savedDeadline = Date.now() + 10_000;
+      while (savedTokenPassAnswer(fixture.home, apiKey) !== "has_pass" && Date.now() < savedDeadline) await Bun.sleep(50);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+
+      // The marks start the session on the Token Pass default without
+      // waiting for the credits check.
+      await session.sendText("Use the catalog's answer.");
+      await session.waitForText("CATALOG_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("first prompt sent before the check answered");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "/credits shows the Token Pass balance, and a reply without Token Pass drops its headings",
     async () => {
       const fixture = createModelsMenuFixture();
@@ -3667,9 +3776,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const tokenPassModel = "zai/glm-5.3-flash";
       let creditsReplies = 0;
       gateway = startFakeGateway([], {
-        models: [
+        // The catalog marks the Token Pass model while the credits replies
+        // say the team has a pass.
+        models: () => [
           { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
-          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000, ...(creditsReplies <= 2 ? { token_pass: true } : {}) },
         ],
         // The launch check and the first /credits see Token Pass; the
         // second /credits says the team no longer has an active one.
@@ -3741,6 +3852,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           context_window: model.context,
           max_tokens: model.output,
           ...(model.fast ? { fast_options: [{ type: "toggle" }] } : {}),
+          // The team's pass pays for the first two.
+          ...(index < 2 ? { token_pass: true } : {}),
         })),
         // The headings show only for a team with Token Pass.
         usage: tokenPassCredits(() => true),
@@ -3794,14 +3907,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       menu = await session.capturePaneGrid();
       expectOneColumn(menu, " context");
 
-      // Short: with only a few rows the menu still shows the selected model
-      // and marks it as Token Pass, by heading or by tag.
+      // Short: with only a few rows the menu still shows the selected model,
+      // the first one the catalog marks in the picker's order, and marks it
+      // as Token Pass, by heading or by tag.
       await session.resizeWindow(56, 12);
-      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes("kimi-k3"), 5_000);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes("glm-5.3-flash"), 5_000);
       menu = await session.capturePaneGrid();
       expect(menu.length).toBeLessThanOrEqual(12);
       expect(menu.some((line) => line.includes("Token Pass"))).toBe(true);
-      expect(row(menu, "kimi-k3")).not.toBe("");
+      expect(row(menu, "glm-5.3-flash")).not.toBe("");
 
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
