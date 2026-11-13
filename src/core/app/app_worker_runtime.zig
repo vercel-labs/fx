@@ -600,6 +600,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.propagateGrant(tool_name, target_path);
                 return;
             }
+            try app_permission_runtime.Runtime(App).allowSubagentForSession(app, agent, tool_name, target_path);
             try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
         }
 

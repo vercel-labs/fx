@@ -754,6 +754,57 @@ test "tool authority refuses a tool the host lacks" {
     try std.testing.expectEqual(ToolAuthorityDecision.unavailable, decision);
 }
 
+test "a session approval lets an asked action run, and never a tool the child lacks or a denied one" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const target = "/tmp/workspace/app/page.tsx";
+    // The grants a file change's approval offers: the workspace tree.
+    const approved = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", target, .path_create_parent);
+    const asking = LiveAuthority{
+        .generation = 1,
+        .root_id = "root",
+        .tools = &.{"write_file"},
+        .integrations = &.{},
+        .rules = .{},
+        .grants = &.{},
+        .permission_mode = .ask,
+    };
+
+    try std.testing.expectEqual(
+        ToolAuthorityDecision.ask,
+        try decideToolAuthority(alloc, asking, "/tmp/workspace", "write_file", target, .path_create_parent),
+    );
+
+    var approved_authority = asking;
+    approved_authority.grants = approved;
+    try std.testing.expectEqual(
+        ToolAuthorityDecision.allow,
+        try decideToolAuthority(alloc, approved_authority, "/tmp/workspace", "write_file", target, .path_create_parent),
+    );
+    // Another subagent of the same instance reads the same grants.
+    try std.testing.expectEqual(
+        ToolAuthorityDecision.allow,
+        try decideToolAuthority(alloc, approved_authority, "/tmp/workspace", "write_file", "/tmp/workspace/other/file.txt", .path_create_parent),
+    );
+
+    var lacking = approved_authority;
+    lacking.tools = &.{"read_file"};
+    try std.testing.expectEqual(
+        ToolAuthorityDecision.unavailable,
+        try decideToolAuthority(alloc, lacking, "/tmp/workspace", "write_file", target, .path_create_parent),
+    );
+
+    var denied = approved_authority;
+    var deny_rules = [_]types.PermissionRule{.{ .permission = @constCast("write_file"), .pattern = @constCast("*"), .action = .deny }};
+    denied.rules = .{ .rules = &deny_rules };
+    try std.testing.expectEqual(
+        ToolAuthorityDecision.deny,
+        try decideToolAuthority(alloc, denied, "/tmp/workspace", "write_file", target, .path_create_parent),
+    );
+}
+
 test "narrowing an MCP view to a profile's servers leaves it whole when an allocation fails" {
     const Narrow = struct {
         fn run(alloc: Allocator, profile: *const profiles.Profile) !void {

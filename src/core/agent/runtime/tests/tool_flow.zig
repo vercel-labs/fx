@@ -7374,3 +7374,148 @@ test "child live authority allow to ask requires current approval before effect"
         hooks.successful_effect_count.load(.seq_cst),
     );
 }
+
+/// A subagent's live authority over one tool. The tool is allowed and asks,
+/// as it does for a subagent in `ask` mode, so every call reaches approval.
+const AskingChildAuthority = struct {
+    tool: []const u8,
+
+    fn resolve(
+        raw: *anyopaque,
+        _: std.mem.Allocator,
+        _: ToolCall,
+        _: []const u8,
+        _: []const u8,
+        _: tool_dispatch.PermissionTargetKind,
+    ) !runtime_deps.ResolvedLiveToolAuthority {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return .{
+            .authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = (&self.tool)[0..1],
+                .integrations = &.{},
+                .rules = .{ .rules = &.{} },
+                .grants = &.{},
+                .permission_mode = .auto,
+            },
+            .decision = .ask,
+        };
+    }
+};
+
+const ChildApprovalKind = enum { ordinary, file_change, command };
+
+/// What a subagent's approval of one call stored, as the turn reported it.
+const ChildApprovalGrants = struct {
+    executed: usize,
+    propagated: usize,
+    events: usize,
+    frozen_match: bool,
+};
+
+fn childApproval(kind: ChildApprovalKind, decision: types.ToolPermissionDecision, live: bool) !ChildApprovalGrants {
+    const alloc = std.testing.allocator;
+    const call = switch (kind) {
+        .ordinary => toolCall("child_call", "read_file", "{\"path\":\"notes.txt\"}"),
+        .file_change => toolCall("child_call", "write_file", "{\"path\":\"app/page.tsx\",\"content\":\"x\"}"),
+        .command => toolCall("child_call", "shell", "{\"command\":\"zig fmt\"}"),
+    };
+    const calls = [_]ToolCall{call};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{decision};
+    hooks.permission_target = if (kind == .file_change) "/tmp/workspace/app/page.tsx" else "/tmp/workspace/file.txt";
+    var authority = AskingChildAuthority{ .tool = call.name };
+    if (live) hooks.live_tool_authority = .{ .context = &authority, .resolve_fn = AskingChildAuthority.resolve };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    return .{
+        .executed = hooks.executed_names.items.len,
+        .propagated = hooks.propagated_grants.items.len,
+        .events = hooks.event_grants.items.len,
+        .frozen_match = kind != .file_change or (hooks.last_frozen_file_grants.items.len > 0 and
+            grantListsEqual(hooks.last_frozen_file_grants.items, hooks.propagated_grants.items)),
+    };
+}
+
+fn grantListsEqual(a: []const PermissionGrant, b: []const PermissionGrant) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.tool_name, right.tool_name)) return false;
+        if (!std.mem.eql(u8, left.target_path, right.target_path)) return false;
+    }
+    return true;
+}
+
+fn expectChildAlwaysStoresGrant(kind: ChildApprovalKind) !void {
+    const child = try childApproval(kind, .always, true);
+    try std.testing.expectEqual(@as(usize, 1), child.executed);
+    try std.testing.expect(child.propagated > 0);
+    try std.testing.expectEqual(child.propagated, child.events);
+    try std.testing.expect(child.frozen_match);
+
+    // The same call from a turn with no live authority, which main's is.
+    const main = try childApproval(kind, .always, false);
+    try std.testing.expectEqual(main.propagated, child.propagated);
+    try std.testing.expectEqual(main.events, child.events);
+}
+
+test "a subagent's always approval of an ordinary call stores the session grant" {
+    try expectChildAlwaysStoresGrant(.ordinary);
+}
+
+test "a subagent's always approval of a file change stores the session grant" {
+    try expectChildAlwaysStoresGrant(.file_change);
+}
+
+test "a subagent's always approval of a command stores the session grant" {
+    try expectChildAlwaysStoresGrant(.command);
+}
+
+test "a subagent's one-time approval stores no session grant" {
+    for (std.enums.values(ChildApprovalKind)) |kind| {
+        const child = try childApproval(kind, .once, true);
+        try std.testing.expectEqual(@as(usize, 1), child.executed);
+        try std.testing.expectEqual(@as(usize, 0), child.propagated);
+        try std.testing.expectEqual(@as(usize, 0), child.events);
+    }
+}
+
+test "a subagent's always approvals of two calls in one step store the session grants" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("child_a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("child_b", "read_file", "{\"path\":\"b.txt\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .always, .always };
+    var authority = AskingChildAuthority{ .tool = "read_file" };
+    hooks.live_tool_authority = .{ .context = &authority, .resolve_fn = AskingChildAuthority.resolve };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expect(hooks.propagated_grants.items.len > 0);
+    try std.testing.expectEqual(hooks.propagated_grants.items.len, hooks.event_grants.items.len);
+}

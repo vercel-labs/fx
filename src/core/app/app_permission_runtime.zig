@@ -175,6 +175,17 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Records, at once, an "always" approval a subagent's turn just gave. A
+        /// subagent resolves its authority from its instance's approvals at
+        /// every tool call, so its next call may run before the main loop
+        /// handles the event that carries the same approval. A main agent
+        /// keeps its own list for the rest of its turn and needs no early write.
+        pub fn allowSubagentForSession(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+            if (comptime !per_instance) return;
+            if (!isSubagent(app, agent)) return;
+            try allowForSession(app, agent, tool_name, target_path);
+        }
+
         /// Drops `agent`'s session approvals when its session ends: they
         /// last one session, and only its own end.
         pub fn clearSessionGrants(app: *App, agent: *AppAgent) void {

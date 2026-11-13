@@ -6892,6 +6892,58 @@ test "each instance keeps its own permission mode and session approvals" {
     try std.testing.expectEqual(second_count, view.grants.items.len);
 }
 
+test "a subagent's always approval reaches its instance's list at once, for main and its siblings only" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Worker = app_worker_runtime.Runtime(App);
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const second = try addTestChildAgent(&app, "instance-2");
+    second.agent.role = .instance;
+    const child = try addTestChildAgent(&app, "child-1");
+    const sibling = try addTestChildAgent(&app, "child-2");
+    const other = try addTestChildAgent(&app, "child-of-instance-2");
+    other.agent.root_instance = &second.agent;
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The grants a file change's approval offers: the workspace tree.
+    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    try std.testing.expect(file_grants.len > 0);
+
+    // They are in the list when the call returns, before the event that
+    // carries them reaches the main loop.
+    for (file_grants) |grant| try Worker.propagateGrant(&app, &child.agent, grant.tool_name, grant.target_path);
+    for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
+        try std.testing.expect(permissions.sessionGrantAllowed(Permission.grantsOf(&app, agent), "write_file", "/tmp/workspace/other/file.txt"));
+    }
+    try std.testing.expect(Permission.grantsOf(&app, &child.agent).ptr == Permission.grantsOf(&app, &app.main_agent).ptr);
+    const stored = Permission.grantsOf(&app, &app.main_agent).len;
+
+    // The same approval again leaves the list as it was.
+    for (file_grants) |grant| try Worker.propagateGrant(&app, &child.agent, grant.tool_name, grant.target_path);
+    try std.testing.expectEqual(stored, Permission.grantsOf(&app, &app.main_agent).len);
+
+    // A second instance is another session: it keeps its own list, and its
+    // subagent's approval stays there.
+    try std.testing.expectEqual(@as(usize, 0), Permission.grantsOf(&app, &second.agent).len);
+    try std.testing.expect(!permissions.sessionGrantAllowed(Permission.grantsOf(&app, &other.agent), "write_file", "/tmp/workspace/other/file.txt"));
+    try Worker.propagateGrant(&app, &other.agent, "skill", "demo");
+    try std.testing.expect(permissions.sessionGrantAllowed(Permission.grantsOf(&app, &second.agent), "skill", "demo"));
+    try std.testing.expect(!permissions.sessionGrantAllowed(Permission.grantsOf(&app, &app.main_agent), "skill", "demo"));
+    try std.testing.expectEqual(stored, Permission.grantsOf(&app, &app.main_agent).len);
+
+    // A main agent's own turn writes nothing early: its list and its event
+    // carry the approval.
+    try Worker.propagateGrant(&app, &app.main_agent, "skill", "main-only");
+    try std.testing.expectEqual(stored, Permission.grantsOf(&app, &app.main_agent).len);
+}
+
 test "a subagent's turn is stamped with its run's model, permissions, credential, and root request" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
