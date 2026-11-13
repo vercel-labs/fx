@@ -5277,6 +5277,79 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "Escape ends a running tty command with no steering",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tty-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "tty-escape-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
+      const escapeGateway = startFakeGateway([
+        fakeGatewayToolCall("tty_escape_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            tty: true,
+            command,
+          },
+        }),
+      ]);
+      gateway = escapeGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tty-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: escapeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: escapeGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: escapeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the tty escape fixture.");
+      await session.waitForText("Running printf", TIMEOUT);
+      await waitForCondition(
+        () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+        "tty escape command pid",
+      );
+      const commandPid = Number(readTrimmed(pidPath));
+      expect(isProcessAlive(commandPid)).toBe(true);
+
+      await session.sendInterruptEscapePair(TIMEOUT);
+      // The interrupt ends the command, so no process outlives its session.
+      await waitForCondition(
+        () => !isProcessAlive(commandPid),
+        "interrupted tty command exit",
+      );
+      expect(readFileSync(tracePath, "utf8")).toContain("outcome_kind=interrupted");
+      expect(escapeGateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "rich steering interrupts tool-free generation without queue UI",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-order-")));
