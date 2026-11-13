@@ -1736,6 +1736,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         },
         .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .tool_yield_flag = &ctx.worker.tool_yield_requested,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
@@ -1771,6 +1772,7 @@ fn terminal_lease_cleanup_dispatch_context(
 ) tool_dispatch.DispatchContext {
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.cancel_flag = null;
+    dispatch.tool_yield_flag = null;
     return dispatch;
 }
 
