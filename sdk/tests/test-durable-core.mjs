@@ -1131,6 +1131,7 @@ function recordingAgent(durability, { refuseFirst = false } = {}) {
     harness: () => {
       const base = scriptedHarness()();
       return {
+        settings: ({ model }) => model === undefined ? undefined : { model },
         open: async (options) => {
           const session = await base.open(options);
           return {
@@ -2073,6 +2074,38 @@ if (durabilityKind === "queue") {
     await theirs.close();
     await ours.close();
     for (const { stored } of [acme, evil, twin]) await stored.close();
+  });
+
+  test("Workflow replay finds the saved agent and store across Worlds sharing one route", async () => {
+    const { recreateRunFromExisting } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const first = await routeWorld("replay-first");
+    const second = await routeWorld("replay-second");
+    const agents = [
+      createTaggedAgent({ durability: first.durability, name: "support", tag: "first" }),
+      createTaggedAgent({ durability: second.durability, name: "support", tag: "second" }),
+    ];
+    try {
+      for (const [index, fixture] of [first, second].entries()) {
+        const agent = agents[index];
+        const original = agent.session();
+        const turn = original.prompt(`tenant-${index}`, { messageId: `source-${index}` });
+        await turn.accepted;
+        for (const message of fixture.sent.splice(0)) await post(wakeHandler(), message.payload);
+        assert.equal((await turn.result).stopReason, "end_turn");
+        const replayed = await recreateRunFromExisting(fixture.durability.world(), original.id, { specVersion: 8 });
+        const delivery = fixture.sent.find(({ payload }) => payload.runId === replayed && !payload.input);
+        assert.ok(delivery);
+        assert.equal((await post(wakeHandler(), delivery.payload)).status, 200);
+        assert.deepEqual(openersOf(replayed), [index === 0 ? "first" : "second"]);
+        const log = await agent[Symbol.for("libfx.durableInternals")].openLog(replayed);
+        const input = (await log.read()).find(({ entry }) => entry.k === "input");
+        assert.equal(input.entry.input, `tenant-${index}`);
+      }
+    } finally {
+      for (const agent of agents) await agent.close();
+      await first.stored.close();
+      await second.stored.close();
+    }
   });
 
   test("a forged steer, cancel or resume runs nothing, and a forged delivery is answered alike whether or not its session exists", async () => {
@@ -3875,6 +3908,151 @@ if (durabilityKind === "queue") {
     const lines = await readLines(second.session(session.id).stream(0), 32);
     assert.equal(lines.filter((line) => line.type === "turn_end").length, 1, "the turn ended once");
     for (const closing of [first, second]) await closing.close();
+  });
+}
+
+if (durabilityKind === "world") {
+  test("an app World's standard Workflow handler keeps its own deliveries", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-shared-workflow-"));
+    dirs.push(dir);
+    const durability = await appWorldAt(dir);
+    const stored = durability.world();
+    let received = false;
+    stored.registerHandler("__wkf_workflow_", stored.createQueueHandler("__wkf_workflow_", async () => { received = true; }));
+    const agent = createAgent({ durability });
+    try {
+      await agent.session().prompt("libfx").result;
+      await stored.queue("__wkf_workflow_app/flow", { runId: "wrun_0123456789ABCDEFGHIJK" });
+      const deadline = Date.now() + 1000;
+      while (!received && Date.now() < deadline) await sleep(20);
+      assert.equal(received, true, "libfx does not replace the app's Workflow handler");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "local") {
+  test("Workflow replay reaches the local World's real in-process queue handler", async () => {
+    const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-local-replay-"));
+    dirs.push(dir);
+    const settings = local({ dir });
+    const stored = settings.world();
+    const durability = world(() => stored, settings);
+    const agent = createAgent({ durability });
+    try {
+      const original = agent.session();
+      await original.prompt("local-replay", { messageId: "first" }).result;
+      const source = await stored.runs.get(original.id, { resolveData: "all" });
+      await cancelRun(stored, original.id);
+      const replayed = await recreateRunFromExisting(stored, original.id, { specVersion: source.specVersion });
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(replayed);
+      const ended = async () => (await log.read()).some(({ entry }) => entry.k === "record" && entry.marks?.some((mark) => mark.end));
+      const deadline = Date.now() + 15_000;
+      while (!await ended() && Date.now() < deadline) await sleep(20);
+      assert.equal(await ended(), true, "the local World's queue delivered the Workflow replay");
+      const lines = await readLines(agent.session(replayed).stream(0), 5);
+      assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join("").trim(), "local-replay-0 local-replay-1 local-replay-2");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("Workflow replay rejects a descriptor for another store, agent, or source before opening a harness", async () => {
+    const { workflowCodec } = await import("../durable/workflow.mjs");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-replay-validation-"));
+    dirs.push(dir);
+    const { durability } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
+    const stored = durability.world();
+    const createHandler = stored.createQueueHandler;
+    let deliver;
+    stored.createQueueHandler = (prefix, handler) => {
+      deliver ??= handler;
+      return createHandler(prefix, handler);
+    };
+    const agent = createAgent({ durability });
+    try {
+      const original = agent.session();
+      await original.prompt("private", { messageId: "private-prompt" }).result;
+      const source = await stored.runs.get(original.id, { resolveData: "all" });
+      const [descriptor] = await workflowCodec.decode(source, stored);
+      const target = await agent.newSessionId();
+      const get = stored.runs.get;
+      const before = opened.count;
+      for (const overrides of [
+        { libfx: 0 },
+        { store: "another-customer" },
+        { agent: "missing-agent" },
+        { sourceRunId: target },
+        { sourceRunId: "invalid" },
+      ]) {
+        const input = await workflowCodec.encode([{ ...descriptor, ...overrides }], target);
+        stored.runs.get = (runId, options) => runId === target
+          ? Promise.resolve({ ...source, runId: target, input, executionContext: { replayedFromRunId: original.id } })
+          : get(runId, options);
+        await assert.rejects(deliver({ runId: target }, { messageId: "invalid-replay", attempt: 1 }));
+      }
+      stored.runs.get = get;
+      assert.equal(opened.count, before, "no rejected replay opened a harness");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("Workflow dashboard replay runs a saved prompt in a fresh session on the same or latest deployment", async () => {
+    const { workflowCodec } = await import("../durable/workflow.mjs");
+    const { recreateRunFromExisting, cancelRun } = await import("../durable/node_modules/@workflow/core/dist/runtime/runs.js");
+    const dir = await mkdtemp(join(tmpdir(), "libfx-workflow-replay-"));
+    dirs.push(dir);
+    const { durability: supplied, broker } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
+    const stored = supplied.world();
+    const durability = world(() => stored, supplied);
+    const { agent, seen } = recordingAgent(durability);
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const until = async (check, message) => {
+      const deadline = Date.now() + 10_000;
+      while (!await check()) {
+        if (Date.now() > deadline) throw new Error(message);
+        await sleep(20);
+      }
+    };
+    try {
+      const original = agent.session(undefined, { context: { customer: "fixture" }, model: "fixture/model" });
+      const input = [{ type: "text", text: "replay" }, image];
+      assert.equal((await textOf(original.prompt(input, { messageId: "replay-first" }))).result.stopReason, "end_turn");
+      await original.prompt("later prompt", { messageId: "replay-later" }).result;
+      const saved = await stored.runs.get(original.id, { resolveData: "all" });
+      assert.deepEqual(await workflowCodec.decode(saved, stored), [{ libfx: 1, sourceRunId: original.id, agent: "default", store: "queue" }]);
+      await cancelRun(stored, original.id);
+      for (const deploymentId of [undefined, "dpl_latest"]) {
+        const replayed = await recreateRunFromExisting(stored, original.id, { ...(deploymentId ? { deploymentId } : {}), specVersion: saved.specVersion });
+        await until(async () => (await (await internals.openLog(replayed)).read()).some(({ entry }) => entry.k === "record" && entry.marks?.some((mark) => mark.end)), "replayed prompt did not execute");
+        const lines = await readLines(agent.session(replayed).stream(0), 5);
+        assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join("").trim(), "image-0 image-1 image-2");
+        assert.deepEqual(seen.at(-1), input, "the first saved prompt's image bytes reached the harness");
+        const log = await internals.openLog(replayed);
+        const inputs = (await log.read()).filter(({ entry }) => entry.k === "input" && entry.type === "prompt");
+        assert.equal(inputs.length, 1, "the first prompt is copied once, including when a health check names the run");
+        assert.deepEqual(inputs[0].entry.context, { customer: "fixture" });
+        assert.equal(inputs[0].entry.settings.model, "fixture/model");
+        const run = await stored.runs.get(replayed, { resolveData: "all" });
+        assert.equal(run.executionContext.replayedFromRunId, original.id);
+        if (deploymentId) assert.equal(run.deploymentId, deploymentId);
+        // A duplicate Workflow delivery must not execute the prompt again.
+        const delivery = broker.sent.find((message) => message.payload.runId === replayed && !message.payload.input);
+        const before = ran.length;
+        broker.adopt(delivery);
+        await sleep(100);
+        assert.equal(ran.length, before);
+      }
+    } finally {
+      await agent.close();
+    }
   });
 }
 
