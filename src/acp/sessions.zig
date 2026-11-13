@@ -883,6 +883,9 @@ fn handleRestoreSession(
             active.permission_mode = start.permission_mode;
             state.subagent_authority_mutex.unlock(io_mod.getIo());
             if (!in_place) if (previous_host) |h| h.stop();
+            // A session whose host did not build when it opened gets one now,
+            // as every reload gave it before.
+            if (state.subagent_host == null) server.enableSubagentHost(state);
             // One map, so a recovered read can name a call from an earlier turn.
             var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
             defer sources.deinit(alloc);
@@ -2475,6 +2478,27 @@ test "ACP load of the active session keeps its subagent host and the session it 
         );
         _ = server.applySessionMode(state.cfg.mode_registry, &state.active_session.?, "review");
     }
+
+    // A session whose host did not build when it opened gets one on a reload, as it always did.
+    server.disableSubagentHost(&state);
+    try std.testing.expect(state.subagent_host == null);
+    try std.testing.expect(state.subagent_v2_children == null);
+    var params: std.Io.Writer.Allocating = .init(arena);
+    defer params.deinit();
+    try params.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(state.active_session.?.session_id, &params.writer);
+    try params.writer.writeAll(",\"mcpServers\":[]}");
+    var again = jsonrpc.Message{
+        .id = .{ .integer = 4 },
+        .method = "session/load",
+        .params_raw = params.writer.buffered(),
+    };
+    try handleLoadSession(&state, arena, &again);
+    const rebuilt = state.subagent_host orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.subagent_v2_children != null);
+    try std.testing.expect(state.active_session.?.v2.? == parent);
+    // It is wired to the live server: a report a child posts reaches this session's queue.
+    try std.testing.expect(rebuilt.report_sink.?.context == @as(?*anyopaque, @ptrCast(&state)));
 }
 
 test "ACP history excludes typed summaries without filtering original user text" {
