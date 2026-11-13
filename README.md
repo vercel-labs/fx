@@ -115,7 +115,7 @@ Run `/feedback` inside fx to open the feedback form, or [open an issue](https://
 
 ## Contributing
 
-You need [Zig 0.17.0](https://ziglang.org/download/) to build fx:
+You need [Zig 0.17.1](https://ziglang.org/download/) to build fx:
 
 ```bash
 git clone https://github.com/vercel-labs/fx.git

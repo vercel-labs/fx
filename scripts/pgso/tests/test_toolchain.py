@@ -39,10 +39,10 @@ class PgsoToolchainTests(unittest.TestCase):
         self.zig_sdk = self.zig_lib / "libc" / "darwin"
         self.zig_sdk.mkdir(parents=True)
         (self.zig_sdk / "libSystem.tbd").write_bytes(b"system stub")
-        (self.zig_sdk / "SDKSettings.json").write_text('{"MinimalDisplayName":"26.4"}')
+        (self.zig_sdk / "SDKSettings.json").write_text('{"Version":"26.4"}')
         zig_env = f'.{{\n    .lib_dir = {json.dumps(str(self.zig_lib))},\n}}\n'
         self.write_executable(self.zig, f"""case "$1" in
-  version) printf '0.17.0\\n' ;;
+  version) printf '0.17.1\\n' ;;
   env) printf '%s' {shlex.quote(zig_env)} ;;
   *) exit 2 ;;
 esac""")
@@ -132,7 +132,7 @@ esac"""
         self.assertEqual(self.zig_sdk.resolve(), toolchain.tools.zig_darwin_sdk)
         self.assertEqual("26.4", toolchain.tools.zig_sdk_version)
         self.assertEqual(self.profile_runtime.resolve(), toolchain.profile_runtime)
-        self.assertEqual("0.17.0", toolchain.zig_version)
+        self.assertEqual("0.17.1", toolchain.zig_version)
         self.assertEqual("22.1.8", toolchain.llvm_version)
         self.assertEqual("aarch64-macos", toolchain.target)
         self.assertIs(macos, toolchain.platform)
@@ -173,9 +173,9 @@ esac"""
                 )
 
     def test_discover_rejects_the_wrong_zig_version(self) -> None:
-        self.write_executable(self.zig, "printf '0.17.1\\n'")
+        self.write_executable(self.zig, "printf '0.17.0\\n'")
 
-        with self.assertRaisesRegex(PgsoError, "requires Zig 0.17.0"):
+        with self.assertRaisesRegex(PgsoError, "requires Zig 0.17.1"):
             self.discover()
 
     def test_discover_rejects_a_mixed_llvm_version(self) -> None:
@@ -230,12 +230,13 @@ esac"""
 
     def test_discover_rejects_unusable_zig_library_metadata(self) -> None:
         for env_text in (".{}", '.{\n.lib_dir = "relative",\n}', '.{\n.lib_dir = "a",\n.lib_dir = "b",\n}'):
-            self.write_executable(self.zig, f"""if [ "$1" = version ]; then printf '0.17.0\\n'; else printf '%s' {shlex.quote(env_text)}; fi""")
+            self.write_executable(self.zig, f"""if [ "$1" = version ]; then printf '0.17.1\\n'; else printf '%s' {shlex.quote(env_text)}; fi""")
             with self.subTest(env_text=env_text), self.assertRaises(PgsoError):
                 self.discover()
 
     def test_discover_rejects_invalid_zig_sdk_settings(self) -> None:
-        for text in ("invalid", "[]", '{"MinimalDisplayName":"unknown"}'):
+        # 0.17.0's key alone is not 0.17.1's stub.
+        for text in ("invalid", "[]", '{"Version":"unknown"}', '{"MinimalDisplayName":"26.4"}'):
             (self.zig_sdk / "SDKSettings.json").write_text(text)
             with self.subTest(text=text), self.assertRaises(PgsoError):
                 self.discover()

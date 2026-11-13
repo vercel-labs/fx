@@ -12,7 +12,7 @@ from typing import Any
 from scripts.pgso.model import PgsoError
 
 
-REQUIRED_ZIG_VERSION = "0.17.0"
+REQUIRED_ZIG_VERSION = "0.17.1"
 REQUIRED_LLVM_VERSION = "22.1.8"
 DEFAULT_TARGET = "aarch64-macos"
 IR_SIZE_SCRIPT = pathlib.Path(__file__).resolve().with_name("ir_size.py")

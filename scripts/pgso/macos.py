@@ -89,7 +89,9 @@ def _zig_darwin_sdk(zig: pathlib.Path) -> tuple[pathlib.Path, str]:
         settings = json.loads((sdk / "SDKSettings.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise PgsoError("could not read Zig Darwin SDK settings") from error
-    version = settings.get("MinimalDisplayName") if isinstance(settings, dict) else None
+    # Zig 0.17.1's stub names the version `Version`, the key its linker reads;
+    # 0.17.0's named it `MinimalDisplayName`.
+    version = settings.get("Version") if isinstance(settings, dict) else None
     if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+(?:\.\d+)?", version) is None:
         raise PgsoError("invalid Zig Darwin SDK version")
     return sdk, version
