@@ -62,6 +62,23 @@ export function logLines(home: string, id: string): LogLine[] {
   return lines;
 }
 
+/// Every line of a session's log whose turns may compact in the middle. A
+/// turn is superseded only after a compaction in it moved its first results
+/// out of the agent's view, once for that compaction
+/// (`tests/tla/session/TurnStream.tla` SupersedeExplained).
+export function logLinesAfterCompaction(home: string, id: string): LogLine[] {
+  const lines = readLog(home, id);
+  let compacted = false;
+  for (const line of lines) {
+    if (line.kind === "turn_started") compacted = false;
+    if (line.kind === "compacted") compacted = true;
+    if (line.type !== "superseded") continue;
+    expect({ seq: line.seq, compacted }).toEqual({ seq: line.seq, compacted: true });
+    compacted = false;
+  }
+  return lines;
+}
+
 /// Every saved session's id, children included.
 export function savedSessionIds(home: string): string[] {
   return readdirSync(storeRoot(home)).filter((name) => !name.startsWith(".") && !name.startsWith("index"));
