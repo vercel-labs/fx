@@ -366,7 +366,7 @@ describe("filesystem path handling", () => {
       inline: true,
     },
     {
-      // The catalog lists the default model, spacexai/grok-4.7, with vision
+      // The catalog lists spacexai/grok-4.7 with vision
       // and without file-input, which covers documents rather than images.
       name: "read_file attaches a workspace image inline for a vision model without file input",
       modelTags: ["reasoning", "tool-use", "implicit-caching", "vision", "structured-output"],

@@ -91,7 +91,7 @@ function allReports(raw: string): Record<string, unknown>[] {
   }
   return out;
 }
-const DEFAULT_MODEL = "spacexai/grok-4.7";
+const DEFAULT_MODEL = "openai/gpt-6.1-sol";
 /** What fx says when it cannot connect to the model catalog and drops fast
  * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
 const CATALOG_CONNECT_FAST_NOTICE =
@@ -1617,14 +1617,20 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask uses Grok 4.7 as the default model", async () => {
+  test.each(["", "spacexai/grok-4.7"])("ask uses GPT-6.1 Sol by default and preserves a saved model (%s)", async (savedModel) => {
     const root = createFixtureRoot("default-model");
+    const expectedModel = savedModel || DEFAULT_MODEL;
+    if (savedModel) {
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+        models: { gateway: savedModel },
+      }));
+    }
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("DEFAULT_MODEL_COMPLETE"),
       {
         models: [{
-          id: DEFAULT_MODEL,
+          id: expectedModel,
           type: "language",
           tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
           reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
@@ -1650,10 +1656,14 @@ describe("gateway stream lifecycle", () => {
       expect(parseAskJson(result.stdout).output).toContain(
         "DEFAULT_MODEL_COMPLETE",
       );
+      expect(parseAskJson(result.stdout).model).toBe(expectedModel);
+      if (savedModel) {
+        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")).models.gateway).toBe(savedModel);
+      }
       expect(result.stderr).toBe("");
       expect(gateway.requests).toHaveLength(1);
       expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
-        DEFAULT_MODEL,
+        expectedModel,
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");

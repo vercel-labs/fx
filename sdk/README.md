@@ -314,7 +314,7 @@ createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "high", fast: 
 
 ### AI Gateway
 
-AI Gateway is the default. libfx uses the first credential it finds: the `apiKey` option, then `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token.
+AI Gateway is the default provider, with `openai/gpt-6.1-sol` as the default model. libfx uses the first credential it finds: the `apiKey` option, then `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token.
 
 ### ChatGPT plans
 

@@ -15,7 +15,7 @@ import { Harness, actFor, checkTlc, seededRandom, specFiles, toTla, type Checked
 const listed = (vision: boolean, file_input: boolean): View => ({ kind: "listed", vision, file_input });
 const down: View = { kind: "down", vision: false, file_input: false };
 const missing: View = { kind: "missing", vision: false, file_input: false };
-// The live catalog's entry for the default model, spacexai/grok-4.7.
+// The Grok 4.7 catalog entry from the original default-model report.
 const visionOnly = listed(true, false);
 const views: View[] = [listed(true, true), visionOnly, listed(false, true), listed(false, false), missing, down];
 
