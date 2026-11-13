@@ -276,6 +276,8 @@ measurements/
 manifest.json
 ```
 
+Training and behavior jobs also upload the crash reports macOS wrote for fx, in `crash-reports/`. These builds print no stack trace when fx panics, but the report lists each thread's frames as offsets into the binary. A function's address in `logs/instrumented-link.map` (training) or `logs/candidate-link.map` (behavior) is 0x100000000 plus that offset.
+
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 
 The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence normally retains at most the last 1,048,576 characters from each output stream per command. The candidate symbol census permits 8,388,608 characters and rejects truncated output. Records include total character counts and truncation status; no environment variables are printed.
