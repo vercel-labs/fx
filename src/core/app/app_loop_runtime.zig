@@ -133,7 +133,7 @@ pub fn Runtime(comptime App: type) type {
             var shown = try text_utils.encodeTerminalSafe(app.alloc, prompt, max_prompt_display_bytes);
             defer shown.deinit(app.alloc);
             var interval_buf: [32]u8 = undefined;
-            try writeNotice(app, .neutral, "Loop {d} runs every {s} until you stop it or fx exits: {s}", .{ id, formatInterval(&interval_buf, interval_ms), shown.bytes });
+            try writeNotice(app, .neutral, "Loop {d} runs now, then every {s} until you stop it or fx exits: {s}", .{ id, formatInterval(&interval_buf, interval_ms), shown.bytes });
         }
 
         fn writeList(app: *App, agent: anytype) !void {
@@ -199,7 +199,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.id == id) break item;
             } else unreachable;
             var interval_buf: [32]u8 = undefined;
-            try writeNotice(app, .neutral, "Resumed loop {d}. Next run in {s}.", .{ id, formatInterval(&interval_buf, loop.interval_ms) });
+            try writeNotice(app, .neutral, "Resumed loop {d}. It runs now, then every {s}.", .{ id, formatInterval(&interval_buf, loop.interval_ms) });
         }
 
         /// Ends every loop `agent` holds, because its conversation changes
@@ -347,4 +347,9 @@ test "noteTurnFinished reports each failed run, then the pause" {
     try std.testing.expectEqualStrings("Loop 1 failed (1 of 3 before it pauses).", app.notices.items[0]);
     try std.testing.expectEqualStrings("Loop 1 failed (2 of 3 before it pauses).", app.notices.items[1]);
     try std.testing.expectEqualStrings("Loop 1 paused after 3 failed runs. Fix the cause, then run /loop resume 1.", app.notices.items[2]);
+
+    // Resuming runs the loop at once, so the fix shows up without waiting.
+    try Runtime(FakeApp).resumeLoop(&app, &app.main_agent, 1);
+    try std.testing.expectEqualStrings("Resumed loop 1. It runs now, then every 1m.", app.notices.items[3]);
+    try std.testing.expect(app.main_agent.loops.nextDue(app_permission_runtime.monotonicMillis()) != null);
 }

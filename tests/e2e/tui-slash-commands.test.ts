@@ -378,18 +378,24 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
   test(
     "loop arms, lists, and stops",
     async () => {
-      gateway = startFakeGateway([]);
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LOOP_REPLY"));
       const { stderrPath } = await launchLoopTerminal("arm");
 
       await session!.sendText("/loop");
       await session!.waitForText("No active loops. Start one with /loop <interval> <prompt>.", 5_000);
       await session!.sendText("/loop 1h say LOOP_OK");
-      await session!.waitForText("Loop 1 runs every 1h until you stop it or fx exits: say LOOP_OK", 5_000);
+      await session!.waitForText("Loop 1 runs now, then every 1h until you stop it or fx exits: say LOOP_OK", 5_000);
+      // The first run starts right away, not one interval later.
+      await waitForCount("loop 1 · every 1h · say LOOP_OK", 1, 5_000);
+      await waitForCount("LOOP_REPLY", 1, 10_000);
+      await session!.waitForComposer(5_000);
       // The footer counts the loops the agent on screen holds.
       await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
       await session!.sendText("/loop");
-      await session!.waitForText(/1 +every 1h +next in \d+m +runs 0 +failures 0\/3 +say LOOP_OK/, 5_000);
+      await session!.waitForText(/1 +every 1h +next in \d+m +runs 1 +failures 0\/3 +say LOOP_OK/, 5_000);
       await session!.sendText("/loop 2h second");
+      await waitForCount("LOOP_REPLY", 2, 10_000);
+      await session!.waitForComposer(5_000);
       await session!.waitForText(/gpt-5 · 2 loops\s*$/m, 5_000);
       await session!.sendText("/loop stop 1");
       await session!.waitForText("Stopped loop 1.", 5_000);
@@ -427,7 +433,7 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
       const { stderrPath } = await launchLoopTerminal("run", { FX_TEST_LOOP_INTERVAL_MS: "500" });
 
       await session!.sendText("/loop 1m say LOOP_OK");
-      await session!.waitForText("Loop 1 runs every 1m", 5_000);
+      await session!.waitForText("Loop 1 runs now, then every 1m", 5_000);
       // A draft in the composer does not hold a run back, and survives it.
       await session!.sendLiteral("draft stays");
       await waitForCount("loop 1 · every 1m · say LOOP_OK", 2, 10_000);
@@ -508,13 +514,17 @@ describe.skipIf(TMUX_SKIP)("tui: loop", () => {
   test(
     "clear ends active loops with a notice",
     async () => {
-      gateway = startFakeGateway([]);
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("CLEAR_REPLY"));
       const { stderrPath } = await launchLoopTerminal("clear");
 
       await session!.sendText("/loop 1h first");
-      await session!.waitForText("Loop 1 runs every 1h", 5_000);
+      await session!.waitForText("Loop 1 runs now, then every 1h", 5_000);
+      await waitForCount("CLEAR_REPLY", 1, 10_000);
+      await session!.waitForComposer(5_000);
       await session!.sendText("/loop 2h second");
-      await session!.waitForText("Loop 2 runs every 2h", 5_000);
+      await session!.waitForText("Loop 2 runs now, then every 2h", 5_000);
+      await waitForCount("CLEAR_REPLY", 2, 10_000);
+      await session!.waitForComposer(5_000);
       await session!.sendText("/clear");
       await session!.waitForText("Ended loops 1, 2 because the conversation changed.", 5_000);
       await session!.waitForComposer(5_000);

@@ -105,7 +105,8 @@ pub const Loops = struct {
     /// can say so, because a switch redraws the screen in between.
     ended_ids: std.ArrayList(u32) = .empty,
 
-    /// Copies `prompt`. The first run is due one interval from `now_ms`.
+    /// Copies `prompt`. The first run is due at `now_ms`, so arming shows at
+    /// once whether the prompt works; later runs wait one interval each.
     pub fn arm(self: *Loops, alloc: Allocator, interval_ms: u64, prompt: []const u8, now_ms: i64) error{ TooManyLoops, OutOfMemory }!u32 {
         if (self.items.items.len >= max_loops) return error.TooManyLoops;
         const owned = try alloc.dupe(u8, prompt);
@@ -116,7 +117,7 @@ pub const Loops = struct {
             .interval_ms = interval_ms,
             .prompt = owned,
             .state = .waiting,
-            .next_due_ms = after(now_ms, self.wait_override_ms orelse interval_ms),
+            .next_due_ms = now_ms,
         });
         self.next_id += 1;
         return id;
@@ -135,12 +136,14 @@ pub const Loops = struct {
         }
     }
 
+    /// Restarts a paused loop with its next run due at `now_ms`, so the fix
+    /// that prompted the resume shows up without waiting an interval.
     pub fn resumeLoop(self: *Loops, id: u32, now_ms: i64) error{ UnknownLoop, NotPaused }!void {
         const loop = &self.items.items[self.indexOf(id) orelse return error.UnknownLoop];
         if (loop.state != .paused) return error.NotPaused;
         loop.state = .waiting;
         loop.consecutive_failures = 0;
-        loop.next_due_ms = after(now_ms, self.waitMs(loop.*));
+        loop.next_due_ms = now_ms;
     }
 
     /// The waiting loop due earliest at `now_ms`, or null. Running and paused
@@ -324,7 +327,9 @@ test "backlog collapses to one run" {
     defer loops.deinit(testing.allocator);
     const t0: i64 = 1_000;
     _ = try loops.arm(testing.allocator, hour_ms, "p", t0);
-    try testing.expect(loops.nextDue(t0 + hour_ms - 1) == null);
+    // The first run is due the moment the loop is armed.
+    try testing.expect(loops.nextDue(t0 - 1) == null);
+    try testing.expectEqual(t0, loops.items.items[0].next_due_ms);
     const due = loops.nextDue(t0 + 5 * hour_ms).?;
     loops.markStarted(due, 42);
     try testing.expect(loops.nextDue(t0 + 5 * hour_ms) == null);
@@ -340,7 +345,7 @@ test "backlog collapses to one run" {
 test "one loop per tick, earliest due first" {
     var loops: Loops = .{};
     defer loops.deinit(testing.allocator);
-    _ = try loops.arm(testing.allocator, 2 * hour_ms, "late", 0);
+    _ = try loops.arm(testing.allocator, 2 * hour_ms, "late", 10);
     _ = try loops.arm(testing.allocator, hour_ms, "early", 0);
     const first = loops.nextDue(3 * hour_ms).?;
     try testing.expectEqualStrings("early", first.prompt);
@@ -446,7 +451,8 @@ test "resume restarts a paused loop" {
     try loops.resumeLoop(1, 100);
     try testing.expectEqual(State.waiting, loops.items.items[0].state);
     try testing.expectEqual(@as(u8, 0), loops.items.items[0].consecutive_failures);
-    try testing.expectEqual(@as(i64, 100 + minute_ms), loops.items.items[0].next_due_ms);
+    // A resumed loop runs at once, so the fix shows up without waiting.
+    try testing.expectEqual(@as(i64, 100), loops.items.items[0].next_due_ms);
 }
 
 test "count includes paused loops and endAll empties the list" {
