@@ -137,7 +137,7 @@ pub const WorkEnd = struct {
     /// Borrowed for the call.
     leftovers: []const child_state.ActiveWork = &.{},
     /// Why the work never began, for one that failed because its slot could
-    /// not start: its report says the message never ran.
+    /// not start: its report says the message never ran. A static string.
     start_failure: ?[]const u8 = null,
 };
 
@@ -475,7 +475,8 @@ pub const Owner = struct {
         return .{ .report_owed = self.finish(child_id, work_id, outcome, null, stopped_by == .parent, end).report_owed, .end = end };
     }
 
-    /// A work no slot began, ended.
+    /// A work no slot began, ended. `work_id` is owned by the caller, who
+    /// frees it with `deinit`.
     pub const UnstartedEnd = struct {
         work_id: []u8,
         report_owed: bool,
