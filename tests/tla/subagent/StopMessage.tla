@@ -65,6 +65,17 @@
 (* nothing, and the hook installed the kept messages and armed the work.   *)
 (* "leftover_uncounted" is the slot that drops them without counting.     *)
 (*                                                                         *)
+(* The user's stop reaches the same slot. Esc on a turn main did not start *)
+(* lands while main's slot is between two works (`userWorkRun` in          *)
+(* app_agents_runtime.zig), so `UserStop` meets an ended, an installed, or *)
+(* a starting subagent as well as a running one, and counts and drops what *)
+(* a stop does (`Owner.noteUserStop`, `Runtime.userStopped`). It takes the *)
+(* host's admission lock, so it cannot land between the install and the    *)
+(* arm. "user_ended_uncounted" drops the kept messages without counting   *)
+(* them, "user_before_lock" lets the stop land in that gap, where the arm  *)
+(* erases it, and "user_next_runs" leaves the next work to run. Each     *)
+(* plants the user's stop as it was before.                                *)
+(*                                                                         *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
 (* stopped is refused, one to a work the user stopped joins it and is lost *)
@@ -81,7 +92,8 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
          "queue_closing", "start_next_turn", "late_rearm",
          "before_idle", "note_after_take", "names_busy",
-         "leftover_gap", "leftover_uncounted"}
+         "leftover_gap", "leftover_uncounted",
+         "user_ended_uncounted", "user_before_lock", "user_next_runs"}
 ASSUME Bug \in Bugs
 
 \* What an end tells main: no report, a report that says its subagent is
@@ -394,17 +406,32 @@ Exec ==
 \* The user stops the subagent's turn on its screen; fx drops main's
 \* messages in its queue and tells main how many (noteUserStop).
 UserStop(s) ==
-    /\ phase[s] = "running"
+    LET waiting == Range(waitq[s])
+        \* fx before the user's stop counted what the slot holds.
+        keptLost == phase[s] = "ended" /\ Bug = "user_ended_uncounted"
+        keptCounted == IF phase[s] = "ended" /\ ~keptLost THEN kept[s] ELSE {}
+        keptDropped == IF phase[s] = "ended" THEN kept[s] ELSE {}
+        \* fx before the user's stop dropped the next work: it only flagged
+        \* the slot, and the work began.
+        nextRuns == \/ phase[s] = "starting" /\ Bug = "user_next_runs"
+                    \/ phase[s] = "installed" /\ Bug = "user_before_lock"
+        heldDropped == IF phase[s] = "starting" /\ ~nextRuns THEN startq[s] ELSE {}
+        counted == waiting \cup unread[s] \cup keptCounted \cup heldDropped
+    IN
+    /\ \/ phase[s] \in {"running", "ended", "starting"}
+       \* The stop takes the admission lock, so it cannot land between the
+       \* install and the arm. fx before that: it did.
+       \/ phase[s] = "installed" /\ Bug = "user_before_lock"
     /\ stops < MaxStops
-    /\ phase' = [phase EXCEPT ![s] = "ending_user"]
+    /\ phase' = [phase EXCEPT ![s] = IF nextRuns THEN @ ELSE "ending_user"]
     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
-    /\ dropped' = dropped \cup Range(waitq[s])
-    /\ toldDropped' = toldDropped \cup Range(waitq[s]) \cup unread[s]
+    /\ startq' = [startq EXCEPT ![s] = IF phase[s] = "starting" /\ ~nextRuns THEN {} ELSE @]
+    /\ kept' = [kept EXCEPT ![s] = {}]
+    /\ dropped' = dropped \cup waiting \cup keptDropped \cup heldDropped
+    /\ toldDropped' = toldDropped \cup counted
     /\ stops' = stops + 1
-    /\ stoppedQ' = stoppedQ \cup Range(waitq[s]) \cup unread[s]
-    /\ last' = Event("user_stop", s, NoMsg, "stopped",
-                     Cardinality(Range(waitq[s]) \cup unread[s]))
-    /\ UNCHANGED <<startq, kept>>
+    /\ stoppedQ' = stoppedQ \cup waiting \cup unread[s] \cup kept[s] \cup startq[s]
+    /\ last' = Event("user_stop", s, NoMsg, "stopped", Cardinality(counted))
     /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart>>
     /\ UNCHANGED idleVars
 

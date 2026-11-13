@@ -525,16 +525,26 @@ pub const Owner = struct {
         return .{ .report_owed = self.finish(child_id, work_id, outcome, null, stopped_by == .parent, end).report_owed, .end = end };
     }
 
-    /// The user stopped the child's running turn on its screen, which its
-    /// report names as the cause.
-    pub fn noteUserStop(self: *Owner, child_id: []const u8) void {
+    /// The user stopped a turn on the child's screen, which its report names
+    /// as the cause. The turn can be the user's own while the parent's slot is
+    /// between two works, so the stop meets what the slot holds: the kept
+    /// messages of a turn that ended, and the next work that no turn has begun
+    /// on. Returns how many of the parent's messages those are, which the stop
+    /// drops and no earlier stop counted. With no worker attached the app has
+    /// no turn to cancel, so the slot's work is cancelled here and ends before
+    /// its turn begins. Call with the host's admission lock held, as a stop of
+    /// the child does.
+    pub fn noteUserStop(self: *Owner, child_id: []const u8) usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
-            if (slot.completion == .running) slot.stopped_by_user = true;
-            return;
+            if (slot.completion != .running) return 0;
+            slot.stopped_by_user = true;
+            if (slot.worker == null) slot.cancel.store(true, .seq_cst);
+            return countDropped(slot);
         }
+        return 0;
     }
 
     /// fx is quitting: the works its quit cancels say so in their reports.
@@ -553,9 +563,8 @@ pub const Owner = struct {
 
     /// The user closed the child from the agent list: ends its running turn
     /// as the user's own stop does, and its report says the user closed it.
-    /// Returns how many of the parent's messages its next work carried that
-    /// no turn had begun on, and the ended turn's kept messages that no stop
-    /// counted, which the close drops, or null when nothing runs.
+    /// Returns how many of the parent's messages the close drops that no
+    /// earlier stop counted (`countDropped`), or null when nothing runs.
     pub fn closeByUser(self: *Owner, child_id: []const u8) ?usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -566,9 +575,8 @@ pub const Owner = struct {
             slot.closed_by_user = true;
             slot.cancel.store(true, .seq_cst);
             stopTurn(slot, .cancel);
-            const unstarted = slot.unstarted;
-            slot.unstarted = 0;
-            return unstarted + uncountedLeftovers(slot);
+            // Counted after the cancel, as the parent's stop counts.
+            return countDropped(slot);
         }
         return null;
     }
@@ -587,23 +595,13 @@ pub const Owner = struct {
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
             if (slot.completion != .running) return null;
-            // A second stop of a turn still ending: the first counted its
-            // unread messages, which stay queued until the end drops them.
-            const counted = slot.stopped_by_parent;
             slot.stopped_by_parent = true;
             slot.cancel.store(true, .seq_cst);
             stopTurn(slot, .cancel);
-            if (counted) return 0;
             // Counted after the cancel, so no step of the turn reads one of
-            // them any more (`StopMessage.tla` CountedNeverRead).
-            const unstarted = slot.unstarted;
-            slot.unstarted = 0;
-            if (slot.worker) |worker| {
-                const unread = worker.queuedParentSteering();
-                slot.unread_counted = unread;
-                return unstarted + unread;
-            }
-            return unstarted + uncountedLeftovers(slot);
+            // them any more (`StopMessage.tla` CountedNeverRead). A second
+            // stop of a turn still ending counts only what the first did not.
+            return countDropped(slot);
         }
         return null;
     }
@@ -954,7 +952,7 @@ test "a stopped turn that is still ending takes no message, and its stop counts 
     try std.testing.expectEqual(@as(usize, 1), parent_worker.queuedPromptCount());
 
     // So does one sent while the user's stop ends the turn.
-    owner.noteUserStop("user-stopped");
+    _ = owner.noteUserStop("user-stopped");
     try std.testing.expect((try owner.steer("user-stopped", "work", "after-user-stop", fingerprint, "text")) == .stopping);
     try std.testing.expectEqual(@as(usize, 0), user_worker.queuedPromptCount());
 
@@ -1399,6 +1397,24 @@ fn freeLeftovers(alloc: Allocator, slot: *Slot) void {
     for (slot.leftovers.items) |*work| work.deinit(alloc);
     slot.leftovers.clearAndFree(alloc);
     slot.leftovers_counted = 0;
+}
+
+/// How many of the parent's messages a stop or close of `slot` drops that no
+/// earlier one counted: those its next work carries with no turn begun on
+/// them, and its turn's unread ones, which are still queued on the attached
+/// worker or, once the worker detached, kept by the slot. Every stop, user
+/// stop, and close counts through here, so a message is counted once however
+/// many of them come. Call with the owner's lock held.
+fn countDropped(slot: *Slot) usize {
+    const unstarted = slot.unstarted;
+    slot.unstarted = 0;
+    if (slot.worker) |worker| {
+        const unread = worker.queuedParentSteering();
+        const fresh = unread -| slot.unread_counted;
+        slot.unread_counted = @max(slot.unread_counted, unread);
+        return unstarted + fresh;
+    }
+    return unstarted + uncountedLeftovers(slot);
 }
 
 /// How many kept messages no stop or close has counted yet, which the one

@@ -19,6 +19,10 @@
 (*             read the messages `msgs` that made it, if any did;          *)
 (*   "read"    subagent `sub`'s running turn read the messages `msgs`;     *)
 (*   "finish"  its turn ended with nothing more to read;                  *)
+(*   "user_stop"  the user stopped a turn on subagent `sub`'s screen while  *)
+(*             the slot held it between two works, the driver holds that *)
+(*             slot there (FX_TEST_SUBAGENT_USER_STOP), and `count` is   *)
+(*             what fx dropped and counted;                              *)
 (*   "fail"    its turn ended without reading the messages that joined   *)
 (*             it, and its slot kept them: the driver holds the slot     *)
 (*             there (FX_TEST_SUBAGENT_RUN_HELD);                         *)
@@ -85,6 +89,9 @@ Observable(o) ==
      /\ Finish(o.sub)
      /\ read' \ read = o.msgs
      /\ note' = o.note
+  \/ /\ o.op = "user_stop"
+     /\ UserStop(o.sub)
+     /\ last'.count = o.count
   \/ /\ o.op = "fail"
      /\ Fail(o.sub)
   \/ /\ o.op = "hook"

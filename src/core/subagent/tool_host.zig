@@ -293,10 +293,19 @@ pub const Runtime = struct {
         errdefer runtime.approvals.deinit();
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
+        end_test_controls.setUserStopHook(.{ .context = runtime, .stop_fn = userStopForTest });
         return runtime;
     }
 
+    /// `FX_TEST_SUBAGENT_USER_STOP`: the user's Esc, for a test that holds a
+    /// slot (`end_test_controls.zig`).
+    fn userStopForTest(raw: *anyopaque, child_id: []const u8) void {
+        const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.userStopped(child_id, 0);
+    }
+
     pub fn deinit(self: *Runtime) void {
+        end_test_controls.clearUserStopHook(self);
         self.managed.deinit();
         if (self.team_note) |note| self.alloc.free(note);
         for (self.pending.items) |*item| {
@@ -1021,14 +1030,19 @@ pub const Runtime = struct {
     /// user's own stop: the turn ends as
     /// the Esc ends it, and the parent's messages waiting for the subagent
     /// are dropped now, so none of them starts after it: those waiting here,
-    /// and `from_queue` the subagent's own queue already dropped. The parent
-    /// learns of the drop from the stopped work's report, or else a notice.
+    /// `from_queue` the subagent's own queue already dropped, and those its
+    /// slot holds: the kept messages of a turn that ended, and a next work no
+    /// turn has begun on. That reaches the slot between two works when the
+    /// user stops a turn the parent did not start. The parent learns of the
+    /// drop from the stopped work's report, or else a notice. The stop takes
+    /// the admission lock first, as the parent's does, so it is either before
+    /// the end hook's install or after its arm.
     pub fn userStopped(self: *Runtime, child_id: []const u8, from_queue: usize) void {
-        self.managed.noteUserStop(child_id);
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
+        const held = self.managed.noteUserStop(child_id);
         if (self.findTurnWorkLocked(child_id)) |index| self.turn_works.items[index].stopped_by = .user;
-        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue;
+        const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue + held;
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=user running={} dropped={d}", .{ child_id, self.isBusyLocked(child_id), dropped });
         self.noteUserDropLocked(child_id, dropped, false);
     }
@@ -3793,6 +3807,331 @@ test "the user's close that lands between a turn's end and the slot finishing it
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
+test "the user's stop that lands between a turn's end and the slot finishing its work counts the message the turn never took" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    HeldAfterRun.arm();
+    defer HeldAfterRun.disarm();
+
+    try Leftovers.endFirstWorkUnread(runtime, &fixture, arena);
+    try HeldAfterRun.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    // The user's Esc on a turn main did not start, while main's slot is between
+    // two works: no turn of main's is running for the app to cancel.
+    runtime.userStopped(child_id, 0);
+    HeldAfterRun.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    // The work's report carries the notice of the message the stop dropped.
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "the user's stop that lands after the slot finished its work and before its end hook runs counts the message the turn never took" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    HeldBeforeHook.arm();
+    defer HeldBeforeHook.disarm();
+
+    try Leftovers.endFirstWorkUnread(runtime, &fixture, arena);
+    try HeldBeforeHook.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    runtime.userStopped(child_id, 0);
+    // A second stop of the same end counts nothing more.
+    runtime.userStopped(child_id, 0);
+    HeldBeforeHook.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "the user's stop that lands as the next work is installed counts its message, and the work never begins" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    HeldNextWork.arm();
+    defer HeldNextWork.disarm();
+
+    try EndHooks.endFirstWorkHoldingNext(runtime, &fixture, arena);
+    const child_id = try reviewerId(runtime, arena);
+    runtime.userStopped(child_id, 0);
+    HeldNextWork.release();
+    try waitForSlotEnd(runtime, child_id);
+    // Only the first work's turn began; the installed work ended at once, and
+    // its report says what the stop dropped and that the user stopped it.
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], "DONE first"));
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], " dropped=1"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "the user's close of a working subagent counts the message its turn had not read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    const child_id = try reviewerId(runtime, arena);
+    // The message is on the attached worker's queue, not yet read.
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expect(closed.stopped);
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
+}
+
+test "a message counted by the parent's stop is not counted again by the user's close of the same turn" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    const child_id = try reviewerId(runtime, arena);
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, stopped, Leftovers.dropped_stop) != null);
+    // The turn is cancelled whether or not it has detached yet: either way the
+    // stop counted the message, and the close counts nothing more.
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 0), closed.dropped);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+}
+
+/// fx quits, or the user switches sessions: the subagent host is torn down on
+/// its own thread, which joins the slots and then frees the host.
+const QuitHost = struct {
+    /// A quit while a slot works: the work is held by the fixture until the
+    /// quit cancels it, so the test only joins the quit.
+    fn begin(runtime: *Runtime) !std.Thread {
+        return std.Thread.spawn(.{}, tearDown, .{runtime});
+    }
+
+    /// A quit while the test holds a slot at one of its ends: the owner marks
+    /// itself closed before it joins anything, and the held slot keeps the
+    /// host alive until the test lets it go, so a bounded poll for that mark is
+    /// the one wait no event can replace. Never call it without a held slot,
+    /// or the host can be freed under the poll.
+    fn beginHeld(runtime: *Runtime) !std.Thread {
+        const thread = try begin(runtime);
+        for (0..5000) |_| {
+            runtime.managed.mutex.lockUncancelable(io_mod.getIo());
+            const closed = runtime.managed.closed;
+            runtime.managed.mutex.unlock(io_mod.getIo());
+            if (closed) return thread;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        return error.Timeout;
+    }
+
+    fn tearDown(runtime: *Runtime) void {
+        runtime.deinit();
+    }
+};
+
+test "a quit while a message waits for a working subagent never starts it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var torn_down = false;
+    defer if (!torn_down) runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    // The quit cancels the first work, and the host is gone before the waiting
+    // message could be anyone's next work.
+    const quit = try QuitHost.begin(runtime);
+    torn_down = true;
+    quit.join();
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+}
+
+test "a quit while a message is unread on a working subagent's turn never starts it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var torn_down = false;
+    defer if (!torn_down) runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    const quit = try QuitHost.begin(runtime);
+    torn_down = true;
+    quit.join();
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+}
+
+test "a quit after a turn ended with a message unread never starts the kept message" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var torn_down = false;
+    defer if (!torn_down) runtime.deinit();
+    HeldAfterRun.arm();
+    defer HeldAfterRun.disarm();
+
+    try Leftovers.endFirstWorkUnread(runtime, &fixture, arena);
+    try HeldAfterRun.waitHeld();
+    const quit = try QuitHost.beginHeld(runtime);
+    torn_down = true;
+    HeldAfterRun.release();
+    quit.join();
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+}
+
+test "a quit as the next work is installed never begins it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var torn_down = false;
+    defer if (!torn_down) runtime.deinit();
+    HeldNextWork.arm();
+    defer HeldNextWork.disarm();
+
+    try EndHooks.endFirstWorkHoldingNext(runtime, &fixture, arena);
+    const quit = try QuitHost.beginHeld(runtime);
+    torn_down = true;
+    HeldNextWork.release();
+    quit.join();
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+}
+
+test "the parent's close of a working subagent counts the message its turn had not read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    const child_id = try reviewerId(runtime, arena);
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expect(std.mem.find(u8, closed, "Closed reviewer, ending its turn. The message waiting for it was dropped.") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+}
+
+test "the user's stop counts a message still queued on the attached worker" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    const child_id = try reviewerId(runtime, arena);
+    // The app takes the subagent's own queue before it tells the host
+    // (`from_queue`); a message it left on the worker is the host's to count.
+    runtime.userStopped(child_id, 0);
+    fixture.release.set(io_mod.getIo());
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " dropped=1"));
+}
+
 test "a stop after a work failed before its worker attached does not count the messages that work carried" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3902,6 +4241,42 @@ test "a stop that lands as the user's turn ends and the waiting message starts d
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
     try std.testing.expect(std.mem.find(u8, stopped, "Stopped reviewer: its turn ended, and the message waiting for it was dropped.") != null);
+}
+
+test "the user's stop that lands as the user's turn ends and the waiting message starts counts it, and the work never begins" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    HeldStart.arm();
+    defer HeldStart.disarm();
+
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try HeldStart.waitHeld();
+    // The user's Esc on a later turn lands while the new slot has no worker.
+    runtime.userStopped(child_id, 0);
+    HeldStart.release();
+    try waitForSlotEnd(runtime, child_id);
+    try std.testing.expectEqual(@as(usize, 1), fixture.begun.load(.seq_cst));
+    // The first work's report, then the cancelled one's, which says what the
+    // stop dropped.
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], " dropped=1"));
 }
 
 test "a stop after the next work began does not count its message" {
