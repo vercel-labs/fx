@@ -94,7 +94,7 @@ pub const ChildAgent = struct {
     profile: []u8 = &.{},
     /// What it is for, from its host's saved list: one line, set when its
     /// parent started it, which the agent list shows while it has no title
-    /// and searches. Empty until the list syncs or a run of its starts, and
+    /// and searches. Empty until the list syncs or its first run starts, and
     /// for a one-off. Owned.
     purpose: []u8 = &.{},
     /// Where its current approval and question come in the order its tree's
@@ -723,8 +723,8 @@ fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *us
     }
 }
 
-/// What subagent `target` is for; empty for an instance, null for the first
-/// one, and a subagent that has none.
+/// What subagent `target` is for. It is empty for the first instance (null),
+/// for any other instance, and for a subagent that has none.
 fn purposeOf(target: ?*const ChildAgent) []const u8 {
     const child = target orelse return "";
     return if (child.agent.role == .subagent) child.purpose else "";

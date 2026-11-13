@@ -2237,6 +2237,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
         await until("the auditor's turn", () => childCalls >= 1);
         await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+        // Down opens the list only once main's turn is over and its composer is empty.
+        await session.waitForComposer(15_000);
         await session.sendKeys("Down");
 
         // The title model has not answered for the auditor, so its row has
@@ -2368,6 +2370,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.waitForText("PURPOSE_MAIN_IDLE", 30_000);
           await until("the helper's request", () => helperAsked);
           await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+          await session.waitForComposer(15_000);
 
           // Lead's helper has no title yet, and sits under lead on a branch of
           // its own; its row says what it is for.
