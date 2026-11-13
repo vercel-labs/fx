@@ -1390,9 +1390,15 @@ test "a cancelled provider switch ends at once while its sign-in refresh finishe
     try std.testing.expect(!runtime.providerPreparationPending());
     try std.testing.expectEqual(@as(usize, 1), runtime.cancelled_provider_preparations.items.len);
     try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+    // The refresh can hold the login's lock until it ends.
+    try std.testing.expect(runtime.signInRefreshFinishing());
 
-    // A full shutdown waits for it, and the new login is saved.
+    // Once it ends, the new login is saved and the runtime frees it.
+    const task = runtime.cancelled_provider_preparations.items[0];
     transport.release.store(true, .seq_cst);
+    try waitForPreparationTest(&task.done);
+    try std.testing.expect(!runtime.signInRefreshFinishing());
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
     runtime.deinit(alloc);
     var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
     defer stored.deinit(alloc);
@@ -2482,6 +2488,16 @@ pub const Runtime = struct {
         };
         debug_trace.logf("auth", "cancelled provider preparation left running target={t}", .{task.input.target()});
         return true;
+    }
+
+    /// Whether a sign-in refresh that nothing waits for still runs: a
+    /// cancelled provider preparation or a refresh a prompt stopped waiting
+    /// for. It can hold the sign-in's lock, so the input loop must not take
+    /// that lock, as a logout or a team change does, until it ends.
+    pub fn signInRefreshFinishing(self: *Self) bool {
+        self.freeFinishedProviderPreparations();
+        self.freeFinishedPromptRefreshes();
+        return self.cancelled_provider_preparations.items.len > 0 or self.abandoned_prompt_refreshes.items.len > 0;
     }
 
     fn freeFinishedProviderPreparations(self: *Self) void {
@@ -5994,6 +6010,7 @@ test "a prompt that leaves during its credential refresh lets the refresh finish
     try std.testing.expect(runtime.prompt_credential_refresh_task == null);
     try std.testing.expectEqual(@as(usize, 1), runtime.abandoned_prompt_refreshes.items.len);
     try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+    try std.testing.expect(runtime.signInRefreshFinishing());
 
     // A full shutdown waits for it, and the new login is saved.
     transport.release.store(true, .seq_cst);

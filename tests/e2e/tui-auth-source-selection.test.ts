@@ -10165,6 +10165,10 @@ tmuxTest("a cancelled provider switch ends at once while its sign-in refresh fin
     await session.sendKeys("C-c");
     await session.waitForText("Provider preparation cancelled.", 1500);
     expect(storedFxLoginToken(home)).toBe("expired-login-token");
+    // A logout would wait for the login's lock, which the refresh holds: it
+    // is refused at once, and the terminal stays responsive.
+    await session.sendText("/logout vercel");
+    await session.waitForText("A sign-in refresh is still finishing. Try again in a moment.", 1500);
 
     release();
     const deadline = Date.now() + 5000;

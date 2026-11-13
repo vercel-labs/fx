@@ -257,6 +257,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn runLogoutCommand(app: *App, agent: *AppAgent, target: []const u8) !void {
             if (try rejectPendingPreparation(app)) return;
+            if (try rejectFinishingSignInRefresh(app)) return;
             if (hostManagesAuth(app)) {
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
                 return;
@@ -1313,6 +1314,20 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Refuses an action that takes a sign-in's lock on the input loop,
+        /// such as a logout or a team change, while a refresh nothing waits
+        /// for may hold it (`auth_runtime.Runtime.signInRefreshFinishing`).
+        fn rejectFinishingSignInRefresh(app: *App) !bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "signInRefreshFinishing")) return false;
+            if (!app.auth.signInRefreshFinishing()) return false;
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "A sign-in refresh is still finishing. Try again in a moment.",
+            }, true);
+            return true;
+        }
+
         fn beginPreparation(app: *App, input: auth_runtime.ProviderPreparationInput) !void {
             app.auth.beginProviderPreparation(app.alloc, input) catch |err| {
                 debug_trace.logf("provider", "preparation start failed err={s}", .{@errorName(err)});
@@ -1667,6 +1682,7 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
             if (try rejectPendingPreparation(app)) return false;
+            if (try rejectFinishingSignInRefresh(app)) return false;
             if (try reject_provider_picker_if_busy(app, agent)) return false;
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
