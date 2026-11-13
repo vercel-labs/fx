@@ -3217,6 +3217,65 @@ test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches th
     try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
 }
 
+test "main's cancel while it waits on a subagent's run ends the question that run waits on" {
+    const alloc = std.testing.allocator;
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var completion: agents.ChildRunCompletion = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+
+    const Side = struct {
+        fn ask(runtime: *worker_runtime.WorkerRuntime, batch: []const types.QuestionBatchEntry, answered: *std.atomic.Value(bool)) void {
+            const answers = (runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, batch) catch return) orelse return;
+            for (answers) |answer| std.testing.allocator.free(answer);
+            std.testing.allocator.free(answers);
+            answered.store(true, .release);
+        }
+
+        fn wait(
+            done: *agents.ChildRunCompletion,
+            flag: *std.atomic.Value(bool),
+            runtime: *worker_runtime.WorkerRuntime,
+            outcome: *agents.ChildRunCompletion.Outcome,
+        ) void {
+            outcome.* = waitForCompletion(done, flag, runtime);
+        }
+
+        /// Whether the question is open (or closed) within a bounded time, so a
+        /// question that does not end fails its test instead of hanging it.
+        fn questionIs(runtime: *worker_runtime.WorkerRuntime, open: bool) bool {
+            for (0..2000) |_| {
+                var snapshot = runtime.snapshotPendingQuestionBatch(std.testing.allocator) catch return false;
+                if (snapshot) |*batch| {
+                    batch.deinit(std.testing.allocator);
+                    if (open) return true;
+                } else if (!open) return true;
+                io_mod.sleep(1 * std.time.ns_per_ms);
+            }
+            return false;
+        }
+    };
+
+    var answered = std.atomic.Value(bool).init(false);
+    const asker = try std.Thread.spawn(.{}, Side.ask, .{ &worker, &entries, &answered });
+    var outcome: agents.ChildRunCompletion.Outcome = .completed;
+    const waiter = try std.Thread.spawn(.{}, Side.wait, .{ &completion, &cancel, &worker, &outcome });
+    const opened = Side.questionIs(&worker, true);
+    cancel.store(true, .seq_cst);
+    const ended = opened and Side.questionIs(&worker, false);
+    // A question that stayed open is released, so the test fails instead of hanging.
+    if (!ended) worker.requestStop();
+    completion.finish(.cancelled);
+    waiter.join();
+    asker.join();
+    try std.testing.expect(opened);
+    try std.testing.expect(ended);
+    try std.testing.expect(!answered.load(.acquire));
+    try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.cancelled, outcome);
+}
+
 test "the switch list follows the registry's start order, with an unlisted agent kept after it" {
     const ids = [_][]u8{ @constCast("new"), @constCast("second"), @constCast("first"), @constCast("stray") };
     var agents_storage: [4]ChildAgent = undefined;
