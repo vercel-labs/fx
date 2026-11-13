@@ -1242,6 +1242,40 @@ pub const WorkerRuntime = struct {
         return prompt;
     }
 
+    /// Drops the queued prompts for which `drop` answers true, oldest first,
+    /// and keeps the others in their order. `drop` gets each prompt's place in
+    /// the queue as it stood on entry. It runs under the queue's lock, so it
+    /// must not call into this worker. Returns how many it dropped. A host
+    /// that gives up some of the mail it queued uses this, where
+    /// `takeQueuedPrompt` takes only the oldest.
+    pub fn discardQueuedWhere(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        context: anytype,
+        comptime drop: fn (@TypeOf(context), usize, *const QueuedPrompt) bool,
+    ) usize {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var dropped: usize = 0;
+        var index: usize = 0;
+        var place: usize = 0;
+        while (index < self.queued_prompts.items.len) : (place += 1) {
+            if (!drop(context, place, &self.queued_prompts.items[index])) {
+                index += 1;
+                continue;
+            }
+            const prompt = self.queued_prompts.orderedRemove(index);
+            debug_trace.eventf("worker", "queued_prompt_discarded", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
+            discardQueuedPrompt(alloc, prompt, &.{});
+            dropped += 1;
+        }
+        if (dropped > 0 and self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        return dropped;
+    }
+
     /// As `takeQueuedPrompt`, and marks turn `turn_id`, which runs the
     /// prompt, in the same step, as `beginDirectProcessing` does: mail posted
     /// from the take on joins that turn (`tests/tla/subagent/MainMail.tla`

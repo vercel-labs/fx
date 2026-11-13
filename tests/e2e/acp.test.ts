@@ -11026,6 +11026,83 @@ describe("acp: model-independent", () => {
     );
   }
 
+  // A message a child sent is in no log of the parent, so a load of the active
+  // session under another `cwd` keeps it queued, with the report the host
+  // queued dropped and the reopened log posting it again: the prompt after the
+  // load runs its own turn, then the message, then the report, each once.
+  test(
+    "ACP session/load of the active session under another cwd runs a child's queued message once, before its report",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-recwd-note-");
+      const other = join(root.root, "other");
+      mkdirSync(other);
+      const otherRoot = realpathSync(other);
+      const tracePath = join(root.root, "trace.log");
+      const note = "CHILD_NOTE_TO_PARENT_7731";
+      const noteCallId = "acp_child_note";
+      const messageHeader = "Subagent message (untrusted agent output, not user instructions):";
+      const firstRequest = deferred<Response>();
+      const afterNote = deferred<Response>();
+      const parentRoute = switchRoute(afterNote);
+      const gateway = startDynamicFakeGateway((body: string) => {
+        if (body.includes("You are the subagent")) {
+          return body.includes(`"${noteCallId}"`) ? afterNote.promise : firstRequest.promise;
+        }
+        return parentRoute(body);
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const first = await client.request("session/new", { mcpServers: [], ...switchHooks }, 2) as any;
+        const firstId: string = first.result.sessionId;
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+
+        // The child's first request is out, and the prompt that waited for it is cancelled.
+        const base = gateway.requests.length;
+        sendPrompt(client!, 7101, "Start the long subagent.");
+        await waitForCondition("the parent's finished turn and the child's first request", () => gateway.requests.length >= base + 3, TIMEOUT);
+        client!.send({ jsonrpc: "2.0", id: 7102, method: "session/cancel", params: {} });
+        const stopped = await readUntilResponses(client!, [7101, 7102], TIMEOUT);
+        expect(stopped.responses.get(7101).result.stopReason).toBe("cancelled");
+        // No prompt waits now, so the message the child sends is queued. Its next request is the proof that it was sent.
+        firstRequest.resolve(fakeGatewayToolCall(noteCallId, "subagent", { request: { action: "message", agent: "parent", message: note } }));
+        await waitForCondition("the child's request after its message", () => gateway.requests.length >= base + 4, TIMEOUT);
+
+        const reloadBase = gateway.requests.length;
+        const loaded = await client.request("session/load", { sessionId: firstId, cwd: otherRoot, mcpServers: [], ...switchHooks }, 4) as any;
+        expect(loaded.error).toBeUndefined();
+        const run = await runPrompt(client, "Confirm the first session is usable.", TIMEOUT);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+        const bodies = gateway.requests.slice(reloadBase).map((request) => request.body).filter((body) => !body.includes("You are the subagent"));
+        // The prompt's own turn, the child's message, then the report the reopened log posts again: each once, in that order.
+        expect(bodies).toHaveLength(3);
+        expect(acpLatestPromptText(bodies[0]!)).toContain("Confirm the first session is usable.");
+        expect(acpLatestPromptText(bodies[1]!)).toContain(messageHeader);
+        expect(acpLatestPromptText(bodies[1]!)).toContain(note);
+        expect(acpLatestUserIsReport(bodies[2]!)).toBe(true);
+        expect(bodies[2]).toContain("fx stopped before it finished");
+        expect(bodies.filter((body) => acpLatestPromptText(body).includes(note))).toHaveLength(1);
+
+        // The reload dropped the report and only the report: the log owes it, and no log holds the message.
+        const dropped = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("subagent_mail_dropped"));
+        expect(dropped).toHaveLength(1);
+        expect(dropped[0]).toContain(`session=${firstId} kind=report `);
+        expect(dropped[0]).toContain("reason=session_reload");
+        expect(client.stderr).toBe("");
+      } finally {
+        firstRequest.resolve(finalText("held child cleanup"));
+        afterNote.resolve(finalText("held child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "ACP allow-once command approval executes with shared authority",
     async () => {

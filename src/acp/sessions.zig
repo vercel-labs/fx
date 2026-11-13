@@ -3368,23 +3368,29 @@ test "a reload under another cwd and a libfx/new drop what the host they replace
     try handleNewSession(&state, arena, &new_msg);
     const subagents = state.subagent_host.?;
     try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
-    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+    // A child's message sits between two reports, and no log of the parent holds it.
+    try subagents.report_sink.?.post(subagents, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "child-1", .text = "a note for you" } });
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-3", .work_id = "work-3", .call_id = "call-3", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 3), state.worker.queuedPromptCount());
 
-    // A reload under another cwd: the host is joined, what it queued is dropped, and the session stays until it is released.
+    // A reload under another cwd: the host is joined and the reports the log owes are dropped, which it posts again.
+    // The message stays queued for the reopened session, with its call, and the session stays until it is released.
     server.stopSubagentsForReopen(&state);
     try std.testing.expect(state.subagent_host == null);
-    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
-    try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), state.report_calls.items.len);
+    try std.testing.expect(state.report_calls.items[0].outcome == null);
+    try std.testing.expectEqualStrings("child-1", state.report_calls.items[0].child_id);
     try std.testing.expect(state.active_session != null);
     // With no session to reload, a second call has nothing to do.
     try server.releaseActiveSession(&state);
     server.stopSubagentsForReopen(&state);
 
-    // A libfx/new session replaces a session whose host queued a report.
+    // A libfx/new session replaces a session whose host queued a report, and drops all the mail, a message too.
     try handleNewSession(&state, arena, &new_msg);
     const next = state.subagent_host.?;
     try next.report_sink.?.post(next, .{ .report = .{ .agent = "reviewer", .child_id = "child-2", .work_id = "work-2", .call_id = "call-2", .outcome = .completed, .output = "done" } });
-    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 2), state.worker.queuedPromptCount());
     var libfx_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
         .method = "libfx/new",
