@@ -1313,6 +1313,157 @@ pub fn suspendToJobControl(
     try resumeTerminalAfterJobControl(terminal, shell, metrics, footer_rows);
 }
 
+// Caught rather than ignored: exec resets it for the editor, while fx survives
+// a terminal-generated interrupt delivered to their shared foreground group.
+var external_interrupted: std.atomic.Value(bool) = .init(false);
+var external_continued: std.atomic.Value(bool) = .init(false);
+
+fn externalInterrupt(_: std.posix.SIG) callconv(.c) void {
+    external_interrupted.store(true, .seq_cst);
+}
+
+fn externalContinue(_: std.posix.SIG) callconv(.c) void {
+    external_continued.store(true, .seq_cst);
+}
+
+/// Runs one foreground editor with inherited TTYs. Restores fx's original
+/// terminal settings, not settings an editor may have left behind. No pipes or
+/// new process group are created. Wait for the foreground launcher to exit,
+/// including after an interrupt: killing just a wrapper can orphan its editor.
+pub fn runExternalInteractive(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    footer_rows: u16,
+    argv: []const []const u8,
+    cwd: std.Io.Dir,
+) !std.process.Child.Term {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.EditorUnavailable;
+    try terminal.ensureInteractive();
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = externalInterrupt },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    external_interrupted.store(false, .seq_cst);
+    external_continued.store(false, .seq_cst);
+    const continue_action: std.posix.Sigaction = .{
+        .handler = .{ .handler = externalContinue },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old_cont: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.CONT, &continue_action, &old_cont);
+    defer std.posix.sigaction(.CONT, &old_cont, null);
+    var old_int: std.posix.Sigaction = undefined;
+    var old_quit: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.INT, &action, &old_int);
+    defer std.posix.sigaction(.INT, &old_int, null);
+    std.posix.sigaction(.QUIT, &action, &old_quit);
+    defer std.posix.sigaction(.QUIT, &old_quit, null);
+
+    suspendTerminalForJobControl(terminal, shell, metrics);
+    const outcome = runEditorChild(terminal, argv, cwd);
+    // Even a failed stage must not skip the remaining restore attempts. A
+    // restore failure is fatal to the interactive loop, not an editor notice.
+    var restore = EditorRestore{ .terminal = terminal, .shell = shell, .metrics = metrics, .footer_rows = footer_rows };
+    try restoreEditorTerminal(&restore);
+    return outcome;
+}
+
+const EditorRestore = struct {
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    footer_rows: u16,
+
+    fn cooked(self: *EditorRestore) !void {
+        // Flush editor input; never recapture an editor's changed baseline.
+        try io_mod.tcsetattr(self.terminal.stdin_fd, .FLUSH, self.terminal.original_termios);
+    }
+    fn raw(self: *EditorRestore) !void {
+        try self.terminal.enableRawMode();
+    }
+    fn modes(self: *EditorRestore) !void {
+        self.shell.layout = self.terminal.queryLayout(self.footer_rows) catch self.shell.layout;
+        try enableInteractiveTerminalModes(self.shell, self.metrics);
+    }
+    fn reset(self: *EditorRestore) !void {
+        try self.shell.requestTerminalReset(self.metrics);
+    }
+    fn repaint(self: *EditorRestore) void {
+        self.shell.render_requests.request(.first_frame);
+    }
+};
+
+fn restoreEditorTerminal(restore: anytype) !void {
+    var failed = false;
+    restore.cooked() catch {
+        failed = true;
+    };
+    restore.raw() catch {
+        failed = true;
+    };
+    restore.modes() catch {
+        failed = true;
+    };
+    restore.reset() catch {
+        failed = true;
+    };
+    restore.repaint();
+    if (failed) return error.EditorTerminalRestoreFailed;
+}
+
+fn runEditorChild(terminal: *TerminalState, argv: []const []const u8, cwd: std.Io.Dir) !std.process.Child.Term {
+    // disableRawMode is best-effort for shutdown. This boundary must prove
+    // cooked mode before handing the TTY to another process.
+    try io_mod.tcsetattr(terminal.stdin_fd, .FLUSH, terminal.original_termios);
+    if (external_interrupted.load(.seq_cst)) return error.EditorInterrupted;
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const pid = child.id.?;
+    var interrupt_resumed_job = false;
+    while (true) {
+        if (external_interrupted.load(.seq_cst) and !interrupt_resumed_job) {
+            // A stopped descendant behind a waiting wrapper is not our child
+            // and has no wait status here. Resume the existing foreground job
+            // once so it can process its pending interrupt and finish cleanup.
+            // Keep waiting for the launcher before fx reclaims the terminal.
+            _ = std.c.kill(0, .CONT);
+            interrupt_resumed_job = true;
+        }
+        var status: c_int = 0;
+        const result = std.c.waitpid(pid, &status, std.c.W.NOHANG | std.c.W.UNTRACED);
+        if (result == pid) {
+            if (std.c.W.IFSTOPPED(@bitCast(status))) {
+                // A whole foreground job resumes together. Ignore its stale
+                // stop notification; never cancel an editor after `fg`.
+                const resumed_job = external_continued.swap(false, .seq_cst);
+                if (!resumed_job or std.c.W.STOPSIG(@bitCast(status)) == .STOP) {
+                    external_interrupted.store(true, .seq_cst);
+                }
+                // A SIGCONT receipt does not identify this particular stop:
+                // the child may have stopped again immediately after `fg`.
+                // Always resume the observed child so no consumed status can
+                // leave it permanently stopped. Do not kill a wrapper.
+                _ = std.c.kill(pid, .CONT);
+                continue;
+            }
+            child.id = null;
+            if (external_interrupted.load(.seq_cst)) return error.EditorInterrupted;
+            return std.Io.Threaded.statusToTerm(@bitCast(status));
+        }
+        if (result < 0 and std.c.errno(result) != .INTR) return error.EditorWaitFailed;
+        if (result == 0) external_continued.store(false, .seq_cst);
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
 fn leaveAlternateScreens(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) void {
     switch (terminal.alternate_screen_owner) {
         .none => {},
@@ -3023,4 +3174,40 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+test "editor restoration attempts every stage and fails closed" {
+    const Probe = struct {
+        failed_stage: ?u8,
+        visited: [5]u8 = undefined,
+        len: usize = 0,
+        fn stage(self: *@This(), n: u8) !void {
+            self.visited[self.len] = n;
+            self.len += 1;
+            if (self.failed_stage == n) return error.InputOutput;
+        }
+        fn cooked(self: *@This()) !void {
+            try self.stage(0);
+        }
+        fn raw(self: *@This()) !void {
+            try self.stage(1);
+        }
+        fn modes(self: *@This()) !void {
+            try self.stage(2);
+        }
+        fn reset(self: *@This()) !void {
+            try self.stage(3);
+        }
+        fn repaint(self: *@This()) void {
+            self.stage(4) catch unreachable;
+        }
+    };
+    for (0..4) |stage| {
+        var probe: Probe = .{ .failed_stage = @intCast(stage) };
+        try std.testing.expectError(error.EditorTerminalRestoreFailed, restoreEditorTerminal(&probe));
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4 }, probe.visited[0..probe.len]);
+    }
+    var probe: Probe = .{ .failed_stage = null };
+    try restoreEditorTerminal(&probe);
+    try std.testing.expectEqual(@as(usize, 5), probe.len);
 }

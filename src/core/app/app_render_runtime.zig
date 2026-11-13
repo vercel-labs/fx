@@ -2131,6 +2131,7 @@ pub fn Runtime(comptime App: type) type {
                 .handle_byte = App.loopHandleByte,
                 .settle_delivery_epoch = App.loopSettleInputDeliveryEpoch,
                 .commit_frame = App.loopCommitFrame,
+                .yield_requested = if (comptime @hasDecl(App, "loopYieldRequested")) App.loopYieldRequested else null,
                 .poll_timeout_ms = if (comptime @hasDecl(App, "loopPollTimeoutMs")) App.loopPollTimeoutMs else null,
             };
         }

@@ -11,6 +11,7 @@ pub const EventLoopCallbacks = struct {
     handle_byte: *const fn (*anyopaque, u8) anyerror!void,
     settle_delivery_epoch: *const fn (*anyopaque) anyerror!void,
     commit_frame: *const fn (*anyopaque) anyerror!void,
+    yield_requested: ?*const fn (*anyopaque) bool = null,
     poll_timeout_ms: ?*const fn (*anyopaque, i32) i32 = null,
 };
 
@@ -25,9 +26,18 @@ fn attemptFinalFrameCommit(callbacks: EventLoopCallbacks, reason: []const u8) vo
 }
 
 pub const ExitCause = enum {
+    yielded,
     requested_exit,
     input_closed,
 };
+
+fn commitRequestedYield(callbacks: EventLoopCallbacks) !bool {
+    const requested = callbacks.yield_requested orelse return false;
+    if (!requested(callbacks.ctx)) return false;
+    try callbacks.settle_delivery_epoch(callbacks.ctx);
+    try callbacks.commit_frame(callbacks.ctx);
+    return true;
+}
 
 pub fn pump_ready_input(terminal: anytype, should_exit: *bool, callbacks: EventLoopCallbacks) !?ExitCause {
     var buf: [128]u8 = undefined;
@@ -39,6 +49,7 @@ pub fn pump_ready_input(terminal: anytype, should_exit: *bool, callbacks: EventL
         if (should_exit.*) return .requested_exit;
     }
 
+    if (try commitRequestedYield(callbacks)) return .yielded;
     var poll_result = try terminal.pollInput(0);
     var input_reads: usize = 0;
 
@@ -55,6 +66,7 @@ pub fn pump_ready_input(terminal: anytype, should_exit: *bool, callbacks: EventL
             try callbacks.handle_byte(callbacks.ctx, byte);
             if (should_exit.*) return .requested_exit;
         }
+        if (try commitRequestedYield(callbacks)) return .yielded;
         poll_result = try terminal.pollInput(0);
     }
 
@@ -88,6 +100,7 @@ pub fn run(terminal: anytype, should_exit: *bool, poll_timeout_ms: i32, callback
             if (should_exit.*) return .requested_exit;
         }
 
+        if (try commitRequestedYield(callbacks)) return .yielded;
         const timeout_ms = if (callbacks.poll_timeout_ms) |resolve|
             resolve(callbacks.ctx, poll_timeout_ms)
         else
@@ -106,6 +119,7 @@ pub fn run(terminal: anytype, should_exit: *bool, poll_timeout_ms: i32, callback
                 try callbacks.handle_byte(callbacks.ctx, byte);
                 if (should_exit.*) return .requested_exit;
             }
+            if (try commitRequestedYield(callbacks)) return .yielded;
             poll_result = try terminal.pollInput(0);
         }
 
@@ -120,6 +134,7 @@ pub fn run(terminal: anytype, should_exit: *bool, poll_timeout_ms: i32, callback
 
         try callbacks.settle_delivery_epoch(callbacks.ctx);
         try callbacks.commit_frame(callbacks.ctx);
+        if (callbacks.yield_requested) |requested| if (requested(callbacks.ctx)) return .yielded;
     }
     return .requested_exit;
 }
@@ -600,4 +615,47 @@ test "event loop commits handled input before read EOF" {
     try std.testing.expectEqual(ExitCause.input_closed, exit_cause);
     try std.testing.expect(!should_exit);
     try std.testing.expectEqual(@as(usize, 1), trace.commits);
+}
+
+fn yieldAfterEventLoopInput(ctx: *anyopaque) bool {
+    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
+    return std.mem.findScalar(u8, trace.bytes[0..trace.len], 'b') != null;
+}
+
+test "event loop yields only after the current read settles and commits" {
+    var should_exit = false;
+    var polls: usize = 0;
+    var trace = EventLoopTestTrace{ .should_exit = &should_exit };
+    const result = try run(EventLoopTestTerminal{ .polls = &polls }, &should_exit, 8, .{
+        .ctx = &trace,
+        .collect_facts = collectEventLoopTestFacts,
+        .next_collected_byte = noCollectedEventLoopByte,
+        .handle_byte = handleEventLoopTestByte,
+        .settle_delivery_epoch = settleEventLoopTestDeliveryEpoch,
+        .commit_frame = commitEventLoopTestFrameWithoutExit,
+        .yield_requested = yieldAfterEventLoopInput,
+    });
+    try std.testing.expectEqual(ExitCause.yielded, result);
+    try std.testing.expectEqualStrings("tabsc", trace.bytes[0..trace.len]);
+    try std.testing.expectEqual(@as(usize, 1), polls);
+    // A strict network guard would panic here if run's guard had not unwound.
+    input_loop_guard.noteNetworkRequest("post-yield editor coordinator");
+}
+
+test "cooperative pump yields after collected input without polling or facts" {
+    var should_exit = false;
+    var polls: usize = 0;
+    var trace = EventLoopTestTrace{ .should_exit = &should_exit, .collected = .{ 'a', 'b' }, .collected_len = 2 };
+    const result = try pump_ready_input(EventLoopTestTerminal{ .polls = &polls }, &should_exit, .{
+        .ctx = &trace,
+        .collect_facts = collectEventLoopTestFacts,
+        .next_collected_byte = nextCollectedEventLoopByte,
+        .handle_byte = handleEventLoopTestByte,
+        .settle_delivery_epoch = settleEventLoopTestDeliveryEpoch,
+        .commit_frame = commitEventLoopTestFrameWithoutExit,
+        .yield_requested = yieldAfterEventLoopInput,
+    });
+    try std.testing.expectEqual(@as(?ExitCause, .yielded), result);
+    try std.testing.expectEqualStrings("absc", trace.bytes[0..trace.len]);
+    try std.testing.expectEqual(@as(usize, 0), polls);
 }

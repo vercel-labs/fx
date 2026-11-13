@@ -543,7 +543,7 @@ const terminal = await createFxTerminal({
 await terminal.interactive;
 ```
 
-This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. See [Terminal](https://fx.sh/docs/lib/terminal).
+This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. See [Terminal](https://fx.sh/docs/lib/terminal). The native `/edit` command is unavailable here; it preserves your draft and does not open an editor or send a prompt.
 
 ## Entry points
 

@@ -29,6 +29,7 @@ const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
+const app_prompt_edit_runtime = @import("core/app/app_prompt_edit_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
@@ -183,7 +184,6 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ResumeProjection = resume_projection.ResumeProjection;
 const RawEnviron = io_mod.RawEnviron;
 
-const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
 const focused_ui_worker_poll_timeout_ms: i32 = 1;
 const idle_wasm_poll_timeout_ms: i32 = 16;
@@ -411,6 +411,7 @@ fn currentBuild() update_target.CurrentBuild {
 const App = struct {
     pub const app_version = version;
     pub const host_profile = selected_host_profile;
+    pub const footer_rows: u16 = 4;
     pub const input_limits = paste_framing.default_input_limits;
     pub const build_update_channel = compiled_update_channel;
     pub const build_revision = build_options.git_commit;
@@ -578,6 +579,7 @@ const App = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     approval_screen: ApprovalScreenState = .{},
 
+    prompt_edit_request: ?app_prompt_edit_runtime.Request = null,
     should_exit: bool = false,
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
@@ -729,7 +731,7 @@ const App = struct {
         try BootstrapAppRuntime.bootstrap(
             &app,
             &app.main_agent,
-            footer_rows,
+            App.footer_rows,
             builtin_gateway.default_model,
             default_max_agent_steps,
             handle_sigwinch,
@@ -1098,6 +1100,7 @@ const App = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.prompt_history.deinit(self.alloc);
+        if (self.prompt_edit_request) |request| self.alloc.free(request.seed);
         self.clearPendingImages(main_agent);
         main_agent.pending_images.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
@@ -1154,6 +1157,15 @@ const App = struct {
             &self.metrics,
             self.terminalTitle(),
         );
+    }
+
+    pub fn requestPromptEdit(self: *App, seed: []const u8) !void {
+        try app_prompt_edit_runtime.Runtime(App).request(self, seed);
+    }
+
+    pub fn loopYieldRequested(ctx: *anyopaque) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.prompt_edit_request != null;
     }
 
     pub fn flushBeforeBlockingExternalWork(self: *App) !void {
@@ -1252,6 +1264,7 @@ const App = struct {
                 callbacks,
             );
             switch (exit_cause) {
+                .yielded => try app_prompt_edit_runtime.Runtime(App).run(self, max_prompt_history),
                 .requested_exit => return,
                 .input_closed => return error.TerminalInputClosed,
             }
@@ -3314,7 +3327,7 @@ const App = struct {
                 &self.metrics,
                 &self.terminal_input_runtime.terminal_cursor_probe,
                 &resize_interlock,
-                footer_rows,
+                App.footer_rows,
                 resize_debounce_ms,
                 !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
             ) catch |err| {
@@ -3717,6 +3730,11 @@ const App = struct {
 
     pub fn loopHandleByte(ctx: *anyopaque, byte: u8) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (self.prompt_edit_request) |*request| {
+            request.suffix_discarded = true;
+            _ = self.terminal_input_runtime.consumeDeferredTerminalInputDispatch();
+            return;
+        }
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
         const deferred_source = self.terminal_input_runtime.consumeDeferredTerminalInputDispatch();
 

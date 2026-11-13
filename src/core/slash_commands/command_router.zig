@@ -5,6 +5,7 @@ const SlashKind = command_specs.SlashKind;
 const SlashRegistry = command_specs.SlashRegistry;
 
 pub const ParsedCommand = union(enum) {
+    edit: []const u8,
     quit,
     clear_screen,
     new_session,
@@ -50,6 +51,7 @@ pub const ParsedCommand = union(enum) {
 
 pub const CommandHandlers = struct {
     ctx: *anyopaque,
+    edit: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void = editUnavailable,
     quit: *const fn (ctx: *anyopaque) anyerror!void,
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
@@ -95,12 +97,17 @@ pub const CommandHandlers = struct {
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
+fn editUnavailable(_: *anyopaque, _: []const u8) !void {
+    return error.EditorUnavailable;
+}
+
 fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
     return std.mem.trim(u8, cmd[prefix.len..], " \t");
 }
 
 fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
     return switch (kind) {
+        .edit => .{ .edit = payload },
         .quit => .quit,
         .clear_screen => .clear_screen,
         .new_session => .new_session,
@@ -168,6 +175,7 @@ fn typedSetupAlias(registry: SlashRegistry, cmd: []const u8) bool {
 
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
     switch (parse(registry, cmd)) {
+        .edit => |rest| try handlers.edit(handlers.ctx, rest),
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
@@ -691,4 +699,10 @@ test "route propagates callback errors" {
     handlers.show_status = failStatus;
 
     try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
+}
+
+test "edit is a payload command with an exact token boundary" {
+    try std.testing.expectEqualStrings("seed", parse(testSlashRegistry(), "/edit seed").edit);
+    try std.testing.expectEqualStrings("", parse(testSlashRegistry(), "/edit").edit);
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/editfoo"));
 }

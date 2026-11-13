@@ -278,6 +278,7 @@ pub fn Handlers(comptime App: type) type {
         pub fn commandHandlers(app: *App) command_router.CommandHandlers {
             return .{
                 .ctx = @ptrCast(app),
+                .edit = commandEdit,
                 .quit = commandQuit,
                 .clear_screen = commandClearScreen,
                 .new_session = commandNewSession,
@@ -322,6 +323,15 @@ pub fn Handlers(comptime App: type) type {
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
+        }
+
+        fn commandEdit(ctx: *anyopaque, seed: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "requestPromptEdit")) {
+                try app.requestPromptEdit(seed);
+            } else {
+                try app.writeDomainNotice(.{ .topic = "edit", .tone = .neutral, .body = "The external editor is unavailable on this host." }, true);
+            }
         }
 
         /// What the MCP host and `/mcp` have to say, and the reload a `/mcp` change asked for.
