@@ -9433,6 +9433,38 @@ test "processQueuedPrompt replays a 401 with the team its forced refresh returns
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt waiting for a sign-in resends with the login another fx process saved" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+        .{ .content = "answer on the other login" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // The refused token is stored and its refresh is refused. Nobody signs in
+    // here; another fx process has saved a new login.
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-before", "token-after" };
+    hooks.credential_refresh_fail_force = true;
+    hooks.credential_stored_token = "token-after";
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "Sign-in expired · waiting "));
+    try std.testing.expect(hooks.credential_stored_reads >= 1);
+    try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+    try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
 test "processQueuedPrompt waits for a sign-in when a refused login's refresh stops working" {
     const alloc = std.testing.allocator;
     const refused = "{\"error\":{\"message\":\"refused for now\"}}";

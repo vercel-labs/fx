@@ -1226,6 +1226,10 @@ const App = struct {
         try AuthAppRuntime.beginRecoverySignIn(self, agent);
     }
 
+    pub fn closeRecoverySignInForStoredLogin(self: *App) !void {
+        try AuthAppRuntime.closeRecoverySignInForStoredLogin(self);
+    }
+
     pub fn runLoginCommand(self: *App, agent: *agents.Agent) !void {
         try AuthAppRuntime.runLoginCommand(self, agent);
     }

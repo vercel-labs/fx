@@ -52,6 +52,8 @@ const tick_ms: u64 = 1_000;
 const wait_tick_ms: u64 = 100;
 /// How often a wait checks for Esc.
 const cancel_poll_ms: u64 = 25;
+/// How often a wait for a sign-in asks whether the store holds a new login.
+const sign_in_check_ms: u64 = 1_000;
 /// Tests run the ticker thread fast; the module still sees the virtual clock.
 const ticker_interval_ns: i96 = if (builtin.is_test) 5 * std.time.ns_per_ms else tick_ms * std.time.ns_per_ms;
 /// The virtual boot clock tests start at.
@@ -76,6 +78,14 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
 /// that sends one every time is broken, not having a bad moment.
 const max_unreadable_replies = 3;
 
+/// Whether the store now holds a login the waiting request can send, other
+/// than the one the provider refused, as another fx process that signs in
+/// saves.
+pub const SignInRenewed = struct {
+    ctx: *anyopaque,
+    check: *const fn (ctx: *anyopaque) bool,
+};
+
 pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
     cancel_flag: *std.atomic.Value(bool),
@@ -87,6 +97,9 @@ pub const RequestRecovery = struct {
     /// Set by the same host when the sign-in it opened for this request
     /// closes without a new login (`recovery.Event.sign_in_closed`).
     sign_in_closed_flag: ?*std.atomic.Value(bool) = null,
+    /// Set by fx while the request waits for a sign-in. Asked about once a
+    /// second; a new login answers the wait as the user's continue does.
+    sign_in_renewed: ?SignInRenewed = null,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
     /// Replies this request could not read. Touched only by the request's
@@ -275,12 +288,13 @@ pub const RequestRecovery = struct {
     }
 
     /// Waits for the module's next send, delivering `tick` every
-    /// `wait_tick_ms`, `user_continue` when the continue flag is set, and
-    /// `sign_in_closed` when the sign-in closed flag is. Returns null when
-    /// the cancel flag is set; the caller then runs its cancel path, which
-    /// calls `cancel`.
+    /// `wait_tick_ms`, `user_continue` when the continue flag is set or
+    /// `sign_in_renewed` finds a new login, and `sign_in_closed` when the
+    /// sign-in closed flag is set. Returns null when the cancel flag is set;
+    /// the caller then runs its cancel path, which calls `cancel`.
     pub fn waitForSend(self: *RequestRecovery) !?Send {
         var next_tick_ms = self.nowMs() +| wait_tick_ms;
+        var next_sign_in_check_ms = self.nowMs() +| sign_in_check_ms;
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
             if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
@@ -290,6 +304,12 @@ pub const RequestRecovery = struct {
                 if (try self.deliverAnswer(.sign_in_closed, "wait")) |send| return send;
             };
             const now_ms = self.nowMs();
+            if (self.sign_in_renewed) |renewed| if (now_ms >= next_sign_in_check_ms) {
+                next_sign_in_check_ms = now_ms +| sign_in_check_ms;
+                if (renewed.check(renewed.ctx)) {
+                    if (try self.deliverAnswer(.user_continue, "stored_sign_in")) |send| return send;
+                }
+            };
             if (now_ms < next_tick_ms) {
                 self.sleepMs(@min(cancel_poll_ms, next_tick_ms - now_ms));
                 continue;
@@ -749,6 +769,41 @@ test "a healthy request shows nothing and reports no recovery" {
     try request.succeeded();
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_statuses.items.len);
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_clear_count);
+}
+
+const StoredSignInProbe = struct {
+    found_after: usize,
+    checks: usize = 0,
+
+    fn check(raw: *anyopaque) bool {
+        const self: *StoredSignInProbe = @ptrCast(@alignCast(raw));
+        self.checks += 1;
+        return self.checks > self.found_after;
+    }
+};
+
+test "a request waiting for a sign-in resends once another fx process saves a login" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+    var probe = StoredSignInProbe{ .found_after = 2 };
+    request.sign_in_renewed = .{ .ctx = &probe, .check = StoredSignInProbe.check };
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    const waited_from_ms = request.nowMs();
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(usize, 3), probe.checks);
+    try std.testing.expectEqual(@as(u16, 2), request.attempt());
+    // About a second apart, and long before the wait's own next try.
+    const waited_ms = request.nowMs() - waited_from_ms;
+    try std.testing.expect(waited_ms >= 3 * sign_in_check_ms);
+    try std.testing.expect(waited_ms < 60 * 1000);
 }
 
 test "a sign-in that finishes while a sign-in resend is on the wire sends again when that resend fails" {
