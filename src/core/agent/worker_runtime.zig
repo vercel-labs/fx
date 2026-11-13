@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -8512,16 +8513,6 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
 }
 
-/// Whether the thread that asked has returned, waited for on the event it sets,
-/// so a wait that does not end fails its test instead of hanging it.
-fn askerReturned(event: *std.Io.Event) bool {
-    event.waitTimeout(io_mod.getIo(), .{ .duration = .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(5000),
-    } }) catch return false;
-    return true;
-}
-
 fn runPermissionRequestWithReview(
     state: *PermissionThreadState,
     runtime: *WorkerRuntime,
@@ -8566,7 +8557,7 @@ test "cancelling a turn ends the question it waits on, whoever asked it" {
         var snapshot = try waitForQuestionSnapshot(&runtime);
         snapshot.deinit(alloc);
         runtime.requestTurnCancel();
-        const ended = askerReturned(&state.returned);
+        const ended = testing_event.setInTime(&state.returned);
         // A wait that did not end is released, so the test fails instead of hanging.
         if (!ended) runtime.requestStop();
         thread.join();
@@ -8585,7 +8576,7 @@ test "cancelling a turn declines the permission request it waits on" {
     const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
     _ = try waitForPermissionLabel(&runtime, "Allow?");
     runtime.requestTurnCancel();
-    const ended = askerReturned(&state.returned);
+    const ended = testing_event.setInTime(&state.returned);
     // A request that stayed open is released, so the test fails instead of hanging.
     if (!ended) runtime.requestStop();
     thread.join();
@@ -8604,7 +8595,7 @@ test "cancelling a turn declines a permission request that waits on a file revie
     const thread = try std.Thread.spawn(.{}, runPermissionRequestWithReview, .{ &state, &runtime, "file_mutation", &review });
     _ = try waitForPermissionLabel(&runtime, "file_mutation");
     runtime.requestTurnCancel();
-    const ended = askerReturned(&state.returned);
+    const ended = testing_event.setInTime(&state.returned);
     if (!ended) runtime.requestStop();
     thread.join();
     try std.testing.expect(ended);

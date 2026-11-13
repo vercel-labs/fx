@@ -33,6 +33,7 @@ const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -3319,16 +3320,6 @@ test "the cancel a run's wait repeats ends the question that run waits on" {
             }
             return false;
         }
-
-        /// Whether the thread that asked has returned, so a question that does
-        /// not end fails the test instead of hanging it.
-        fn askerReturned(event: *std.Io.Event) bool {
-            event.waitTimeout(io_mod.getIo(), .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(5000),
-            } }) catch return false;
-            return true;
-        }
     };
 
     var answered = std.atomic.Value(bool).init(false);
@@ -3338,7 +3329,7 @@ test "the cancel a run's wait repeats ends the question that run waits on" {
     const waiter = try std.Thread.spawn(.{}, Side.wait, .{ &completion, &cancel, &worker, &outcome });
     const opened = Side.questionOpens(&worker);
     cancel.store(true, .seq_cst);
-    const ended = opened and Side.askerReturned(&returned);
+    const ended = opened and testing_event.setInTime(&returned);
     // A question that stayed open is released, so the test fails instead of hanging.
     if (!ended) worker.requestStop();
     completion.finish(.cancelled);
