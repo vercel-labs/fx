@@ -140,9 +140,11 @@ pub fn responseId(input: []const u8) ?RequestId {
 }
 
 /// Finds the fields listed in `names` in the JSON object `object` and stores
-/// each raw value, a slice of `object`, at the same index in `out`. Other
-/// fields, and keys written with escapes, are skipped. A wanted field that
-/// appears twice is an error, so a message can't say two things at once.
+/// each raw value, a slice of `object`, at the same index in `out`. A key is
+/// the name it spells once decoded, as `std.json` reads it: `"is\u0045rror"`
+/// is `isError`. Other fields are skipped. A wanted field that appears twice,
+/// however each is spelled, is an error, so a message can't say two things at
+/// once.
 pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]const u8) DecodeError!void {
     std.debug.assert(names.len == out.len);
     @memset(out, null);
@@ -153,6 +155,7 @@ pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]con
 
     if ((try nextToken(&scanner)) != .object_begin) return error.NotAnObject;
     while (true) {
+        const before = scanner.cursor;
         var token = try nextToken(&scanner);
         if (token == .object_end) break;
         // A key with escapes arrives in pieces; the last piece is a string.
@@ -161,12 +164,13 @@ pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]con
             .string => |piece| break piece,
             else => escaped = true,
         };
+        // The key as written, quotes included: the first quote after the last value and the comma.
+        const key_token = if (escaped) object[std.mem.findScalarPos(u8, object, before, '"') orelse return error.InvalidJson .. scanner.cursor] else key;
         _ = scanner.peekNextTokenType() catch return error.InvalidJson;
         const start = scanner.cursor;
         try skip(&scanner);
-        if (escaped) continue;
         for (names, out) |name, *slot| {
-            if (!std.mem.eql(u8, key, name)) continue;
+            if (if (escaped) !spells(key_token, name) else !std.mem.eql(u8, key, name)) continue;
             if (slot.* != null) return error.DuplicateField;
             slot.* = object[start..scanner.cursor];
         }
@@ -254,6 +258,108 @@ pub fn arrayHasString(array: []const u8, needle: []const u8) DecodeError!bool {
     }
     return found;
 }
+
+/// Whether two JSON string tokens, quotes included, spell the same string
+/// once decoded: `"caf\u00e9"` and `"café"`, `"a\/b"` and `"a/b"`, and a
+/// surrogate pair and the character in UTF-8 are one string each. This is
+/// JSON's equality, which is `std.json`'s. It decodes both tokens as it goes
+/// and allocates nothing. A token that is not a string, or holds an escape or
+/// UTF-8 that is not valid, matches only a token with the same bytes. Tokens
+/// that reach here have been through the scanner, which refuses invalid ones.
+pub fn sameString(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (!isStringToken(a) or !isStringToken(b)) return false;
+    var x: Decoder = .{ .raw = a[1 .. a.len - 1] };
+    var y: Decoder = .{ .raw = b[1 .. b.len - 1] };
+    return sameDecoded(&x, &y);
+}
+
+/// Whether the string token `token`, quotes included, spells `name`, which is
+/// already decoded.
+fn spells(token: []const u8, name: []const u8) bool {
+    if (!isStringToken(token)) return false;
+    var x: Decoder = .{ .raw = token[1 .. token.len - 1] };
+    var y: Decoder = .{ .raw = name, .literal = true };
+    return sameDecoded(&x, &y);
+}
+
+fn isStringToken(raw: []const u8) bool {
+    return raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"';
+}
+
+fn sameDecoded(x: *Decoder, y: *Decoder) bool {
+    while (true) {
+        const p = x.next() catch return false;
+        const q = y.next() catch return false;
+        if (p == null or q == null) return p == null and q == null;
+        if (p.? != q.?) return false;
+    }
+}
+
+/// The code points of the inside of a JSON string token, one at a time. With
+/// `literal` set the bytes are a decoded string, and no byte is an escape.
+const Decoder = struct {
+    raw: []const u8,
+    at: usize = 0,
+    literal: bool = false,
+
+    const Invalid = error{Invalid};
+
+    /// The next code point, or null at the end. A surrogate pair written as
+    /// two escapes is one code point, and a lone surrogate is invalid.
+    fn next(d: *Decoder) Invalid!?u21 {
+        if (d.at >= d.raw.len) return null;
+        const c = d.raw[d.at];
+        if (c != '\\' or d.literal) {
+            const n = std.unicode.utf8ByteSequenceLength(c) catch return error.Invalid;
+            if (d.at + n > d.raw.len) return error.Invalid;
+            const bytes = d.raw[d.at..][0..n];
+            // Each decoder refuses an overlong form; the three-byte one also refuses an encoded surrogate half.
+            const code_point: u21 = switch (n) {
+                1 => c,
+                2 => std.unicode.utf8Decode2(bytes[0..2].*) catch return error.Invalid,
+                3 => std.unicode.utf8Decode3(bytes[0..3].*) catch return error.Invalid,
+                4 => std.unicode.utf8Decode4(bytes[0..4].*) catch return error.Invalid,
+                else => return error.Invalid,
+            };
+            d.at += n;
+            return code_point;
+        }
+        if (d.at + 1 >= d.raw.len) return error.Invalid;
+        const escape = d.raw[d.at + 1];
+        d.at += 2;
+        switch (escape) {
+            '"' => return '"',
+            '\\' => return '\\',
+            '/' => return '/',
+            'b' => return 0x08,
+            'f' => return 0x0c,
+            'n' => return '\n',
+            'r' => return '\r',
+            't' => return '\t',
+            'u' => {},
+            else => return error.Invalid,
+        }
+        const unit = try d.hex4();
+        if (unit >= 0xdc00 and unit <= 0xdfff) return error.Invalid;
+        if (unit < 0xd800 or unit > 0xdbff) return unit;
+        // A high surrogate needs a low one, written as the next escape.
+        if (d.at + 1 >= d.raw.len or d.raw[d.at] != '\\' or d.raw[d.at + 1] != 'u') return error.Invalid;
+        d.at += 2;
+        const low = try d.hex4();
+        if (low < 0xdc00 or low > 0xdfff) return error.Invalid;
+        return 0x10000 + ((@as(u21, unit) - 0xd800) << 10) + (low - 0xdc00);
+    }
+
+    /// Four hex digits, in either case, and nothing else: no sign.
+    fn hex4(d: *Decoder) Invalid!u16 {
+        if (d.at + 4 > d.raw.len) return error.Invalid;
+        var unit: u16 = 0;
+        for (d.raw[d.at..][0..4]) |digit| unit = unit * 16 + (std.fmt.charToDigit(digit, 16) catch return error.Invalid);
+        d.at += 4;
+        return unit;
+    }
+};
 
 fn nextToken(scanner: *std.json.Scanner) DecodeError!std.json.Token {
     return scanner.next() catch |err| switch (err) {
@@ -501,6 +607,11 @@ fn validate(value: []const u8) error{InvalidRawJson}!void {
 
 const testing = std.testing;
 
+/// The raw value found for a name, or a failure that says nothing was found, instead of a crash on `.?`.
+fn expectRaw(want: []const u8, got: ?[]const u8) !void {
+    try testing.expectEqualStrings(want, got orelse "(the name was not found)");
+}
+
 fn within(input: []const u8, part: []const u8) bool {
     const start = @intFromPtr(input.ptr);
     const at = @intFromPtr(part.ptr);
@@ -569,6 +680,222 @@ test "a key written with escapes never matches a field" {
     // The scanner splits this key into pieces, and the last one is "id".
     const message = try decode("{\"jsonrpc\":\"2.0\",\"x\\u0000id\":5,\"id\":1,\"result\":{}}");
     try testing.expectEqual(@as(?RequestId, 1), message.response.id);
+}
+
+test "a name written with escapes is read as the name it spells" {
+    var mode: [1]?[]const u8 = undefined;
+    try objectFields("{\"m\\u006fde\":\"url\"}", &.{"mode"}, &mode);
+    try expectRaw("\"url\"", mode[0]);
+    // Every letter escaped, and capital hex digits.
+    try objectFields("{\"\\u006D\\u006F\\u0064\\u0065\":\"form\"}", &.{"mode"}, &mode);
+    try expectRaw("\"form\"", mode[0]);
+    // Next to a plain name, and in the order the names were asked for.
+    var two: [2]?[]const u8 = undefined;
+    try objectFields("{\"url\":1,\"m\\u006fde\":2}", &.{ "mode", "url" }, &two);
+    try expectRaw("2", two[0]);
+    try expectRaw("1", two[1]);
+    // A message the engine reads as an envelope.
+    const message = try decode("{\"jsonrpc\":\"2.0\",\"i\\u0064\":7,\"result\":{}}");
+    try testing.expectEqual(@as(?RequestId, 7), message.response.id);
+}
+
+test "an asked name that holds a backslash or a quote is matched by the key that spells it" {
+    // The asked name is already decoded: its backslash is a backslash, not the start of an escape.
+    var found: [3]?[]const u8 = undefined;
+    const names = [_][]const u8{ "a\\b", "q\"x", "a\\n" };
+    try objectFields("{\"a\\\\b\":1,\"q\\\"x\":2,\"a\\\\n\":3}", &names, &found);
+    try expectRaw("1", found[0]);
+    try expectRaw("2", found[1]);
+    try expectRaw("3", found[2]);
+    // The same names spelled with escapes of every letter.
+    try objectFields("{\"\\u0061\\u005c\\u0062\":4,\"q\\u0022x\":5,\"a\\u005cn\":6}", &names, &found);
+    try expectRaw("4", found[0]);
+    try expectRaw("5", found[1]);
+    try expectRaw("6", found[2]);
+}
+
+test "a name seen twice is a duplicate, however either one is written" {
+    var mode: [1]?[]const u8 = undefined;
+    try testing.expectError(error.DuplicateField, objectFields("{\"mode\":\"form\",\"mode\":\"url\"}", &.{"mode"}, &mode));
+    try testing.expectError(error.DuplicateField, objectFields("{\"mode\":\"form\",\"m\\u006fde\":\"url\"}", &.{"mode"}, &mode));
+    try testing.expectError(error.DuplicateField, objectFields("{\"m\\u006fde\":\"form\",\"mode\":\"url\"}", &.{"mode"}, &mode));
+    try testing.expectError(error.DuplicateField, objectFields("{\"m\\u006fde\":\"form\",\"mo\\u0064e\":\"url\"}", &.{"mode"}, &mode));
+    // A name that is not asked for may repeat, plain or written with escapes.
+    try objectFields("{\"x\":1,\"x\":2,\"\\u0078\":3,\"mode\":\"form\"}", &.{"mode"}, &mode);
+    try expectRaw("\"form\"", mode[0]);
+}
+
+test "keys that spell no asked name are skipped, nested ones too" {
+    var mode: [1]?[]const u8 = undefined;
+    // An escaped key that is longer than any name, one with NUL in it, a surrogate pair, one whose last piece is a
+    // name, and an object that holds escaped keys, which is skipped whole.
+    const message = "{\"mode\\u0000x\":1,\"\\u0000\":2,\"\\ud83d\\ude00\":3,\"x\\u0000mode\":4," ++
+        "\"nested\":{\"m\\u006fde\":\"url\",\"deeper\":{\"mo\\u0064e\":\"url\"}},\"mode\":\"form\"}";
+    try objectFields(message, &.{"mode"}, &mode);
+    try expectRaw("\"form\"", mode[0]);
+    // Nothing asked for is found.
+    try objectFields("{\"mode\\u0000\":1}", &.{"mode"}, &mode);
+    try testing.expectEqual(@as(?[]const u8, null), mode[0]);
+}
+
+test "an object cut at any byte, with names written with escapes, is refused cleanly" {
+    const whole = "{\"m\\u006fde\":\"url\",\"x\\ud83d\\ude00\":{\"\\u0061\":[1,2]},\"url\":\"https:\\/\\/e.example\"}";
+    var found: [2]?[]const u8 = undefined;
+    try objectFields(whole, &.{ "mode", "url" }, &found);
+    for (0..whole.len) |cut| {
+        if (objectFields(whole[0..cut], &.{ "mode", "url" }, &found)) |_| {
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "an input_required result written with an escaped resultType is still input_required" {
+    const message = try decode("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"result\\u0054ype\":\"input_required\",\"inputRequests\":{}}}");
+    try testing.expectEqual(ResultKind.input_required, message.response.body.result.kind);
+}
+
+test "a server request with an escaped id is a request, not a notification" {
+    const message = try decode("{\"jsonrpc\":\"2.0\",\"i\\u0064\":5,\"method\":\"ping\"}");
+    try testing.expectEqual(std.meta.Tag(Message).request, std.meta.activeTag(message));
+    // The same request with the key written plainly, and a notification, which has no id.
+    const plain = try decode("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\"}");
+    try testing.expectEqual(std.meta.Tag(Message).request, std.meta.activeTag(plain));
+    const note = try decode("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
+    try testing.expectEqual(std.meta.Tag(Message).notification, std.meta.activeTag(note));
+}
+
+test "a lone surrogate or an invalid escape in a name is refused as invalid JSON" {
+    var found: [1]?[]const u8 = undefined;
+    const bad = [_][]const u8{
+        "{\"\\ud83d\":1}", // a high surrogate alone
+        "{\"\\ude00\":1}", // a low surrogate alone
+        "{\"\\ud83dx\":1}", // a high surrogate then a plain letter
+        "{\"\\ud83d\\u0041\":1}", // a high surrogate then a letter that is not a low surrogate
+        "{\"\\ude00\\ud83d\":1}", // a pair in the wrong order
+        "{\"m\\qde\":1}", // an escape that does not exist
+        "{\"m\\u12\":1}", // cut hex digits
+        "{\"m\\u12zz\":1}", // hex digits that are not
+    };
+    for (bad) |text| try testing.expectError(error.InvalidJson, objectFields(text, &.{"mode"}, &found));
+}
+
+test "thousands of members written with escapes are read in one pass" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const w = &out.writer;
+    try w.writeAll("{");
+    // 20,000 members whose names are all written with escapes, some holding nested objects.
+    for (0..20_000) |i| {
+        try w.print("\"k\\u0030\\u{x:0>4}\":{{\"\\u0061\":[{d}]}},", .{ i % 0xffff, i });
+    }
+    // A name of 100,000 escapes, then the one the reader asks for, written with an escape.
+    try w.writeAll("\"");
+    for (0..100_000) |_| try w.writeAll("\\u0061");
+    try w.writeAll("\":1,\"i\\u0073Error\":true}");
+    var found: [1]?[]const u8 = undefined;
+    try objectFields(out.written(), &.{"isError"}, &found);
+    try expectRaw("true", found[0]);
+    // Nested objects with escaped names near the scanner's depth limit are skipped whole.
+    var deep: std.Io.Writer.Allocating = .init(arena.allocator());
+    try deep.writer.writeAll("{\"x\":");
+    for (0..1500) |_| try deep.writer.writeAll("{\"\\u0061\":");
+    try deep.writer.writeAll("1");
+    for (0..1500) |_| try deep.writer.writeAll("}");
+    try deep.writer.writeAll(",\"m\\u006fde\":\"form\"}");
+    var mode: [1]?[]const u8 = undefined;
+    try objectFields(deep.written(), &.{"mode"}, &mode);
+    try expectRaw("\"form\"", mode[0]);
+}
+
+test "sameString is JSON's equality of two string tokens" {
+    const same = [_][2][]const u8{
+        .{ "\"\"", "\"\"" },
+        .{ "\"\\u0041\"", "\"A\"" },
+        .{ "\"A\"", "\"\\u0041\"" },
+        .{ "\"\\u00e9\"", "\"é\"" },
+        .{ "\"\\u00E9\"", "\"\\u00e9\"" },
+        .{ "\"\\uD83D\\uDE00\"", "\"😀\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"\\uD83D\\uDE00\"" },
+        .{ "\"\\ud800\\udc00\"", "\"\u{10000}\"" }, // the first astral code point
+        .{ "\"\\udbff\\udfff\"", "\"\u{10ffff}\"" }, // the last
+        .{ "\"\\ud7ff\"", "\"\u{d7ff}\"" }, // just below the surrogates
+        .{ "\"\\ue000\"", "\"\u{e000}\"" }, // just above
+        .{ "\"\\uffff\"", "\"\u{ffff}\"" },
+        .{ "\"\\u0080\"", "\"\u{80}\"" }, // the first two-byte code point
+        .{ "\"\\u07ff\"", "\"\u{7ff}\"" }, // the last
+        .{ "\"\\u0800\"", "\"\u{800}\"" }, // the first three-byte one
+        .{ "\"\\u20ac\"", "\"€\"" },
+        .{ "\"a\\/b\"", "\"a/b\"" },
+        .{ "\"\\n\"", "\"\\u000a\"" },
+        .{ "\"\\b\\f\\r\\t\"", "\"\\u0008\\u000C\\u000d\\u0009\"" },
+        .{ "\"\\\"\\\\\"", "\"\\u0022\\u005c\"" },
+        .{ "\"\\u0000\"", "\"\\u0000\"" },
+        .{ "\"x\\u00e9y\\ud83d\\ude00z\"", "\"xéy😀z\"" },
+    };
+    for (same) |pair| {
+        testing.expect(sameString(pair[0], pair[1]) and sameString(pair[1], pair[0])) catch |err| {
+            std.debug.print("expected the same string: {s} and {s}\n", .{ pair[0], pair[1] });
+            return err;
+        };
+    }
+    const different = [_][2][]const u8{
+        .{ "\"A\"", "\"a\"" },
+        .{ "\"\\u0041\"", "\"B\"" },
+        .{ "\"\\u00e9\"", "\"e\"" },
+        .{ "\"\\u00e9\"", "\"\\u00e8\"" },
+        .{ "\"ab\"", "\"a\"" },
+        .{ "\"a\"", "\"ab\"" },
+        .{ "\"\\u0041\"", "\"AA\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"\\ud83d\\ude01\"" },
+        .{ "\"\\ud83d\\ude00\"", "\"😁\"" },
+        .{ "\"\\u0041\"", "\"\\u0041\\u0000\"" },
+        // An escape or a surrogate that is not valid matches only the same bytes.
+        .{ "\"\\u+041\"", "\"A\"" },
+        .{ "\"\\u 041\"", "\"A\"" },
+        .{ "\"\\u004\"", "\"A\"" },
+        .{ "\"\\u00\"", "\"\\u00\"x" },
+        .{ "\"\\q\"", "\"q\"" },
+        .{ "\"\\ud83d\"", "\"\\uD83D\"" }, // a lone high surrogate, spelled two ways
+        .{ "\"\\ude00\"", "\"\\uDE00\"" }, // a lone low one
+        .{ "\"\\ud83d\\u0041\"", "\"\\uD83D\\u0041\"" }, // a high surrogate then another escape
+        .{ "\"\\ud83dx\"", "\"\\uD83Dx\"" },
+        .{ "\"\\ude00\\ud83d\"", "\"\\uDE00\\uD83D\"" }, // the pair the wrong way round
+        // UTF-8 that is not valid matches only the same bytes: an overlong form, an encoded surrogate half, a code
+        // point past U+10FFFF, a cut sequence, a stray continuation byte.
+        .{ "\"\xc0\xaf\"", "\"/\"" },
+        .{ "\"\xe0\x80\xaf\"", "\"/\"" },
+        .{ "\"\xf0\x80\x80\xaf\"", "\"/\"" },
+        .{ "\"\xed\xa0\x80\"", "\"\\ud800\"" },
+        .{ "\"\xed\xb0\x80\"", "\"\\udc00\"" },
+        // The same encoded half on both sides, then the same text spelled two ways: still not valid.
+        .{ "\"\xed\xa0\x80\\u0041\"", "\"\xed\xa0\x80A\"" },
+        .{ "\"\xed\xb0\x80\\u0041\"", "\"\xed\xb0\x80A\"" },
+        .{ "\"\xf4\x90\x80\x80\"", "\"x\"" },
+        .{ "\"\xe2\x82\"", "\"\\u20ac\"" },
+        .{ "\"\xc3\"", "\"\\u00c3\"" },
+        .{ "\"\x80\"", "\"\\u0080\"" },
+        // Not strings.
+        .{ "1", "\"1\"" },
+        .{ "\"\\u0031\"", "1" },
+        .{ "true", "\"true\"" },
+        .{ "\"", "\"a\"" },
+        // A token whose inside is empty is not the empty string.
+        .{ "12", "\"\"" },
+        .{ "{}", "\"\"" },
+        .{ "[]", "\"\"" },
+        .{ "true", "\"ru\"" },
+    };
+    for (different) |pair| {
+        testing.expect(!sameString(pair[0], pair[1]) and !sameString(pair[1], pair[0])) catch |err| {
+            std.debug.print("expected different strings: {s} and {s}\n", .{ pair[0], pair[1] });
+            return err;
+        };
+    }
+    // The same bytes are the same string, whatever they hold.
+    try testing.expect(sameString("1", "1"));
+    try testing.expect(sameString("\"\\ud83d\"", "\"\\ud83d\""));
+    try testing.expect(sameString("\"\xed\xa0\x80\"", "\"\xed\xa0\x80\""));
 }
 
 test "walks an object's fields with their keys exactly as written" {

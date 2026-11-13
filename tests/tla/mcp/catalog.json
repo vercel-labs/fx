@@ -54,5 +54,9 @@
   {
     "module": "ExitReaper",
     "unit": "U03"
+  },
+  {
+    "module": "FieldRead",
+    "unit": "U01"
   }
 ]

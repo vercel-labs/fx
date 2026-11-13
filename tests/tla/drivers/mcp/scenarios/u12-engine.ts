@@ -698,4 +698,62 @@ export const scenarios: Scenario[] = [
     machines: { a: ["engine"] },
     control: { server: "a", maxAttempts: 3 },
   }),
+  // ---- a protocol field name written with escapes (finding N5, GN5) ----
+  // The reply lines are raw, so a field name carries a JSON escape: `is\u0045rror` is `isError` once decoded.
+  engineScenario({
+    name: "u12-escaped-iserror",
+    description: "A tool result the server marks with an escaped `isError` is reported as an error, as std.json reads it (CAT-08)",
+    servers: { a: { rules: modern({ method: "tools/call", times: 1, raw: '{"jsonrpc":"2.0","id":{id},"result":{"resultType":"complete","content":[{"type":"text","text":"boom"}],"is\\u0045rror":true}}' }) } },
+    script: ["call a echo", "expect a.called.1.result"],
+    machines: { a: BASE },
+    check: (lines) => {
+      const called = lines.find((l) => l.event?.tag === "a.called.1.result")?.event as { is_error?: boolean | null } | undefined;
+      return expectThat(called?.is_error === true, `the result the server marked isError was reported with is_error ${JSON.stringify(called?.is_error)}`);
+    },
+  }),
+  engineScenario({
+    name: "u12-escaped-resulttype",
+    description: "A result whose `resultType` name is written with an escape and says input_required asks the host, as std.json reads it (MRTR-01)",
+    servers: { a: { rules: modern({ method: "tools/call", times: 1, raw: `{"jsonrpc":"2.0","id":{id},"result":{"result\\u0054ype":"input_required","inputRequests":${JSON.stringify(askName)}}}` }) } },
+    labFlags: FORM,
+    script: ["call a ask", "expect a.input.1", 'respond 1 [{"action":"accept","content":{"name":"Ada"}}]', "expect a.called.1.result"],
+    machines: { a: [...BASE, "subscription", { mrtr: "x3" }] },
+    check: (_lines, logs) => {
+      const calls = received(logs.a, "tools/call");
+      return first(same(calls.length, 2, "tools/call requests"), same(calls[1]?.params?.inputResponses, { k: { action: "accept", content: { name: "Ada" } } }, "the second round's answers"));
+    },
+  }),
+  engineScenario({
+    name: "u12-escaped-requeststate",
+    description: "A `requestState` name written with an escape is echoed in the next round, as the server asked (MRTR-03)",
+    servers: { a: { rules: modern({ method: "tools/call", times: 1, raw: `{"jsonrpc":"2.0","id":{id},"result":{"resultType":"input_required","inputRequests":${JSON.stringify(askName)},"request\\u0053tate":"opaque"}}` }) } },
+    labFlags: FORM,
+    script: ["call a ask", "expect a.input.1", 'respond 1 [{"action":"accept","content":{"name":"Ada"}}]', "expect a.called.1.result"],
+    machines: { a: [...BASE, "subscription", { mrtr: "x3" }] },
+    check: (_lines, logs) => {
+      const calls = received(logs.a, "tools/call");
+      return first(same(calls.length, 2, "tools/call requests"), same(calls[1]?.params?.requestState, "opaque", "the second round's requestState"));
+    },
+  }),
+  engineScenario({
+    name: "u12-escaped-nextcursor",
+    description: "A tools/list page whose `nextCursor` name is written with an escape is followed to the next page, as std.json reads it (CAT-01)",
+    servers: {
+      a: {
+        rules: [
+          discover,
+          listen,
+          { method: "tools/list", cursor: null, raw: '{"jsonrpc":"2.0","id":{id},"result":{"resultType":"complete","tools":[{"name":"one","inputSchema":{"type":"object"}}],"ne\\u0078tCursor":"c2"}}' },
+          { method: "tools/list", cursor: "c2", result: { resultType: "complete", tools: [tool("two")] } },
+          ok("fine"),
+        ],
+      },
+    },
+    script: ["tools a", "expect a.tools.ok"],
+    machines: { a: BASE },
+    check: (lines) => {
+      const lists = lines.filter((l) => l.event?.tag === "a.tools.ok");
+      return same(lists[lists.length - 1]?.event?.names, ["one", "two"], "the tool names after the last list");
+    },
+  }),
 ];

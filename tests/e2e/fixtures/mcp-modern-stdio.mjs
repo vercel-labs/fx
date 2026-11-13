@@ -88,8 +88,19 @@ if (process.env.FX_MCP_ENV_NAMES_CAPTURE) {
 }
 if (stallRecovery) setInterval(() => {}, 1000);
 
+// FX_MCP_ESCAPE_KEYS=mode,url: write each of these keys with one \uXXXX escape (mode becomes m\u006fde) in every
+// message this server sends. The bytes still mean the same key to any JSON reader that decodes keys.
+const escapedKeys = (process.env.FX_MCP_ESCAPE_KEYS ?? "").split(",").filter(Boolean);
+function writeEscapedKeys(line) {
+  for (const key of escapedKeys) {
+    const escaped = `${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}`;
+    line = line.replaceAll(`"${key}":`, `"${escaped}":`);
+  }
+  return line;
+}
+
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  process.stdout.write(`${writeEscapedKeys(JSON.stringify(message))}\n`);
 }
 
 function sendCatalogResponse(message) {
