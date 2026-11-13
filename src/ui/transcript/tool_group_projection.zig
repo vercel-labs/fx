@@ -12,6 +12,7 @@ const code_highlight = @import("../../core/agent/presentation/code_highlight.zig
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ascii_case = @import("../../core/shared/ascii_case.zig");
+const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -673,9 +674,9 @@ const JsonField = union(enum) { string: []const u8, integer: i64, other };
 
 /// The value of `key` among the top-level fields of the JSON object `json`,
 /// or, when it has a "request" field, among that object's fields only: a
-/// call can wrap its fields in {"request": {...}}, and core then reads
-/// nothing outside it, and nothing at all when "request" is not an object
-/// (src/core/tooling/tool_presentation.zig). It reads the top-level field
+/// call can wrap its fields in {"request": {...}}, or send that object as
+/// JSON text, and core then reads nothing outside it, and nothing at all when
+/// "request" is neither (`unwrapRequest` in src/core/tooling/tool_args.zig). It reads the top-level field
 /// names to the end of the object, because a "request" field can come after
 /// the key, and it skips each value by jumping from quote to quote. It
 /// decodes only the key's own value, so a write_file call that holds a whole
@@ -710,8 +711,12 @@ fn objectField(scratch: std.mem.Allocator, json: []const u8, start: usize, key: 
         index = skipJsonSpace(json, index + 1);
         if (index >= json.len) return error.SyntaxError;
         if (top and std.mem.eql(u8, name, "request")) {
-            if (json[index] != '{') return null;
-            return objectField(scratch, json, index + 1, key, false);
+            if (json[index] == '{') return objectField(scratch, json, index + 1, key, false);
+            if (json[index] != '"') return null;
+            return switch (try fieldValue(scratch, json, index)) {
+                .string => |text| try requestTextField(scratch, text, key),
+                else => null,
+            };
         }
         if (top_match == null and std.mem.eql(u8, name, key)) {
             top_match = try fieldValue(scratch, json, index);
@@ -723,6 +728,21 @@ fn objectField(scratch: std.mem.Allocator, json: []const u8, start: usize, key: 
         if (index < json.len and json[index] == ',') index = skipJsonSpace(json, index + 1);
     }
     return top_match;
+}
+
+/// The value of `key` in a "request" that a model sent as JSON text, read as
+/// core reads it (`normalizeCompositeObjectValue` in
+/// src/core/tooling/tool_args.zig): text that nests too deep, is not valid
+/// JSON, or is not one object gives no fields.
+fn requestTextField(scratch: std.mem.Allocator, text: []const u8, key: []const u8) std.mem.Allocator.Error!?JsonField {
+    if (json_depth.exceeds(text)) return null;
+    if (!try std.json.validate(scratch, text)) return null;
+    const open = skipJsonSpace(text, 0);
+    if (open >= text.len or text[open] != '{') return null;
+    return objectField(scratch, text, open + 1, key, false) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 fn fieldValue(scratch: std.mem.Allocator, json: []const u8, start: usize) !JsonField {
@@ -6103,6 +6123,11 @@ test "story fields come from a JSON scan that skips values it does not need" {
     try std.testing.expect(jsonField(arena, "{\"request\":{\"action\":\"wait\"},\"agent\":\"top\"}", "agent") == null);
     try std.testing.expect(jsonField(arena, "{\"agent\":\"top\",\"request\":\"text\"}", "agent") == null);
     try std.testing.expectEqualStrings("top", jsonField(arena, "{\"agent\":\"top\",\"note\":\"a request\"}", "agent").?.string);
+    // A "request" sent as JSON text counts only when it is one valid object.
+    try std.testing.expectEqualStrings("inner", jsonField(arena, "{\"agent\":\"top\",\"request\":\"{\\\"agent\\\":\\\"inner\\\"}\"}", "agent").?.string);
+    try std.testing.expect(jsonField(arena, "{\"agent\":\"top\",\"request\":\"[1]\"}", "agent") == null);
+    try std.testing.expect(jsonField(arena, "{\"request\":\"{\\\"agent\\\":\"}", "agent") == null);
+    try std.testing.expect(jsonField(arena, "{\"request\":7}", "agent") == null);
     try std.testing.expect(jsonField(arena, "[1,2]", "path") == null);
     try std.testing.expect(jsonField(arena, "not json", "path") == null);
     try std.testing.expect(jsonField(arena, "{\"line_count\":1.5}", "line_count").? == .other);
