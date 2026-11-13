@@ -24,7 +24,7 @@ pub const script =
     \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
     \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
-    \\    *'"method":"tools/call"'*slow*) printf '%s\n' "$id" >> "$0.slow" ;;
+    \\    *'"method":"tools/call"'*slow*) printf x >> "$0.slow" ;;
     \\    *'"method":"tools/call"'*withdraw*)
     \\      call=$id
     \\      printf '{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"mode":"form","message":"Q1","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}\n'
@@ -72,15 +72,15 @@ pub const Fixture = struct {
     }
 
     /// How many calls that mention "slow" the servers have received, which a test waits for
-    /// before it acts on a call that is out.
+    /// before it acts on a call that is out. Each call appends one byte to the file, so its
+    /// size is the count, and the file is never read while a server still writes it.
     pub fn slowCalls(f: *const Fixture) usize {
         const path = testing.allocator.print("{s}.slow", .{f.server}) catch return 0;
         defer testing.allocator.free(path);
         var file = std.Io.Dir.openFileAbsolute(testing.io, path, .{}) catch return 0;
         defer file.close(testing.io);
-        const noted = io_mod.readFileToEnd(testing.allocator, &file, 4096) catch return 0;
-        defer testing.allocator.free(noted);
-        return std.mem.count(u8, noted, "\n");
+        const stat = file.stat(testing.io) catch return 0;
+        return @intCast(stat.size);
     }
 
     pub fn options(f: *const Fixture) Options {
