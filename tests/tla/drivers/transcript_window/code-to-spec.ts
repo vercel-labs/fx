@@ -55,7 +55,7 @@ export class Recorder {
     this.painted = [...new Set([...base, ...paintedBy(shown.out)])].sort((a, b) => a - b);
     this.states.push({
       cycle: s.cycle, cycleFirst: s.cycleFirst, prevFirst: s.prevFirst === -1 ? this.none : s.prevFirst,
-      nextSeq: s.nextSeq, savedThrough: s.savedThrough, live: shown.live, turnOpen: s.turnOpen,
+      nextSeq: s.nextSeq, savedThrough: s.savedThrough, live: shown.live, turnOpen: s.turnOpen, prevWaits: s.prevWaits,
       paintedThrough: s.paintedThrough, reprinting: s.reprinting, coOpen: s.coOpen, coLo: s.coLo, coHi: s.coHi,
       coAtStart: s.coAtStart, pending: s.pending, pendingDir: s.pendingDir, nextToken: s.nextToken,
       out: shown.out, act, alive: true, cycleStarts: [...this.cycleStarts], painted: [...this.painted],
