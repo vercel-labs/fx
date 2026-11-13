@@ -58,6 +58,21 @@
 # SteerQueueTrace.tla checks runs of the built fx binary against the model;
 # tests/tla/drivers/subagent/driver.ts runs it.
 #
+# The QuietRelay configs:
+#
+# QuietRelay models fx's note to a parent when its subagent's shell command
+# crosses the quiet limit (noteChildQuiet in tool_host.zig, raised by
+# agent_adapter.zig and app_worker_runtime.zig), and the parent's wait that
+# the note wakes. quiet-relay.cfg and quiet-relay-deep.cfg are the design and
+# must pass. Each quiet-relay-mutation-*.cfg plants one defect, and the rule it
+# names must catch it:
+#
+#   relay-late-notice  a later notice in the same spell is relayed     OnePerSpell
+#   relay-after-close  a note for a closed subagent is posted          NoRelayAfterClose
+#   silent-drop        a note the full mailbox refuses is not logged   EveryCrossingAccounted
+#   no-cap             a note is posted past the mailbox bound         MailboxBounded
+#   check-first        the wait checks the mailbox before it registers NoSleepOnMail
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
@@ -130,4 +145,11 @@ MainMail main-mail-today-acp WaitHonest
 MainMail main-mail-mutation-wait-always-follows WaitHonest
 MainMail main-mail-mutation-lost-at-finish NoneLost
 MainMail main-mail-mutation-close-with-mail JoinsOpenTurn
+QuietRelay quiet-relay -
+QuietRelay quiet-relay-deep -
+QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell
+QuietRelay quiet-relay-mutation-relay-after-close NoRelayAfterClose
+QuietRelay quiet-relay-mutation-silent-drop EveryCrossingAccounted
+QuietRelay quiet-relay-mutation-no-cap MailboxBounded
+QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
 VERDICTS

@@ -224,7 +224,12 @@ fn parseQuestionBatch(
         if (question_trimmed.len == 0) return error.EmptyQuestionText;
         const question_safe = try dupeQuestionMarkdown(arena, question_trimmed);
 
-        const options_value = q_item.object.get("options") orelse return error.MissingOptions;
+        var options_value = q_item.object.get("options") orelse return error.MissingOptions;
+        // The options array can come as JSON text too, like questions.
+        tool_args.normalizeCompositeArrayValue(arena, &options_value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.OptionsNotArray,
+        };
         if (options_value != .array) return error.OptionsNotArray;
 
         const options_arr = options_value.array;
@@ -591,6 +596,54 @@ test "ask_user_question accepts the questions array sent as JSON text" {
     try expectRequesterOutput("{\"questions\":\"{}\"}", "(ask_user_question: \"questions\" must be an array)");
 }
 
+fn questionWithOptionsText(alloc: Allocator, options_text: []const u8) ![]u8 {
+    return std.json.Stringify.valueAlloc(alloc, .{ .questions = .{.{ .question = "Choose?", .options = options_text }} }, .{});
+}
+
+test "ask_user_question accepts each question's options sent as JSON text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const options_text = "[{\"label\":\" Yes \"},{\"label\":\"No\"}]";
+
+    var fake = FakeRequester{};
+    const output = try executeWithRequester(alloc, try questionWithOptionsText(arena, options_text), .{
+        .ctx = &fake,
+        .response_alloc = alloc,
+        .request = FakeRequester.request,
+    });
+    defer alloc.free(output);
+    try std.testing.expect(fake.called);
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+
+    // Both levels can be text.
+    const batch_text = try std.json.Stringify.valueAlloc(arena, .{.{ .question = "Choose?", .options = options_text }}, .{});
+    var nested_fake = FakeRequester{};
+    const nested = try executeWithRequester(alloc, try std.json.Stringify.valueAlloc(arena, .{ .questions = batch_text }, .{}), .{
+        .ctx = &nested_fake,
+        .response_alloc = alloc,
+        .request = FakeRequester.request,
+    });
+    defer alloc.free(nested);
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", nested);
+
+    // Text that is not one array is refused as a value of the wrong type is,
+    // including an array encoded twice and text nested deeper than tool input
+    // may be.
+    const not_array = "(ask_user_question: question 1: \"options\" must be an array)";
+    const deep = text_utils.repeat("[", 300) ++ text_utils.repeat("]", 300);
+    for ([_][]const u8{ "not json", "{}", "2", "null", "", "\"[{\\\"label\\\":\\\"A\\\"},{\\\"label\\\":\\\"B\\\"}]\"", deep }) |text| {
+        try expectRequesterOutput(try questionWithOptionsText(arena, text), not_array);
+    }
+    // The rules for the options themselves apply as they do to an array.
+    try expectRequesterOutput(try questionWithOptionsText(arena, "[]"), "(ask_user_question: question 1: provide 2 to 6 options)");
+    try expectRequesterOutput(
+        try questionWithOptionsText(arena, "[{\"label\":\"A\"},{\"label\":2}]"),
+        "(ask_user_question: question 1, option 2: \"label\" must be a string)",
+    );
+}
+
 const max_fuzz_questions_text_bytes: usize = 16 * 1024;
 
 fn fuzzQuestionsText(_: void, smith: *std.testing.Smith) !void {
@@ -608,6 +661,17 @@ fn fuzzQuestionsText(_: void, smith: *std.testing.Smith) !void {
     var position: ParsePosition = .{};
     if (parseQuestionBatch(arena, args_json, &position)) |entries| {
         try std.testing.expect(entries.len >= 1 and entries.len <= question_answer.max_questions);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    }
+
+    // The same bytes as one question's options text.
+    const options_json = try questionWithOptionsText(arena, text);
+    position = .{};
+    if (parseQuestionBatch(arena, options_json, &position)) |entries| {
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expect(entries[0].options.len >= 2 and entries[0].options.len <= 6);
     } else |err| switch (err) {
         error.OutOfMemory => return err,
         else => {},
