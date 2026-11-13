@@ -8359,6 +8359,37 @@ fn questionWaitEnds(runtime: *WorkerRuntime) bool {
     return false;
 }
 
+/// Whether `runtime` stops waiting on a permission request, polled for a
+/// bounded time so a wait that does not end fails its test instead of hanging it.
+fn permissionWaitEnds(runtime: *WorkerRuntime) bool {
+    for (0..500) |_| {
+        runtime.worker_mutex.lockUncancelable(io_mod.getIo());
+        const waiting = runtime.pending_permission_waiting;
+        runtime.worker_mutex.unlock(io_mod.getIo());
+        if (!waiting) return true;
+        io_mod.sleep(1 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+fn runPermissionRequestWithReview(
+    state: *PermissionThreadState,
+    runtime: *WorkerRuntime,
+    label: []const u8,
+    review: *const diff_mod.FileReview,
+) void {
+    var response = runtime.requestPermissionBlockingWithReview(
+        std.testing.allocator,
+        .{ .label = label },
+        review,
+    ) catch |err| {
+        state.err = err;
+        return;
+    };
+    defer response.deinit();
+    state.decision = response.decision;
+}
+
 fn runMcpElicitationRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
     state.answers = runtime.requestMcpElicitationAnswerBlocking(std.testing.allocator, entries) catch |err| {
         state.err = err;
@@ -8402,22 +8433,31 @@ test "cancelling a turn declines the permission request it waits on" {
     const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
     _ = try waitForPermissionLabel(&runtime, "Allow?");
     runtime.requestTurnCancel();
-    var ended = false;
-    for (0..500) |_| {
-        runtime.worker_mutex.lockUncancelable(io_mod.getIo());
-        const waiting = runtime.pending_permission_waiting;
-        runtime.worker_mutex.unlock(io_mod.getIo());
-        if (!waiting) {
-            ended = true;
-            break;
-        }
-        io_mod.sleep(1 * std.time.ns_per_ms);
-    }
+    const ended = permissionWaitEnds(&runtime);
     // A request that stayed open is released, so the test fails instead of hanging.
     if (!ended) runtime.requestStop();
     thread.join();
     try std.testing.expect(ended);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
+}
+
+test "cancelling a turn declines a permission request that waits on a file review" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var review = try diff_mod.FileReview.init(alloc, "", "line 1\n");
+    defer review.deinit(alloc);
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequestWithReview, .{ &state, &runtime, "file_mutation", &review });
+    _ = try waitForPermissionLabel(&runtime, "file_mutation");
+    runtime.requestTurnCancel();
+    const ended = permissionWaitEnds(&runtime);
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
+    try std.testing.expect(runtime.pending_permission_review == null);
 }
 
 test "question resume observer runs only for accepted answers before releasing the worker" {
