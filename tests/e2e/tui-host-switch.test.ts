@@ -751,6 +751,53 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Main starts subagent `worker` under the never rule, so its completed work
+  // owes no report, and calls wait. The settle hold
+  // (src/core/subagent/end_test_controls.zig) stops fx after it has told main
+  // of the work's end and before it clears the subagent's busy flag. Main's
+  // wait starts in that gap, and fx lets the end go once its trace shows the
+  // wait began. The wait has to come back and main has to finish its turn.
+  test(
+    "a wait that starts as a subagent's work ends with nothing to report still returns",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-wait-gap-")));
+      const settleHeld = join(dir, "settle-held");
+      const settleRelease = join(dir, "settle-release");
+      const tracePath = join(dir, "fx-trace.log");
+      let waitResult = "";
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) return text("child_answer", "WAITGAP_CHILD_DONE");
+          if (body.includes('"main_wait"')) {
+            waitResult ||= toolResultText(body, "main_wait");
+            return text("main_done", "WAITGAP_MAIN_DONE");
+          }
+          if (body.includes('"main_sub"')) {
+            // The subagent's work has ended, and fx is held before it settles it.
+            await until("the held end", () => existsSync(`${settleHeld}.1`), 30_000);
+            void until("the wait to begin", () => traceHas(tracePath, "event=wait_begin"), 30_000).then(() => writeFileSync(settleRelease, ""));
+            return toolCall("main_wait", "subagent", { request: { action: "wait" } });
+          }
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "WAITGAP_TASK", report: "never" },
+          });
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("WAITGAP_MAIN_DONE", 30_000);
+          expect(waitResult).toContain("ended without a report");
+        }, () => {}, false, {
+          FX_TRACE_LOG: tracePath,
+          FX_TEST_SUBAGENT_SETTLE_HELD: settleHeld,
+          FX_TEST_SUBAGENT_SETTLE_RELEASE: settleRelease,
+        });
+      } finally {
+        writeFileSync(settleRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   // Main starts subagent `worker`, whose first turn the start hold
   // (src/core/subagent/start_test_controls.zig) stops before its worker
   // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
