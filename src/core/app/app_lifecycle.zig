@@ -416,7 +416,7 @@ pub const ModelOrigin = enum {
         };
     }
 
-    fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
+    pub fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
         if (env_model != null) return .env;
         return if (settings.models.get(provider) != null) .settings else .default;
     }

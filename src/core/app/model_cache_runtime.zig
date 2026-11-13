@@ -388,6 +388,18 @@ fn modelMenuDisplayIndex(
     return modelMenuRanking(items, provider_filter, query).rankOf(position);
 }
 
+const TokenPassDefault = enum {
+    /// fx has not asked whether this team has Token Pass.
+    unchecked,
+    /// A quiet credits lookup is asking.
+    checking,
+    /// The team has Token Pass; fx moves to its default model once the main
+    /// agent is idle.
+    pending,
+    /// Nothing more to do for this credential.
+    settled,
+};
+
 /// Matches a model on its full id, provider prefix included, so one query
 /// can name both the provider and the model, and on the model's own name
 /// after the last `/`, so typing that name exactly lists it first:
@@ -497,6 +509,12 @@ pub const Runtime = struct {
     /// both belong to one credential and team. Main thread only, so the
     /// mutex does not guard it.
     token_pass: token_pass_mod.Tracker = .{},
+    /// How far fx got moving a user with no chosen model to the Token Pass
+    /// default for this credential. Resets with `token_pass`.
+    token_pass_default: TokenPassDefault = .unchecked,
+    /// Counts credential changes, so a credits reply that started for an
+    /// earlier credential does not speak for this one.
+    token_pass_epoch: u32 = 0,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -695,6 +713,8 @@ pub const Runtime = struct {
             debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
         }
         self.token_pass = .{};
+        self.token_pass_default = .unchecked;
+        self.token_pass_epoch +%= 1;
     }
 
     /// Records the provider that served one of this credential's requests.
