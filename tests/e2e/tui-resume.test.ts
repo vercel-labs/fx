@@ -21,6 +21,7 @@ import { basename, join } from "node:path";
 import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks } from "./tui-render-assertions";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySerializedToolCall,
@@ -4765,12 +4766,14 @@ test.skipIf(!tmuxAvailable())(
       });
       await contender.sendLiteralText("/");
       await contender.sendLiteralText("/");
+      // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+      // the pane dead many seconds later.
       await waitForCondition(
-        () => contender?.paneStatus().dead === true,
+        () => contender!.recordedExitStatus() !== null,
         "contended resume to exit",
       );
 
-      expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
+      expect(contender.recordedExitStatus()).toBe(1);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
         "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
@@ -5529,6 +5532,133 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resuming from the picker keeps a transcript whose newest compaction followed its last turn",
+  async () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "fx-tui-resume-picker-compacted-")),
+    );
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    // Taller than the window, so the resume leaves the start of the answer in
+    // terminal history and its end on screen.
+    const rows = Array.from(
+      { length: 60 },
+      (_, index) => `PICKER_COMPACTED_ROW_${String(index + 1).padStart(2, "0")}`,
+    );
+    const tail = "PICKER_COMPACTED_TAIL";
+    const summary =
+      "Facts:\nF1: PICKER_COMPACTED_SUMMARY: the user asked for a long answer.";
+    // Two short turns give /compact older turns to summarize.
+    const shortAnswers = ["PICKER_COMPACTED_FIRST", "PICKER_COMPACTED_SECOND"];
+    let turns = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      // The compactor asks for its summary with no tools.
+      const request = JSON.parse(body) as {
+        toolChoice?: { type?: string };
+        tools?: unknown[];
+      };
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        return fakeGatewayFinalText(summary);
+      }
+      turns += 1;
+      return fakeGatewayFinalText(
+        shortAnswers[turns - 1] ?? `${rows.join("\n\n")}\n\n${tail}`,
+      );
+    });
+    let active: TmuxSession | null = null;
+    let passed = false;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      for (const [index, answer] of shortAnswers.entries()) {
+        await active.sendText(`Give short answer ${index + 1}.`);
+        await active.waitForText(answer, TIMEOUT);
+        await active.waitForComposer(TIMEOUT);
+      }
+      await active.sendText("Write a long answer before the compaction.");
+      await active.waitForText(tail, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const sessionId = sessionIdFromHome(home);
+      // With no turn after the compaction, a resume shows the cycle before
+      // it, and the transcript window lets those entries go as they scroll
+      // off.
+      await active.sendText("/compact");
+      await waitForCondition(
+        () => logLines(home, sessionId).some((line: any) => line.kind === "compacted"),
+        "the saved compaction",
+      );
+      await active.waitForPane(
+        (pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane),
+        TIMEOUT,
+      );
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} -r`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForPane(
+        (pane) => pane.includes("Sessions 1") && pane.includes("enter resume"),
+        TIMEOUT,
+      );
+      await active.sendKeys("Enter");
+      await waitForSessionPickerClosed(active);
+      // A typed character draws a later frame than the resume's own, so the
+      // pane below shows what the resume left on screen.
+      await active.sendLiteral("x");
+      const pane = stripAnsi(
+        await active.waitForPane((value) => composerContains(stripAnsi(value), "x"), TIMEOUT),
+      );
+      expect(pane).toContain(rows.at(-1)!);
+      expect(pane).toContain(tail);
+      const scrollback = stripAnsi(await active.captureFullScrollback());
+      for (const row of [...rows, tail]) {
+        expect(countOccurrences(scrollback, row)).toBe(1);
+      }
+      expect(sessionIdFromHome(home)).toBe(sessionId);
+      await active.sendKeys("BSpace");
+      await active.waitForPane((value) => hasEmptyComposer(stripAnsi(value)), TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      if (passed) {
+        rmSync(root, { recursive: true, force: true });
+      } else {
+        console.error(`retained picker compaction artifacts at ${root}`);
+      }
+    }
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -8669,13 +8799,18 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     expect(tui.paneStatus().status).toBe(0);
     await tui.kill();
   }
+  // fx's exit status once it exits by itself. The pane's wrapper records it as
+  // fx exits; tmux can mark the pane dead many seconds later.
+  async function exitStatus(tui: TmuxSession, timeout = TIMEOUT) {
+    await tui.waitForPane(() => tui.recordedExitStatus() !== null, timeout);
+    return tui.recordedExitStatus();
+  }
   try {
     const a = await runFx(["ask", "--json", "Remember conversation A."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(a.code).toBe(0);
     const aId = JSON.parse(a.stdout).session_id;
     active = await open(["-c"], "missing");
-    await active.waitForPane(() => active!.paneStatus().dead, TIMEOUT);
-    expect(active.paneStatus().status).toBe(1);
+    expect(await exitStatus(active)).toBe(1);
     expect(readFileSync(join(root, "missing.stderr"), "utf8")).toContain("no remembered session");
     await active.kill(); active = null;
     active = await open(["--resume", aId], "select-a");
@@ -8709,8 +8844,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     expect(trace).not.toContain("mode=workspace_writable_last");
     expect(trace).not.toContain("session picker catalog loaded");
     other = await open(["--continue"], "busy");
-    await other.waitForPane(() => other!.paneStatus().dead, TIMEOUT);
-    expect(other.paneStatus().status).toBe(1);
+    expect(await exitStatus(other)).toBe(1);
     expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another fx process");
     await other.kill(); other = null;
     await active.sendText("/resume");
@@ -8737,8 +8871,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     const fifo = Bun.spawnSync(["mkfifo", bookmark]);
     expect(fifo.exitCode).toBe(0);
     active = await open(["-c"], "invalid-bookmark", unread);
-    await active.waitForPane(() => active!.paneStatus().dead, 3000);
-    expect(active.paneStatus().status).toBe(1);
+    expect(await exitStatus(active, 3000)).toBe(1);
     expect(readFileSync(join(root, "invalid-bookmark.stderr"), "utf8")).toContain("remembered session ID could not be read");
     await active.kill(); active = null;
     passed = true;

@@ -81,6 +81,7 @@ type RootOptions = {
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "tool_protocol_error"
     | "invalid_params"
     | "image_result"
     | "response_missing_jsonrpc"
@@ -112,6 +113,8 @@ type RootOptions = {
     | "typed_arguments";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
+  /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
+  failureText?: string;
   operationTimeoutMs?: number;
   restartLimit?: number;
   recoveredToolName?: string;
@@ -185,6 +188,10 @@ function createRoot(
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
+            // JSON, so the text can hold bytes an environment variable cannot.
+            FX_MCP_FAILURE_TEXT: options.failureText === undefined
+              ? undefined
+              : JSON.stringify(options.failureText),
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
             FX_MCP_INVALIDATION_RELEASE_PATH: invalidationReleasePath,
@@ -4204,6 +4211,42 @@ describe("fx mcp call", () => {
     expect(seen).toContain("returned an error");
     expect(seen).toContain("Invalid input: labels require at least one item");
     expect(seen).toContain("out=0");
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a tool error's text with control bytes shows as visible escapes, and its plain lines stay as they are", async () => {
+    // The text is the server's own: a window title, a bell, a clear screen,
+    // a C1 control sequence introducer, DEL, a carriage return that would
+    // overwrite the line, and plain lines around them. (fx drops a text with
+    // NUL in it before the command sees it, so NUL has no case here.)
+    const failureText = "Invalid input: labels require at least one item\nretry rejected\n" +
+      "\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rgood\r\nlast";
+    const root = bridgeRoot("bridge-tool-error-bytes", {}, { mode: "tool_failure", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=6");
+    expect(seen).toContain(
+      `fx mcp call: ${TOOL_NAME} returned an error:\n` +
+        "Invalid input: labels require at least one item\nretry rejected\n" +
+        "\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dgood\nlast\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a protocol error's message with control bytes shows as visible escapes, and the call exits 1", async () => {
+    // The message is the server's own, in a JSON-RPC error that answers
+    // tools/call: a window title, a bell, a clear screen, a C1 control
+    // sequence introducer, DEL, a carriage return that would overwrite the
+    // line, and plain text around them.
+    const failureText = "bad\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rafter\r\nlast line";
+    const root = bridgeRoot("bridge-protocol-error-bytes", {}, { mode: "tool_protocol_error", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain(
+      "fx mcp call: MCP protocol error -32000: " +
+        "bad\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dafter\nlast line\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
     expect(toolCalls(root)).toHaveLength(1);
   }, 90_000);
 

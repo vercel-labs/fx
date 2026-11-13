@@ -733,7 +733,9 @@ fn completeSignIn(
     var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
-    const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
+    // The new login starts on the person's team, so the team picker selects
+    // it and closing the picker keeps it.
+    const session = try take_login_session(alloc, issuer_url, client_id, token, savedLoginTeam(alloc, teams.items), now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
@@ -783,7 +785,8 @@ pub fn runLogin(
 
     var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
-    const selected_team_index = try selectTeam(alloc, teams.items, null);
+    const saved_team = savedLoginTeam(alloc, teams.items);
+    const selected_team_index = try selectTeam(alloc, teams.items, if (saved_team) |team| team.id else null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
 
     const now_ms = io_mod.milliTimestamp();
@@ -801,6 +804,51 @@ pub fn runLogin(
         debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
         return signInPersistenceError(err);
     };
+}
+
+/// The team a new fx login starts on, so signing in again keeps the person's
+/// team instead of the first team of the list: the saved login's team, else
+/// the team fx kept when it retired the last login (`oauth_session.loadKeptTeam`),
+/// when the new account's list has it. Null means the first team; the trace
+/// says why, without naming the team.
+fn savedLoginTeam(alloc: Allocator, teams: []const Team) ?*const Team {
+    if (teams.len == 0) return null;
+    var saved = oauth_session.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "saved login not read for the team choice err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (saved) |*session| session.deinit(alloc);
+    if (saved) |session| {
+        if (session.team_id != null or session.team_slug != null) {
+            return startingTeam(teams, session.team_id, session.team_slug, "saved_login");
+        }
+    }
+    var kept = oauth_session.loadKeptTeam(alloc) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=no_known_team", .{});
+        return null;
+    };
+    defer kept.deinit(alloc);
+    return startingTeam(teams, kept.id, kept.slug, "kept_team");
+}
+
+fn startingTeam(teams: []const Team, id: ?[]const u8, slug: ?[]const u8, comptime source: []const u8) ?*const Team {
+    const team = teamIn(teams, id, slug) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=" ++ source ++ "_not_in_list", .{});
+        return null;
+    };
+    debug_trace.logf("auth", "sign-in starts on a known team source=" ++ source, .{});
+    return team;
+}
+
+/// The team in `teams` with the id `id`, else with the slug `slug`.
+fn teamIn(teams: []const Team, id: ?[]const u8, slug: ?[]const u8) ?*const Team {
+    if (id) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.id, value)) return team;
+    };
+    if (slug) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.slug, value)) return team;
+    };
+    return null;
 }
 
 fn take_login_session(
@@ -940,9 +988,16 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
                 break :load null;
             },
         };
-        break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
+        const deleted = mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
         };
+        // Signing out forgets the team fx kept for the next sign-in.
+        if (mutation.forgetTeam()) |forgotten| {
+            if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=logout", .{});
+        } else |err| {
+            debug_trace.logf("auth", "kept team not forgotten err={s}", .{@errorName(err)});
+        }
+        break :blk deleted;
     };
     return .{
         .result = .{
@@ -1341,9 +1396,10 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     if (teams.len == 0) return null;
     if (teams.len == 1) return 0;
 
-    const default_index = defaultTeamIndex(teams, current);
+    const current_index = currentTeamIndex(teams, current);
+    const default_index = current_index orelse 0;
     const index = if (canUseInteractiveTeamPicker())
-        selectTeamInteractive(alloc, teams, default_index) catch |err| switch (err) {
+        selectTeamInteractive(alloc, teams, default_index, current_index) catch |err| switch (err) {
             error.NotATerminal => try selectTeamByLine(alloc, teams, default_index),
             else => return err,
         }
@@ -1352,12 +1408,12 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     return index;
 }
 
-fn defaultTeamIndex(teams: []const Team, current: ?[]const u8) usize {
-    const needle = current orelse return 0;
+fn currentTeamIndex(teams: []const Team, current: ?[]const u8) ?usize {
+    const needle = current orelse return null;
     for (teams, 0..) |team, i| {
         if (std.mem.eql(u8, team.id, needle) or std.mem.eql(u8, team.slug, needle)) return i;
     }
-    return 0;
+    return null;
 }
 
 fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
@@ -1383,7 +1439,9 @@ fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize)
     }
 }
 
-fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
+/// `current_index` is the team the login already uses, labeled "(current)";
+/// null when it has none in `teams`.
+fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize, current_index: ?usize) !usize {
     var raw = try TeamPickerRawMode.enable();
     defer raw.disable();
 
@@ -1392,17 +1450,17 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
     var selected = default_index;
     var first_render = true;
-    try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+    try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
 
     while (true) {
         switch (try readTeamPickerKey()) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .down => {
                 selected = if (selected + 1 == teams.len) 0 else selected + 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .enter => return selected,
             .cancel => return LoginError.InvalidTeamSelection,
@@ -1423,7 +1481,7 @@ fn renderTeamPicker(
     alloc: Allocator,
     teams: []const Team,
     selected: usize,
-    default_index: usize,
+    current_index: ?usize,
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
@@ -1434,7 +1492,7 @@ fn renderTeamPicker(
 
     for (teams, 0..) |team, i| {
         const prefix = if (i == selected) "  › " else "    ";
-        const marker = if (i == default_index) " (current)" else "";
+        const marker = if (current_index == i) " (current)" else "";
         try writeStdoutFmt("\x1b[2K{s}{d}. {s} ({s}){s}\n", .{ prefix, i + 1, team.name, team.slug, marker });
     }
     first_render.* = false;

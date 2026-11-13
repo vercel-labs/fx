@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
+import { bearer, rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
@@ -725,6 +726,87 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       }
       await terminal?.kill();
       gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("manual: a summary the gateway rejects for a login another fx renewed is sent again with the renewed login", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compact-renewed-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+    writeFxLogin(home, issuer.issuerUrl, "launch-token");
+    const summaryTokens: string[] = [];
+    // Older turns outside the kept suffix, so /compact has work to do.
+    const seedTurns = 3;
+    let seeded = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        // The gateway records each request before it answers.
+        const token = bearer(gateway.requests.at(-1)!.headers);
+        summaryTokens.push(token);
+        if (token === "launch-token") {
+          // Another fx renewed the shared login after /compact read it.
+          rotateFxLogin(home, "rotated-token");
+          return Response.json({ error: { message: "token expired" } }, { status: 401 });
+        }
+        return fakeGatewayFinalText(HANDOFF);
+      }
+      if (seeded < seedTurns) {
+        const seedRead = `seed-read-${seeded + 1}`;
+        if (!raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
+        seeded++;
+        const head = seeded === 1 ? HEAD : `HISTORY_MIDDLE_${seeded}`;
+        return fakeGatewayFinalText(`${head}\n${"history alpha beta gamma delta sample line\n".repeat(400)}SEED_DONE_${seeded}${seeded === seedTurns ? `\n${TAIL}` : ""}`);
+      }
+      return fakeGatewayFinalText(FOLLOWUP);
+    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: binary,
+        cwd: workspace,
+        isolated: true,
+        env: {
+          HOME: home, TMPDIR: root, FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl, FX_OAUTH_CLIENT_ID: "test-client", FX_NO_OPEN_BROWSER: "1",
+        },
+      });
+      await terminal.waitForStableComposer(20_000);
+      for (let turn = 1; turn <= seedTurns; turn++) {
+        await terminal.sendText(`Read the seed notes, part ${turn}.`);
+        await terminal.waitForPane((pane) => pane.includes(`SEED_DONE_${turn}`) && hasEmptyComposer(pane), 20_000);
+      }
+      await terminal.sendText("/compact");
+      await until(() => summaryTokens.length >= 2, "the renewed summary request");
+      await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 15_000);
+      // One refused summary request, then every request with the renewed login.
+      expect(summaryTokens[0]).toBe("launch-token");
+      expect(summaryTokens.slice(1).length).toBeGreaterThan(0);
+      expect(summaryTokens.slice(1).every((token) => token === "rotated-token")).toBe(true);
+      expect(issuer.refreshes).toHaveLength(0);
+      expect(await terminal.capturePane()).not.toContain("Compaction failed");
+      // The next request carries the compacted context.
+      await terminal.sendText("Follow the latest request.");
+      await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 15_000);
+      expect(gateway.requests.at(-1)!.body).toContain("INTERNAL_HANDOFF_4e12");
+      passed = true;
+    } finally {
+      await terminal?.kill();
+      gateway.stop();
+      issuer.stop();
       if (passed) rmSync(root, { recursive: true, force: true });
     }
   }, 90_000);

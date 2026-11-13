@@ -910,7 +910,9 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
 
     // The interactive app says what to do.
     const resumed = await startApp(fixture, gateway, ["--resume", id], false);
-    expect(await resumed.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    // The pane's wrapper records fx's exit status as fx exits; tmux can end
+    // the session many seconds later.
+    await until(() => resumed.session.recordedExitStatus() !== null, "the app to exit");
     await resumed.session.kill();
     expect(readFileSync(resumed.stderrPath, "utf8")).toBe(
       "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n",
@@ -3443,6 +3445,14 @@ function savedModel(fixture: Fixture, id: string): string {
   return (prefs.at(-1) as any).value.model;
 }
 
+/// How long ago a session list says a session changed.
+const AGE_TEXT = /^(just now|\d+[mhd] ago)$/;
+
+/// The cells of one row of a session list's text, which two or more spaces separate.
+function tableCells(line: string): string[] {
+  return line === "" ? [] : line.split(/ {2,}/);
+}
+
 /// The logs of the sessions `ids`, to show a read wrote nothing.
 function logBytesOf(fixture: Fixture, ids: string[]) {
   return ids.map((id) => readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")));
@@ -3477,7 +3487,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const none = await command(fixture, gateway, ["sessions", "--live"]);
     expect(none.code).toBe(0);
     expect(none.stderr).toBe("");
-    expect(none.stdout).toBe("[sessions] no live sessions\n");
+    expect(none.stdout).toBe("No live sessions in this workspace.\n");
 
     holders.push(spawnAsk(fixture, gateway, ["Hold the live turn."]));
     await until(() => mainHeld, "the held turn");
@@ -3515,17 +3525,29 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const text = await command(fixture, gateway, ["sessions", "--live", "--all"]);
     expect(text.code).toBe(0);
     expect(text.stderr).toBe("");
-    expect(text.stdout.replace(/updated [^\n]+/g, "updated <time>")).toBe([
-      "[sessions] 2 live",
-      " - Delegate the live review.",
-      `   id=${delegating} | idle | saved model ${savedModel(fixture, delegating!)} | updated <time>`,
-      `   workspace=${other}`,
-      `   - reviewer | working | ${delegating}/reviewer`,
-      " - Untitled session",
-      `   id=${working} | working | saved model ${savedModel(fixture, working!)} | updated <time>`,
-      `   workspace=${fixture.workspace}`,
+    const model = savedModel(fixture, working!);
+    expect(savedModel(fixture, delegating!)).toBe(model);
+    const lines = text.stdout.split("\n");
+    expect(lines.slice(0, 3)).toEqual(["2 live sessions in all workspaces  ·  1 working  ·  1 idle", `Model ${model}`, ""]);
+    // One row per session in columns, working ones first, each subagent in a tree below its session.
+    expect(lines.slice(3, 9).map(tableCells)).toEqual([
+      ["TITLE", "STATUS", "UPDATED", "SESSION ID", "WORKSPACE"],
+      ["Untitled session", "working", expect.stringMatching(AGE_TEXT), working, fixture.workspace],
+      [],
+      ["Delegate the live review.", "idle", expect.stringMatching(AGE_TEXT), delegating, other],
+      ["└─ reviewer", "working"],
+      [],
+    ]);
+    // Each session id starts where its column's head does.
+    const idColumn = lines[3]!.indexOf("SESSION ID");
+    expect(lines[4]!.indexOf(working!)).toBe(idColumn);
+    expect(lines[6]!.indexOf(delegating!)).toBe(idColumn);
+    expect(lines.slice(9)).toEqual([
+      "Read a session    fx session <session id> --tail 5",
+      "Read a subagent   fx session <session id>/<name> --tail 5",
+      "Every field       fx sessions --live --all --json",
       "",
-    ].join("\n"));
+    ]);
 
     // Listing took no lock that stayed and wrote nothing.
     expect(logBytesOf(fixture, [working!, delegating!, childId])).toEqual(before);
@@ -3633,6 +3655,62 @@ test("fx session shows saved control bytes as visible escapes, with --tail and w
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("fx sessions fits a terminal in color, and NO_COLOR, TERM=dumb, and a pipe get whole plain titles", async () => {
+  const fixture = createFixture("fx-v2-list-terminal-");
+  const prompt = "Plan the move of every saved session to the new store and check each one.";
+  const gateway = startFakeGateway([fakeGatewayFinalText("PLANNED")]);
+  const panes: TmuxSession[] = [];
+  const sgr = /\x1b\[[0-9;]*m/g;
+  // What `fx sessions` printed in a 60-column terminal with `extra` in its environment, with its escapes.
+  const inTerminal = async (extra: Record<string, string | undefined>) => {
+    const pane = await TmuxSession.create({
+      cmd: `${FX_BIN} sessions`,
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), NO_COLOR: undefined, ...extra },
+      width: 60,
+      remainOnExit: true,
+    });
+    panes.push(pane);
+    await pane.waitForText("Running now", TIMEOUT);
+    // Only the list, through its last line, and not what tmux shows after fx exits.
+    const lines = (await pane.capturePaneEscapes()).split("\n");
+    return lines.slice(0, lines.findIndex((line) => line.replace(sgr, "").startsWith("Running now")) + 1).join("\n");
+  };
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, [prompt])).stdout).session_id;
+    const saved = JSON.parse((await command(fixture, gateway, ["sessions", "--json"])).stdout).sessions[0];
+    expect(saved.id).toBe(id);
+    // Wider than the 29 columns the title gets in this window.
+    const title: string = saved.title;
+    expect(title.length).toBeGreaterThan(29);
+
+    // A terminal that takes color gets color, and the title is cut so the row fits the window.
+    const styled = await inTerminal({});
+    expect(styled).toContain("\x1b[");
+    const rows = styled.replace(sgr, "").split("\n").map((line) => line.trimEnd());
+    const row = rows.find((line) => line.endsWith(id))!;
+    expect(row).toContain("…");
+    expect(row).not.toContain(title);
+    for (const line of rows) expect(line.length).toBeLessThanOrEqual(60);
+
+    // NO_COLOR, TERM=dumb, and a pipe get no color and the whole title.
+    for (const extra of [{ NO_COLOR: "1" }, { TERM: "dumb" }]) {
+      const plain = await inTerminal(extra);
+      expect(plain).not.toContain("\x1b[");
+      expect(plain).toContain(title);
+      expect(plain).not.toContain("…");
+    }
+    const piped = await command(fixture, gateway, ["sessions"]);
+    expect(piped.code).toBe(0);
+    expect(piped.stdout).not.toMatch(/[\x1b…]/);
+    expect(piped.stdout.split("\n").find((line) => line.includes(id))).toContain(title);
+  } finally {
+    for (const pane of panes) await pane.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
 
 test("fx session <id>/<agent> reads a subagent by the name its parent gave it", async () => {
   const fixture = createFixture("fx-v2-agent-read-");
@@ -3930,7 +4008,7 @@ test.skipIf(!tmuxAvailable())("fx sessions --live shows an interactive fx's suba
       agents: [{ name: "helper", address: `${id}/lead/helper`, id: helperId, state: "working", agents: [] }],
     }]);
     const text = await command(fixture, gateway, ["sessions", "--live"]);
-    expect(text.stdout).toContain(`   - lead | idle | ${id}/lead\n     - helper | working | ${id}/lead/helper\n`);
+    expect(text.stdout).toMatch(/\n└─ lead +idle\n   └─ helper +working\n/);
     // The helper has no finished turn yet; lead has one.
     const helper = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead/helper`, "--tail", "1", "--json"])).stdout);
     expect(helper).toMatchObject({ id: helperId, address: `${id}/lead/helper`, history_len: 0, history: [] });
@@ -4596,8 +4674,10 @@ async function appExit(fixture: Fixture, gateway: any, args: string[]) {
     stderrPath,
     remainOnExit: true,
   });
-  await until(() => session.paneStatus().dead === true, "the app to exit");
-  const status = session.paneStatus().status;
+  // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+  // the pane dead many seconds later.
+  await until(() => session.recordedExitStatus() !== null, "the app to exit");
+  const status = session.recordedExitStatus();
   await session.kill();
   return { status, stderr: readFileSync(stderrPath, "utf8") };
 }
@@ -5264,9 +5344,12 @@ const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost,
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  // The app's pattern leaves out the terminal recording's line, which names
+  // the same fault: a recording that started on the full disk is a leak from
+  // the environment, not the session's refusal this row checks.
   full: REAL_FULL_DISK
-    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
-    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|(?<!terminal recording: )the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|(?<!terminal recording: )a file-size limit was reached/, acp: /a file-size limit was reached/ },
 };
 
 /// A first reply over the blob limit, so every base session has a blob.
@@ -5448,10 +5531,12 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         writeFileSync(cmd, `#!/bin/sh\ntrap '' XFSZ\nulimit -f ${limit}\nexec '${FX_BIN}' ${args}\n`, { mode: 0o700 });
       }
       const session = await TmuxSession.create({ cmd, cwd: c.fixture.workspace, env: { ...env(c.fixture, gateway), NO_COLOR: "1" }, stderrPath, remainOnExit: true });
-      // The pane stays after fx exits, so its end is the pane dying.
+      // The pane stays after fx exits, so its end is the exit status the
+      // pane's wrapper records; tmux can mark the pane dead many seconds later.
+      const exited = () => session.recordedExitStatus() !== null;
       const exit = async (what: string) => {
         const deadline = Date.now() + TIMEOUT;
-        while (!session.paneStatus().dead) {
+        while (!exited()) {
           if (Date.now() > deadline) throw new Error(`${entry}: the app did not exit ${what}`);
           await Bun.sleep(50);
         }
@@ -5460,12 +5545,12 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         // Either the composer shows or the app refuses and exits.
         let settled = false;
         const died = (async () => {
-          while (!settled && !session.paneStatus().dead) await Bun.sleep(50);
+          while (!settled && !exited()) await Bun.sleep(50);
           return "exited";
         })();
         let started = await Promise.race([session.waitForComposer(TIMEOUT).then(() => "composer", () => "neither"), died]);
         settled = true;
-        if (started === "neither" && session.paneStatus().dead) started = "exited";
+        if (started === "neither" && exited()) started = "exited";
         if (started === "exited") return { entered: false, said: readFileSync(stderrPath, "utf8") };
         if (started === "neither") throw new Error(`${entry}: the app neither showed its composer nor exited`);
         await session.waitForStableComposer(TIMEOUT, 300);

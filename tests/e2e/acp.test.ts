@@ -30,7 +30,7 @@ import {
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
-import { bearer, rotateFxLogin, startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
+import { bearer, rotateFxLogin, startFakeIssuer, storedFxLoginToken, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -296,6 +296,18 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
+
+// A provider's prompt cache covers a request only up to the first message that
+// differs from the request before it, so the next request must open with every
+// message the last one carried, byte for byte.
+function expectAcpPromptExtends(previousBody: string, nextBody: string) {
+  const before = acpGatewayRequest(previousBody).prompt;
+  const after = acpGatewayRequest(nextBody).prompt;
+  expect(after.length).toBeGreaterThanOrEqual(before.length);
+  before.forEach((message, index) => {
+    expect(JSON.stringify(after[index])).toBe(JSON.stringify(message));
+  });
+}
 
 function acpPromptText(body: string): string {
   return acpGatewayRequest(body).prompt
@@ -1474,6 +1486,32 @@ function expectPromptExtends(previousBody: string, nextBody: string) {
   });
 }
 
+// The instructions of a request: the system messages before its conversation
+// starts. A provider's prompt cache stops at the first byte that differs, so
+// these must stay as they were for as long as the session lives.
+function acpInstructions(body: string): string {
+  const prompt = acpGatewayRequest(body).prompt;
+  const first = prompt.findIndex((message) => message.role !== "system");
+  return JSON.stringify(prompt.slice(0, first < 0 ? prompt.length : first));
+}
+
+// The conversation of a request: every message after its instructions.
+function acpConversation(body: string): string {
+  const prompt = acpGatewayRequest(body).prompt;
+  const first = prompt.findIndex((message) => message.role !== "system");
+  return JSON.stringify(first < 0 ? [] : prompt.slice(first));
+}
+
+// What an attached file's folder brings: the folder's rules, as a block or
+// as the reminder a later attachment from the same folder gets (D93).
+function acpRulesBlock(folder: string, rules: string): string {
+  return `<scoped-rules from="${folder}/AGENTS.md" scope="${folder}">\n${rules}\n</scoped-rules>`;
+}
+
+function acpRulesReminder(folder: string): string {
+  return `<scoped-rules-reminder from="${folder}/AGENTS.md" scope="${folder}">The rules fx added earlier for this folder still apply.</scoped-rules-reminder>`;
+}
+
 async function startAutoSession(client: AcpClient, hooks = false) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   const created = await client.request("session/new", { mcpServers: [], ...(hooks ? { _meta: { fx: { hooks: { captureContent: true } } } } : {}) }, 2) as any;
@@ -1692,6 +1730,55 @@ describe("acp: model-independent", () => {
         expect(JSON.stringify(result.messages)).toContain("ACP Generated Title");
         expect(gateway.titleRequests.map((request) => bearer(request.headers))).toEqual(["other-fx-token"]);
         expect(issuer.refreshes).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP refreshes the login once and replays a rejected prompt when the store still holds the rejected token",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-401-refresh-");
+      const issuer = startFakeIssuer({ refresh: () => "refreshed-token" });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      let mainRequests = 0;
+      // The gateway rejects the first turn request, and no other fx renews the
+      // stored login in between.
+      const gateway = startDynamicFakeGateway(() => {
+        mainRequests += 1;
+        return mainRequests === 1 ? unauthorized() : finalText("ACP_MAIN_ANSWER_OK");
+      }, {
+        titleResponses: [() => finalText("ACP Generated Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Answer directly.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_MAIN_ANSWER_OK");
+        expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token", "refreshed-token"]);
+        expect(issuer.refreshes).toHaveLength(1);
+        expect(storedFxLoginToken(root.home)).toBe("refreshed-token");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -3132,11 +3219,15 @@ describe("acp: model-independent", () => {
             .map((message) => acpContentText(message.content))
             .join("\n");
           expect(prompt.length).toBeLessThan(64 * 1024);
-          expect(prompt.match(/<project-rules-omitted from=/g)).toHaveLength(32);
+          // The instructions keep the one omission their own gather made (the
+          // workspace is not below home); the resources' 32 retained records and
+          // the summary of the other 96 ride in the turn's note.
+          expect(prompt.match(/<project-rules-omitted from=/g)).toHaveLength(33);
           expect(prompt).toContain("https://example.test/resource/0");
           expect(prompt).not.toContain("https://example.test/resource/127");
-          expect(prompt).toContain('<project-rules-omitted-summary omitted_count="97"');
-          expect(prompt).toContain("workspace is not below home:1, unsafe target:96");
+          expect(prompt).toContain('<project-rules-omitted-summary omitted_count="96"');
+          expect(prompt).toContain('reasons="unsafe target:96"');
+          expect(acpInstructions(gateway.requests[0]!.body)).not.toContain("https://example.test/resource/0");
           expect(prompt).toMatch(/records_sha256="[0-9a-f]{24}"/);
 
           const notices = result.messages
@@ -6956,6 +7047,139 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  test("ACP's next prompt starts with the request that carried a Vision outage notice", async () => {
+    const root = createIsolatedRoot("fx-acp-vision-outage-");
+    writeFileSync(
+      join(root.workspace, "logo.png"),
+      readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png")),
+    );
+    const outageNotice = "None of the requested images were read by Vision.";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("vision_outage", "vision", { paths: ["logo.png"], focus: "describe the image" }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      finalText("ACP_VISION_OUTAGE_ANSWER"),
+      finalText("ACP_SECOND_PROMPT_ANSWER"),
+      finalText("ACP_LOADED_PROMPT_ANSWER"),
+    ], {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "google/gemini-2.5-flash", type: "language", tags: ["vision", "file-input", "tool-use"] },
+      ],
+    });
+    try {
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      const sessionId = await startAutoSession(client);
+      const first = await runPrompt(client, "Describe logo.png.", TIMEOUT);
+      expect(first.promptResult.result.stopReason).toBe("end_turn");
+      const turnEnd = gateway.requests.length - 1;
+      expect(gateway.requests[turnEnd]!.body).toContain(outageNotice);
+
+      const second = await runPrompt(client, "And once more.", TIMEOUT);
+      expect(second.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(turnEnd + 2);
+      expectAcpPromptExtends(gateway.requests[turnEnd]!.body, gateway.requests[turnEnd + 1]!.body);
+
+      // A reloaded session replays what the user saw and nothing fx sent on
+      // its own: neither the notice nor the marker that saves it.
+      await client.close();
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 10);
+      client.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, cwd: root.workspace, mcpServers: [] } });
+      const replayed: unknown[] = [];
+      for (;;) {
+        const message = await client.readLine(TIMEOUT) as any;
+        if (message.id === 11) {
+          expect(message.error).toBeUndefined();
+          break;
+        }
+        replayed.push(message);
+      }
+      expect(JSON.stringify(replayed)).toContain("ACP_SECOND_PROMPT_ANSWER");
+      expect(JSON.stringify(replayed)).not.toContain(outageNotice);
+      expect(JSON.stringify(replayed)).not.toContain("fx_recovery_prompt");
+
+      const loaded = await runPrompt(client, "One more after the reload.", TIMEOUT);
+      expect(loaded.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(turnEnd + 3);
+      expectAcpPromptExtends(gateway.requests[turnEnd + 1]!.body, gateway.requests[turnEnd + 2]!.body);
+      expect(client.stderr).toBe("");
+    } finally {
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
+
+  test("ACP after a crash with the Vision outage notice in flight, the next prompt starts with the cut-off request", async () => {
+    const root = createIsolatedRoot("fx-acp-vision-crash-");
+    writeFileSync(
+      join(root.workspace, "logo.png"),
+      readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png")),
+    );
+    const outageNotice = "None of the requested images were read by Vision.";
+    const held = heldFakeGatewayFinalText();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("vision_outage", "vision", { paths: ["logo.png"], focus: "describe the image" }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      // The request after the notice parks here; the process dies while it is
+      // in flight.
+      held.response,
+      finalText("ACP_RECOVERED_ANSWER"),
+    ], {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "google/gemini-2.5-flash", type: "language", tags: ["vision", "file-input", "tool-use"] },
+      ],
+    });
+    const proc = nodeSpawn(FX_BIN, ["acp"], {
+      cwd: root.workspace,
+      env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    try {
+      client = new AcpClient(proc);
+      const sessionId = await startAutoSession(client);
+      sendPrompt(client, 40, "Describe logo.png.");
+      await waitForCondition("held request after the notice", () => gateway.requests.length === 5, TIMEOUT);
+      expect(gateway.requests[4]!.body).toContain(outageNotice);
+      const exited = client.waitForExit();
+      proc.kill("SIGKILL");
+      await exited;
+      expect(proc.signalCode).toBe("SIGKILL");
+
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 10);
+      client.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, mcpServers: [] } });
+      const loaded: unknown[] = [];
+      for (;;) {
+        const message = await client.readLine() as any;
+        if (message.id === 11) {
+          expect(message.error).toBeUndefined();
+          break;
+        }
+        loaded.push(message);
+      }
+      // The reopened turn shows the user's prompt, never fx's own notice.
+      expect(JSON.stringify(loaded)).toContain("Describe logo.png.");
+      expect(JSON.stringify(loaded)).not.toContain(outageNotice);
+      expect(JSON.stringify(loaded)).not.toContain("fx_recovery_prompt");
+
+      const resumed = await runPrompt(client, "Carry on from the saved turn.", TIMEOUT);
+      expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(6);
+      expectAcpPromptExtends(gateway.requests[4]!.body, gateway.requests[5]!.body);
+    } finally {
+      held.dispose();
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
+
   test("ACP keeps a failed turn's image through reload and a new image prompt goes on", async () => {
     const root = createIsolatedRoot("fx-acp-checkpoint-image-");
     const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
@@ -9572,6 +9796,457 @@ describe("acp: model-independent", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "an attached file from a folder with its own rules reaches the model as a note and leaves the instructions alone",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-rules-");
+      const docs = join(root.workspace, "docs");
+      const other = join(root.workspace, "other");
+      mkdirSync(docs, { recursive: true });
+      mkdirSync(other, { recursive: true });
+      writeFileSync(join(root.workspace, "AGENTS.md"), "ACP_ATTACH_ROOT_RULE\n");
+      writeFileSync(join(docs, "AGENTS.md"), "ACP_ATTACH_DOCS_RULE\n");
+      writeFileSync(join(other, "AGENTS.md"), "ACP_ATTACH_OTHER_RULE\n");
+      for (const name of ["a.md", "b.md", "c.md"]) writeFileSync(join(docs, name), `${name}\n`);
+      writeFileSync(join(other, "x.md"), "x\n");
+      const docsBlock = acpRulesBlock("docs", "ACP_ATTACH_DOCS_RULE");
+      const otherBlock = acpRulesBlock("other", "ACP_ATTACH_OTHER_RULE");
+      const attach = (folder: string, name: string) => ({
+        type: "resource",
+        resource: { uri: pathToFileURL(join(root.workspace, folder, name)).href, text: `ATTACHED_${name}` },
+      });
+      const gateway = startFakeGateway([
+        finalText("ACP_ATTACH_ONE"),
+        finalText("ACP_ATTACH_TWO"),
+        finalText("ACP_ATTACH_THREE"),
+        finalText("ACP_ATTACH_FOUR"),
+        finalText("ACP_ATTACH_FIVE"),
+      ]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+
+        // Turn 1 attaches nothing, so no folder's rules are in play yet.
+        await runPrompt(client, "Hello.", TIMEOUT);
+        expect(gateway.requests).toHaveLength(1);
+        const first = gateway.requests[0]!.body;
+        expect(first).toContain("ACP_ATTACH_ROOT_RULE");
+        expect(first).not.toContain("ACP_ATTACH_DOCS_RULE");
+
+        // Turn 2 attaches a file from a folder the session has not seen. The
+        // request opens with everything turn 1 sent, instructions included,
+        // and the folder's rules end the turn's own message, once.
+        const second = await runPromptBlocks(client, [
+          { type: "text", text: "Look at this file." },
+          attach("docs", "a.md"),
+        ], TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        const secondBody = gateway.requests[1]!.body;
+        expect(acpInstructions(secondBody)).toBe(acpInstructions(first));
+        expectPromptExtends(first, secondBody);
+        expect(occurrenceCount(secondBody, "ACP_ATTACH_DOCS_RULE")).toBe(1);
+        expect(acpLatestPromptText(secondBody).trimEnd().endsWith(docsBlock)).toBe(true);
+        expect(acpLatestPromptText(secondBody)).toContain("ATTACHED_a.md");
+
+        // Another file from the same folder: turn 2's message comes back as
+        // it was, and this turn's message ends with the reminder line.
+        await runPromptBlocks(client, [
+          { type: "text", text: "And this one?" },
+          attach("docs", "b.md"),
+        ], TIMEOUT);
+        const thirdBody = gateway.requests[2]!.body;
+        expect(acpInstructions(thirdBody)).toBe(acpInstructions(first));
+        expectPromptExtends(secondBody, thirdBody);
+        expect(occurrenceCount(thirdBody, "ACP_ATTACH_DOCS_RULE")).toBe(1);
+        expect(occurrenceCount(acpPromptText(thirdBody), acpRulesReminder("docs"))).toBe(1);
+        expect(acpLatestPromptText(thirdBody).trimEnd().endsWith(acpRulesReminder("docs"))).toBe(true);
+        await client.close();
+
+        // A new process loads the session. Its next request still opens with
+        // everything the last one carried, and the saved note is not sent again.
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        while (((await client.readLine()) as any).id !== 11) { /* replayed history */ }
+        await client.request("session/set_mode", { modeId: "auto" }, 12);
+        await runPrompt(client, "Anything else?", TIMEOUT);
+        const fourthBody = gateway.requests[3]!.body;
+        expect(acpInstructions(fourthBody)).toBe(acpInstructions(first));
+        expectPromptExtends(thirdBody, fourthBody);
+        expect(occurrenceCount(fourthBody, "ACP_ATTACH_DOCS_RULE")).toBe(1);
+
+        // After the load, a file from the saved folder still gets only the
+        // reminder, and a file from a new folder brings its own rules, both
+        // at the end of the message.
+        await runPromptBlocks(client, [
+          { type: "text", text: "Compare these." },
+          attach("docs", "c.md"),
+          attach("other", "x.md"),
+        ], TIMEOUT);
+        const fifthBody = gateway.requests[4]!.body;
+        expect(acpInstructions(fifthBody)).toBe(acpInstructions(first));
+        expectPromptExtends(fourthBody, fifthBody);
+        expect(occurrenceCount(fifthBody, "ACP_ATTACH_DOCS_RULE")).toBe(1);
+        expect(occurrenceCount(fifthBody, "ACP_ATTACH_OTHER_RULE")).toBe(1);
+        const latest = acpLatestPromptText(fifthBody);
+        expect(latest).toContain(otherBlock);
+        expect(latest).toContain(acpRulesReminder("docs"));
+        expect(latest.indexOf("ATTACHED_c.md")).toBeLessThan(latest.indexOf(otherBlock));
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
+    "an attached remote resource and a file outside the workspace are not workspace files",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-not-workspace-");
+      const docs = join(root.workspace, "docs");
+      mkdirSync(docs, { recursive: true });
+      writeFileSync(join(root.workspace, "AGENTS.md"), "ACP_NOT_WS_ROOT_RULE\n");
+      writeFileSync(join(docs, "AGENTS.md"), "ACP_NOT_WS_DOCS_RULE\n");
+      writeFileSync(join(docs, "a.md"), "a\n");
+      writeFileSync(join(root.external, "AGENTS.md"), "ACP_NOT_WS_EXTERNAL_RULE\n");
+      writeFileSync(join(root.external, "outside.md"), "outside\n");
+      const remoteUri = "https://example.test/docs/reference.md";
+      // A parent segment makes the URI no workspace file, though it names one.
+      const dotDotUri = `${pathToFileURL(docs).href}/../docs/a.md`;
+      const gateway = startFakeGateway([finalText("ACP_NOT_WS_ONE"), finalText("ACP_NOT_WS_TWO")]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        const first = gateway.requests[0]!.body;
+
+        const second = await runPromptBlocks(client, [
+          { type: "text", text: "Read these." },
+          { type: "resource", resource: { uri: remoteUri, text: "REMOTE_BODY" } },
+          { type: "resource", resource: { uri: pathToFileURL(join(root.external, "outside.md")).href, text: "OUTSIDE_BODY" } },
+          { type: "resource", resource: { uri: dotDotUri, text: "DOTDOT_BODY" } },
+        ], TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        const body = gateway.requests[1]!.body;
+        // The instructions do not move, and nothing here brings a folder's rules.
+        expect(acpInstructions(body)).toBe(acpInstructions(first));
+        expectPromptExtends(first, body);
+        expect(body).not.toContain("ACP_NOT_WS_DOCS_RULE");
+        expect(body).not.toContain("ACP_NOT_WS_EXTERNAL_RULE");
+        expect(acpConversation(body)).not.toContain("<scoped-rules");
+        // The sources fx could not use still get their omission records, now
+        // in the note at the end of the turn's message, and the user's notice.
+        const latest = acpLatestPromptText(body);
+        expect(latest).toContain(`<project-rules-omitted from="${remoteUri}" reason="unsafe target" />`);
+        expect(latest).toContain(`from="${dotDotUri}" reason="unsafe target" />`);
+        expect(acpInstructions(body)).not.toContain(remoteUri);
+        expect(acpInstructions(body)).not.toContain(dotDotUri);
+        const notices = second.messages
+          .filter((message: any) => message.method === "session/update")
+          .map((message: any) => acpContentText(message.params?.update?.content))
+          .join("\n");
+        expect(notices).toContain("action=omitted");
+        expect(notices).toContain("reason=unsafe target");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a file attached from the workspace root brings no note and leaves the instructions alone",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-root-");
+      writeFileSync(join(root.workspace, "AGENTS.md"), "ACP_ATTACH_TOP_RULE\n");
+      writeFileSync(join(root.workspace, "readme.md"), "readme\n");
+      const gateway = startFakeGateway([finalText("ACP_ROOT_ONE"), finalText("ACP_ROOT_TWO")]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        await runPromptBlocks(client, [
+          { type: "text", text: "Read this." },
+          { type: "resource", resource: { uri: pathToFileURL(join(root.workspace, "readme.md")).href, text: "ROOT_BODY" } },
+        ], TIMEOUT);
+        const first = gateway.requests[0]!.body;
+        const second = gateway.requests[1]!.body;
+        expect(acpInstructions(second)).toBe(acpInstructions(first));
+        expectPromptExtends(first, second);
+        expect(occurrenceCount(second, "ACP_ATTACH_TOP_RULE")).toBe(1);
+        expect(acpConversation(second)).not.toContain("<scoped-rules");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "attached folder rules that changed between turns are sent again once, as replacing the earlier copy",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-changed-");
+      const docs = join(root.workspace, "docs");
+      mkdirSync(docs, { recursive: true });
+      writeFileSync(join(docs, "AGENTS.md"), "ACP_CHANGED_RULE_ONE\n");
+      for (const name of ["a.md", "b.md"]) writeFileSync(join(docs, name), `${name}\n`);
+      const attach = (name: string) => ({
+        type: "resource",
+        resource: { uri: pathToFileURL(join(docs, name)).href, text: `ATTACHED_${name}` },
+      });
+      const gateway = startFakeGateway([finalText("ACP_CHANGED_ONE"), finalText("ACP_CHANGED_TWO"), finalText("ACP_CHANGED_THREE")]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        await runPromptBlocks(client, [{ type: "text", text: "First look." }, attach("a.md")], TIMEOUT);
+        writeFileSync(join(docs, "AGENTS.md"), "ACP_CHANGED_RULE_TWO, now longer\n");
+        await runPromptBlocks(client, [{ type: "text", text: "Second look." }, attach("b.md")], TIMEOUT);
+
+        const [first, second, third] = gateway.requests.map((request) => request.body);
+        expect(acpInstructions(third!)).toBe(acpInstructions(first!));
+        expectPromptExtends(second!, third!);
+        expect(occurrenceCount(third!, "ACP_CHANGED_RULE_ONE")).toBe(1);
+        expect(occurrenceCount(third!, "ACP_CHANGED_RULE_TWO")).toBe(1);
+        expect(acpLatestPromptText(third!).trimEnd().endsWith(
+          "The rules below replace the earlier copy from the same file.\n\n" +
+            acpRulesBlock("docs", "ACP_CHANGED_RULE_TWO, now longer"),
+        )).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a model request that fails and is retried carries the attached folder's rules once",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-retry-");
+      const docs = join(root.workspace, "docs");
+      mkdirSync(docs, { recursive: true });
+      writeFileSync(join(docs, "AGENTS.md"), "ACP_RETRY_RULE\n");
+      for (const name of ["a.md", "b.md"]) writeFileSync(join(docs, name), `${name}\n`);
+      const attach = (name: string) => ({
+        type: "resource",
+        resource: { uri: pathToFileURL(join(docs, name)).href, text: `ATTACHED_${name}` },
+      });
+      const gateway = startFakeGateway([
+        finalText("ACP_RETRY_ONE"),
+        retryAfterUnavailable(0),
+        finalText("ACP_RETRY_TWO"),
+        finalText("ACP_RETRY_THREE"),
+      ]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        const result = await runPromptBlocks(client, [{ type: "text", text: "Look." }, attach("a.md")], TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        // The failed request and its retry are the same request.
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2]!.body).toBe(gateway.requests[1]!.body);
+        expect(acpInstructions(gateway.requests[2]!.body)).toBe(acpInstructions(gateway.requests[0]!.body));
+        expect(occurrenceCount(gateway.requests[2]!.body, "ACP_RETRY_RULE")).toBe(1);
+
+        // The retried turn saved its note: the next attachment gets a reminder.
+        await runPromptBlocks(client, [{ type: "text", text: "And this?" }, attach("b.md")], TIMEOUT);
+        const last = gateway.requests[3]!.body;
+        expectPromptExtends(gateway.requests[2]!.body, last);
+        expect(occurrenceCount(last, "ACP_RETRY_RULE")).toBe(1);
+        expect(occurrenceCount(acpPromptText(last), acpRulesReminder("docs"))).toBe(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an attached folder whose rule file cannot be read is reported in the note, not in the instructions",
+    async () => {
+      if (process.getuid?.() === 0) return; // A file mode does not stop root.
+      const root = createIsolatedRoot("fx-acp-attached-unreadable-");
+      const docs = join(root.workspace, "docs");
+      mkdirSync(docs, { recursive: true });
+      writeFileSync(join(docs, "AGENTS.md"), "ACP_UNREADABLE_RULE\n");
+      chmodSync(join(docs, "AGENTS.md"), 0o000);
+      writeFileSync(join(docs, "a.md"), "a\n");
+      const gateway = startFakeGateway([finalText("ACP_UNREADABLE_ONE"), finalText("ACP_UNREADABLE_TWO")]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        const result = await runPromptBlocks(client, [
+          { type: "text", text: "Look." },
+          { type: "resource", resource: { uri: pathToFileURL(join(docs, "a.md")).href, text: "ATTACHED_a.md" } },
+        ], TIMEOUT);
+        const body = gateway.requests[1]!.body;
+        expect(acpInstructions(body)).toBe(acpInstructions(gateway.requests[0]!.body));
+        expectPromptExtends(gateway.requests[0]!.body, body);
+        expect(body).not.toContain("ACP_UNREADABLE_RULE");
+        expect(acpLatestPromptText(body)).toContain('reason="unreadable rule file"');
+        const notices = result.messages
+          .filter((message: any) => message.method === "session/update")
+          .map((message: any) => acpContentText(message.params?.update?.content))
+          .join("\n");
+        expect(notices).toContain("reason=unreadable rule file");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a prompt that attaches hundreds of files from a hundred folders keeps the instructions and bounds the note",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-many-");
+      const folders = 100;
+      const perFolder = 4;
+      const resources: Array<Record<string, unknown>> = [];
+      for (let index = 0; index < folders; index += 1) {
+        const dir = join(root.workspace, `f${String(index).padStart(3, "0")}`);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "AGENTS.md"), `ACP_MANY_RULE_${index}\n`);
+        for (let file = 0; file < perFolder; file += 1) {
+          const path = join(dir, `file${file}.md`);
+          writeFileSync(path, "x\n");
+          resources.push({ type: "resource", resource: { uri: pathToFileURL(path).href, text: "S" } });
+        }
+      }
+      const gateway = startFakeGateway([finalText("ACP_MANY_ONE"), finalText("ACP_MANY_TWO"), finalText("ACP_MANY_THREE")]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        const second = await runPromptBlocks(client, [{ type: "text", text: "Read all of these." }, ...resources], TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        const first = gateway.requests[0]!.body;
+        const body = gateway.requests[1]!.body;
+        expect(acpInstructions(body)).toBe(acpInstructions(first));
+        expectPromptExtends(first, body);
+        // The scoped-rules cap holds, and the folders it left out are named.
+        const latest = acpLatestPromptText(body);
+        expect(occurrenceCount(latest, "<scoped-rules from=")).toBe(32);
+        expect(latest).toContain('reason="selection cap"');
+        expect(latest.length).toBeLessThan(128 * 1024);
+
+        // The same attachments again: nothing grows without bound.
+        await runPromptBlocks(client, [{ type: "text", text: "Again." }, ...resources], TIMEOUT);
+        const again = gateway.requests[2]!.body;
+        expect(acpInstructions(again)).toBe(acpInstructions(first));
+        expectPromptExtends(body, again);
+        expect(occurrenceCount(acpLatestPromptText(again), "<scoped-rules from=")).toBeLessThanOrEqual(32);
+        expect(acpLatestPromptText(again).length).toBeLessThan(128 * 1024);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "after a kill during the request that carried the attached rules, the next attachment from the folder is delivered once",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-attached-kill-");
+      const docs = join(root.workspace, "docs");
+      mkdirSync(docs, { recursive: true });
+      writeFileSync(join(docs, "AGENTS.md"), "ACP_KILL_RULE\n");
+      for (const name of ["a.md", "b.md"]) writeFileSync(join(docs, name), `${name}\n`);
+      const attach = (name: string) => ({
+        type: "resource",
+        resource: { uri: pathToFileURL(join(docs, name)).href, text: `ATTACHED_${name}` },
+      });
+      const gateway = startFakeGateway([
+        finalText("ACP_KILL_ONE"),
+        // The request that carries the note never gets an answer.
+        () => new Promise<Response>(() => {}),
+        finalText("ACP_KILL_THREE"),
+        finalText("ACP_KILL_FOUR"),
+      ]);
+      const proc = nodeSpawn(FX_BIN, ["acp"], {
+        cwd: root.workspace,
+        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = new AcpClient(proc);
+        const sessionId = await startAutoSession(client);
+        await runPrompt(client, "Hello.", TIMEOUT);
+        client.send({
+          jsonrpc: "2.0",
+          id: 40,
+          method: "session/prompt",
+          params: { prompt: [{ type: "text", text: "Look at this." }, attach("a.md")] },
+        });
+        await waitForCondition("held request that carries the note", () => gateway.requests.length === 2, TIMEOUT);
+        expect(occurrenceCount(gateway.requests[1]!.body, "ACP_KILL_RULE")).toBe(1);
+        const exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        while (((await client.readLine()) as any).id !== 11) { /* replayed history */ }
+        await client.request("session/set_mode", { modeId: "auto" }, 12);
+        await runPromptBlocks(client, [{ type: "text", text: "Try again." }, attach("b.md")], TIMEOUT);
+        const last = gateway.requests.at(-1)!.body;
+        expect(acpInstructions(last)).toBe(acpInstructions(gateway.requests[0]!.body));
+        // The rules the killed turn never saved are not counted as delivered,
+        // and they are not sent twice.
+        expect(occurrenceCount(last, "ACP_KILL_RULE")).toBe(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(

@@ -10,6 +10,16 @@
     {"name": "enter_noop", "config": "agents-menu-mutation-enter-noop", "rule": "EnterShowsSelection", "bug": "Enter closes the list without showing the highlighted row"},
     {"name": "open_first", "config": "agents-menu-mutation-open-first", "rule": "OpensOnScreen", "bug": "the list opens on its first row instead of the agent on screen"},
     {"name": "row", "config": "agents-menu-mutation-row", "rule": "SelectionKept", "bug": "the highlight stays on its row, not its agent, when the rows change"},
-    {"name": "stale_sel", "config": "agents-menu-mutation-stale-sel", "rule": "SelListed", "bug": "the highlight stays on an agent that closed"}
-  ]
+    {"name": "stale_sel", "config": "agents-menu-mutation-stale-sel", "rule": "SelListed", "bug": "the highlight stays on an agent that closed"},
+    {"name": "worker_flag", "config": "row-order-mutation-worker-flag", "rule": "IdleRowIsApplied", "bug": "a subagent's row follows the worker flag alone, so a turn that ended but is not applied shows idle at its old place"},
+    {"name": "worker_flag_flip", "config": "row-order-mutation-worker-flag-flip", "rule": "PlaceChangesWithLabel", "bug": "the same bug, seen as a row that moves with no change of its state"}
+  ],
+  "code": {
+    "breaks": "fx before the fix: a subagent whose turn ended but is not applied shows idle, placed by its older history, and moves up a moment later. The hidden agents' events are applied late, so the gap lasts hundreds of milliseconds and is drawn.",
+    "run": "drivers/agents_menu/row-order-mutant.sh bug must fail row-order.ts, caught by IdleRowsNewestFirst or PlaceChangesWithLabel. drivers/agents_menu/row-order-mutant.sh late, the fix with the same late visits, must pass.",
+    "edits": [
+      {"file": "src/core/app/app_agents_runtime.zig", "find": ".idle, .finished => if (resultPending(app, child)) .working else state,", "replace": ".idle, .finished => state,"},
+      {"file": "src/core/app/app_agents_runtime.zig", "late": true, "find": "                if (child == app.agent_on_screen) continue;\n                if (!hasPendingWork(child) and !approvalOutOfDate", "replace": "                if (child == app.agent_on_screen) continue;\n                if (@mod(io_mod.milliTimestamp(), 800) < 400) continue;\n                if (!hasPendingWork(child) and !approvalOutOfDate"}
+    ]
+  }
 }

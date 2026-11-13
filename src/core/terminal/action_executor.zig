@@ -3,6 +3,7 @@ const client = @import("client.zig");
 const contracts = @import("contracts.zig");
 const operation = @import("operation.zig");
 const io_mod = @import("../shared/io.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -11,6 +12,11 @@ pub const Context = struct {
     lifecycle_allocator: Allocator,
     runtime: *client.Runtime,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// When set, a request still pending `yield_grace_ms` after it starts is
+    /// cancelled and ends `.cancelled`, as `cancel_flag` would end it. Only
+    /// read-only waits pass it: cancelling one leaves the session running.
+    yield_flag: ?*const std.atomic.Value(bool) = null,
+    yield_grace_ms: i64 = 0,
 };
 
 pub fn execute(
@@ -38,6 +44,7 @@ pub fn execute(
         } });
     };
     var cancellation_sent = false;
+    const started_ms = io_mod.milliTimestamp();
     while (true) {
         if (ctx.runtime.takeCompletionFor(correlation_id)) |completion_value| {
             var completion = completion_value;
@@ -65,6 +72,15 @@ pub fn execute(
                     cancellation_sent = true;
                 }
             }
+        }
+        if (!cancellation_sent and managed_execution.steerYieldDue(
+            ctx.yield_flag,
+            started_ms,
+            io_mod.milliTimestamp(),
+            ctx.yield_grace_ms,
+        )) {
+            _ = ctx.runtime.cancel(correlation_id);
+            cancellation_sent = true;
         }
         io_mod.sleep(2 * std.time.ns_per_ms);
     }

@@ -84,6 +84,39 @@
 //! - `session_title`: `setting`, `title` (masked; left out when there is
 //!   none), and `generation` {`status`, `session`, `model`, `reason`,
 //!   `detail`, `elapsed_ms`}.
+//! - `subagents`: `open`, the open subagents; `turns_retained` and
+//!   `turns_total`, the subagent turns the bounded ring holds and the ones
+//!   started this session; `registry_error`, when a host's registry could
+//!   not be read; `unmatched_subagent_ids`, the `subagent_id`s in the
+//!   tool-call window whose turn the ring no longer holds. Then a `subagent`
+//!   per open subagent, in the order they started, and per other subagent
+//!   session with retained turns, such as a closed one: `open`, `name` (left
+//!   out for a one-off), `session_id`, the name of its folder in the session
+//!   store, `profile`, `state` (what the agent list says: `needs_approval`,
+//!   `has_question`, `needs_you`, `working`, `finished`, or `idle`),
+//!   `activity` (its host's work phase: `idle`, `running`,
+//!   `awaiting_approval`, `interrupted`, `finished`, `closing`, or `unknown`
+//!   when its host's registry has no entry for it), `last_outcome`
+//!   (`completed`, `failed`, `cancelled`, `interrupted`, `lost`, `none`
+//!   before its first work ends, or `unknown`), `last_reason` (masked), why
+//!   that work failed, `model`, `effort`, `title` (masked), `status`
+//!   (masked), its status row, such as a failed request that waits for the
+//!   user, `task` (masked), the start of its newest retained turn's prompt:
+//!   at most 240 bytes, without the end of a word that cut would split (its
+//!   ASCII bytes, or the whole word when it holds `://`), and left out when
+//!   none of it is kept, and `task_bytes`, that prompt's whole length,
+//!   `turns_retained`,
+//!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
+//!   calls in the tool-call window. A subagent that is not open has only
+//!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
+//!   at 400 bytes; a cut `last_reason`, `title`, or `status` comes with
+//!   `<name>_bytes`, its whole masked length.
+//!   After each `subagent` comes a `subagent_turn` for each of its newest 8
+//!   retained turns, newest first: `session_id`, `source` with the
+//!   `subagent_id` that the turn's `tool_call`, `network_call`, and
+//!   `compaction_event` records carry, `outcome` (`running`, or how the turn
+//!   ended, such as `completed` or `failed`), `model`, `effort`,
+//!   `started_at`, and `duration_ms` once it ended.
 //! - `network`: `retained`, `ok`, `errors`, `avg_ms`, `min_ms`, `max_ms`;
 //!   `session` {`calls`, `ok`, `errors`, `total_ms`}, totals that the bounded
 //!   ring does not limit; `complete`, whether the ring holds every call, and
@@ -163,6 +196,8 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_time = @import("../shared/local_time.zig");
@@ -367,6 +402,7 @@ pub fn build(app: anytype) ![]u8 {
     try writeCompaction(r);
     try writeInterruptedTurn(r, history);
     try writeSessionTitle(r, app);
+    try writeSubagents(r, app);
     try writeNetwork(r);
     try writeModelCatalog(r, app);
     try writeToolCalls(r, history);
@@ -934,6 +970,212 @@ fn writeSessionTitle(r: *Records, app: anytype) !void {
     }
     try r.endObject();
     try r.end();
+}
+
+/// Turns written for one subagent, newest first.
+const subagent_turns_shown: usize = 8;
+/// Bytes kept of a subagent's masked title, status row, task, and failure
+/// reason.
+const subagent_text_max_bytes: usize = 400;
+
+/// What the subagent records read.
+const SubagentsInput = struct {
+    /// The app's subagents, in the order they started.
+    rows: []const app_agents_runtime.TraceRow = &.{},
+    /// Their hosts' registry entries.
+    registry: []const subagent_tool_host.Runtime.TraceChild = &.{},
+    /// Set when a host's registry could not be read.
+    registry_error: ?anyerror = null,
+    /// The retained subagent turns, oldest first.
+    turns: []const diagnostics.SubagentTurn = &.{},
+    turns_total: u64 = 0,
+    /// The tool-call window, oldest first.
+    calls: []const diagnostics.ToolCallMetric = &.{},
+};
+
+/// Each subagent with what the agent list and its host's registry say of
+/// it, and its newest turns, so the `subagent_id` of a tool or network call
+/// names one subagent.
+fn writeSubagents(r: *Records, app: anytype) !void {
+    const App = @TypeOf(app.*);
+    var input: SubagentsInput = .{};
+    if (comptime @hasField(App, "child_agents")) {
+        var rows: std.ArrayList(app_agents_runtime.TraceRow) = .empty;
+        try app_agents_runtime.Runtime(App).traceRows(app, r.arena, &rows);
+        input.rows = rows.items;
+        var hosts: std.ArrayList(*subagent_tool_host.Runtime) = .empty;
+        var registry: std.ArrayList(subagent_tool_host.Runtime.TraceChild) = .empty;
+        for (rows.items) |row| {
+            const host = row.host orelse continue;
+            if (std.mem.findScalar(*subagent_tool_host.Runtime, hosts.items, host) != null) continue;
+            try hosts.append(r.arena, host);
+            const listing = host.traceChildren(r.arena) catch |err| {
+                input.registry_error = err;
+                continue;
+            };
+            try registry.appendSlice(r.arena, listing);
+        }
+        input.registry = registry.items;
+    }
+    const turns = try r.arena.alloc(diagnostics.SubagentTurn, diagnostics.subagent_turn_capacity);
+    input.turns = turns[0..diagnostics.snapshotSubagentTurns(turns)];
+    input.turns_total = diagnostics.subagentTurnTotal();
+    const calls = try r.arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
+    input.calls = calls[0..diagnostics.snapshotToolCalls(calls)];
+    try writeSubagentRecords(r, input);
+}
+
+fn writeSubagentRecords(r: *Records, input: SubagentsInput) !void {
+    try r.begin("subagents");
+    try r.number("open", input.rows.len);
+    try r.number("turns_retained", input.turns.len);
+    try r.number("turns_total", input.turns_total);
+    if (input.registry_error) |err| try r.text("registry_error", @errorName(err));
+    var unmatched = false;
+    for (input.calls, 0..) |call, index| {
+        if (call.subagent_id == 0 or findSubagentTurn(input.turns, call.subagent_id) != null) continue;
+        if (subagentIdSeenBefore(input.calls[0..index], call.subagent_id)) continue;
+        if (!unmatched) try r.beginArray("unmatched_subagent_ids");
+        unmatched = true;
+        try r.json.write(call.subagent_id);
+    }
+    if (unmatched) try r.endArray();
+    try r.end();
+
+    for (input.rows) |row| {
+        try r.begin("subagent");
+        try r.boolean("open", true);
+        try r.optionalText("name", row.name);
+        try r.text("session_id", row.id);
+        try r.text("profile", row.profile);
+        try r.text("state", row.state);
+        if (findTraceChild(input.registry, row.id)) |child| {
+            try r.text("activity", if (child.closing) "closing" else @tagName(child.phase));
+            try r.text("last_outcome", if (child.last_outcome) |outcome| @tagName(outcome) else "none");
+            try writeSubagentText(r, "last_reason", child.last_failure);
+        } else {
+            try r.text("activity", "unknown");
+            try r.text("last_outcome", "unknown");
+        }
+        try r.optionalText("model", row.model);
+        try r.optionalText("effort", row.effort);
+        try writeSubagentText(r, "title", row.title);
+        try writeSubagentText(r, "status", row.status);
+        try endSubagentRecord(r, input, row.id);
+    }
+
+    // A session with retained turns and no open subagent, such as a closed
+    // one, listed once at its newest turn.
+    var index = input.turns.len;
+    while (index > 0) {
+        index -= 1;
+        const session_id = input.turns[index].sessionId();
+        if (findTraceRow(input.rows, session_id)) continue;
+        if (sessionListedAfter(input.turns, index, session_id)) continue;
+        try r.begin("subagent");
+        try r.boolean("open", false);
+        try r.text("session_id", session_id);
+        try endSubagentRecord(r, input, session_id);
+    }
+}
+
+/// Ends subagent `session_id`'s record with its task, its retained turns,
+/// and its calls in the tool-call window, then writes its newest turns,
+/// newest first.
+fn endSubagentRecord(r: *Records, input: SubagentsInput, session_id: []const u8) !void {
+    var retained: usize = 0;
+    var index = input.turns.len;
+    while (index > 0) {
+        index -= 1;
+        const turn = &input.turns[index];
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        if (retained == 0 and turn.prompt_total_bytes > 0) {
+            try r.optionalText("task", try maskedSubagentText(r, turn.prompt()));
+            try r.number("task_bytes", turn.prompt_total_bytes);
+        }
+        retained += 1;
+    }
+    try r.number("turns_retained", retained);
+    if (retained > subagent_turns_shown) try r.number("turns_omitted", retained - subagent_turns_shown);
+    var calls: usize = 0;
+    var not_succeeded: usize = 0;
+    for (input.calls) |call| {
+        if (call.subagent_id == 0) continue;
+        const turn = findSubagentTurn(input.turns, call.subagent_id) orelse continue;
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        calls += 1;
+        if (call.outcome != .succeeded) not_succeeded += 1;
+    }
+    try r.beginObject("tool_calls");
+    try r.number("retained", calls);
+    try r.number("not_succeeded", not_succeeded);
+    try r.endObject();
+    try r.end();
+
+    var shown: usize = 0;
+    index = input.turns.len;
+    while (index > 0 and shown < subagent_turns_shown) {
+        index -= 1;
+        const turn = &input.turns[index];
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        shown += 1;
+        try r.begin("subagent_turn");
+        try r.text("session_id", session_id);
+        try r.source(turn.subagent_id);
+        try r.text("outcome", turn.outcome());
+        try r.optionalText("model", turn.model());
+        try r.optionalText("effort", turn.effort());
+        try r.time("started_at", turn.started_at_ms);
+        if (turn.ended_at_ms != 0) try r.number("duration_ms", @max(turn.ended_at_ms - turn.started_at_ms, 0));
+        try r.end();
+    }
+}
+
+/// Writes `value` masked and cut, with `<name>_bytes` when it was cut, or
+/// nothing when it is empty.
+fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) !void {
+    if (value.len == 0) return;
+    const masked = try text_utils.maskSecrets(r.arena, value);
+    const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
+    try r.text(name, kept);
+    if (kept.len < masked.len) try r.number(name ++ "_bytes", masked.len);
+}
+
+/// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
+/// boundary. Masking comes first, so this cut never splits a secret the mask
+/// would have found. A task comes already cut from the turn ring, which
+/// leaves out the end of the word its own cut splits
+/// (`subagent_turn_metrics.keptPrompt`), so no part of a secret that cut
+/// shortened reaches the mask.
+fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
+    return text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(r.arena, value), subagent_text_max_bytes);
+}
+
+fn findTraceChild(registry: []const subagent_tool_host.Runtime.TraceChild, id: []const u8) ?*const subagent_tool_host.Runtime.TraceChild {
+    for (registry) |*child| if (std.mem.eql(u8, child.id, id)) return child;
+    return null;
+}
+
+fn findTraceRow(rows: []const app_agents_runtime.TraceRow, id: []const u8) bool {
+    for (rows) |row| if (std.mem.eql(u8, row.id, id)) return true;
+    return false;
+}
+
+fn findSubagentTurn(turns: []const diagnostics.SubagentTurn, subagent_id: u64) ?*const diagnostics.SubagentTurn {
+    for (turns) |*turn| if (turn.subagent_id == subagent_id) return turn;
+    return null;
+}
+
+/// Whether a turn newer than `index` ran for `session_id`, so that session
+/// is listed already.
+fn sessionListedAfter(turns: []const diagnostics.SubagentTurn, index: usize, session_id: []const u8) bool {
+    for (turns[index + 1 ..]) |*turn| if (std.mem.eql(u8, turn.sessionId(), session_id)) return true;
+    return false;
+}
+
+fn subagentIdSeenBefore(calls: []const diagnostics.ToolCallMetric, subagent_id: u64) bool {
+    for (calls) |call| if (call.subagent_id == subagent_id) return true;
+    return false;
 }
 
 fn writeNetworkCallFields(r: *Records, call: *const diagnostics.NetworkCall) !void {
@@ -2422,6 +2664,508 @@ test "trace session title reports the retained generation outcome" {
     try std.testing.expectEqualStrings("Fix renderer lag PASSWORD=[redacted]", try testString(installed_record, "title"));
     try std.testing.expectEqualStrings("installed", try testString(try testObject(installed_record, "generation"), "status"));
     try std.testing.expectEqual(@as(usize, 0), installed_trace.count("problem"));
+}
+
+fn testSubagentTurn(subagent_id: u64, session_id: []const u8, outcome: []const u8, prompt: []const u8) diagnostics.SubagentTurn {
+    var turn: diagnostics.SubagentTurn = .{ .subagent_id = subagent_id, .started_at_ms = 1_000 * @as(i64, @intCast(subagent_id)) };
+    @memcpy(turn.session_id_buf[0..session_id.len], session_id);
+    turn.session_id_len = @intCast(session_id.len);
+    @memcpy(turn.model_buf[0.."openai/gpt-5".len], "openai/gpt-5");
+    turn.model_len = "openai/gpt-5".len;
+    @memcpy(turn.effort_buf[0.."high".len], "high");
+    turn.effort_len = "high".len;
+    // A longer prompt goes through the ring's own cut (`testRingTurn`).
+    std.debug.assert(prompt.len <= turn.prompt_buf.len);
+    @memcpy(turn.prompt_buf[0..prompt.len], prompt);
+    turn.prompt_len = @intCast(prompt.len);
+    turn.prompt_total_bytes = @intCast(prompt.len);
+    if (outcome.len > 0) {
+        @memcpy(turn.outcome_buf[0..outcome.len], outcome);
+        turn.outcome_len = @intCast(outcome.len);
+        turn.ended_at_ms = turn.started_at_ms + 25;
+    }
+    return turn;
+}
+
+/// Subagent turn 1 of `session_id` with `prompt`, as the turn ring keeps
+/// it. Resets the trace's rings.
+fn testRingTurn(session_id: []const u8, prompt: []const u8) diagnostics.SubagentTurn {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = 1,
+        .session_id = session_id,
+        .model = "openai/gpt-5",
+        .effort = "high",
+        .prompt = prompt,
+        .started_at_ms = 1_000,
+    });
+    var turns: [1]diagnostics.SubagentTurn = undefined;
+    const kept = diagnostics.snapshotSubagentTurns(&turns);
+    std.debug.assert(kept == 1);
+    return turns[0];
+}
+
+fn testSubagentRow(id: []const u8, name: []const u8) app_agents_runtime.TraceRow {
+    return .{
+        .id = id,
+        .name = name,
+        .profile = "agent",
+        .title = "",
+        .state = "idle",
+        .model = "openai/gpt-5",
+        .effort = "high",
+        .status = "",
+        .host = null,
+    };
+}
+
+test "trace subagents record says when no subagent ran" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagentRecords(&w.records, .{});
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 1), trace.records.len);
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "turns_total"));
+    try expectAbsent(summary, "registry_error");
+    try expectAbsent(summary, "unmatched_subagent_ids");
+}
+
+test "trace subagent records name each subagent with its registry state and turns" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    const a = w.arena.allocator();
+    const secret = "sk-live-0123456789abcdef0123456789";
+    const registry = [_]subagent_tool_host.Runtime.TraceChild{
+        .{ .id = try a.dupe(u8, "child-cards"), .phase = .idle, .last_outcome = .completed, .last_failure = &.{}, .closing = false },
+        .{ .id = try a.dupe(u8, "child-ship"), .phase = .idle, .last_outcome = .failed, .last_failure = try a.dupe(u8, "model request failed:\nHTTP 400 token=" ++ secret), .closing = true },
+    };
+    var ship = testSubagentRow("child-ship", "ship");
+    ship.state = "needs_you";
+    ship.status = "\xe2\x9a\xa0 The provider rejected this request\n\xc2\xb7 press Esc";
+    ship.effort = "";
+    const rows = [_]app_agents_runtime.TraceRow{ testSubagentRow("child-cards", "cards"), ship, testSubagentRow("child-lost", "") };
+    const turns = [_]diagnostics.SubagentTurn{
+        testSubagentTurn(1, "child-cards", "completed", "check the card title"),
+        testSubagentTurn(2, "child-ship", "failed", "pin the\navatar"),
+        testSubagentTurn(3, "child-cards", "", "check it again"),
+    };
+    const calls = [_]diagnostics.ToolCallMetric{
+        .{ .subagent_id = 1, .outcome = .command_failed },
+        .{ .subagent_id = 3, .outcome = .succeeded },
+        .{ .subagent_id = 0, .outcome = .tool_failed },
+    };
+    try writeSubagentRecords(&w.records, .{
+        .rows = &rows,
+        .registry = &registry,
+        .registry_error = error.AccessDenied,
+        .turns = &turns,
+        .turns_total = 5,
+        .calls = &calls,
+    });
+    try expectNotIn(w.out.written(), secret);
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 5), try testInt(summary, "turns_total"));
+    try std.testing.expectEqualStrings("AccessDenied", try testString(summary, "registry_error"));
+    try expectAbsent(summary, "unmatched_subagent_ids");
+    // Each subagent comes with its turns, newest first.
+    const order = [_][]const u8{ "subagents", "subagent", "subagent_turn", "subagent_turn", "subagent", "subagent_turn", "subagent" };
+    try std.testing.expectEqual(order.len, trace.records.len);
+    for (order, trace.records) |want, record| try std.testing.expectEqualStrings(want, try testString(record, "type"));
+
+    const cards = try trace.nth("subagent", 0);
+    try std.testing.expect(try testBool(cards, "open"));
+    try std.testing.expectEqualStrings("cards", try testString(cards, "name"));
+    try std.testing.expectEqualStrings("child-cards", try testString(cards, "session_id"));
+    try std.testing.expectEqualStrings("agent", try testString(cards, "profile"));
+    try std.testing.expectEqualStrings("idle", try testString(cards, "state"));
+    try std.testing.expectEqualStrings("idle", try testString(cards, "activity"));
+    try std.testing.expectEqualStrings("completed", try testString(cards, "last_outcome"));
+    try expectAbsent(cards, "last_reason");
+    try std.testing.expectEqualStrings("openai/gpt-5", try testString(cards, "model"));
+    try std.testing.expectEqualStrings("high", try testString(cards, "effort"));
+    try expectAbsent(cards, "title");
+    try expectAbsent(cards, "status");
+    try std.testing.expectEqualStrings("check it again", try testString(cards, "task"));
+    try std.testing.expectEqual(@as(i64, 14), try testInt(cards, "task_bytes"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(cards, "turns_retained"));
+    try expectAbsent(cards, "turns_omitted");
+    const cards_calls = try testObject(cards, "tool_calls");
+    try std.testing.expectEqual(@as(i64, 2), try testInt(cards_calls, "retained"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(cards_calls, "not_succeeded"));
+
+    const running = try trace.nth("subagent_turn", 0);
+    try std.testing.expectEqualStrings("child-cards", try testString(running, "session_id"));
+    try std.testing.expectEqualStrings("subagent", try testString(running, "source"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(running, "subagent_id"));
+    try std.testing.expectEqualStrings("running", try testString(running, "outcome"));
+    try std.testing.expectEqualStrings("openai/gpt-5", try testString(running, "model"));
+    try std.testing.expectEqualStrings("high", try testString(running, "effort"));
+    try std.testing.expectEqualStrings("1970-01-01T00:00:03.000Z", try testString(running, "started_at"));
+    try std.testing.expectEqual(@as(i64, 3_000), try testInt(running, "started_at_ms"));
+    try expectAbsent(running, "duration_ms");
+    const ended = try trace.nth("subagent_turn", 1);
+    try std.testing.expectEqual(@as(i64, 1), try testInt(ended, "subagent_id"));
+    try std.testing.expectEqualStrings("completed", try testString(ended, "outcome"));
+    try std.testing.expectEqual(@as(i64, 25), try testInt(ended, "duration_ms"));
+
+    // A closing subagent, its failure masked, and its status row.
+    const ship_record = try trace.nth("subagent", 1);
+    try std.testing.expectEqualStrings("needs_you", try testString(ship_record, "state"));
+    try std.testing.expectEqualStrings("closing", try testString(ship_record, "activity"));
+    try std.testing.expectEqualStrings("failed", try testString(ship_record, "last_outcome"));
+    try expectStartsWith(try testString(ship_record, "last_reason"), "model request failed:\nHTTP 400 ");
+    try expectAbsent(ship_record, "effort");
+    try std.testing.expectEqualStrings(ship.status, try testString(ship_record, "status"));
+    try std.testing.expectEqualStrings("pin the\navatar", try testString(ship_record, "task"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.nth("subagent_turn", 2), "subagent_id"));
+
+    // A one-off with no registry entry and no retained turn.
+    const lost = try trace.nth("subagent", 2);
+    try expectAbsent(lost, "name");
+    try std.testing.expectEqualStrings("child-lost", try testString(lost, "session_id"));
+    try std.testing.expectEqualStrings("unknown", try testString(lost, "activity"));
+    try std.testing.expectEqualStrings("unknown", try testString(lost, "last_outcome"));
+    try expectAbsent(lost, "task");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(lost, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(try testObject(lost, "tool_calls"), "retained"));
+}
+
+test "trace subagent records list closed sessions and numbers with no retained turn" {
+    var turns: [subagent_turns_shown + 3]diagnostics.SubagentTurn = undefined;
+    for (&turns, 0..) |*turn, index| turn.* = testSubagentTurn(index + 10, "child-gone", "completed", "old work");
+    const calls = [_]diagnostics.ToolCallMetric{
+        .{ .subagent_id = 7, .outcome = .succeeded },
+        .{ .subagent_id = 12, .outcome = .rejected },
+        .{ .subagent_id = 7, .outcome = .tool_failed },
+        .{ .subagent_id = 4, .outcome = .succeeded },
+    };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagentRecords(&w.records, .{ .turns = &turns, .turns_total = turns.len, .calls = &calls });
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 11), try testInt(summary, "turns_retained"));
+    // Each number is listed once, in window order.
+    const unmatched = summary.get("unmatched_subagent_ids").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), unmatched.len);
+    try std.testing.expectEqual(@as(i64, 7), unmatched[0].integer);
+    try std.testing.expectEqual(@as(i64, 4), unmatched[1].integer);
+
+    // Listed once, with its newest turns and the older ones counted.
+    const gone = try trace.one("subagent");
+    try std.testing.expect(!try testBool(gone, "open"));
+    try std.testing.expectEqualStrings("child-gone", try testString(gone, "session_id"));
+    try expectAbsent(gone, "state");
+    try expectAbsent(gone, "activity");
+    try std.testing.expectEqualStrings("old work", try testString(gone, "task"));
+    try std.testing.expectEqual(@as(i64, 11), try testInt(gone, "turns_retained"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(gone, "turns_omitted"));
+    const gone_calls = try testObject(gone, "tool_calls");
+    try std.testing.expectEqual(@as(i64, 1), try testInt(gone_calls, "retained"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(gone_calls, "not_succeeded"));
+    try std.testing.expectEqual(subagent_turns_shown, trace.count("subagent_turn"));
+    try std.testing.expectEqual(@as(i64, 20), try testInt(try trace.nth("subagent_turn", 0), "subagent_id"));
+    try std.testing.expectEqual(@as(i64, 13), try testInt(try trace.nth("subagent_turn", subagent_turns_shown - 1), "subagent_id"));
+}
+
+test "trace subagent text is cut on a character boundary and keeps control characters inside its line" {
+    const long_title = "x" ++ text_utils.repeat("\xc3\xa9", 300);
+    const long_task = "first words " ++ text_utils.repeat("\xc3\xa9", 200);
+    var row = testSubagentRow("child-long", "long");
+    row.title = long_title;
+    row.status = "a\x1b[31m red\r\n\ttabbed";
+    const turn = testRingTurn("child-long", long_task);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .turns = &.{turn}, .turns_total = 1 });
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(trace.records.len, std.mem.count(u8, w.out.written(), "\n"));
+    const record = try trace.one("subagent");
+    // 400 bytes would end inside an "é", so the cut leaves it out.
+    try std.testing.expectEqualStrings(long_title[0..399], try testString(record, "title"));
+    try std.testing.expectEqual(@as(i64, long_title.len), try testInt(record, "title_bytes"));
+    try std.testing.expectEqualStrings(row.status, try testString(record, "status"));
+    try expectAbsent(record, "status_bytes");
+    // The ring's cut at 240 bytes falls between two "é", and text that is
+    // not ASCII stays.
+    try std.testing.expectEqualStrings(long_task[0..240], try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, long_task.len), try testInt(record, "task_bytes"));
+}
+
+test "trace subagent records read the turn ring and the tool-call window" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = 9,
+        .session_id = "child-ring",
+        .model = "openai/gpt-5",
+        .effort = "low",
+        .prompt = "read the ring",
+        .started_at_ms = 1_700_000_000_000,
+    });
+    diagnostics.recordSubagentTurnEnd(9, "completed");
+    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 1_700_000_000_100, .outcome = .command_failed, .subagent_id = 9 };
+    call.setName("shell");
+    diagnostics.recordToolCall(call);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSubagents(&w.records, &struct {}{});
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("subagents");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(summary, "open"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(summary, "turns_total"));
+    const record = try trace.one("subagent");
+    try std.testing.expectEqualStrings("child-ring", try testString(record, "session_id"));
+    try std.testing.expectEqualStrings("read the ring", try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(try testObject(record, "tool_calls"), "not_succeeded"));
+    const turn = try trace.one("subagent_turn");
+    try std.testing.expectEqual(@as(i64, 9), try testInt(turn, "subagent_id"));
+    try std.testing.expectEqualStrings("completed", try testString(turn, "outcome"));
+    try std.testing.expectEqualStrings("low", try testString(turn, "effort"));
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), try testInt(turn, "started_at_ms"));
+}
+
+/// Bytes of a prompt the turn ring keeps.
+const ring_prompt_bytes = @typeInfo(@FieldType(diagnostics.SubagentTurn, "prompt_buf")).array.len;
+
+/// A secret the leak checks plant, and the length of its fixed start: a
+/// record that shows that start and the next byte shows part of the secret.
+/// Each body is capitals and digits, which `subagentFiller` never writes.
+const PlantedSecret = struct { text: []const u8, fixed: usize };
+
+const planted_secrets = [_]PlantedSecret{
+    .{ .text = "ghp_" ++ text_utils.repeat("Q7Z3", 9), .fixed = "ghp_".len },
+    .{ .text = "sk-" ++ text_utils.repeat("Q7Z3", 4), .fixed = "sk-".len },
+    .{ .text = "AKIA" ++ text_utils.repeat("Q7Z3", 4), .fixed = "AKIA".len },
+    .{ .text = "https://Q7Z3W9X2:V5T8R1N4Q7Z3@example.com", .fixed = "https://".len },
+    // A URL credential may hold raw UTF-8, here "ä", before its `@`.
+    .{ .text = "https://ADMIN:P\u{e4}7Z3W9X2Q7Z3@example.com", .fixed = "https://".len },
+};
+
+/// Fails, naming the secret, when a string anywhere in `trace` shows the
+/// fixed start of a planted secret and the byte after it.
+fn expectNoPlantedSecret(trace: *const TestTrace) !void {
+    for (trace.records) |record| try expectNoPlantedSecretIn(.{ .object = record });
+}
+
+fn expectNoPlantedSecretIn(value: std.json.Value) anyerror!void {
+    switch (value) {
+        .string => |text| for (planted_secrets) |secret| try expectNotIn(text, secret.text[0 .. secret.fixed + 1]),
+        .array => |items| for (items.items) |item| try expectNoPlantedSecretIn(item),
+        .object => |fields| {
+            var entries = fields.iterator();
+            while (entries.next()) |entry| try expectNoPlantedSecretIn(entry.value_ptr.*);
+        },
+        else => {},
+    }
+}
+
+/// `len` bytes of filler made from `fuzzed`, repeated as needed: each byte
+/// below 0x80 becomes a lowercase letter, a space, or a symbol, so the filler
+/// never holds a capital or a digit, and the other bytes stay as they are.
+fn subagentFiller(arena: std.mem.Allocator, fuzzed: []const u8, len: usize) ![]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz -_.=:/@\"'\\\n\r\t\x00\x1b\x7f";
+    const out = try arena.alloc(u8, len);
+    for (out, 0..) |*byte, index| {
+        const source: u8 = if (fuzzed.len == 0) 'a' else fuzzed[index % fuzzed.len];
+        byte.* = if (source < 0x80) alphabet[source % alphabet.len] else source;
+    }
+    return out;
+}
+
+/// `filler` cut to put `secret` across byte `cut`, `inside` bytes of it
+/// before the cut, with `separator` on each side.
+fn plantAcross(arena: std.mem.Allocator, filler: []const u8, secret: []const u8, separator: []const u8, cut: usize, inside: usize) ![]u8 {
+    return std.mem.concat(arena, u8, &.{ filler[0 .. cut - inside - separator.len], separator, secret, separator, filler[0..20] });
+}
+
+/// What the fuzz check puts on each side of a planted secret: a space, a
+/// line break, or CJK text with no space.
+const planted_separators = [_][]const u8{ " ", "\n", "\u{4e2d}\u{6587}" };
+
+/// The `task` a trace shows for one subagent turn whose prompt holds
+/// `secret` across the turn ring's cut, `inside` bytes of it before the cut.
+/// Fails when any record shows part of a planted secret.
+fn taskWithSecretAcrossCut(arena: std.mem.Allocator, secret: []const u8, inside: usize) ![]const u8 {
+    const filler = text_utils.repeat("plan the work ", 20);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    const prompt = try plantAcross(w.records.arena, filler, secret, " ", ring_prompt_bytes, inside);
+    const turn = testRingTurn("child-secret", prompt);
+    try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
+    var trace = try w.trace();
+    defer trace.deinit();
+    try expectNoPlantedSecret(&trace);
+    return arena.dupe(u8, try testString(try trace.one("subagent"), "task"));
+}
+
+test "trace subagent task never shows part of a secret the ring's cut split" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var leaks: usize = 0;
+    for (planted_secrets) |secret| {
+        for (1..secret.text.len + 1) |inside| {
+            _ = taskWithSecretAcrossCut(arena, secret.text, inside) catch {
+                std.debug.print("trace test: {s} leaks with {d} of its bytes before the cut\n", .{ secret.text, inside });
+                leaks += 1;
+                break;
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), leaks);
+
+    // The words before the secret stay; a secret that ends at the cut is
+    // kept whole and masked.
+    const words = text_utils.repeat("plan the work ", 20);
+    for (planted_secrets) |secret| {
+        for (1..secret.text.len + 1) |inside| {
+            const task = try taskWithSecretAcrossCut(arena, secret.text, inside);
+            const before = try std.mem.concat(arena, u8, &.{ words[0 .. ring_prompt_bytes - inside - 1], " " });
+            if (inside == secret.text.len) {
+                try expectStartsWith(task, before);
+                try std.testing.expect(task.len > before.len);
+            } else {
+                try std.testing.expectEqualStrings(before, task);
+            }
+        }
+    }
+}
+
+/// The one `subagent` record a trace writes for `turn`, a turn with no
+/// open subagent.
+fn testTaskRecord(w: *TestWriter, turn: diagnostics.SubagentTurn) !struct { TestTrace, std.json.ObjectMap } {
+    try writeSubagentRecords(&w.records, .{ .turns = &.{turn}, .turns_total = 1 });
+    var trace = try w.trace();
+    errdefer trace.deinit();
+    return .{ trace, try trace.one("subagent") };
+}
+
+test "trace subagent task keeps a CJK prompt up to a character boundary" {
+    // "中" is three bytes and "𠀀" four, so the cut at 240 bytes falls
+    // inside a "中", and the prompt has no space at all.
+    const prompt = text_utils.repeat("\u{4e2d}\u{20000}", 40);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var trace, const record = try testTaskRecord(w, testRingTurn("child-cjk", prompt));
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(text_utils.repeat("\u{4e2d}\u{20000}", 34), try testString(record, "task"));
+    try std.testing.expectEqual(@as(i64, prompt.len), try testInt(record, "task_bytes"));
+}
+
+test "trace subagent task is left out when the ring keeps none of the prompt" {
+    const prompt = text_utils.repeat("Q7Z3", 70);
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var trace, const record = try testTaskRecord(w, testRingTurn("child-token", prompt));
+    defer trace.deinit();
+    try expectAbsent(record, "task");
+    try std.testing.expectEqual(@as(i64, prompt.len), try testInt(record, "task_bytes"));
+}
+
+/// Writes a subagent whose name, model, and effort are fuzzed filler, and
+/// whose task, title, status row, and failure reason hold each planted secret
+/// across the cut of the turn ring or of the trace. Checks that every record
+/// is one JSON line, that no record shows part of a secret, and what a reader
+/// gets back.
+fn checkSubagentText(fuzzed: []const u8) !void {
+    // Where each secret crosses the cut, and what is around it, follow
+    // from the input.
+    var choices = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, fuzzed));
+    const choice = choices.random();
+    for (planted_secrets) |secret| {
+        const w = try TestWriter.create();
+        defer w.destroy();
+        const a = w.records.arena;
+        const inside = 1 + choice.uintLessThan(usize, secret.text.len);
+        const separator = planted_separators[choice.uintLessThan(usize, planted_separators.len)];
+        const words = try subagentFiller(a, fuzzed, subagent_text_max_bytes);
+        const prompt = try plantAcross(a, words, secret.text, separator, ring_prompt_bytes, inside);
+        const text = try plantAcross(a, words, secret.text, separator, subagent_text_max_bytes, inside);
+        const name = try subagentFiller(a, fuzzed, fuzzed.len);
+        const registry = [_]subagent_tool_host.Runtime.TraceChild{
+            .{ .id = try a.dupe(u8, "child-fuzz"), .phase = .running, .last_outcome = .failed, .last_failure = text, .closing = false },
+        };
+        var row = testSubagentRow("child-fuzz", name);
+        row.title = text;
+        row.status = text;
+        row.model = name;
+        row.effort = name;
+        const turn = testRingTurn("child-fuzz", prompt);
+        // The ring keeps a start of the prompt that fits.
+        try std.testing.expect(std.mem.startsWith(u8, prompt, turn.prompt()));
+        try std.testing.expect(turn.prompt().len <= ring_prompt_bytes);
+        try writeSubagentRecords(&w.records, .{ .rows = &.{row}, .registry = &registry, .turns = &.{turn}, .turns_total = 1 });
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, w.out.written(), "\n"));
+
+        var trace = try w.trace();
+        defer trace.deinit();
+        try expectNoPlantedSecret(&trace);
+        const ta = trace.arena.allocator();
+        const record = try trace.one("subagent");
+        inline for (.{ "name", "model", "effort" }) |field| {
+            if (name.len == 0) {
+                try expectAbsent(record, field);
+            } else {
+                try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, name), try testString(record, field));
+            }
+        }
+        const masked = try text_utils.maskSecrets(ta, text);
+        const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
+        inline for (.{ "last_reason", "title", "status" }) |field| {
+            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, kept), try testString(record, field));
+            if (kept.len < masked.len) {
+                try std.testing.expectEqual(@as(i64, @intCast(masked.len)), try testInt(record, field ++ "_bytes"));
+            } else try expectAbsent(record, field ++ "_bytes");
+        }
+        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, turn.prompt()), subagent_text_max_bytes);
+        if (task.len == 0) {
+            // The ring kept nothing, such as a first word that holds a URL.
+            try expectAbsent(record, "task");
+        } else {
+            try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, task), try testString(record, "task"));
+        }
+        try std.testing.expectEqual(@as(i64, @intCast(prompt.len)), try testInt(record, "task_bytes"));
+        try std.testing.expectEqual(@as(i64, 1), try testInt(try trace.one("subagent_turn"), "subagent_id"));
+    }
+}
+
+fn fuzzSubagentText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try checkSubagentText(buffer[0..len]);
+}
+
+test "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text" {
+    try std.testing.fuzz({}, fuzzSubagentText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "plain text",
+            "two\nlines\r\n\ttabbed",
+            "\x1b[31mred\x1b[0m\x7f\xc2\x85",
+            "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
+            "token=\"open quote and spaces " ++ text_utils.repeat("\xc3\xa9", 210),
+        }) ++ @import("fuzz_corpus").subagent_task_line.*),
+    });
 }
 
 test "trace tool calls name why an MCP server refused the parameters" {

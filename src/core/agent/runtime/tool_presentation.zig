@@ -1181,10 +1181,7 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
         .object => |object| object,
         else => return false,
     };
-    const object = if (outer.get("request")) |request| switch (request) {
-        .object => |value| value,
-        else => return false,
-    } else outer;
+    const object = (try tool_args.unwrapRequest(parsed.arena.allocator(), outer)) orelse return false;
     const action = switch (object.get("action") orelse return false) {
         .string => |value| value,
         else => return false,
@@ -3263,6 +3260,27 @@ test "cancelled command ignores malformed artifact metadata" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expect(terminal.command_artifact_handle == null);
+}
+
+test "a shell wait is read from top-level arguments and from either request wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { arguments_json: []const u8, wait: bool }{
+        .{ .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-1\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":{\"action\":\"wait\",\"session_id\":\"shell-1\"}}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\",\\\"session_id\\\":\\\"shell-1\\\"}\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\"}\"}", .wait = false },
+        .{ .arguments_json = "{\"request\":\"[\\\"wait\\\"]\"}", .wait = false },
+        .{ .arguments_json = "not json", .wait = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.wait, try isShellWaitCall(arena, .{
+            .id = "shell-wait",
+            .name = "shell",
+            .arguments_json = case.arguments_json,
+        }));
+    }
 }
 
 test "cancelled shell wait names the observation instead of the process" {

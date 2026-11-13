@@ -33,6 +33,9 @@ pub const StepBatchState = struct {
     /// `step_had_writes`, a write or edit that failed does not count.
     step_changed_files: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
+    /// What the step's tools told the model on their own, held until the step's
+    /// results are in (`appendToolNotice`). Drained after `pending_user_suffix`.
+    pending_notices: std.ArrayList(ChatMessage) = .empty,
     /// Turn-scoped identical-failure tracker owned by the orchestrator step
     /// loop. Null disables escalation (tests and non-turn callers).
     identical_failure_escalation: ?*runtime_tool_admission.IdenticalFailureEscalationState = null,
@@ -131,6 +134,32 @@ pub fn appendPermissionFeedback(
     }
 }
 
+/// Holds a notice a tool handed the model, such as Vision's when it could not
+/// read an image, until every result of the step is in. It joins the turn as
+/// fx's own message, `recovery_prompt`, so the saved turn keeps it. A saved turn
+/// counts steering only at a step's boundary, after the step's results and
+/// their permission feedback, so the notice waits for that boundary. Appended
+/// right after its own result it would sit between two results, the save would
+/// end the step there and drop the later results, and the next request would
+/// put the notice after both. The notes the step's calls queue join before it
+/// at the next step (`insertBoundaryNotes` in the orchestrator), as they do
+/// before any steering. An empty notice says nothing, so none is held.
+pub fn appendToolNotice(
+    arena: Allocator,
+    batch: *StepBatchState,
+    notice: []const u8,
+) !void {
+    if (notice.len == 0) return;
+    try batch.pending_notices.append(arena, .{
+        .role = .user,
+        // The tool's own text may be freed with its result before the step ends.
+        .content = try arena.dupe(u8, notice),
+        .recovery_prompt = true,
+    });
+}
+
+/// Adds what the step held to the turn: the permission feedback of its calls,
+/// then its tools' notices, the order a saved turn restores them in.
 pub fn drainPendingUserSuffix(
     arena: Allocator,
     batch: *StepBatchState,
@@ -138,6 +167,8 @@ pub fn drainPendingUserSuffix(
 ) !void {
     try within_turn_suffix.appendSlice(arena, batch.pending_user_suffix.items);
     batch.pending_user_suffix.clearRetainingCapacity();
+    try within_turn_suffix.appendSlice(arena, batch.pending_notices.items);
+    batch.pending_notices.clearRetainingCapacity();
 }
 
 pub fn reserveCommittedFileBookkeeping(
@@ -571,6 +602,45 @@ test "appendPermissionFeedback marks typed approval feedback" {
         "call_permission",
         batch.pending_user_suffix.items[0].tool_call_id.?,
     );
+}
+
+test "a tool's notice waits for every result of its step and follows the permission feedback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var batch = StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const calls = [_]ToolCall{
+        .{ .id = "call_first", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "call_second", .name = "vision", .arguments_json = "{}" },
+    };
+    try appendAssistantToolCallStep(arena, &suffix, null, &calls, null);
+
+    // The first call raises the notice and the second gets feedback; neither
+    // reaches the turn until both results are in.
+    const freed_with_its_result = try arena.dupe(u8, "notice from the first call");
+    try appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, calls[0], "first result", null, .{});
+    try appendToolNotice(arena, &batch, freed_with_its_result);
+    @memset(freed_with_its_result[0..], 'x');
+    try appendToolNotice(arena, &batch, "");
+    try appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, calls[1], "second result", null, .{});
+    try appendPermissionFeedback(arena, &batch, calls[1].id, &.{"feedback for the second call"});
+    try std.testing.expectEqual(@as(usize, 3), suffix.items.len);
+
+    try drainPendingUserSuffix(arena, &batch, &suffix);
+    try std.testing.expectEqual(@as(usize, 5), suffix.items.len);
+    try std.testing.expectEqualStrings("second result", suffix.items[2].content.?);
+    try std.testing.expect(suffix.items[3].permission_feedback and !suffix.items[3].recovery_prompt);
+    try std.testing.expectEqualStrings("feedback for the second call", suffix.items[3].content.?);
+    // fx's own message, whose text the tool no longer owns.
+    try std.testing.expectEqual(types.ChatRole.user, suffix.items[4].role);
+    try std.testing.expect(suffix.items[4].recovery_prompt and !suffix.items[4].permission_feedback);
+    try std.testing.expectEqualStrings("notice from the first call", suffix.items[4].content.?);
+
+    // A step drains once.
+    try drainPendingUserSuffix(arena, &batch, &suffix);
+    try std.testing.expectEqual(@as(usize, 5), suffix.items.len);
 }
 
 test "drained batch feedback follows all tool results and keeps its source call" {
