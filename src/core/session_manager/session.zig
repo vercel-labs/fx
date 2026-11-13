@@ -1659,6 +1659,12 @@ pub fn readBlob(env: *const Env, gpa: std.mem.Allocator, id_: []const u8, hash: 
     defer s.closeDir(dir);
     const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
     defer s.closeDir(blobs);
+    return readBlobIn(s, blobs, gpa, hash);
+}
+
+/// `readBlob` within a session's open blobs folder. The caller owns the
+/// result.
+fn readBlobIn(s: storage.Storage, blobs: storage.Dir, gpa: std.mem.Allocator, hash: []const u8) BlobError![]u8 {
     const file = s.openFile(blobs, hash, .read_only) catch |err| return notFoundOr(err);
     defer s.closeFile(file);
     const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
@@ -1680,6 +1686,11 @@ pub fn blobExists(env: *const Env, id_: []const u8, hash: []const u8) (error{Not
     defer s.closeDir(dir);
     const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
     defer s.closeDir(blobs);
+    return blobFileIn(s, blobs, hash);
+}
+
+/// `blobExists` within a session's open blobs folder.
+fn blobFileIn(s: storage.Storage, blobs: storage.Dir, hash: []const u8) (error{NotFound} || storage.IoFault)!void {
     const st = s.stat(blobs, hash) catch |err| return notFoundOr(err);
     if (st.kind != .file) return error.NotFound;
 }
@@ -2331,11 +2342,18 @@ pub const VerifyOptions = struct {
     /// Asked before each line; when it says stop, the check ends there and
     /// `Verified.stopped_at` names the line.
     stop: ?Stop = null,
+};
 
-    pub const Stop = struct {
-        context: *anyopaque,
-        requested: *const fn (context: *anyopaque) bool,
-    };
+/// Asked between the steps of a long read, such as `verifySessionWith`;
+/// true ends the read there.
+pub const Stop = struct {
+    context: *anyopaque,
+    requested: *const fn (context: *anyopaque) bool,
+
+    pub fn now(stop: ?Stop) bool {
+        const s = stop orelse return false;
+        return s.requested(s.context);
+    }
 };
 
 /// The blobs folder of the session being verified, opened on first use, and
@@ -2381,28 +2399,19 @@ const BlobChecker = struct {
             },
         };
         switch (c.mode) {
-            .exists => {
-                const st = c.s.stat(blobs, hash) catch |err| switch (err) {
-                    error.NotFound => return false,
-                    else => return error.Io,
-                };
-                return st.kind == .file;
+            .exists => blobFileIn(c.s, blobs, hash) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => |e| return e,
             },
             .hash => {
-                const file = c.s.openFile(blobs, hash, .read_only) catch |err| switch (err) {
-                    error.NotFound => return false,
-                    else => return error.Io,
+                const bytes = readBlobIn(c.s, blobs, gpa, hash) catch |err| switch (err) {
+                    error.NotFound, error.Corrupt => return false,
+                    else => |e| return e,
                 };
-                defer c.s.closeFile(file);
-                const len = c.s.length(file) catch |io_err| return storage.ioFault(io_err);
-                if (len > max_blob_bytes) return false;
-                const bytes = try gpa.alloc(u8, @intCast(len));
-                defer gpa.free(bytes);
-                if ((c.s.readAt(file, bytes, 0) catch |io_err| return storage.ioFault(io_err)) != bytes.len) return error.Io;
-                const actual = schema.blobHash(bytes);
-                return std.mem.eql(u8, &actual, hash);
+                gpa.free(bytes);
             },
         }
+        return true;
     }
 };
 
@@ -2435,10 +2444,10 @@ pub fn verifySessionWith(env: *const Env, id_: []const u8, options: VerifyOption
     var result: Verified = .{ .lines = 0, .damaged_at = null, .bad_snapshots = 0 };
     var fork_seq: u64 = 0;
     while (true) {
-        if (options.stop) |stop| if (stop.requested(stop.context)) {
+        if (Stop.now(options.stop)) {
             result.stopped_at = reader.buf_offset + reader.pos;
             break;
-        };
+        }
         const line = (reader.next() catch |err| switch (err) {
             error.Corrupt => {
                 result.damaged_at = reader.damaged_at;

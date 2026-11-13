@@ -1124,7 +1124,7 @@ pub const DoctorOptions = struct {
     blobs: @FieldType(sm.VerifyOptions, "blobs") = .hash,
     /// When it says stop, the session being checked and the ones after it
     /// are counted in `Doctor.unfinished`, not checked.
-    stop: ?sm.VerifyOptions.Stop = null,
+    stop: ?sm.Stop = null,
     /// Told before each session's check, with how many are done and how
     /// many will be checked, so a long check can show where it is.
     progress: ?Progress = null,
@@ -1135,8 +1135,7 @@ pub const DoctorOptions = struct {
     };
 
     fn stopRequested(options: DoctorOptions) bool {
-        const stop = options.stop orelse return false;
-        return stop.requested(stop.context);
+        return sm.Stop.now(options.stop);
     }
 
     fn tell(options: DoctorOptions, done: usize, total: usize) void {
@@ -1204,10 +1203,9 @@ pub fn doctorWith(store: *Store, alloc: Allocator, options: DoctorOptions) !Doct
     }
     options.tell(to_check.items.len, to_check.items.len);
     const limit = options.limit -| report.unfinished;
-    const v1_stop: ?v1_conversion.Stop = if (options.stop) |stop| .{ .context = stop.context, .requested = stop.requested } else null;
-    try doctorV1(store, alloc, &report, limit, v1_stop);
+    try doctorV1(store, alloc, &report, limit, options.stop);
     var kept_complete = true;
-    report.kept_children = try keptChildrenUntil(store, alloc, v1_stop, &kept_complete);
+    report.kept_children = try keptChildrenUntil(store, alloc, options.stop, &kept_complete);
     if (!kept_complete) report.v1_incomplete = true;
     for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
     try store.sweepFiles(alloc, &report, options.now_ms, options.orphans);
@@ -1217,7 +1215,7 @@ pub fn doctorWith(store: *Store, alloc: Allocator, options: DoctorOptions) !Doct
 /// Counts the roots an older fx saved that v2 does not hold yet, and names
 /// each checked one that can't be converted with what `fx session recover`
 /// copies of it (D73). Reads only; a busy family is left out.
-fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize, stop: ?v1_conversion.Stop) !void {
+fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize, stop: ?sm.Stop) !void {
     var complete = true;
     defer if (!complete) {
         report.v1_incomplete = true;
@@ -1234,10 +1232,10 @@ fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize, stop
         alloc.free(roots);
     }
     for (roots) |root| {
-        if (stop) |s| if (s.requested(s.context)) {
+        if (sm.Stop.now(stop)) {
             complete = false;
             break;
-        };
+        }
         if (store.manager.peek(alloc, root.id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -4704,7 +4702,7 @@ fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
 }
 
 /// `keptChildren`, ended early when `stop` says so; `complete` is then false.
-fn keptChildrenUntil(store: *Store, alloc: Allocator, stop: ?v1_conversion.Stop, complete: *bool) ![]KeptChild {
+fn keptChildrenUntil(store: *Store, alloc: Allocator, stop: ?sm.Stop, complete: *bool) ![]KeptChild {
     const strays = v1_conversion.strayChildrenUntil(alloc, store.home, stop, complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {

@@ -609,17 +609,20 @@ describe("fx doctor MCP", () => {
     const hang = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, fetch: () => new Promise<Response>(() => {}) });
     cleanups.push(() => hang.stop(true));
     writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { slow: { type: "http", url: `http://127.0.0.1:${hang.port}/mcp` } } }));
-    for (const args of ["", " --json"]) {
+    // At 30 columns the notice is longer than a row, so doctor cuts it to
+    // one row, and erasing it leaves no fragment.
+    for (const [args, width] of [["", 120], ["", 30], [" --json", 120]] as const) {
       // The word after doctor ends marks the end of its output, which a
       // narrow pane can wrap.
       const cmd = `/bin/sh -c ${JSON.stringify(`${JSON.stringify(FX_BIN)} doctor${args}; echo DOCTOR-ENDED`)}`;
-      const session = await TmuxSession.create({ cmd, cwd: r.workspace, env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "2000" }), remainOnExit: true });
+      const session = await TmuxSession.create({ cmd, cwd: r.workspace, env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "2000" }), remainOnExit: true, width });
       try {
         // The slow server holds doctor for its whole 2 s limit.
-        if (!args) await session.waitForText("checking 1 MCP server (up to 2 s)...", 10_000);
+        if (!args) await session.waitForText(width === 120 ? "checking 1 MCP server (up to 2 s)..." : "checking 1 MCP server (up to", 10_000);
         await session.waitForText("DOCTOR-ENDED", 15_000);
         const screen = await session.captureFullScrollback();
         expect(screen).not.toContain("checking ");
+        expect(screen).not.toContain("(up to");
         if (!args) expect(screen).toContain("fx doctor");
       } finally {
         await session.kill();

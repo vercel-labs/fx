@@ -133,20 +133,19 @@ pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
     return rootIdsUntil(alloc, home, null, &complete);
 }
 
-/// Asked before each folder a scan reads; true ends the scan there.
-pub const Stop = struct {
-    context: *anyopaque,
-    requested: *const fn (context: *anyopaque) bool,
+/// Whether `stop`, null or an optional value with `context` and
+/// `requested` such as the session manager's `Stop`, says to end a scan.
+/// Only the session adapter imports the session manager, so the type is
+/// left to the caller.
+fn stopNow(stop: anytype) bool {
+    if (@TypeOf(stop) == @TypeOf(null)) return false;
+    const s = stop orelse return false;
+    return s.requested(s.context);
+}
 
-    fn now(stop: ?Stop) bool {
-        const s = stop orelse return false;
-        return s.requested(s.context);
-    }
-};
-
-/// `rootIds`, ended early when `stop` says so; `complete` is then false and
+/// `rootIds`, ended early when `stop`, asked before each folder, says so; `complete` is then false and
 /// the roots are those read before it.
-pub fn rootIdsUntil(alloc: Allocator, home: []const u8, stop: ?Stop, complete: *bool) ![]Root {
+pub fn rootIdsUntil(alloc: Allocator, home: []const u8, stop: anytype, complete: *bool) ![]Root {
     complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
@@ -157,7 +156,7 @@ pub fn rootIdsUntil(alloc: Allocator, home: []const u8, stop: ?Stop, complete: *
     }
     var candidates = store.readOnlyCandidates();
     while (true) {
-        if (Stop.now(stop)) {
+        if (stopNow(stop)) {
             complete.* = false;
             break;
         }
@@ -212,7 +211,7 @@ pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
 
 /// `strayChildren`, ended early when `stop` says so; `complete` is then
 /// false and the children are those found before it.
-pub fn strayChildrenUntil(alloc: Allocator, home: []const u8, stop: ?Stop, complete: *bool) ![]Stray {
+pub fn strayChildrenUntil(alloc: Allocator, home: []const u8, stop: anytype, complete: *bool) ![]Stray {
     complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
@@ -223,7 +222,7 @@ pub fn strayChildrenUntil(alloc: Allocator, home: []const u8, stop: ?Stop, compl
     }
     var candidates = store.readOnlyCandidates();
     while (true) {
-        if (Stop.now(stop)) {
+        if (stopNow(stop)) {
             complete.* = false;
             break;
         }

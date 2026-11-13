@@ -47,6 +47,7 @@ pub const Direction = session_mod.Direction;
 pub const ForkPoint = session_mod.ForkPoint;
 pub const Verified = session_mod.Verified;
 pub const VerifyOptions = session_mod.VerifyOptions;
+pub const Stop = session_mod.Stop;
 pub const Summary = catalog_mod.Summary;
 pub const ListPage = catalog_mod.Page;
 pub const ListCursor = catalog_mod.Cursor;

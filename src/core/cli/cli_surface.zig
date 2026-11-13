@@ -4463,6 +4463,16 @@ fn stdoutIsTerminal() bool {
     return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
 }
 
+/// The width of the terminal on doctor's stderr, so a progress line fits on
+/// one row; null when it cannot be read.
+fn stderrColumns() ?usize {
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
+    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
+    if (std.c.ioctl(std.posix.STDERR_FILENO, req, &ws) == -1 or ws.col == 0) return null;
+    return ws.col;
+}
+
 /// The local checks with the probe checks after them. The provider's answer
 /// replaces the local auth line, which only saw a credential; a credential
 /// the provider was asked about and never answered for is not confirmed.
@@ -4501,6 +4511,7 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         .enabled = opts.format == .text and !builtin.is_test and stderrIsTerminal(),
         .erase = !terminal_env.dumbTerminal(),
     };
+    if (progress.enabled) progress.columns = stderrColumns();
     // Never leaves a progress line above the report, or above an error.
     defer progress.clear();
     if (progress.erase) progress.line("checking fx setup...\n");
@@ -4514,7 +4525,6 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         mcp_inspection.profile_diagnostic,
         mcp_inspection.snapshot.configuration_issues,
         .{
-            .slow_checks = .later,
             .version = cfg.version,
             .channel = cfg.build_channel.label(),
             .skill_root_policy = cfg.skill_root_policy,
@@ -4535,10 +4545,6 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         for (state_checks.items) |*entry| entry.deinit(alloc);
         state_checks.deinit(alloc);
     }
-    // The skills check reads every installed skill, which can take seconds,
-    // so it runs while the network checks do.
-    progress.rewrite("checking skills...");
-    const skill_result: anyerror!void = doctor_runtime.appendSkillChecks(&state_checks, alloc, workspace_root, cfg.skill_root_policy);
     var stop: DoctorSessionStop = .{ .deadline = if (opts.deep) null else probes.deadline, .probes = if (opts.deep) null else &probes };
     const state_options: doctor_runtime.StateOptions = .{
         .orphans = if (opts.fix) .remove else .count,
@@ -4549,13 +4555,12 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     };
     // Plain doctor checks the sessions while the network checks run, within
     // their deadline. `--deep` has no limit, so it checks them after.
-    const state_result: anyerror!void = if (opts.deep) {} else doctor_runtime.appendStateChecksWith(&state_checks, alloc, state_options);
+    const state_result: anyerror!void = if (opts.deep) {} else doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
     // Runs on every path, so nothing doctor started outlives it.
     if (probes.wait()) |sig| doctor_probes.endBySignal(sig);
     try started;
-    try skill_result;
     try state_result;
-    if (opts.deep) try doctor_runtime.appendStateChecksWith(&state_checks, alloc, state_options);
+    if (opts.deep) try doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
     progress.clear();
 
     var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;
@@ -4612,13 +4617,17 @@ const DoctorSessionStop = struct {
 
 /// What doctor is doing, on a terminal's stderr while it works: whole lines,
 /// then one line it rewrites in place. `clear` erases them all, so the
-/// report starts on a clean screen. Pipes and unit tests get none of it, and
+/// report starts on a clean screen. Each line is cut to fit one row, since
+/// `clear` erases one row per line. Pipes and unit tests get none of it, and
 /// a `TERM=dumb` terminal, which cannot move the cursor, gets only the whole
 /// lines, which stay.
 const DoctorProgress = struct {
     deps: RunDeps,
     enabled: bool,
     erase: bool,
+    /// The terminal's width, when known. The lines are ASCII, so a byte is
+    /// a column.
+    columns: ?usize = null,
     /// Whole lines written since the last `clear`.
     lines: usize = 0,
     /// Whether the cursor is at the end of a line `rewrite` wrote.
@@ -4628,15 +4637,22 @@ const DoctorProgress = struct {
     fn line(self: *DoctorProgress, text: []const u8) void {
         if (!self.enabled) return;
         self.closeOpenLine();
-        self.write(text);
+        self.write(self.fit(text[0 .. text.len - 1]));
+        self.write("\n");
         self.lines += 1;
     }
 
     fn rewrite(self: *DoctorProgress, text: []const u8) void {
         if (!self.enabled or !self.erase) return;
         self.write(if (self.open_line) "\r\x1b[2K" else "");
-        self.write(text);
+        self.write(self.fit(text));
         self.open_line = true;
+    }
+
+    /// `text` cut short of the last column, so it never wraps.
+    fn fit(self: *const DoctorProgress, text: []const u8) []const u8 {
+        const columns = self.columns orelse return text;
+        return text[0..@min(text.len, columns -| 1)];
     }
 
     fn sessions(context: *anyopaque, done: usize, total: usize) void {
