@@ -532,6 +532,11 @@ test "an empty optional string is refused here, so only the decoder treats one a
     var profile = plain;
     profile.profile = "";
     try std.testing.expectError(error.InvalidProfile, validateRequest(alloc, .{ .message = profile }));
+    // The same holds for an agent: status takes one but does not need it, and
+    // stop and close do need it, so none of the three accepts an empty one here.
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .close = .{ .agent = "" } }));
 }
 
 test "a message with no optional fields is planned on every path, and a present one is not" {

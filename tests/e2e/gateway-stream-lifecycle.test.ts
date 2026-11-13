@@ -13961,11 +13961,18 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
   const startHeld = join(root.root, "start-held"), startRelease = join(root.root, "start-release");
   const tracePath = join(root.root, "trace.log");
   const emptyOptionalFields = options.emptyOptionalFields ?? false;
-  const state = { noteJoined: 0, noteTurns: 0, noteAnswer: "", startAnswer: "", trace: "" };
+  const state = { noteJoined: 0, noteTurns: 0, noteAnswer: "", startAnswer: "", statusAnswer: "", trace: "" };
   const release = () => { if (!existsSync(startRelease)) writeFileSync(startRelease, ""); };
   const gateway = startDynamicFakeGateway(async raw => {
     const body = JSON.parse(raw);
     const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    // With empty optional fields, main also asks for status with an empty agent
+    // once its note is answered. It does so before the report check, so a report
+    // that arrives early cannot skip the call.
+    if (emptyOptionalFields && raw.includes("startgap-status")) state.statusAnswer = toolResultText(raw, "startgap-status");
+    if (emptyOptionalFields && raw.includes("startgap-note") && !raw.includes("startgap-status")) {
+      return fakeGatewayToolCall("startgap-status", "subagent", { action: "status", agent: "" });
+    }
     if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STARTGAP_REPORT_SEEN");
     if (latest.includes("STARTGAP_NOTE")) {
       // A note after the task's final answer came in a turn of its own.
@@ -14041,9 +14048,14 @@ test("a message right after starting a subagent joins its first task", async () 
 test("a message whose optional fields are all empty starts a subagent, and a second one joins its work", async () => {
   // Both calls set instructions, report, model, effort, and profile to empty
   // strings. Each means the field is absent: the first message starts
-  // `worker`, and the second reaches it while it works, without
-  // `child_busy` for the instructions or `override_after_create` for the model.
+  // `worker`, and the second reaches it while it works. A present
+  // `instructions` would get `child_busy` there, and a present `model`
+  // `override_after_create`. A status call with an empty `agent` then lists
+  // the subagents, as it does with no `agent`.
   const { result, state, heldMarker } = await runStartGap("start-then-message-empty-fields", { releaseWhenWaiting: true, emptyOptionalFields: true });
+  expect(state.statusAnswer).toContain("\"ok\":true");
+  expect(state.statusAnswer).toContain("worker");
+  expect(state.statusAnswer).not.toContain("invalid_agent");
   expect(state.startAnswer).toContain("\"ok\":true");
   expect(state.startAnswer).toContain("Sent to worker, which works on it now");
   expect(heldMarker).toContain("start child=");

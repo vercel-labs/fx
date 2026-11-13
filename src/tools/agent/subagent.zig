@@ -172,7 +172,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     if (std.mem.eql(u8, action, "wait")) {
         problem.action = "wait";
         try rejectOutsideAction(request, &wait_fields, problem);
-        if (try optionalString(request, "agent", problem)) |agent| {
+        if (try optionalFilledString(request, "agent", problem)) |agent| {
             debug_trace.logf(
                 "subagent",
                 "wait ignored agent=\"{f}\": wait returns the next report from any subagent",
@@ -184,7 +184,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     if (std.mem.eql(u8, action, "status")) {
         problem.action = "status";
         try rejectOutsideAction(request, &status_fields, problem);
-        return .{ .status = .{ .agent = try optionalString(request, "agent", problem) } };
+        return .{ .status = .{ .agent = try optionalFilledString(request, "agent", problem) } };
     }
     if (std.mem.eql(u8, action, "stop")) {
         problem.action = "stop";
@@ -229,12 +229,13 @@ fn optionalString(
 
 /// An optional string, except that one set to an empty string is absent: it
 /// asks for nothing, so it means the same as a missing key, as an empty field
-/// does on an action that does not take it (`rejectOutsideAction`). Only zero
-/// bytes count, as in `tool_args.isEmptyArgumentValue`: a field of spaces is
-/// text, and `model_contract.validateRequest` still judges it. Validation and
-/// planning never see an empty optional string, so a message to a new, idle,
-/// or working subagent is not refused for one (`invalid_*`, `child_busy`,
-/// `override_after_create`).
+/// does on an action that does not take it (`rejectOutsideAction`). Use it for
+/// a field the action takes but does not need: the optional fields of
+/// `message`, and the `agent` of `status` and `wait`. Only zero bytes count, as
+/// in `tool_args.isEmptyArgumentValue`: a field of spaces is text, and
+/// `model_contract.validateRequest` still judges it. Validation and planning
+/// never see an empty optional string, so an empty field never decides what a
+/// message does on a new, idle, or working subagent.
 fn optionalFilledString(
     object: std.json.ObjectMap,
     key: []const u8,
@@ -483,12 +484,55 @@ test "decode ignores empty fields the action does not take" {
     try expectRequestTag("{\"action\":\"wait\",\"message\":\"\",\"instructions\":\"\",\"model\":\"\"}", .wait);
     try expectRequestTag("{\"action\":\"stop\",\"agent\":\"reviewer\",\"message\":\"\",\"report\":false}", .stop);
     try expectRequestTag("{\"action\":\"status\",\"profile\":\"\"}", .status);
+    try expectRequestTag("{\"action\":\"status\",\"agent\":\"\"}", .status);
     // Text, a true flag, or an unknown name still does not belong to the action.
     try expectCorrection("{\"action\":\"wait\",\"message\":\"x\"}", "unknown_field", "message does not apply to wait.");
     try expectCorrection("{\"action\":\"close\",\"agent\":\"reviewer\",\"report\":true}", "unknown_field", "report does not apply to close.");
     try expectCorrection("{\"action\":\"wait\",\"task\":\"\"}", "unknown_field", "task does not apply to wait.");
     // Fields beside a request wrapper are still rejected.
     try expectCorrection("{\"request\":{\"action\":\"wait\"},\"message\":\"\"}", "unknown_field", "message cannot sit beside request");
+}
+
+/// Decodes `args_json`, which must be an `action` request, and checks the agent
+/// it names: `expected`, or none. A refusal fails the test with its body in the
+/// string diff.
+fn expectAgentName(args_json: []const u8, action: model_contract.Action, expected: ?[]const u8) !void {
+    const alloc = std.testing.allocator;
+    const result = try decode(.{ .allocator = alloc }, args_json);
+    switch (result) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings("a request that decodes", body);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const request = input.as(Input).request;
+            try std.testing.expectEqual(action, request.action());
+            if (expected) |name| {
+                try std.testing.expectEqualStrings(name, request.agentName().?);
+            } else {
+                try std.testing.expect(request.agentName() == null);
+            }
+        },
+    }
+}
+
+test "an empty agent on status or wait means no agent, and a required agent is still refused" {
+    // `agent` is optional for status: with none it lists every subagent. An
+    // empty one asks for nothing more, so it is the same call.
+    try expectAgentName("{\"action\":\"status\"}", .status, null);
+    try expectAgentName("{\"action\":\"status\",\"agent\":\"\"}", .status, null);
+    try expectAgentName("{\"request\":{\"action\":\"status\",\"agent\":\"\"}}", .status, null);
+    try expectAgentName("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status, "reviewer");
+    // `wait` ignores its agent, so an empty one is the same call as none.
+    try expectAgentName("{\"action\":\"wait\",\"agent\":\"\"}", .wait, null);
+    // A present agent still has to be a name, and a field of spaces is not empty.
+    try expectDecodeFailure("{\"action\":\"status\",\"agent\":\"  \"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"status\",\"agent\":\"Not A Name\"}", "invalid_agent");
+    // stop and close need an agent, so an empty one is a mistake.
+    try expectDecodeFailure("{\"action\":\"stop\",\"agent\":\"\"}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"close\",\"agent\":\"\"}", "invalid_agent");
 }
 
 const optional_message_fields = [_][]const u8{ "instructions", "report", "model", "effort", "profile" };
