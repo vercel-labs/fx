@@ -220,6 +220,13 @@ pub const State = struct {
     /// Whether this run's start model is decided. Once the first check
     /// answers or the first prompt goes out, fx no longer changes the model.
     start_settled: bool = false,
+    /// Whether AI Gateway or the catalog's marks answered for the team in
+    /// this run. A saved answer alone does not count.
+    heard: bool = false,
+    /// Whether fx itself put the session on the Token Pass default.
+    fx_moved_to_default: bool = false,
+    /// Whether this run's transcript says Token Pass is active.
+    default_noted: bool = false,
 
     pub fn deinit(self: *State) void {
         self.lookup.deinit();
@@ -228,9 +235,20 @@ pub const State = struct {
     /// Ends this run's start-model decision: once the user chooses a model,
     /// fx no longer changes it, whatever the check answers later.
     pub fn settle(self: *State, reason: []const u8) void {
+        // A model the user chose never gets the Token Pass line.
+        self.fx_moved_to_default = false;
         if (self.start_settled) return;
         self.start_settled = true;
         debug_trace.logf("token_pass", "start model settled reason={s}", .{reason});
+    }
+
+    /// Whether the transcript can now say Token Pass is active: fx moved the
+    /// session to the Token Pass default, the session still runs it, and an
+    /// answer from this run, not only a saved one, says the team has a pass
+    /// after the check has finished. Written once per run.
+    fn shouldNoteDefault(self: *const State, check_running: bool, status_active: bool, model_is_default: bool) bool {
+        return !self.default_noted and !check_running and self.heard and status_active and
+            self.fx_moved_to_default and model_is_default;
     }
 
     /// Whether the session's first prompt waits for the running check: only
@@ -277,6 +295,8 @@ pub fn Runtime(comptime App: type) type {
             state.asked = named.asked;
             state.saved_as = named.saved_as;
             state.started_ms = null;
+            // Nothing in this run has answered for the new team yet.
+            state.heard = false;
             const saved: ?token_pass.Answer = if (io_mod.homeDir()) |home|
                 if (named.saved_as) |id| token_pass_memory.load(app.alloc, home, &id) else null
             else
@@ -314,6 +334,8 @@ pub fn Runtime(comptime App: type) type {
             if (answer) |fresh| record(app, fresh, "credits_check");
             debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
             try applyStartModel(app);
+            // A saved answer the check confirms leaves the model as it was.
+            try noteStartModel(app);
             // A check that failed leaves the start model open for another
             // answer, such as the catalog's, until the first prompt.
             if (answer != null) state.start_settled = true;
@@ -327,6 +349,9 @@ pub fn Runtime(comptime App: type) type {
             app.model_cache.observeTokenPassAnswer(answer, source);
             if (comptime !@hasField(App, "token_pass_check")) return;
             const state = &app.token_pass_check;
+            // Every source that records answers in this run; the saved answer
+            // arrives through `start`.
+            state.heard = true;
             if (state.answer == answer) return;
             state.answer = answer;
             if (state.saved_as) |id| if (io_mod.homeDir()) |home| saveAnswer(app.alloc, home, &id, answer);
@@ -342,6 +367,9 @@ pub fn Runtime(comptime App: type) type {
             record(app, .has_pass, token_pass_team.catalog_source);
             applyStartModel(app) catch |err| {
                 debug_trace.logf("token_pass", "start model not applied source=catalog err={s}", .{@errorName(err)});
+            };
+            noteStartModel(app) catch |err| {
+                debug_trace.logf("token_pass", "start model notice not written source=catalog err={s}", .{@errorName(err)});
             };
         }
 
@@ -395,7 +423,27 @@ pub fn Runtime(comptime App: type) type {
             // Token Pass credit pays only for standard speed; the built-in
             // default goes back to the speed the profile chose.
             try session_commands.Commands(App).adoptStartModel(app, agent, target, if (has_pass) false else seed.fast_mode);
-            if (has_pass) try app.writeDomainNotice(.{
+            state.fx_moved_to_default = has_pass;
+            if (!has_pass and state.default_noted) {
+                // The transcript said Token Pass is active; say what changed.
+                const body = try app.alloc.print("Token Pass is not active, so fx uses {s}. Change it with /model.", .{target});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body }, true);
+                state.default_noted = false;
+            }
+            try noteStartModel(app);
+        }
+
+        /// Says in the transcript that the session runs the Token Pass
+        /// default because the team has Token Pass, once that is known to be
+        /// true (`State.shouldNoteDefault`).
+        fn noteStartModel(app: *App) !void {
+            const state = &app.token_pass_check;
+            const model_is_default = std.mem.eql(u8, provider_runtime.modelOf(app, &app.main_agent), token_pass.default_model);
+            if (!state.shouldNoteDefault(state.lookup.task != null, app.model_cache.tokenPassStatus() == .active, model_is_default)) return;
+            state.default_noted = true;
+            debug_trace.logf("token_pass", "start model noted model={s}", .{token_pass.default_model});
+            try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .neutral,
                 .body = token_pass.default_model_notice,
@@ -481,4 +529,34 @@ test "token pass check: the first prompt waits only for an answer fx has not sav
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
     state = .{};
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
+}
+
+test "token pass check: the transcript says Token Pass is active only once it is known in this run" {
+    // fx moved the session to the Token Pass default, and this run's answer
+    // says the team has a pass.
+    var state: State = .{ .heard = true, .fx_moved_to_default = true };
+    try std.testing.expect(state.shouldNoteDefault(false, true, true));
+
+    // A saved answer alone, or a check still running, is not enough yet.
+    state.heard = false;
+    try std.testing.expect(!state.shouldNoteDefault(false, true, true));
+    state.heard = true;
+    try std.testing.expect(!state.shouldNoteDefault(true, true, true));
+
+    // No pass, or a session no longer on the Token Pass default.
+    try std.testing.expect(!state.shouldNoteDefault(false, false, true));
+    try std.testing.expect(!state.shouldNoteDefault(false, true, false));
+
+    // Once per run.
+    state.default_noted = true;
+    try std.testing.expect(!state.shouldNoteDefault(false, true, true));
+
+    // A model the user chose never gets the line.
+    state = .{ .heard = true, .fx_moved_to_default = true };
+    state.settle("model_choice");
+    try std.testing.expect(!state.shouldNoteDefault(false, true, true));
+    // Even when the start model was already settled by the first prompt.
+    state = .{ .heard = true, .fx_moved_to_default = true, .start_settled = true };
+    state.settle("model_choice");
+    try std.testing.expect(!state.shouldNoteDefault(false, true, true));
 }

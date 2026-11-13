@@ -3579,6 +3579,87 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("Keep going.");
       await session.waitForText("AFTER_CHECK_REPLY", 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash"]);
+      // Only a saved answer ever said the team has Token Pass, so the
+      // transcript never did.
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer the check says has ended moves the session back without saying Token Pass is active",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-ended-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".fx", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      gateway = startFakeGateway([fakeGatewayFinalText("ENDED_PASS_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false, 1_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // The team's pass has ended: the check's answer moves the session back
+      // to the built-in default before the first prompt.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      await session.waitForPane((pane) => pane.includes("grok-4.7"), 10_000);
+      await session.sendText("Use the built-in default.");
+      await session.waitForText("ENDED_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer the check confirms says Token Pass is active once",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-confirmed-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".fx", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      gateway = startFakeGateway([fakeGatewayFinalText("CONFIRMED_PASS_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => true, 1_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      const notice = "Token Pass is active, so fx uses deepseek/deepseek-v4.1-flash. Change it with /model.";
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+      await session.waitForText(notice, 10_000);
+      await session.sendText("Use the Token Pass default.");
+      await session.waitForText("CONFIRMED_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      expect((await session.captureFullScrollback()).split(notice).length - 1).toBe(1);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
