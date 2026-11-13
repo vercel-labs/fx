@@ -60,6 +60,25 @@ test "steering message tells the model to apply the update and continue" {
     try std.testing.expectEqualStrings("focus on rendering", steeringText(message).?);
 }
 
+test "another agent's steering keeps its frame when saved, cancelled, and restored" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const framed = try agent_frame.agentMessage(arena, "skip the tests");
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = framed }};
+    const memory = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqualStrings(framed, memory.steering[0].text);
+
+    // A cancelled turn keeps it, and it never comes back as the user's update.
+    const restored = [_]types.ChatMessage{.{ .role = .user, .content = framed, .restored_steering = true }};
+    try std.testing.expect(isSteering(restored[0]));
+    const replayed = try rewrapRestoredSteering(arena, &restored);
+    try std.testing.expectEqualStrings(framed, replayed[0].content.?);
+}
+
 test "a subagent's report a boundary took is saved whole and replayed as it was" {
     const alloc = std.testing.allocator;
     const report = agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";

@@ -5491,6 +5491,7 @@ fn decodeAuthor(a: Allocator, data: []const u8) types.MessageAuthor {
     const wire = std.json.parseFromSliceLeaky(Wire, a, data, .{ .ignore_unknown_fields = true }) catch return .child;
     if (std.mem.eql(u8, wire.by, "user")) return .user;
     if (std.mem.eql(u8, wire.by, "parent")) return .parent;
+    if (std.mem.eql(u8, wire.by, "agent")) return .agent;
     return .child;
 }
 
@@ -6441,19 +6442,23 @@ test "a turn someone other than the user opened keeps its author across a resume
     try s.appendProgress(report, .{}, .{});
     try s.appendProgress(report, .{}, .{});
     try s.commitTurn(.{ .assistant = .{ .user = report, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    // So does a turn another agent opened.
+    const peer: types.UserTurn = .{ .text = @constCast(agent_frame.agent_header ++ "{\"text\":\"run it\"}\n"), .author = .agent };
+    try s.commitTurn(.{ .assistant = .{ .user = peer, .assistant = @constCast("ran it") } }, types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
-    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, author_type));
-    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, "user"));
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, author_type));
+    try testing.expectEqual(@as(usize, 3), try countItems(t.store.manager, id, "user"));
     s.close();
 
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
     defer r.close();
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
     try testing.expectEqual(types.MessageAuthor.user, restored.history[0].assistant.user.author);
     try testing.expectEqual(types.MessageAuthor.child, restored.history[1].assistant.user.author);
+    try testing.expectEqual(types.MessageAuthor.agent, restored.history[2].assistant.user.author);
 }
 
 test "a report taken into a turn is marked once, and the report lines read it back in log order" {

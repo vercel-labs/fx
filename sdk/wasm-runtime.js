@@ -442,7 +442,7 @@ function createRuntime(options) {
     steeringHandoff = false;
   }
 
-  function queueSteering(text, id = "") {
+  function queueSteering(text, id = "", author = "") {
     if (!steeringOpen) throw new Error("no prompt is running");
     const value = encoder.encode(text);
     if (value.length === 0) throw new TypeError("steering text cannot be empty");
@@ -452,7 +452,7 @@ function createRuntime(options) {
     if (steering.length >= maxSteeringMessages || value.length > maxSteeringQueueBytes - steeringBytes) {
       throw new Error("steering queue is full");
     }
-    steering.push({ id, value });
+    steering.push({ id, value, author });
     steeringBytes += value.length;
   }
 
@@ -465,17 +465,22 @@ function createRuntime(options) {
     return true;
   }
 
-  // Each message is its input id, a newline, then the text.
+  // Each message is its input id, a newline, its author, a newline, then the
+  // text. No author means the user.
   function steeringTake(outputPtr, outputCap) {
     const entry = steering[0];
     if (!entry) return 0;
     const output = checkedBytes(outputPtr, outputCap);
     const id = encoder.encode(entry.id);
-    const length = id.length + 1 + entry.value.length;
+    const author = encoder.encode(entry.author);
+    const textStart = id.length + 1 + author.length + 1;
+    const length = textStart + entry.value.length;
     if (!output || length > output.length) return -1;
     output.set(id, 0);
     output[id.length] = 10;
-    output.set(entry.value, id.length + 1);
+    output.set(author, id.length + 1);
+    output[textStart - 1] = 10;
+    output.set(entry.value, textStart);
     steering.shift();
     steeringBytes -= entry.value.length;
     return length;

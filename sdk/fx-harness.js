@@ -111,7 +111,7 @@ function fxTurn(turn, exited) {
   void result.catch(() => {});
   return {
     result,
-    steer: (text, id) => turn.steer(text, id),
+    steer: (text, id, options) => turn.steer(text, id, options),
     endForSteer: () => turn[engineInternals]?.endForSteer(),
     cancel: (options) => turn.cancel(options),
     async *[Symbol.asyncIterator]() {

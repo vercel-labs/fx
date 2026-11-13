@@ -245,8 +245,8 @@ export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: F
 export type FxTurnEvent =
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
-  /** Steering entering the turn as its model request carries it; `id` is the steer's id. */
-  | { type: "user_message"; text: string; id?: string }
+  /** Steering entering the turn as its model request carries it; `id` is the steer's id, and `author` is `"agent"` when another agent wrote it. */
+  | { type: "user_message"; text: string; id?: string; author?: "agent" }
   | { type: "tool_start"; id: string; name: string; input?: JsonValue; inputTruncated?: undefined; inputPreview?: undefined }
   /** A tool input over 64 KiB of JSON arrives as a prefix. The tool still receives complete arguments. */
   | { type: "tool_start"; id: string; name: string; input?: undefined; inputTruncated: true; inputPreview: string }
@@ -557,6 +557,8 @@ export interface FxEnginePromptOptions {
   onAmbiguous?: FxOnAmbiguous;
   /** With `persistence`: a time, in milliseconds since the epoch, after which the turn stops before its next model request with the stop reason `yielded`. The journal keeps it open, and the next `resume()` continues it without telling the model it was interrupted. */
   yieldAt?: number;
+  /** Who wrote the prompt. Defaults to `"user"`. See {@link FxAuthor}. */
+  author?: FxAuthor;
 }
 
 /** Options for an engine's `resume()`. */
@@ -573,6 +575,12 @@ export interface FxEngineTurnResult {
   usage: FxUsage;
 }
 
+/**
+ * Who wrote a steer. `"agent"` means another agent did, so the model reads the text as that agent's untrusted message
+ * and never as the user's, and fx's permission review doesn't count it as a request from the user.
+ */
+export type FxAuthor = "user" | "agent";
+
 /** A steer: resolves to `{ id }` once accepted, and carries the same `id` at once. */
 export type FxSteer = Promise<{ id: string; withdrawn?: true }> & { readonly id: string };
 
@@ -584,7 +592,7 @@ export interface FxEngineTurn {
   /** Stops the turn. `{ reason: "handoff" }` stores nothing more, so the next agent continues it; it needs persistence. */
   cancel(options?: { reason?: "handoff" }): void;
   /** Appends guidance at the next safe model boundary. */
-  steer(input: FxSteeringInput, id?: string): FxSteer;
+  steer(input: FxSteeringInput, id?: string, options?: { author?: FxAuthor }): FxSteer;
   /** Takes a steer back before the model sees it. */
   withdraw(id: string): Promise<"withdrawn" | "already_placed">;
   [Symbol.asyncIterator](): AsyncIterator<FxTurnEvent>;
@@ -792,6 +800,8 @@ export interface FxSteerOptions {
    * with `FX_MESSAGE_ID_IN_USE`.
    */
   messageId?: string;
+  /** Who wrote the steer. Defaults to `"user"`. See {@link FxAuthor}. */
+  author?: FxAuthor;
 }
 
 /** What a durable session's `steer()` resolves to once the steer is stored. */
@@ -855,7 +865,8 @@ export interface FxResumeTurn extends FxTurnView<FxTurnResult | FxIdleResult> {
 /** One line of `session.stream()` or `turn.readable`, parsed from NDJSON. */
 export type FxStreamLine = (
   | (FxTurnEvent & { messageId: string })
-  | { type: "turn_start"; messageId: string; sessionId: string; input?: string }
+  /** `author` is `"agent"` when another agent's steer started the turn. */
+  | { type: "turn_start"; messageId: string; sessionId: string; input?: string; author?: "agent" }
   | { type: "turn_resume"; messageId: string; sessionId: string }
   | { type: "turn_yield"; messageId: string }
   | {

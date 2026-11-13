@@ -151,6 +151,9 @@ export async function steering(agent: FxEngine): Promise<void> {
       await turn.steer("Keep the public API backward compatible.");
     }
   }
+  await turn.steer("Stop after this step.", "steer_2", { author: "agent" });
+  // @ts-expect-error a steer's author is the user or another agent
+  turn.steer("Stop after this step.", "steer_3", { author: "parent" });
   const steer = turn.steer([{ type: "text", text: "Prefer small diffs." }], "steer_1");
   assertType<Equal<typeof steer.id, string>>();
   const { id } = await steer;

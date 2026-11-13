@@ -1647,13 +1647,14 @@ fn queueLibfxSteering(
     active: *ActiveSessionState,
     text: []const u8,
     input_id: ?[]const u8,
+    author: types.MessageAuthor,
 ) !void {
-    const id = input_id orelse return active.steering.enqueue(state.alloc, text);
+    const id = input_id orelse return active.steering.enqueueFrom(state.alloc, text, null, author);
     active.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer active.session_write_mutex.unlock(io_mod.getIo());
-    try active.steering.enqueueInput(state.alloc, text, id);
+    try active.steering.enqueueFrom(state.alloc, text, id, author);
     const journal = if (active.journal) |*value| value else return;
-    journal.append(alloc, active.session_id, .{ .input_accepted = .{ .id = id, .text = text } }) catch |err| {
+    journal.append(alloc, active.session_id, .{ .input_accepted = .{ .id = id, .text = text, .author = author } }) catch |err| {
         _ = active.steering.withdraw(state.alloc, id);
         return err;
     };
@@ -2376,7 +2377,14 @@ fn handleKernelSteer(
             .message = "Invalid input id",
         }),
     } else null;
-    queueLibfxSteering(state, alloc, active, text.string, input_id) catch |err| {
+    const author: types.MessageAuthor = if (parsed.value.object.get("author")) |value|
+        acp_types.hostAuthor(value) orelse return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid steering author",
+        })
+    else
+        .user;
+    queueLibfxSteering(state, alloc, active, text.string, input_id, author) catch |err| {
         return state.writer.writeError(alloc, msg.id, .{
             .code = switch (err) {
                 error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,

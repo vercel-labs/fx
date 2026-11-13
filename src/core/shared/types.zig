@@ -1786,6 +1786,9 @@ pub const MessageAuthor = enum {
     /// One of this agent's own subagents, reporting or messaging it. The
     /// sender frames the text, as `subagent/reports.zig` does.
     child,
+    /// Another agent, neither parent nor child, as a libfx host names it.
+    /// `agent_frame.agentMessage` frames the text.
+    agent,
 };
 
 pub const UserTurn = struct {
