@@ -7901,6 +7901,89 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 100_000);
 
+  test.skipIf(!tmuxAvailable())(
+    "a read_tool_result request the model wrote as JSON text reads the saved output",
+    async () => {
+      const root = createFixtureRoot("read-request-text");
+      const tracePath = join(root.root, "trace.log");
+      const stderrPath = join(root.root, "stderr.log");
+      const marker = "READ_TEXT_MATCH";
+      let step = 0;
+      let readOutput = "";
+      const gateway = startDynamicFakeGateway((body) => {
+        switch (step++) {
+          case 0:
+            return fakeGatewayToolCall("read-text-source", "shell", {
+              request: { action: "run", command: `printf '${marker} found\\n'`, profile: "clean", yield_time_ms: 30000 },
+            });
+          case 1: {
+            const source = JSON.parse(toolResultOutput(body, "read-text-source"));
+            expect(source.full_output_handle).toBeString();
+            return fakeGatewayToolCall("read-text-page", "read_tool_result", {
+              request: JSON.stringify({ handle: source.full_output_handle, query: marker }),
+            });
+          }
+          case 2:
+            readOutput = toolResultOutput(body, "read-text-page");
+            return fakeGatewayFinalText("READ_TEXT_COMPLETE");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+      let tui: TmuxSession | null = null;
+      try {
+        const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0" };
+        tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
+        await tui.waitForComposer(15000);
+        await tui.sendText("Run the fixture command, then search its output.");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
+        expect(pane).not.toContain("request failed:");
+        expect(pane).toContain("READ_TEXT_COMPLETE");
+        expect(readOutput).toContain(`${marker} found`);
+        expect(readOutput).not.toContain("must be an object");
+        // The row names the output it searches, as it does for an object request.
+        expect(pane).toContain(`output for "${marker}"`);
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(15000)).toBe(true);
+        tui = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        await tui?.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test("fx ask --json names the question of an ask_user_question call whose questions are JSON text", async () => {
+    const root = createFixtureRoot("ask-questions-text");
+    const tracePath = join(root.root, "trace.log");
+    const question = "Which path should the fixture take?";
+    let step = 0;
+    const gateway = startDynamicFakeGateway(() => {
+      if (step++ === 0) {
+        return fakeGatewayToolCall("question-text-1", "ask_user_question", {
+          questions: JSON.stringify([{ question, options: [{ label: "Inspect" }, { label: "Test" }] }]),
+        });
+      }
+      return fakeGatewayFinalText("QUESTION_TEXT_COMPLETE");
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Ask me which path to take."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      const calls = JSON.parse(result.stdout).tool_calls as Array<{ name: string; question?: string }>;
+      expect(calls.find((call) => call.name === "ask_user_question")?.question).toBe(question);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   for (const trigger of ["automatic", "manual"] as const) {
     test.skipIf(!tmuxAvailable())(
       `oversized result retrieval survives empty ${trigger} summary recovery and restart`,

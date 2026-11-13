@@ -3075,7 +3075,13 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const questions_value = parsed.value.object.get("questions") orelse return null;
+    var questions_value = parsed.value.object.get("questions") orelse return null;
+    // The tool reads the batch from JSON text too, so the record names the
+    // same question.
+    tool_args.normalizeCompositeArrayValue(parsed.arena.allocator(), &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (questions_value != .array or questions_value.array.items.len == 0) return null;
     const first = questions_value.array.items[0];
     if (first != .object) return null;
@@ -8415,6 +8421,30 @@ test "fx ask JSON records ask_user_question text for matching assertions" {
     const tool_call = parsed.value.object.get("tool_calls").?.array.items[0].object;
     try std.testing.expectEqualStrings("ask_user_question", tool_call.get("name").?.string);
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
+}
+
+test "fx ask JSON names the question of a batch sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const call = struct {
+        fn of(arguments_json: []const u8) ToolCall {
+            return .{ .id = "question", .name = "ask_user_question", .arguments_json = arguments_json };
+        }
+    }.of;
+
+    const text = (try questionTextForAskCall(alloc, call("{\"questions\":\"[{\\\"question\\\":\\\" Which path? \\\"}]\"}"))).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Which path?", text);
+
+    // Text that does not hold a batch names no question, including a batch
+    // encoded twice.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "[{\"question\":\"Twice?\"}]", .{});
+    for ([_][]const u8{ "not json", "{}", "[]", "[1]", twice }) |questions_text| {
+        const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = questions_text }, .{});
+        try std.testing.expect((try questionTextForAskCall(alloc, call(arguments_json))) == null);
+    }
 }
 
 test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
