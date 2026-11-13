@@ -4530,21 +4530,6 @@ fn stderrIsTerminal() bool {
     return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
 }
 
-/// Whether doctor's stdout is a terminal, so its report may use color.
-fn stdoutIsTerminal() bool {
-    return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
-}
-
-/// The width of the terminal on doctor's stderr, so a progress line fits on
-/// one row; null when it cannot be read.
-fn stderrColumns() ?usize {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    if (std.c.ioctl(std.posix.STDERR_FILENO, req, &ws) == -1 or ws.col == 0) return null;
-    return ws.col;
-}
-
 /// The local checks with the probe checks after them. The provider's answer
 /// replaces the local auth line, which only saw a credential; a credential
 /// the provider was asked about and never answered for is not confirmed.
@@ -4583,7 +4568,7 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         .enabled = opts.format == .text and !builtin.is_test and stderrIsTerminal(),
         .erase = !terminal_env.dumbTerminal(),
     };
-    if (progress.enabled) progress.columns = stderrColumns();
+    if (progress.enabled) progress.columns = terminal_env.stderrColumns();
     // Never leaves a progress line above the report, or above an error.
     defer progress.clear();
     if (progress.erase) progress.line("checking fx setup...\n");
@@ -4623,7 +4608,7 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         .blobs = if (opts.deep) .hash else .exists,
         .stop = .{ .context = &stop, .requested = DoctorSessionStop.requested },
         .progress = .{ .context = &progress, .report = DoctorProgress.sessions },
-        .limit_ms = if (opts.deep) 0 else deadline_ms,
+        .limit_ms = if (opts.deep) null else deadline_ms,
     };
     // Plain doctor checks the sessions while the network checks run, within
     // their deadline. `--deep` has no limit, so it checks them after.
@@ -4759,7 +4744,7 @@ const DoctorProgress = struct {
 
 fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
     if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
-    const color = !builtin.is_test and !terminal_env.colorDisabled() and stdoutIsTerminal();
+    const color = !builtin.is_test and !terminal_env.colorDisabled() and terminal_env.stdoutIsTerminal();
     const text = try snapshot.renderTextStyled(alloc, .{ .color = color });
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);

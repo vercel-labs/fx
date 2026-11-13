@@ -204,14 +204,9 @@ pub const Stray = struct {
 /// gone or already converted. A folder whose kind or parent cannot be read
 /// is left out; `rootIds` reports the first. Fails only when v1's sessions
 /// folder cannot be listed. Caller owns the result.
-pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
-    var complete = true;
-    return strayChildrenUntil(alloc, home, null, &complete);
-}
-
-/// `strayChildren`, ended early when `stop` says so; `complete` is then
-/// false and the children are those found before it.
-pub fn strayChildrenUntil(alloc: Allocator, home: []const u8, stop: anytype, complete: *bool) ![]Stray {
+/// Ended early when `stop`, asked before each folder, says so; `complete` is
+/// then false and the children are those found before it.
+pub fn strayChildren(alloc: Allocator, home: []const u8, stop: anytype, complete: *bool) ![]Stray {
     complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);

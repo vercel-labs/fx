@@ -400,9 +400,9 @@ pub const StateOptions = struct {
     blobs: @FieldType(session_adapter.DoctorOptions, "blobs") = .hash,
     stop: @FieldType(session_adapter.DoctorOptions, "stop") = null,
     progress: @FieldType(session_adapter.DoctorOptions, "progress") = null,
-    /// The limit `stop` enforces, in milliseconds, for the report; 0 when
+    /// The limit `stop` enforces, in milliseconds, for the report; null when
     /// there is none.
-    limit_ms: i64 = 0,
+    limit_ms: ?i64 = null,
 };
 
 /// Reports damaged sessions, and counts side folders whose session is gone
@@ -439,15 +439,15 @@ pub fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, option
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
     }
     if (report.unfinished > 0) {
-        const detail = if (options.limit_ms > 0)
-            try alloc.print("{d} of {d} session(s) were not checked to the end in doctor's {d} s limit; fx doctor --deep checks them all", .{ report.unfinished, report.checked + report.unfinished, @divCeil(options.limit_ms, 1000) })
+        const detail = if (options.limit_ms) |limit_ms|
+            try alloc.print("{d} of {d} session(s) were not checked to the end in doctor's {d} s limit; fx doctor --deep checks them all", .{ report.unfinished, report.checked + report.unfinished, @divCeil(limit_ms, 1000) })
         else
             try alloc.print("{d} session(s) were not checked to the end", .{report.unfinished});
         try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
     }
     if (report.v1_incomplete) {
-        const detail = if (options.limit_ms > 0)
-            try alloc.print("sessions saved by an older fx were not all read in doctor's {d} s limit; fx doctor --deep reads them all", .{@divCeil(options.limit_ms, 1000)})
+        const detail = if (options.limit_ms) |limit_ms|
+            try alloc.print("sessions saved by an older fx were not all read in doctor's {d} s limit; fx doctor --deep reads them all", .{@divCeil(limit_ms, 1000)})
         else
             try alloc.dupe(u8, "sessions saved by an older fx were not all read");
         try appendCheckOwned(checks, alloc, "sessions", .ok, detail);

@@ -4703,7 +4703,7 @@ fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
 
 /// `keptChildren`, ended early when `stop` says so; `complete` is then false.
 fn keptChildrenUntil(store: *Store, alloc: Allocator, stop: ?sm.Stop, complete: *bool) ![]KeptChild {
-    const strays = v1_conversion.strayChildrenUntil(alloc, store.home, stop, complete) catch |err| switch (err) {
+    const strays = v1_conversion.strayChildren(alloc, store.home, stop, complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("convert", "action=ChildrenUnlisted err={s}", .{@errorName(err)});

@@ -4262,11 +4262,12 @@ test("plain doctor only checks that each blob is there, --deep reads it, and the
     expect(deep.stderr).toBe("");
     expect(named(JSON.parse(deep.stdout).checks, "session")).toEqual([damaged]);
 
-    // Past doctor's limit, plain doctor says what it did not check, and
-    // --deep, which has no limit, still checks it.
-    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "1" }, timeoutMs: TIMEOUT };
+    // With a limit already over before the session check starts, plain
+    // doctor says what it did not check, and --deep, which has no limit,
+    // still checks it.
+    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "0" }, timeoutMs: TIMEOUT };
     const cut = JSON.parse((await runFx(["doctor", "--json"], limited)).stdout).checks;
-    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 1 s limit; fx doctor --deep checks them all");
+    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 0 s limit; fx doctor --deep checks them all");
     expect(named(cut, "session")).toEqual([]);
     const whole = JSON.parse((await runFx(["doctor", "--json", "--deep"], limited)).stdout).checks;
     expect(named(whole, "sessions").filter((line) => line.includes("not checked"))).toEqual([]);

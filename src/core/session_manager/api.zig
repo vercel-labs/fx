@@ -527,7 +527,7 @@ pub const Manager = struct {
     pub fn verifyWith(m: *Manager, id: []const u8, options: VerifyOptions) VerifyError!Verified {
         try checkId(id);
         if (!try readyToRead(m)) return error.NotFound;
-        return session_mod.verifySessionWith(&m.env, id, options) catch |err| switch (err) {
+        return session_mod.verifySession(&m.env, id, options) catch |err| switch (err) {
             error.NotFound, error.OutOfMemory => |e| e,
             error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion => error.Io,
             else => |io_err| storage.ioFault(io_err),

@@ -68,14 +68,14 @@ const check_share_divisor: i64 = 4;
 const gh_auth_required: u8 = 4;
 
 /// The one deadline for every probe. `FX_TEST_DOCTOR_DEADLINE_MS` shortens it
-/// for tests.
+/// for tests; 0 ends it at once, so a test sees every check the limit cuts.
 pub fn deadlineMs() i64 {
     return parseDeadlineMs(io_mod.getenv("FX_TEST_DOCTOR_DEADLINE_MS"));
 }
 
 fn parseDeadlineMs(raw: ?[]const u8) i64 {
     const value = std.fmt.parseInt(i64, raw orelse return default_deadline_ms, 10) catch return default_deadline_ms;
-    if (value <= 0 or value > max_test_deadline_ms) return default_deadline_ms;
+    if (value < 0 or value > max_test_deadline_ms) return default_deadline_ms;
     return value;
 }
 
@@ -906,11 +906,12 @@ test "a refused key never reads as accepted" {
     try std.testing.expectEqualStrings("fx login", checks.items[0].fix.?);
 }
 
-test "deadline override accepts only a bounded positive number" {
+test "deadline override accepts only a bounded number that is not negative" {
     try std.testing.expectEqual(default_deadline_ms, parseDeadlineMs(null));
+    try std.testing.expectEqual(@as(i64, 0), parseDeadlineMs("0"));
     try std.testing.expectEqual(@as(i64, 1), parseDeadlineMs("1"));
     try std.testing.expectEqual(max_test_deadline_ms, parseDeadlineMs("60000"));
-    for ([_][]const u8{ "0", "-1", "abc", "", "60001" }) |raw| {
+    for ([_][]const u8{ "-1", "abc", "", "60001" }) |raw| {
         try std.testing.expectEqual(default_deadline_ms, parseDeadlineMs(raw));
     }
     try std.testing.expectEqual(@as(i64, 1), seconds(1));

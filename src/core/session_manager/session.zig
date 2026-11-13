@@ -2344,7 +2344,7 @@ pub const VerifyOptions = struct {
     stop: ?Stop = null,
 };
 
-/// Asked between the steps of a long read, such as `verifySessionWith`;
+/// Asked between the steps of a long read, such as `verifySession`;
 /// true ends the read there.
 pub const Stop = struct {
     context: *anyopaque,
@@ -2418,12 +2418,8 @@ const BlobChecker = struct {
 /// Reads a whole log without its lock: every line's frame, checksum and
 /// seq, and every snapshot against the fold at its position (a snapshot is
 /// a cache that must equal what it replaces).
-pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
-    return verifySessionWith(env, id_, .{});
-}
-
-/// `verifySession`, with the blob check and the stop `options` choose.
-pub fn verifySessionWith(env: *const Env, id_: []const u8, options: VerifyOptions) OpenError!Verified {
+/// `options` choose the blob check and the stop.
+pub fn verifySession(env: *const Env, id_: []const u8, options: VerifyOptions) OpenError!Verified {
     const s = env.s;
     const gpa = env.gpa;
     if (!schema.validId(id_)) return error.NotFound;
@@ -3149,7 +3145,7 @@ const session_tests = struct {
         const fork_id = try gpa.dupe(u8, f.id());
         defer gpa.free(fork_id);
         try closeAndDestroy(f);
-        const verified = try session_mod.verifySession(&t.env, fork_id);
+        const verified = try session_mod.verifySession(&t.env, fork_id, .{});
         try testing.expectEqual(@as(?u64, null), verified.damaged_at);
         try testing.expectEqual(@as(u64, 0), verified.bad_snapshots);
 
