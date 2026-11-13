@@ -387,7 +387,8 @@ pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
 
 /// Returns error.KeychainItemNotFound when no sign-out is kept.
 pub fn loadOAuthPendingRevocations(alloc: std.mem.Allocator) Error!?[]u8 {
-    return loadMcpValueMacControlled(alloc, oauth_pending_revocations_service_name, null);
+    if (comptime builtin.target.os.tag == .macos) return loadMcpValueMacControlled(alloc, oauth_pending_revocations_service_name, null);
+    return error.UnsupportedPlatform;
 }
 
 pub fn storeOAuthPendingRevocations(value: []const u8) Error!void {
@@ -395,11 +396,13 @@ pub fn storeOAuthPendingRevocations(value: []const u8) Error!void {
     if (value.len == 0 or value.len > max_oauth_pending_revocations_bytes) {
         return error.KeychainWriteFailed;
     }
-    return storeMcpValueMac(oauth_pending_revocations_service_name, value);
+    if (comptime builtin.target.os.tag == .macos) return storeMcpValueMac(oauth_pending_revocations_service_name, value);
+    return error.UnsupportedPlatform;
 }
 
 pub fn deleteOAuthPendingRevocations(alloc: std.mem.Allocator) Error!bool {
-    return deleteMcpValueMac(alloc, oauth_pending_revocations_service_name);
+    if (comptime builtin.target.os.tag == .macos) return deleteMcpValueMac(alloc, oauth_pending_revocations_service_name);
+    return error.UnsupportedPlatform;
 }
 
 /// Returns error.KeychainItemNotFound when nothing was stored yet.

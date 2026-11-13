@@ -26,6 +26,7 @@ const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const leased_lock = @import("../shared/leased_lock.zig");
+const process_tree = @import("../execution/process_tree.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
@@ -59,6 +60,9 @@ const Files = struct {
 
 /// The fx login's marker file while its record is in the Keychain.
 const keychain_marker = "auth-revocations.keychain";
+
+/// What a warning adds when a sign-out's tokens are kept to revoke later.
+pub const retry_later = "fx will try again later";
 
 /// How long a sign-out stays kept. Its tokens have most likely expired at the
 /// provider by then.
@@ -118,14 +122,12 @@ fn processId() i64 {
     return std.c.getpid();
 }
 
-fn processAlive(pid: i64) bool {
+/// A zombie, an fx that exited before its parent reaped it, counts as gone.
+/// A check that fails counts as alive, so the lease still ends at its time.
+fn processAlive(alloc: Allocator, pid: i64) bool {
     if (comptime host_target.is_wasm or builtin.target.os.tag == .windows) return false;
     if (pid <= 0 or pid > std.math.maxInt(std.posix.pid_t)) return false;
-    std.posix.kill(@intCast(pid), @fromBackingInt(@intCast(0))) catch |err| return switch (err) {
-        error.ProcessNotFound => false,
-        else => true,
-    };
-    return true;
+    return process_tree.processIsAlive(alloc, @intCast(pid)) catch true;
 }
 
 /// One kept sign-out. Every field is owned; release it with `deinit`.
@@ -145,9 +147,9 @@ const Entry = struct {
     }
 
     /// Whether a live fx, this one included, is sending it now.
-    fn beingSent(self: Entry, now_ms: i64) bool {
+    fn beingSent(self: Entry, alloc: Allocator, now_ms: i64) bool {
         const lease = self.lease orelse return false;
-        return lease.until_ms > now_ms and processAlive(lease.pid);
+        return lease.until_ms > now_ms and processAlive(alloc, lease.pid);
     }
 
     fn init(alloc: Allocator, saved_at_ms: i64, tokens: Tokens) !Entry {
@@ -388,6 +390,8 @@ const Place = struct {
     parent: ?std.Io.Dir = null,
 
     fn of(source: Source) Place {
+        // libfx hosts keep logins themselves; the Keychain code is macOS-only.
+        if (comptime host_target.is_wasm) return .{ .source = source };
         const in_keychain = source == .fx_login and oauth_session.storesInKeychain();
         return .{ .source = source, .keychain = if (in_keychain) native_keychain_backend else null };
     }
@@ -617,7 +621,7 @@ fn retryAt(alloc: Allocator, place: Place, now_ms: i64, revoker: Revoker, before
         errdefer claimed.deinit(alloc);
         const lease: Lease = .mine(place.source, now_ms);
         for (list.entries.items) |*entry| {
-            if (entry.beingSent(now_ms)) continue;
+            if (entry.beingSent(alloc, now_ms)) continue;
             entry.lease = lease;
             try claimed.entries.append(alloc, try entry.clone(alloc));
             changed = true;
@@ -951,6 +955,30 @@ test "a sign-out whose sender is gone is sent at once" {
     const outcome = try retryAt(testing.allocator, place, 1_500, fake.revoker(), null);
     try testing.expectEqual(@as(usize, 1), outcome.revoked);
     try expectKept(place, &.{});
+}
+
+test "a sign-out whose sender exited but is not reaped yet is sent at once" {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const place = testPlace(&tmp, .codex);
+    // The child exits at once, and stays a zombie until it is waited for.
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer _ = child.wait(testing.io) catch {};
+    const pid: i64 = child.id.?;
+    var waited: usize = 0;
+    while (processAlive(testing.allocator, pid) and waited < 200) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
+    try testing.expect(!processAlive(testing.allocator, pid));
+    try keepAt(testing.allocator, place, .{ .refresh_token = "zombie" }, 1_000, .{ .pid = pid, .until_ms = 50_000 });
+    var fake: FakeRevoker = .{};
+    defer fake.deinit();
+    const outcome = try retryAt(testing.allocator, place, 1_500, fake.revoker(), null);
+    try testing.expectEqual(@as(usize, 1), outcome.revoked);
 }
 
 test "a retry leases what it sends, so a retry at the same time skips it" {

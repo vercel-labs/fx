@@ -46,7 +46,7 @@ const LogoutError = error{SessionDeleteFailed};
 pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
 /// `remote_revocation_warning`, when the session's tokens are kept and fx
 /// revokes them later (`pending_revocation`).
-pub const remote_revocation_retry_warning = remote_revocation_warning ++ " fx will try again later.";
+pub const remote_revocation_retry_warning = remote_revocation_warning ++ " " ++ pending_revocation.retry_later ++ ".";
 
 pub const LogoutResult = struct {
     session_deleted: bool = false,

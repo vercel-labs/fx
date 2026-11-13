@@ -40,6 +40,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -1670,7 +1671,7 @@ fn runNonInteractiveWithDeps(
                 };
                 if (outcome.revocation_failed) {
                     try writeStderr(deps, if (outcome.retry_kept)
-                        "fx logout: local Codex session removed, but remote revocation could not be confirmed; fx will try again later\n"
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
                     else
                         "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
                 } else {
@@ -1699,7 +1700,7 @@ fn runNonInteractiveWithDeps(
                 };
                 if (outcome.revocation_failed) {
                     try writeStderr(deps, if (outcome.retry_kept)
-                        "fx logout: local Grok session removed, but remote revocation could not be confirmed; fx will try again later\n"
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
                     else
                         "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
                 } else {

@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -425,7 +426,7 @@ pub fn Runtime(comptime App: type) type {
         fn writeRemoteRevocationWarning(app: *App, source: credentials.Source, retry_kept: bool) !void {
             const grok = "The local Grok session was removed, but remote revocation could not be confirmed.";
             const codex = "The local Codex session was removed, but remote revocation could not be confirmed.";
-            const retry_later = " fx will try again later.";
+            const retry_later = " " ++ pending_revocation.retry_later ++ ".";
             try writeAuthNotice(app, .{
                 .topic = "auth",
                 .tone = .warning,
