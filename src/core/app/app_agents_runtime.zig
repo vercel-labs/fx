@@ -2467,8 +2467,9 @@ pub fn Runtime(comptime App: type) type {
         /// dropped; a report stays owed in the log.
         ///
         /// One whose agent has not applied its finished turn yet is held, and
-        /// offered again once it has, so its prompt takes a history that has
-        /// the turn (`settleBeforeMail`). Posts behind it for the same agent
+        /// offered again once the agent's finish event is applied, so its
+        /// prompt takes a history that has the turn (`settleBeforeMail`, which
+        /// also settles a turn the agent's pacer still keeps). Posts behind it for the same agent
         /// wait with it, so that agent gets them in order; other agents' posts
         /// go on. An agent that is stopping holds nothing: its post fails as it
         /// always did. A held post ends in one of four ways: it is delivered;
@@ -2495,8 +2496,13 @@ pub fn Runtime(comptime App: type) type {
                 if (receiver) |target| {
                     const behind_held = std.mem.indexOfScalar(*AppAgent, waiting.items, target) != null;
                     // A held post's agent applies its events in the loop's own
-                    // tick: no tick here until the finished turn is applied.
-                    if (behind_held or (post.held and target.worker.finishAwaitsHost())) {
+                    // tick: no tick here while its finish event is still queued.
+                    // Once the loop has applied it, the post is offered again
+                    // even though the finish is not released: an open prompt
+                    // pauses the agent's pacer, which keeps the finished turn,
+                    // and only the offer's settle flushes it. The loop's tick
+                    // does not, since the post is not in the agent's worker.
+                    if (behind_held or (post.held and target.worker.finishAwaitsHost() and target.worker.hasPendingFinishEvent())) {
                         holdReport(app, post, target, if (behind_held) "older_post_held" else "finish_unapplied", &held, &waiting);
                         continue;
                     }
