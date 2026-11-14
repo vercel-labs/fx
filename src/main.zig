@@ -7623,15 +7623,16 @@ const TraceCapture = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
 
-    fn start(self: *TraceCapture, alloc: Allocator) !void {
-        self.tmp = std.testing.tmpDir(.{});
-        errdefer self.tmp.cleanup();
-        const root = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+    fn start(alloc: Allocator) !TraceCapture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
-        self.path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
-        errdefer alloc.free(self.path);
+        const path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
+        errdefer alloc.free(path);
         debug_trace.resetForTest();
-        try debug_trace.configureForTest(alloc, self.path);
+        try debug_trace.configureForTest(alloc, path);
+        return .{ .tmp = tmp, .path = path };
     }
 
     fn stop(self: *TraceCapture, alloc: Allocator) void {
@@ -7683,10 +7684,7 @@ const MailFixture = struct {
         const sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
         errdefer sink.close(io_mod.getIo());
         self.* = .{ .app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } }, .sink = sink };
-        if (options.trace) {
-            self.trace = undefined;
-            try self.trace.?.start(alloc);
-        }
+        if (options.trace) self.trace = try TraceCapture.start(alloc);
         if (options.drain_budget_ns) |budget| {
             app_worker_runtime.drain_budget_for_tests_ns = budget;
             self.narrowed_budget = true;
