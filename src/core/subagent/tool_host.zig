@@ -3559,7 +3559,9 @@ test "trace children show each subagent's work phase, last outcome, and closing"
         try std.testing.expect(traced.len <= 1);
         if (traced.len == 1) try std.testing.expect(traced[0].closing);
     }
-    try waitUntilQuiet(runtime);
+    // The close is written as the slot ends, a moment after the host stops
+    // counting the child as working.
+    try waitForSlotEnd(runtime, child_id);
     const taken = try runtime.takeClosed(alloc);
     defer {
         for (taken) |id| alloc.free(id);
