@@ -2815,6 +2815,11 @@ pub fn Runtime(comptime App: type) type {
         pub fn disableSubagentHost(app: *App, agent: *AppAgent) void {
             if (agent.session_persistence.subagent_host) |host| {
                 host.deinit();
+                // Its threads are joined, so no report of it can still arrive.
+                // One that waits for its agent holds the host's pointer.
+                if (comptime @hasField(App, "child_handoffs")) {
+                    @import("app_agents_runtime.zig").Runtime(App).dropReportsOf(app, host);
+                }
                 agent.session_persistence.subagent_host = null;
             }
             if (agent.session_persistence.v2_children) |children| {

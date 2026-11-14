@@ -379,6 +379,14 @@ pub const ReportPost = struct {
     idle: bool = false,
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
+    /// Set once the main loop holds the post back for an agent that has not
+    /// applied its finished turn. Only the main loop reads or writes it.
+    held: bool = false,
+    /// A message's `started_by`, read at the first offer, while the sender's
+    /// turn is still going. A held post is offered again after that turn may
+    /// have ended, and its text must not change. Main loop only.
+    started_by: ?subagent_reports.StartedBy = null,
+    started_by_read: bool = false,
 
     fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
@@ -800,11 +808,20 @@ pub fn Runtime(comptime App: type) type {
         /// finished turn its pacer holds is settled. The mail's prompt takes
         /// the history the agent has when the mail is posted, so mail posted
         /// earlier starts a turn that lacks the finished turn.
+        ///
+        /// One tick applies events only until its budget is spent, which keeps
+        /// the screen answering. When the agent's finished turn is still not
+        /// applied after it, the mail waits: `AgentNotSettled`, and the next
+        /// pass offers it again. The loop's own tick applies the rest, with a
+        /// paint between slices. A loop here could not end for an agent that
+        /// is closing, or whose cancelled turn waits for its worker. Mail for
+        /// an agent that is stopping does not wait: that agent applies nothing
+        /// more, and the post fails as it always did.
         pub fn settleBeforeMail(
             app: *App,
             agent: *AppAgent,
             comptime tick: fn (void, *App, *agents.Agent) anyerror!void,
-        ) void {
+        ) error{AgentNotSettled}!void {
             const Settle = struct {
                 fn run(_: void, a: *App, target: *agents.Agent) anyerror!void {
                     try tick({}, a, target);
@@ -818,6 +835,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 visitScreen(app, agent, &app.main_screen, {}, Settle.run);
             outcome catch |err| debug_trace.logf("session", "agent not settled before mail err={s}", .{@errorName(err)});
+            if (agent.worker.finishAwaitsHost()) return error.AgentNotSettled;
         }
 
         /// True when the hidden `child` has events for the loop to handle or
@@ -2429,21 +2447,35 @@ pub fn Runtime(comptime App: type) type {
         /// Closes the hand-offs at shutdown, releasing every slot thread still
         /// waiting for a hand-off.
         fn closeHandoffs(app: *App) void {
-            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
-            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-            app.child_handoffs.closed = true;
-            for (app.child_handoffs.posts.items) |post| post.settle(.closed);
-            app.child_handoffs.posts.clearRetainingCapacity();
-            for (app.child_handoffs.reports.items) |post| {
-                debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} reason=shutdown", .{ post.child_id, post.work_id });
-                post.destroy();
+            var dropped: std.ArrayList(*ReportPost) = .empty;
+            defer dropped.deinit(handoff_alloc);
+            {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                app.child_handoffs.closed = true;
+                for (app.child_handoffs.posts.items) |post| post.settle(.closed);
+                app.child_handoffs.posts.clearRetainingCapacity();
+                std.mem.swap(std.ArrayList(*ReportPost), &dropped, &app.child_handoffs.reports);
             }
-            app.child_handoffs.reports.clearRetainingCapacity();
+            // A report that waits here, held or not, is still owed in the
+            // log: the next open of the session posts it.
+            for (dropped.items) |post| dropPost(app, post, reportReceiver(app, post), "shutdown", true);
         }
 
         /// Gives each posted delivery to its agent, in the order they were
         /// posted (`App.postAgentMessage`). One whose agent is gone is
         /// dropped; a report stays owed in the log.
+        ///
+        /// One whose agent has not applied its finished turn yet is held, and
+        /// offered again once it has, so its prompt takes a history that has
+        /// the turn (`settleBeforeMail`). Posts behind it for the same agent
+        /// wait with it, so that agent gets them in order; other agents' posts
+        /// go on. An agent that is stopping holds nothing: its post fails as it
+        /// always did. A held post ends in one of four ways: it is delivered;
+        /// its agent is gone, and it is dropped here; its host closes, and
+        /// `dropReportsOf` drops it; fx quits, and `closeHandoffs` drops it.
+        /// Each drop is traced. A dropped report is still owed in the parent's
+        /// log, which posts it again when the session is opened.
         fn deliverReports(app: *App) void {
             var posted: std.ArrayList(*ReportPost) = .empty;
             {
@@ -2453,12 +2485,109 @@ pub fn Runtime(comptime App: type) type {
                 std.mem.swap(std.ArrayList(*ReportPost), &posted, &app.child_handoffs.reports);
             }
             defer posted.deinit(handoff_alloc);
+            var held: std.ArrayList(*ReportPost) = .empty;
+            defer held.deinit(handoff_alloc);
+            // The agents a post is held for this pass.
+            var waiting: std.ArrayList(*AppAgent) = .empty;
+            defer waiting.deinit(handoff_alloc);
             for (posted.items) |post| {
-                defer post.destroy();
+                const receiver = reportReceiver(app, post);
+                if (receiver) |target| {
+                    const behind_held = std.mem.indexOfScalar(*AppAgent, waiting.items, target) != null;
+                    // A held post's agent applies its events in the loop's own
+                    // tick: no tick here until the finished turn is applied.
+                    if (behind_held or (post.held and target.worker.finishAwaitsHost())) {
+                        holdReport(app, post, target, if (behind_held) "older_post_held" else "finish_unapplied", &held, &waiting);
+                        continue;
+                    }
+                }
                 deliverReport(app, post) catch |err| {
-                    debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} kind={s} reason={s}", .{ post.child_id, post.work_id, @tagName(post.kind), @errorName(err) });
+                    if (err == error.AgentNotSettled) if (receiver) |target| {
+                        holdReport(app, post, target, "finish_unapplied", &held, &waiting);
+                        continue;
+                    };
+                    dropPost(app, post, receiver, @errorName(err), false);
+                    continue;
                 };
+                post.destroy();
             }
+            if (held.items.len == 0) return;
+            // Back at the front, in order, to be offered again next pass.
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.closed) {
+                for (held.items) |post| dropPost(app, post, reportReceiver(app, post), "shutdown", true);
+            } else app.child_handoffs.reports.insertSlice(handoff_alloc, 0, held.items) catch {
+                for (held.items) |post| dropPost(app, post, reportReceiver(app, post), "OutOfMemory", true);
+            };
+        }
+
+        /// Keeps `post` for the next pass, behind no other post of `target`'s.
+        /// Traced once per post, the first time it waits. Out of memory drops
+        /// it: a report stays owed.
+        fn holdReport(
+            app: *App,
+            post: *ReportPost,
+            target: *AppAgent,
+            reason: []const u8,
+            held: *std.ArrayList(*ReportPost),
+            waiting: *std.ArrayList(*AppAgent),
+        ) void {
+            if (!post.held) {
+                debug_trace.logf("host", "report held receiver={s} child={s} work_id={s} kind={s} reason={s}", .{ nameOf(hostedOf(app, target)), post.child_id, post.work_id, @tagName(post.kind), reason });
+            }
+            if (std.mem.indexOfScalar(*AppAgent, waiting.items, target) == null) waiting.append(handoff_alloc, target) catch return dropPost(app, post, target, "OutOfMemory", true);
+            held.append(handoff_alloc, post) catch return dropPost(app, post, target, "OutOfMemory", true);
+            post.held = true;
+        }
+
+        /// Ends `post` without a delivery, and says so: who it was for, what
+        /// kind of mail it was, and why. A message holds a place in the queue
+        /// it was going to, which goes back when `holds_place`. A failed
+        /// delivery already gave it back (`App.postAgentMessage`), and giving
+        /// it back twice would take another message's place.
+        fn dropPost(app: *App, post: *ReportPost, receiver: ?*AppAgent, reason: []const u8, holds_place: bool) void {
+            debug_trace.logf("host", "report dropped receiver={s} child={s} work_id={s} kind={s} reason={s} held={}", .{
+                if (receiver) |target| nameOf(hostedOf(app, target)) else "gone",
+                post.child_id,
+                post.work_id,
+                @tagName(post.kind),
+                reason,
+                post.held,
+            });
+            if (holds_place and post.kind == .message) if (receiver) |target| target.worker.releaseAgentMessage();
+            post.destroy();
+        }
+
+        /// The agent `post` goes to, as `deliverReport` finds it.
+        fn reportReceiver(app: *App, post: *const ReportPost) ?*AppAgent {
+            return receiverOf(app, post.host, post.kind == .message and post.from_owner);
+        }
+
+        /// Drops the waiting reports of `host`, once its threads are joined
+        /// and before it is forgotten: a post that waits holds the host's
+        /// pointer, and a host made next can take its address, which would
+        /// deliver the report into another session. The pointer is only
+        /// compared, never read. A report stays owed in the log of the session
+        /// that is closing, and is posted again when that session is opened.
+        pub fn dropReportsOf(app: *App, host: *const subagent_tool_host.Runtime) void {
+            var dropped: std.ArrayList(*ReportPost) = .empty;
+            defer dropped.deinit(handoff_alloc);
+            {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                var index: usize = 0;
+                while (index < app.child_handoffs.reports.items.len) {
+                    const post = app.child_handoffs.reports.items[index];
+                    if (@intFromPtr(post.host) != @intFromPtr(host)) {
+                        index += 1;
+                        continue;
+                    }
+                    _ = app.child_handoffs.reports.orderedRemove(index);
+                    dropped.append(handoff_alloc, post) catch dropPost(app, post, reportReceiver(app, post), "OutOfMemory", true);
+                }
+            }
+            for (dropped.items) |post| dropPost(app, post, reportReceiver(app, post), "host_closed", true);
         }
 
         /// The agent a subagent's delivery from `host` goes to: the host's
@@ -2505,14 +2634,18 @@ pub fn Runtime(comptime App: type) type {
             } else null;
             const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
             // Who started the turn that sent a message, from the host that
-            // runs the sender. That turn is still going: posts are taken
-            // each pass before the children's events, its end among them.
-            const started_by: ?subagent_reports.StartedBy = if (!message)
-                null
-            else if (owner_child) |child|
-                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
-            else
-                post.host.turnStartedBy(post.child_id);
+            // runs the sender. That turn is still going at the first offer:
+            // posts are taken each pass before the children's events, its end
+            // among them. A post held for its agent is offered again after
+            // that turn may have ended, so what the first offer read is kept.
+            if (message and !post.started_by_read) {
+                post.started_by = if (owner_child) |child|
+                    (if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null)
+                else
+                    post.host.turnStartedBy(post.child_id);
+                post.started_by_read = true;
+            }
+            const started_by = post.started_by;
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{

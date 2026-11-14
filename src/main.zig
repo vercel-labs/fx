@@ -2149,7 +2149,7 @@ const App = struct {
     /// `reserveMessagePlace` held for it.
     pub fn postAgentMessage(self: *App, agent: *agents.Agent, text: []const u8, author: types.MessageAuthor, mail: agent_frame.MailKind) !void {
         std.debug.assert(author != .user);
-        AgentsAppRuntime.settleBeforeMail(self, agent, tickAgentInContext);
+        try AgentsAppRuntime.settleBeforeMail(self, agent, tickAgentInContext);
         // Until the worker takes it, a message still holds its place.
         var place_held = mail == .message;
         defer if (place_held) agent.worker.releaseAgentMessage();
@@ -3626,7 +3626,7 @@ const App = struct {
         } else {
             // Past the budget the drain puts the rest back, so the loop reads
             // keys and paints before applying them.
-            try WorkerAppRuntime.tickWithinBudget(self, agent, handlers, app_worker_runtime.interactive_drain_budget_ns);
+            try WorkerAppRuntime.tickWithinBudget(self, agent, handlers, app_worker_runtime.interactiveDrainBudgetNs());
         }
         const now_ns = io_mod.nanoTimestamp();
         if (!agent.approval_prompt.isActive() and !agent.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
@@ -7006,27 +7006,146 @@ fn testFinishedTurn(prompt: []const u8, answer: []const u8) worker_runtime.Worke
     } };
 }
 
+/// An `App` with subagents that take mail, for the tests of how mail meets an
+/// agent whose finished turn is not applied yet. Built in place, since the
+/// agents point at the app. A subagent's own host is only compared, never
+/// read, so a test passes the host it wants, and the fixture clears it before
+/// the agents are freed.
+const MailFixture = struct {
+    app: App,
+    resolver: @import("core/subagent/authority.zig").Resolver = undefined,
+    shut_down: bool = false,
+
+    fn init(self: *MailFixture, alloc: Allocator) void {
+        self.* = .{ .app = App{ .alloc = alloc } };
+    }
+
+    fn deinit(self: *MailFixture) void {
+        for (self.app.child_agents.items) |child| child.agent.session_persistence.subagent_host = null;
+        if (!self.shut_down) App.AgentsAppRuntime.shutdownChildren(&self.app);
+        App.AgentsAppRuntime.deinitChildren(&self.app);
+        self.app.pacer.deinit(self.app.alloc);
+        self.app.shell.deinit(self.app.alloc);
+    }
+
+    /// A subagent whose run is installed. Its worker holds the start of its
+    /// next turn for a finish, as the app's agents do.
+    fn addChild(self: *MailFixture, id: []const u8, own_host: ?*subagent_tool_host.Runtime) !*app_agents_runtime.ChildAgent {
+        const child = try addTestChildAgent(&self.app, id);
+        const credential = credentials.Credential{
+            .token = try self.app.alloc.dupe(u8, "CHILD_TOKEN"),
+            .source = .stored_key,
+        };
+        App.AgentsAppRuntime.installChildRun(&self.app, child, try testChildRun(self.app.alloc, &self.resolver, false, credential));
+        child.agent.worker.holds_start_for_finish = true;
+        child.agent.session_persistence.subagent_host = own_host;
+        return child;
+    }
+
+    /// The worker finished a turn: its last text, then its finish, both
+    /// queued for the loop.
+    fn queueFinishedTurn(child: *app_agents_runtime.ChildAgent) !void {
+        try child.agent.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("earlier answer\n") } });
+        try child.agent.worker.pushEvent(std.heap.c_allocator, testFinishedTurn("earlier prompt", "earlier answer"));
+    }
+
+    /// A report of work `work_id` from a subagent of `from_host`'s owner.
+    fn postReport(self: *MailFixture, from_host: *subagent_tool_host.Runtime, work_id: []const u8) !void {
+        try app_agents_runtime.postDelivery(&self.app.child_handoffs, from_host, .{ .report = .{
+            .agent = "reviewer",
+            .child_id = "c1",
+            .work_id = work_id,
+            .outcome = .completed,
+            .output = "done",
+        } });
+    }
+
+    /// A message from a subagent of `from_host`'s owner, which holds a place
+    /// in its agent's queue as the sink holds it before it posts. Its
+    /// `started_by` is read already, as the first offer reads it, since the
+    /// host here is not one to ask.
+    fn postMessage(self: *MailFixture, to: *app_agents_runtime.ChildAgent, from_host: *subagent_tool_host.Runtime) !void {
+        try std.testing.expect(to.agent.worker.reserveAgentMessage());
+        try app_agents_runtime.postDelivery(&self.app.child_handoffs, from_host, .{ .message = .{
+            .to = .owner,
+            .agent = "reviewer",
+            .child_id = "c1",
+            .text = "found it",
+        } });
+        const post = self.app.child_handoffs.reports.items[self.app.child_handoffs.reports.items.len - 1];
+        post.started_by = .user;
+        post.started_by_read = true;
+    }
+
+    /// Takes the posts waiting for their agents, as the loop does each pass.
+    fn takePosts(self: *MailFixture) void {
+        App.AgentsAppRuntime.takePosts(&self.app);
+    }
+
+    /// The loop's own tick of every agent with events to apply.
+    fn tickAgents(self: *MailFixture) !void {
+        try App.AgentsAppRuntime.tickChildren(&self.app, {}, App.tickAgentInContext);
+    }
+
+    fn heldPosts(self: *const MailFixture) usize {
+        return self.app.child_handoffs.reports.items.len;
+    }
+};
+
+/// What the app traces during a test, read back from a file.
+const TraceCapture = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn start(self: *TraceCapture, alloc: Allocator) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        defer alloc.free(root);
+        self.path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
+        errdefer alloc.free(self.path);
+        debug_trace.resetForTest();
+        try debug_trace.configureForTest(alloc, self.path);
+    }
+
+    fn stop(self: *TraceCapture, alloc: Allocator) void {
+        debug_trace.resetForTest();
+        alloc.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    /// How many times `needle` is in the trace.
+    fn count(self: *const TraceCapture, alloc: Allocator, needle: []const u8) !usize {
+        var file = try std.Io.Dir.openFileAbsolute(std.testing.io, self.path, .{});
+        defer file.close(io_mod.getIo());
+        var read_buf: [1024]u8 = undefined;
+        var reader = file.reader(std.testing.io, &read_buf);
+        const text = try reader.interface.allocRemaining(alloc, std.Io.Limit.limited(1024 * 1024));
+        defer alloc.free(text);
+        var found: usize = 0;
+        var from: usize = 0;
+        while (std.mem.find(u8, text[from..], needle)) |at| {
+            found += 1;
+            from += at + needle.len;
+        }
+        return found;
+    }
+};
+
 test "mail posted to an agent whose finished turn is not applied yet is queued with that turn in its history" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    const credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
-        .source = .stored_key,
-    };
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    const child = try fixture.addChild("child-1", null);
+    child.agent.worker.holds_start_for_finish = false;
 
     // The worker finished the turn and queued its event, which the loop has
     // not taken yet.
     try child.agent.worker.pushEvent(std.heap.c_allocator, testFinishedTurn("earlier prompt", "earlier answer"));
     try std.testing.expectEqual(@as(usize, 0), child.agent.session.agent.history.items.len);
 
-    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
+    try fixture.app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
 
     // The report's turn starts from the history that holds the finished turn.
     try std.testing.expectEqual(@as(usize, 1), child.agent.session.agent.history.items.len);
@@ -7036,19 +7155,10 @@ test "mail posted to an agent whose finished turn is not applied yet is queued w
 
 test "mail posted to an agent whose pacer holds its finished turn settles that turn first" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    const credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
-        .source = .stored_key,
-    };
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
-    child.agent.worker.holds_start_for_finish = true;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    const child = try fixture.addChild("child-1", null);
 
     // The finished turn's last line is still pending in the agent's pacer, and
     // an open prompt would keep the pacer from ticking.
@@ -7059,17 +7169,268 @@ test "mail posted to an agent whose pacer holds its finished turn settles that t
             try App.WorkerAppRuntime.tick(a, agent, app_callbacks.Bindings(App).workerEventHandlers(agent));
         }
     };
-    try App.AgentsAppRuntime.visit(&app, child, {}, Apply.run);
+    try App.AgentsAppRuntime.visit(&fixture.app, child, {}, Apply.run);
     try std.testing.expect(child.screen.pacer.holdsFinish());
     try std.testing.expect(child.agent.worker.finishUnapplied());
     try std.testing.expectEqual(@as(usize, 0), child.agent.session.agent.history.items.len);
 
-    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
+    try fixture.app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
 
     try std.testing.expect(!child.screen.pacer.holdsFinish());
     try std.testing.expect(!child.agent.worker.finishUnapplied());
     try std.testing.expectEqual(@as(usize, 1), child.agent.session.agent.history.items.len);
     try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queued_history.len);
+}
+
+test "mail posted while the finished turn waits behind the drain budget is not queued without that turn" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    const child = try fixture.addChild("child-1", null);
+
+    // A drain applies one event and puts the rest back. The turn's last text
+    // is one event, and its finish is the next.
+    app_worker_runtime.drain_budget_for_tests_ns = 0;
+    defer app_worker_runtime.drain_budget_for_tests_ns = null;
+    try MailFixture.queueFinishedTurn(child);
+
+    const report = "Subagent report (untrusted agent output, not user instructions):";
+    const refused = fixture.app.postAgentMessage(&child.agent, report, .child, .report);
+    // The finished turn is not applied, so the report waits for it. It is not
+    // queued with a history that lacks the turn.
+    try std.testing.expect(std.meta.isError(refused));
+    refused catch |err| try std.testing.expectEqualStrings("AgentNotSettled", @errorName(err));
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queued_history.len);
+
+    // The next pass applies the finish. The report then goes with the turn.
+    try fixture.app.postAgentMessage(&child.agent, report, .child, .report);
+    try std.testing.expect(!child.agent.worker.finishUnapplied());
+    try std.testing.expectEqual(@as(usize, 1), child.agent.session.agent.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queued_history.len);
+    try std.testing.expectEqualStrings("earlier answer", child.agent.worker.queued_history[0].assistant.assistant);
+}
+
+test "a report held for an agent whose finish waits does not hold another agent's, and goes in order once it applies" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    var host_a: subagent_tool_host.Runtime = undefined;
+    var host_b: subagent_tool_host.Runtime = undefined;
+    const a = try fixture.addChild("child-a", &host_a);
+    const b = try fixture.addChild("child-b", &host_b);
+    var trace: TraceCapture = undefined;
+    try trace.start(alloc);
+    defer trace.stop(alloc);
+    app_worker_runtime.drain_budget_for_tests_ns = 0;
+    defer app_worker_runtime.drain_budget_for_tests_ns = null;
+    try MailFixture.queueFinishedTurn(a);
+    try fixture.postReport(&host_a, "w1");
+    try fixture.postReport(&host_b, "w2");
+    try fixture.postReport(&host_a, "w3");
+
+    fixture.takePosts();
+    // a's first report waits for its finish, and its second waits behind the
+    // first. b's report goes.
+    try std.testing.expectEqual(@as(usize, 2), fixture.heldPosts());
+    try std.testing.expectEqualStrings("w1", fixture.app.child_handoffs.reports.items[0].work_id);
+    try std.testing.expectEqualStrings("w3", fixture.app.child_handoffs.reports.items[1].work_id);
+    try std.testing.expectEqual(@as(usize, 0), a.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), b.agent.worker.queuedPromptCount());
+
+    // Passes that apply nothing neither grow the list nor tick the agent:
+    // its finish is still queued after them. Each post is traced once, and
+    // waiting is not a drop.
+    for (0..50) |_| fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 2), fixture.heldPosts());
+    try std.testing.expect(a.agent.worker.hasPendingFinishEvent());
+    try std.testing.expectEqual(@as(usize, 0), a.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 2), try trace.count(alloc, "report held receiver=child-a"));
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "work_id=w1 kind=report reason=finish_unapplied"));
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "work_id=w3 kind=report reason=older_post_held"));
+    try std.testing.expectEqual(@as(usize, 0), try trace.count(alloc, "report dropped"));
+
+    // The loop's own tick applies the finish, and the held reports go next pass.
+    try fixture.tickAgents();
+    try std.testing.expect(!a.agent.worker.finishUnapplied());
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 0), fixture.heldPosts());
+    try std.testing.expectEqual(@as(usize, 2), a.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), a.agent.worker.queued_history.len);
+    try std.testing.expect(std.mem.find(u8, a.agent.worker.queued_prompts.items[0].prompt, "w1") != null);
+    try std.testing.expect(std.mem.find(u8, a.agent.worker.queued_prompts.items[1].prompt, "w3") != null);
+    try std.testing.expectEqual(@as(usize, 2), try trace.count(alloc, "report held receiver=child-a"));
+}
+
+test "a held report is dropped when its agent goes, and posts nothing" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    var mail_host: subagent_tool_host.Runtime = undefined;
+    const child = try fixture.addChild("child-a", &mail_host);
+    var trace: TraceCapture = undefined;
+    try trace.start(alloc);
+    defer trace.stop(alloc);
+    app_worker_runtime.drain_budget_for_tests_ns = 0;
+    defer app_worker_runtime.drain_budget_for_tests_ns = null;
+    try MailFixture.queueFinishedTurn(child);
+    try fixture.postReport(&mail_host, "w1");
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 1), fixture.heldPosts());
+
+    // The agent no longer owns the host. The next pass drops the report.
+    child.agent.session_persistence.subagent_host = null;
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 0), fixture.heldPosts());
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "report dropped receiver=gone child=c1 work_id=w1 kind=report reason=AgentGone held=true"));
+}
+
+test "mail for an agent that is stopping is not held, and a message gives back its place once" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    var mail_host: subagent_tool_host.Runtime = undefined;
+    const child = try fixture.addChild("child-a", &mail_host);
+    var trace: TraceCapture = undefined;
+    try trace.start(alloc);
+    defer trace.stop(alloc);
+    try MailFixture.queueFinishedTurn(child);
+    child.agent.worker.requestStop();
+    // Its hold is still set, and nothing will apply what it holds.
+    try std.testing.expect(child.agent.worker.finishUnapplied());
+    try std.testing.expect(!child.agent.worker.finishAwaitsHost());
+
+    // Another message of its has a place of its own.
+    try std.testing.expect(child.agent.worker.reserveAgentMessage());
+    try fixture.postMessage(child, &mail_host);
+    try std.testing.expectEqual(@as(u8, 2), child.agent.worker.reserved_agent_messages);
+    fixture.takePosts();
+
+    // The post is neither held nor kept. It fails as mail for a stopped
+    // worker always did, and gives back the one place it held.
+    try std.testing.expectEqual(@as(usize, 0), fixture.heldPosts());
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(u8, 1), child.agent.worker.reserved_agent_messages);
+    try std.testing.expectEqual(@as(usize, 0), try trace.count(alloc, "report held"));
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "report dropped receiver=child-a child=c1 work_id= kind=message reason=WorkerStopped held=false"));
+}
+
+test "a held message keeps its place and its started_by, and queues as an immediate one does" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    var host_a: subagent_tool_host.Runtime = undefined;
+    var host_b: subagent_tool_host.Runtime = undefined;
+    const waits = try fixture.addChild("child-a", &host_a);
+    const now = try fixture.addChild("child-b", &host_b);
+    app_worker_runtime.drain_budget_for_tests_ns = 0;
+    defer app_worker_runtime.drain_budget_for_tests_ns = null;
+
+    // One message goes at once, to an agent with nothing unapplied.
+    try fixture.postMessage(now, &host_b);
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 1), now.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(u8, 0), now.agent.worker.reserved_agent_messages);
+
+    // The other waits for its agent's finish, and keeps the place it holds.
+    try MailFixture.queueFinishedTurn(waits);
+    try fixture.postMessage(waits, &host_a);
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 1), fixture.heldPosts());
+    try std.testing.expectEqual(@as(usize, 0), waits.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(u8, 1), waits.agent.worker.reserved_agent_messages);
+    try fixture.tickAgents();
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 0), fixture.heldPosts());
+
+    // Both are queued as the same message: the place is spent, the text
+    // carries who started the sender's turn as the first offer read it, and
+    // the held one has the finished turn in its history.
+    try std.testing.expectEqual(@as(usize, 1), waits.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(u8, 0), waits.agent.worker.reserved_agent_messages);
+    const immediate = now.agent.worker.queued_prompts.items[0];
+    const deferred = waits.agent.worker.queued_prompts.items[0];
+    try std.testing.expectEqual(agent_frame.MailKind.message, immediate.mail);
+    try std.testing.expectEqual(immediate.mail, deferred.mail);
+    try std.testing.expect(std.mem.find(u8, immediate.prompt, "\"started_by\":\"user\"") != null);
+    try std.testing.expect(std.mem.find(u8, deferred.prompt, "\"started_by\":\"user\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), waits.agent.worker.queued_history.len);
+}
+
+test "reports of a host that closes are dropped, and a host made at its address gets none" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    var mail_host: subagent_tool_host.Runtime = undefined;
+    var other_host: subagent_tool_host.Runtime = undefined;
+    const child = try fixture.addChild("child-a", &mail_host);
+    const other = try fixture.addChild("child-b", &other_host);
+    var trace: TraceCapture = undefined;
+    try trace.start(alloc);
+    defer trace.stop(alloc);
+    app_worker_runtime.drain_budget_for_tests_ns = 0;
+    defer app_worker_runtime.drain_budget_for_tests_ns = null;
+    try MailFixture.queueFinishedTurn(child);
+    try MailFixture.queueFinishedTurn(other);
+    try fixture.postReport(&mail_host, "w1");
+    try fixture.postReport(&other_host, "w2");
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 2), fixture.heldPosts());
+    // A message of the closing host's that holds a place in its agent's queue.
+    // It was posted after the pass, so it was never offered.
+    try fixture.postMessage(child, &mail_host);
+    try std.testing.expectEqual(@as(u8, 1), child.agent.worker.reserved_agent_messages);
+
+    // The session switches: the host's reports go, the other host's stay, and
+    // the message's place goes back.
+    App.AgentsAppRuntime.dropReportsOf(&fixture.app, &mail_host);
+    try std.testing.expectEqual(@as(usize, 1), fixture.heldPosts());
+    try std.testing.expectEqualStrings("w2", fixture.app.child_handoffs.reports.items[0].work_id);
+    try std.testing.expectEqual(@as(u8, 0), child.agent.worker.reserved_agent_messages);
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "report dropped receiver=child-a child=c1 work_id=w1 kind=report reason=host_closed held=true"));
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "report dropped receiver=child-a child=c1 work_id= kind=message reason=host_closed held=false"));
+
+    // A host made next takes the same address. Nothing reaches its agent.
+    try fixture.tickAgents();
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), other.agent.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), fixture.heldPosts());
+}
+
+test "a held report is dropped when fx quits" {
+    const alloc = std.testing.allocator;
+    var fixture: MailFixture = undefined;
+    fixture.init(alloc);
+    defer fixture.deinit();
+    var mail_host: subagent_tool_host.Runtime = undefined;
+    const child = try fixture.addChild("child-a", &mail_host);
+    var trace: TraceCapture = undefined;
+    try trace.start(alloc);
+    defer trace.stop(alloc);
+    app_worker_runtime.drain_budget_for_tests_ns = 0;
+    defer app_worker_runtime.drain_budget_for_tests_ns = null;
+    try MailFixture.queueFinishedTurn(child);
+    try fixture.postReport(&mail_host, "w1");
+    fixture.takePosts();
+    try std.testing.expectEqual(@as(usize, 1), fixture.heldPosts());
+
+    // The quit's notice reaches each agent's host, and this one is not a host
+    // to ask, so the agent lets go of it first.
+    child.agent.session_persistence.subagent_host = null;
+    fixture.shut_down = true;
+    App.AgentsAppRuntime.shutdownChildren(&fixture.app);
+    try std.testing.expectEqual(@as(usize, 0), fixture.heldPosts());
+    try std.testing.expect(fixture.app.child_handoffs.closed);
+    try std.testing.expectEqual(@as(usize, 1), try trace.count(alloc, "report dropped receiver=gone child=c1 work_id=w1 kind=report reason=shutdown held=true"));
 }
 
 test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {

@@ -1145,6 +1145,16 @@ pub const WorkerRuntime = struct {
         return self.finish_unapplied;
     }
 
+    /// Whether a finished turn still waits for the host, and this worker can
+    /// still go on. A worker that is stopping, or whose finalization failed,
+    /// takes no more events, so nothing it holds is ever applied, and mail
+    /// for it must not wait.
+    pub fn finishAwaitsHost(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.finish_unapplied and !self.worker_stop_requested and self.finalization_failure == null;
+    }
+
     /// Whether a prompt or a compaction waits to start behind the hold.
     pub fn startWaitsForFinish(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
@@ -7367,18 +7377,26 @@ fn pushFinishedTurn(runtime: *WorkerRuntime, alloc: std.mem.Allocator, prompt: [
     } } } });
 }
 
+/// Leaves `runtime` with its first turn ended: the first prompt taken and
+/// returned, which the caller frees, a second one queued while that turn ran,
+/// and the turn's finish event queued.
+fn endFirstTurnWithSecondQueued(runtime: *WorkerRuntime, alloc: std.mem.Allocator) !QueuedPrompt {
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    // Queued while the first turn runs, it starts the moment that turn ends.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    try pushFinishedTurn(runtime, alloc, "first");
+    runtime.finishProcessing();
+    return first;
+}
+
 test "a finished turn holds queued work until the host applies it" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{ .holds_start_for_finish = true };
     defer runtime.deinit(alloc);
 
-    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
-    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    const first = try endFirstTurnWithSecondQueued(&runtime, alloc);
     defer freeQueuedPrompt(alloc, first);
-    // Queued while the first turn runs, it starts the moment that turn ends.
-    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
-    try pushFinishedTurn(&runtime, alloc, "first");
-    runtime.finishProcessing();
 
     try std.testing.expect(runtime.finishUnapplied());
     try std.testing.expect(runtime.hasPendingFinishEvent());
@@ -7426,12 +7444,8 @@ test "a worker that does not hold its start for a finish starts queued work at o
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
-    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
-    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    const first = try endFirstTurnWithSecondQueued(&runtime, alloc);
     defer freeQueuedPrompt(alloc, first);
-    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
-    try pushFinishedTurn(&runtime, alloc, "first");
-    runtime.finishProcessing();
 
     try std.testing.expect(!runtime.finishUnapplied());
     const second = (try runtime.tryTakeNextPrompt(alloc)).?;
@@ -7439,6 +7453,26 @@ test "a worker that does not hold its start for a finish starts queued work at o
     try std.testing.expectEqualStrings("second", second.prompt);
     var events = runtime.takeEvents();
     freeEventList(alloc, &events);
+}
+
+test "a finish that waits for the host is not awaited once the worker stops or fails" {
+    const alloc = std.testing.allocator;
+    var stopping = WorkerRuntime{ .holds_start_for_finish = true };
+    defer stopping.deinit(alloc);
+    try std.testing.expect(!stopping.finishAwaitsHost());
+    try pushFinishedTurn(&stopping, alloc, "first");
+    try std.testing.expect(stopping.finishAwaitsHost());
+    stopping.requestStop();
+    // Its hold is still set, but nothing it holds will ever be applied.
+    try std.testing.expect(stopping.finishUnapplied());
+    try std.testing.expect(!stopping.finishAwaitsHost());
+
+    var failed = WorkerRuntime{ .holds_start_for_finish = true };
+    defer failed.deinit(alloc);
+    try pushFinishedTurn(&failed, alloc, "first");
+    failed.latchFinalizationFailure(.{ .turn_id = 41, .outcome = .failed });
+    try std.testing.expect(failed.finishUnapplied());
+    try std.testing.expect(!failed.finishAwaitsHost());
 }
 
 test "finishApplied wakes a worker that waits for queued work held behind a finish" {

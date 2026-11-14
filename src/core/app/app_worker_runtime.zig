@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const session_notices = @import("../session/session.zig");
 const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -38,6 +39,16 @@ const HeadSegmentScan = worker_runtime.HeadSegmentScan;
 /// milliseconds, and hundreds can be queued at once. Every slice costs a
 /// frame, so a shorter budget makes the whole turn slower.
 pub const interactive_drain_budget_ns: i128 = 32 * std.time.ns_per_ms;
+
+/// A test narrows the budget to reach a drain that stops early without
+/// queueing 32 ms of events. Tests only: a build that is not a test ignores it.
+pub var drain_budget_for_tests_ns: ?i128 = null;
+
+/// The budget of one interactive drain.
+pub fn interactiveDrainBudgetNs() i128 {
+    if (comptime builtin.is_test) if (drain_budget_for_tests_ns) |budget| return budget;
+    return interactive_drain_budget_ns;
+}
 const InputRuntime = core_input_runtime.Runtime;
 
 const CancelledEventAdmission = enum {
@@ -470,7 +481,7 @@ pub fn Runtime(comptime App: type) type {
             return record.phase == .terminal and record.activity_kind == .command;
         }
 
-        pub const FinishSettle = enum {
+        const FinishSettle = enum {
             /// Settle the turn the pacer holds only when queued work waits behind it.
             when_start_waits,
             /// Settle it now, because mail is about to start a turn.
