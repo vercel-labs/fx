@@ -12132,8 +12132,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await tui.waitForPane(() => childRequests === 1 && parentBodies.length === 2 && parentHold.started, 10000);
       // The child finishes while the parent's reply is still open, so its
       // report waits for the step to end instead of interrupting the model.
+      // The report reaches the worker through the main loop, a moment after
+      // `report_queued`, so the reply stays held until the open turn has it
+      // (`mail_posted` as joined). Released sooner, the step can end first,
+      // the empty reply is asked to continue, and the report comes a request
+      // later.
       child.release("CHILD_REPORT_TEXT");
-      await tui.waitForPane(() => trace().includes("event=report_queued "), 10000);
+      await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
       await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
 
