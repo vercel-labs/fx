@@ -4376,6 +4376,69 @@ test "the user's stop while the user's turn runs counts the message waiting for 
     try std.testing.expect(!runtime.anyWorking());
 }
 
+test "the parent's close while a woken turn waits for the work that ends drops that turn, and the close is written" {
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true });
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    // The parent's work still holds the child, so the woken turn's work waits.
+    const work_id = runtime.beginTurnWork(alloc, child_id, .child, null).?;
+    defer alloc.free(work_id);
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, closed, "Closed reviewer, ending its turn.") != null);
+    // The close is written as the parent's work ends; the turn that waited
+    // for it goes with it, and its own end finds nothing.
+    try waitForSlotEnd(runtime, child_id);
+    runtime.endUserWork(child_id, work_id, .cancelled, "");
+    {
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expect(registry.findById(child_id) == null);
+    }
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    try std.testing.expect(!runtime.anyWorking());
+}
+
+test "the user's close while a woken turn waits for the work that ends drops that turn, and the close is written" {
+    var t: StopFixture = undefined;
+    try t.init(.{ .hold = true });
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginTurnWork(alloc, child_id, .child, null).?;
+    defer alloc.free(work_id);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    try waitForSlotEnd(runtime, child_id);
+    runtime.endUserWork(child_id, work_id, .cancelled, "");
+    {
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expect(registry.findById(child_id) == null);
+    }
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    // The one report is the parent's work, which says the user closed it.
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user closed it before it finished.") != null);
+    try std.testing.expect(!runtime.anyWorking());
+}
+
 test "an early-ended work names each file it changed once, without reads or failed changes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
