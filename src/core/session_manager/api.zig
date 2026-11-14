@@ -2084,7 +2084,28 @@ const api_tests = struct {
         const stopped = try m.verifyWith(id, .{ .stop = .{ .context = &context, .requested = Always.requested } });
         try testing.expectEqual(@as(?u64, 0), stopped.stopped_at);
         try testing.expectEqual(@as(u64, 0), stopped.lines);
-        try testing.expectEqual(@as(?u64, null), (try m.verify(id)).stopped_at);
+        const whole = try m.verify(id);
+        try testing.expectEqual(@as(?u64, null), whole.stopped_at);
+
+        // A stop that comes once the last line is read leaves the check whole.
+        const AfterLast = struct {
+            lines: u64,
+            asked: u64 = 0,
+            fn requested(raw: *anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.asked += 1;
+                return self.asked > self.lines;
+            }
+        };
+        var after: AfterLast = .{ .lines = whole.lines };
+        const late = try m.verifyWith(id, .{ .stop = .{ .context = &after, .requested = AfterLast.requested } });
+        try testing.expectEqual(@as(?u64, null), late.stopped_at);
+        try testing.expectEqual(whole.lines, late.lines);
+        // One line earlier, it stops at the last line.
+        var before: AfterLast = .{ .lines = whole.lines - 1 };
+        const cut = try m.verifyWith(id, .{ .stop = .{ .context = &before, .requested = AfterLast.requested } });
+        try testing.expect(cut.stopped_at != null);
+        try testing.expectEqual(whole.lines - 1, cut.lines);
     }
 
     test "compactor records are a setting that lists blobs inside a turn, and the newest wins on resume and in a fork (D50)" {

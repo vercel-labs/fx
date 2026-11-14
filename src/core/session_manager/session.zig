@@ -2339,8 +2339,8 @@ pub const VerifyOptions = struct {
     /// `exists` only checks that each blob is a regular file, which costs
     /// one `stat` in place of an open, a read, and a hash per blob.
     blobs: enum { hash, exists } = .hash,
-    /// Asked before each line; when it says stop, the check ends there and
-    /// `Verified.stopped_at` names the line.
+    /// Asked before each line is checked; when it says stop, the check ends
+    /// there and `Verified.stopped_at` names the line.
     stop: ?Stop = null,
 };
 
@@ -2440,10 +2440,6 @@ pub fn verifySession(env: *const Env, id_: []const u8, options: VerifyOptions) O
     var result: Verified = .{ .lines = 0, .damaged_at = null, .bad_snapshots = 0 };
     var fork_seq: u64 = 0;
     while (true) {
-        if (Stop.now(options.stop)) {
-            result.stopped_at = reader.buf_offset + reader.pos;
-            break;
-        }
         const line = (reader.next() catch |err| switch (err) {
             error.Corrupt => {
                 result.damaged_at = reader.damaged_at;
@@ -2452,6 +2448,12 @@ pub fn verifySession(env: *const Env, id_: []const u8, options: VerifyOptions) O
             error.OutOfMemory => return error.OutOfMemory,
             else => |io_err| return storage.ioFault(io_err),
         }) orelse break;
+        // Asked only when a line is left, so a check that reached the end
+        // is whole however late the stop comes.
+        if (Stop.now(options.stop)) {
+            result.stopped_at = line.offset;
+            break;
+        }
         result.lines += 1;
         _ = arena.reset(.retain_capacity);
         const kind = line.header.kind orelse continue;
