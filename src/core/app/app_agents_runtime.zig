@@ -2585,7 +2585,7 @@ pub fn Runtime(comptime App: type) type {
                         holdReport(app, post, target, "scrollback_handoff_pending", &held, &waiting);
                         continue;
                     }
-                    const behind_held = std.mem.indexOfScalar(*AppAgent, waiting.items, target) != null;
+                    const behind_held = std.mem.findScalar(*AppAgent, waiting.items, target) != null;
                     // A held post's agent applies its events in the loop's own
                     // tick: no tick here while its finish event is still queued.
                     // Once the loop has applied it, the post is offered again
@@ -2633,7 +2633,7 @@ pub fn Runtime(comptime App: type) type {
             if (!post.held) {
                 debug_trace.logf("host", "report held receiver={s} child={s} work_id={s} kind={s} reason={s}", .{ nameOf(hostedOf(app, target)), post.child_id, post.work_id, @tagName(post.kind), reason });
             }
-            if (std.mem.indexOfScalar(*AppAgent, waiting.items, target) == null) waiting.append(handoff_alloc, target) catch return dropPost(app, post, target, "OutOfMemory", .held);
+            if (std.mem.findScalar(*AppAgent, waiting.items, target) == null) waiting.append(handoff_alloc, target) catch return dropPost(app, post, target, "OutOfMemory", .held);
             held.append(handoff_alloc, post) catch return dropPost(app, post, target, "OutOfMemory", .held);
             post.held = true;
         }
