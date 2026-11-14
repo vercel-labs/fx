@@ -2214,6 +2214,194 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent with no title yet shows what it is for in the agent list, and the list's search finds a word only that text holds",
+    async () => {
+      const auditor = held();
+      const auditorTitle = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          await auditor.promise;
+          return text("child_answer", "PURPOSE_CHILD_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: {
+              action: "message",
+              agent: "auditor",
+              message: "Review src/parser.zig for bugs",
+              instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+            },
+          });
+        }
+        return text("main_wait", "PURPOSE_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER plan it");
+        await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+        await until("the auditor's turn", () => childCalls >= 1);
+        await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+        // Down opens the list only once main's turn is over and its composer is empty.
+        await session.waitForComposer(15_000);
+        await session.sendKeys("Down");
+
+        // The title model has not answered for the auditor, so its row has
+        // no title; it says what the subagent is for.
+        const untitled = await session.waitForPane((pane) => pane.includes(LIST_HINT) && /^ {2}\u2514 auditor {2,}\S/m.test(pane), 15_000);
+        expect(untitled).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}working/m);
+        expect(untitled).not.toContain("new session");
+        expect(untitled).toContain("Agents 2");
+
+        // A word only that text holds finds the row, in any case.
+        await session.sendLiteral("ZEBRA");
+        const found = await session.waitForPane((pane) => composerContains(pane, "ZEBRA") && pane.includes("Agents 1"), 10_000);
+        expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => pane.includes("Agents 2") && !composerContains(pane, "ZEBRA"), 10_000);
+
+        // Once the title model answers, the row shows the title, as any
+        // titled row does, and the search still finds it by what it is for.
+        auditorTitle.release();
+        const titled = await session.waitForPane((pane) => /^ {2}\u2514 auditor {2,}Review the parser {2,}working/m.test(pane), 15_000);
+        expect(titled).not.toContain("You audit the zebra");
+        await session.sendLiteral("zebra");
+        const matched = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+        expect(matched).toMatch(/^ {2}\u2514 auditor {2,}Review the parser {2,}working/m);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => pane.includes("Agents 2") && !composerContains(pane, "zebra"), 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+        auditor.release();
+        await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
+      }, () => {}, false, {}, {
+        titleResponses: Array.from({ length: 8 }, () => async (body: string) => {
+          if (!body.includes("src/parser.zig")) return fakeGatewayFinalText("Plan the parser work");
+          await auditorTitle.promise;
+          return fakeGatewayFinalText("Review the parser");
+        }),
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after a resume, a restored subagent with no title shows what it is for in the agent list, and the search finds it by that text",
+    async () => {
+      const auditor = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The subagent's first turn is cut short by the quit, so it has
+          // saved no title.
+          await auditor.promise;
+          return text("child_answer", "PURPOSE_CHILD_LATE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: {
+              action: "message",
+              agent: "auditor",
+              message: "Review src/parser.zig for bugs",
+              instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+            },
+          });
+        }
+        return text("main_wait", "PURPOSE_MAIN_WAITING");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER plan it");
+        await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+        await until("the auditor's turn", () => childCalls >= 1);
+        await session.waitForComposer(15_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        auditor.release();
+
+        const mains = sessionsHolding(home, "PURPOSE_MAIN_WAITING");
+        expect(mains).toHaveLength(1);
+        const resumed = await launch(`--resume ${mains[0]}`);
+        await resumed.waitForComposer(15_000);
+        // The restored subagent counts at once, so the footer offers the list.
+        await resumed.waitForPane((pane) => pane.includes("main \u2193"), 10_000);
+        await resumed.sendKeys("Down");
+        const list = await resumed.waitForPane((pane) => pane.includes(LIST_HINT) && /^ {2}\u2514 auditor {2,}\S/m.test(pane), 15_000);
+        expect(list).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}idle/m);
+        expect(list).not.toContain("new session");
+
+        await resumed.sendLiteral("zebra");
+        const found = await resumed.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+        expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+        await resumed.sendKeys("Escape");
+        await resumed.waitForPane((pane) => pane.includes("Agents 2") && !composerContains(pane, "zebra"), 10_000);
+        await resumed.sendKeys("Escape");
+        await resumed.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's own subagent with no title yet shows what it is for in the agent list, and the search finds it by that text",
+    async () => {
+      const helper = held();
+      let helperAsked = false;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (userTexts(body).some((text) => text.includes("PURPOSE_HELPER_TASK"))) {
+              helperAsked = true;
+              await helper.promise;
+              return text("helper", "PURPOSE_HELPER_DONE");
+            }
+            if (body.includes("PURPOSE_HELPER_DONE")) return text("lead_after", "PURPOSE_LEAD_SAW_HELPER");
+            if (!body.includes('"lead_sub"')) {
+              return toolCall("lead_sub", "subagent", {
+                request: { action: "message", agent: "helper", message: "PURPOSE_HELPER_TASK", instructions: "You check the zebra crossing logic." },
+              });
+            }
+            return text("lead_started", "PURPOSE_LEAD_STARTED");
+          }
+          if (body.includes("PURPOSE_LEAD_SAW_HELPER")) return text("main_after", "PURPOSE_MAIN_SAW_LEAD_AFTER");
+          if (body.includes("PURPOSE_LEAD_STARTED")) return text("main_idle", "PURPOSE_MAIN_IDLE");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "lead", message: "PURPOSE_LEAD_TASK" },
+            });
+          }
+          return text("main_done", "PURPOSE_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("PURPOSE_MAIN_IDLE", 30_000);
+          await until("the helper's request", () => helperAsked);
+          await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+          await session.waitForComposer(15_000);
+
+          // Lead's helper has no title yet, and sits under lead on a branch of
+          // its own; its row says what it is for.
+          await session.sendKeys("Down");
+          const list = await session.waitForPane((pane) => /^ {4}\u2514 helper /m.test(pane), 10_000);
+          expect(list).toMatch(/^ {4}\u2514 helper {2,}You check the zebra crossing logic\. {2,}working/m);
+          expect(list).not.toContain("new session");
+
+          // A word only that text holds finds it, listed on its own.
+          await session.sendLiteral("zebra");
+          const found = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+          expect(found).toMatch(/^ {2}\u2514 helper {2,}You check the zebra crossing logic\./m);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => pane.includes("Agents 3") && !composerContains(pane, "zebra"), 10_000);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+          helper.release();
+          await session.waitForPane((pane) => pane.includes("PURPOSE_MAIN_SAW_LEAD_AFTER") && !pane.includes("subagent working"), 30_000);
+        });
+      } finally {
+        helper.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "after a resume, the agent list shows a restored subagent's own title, before and after it is shown",
     async () => {
       await withFx((body) => {
@@ -2479,6 +2667,297 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         tracePath = join(home, "fx-trace.log");
         env.FX_TRACE_LOG = tracePath;
       }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  // Main has started two subagents: `worker`, whose turn the test holds, so it
+  // works until the test ends, and `scribe`, which answered at once and is
+  // idle. The list shows them under main in that order. `run` gets the
+  // trace log's text, read fresh on each call.
+  async function withWorkerAndScribe(run: (session: TmuxSession, trace: () => string) => Promise<void>) {
+    const worker = held();
+    let workerCalls = 0;
+    let tracePath = "";
+    const env: Record<string, string> = {};
+    try {
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (userTexts(body).some((value) => value.includes("RUN_WORKER"))) {
+            workerCalls += 1;
+            await worker.promise;
+            return text("worker_done", "RUN_WORKER_DONE");
+          }
+          return text("scribe_done", "RUN_SCRIBE_DONE");
+        }
+        if (!body.includes('"main_worker"')) {
+          return toolCall("main_worker", "subagent", { request: { action: "message", agent: "worker", message: "RUN_WORKER wait for me" } });
+        }
+        if (!body.includes('"main_scribe"')) {
+          return toolCall("main_scribe", "subagent", { request: { action: "message", agent: "scribe", message: "RUN_SCRIBE note it" } });
+        }
+        return text("main_done", "RUN_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start the team");
+        await session.waitForText("RUN_MAIN_DONE", 30_000);
+        await session.waitForComposer(15_000);
+        await until("the worker's turn", () => workerCalls >= 1);
+        await run(session, () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : ""));
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    } finally {
+      worker.release();
+    }
+  }
+
+  // `key` sent `count` times in one write, as a held key repeats it: fx reads
+  // them one after the other with nothing between.
+  const held_key = (key: string, count: number) => Array.from({ length: count }, () => key).join(" ");
+
+  // How many times the trace log shows `event`.
+  const eventCount = (trace: string, event: string) => trace.split("\n").filter((line) => line.includes(`event=${event} `)).length;
+
+  // The previewed worker is mid-turn, and its "Thinking (Ns)" line blinks its
+  // bullet and counts seconds, so two captures never match with it in.
+  const withoutThinkingTimer = (pane: string) => pane.replace(/^[ •]*Thinking \(\d+s\)$/gm, "Thinking");
+
+  // The pane once it has held still for 300 ms, so every key sent before is
+  // handled.
+  async function paneAtRest(session: TmuxSession, ms = 15_000): Promise<string> {
+    const deadline = Date.now() + ms;
+    let last = await session.capturePane();
+    let previous = last;
+    while (Date.now() < deadline) {
+      await Bun.sleep(300);
+      const now = await session.capturePane();
+      if (withoutThinkingTimer(now) === withoutThinkingTimer(last)) return now;
+      previous = last;
+      last = now;
+    }
+    const before = previous.split("\n");
+    const changed = last.split("\n").map((line, index) => (line === before[index] ? "" : `\n  - ${before[index]}\n  + ${line}`)).join("");
+    throw new Error(`the pane never held still; the last two captures differ in:${changed}\n${last}`);
+  }
+
+  // Opens the list and types a search that only `worker` matches, so the list
+  // shows it, working, as the only row.
+  async function searchForWorker(session: TmuxSession) {
+    await session.sendKeys("C-x");
+    await session.waitForText(LIST_HINT, 10_000);
+    await session.sendLiteral("wor");
+    const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "wor")
+      && subagentRow("worker", "working").test(pane), 10_000);
+    expect(found).toContain("esc clear");
+    expect(found).not.toContain("delete close");
+  }
+
+  test(
+    "a held Backspace that empties the agent list's search goes on to nothing: no close is armed, and the highlighted agent stays open and working",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        // Three presses empty the search and four more follow, as a held key
+        // repeats, with no other key between.
+        await session.sendKeys(held_key("BSpace", 7));
+        // fx logs each press it leaves alone; before this change nothing did,
+        // and the fourth press armed the close instead.
+        await until("the held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "wor")).toBe(false);
+        expect(after).toContain("Agents 3");
+        expectRowOrder(after, mainRow(), subagentRow("worker", "working"), subagentRow("scribe", "idle"));
+        // Nothing is armed: the hint offers the close again, not its warning.
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after a Backspace run emptied the agent list's search, another key ends it, and two Backspaces on the next row arm and close it",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        await session.sendKeys(held_key("BSpace", 3));
+        await paneAtRest(session);
+        // Down moves to scribe, a key other than Backspace: the run is over.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "scribe");
+        await session.sendKeys(held_key("BSpace", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("scribe").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("worker", "working"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "on a list nothing was searched in, Backspace pressed twice in a row arms and closes the highlighted subagent, as it always has",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "worker");
+        await session.sendKeys(held_key("BSpace", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("scribe", "idle"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "forward Delete after a Backspace run emptied the agent list's search arms and closes as it does on any list, since it is another key",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        await session.sendKeys(held_key("BSpace", 3));
+        await paneAtRest(session);
+        await session.sendKeys("DC");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("DC");
+        const closed = await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("scribe", "idle"));
+        const log = trace();
+        expect(eventCount(log, "agents_menu_close_armed")).toBe(1);
+        expect(log).toContain("subagent_closed");
+        expect(log).not.toContain("agents_menu_close_ignored");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a held forward Delete that empties the agent list's search from its start goes on to nothing either, and another key ends the run",
+    async () => {
+      await withWorkerAndScribe(async (session, trace) => {
+        await searchForWorker(session);
+        // Left puts the cursor at the start of the search, where Delete takes
+        // the text away letter by letter: three presses empty it, four more
+        // follow.
+        await session.sendKeys(held_key("Left", 3));
+        await session.sendKeys(held_key("DC", 7));
+        await until("the held Delete to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "wor")).toBe(false);
+        expect(after).toContain("Agents 3");
+        expectRowOrder(after, mainRow(), subagentRow("worker", "working"), subagentRow("scribe", "idle"));
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+
+        // Down is another key, so Delete twice closes scribe.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "scribe");
+        await session.sendKeys(held_key("DC", 2));
+        const closed = await session.waitForPane((pane) => !subagentRow("scribe").test(pane) && pane.includes("esc back"), 15_000);
+        expectRowOrder(closed, mainRow(), subagentRow("worker", "working"));
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a search that matches a subagent only by what it is for, cleared by a held Backspace and then some, closes nothing: the agent stays open and working",
+    async () => {
+      const auditor = held();
+      const auditorTitle = held();
+      let childCalls = 0;
+      let tracePath = "";
+      const env: Record<string, string> = {};
+      const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await auditor.promise;
+            return text("child_answer", "PURPOSE_CHILD_DONE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: {
+                action: "message",
+                agent: "auditor",
+                message: "Review src/parser.zig for bugs",
+                instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+              },
+            });
+          }
+          return text("main_wait", "PURPOSE_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER plan it");
+          await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+          await until("the auditor's turn", () => childCalls >= 1);
+          await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendKeys("Down");
+
+          // The title model has not answered, so the row says what the
+          // auditor is for, and only that text holds "zebra".
+          const untitled = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+            && /^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}working/m.test(pane), 15_000);
+          expect(untitled).toContain("Agents 2");
+          await session.sendLiteral("zebra");
+          const found = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+          expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+
+          // Five presses empty the search and four more follow, as a held key
+          // repeats, with no other key between.
+          await session.sendKeys(held_key("BSpace", 9));
+          await until("the held Backspace to be handled", () =>
+            eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+          const after = await paneAtRest(session);
+          expect(composerContains(after, "zebra")).toBe(false);
+          expect(after).toContain("Agents 2");
+          expectRowOrder(after, mainRow(), subagentRow("auditor", "working"));
+          await waitForSelectedRow(session, "auditor");
+          // Nothing is armed: the hint offers the close again, not its warning.
+          expect(after).not.toContain("press delete again");
+          expect(after).toContain("delete close");
+          const log = trace();
+          expect(log).not.toContain("agents_menu_close_armed");
+          expect(log).not.toContain("subagent_closed");
+          expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+          auditor.release();
+          await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
+        }, (home) => {
+          tracePath = join(home, "fx-trace.log");
+          env.FX_TRACE_LOG = tracePath;
+        }, false, env, {
+          titleResponses: Array.from({ length: 8 }, () => async (body: string) => {
+            if (!body.includes("src/parser.zig")) return fakeGatewayFinalText("Plan the parser work");
+            await auditorTitle.promise;
+            return fakeGatewayFinalText("Review the parser");
+          }),
+        });
+      } finally {
+        auditor.release();
+        auditorTitle.release();
+      }
     },
     TIMEOUT,
   );

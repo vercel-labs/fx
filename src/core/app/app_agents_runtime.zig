@@ -95,6 +95,11 @@ pub const ChildAgent = struct {
     /// The profile it runs in, from its host's list. Empty until the list is
     /// read. Owned.
     profile: []u8 = &.{},
+    /// What it is for, from its host's saved list: one line, set when its
+    /// parent started it, which the agent list shows while it has no title
+    /// and searches. Empty until the list syncs or its first run starts, and
+    /// for a one-off. Owned.
+    purpose: []u8 = &.{},
     /// Where its current approval and question come in the order its tree's
     /// prompts were asked (`App.prompt_order`), so the instance's screen
     /// shows the oldest first. Meaningful only while that prompt is active.
@@ -138,6 +143,11 @@ pub const ChildAgent = struct {
 /// above a closed agent: a subagent, or an instance with null for the first.
 const ListedAgent = struct { agent: ?*ChildAgent };
 
+/// A key that arms, and then closes, the highlighted row of the agent list
+/// when the search is empty, and edits the search when it holds text:
+/// Backspace, in any encoding of it, or forward Delete.
+pub const CloseKey = enum { backspace, delete };
+
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
 /// is doing now. It opens on the agent on screen, and its highlight is a
@@ -162,6 +172,12 @@ pub const AgentsMenu = struct {
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?ListedAgent = null,
+    /// The close key whose presses have edited the search since a key other
+    /// than it was last pressed in the list. While it is set, that key does
+    /// nothing on an empty search, so one held down to clear a search never
+    /// goes on to arm and close an agent
+    /// (`tests/tla/agents_menu/spec/AgentsMenu.tla` RunNeverCloses).
+    edit_run: ?CloseKey = null,
     /// The draft of the agent on screen, set aside while the composer is
     /// the list's search box, and back in the composer once the list closes.
     draft: ?composer_stash.State = null,
@@ -757,6 +773,22 @@ fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *us
     }
 }
 
+/// What subagent `target` is for. It is empty for the first instance (null),
+/// for any other instance, and for a subagent that has none.
+fn purposeOf(target: ?*const ChildAgent) []const u8 {
+    const child = target orelse return "";
+    return if (child.agent.role == .subagent) child.purpose else "";
+}
+
+/// Whether an agent's `name`, `title`, or `purpose` has `search` in it, case
+/// aside. The list shows the purpose only where a title is missing, so a
+/// match on it can come from text the row does not show.
+fn matchesSearchText(name: []const u8, title: []const u8, purpose: []const u8, search: []const u8) bool {
+    return ascii_case.containsIgnoreCase(name, search) or
+        ascii_case.containsIgnoreCase(title, search) or
+        ascii_case.containsIgnoreCase(purpose, search);
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -1152,6 +1184,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
                     if (child.profile.len == 0) child.profile = try app.alloc.dupe(u8, entry.profile);
+                    if (child.purpose.len == 0 and entry.purpose.len > 0) child.purpose = try app.alloc.dupe(u8, entry.purpose);
                     if (child.parent_host == null) setParentHost(app, child, host);
                     try order.append(app.alloc, .{ .id = entry.id });
                 }
@@ -1256,11 +1289,11 @@ pub fn Runtime(comptime App: type) type {
             return .{ .agent = order.items[at - 1] };
         }
 
-        /// Whether agent `target`'s name or title has `search` in it, case aside.
+        /// Whether agent `target`'s name, title, or purpose has `search` in
+        /// it, case aside.
         fn matchesSearch(app: *App, target: ?*ChildAgent, search: []const u8) bool {
             var buf: [instance_name_bytes]u8 = undefined;
-            return ascii_case.containsIgnoreCase(noteName(app, target, &buf), search) or
-                ascii_case.containsIgnoreCase(targetAgent(app, target).session_title.items, search);
+            return matchesSearchText(noteName(app, target, &buf), targetAgent(app, target).session_title.items, purposeOf(target), search);
         }
 
         /// How the waiting note names agent `child`, null for the first
@@ -1548,6 +1581,7 @@ pub fn Runtime(comptime App: type) type {
             menu.highlight = .{ .agent = app.agent_on_screen };
             menu.origin = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
+            menu.edit_run = null;
             setDraftAside(app);
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
@@ -1573,6 +1607,7 @@ pub fn Runtime(comptime App: type) type {
             menu.highlight = .on_screen;
             menu.origin = .on_screen;
             menu.close_armed = null;
+            menu.edit_run = null;
             putDraftBack(app);
             app.shell.render_requests.request(.footer);
         }
@@ -1729,6 +1764,7 @@ pub fn Runtime(comptime App: type) type {
                     // A search lists its matches flat, since their parents may not match.
                     .nested = if (subagent) |child| searchText(app).len == 0 and parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
+                    .purpose = purposeOf(target),
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = listedProfile(if (subagent) |child| child.profile else agent.profile.profile.name),
@@ -1759,12 +1795,38 @@ pub fn Runtime(comptime App: type) type {
             return if (std.mem.eql(u8, name, profiles.main_name)) "" else name;
         }
 
+        /// A key was pressed in the open list. A run of close key presses
+        /// that edited the search goes on only through that key, so a key
+        /// other than it ends the run; `pressed` is the close key it is, or
+        /// null for any other key.
+        pub fn noteKeyPress(app: *App, pressed: ?CloseKey) void {
+            if (comptime !@hasField(App, "instances")) return;
+            const menu = &app.instances.agents_menu;
+            const run = menu.edit_run orelse return;
+            if (pressed == run) return;
+            menu.edit_run = null;
+        }
+
+        /// Close key `key` was pressed while the composer, the list's search
+        /// box, holds text, so it edits the search: its run of presses starts
+        /// or goes on, and none of them arms a close, even once the search is
+        /// empty, until another key is pressed.
+        pub fn noteSearchEditKey(app: *App, key: CloseKey) void {
+            if (comptime !@hasField(App, "instances")) return;
+            app.instances.agents_menu.edit_run = key;
+        }
+
         /// Delete in the agent list: the first press on a row arms its close,
         /// and the second closes it: a subagent for good (`closeSubagent`), an
         /// instance as `/close` does (`closeInstanceFromMenu`). The last open
-        /// instance stays, since closing it would end fx.
-        pub fn pressCloseKey(app: *App) !bool {
+        /// instance stays, since closing it would end fx. A press of `key`
+        /// while its run is editing the search does nothing.
+        pub fn pressCloseKey(app: *App, key: CloseKey) !bool {
             if (!menuActive(app)) return false;
+            if (app.instances.agents_menu.edit_run == key) {
+                debug_trace.eventf("host", "agents_menu_close_ignored", .{}, "key={s} reason=search_run", .{@tagName(key)});
+                return true;
+            }
             var order: std.ArrayList(?*ChildAgent) = .empty;
             defer order.deinit(app.alloc);
             try switchList(app, &order);
@@ -2614,6 +2676,9 @@ pub fn Runtime(comptime App: type) type {
             if (child.name.len == 0) if (post.turn.child_name) |name| {
                 child.name = try app.alloc.dupe(u8, name);
             };
+            if (child.purpose.len == 0) if (post.turn.child_purpose) |purpose| {
+                child.purpose = try app.alloc.dupe(u8, purpose);
+            };
             installChildRun(app, child, post.run.?);
             post.run = null;
             const start: Start = .{ .post = post, .child = child };
@@ -2890,6 +2955,7 @@ pub fn Runtime(comptime App: type) type {
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);
             if (child.profile.len > 0) app.alloc.free(child.profile);
+            if (child.purpose.len > 0) app.alloc.free(child.purpose);
             app.alloc.free(child.id);
             app.alloc.destroy(child);
         }
@@ -3222,6 +3288,7 @@ pub fn Runtime(comptime App: type) type {
                 child.screen.deinit(app.alloc);
                 if (child.name.len > 0) app.alloc.free(child.name);
                 if (child.profile.len > 0) app.alloc.free(child.profile);
+                if (child.purpose.len > 0) app.alloc.free(child.purpose);
                 app.alloc.free(child.id);
                 app.alloc.destroy(child);
             }
@@ -3571,4 +3638,28 @@ test "the newest turn's end time never falls back to an older turn" {
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, untimed }));
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{compacted}));
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{}));
+}
+
+test "only a subagent has a purpose to show, and the list's search reads it with the name and the title" {
+    var id = "sub".*;
+    var purpose = "You audit the zebra crossing logic.".*;
+    var subagent: ChildAgent = .{ .id = &id, .agent = .{ .role = .subagent }, .purpose = &purpose };
+    var instance: ChildAgent = .{ .id = &id, .agent = .{ .role = .instance }, .purpose = &purpose };
+    try std.testing.expectEqualStrings(&purpose, purposeOf(&subagent));
+    // The first instance, an instance, and a subagent with none have no purpose.
+    try std.testing.expectEqualStrings("", purposeOf(null));
+    try std.testing.expectEqualStrings("", purposeOf(&instance));
+    subagent.purpose = &.{};
+    try std.testing.expectEqualStrings("", purposeOf(&subagent));
+
+    const text = "You audit the zebra crossing logic.";
+    // Only the purpose holds the word, in any case, whether or not there is a title.
+    try std.testing.expect(matchesSearchText("auditor", "", text, "zebra"));
+    try std.testing.expect(matchesSearchText("auditor", "", text, "ZEBRA"));
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "zebra"));
+    // The name and the title still match, and a word none holds does not.
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "AUDITOR"));
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "parser"));
+    try std.testing.expect(!matchesSearchText("auditor", "Review the parser", text, "giraffe"));
+    try std.testing.expect(!matchesSearchText("auditor", "", "", "zebra"));
 }

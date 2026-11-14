@@ -20,6 +20,8 @@
 #   open-first     the list opens on its first row                   OpensOnScreen
 #   row            the highlight stays on its row, not its agent     SelectionKept
 #   stale-sel      the highlight stays on an agent that closed       SelListed
+#   run-closes     a run of a close key that edited the search goes
+#                  on to arm and close a row (fx before the run)     RunNeverCloses
 #
 # spec/RowOrder.tla models how a subagent's row changes when its turn ends: its
 # label comes from the worker and its place from the history the main loop
@@ -62,6 +64,7 @@ MCAgentsMenu agents-menu-mutation-enter-noop EnterShowsSelection
 MCAgentsMenu agents-menu-mutation-open-first OpensOnScreen
 MCAgentsMenu agents-menu-mutation-row SelectionKept
 MCAgentsMenu agents-menu-mutation-stale-sel SelListed
+MCAgentsMenu agents-menu-mutation-run-closes RunNeverCloses
 MCRowOrder row-order -
 MCRowOrder row-order-mutation-worker-flag IdleRowIsApplied
 MCRowOrder row-order-mutation-worker-flag-flip PlaceChangesWithLabel
