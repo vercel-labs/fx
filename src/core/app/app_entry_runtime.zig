@@ -360,13 +360,19 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     }
 
     app.run() catch |err| {
+        // The terminal hung up: its input closed, or a frame write failed
+        // because it hung up (`error.TerminalHungUp` from the frame sink).
+        const hung_up = err == error.TerminalInputClosed or err == error.TerminalHungUp;
+        if (err == error.TerminalHungUp) {
+            debug_trace.logf("core", "interactive run ended: the terminal hung up during a frame write", .{});
+        }
         // Before the terminal is released, which puts back SIGHUP's default
         // action: a closed window with a turn running ends fx here.
         if (comptime !cooperative and @hasDecl(App, "closeOnHangup")) {
-            if (err == error.TerminalInputClosed) app.closeOnHangup();
+            if (hung_up) app.closeOnHangup();
         }
         app.releaseTerminal();
-        if (err == error.TerminalInputClosed) {
+        if (hung_up) {
             app_needs_deinit = false;
             if (comptime cooperative) {
                 app.deinit();
@@ -1416,6 +1422,34 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
         "terminal-release",
         "deinit",
     });
+}
+
+test "app entry closes as a hang-up when a frame write finds the terminal hung up" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalHungUp;
+    capture.record_stderr_event = true;
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "hangup-close", "terminal-release", "deinit" });
+}
+
+test "app entry still reports a frame write that fails another way" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TerminalSyncRecoveryFailed;
+    capture.record_stderr_event = true;
+
+    try std.testing.expectError(error.TerminalSyncRecoveryFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: terminal sync recovery failed\n", capture.stderr.written());
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry preserves run errors when fatal formatting fails" {

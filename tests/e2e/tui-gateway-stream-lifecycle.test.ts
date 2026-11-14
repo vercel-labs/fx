@@ -3201,6 +3201,147 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
+  // A window can also close while fx is blocked writing a frame, as when
+  // tmux falls behind reading the pane on a busy machine. The write fails
+  // before fx sees the hang-up on its input, and fx must still close as a
+  // hang-up. This test's own tmux server stops reading the pane until fx
+  // blocks in a write, then goes away under that write. SIGHUP stays
+  // blocked, so the failed write is all fx sees.
+  test.skipIf(!Bun.which("python3"))(
+    "a window that closes while fx is blocked writing a frame resumes its request on reopen",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-recovery-blocked-write-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const statusPath = join(root, "exit-status");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const prompt = "Stream until the window closes.";
+      const finalText = "Blocked write recovered once.";
+      const resumed: HoldState = { started: false, cancelled: false };
+      let streaming: ReturnType<typeof setInterval> | undefined;
+      const queuedGateway = startFakeGateway([
+        // Paragraphs keep coming, so fx keeps writing frames.
+        () => new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            const encoder = new TextEncoder();
+            let n = 0;
+            streaming = setInterval(() => {
+              try {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: `word${n++} ${"x".repeat(60)}\n\n` })}\n\n`));
+              } catch {
+                clearInterval(streaming);
+              }
+            }, 2);
+          },
+          cancel() {
+            clearInterval(streaming);
+          },
+        }), { headers: { "content-type": "text/event-stream" } }),
+        () => heldGatewayResponse(resumed, [], [
+          { type: "text-delta", id: "answer_1", delta: finalText },
+          { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+        ]),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      gateway = queuedGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      };
+      // The wrapper blocks SIGHUP for itself and fx, and records fx's exit status.
+      const wrapper =
+        `python3 -c 'import signal, subprocess, sys; signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP}); status = subprocess.run(sys.argv[2:]).returncode; open(sys.argv[1], "w").write(str(status))'`;
+      const socketName = `fx-e2e-blocked-write-${process.pid}-${Date.now()}`;
+      session = await TmuxSession.create({
+        cmd: `${wrapper} ${statusPath} ${FX_BIN}`,
+        cwd: workspace,
+        width: 72,
+        height: 24,
+        stderrPath,
+        socketName,
+        env: { ...env, FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "frame_commit" },
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(prompt);
+      await session.waitForPane((pane) => /word\d+/.test(pane), TIMEOUT);
+
+      const tmux = (format: string) =>
+        execFileSync("tmux", ["-L", socketName, "display-message", "-p", format], { encoding: "utf8" }).trim();
+      const serverPid = Number(tmux("#{pid}"));
+      const socketPath = tmux("#{socket_path}");
+      try {
+        // tmux stops reading the pane. Once the pty is full, a frame write
+        // blocks, and fx's trace of committed frames stops growing while
+        // the answer still streams.
+        process.kill(serverPid, "SIGSTOP");
+        let size = -1;
+        let quietPolls = 0;
+        await waitForCondition(() => {
+          const now = readFileSync(tracePath).length;
+          quietPolls = now === size ? quietPolls + 1 : 0;
+          size = now;
+          return quietPolls >= 20;
+        }, "fx to block in a frame write");
+      } finally {
+        // The window goes away under that write.
+        process.kill(serverPid, "SIGKILL");
+        session = null;
+        rmSync(socketPath, { force: true });
+      }
+      await waitForCondition(
+        () => existsSync(statusPath) && readFileSync(statusPath, "utf8") !== "",
+        "fx to exit after its window closed",
+      );
+      clearInterval(streaming);
+
+      // fx closed as a hang-up: it printed nothing and ended with SIGHUP's
+      // status, and the frame the hang-up broke is in its trace.
+      const frameFailures = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("cleanup=failed"));
+      expect({
+        stderr: readFileSync(stderrPath, "utf8"),
+        status: readFileSync(statusPath, "utf8"),
+        frameFailures,
+      }).toEqual({ stderr: "", status: "129", frameFailures: [expect.stringContaining("err=TerminalHungUp")] });
+
+      const resumedStderr = join(root, "resumed-stderr.log");
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: workspace,
+        width: 100,
+        height: 32,
+        stderrPath: resumedStderr,
+        env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      // The close saved the request, so reopening sends it again on its own
+      // (`tests/tla/recovery/Resume.tla` Close and AutoResumes).
+      await waitForCondition(() => resumed.started, "resumed request after the window closed");
+      await session.waitForText("Resuming the interrupted request", TIMEOUT);
+      resumed.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => hasEmptyComposer(pane), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback).not.toContain("Cancelled");
+      expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(readFileSync(resumedStderr, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
   test(
     "recovering tool lifecycle admits resumed tools on the same turn",
     async () => {
