@@ -10995,7 +10995,7 @@ describe("acp: model-independent", () => {
 
   // Closing stdin ends the server while a subagent is inside a shell command. The subagents stop before the
   // executions they run commands through are torn down: torn down first, the process waited for ever on a
-  // runtime that was gone, and on macOS it sometimes aborted on the assertion that no operation is in flight.
+  // runtime that was gone, and it could abort on the assertion that no operation is in flight.
   for (const after of ["while the prompt runs", "after session/cancel"] as const) {
     test(
       `ACP closing stdin ${after} stops a subagent that runs a shell command, and the server exits`,
@@ -11039,6 +11039,56 @@ describe("acp: model-independent", () => {
       TIMEOUT * 2,
     );
   }
+
+  // Two subagents are inside shell commands when stdin closes. The subagents are joined one after the other, and
+  // the first one's slot must stay alive until the second one's thread has ended: that thread reads every slot
+  // when its work ends. The second command ignores SIGTERM, so its subagent ends later than the first one, after
+  // the first one's thread was joined and its slot freed, and the window opens on every run.
+  test(
+    "ACP closing stdin with two subagents inside shell commands stops both, and the server exits",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-stdin-close-two-");
+      const startedOne = join(root.root, "shell-started-one");
+      const startedTwo = join(root.root, "shell-started-two");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          return body.includes("RUN_COMMAND_ONE")
+            ? fakeShellRun("two_close_shell_one", `touch '${startedOne}'; sleep 30`)
+            : fakeShellRun("two_close_shell_two", `trap '' TERM; touch '${startedTwo}'; sleep 30`);
+        }
+        if (body.includes("two_close_call_two")) return finalText("ACP_TWO_CLOSE_PARENT_DONE");
+        if (body.includes("two_close_call_one")) {
+          return fakeGatewayToolCall("two_close_call_two", "subagent", {
+            request: { action: "message", agent: "second", message: "RUN_COMMAND_TWO" },
+          });
+        }
+        return fakeGatewayToolCall("two_close_call_one", "subagent", {
+          request: { action: "message", agent: "first", message: "RUN_COMMAND_ONE" },
+        });
+      });
+      const childOutcomes = (sessionId: string): string[] =>
+        (logLines(root.home, sessionId) as any[]).filter((line) => line.kind === "child_finished").map((line) => line.outcome);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "full-access" }, 4);
+        sendPrompt(client, 8311, "Start the two subagents that run the commands.");
+        await waitForPath(startedOne, TIMEOUT);
+        await waitForPath(startedTwo, TIMEOUT);
+
+        client.endStdin();
+        const code = await client.waitForExit(TIMEOUT);
+        // The exit code and stderr together, so a failure shows what the process said.
+        expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
+        expect(childOutcomes(sessionId)).toEqual(["interrupted", "interrupted"]);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
 
   test(
     "protocol request cancellation aborts held automatic review and keeps server usable",
