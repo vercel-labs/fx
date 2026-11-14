@@ -525,15 +525,12 @@ async function sessionGrantsNow(session: TmuxSession): Promise<string> {
 }
 
 // Types `/permissions reset` while main's turn runs, and returns the grants line
-// before it and the one after it, once the list is empty.
+// before it and the one after it. fx takes typed commands in order, so the panel
+// the second look opens shows the list after the reset.
 async function resetSessionGrants(session: TmuxSession): Promise<{ before: string; after: string }> {
   const before = await sessionGrantsNow(session);
   await session.sendText("/permissions reset");
-  let after = await sessionGrantsNow(session);
-  for (let tries = 0; tries < 20 && !/none/.test(after); tries++) {
-    await Bun.sleep(250);
-    after = await sessionGrantsNow(session);
-  }
+  const after = await sessionGrantsNow(session);
   return { before, after };
 }
 
