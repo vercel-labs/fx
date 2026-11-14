@@ -12,7 +12,11 @@ const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const kept_sign_outs = @import("kept_sign_outs.zig");
 const secret = @import("../auth/secret.zig");
+const auth_oauth = @import("../auth/oauth.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const slack = @import("slack.zig");
 const runtime_mod = @import("runtime.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
@@ -381,6 +385,27 @@ pub const Context = struct {
     hosts: Hosts,
     /// Ends a `show` still connecting, such as when fx quits.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// How a `login` that signs in and every `logout` send the sign-outs that
+    /// earlier logouts kept (`kept_sign_outs.zig`). Null: they wait for the
+    /// next TUI start, or for an `fx mcp` command that has this.
+    kept_sign_outs: ?KeptSignOutRetry = null,
+};
+
+pub const KeptSignOutRetry = struct {
+    transport: oauth_transport.Provider,
+    /// Runs before the first revocation goes out.
+    notice: ?auth_oauth.BeforeRevocation = null,
+
+    /// Sends those of the logins saved under `home`; one that fails stays
+    /// kept for the next retry, and nothing is said, since the logout that
+    /// kept it already did.
+    fn run(retry: ?KeptSignOutRetry, alloc: Allocator, home: []const u8) void {
+        const r = retry orelse return;
+        const outcome = kept_sign_outs.retry(alloc, home, r.transport, r.notice);
+        if (outcome.revoked != 0 or outcome.failed) {
+            debug_trace.logf("mcp", "MCP kept sign-outs retried revoked={d} failed={}", .{ outcome.revoked, outcome.failed });
+        }
+    }
 };
 
 /// Runs `fx mcp ARGS` or `/mcp ARGS` and returns the exit code: 0 for
@@ -1013,11 +1038,18 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
             // The server never hears of a logout it wasn't sent: a copy of
             // the tokens keeps working there.
             .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
-            .unconfirmed => try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
+            .unconfirmed => if (done.retry_later)
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid for now. " ++ pending_revocation.retry_later ++ ".\n", .{shown})
+            else
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
         }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
     }
+    // The sign-out just kept is leased to this fx, so this retry leaves it
+    // and sends only older ones.
+    try c.out.flush();
+    KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
     return 0;
 }
 
@@ -1147,6 +1179,8 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
             };
             if (ok) {
                 try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                try c.out.flush();
+                KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
                 return 0;
             }
             try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safe(arena, waiter.reason orelse "the server refused") });

@@ -366,6 +366,17 @@ pub const Engine = struct {
         return s.saveCredential(w);
     }
 
+    /// Writes the credential server `name`'s next `signOut` revokes, as
+    /// `saveCredential` writes it: the one it holds, or, before it starts,
+    /// the one `restoreCredential` gave it. False when there is none.
+    pub fn writeSignOutCredential(e: *Engine, name: []const u8, w: *std.Io.Writer) Error!bool {
+        const slot = try e.find(name);
+        if (slot.server) |s| return s.saveCredential(w);
+        const saved = slot.config.auth.saved orelse return false;
+        try w.writeAll(saved);
+        return true;
+    }
+
     /// Gives server `name` the credential `saveCredential` wrote, as
     /// `Config.auth.saved` does, for a host that reads it after `init`.
     /// `saved` is copied. Call it before anything starts the server: a

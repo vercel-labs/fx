@@ -1039,26 +1039,36 @@ describe("MCP login", () => {
   }, 60_000);
 
   // A revocation the server refused, or didn't answer before fx stopped
-  // waiting, may have left the tokens working there.
+  // waiting, may have left the tokens working there. Before, fx forgot them
+  // and never tried again; now it keeps them to revoke later.
+  const unconfirmedLogout =
+    "Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid for now. fx will try again later.\n";
+  const keptSignOuts = (root: { home: string }) => join(root.home, ".fx", "mcp-revocations.json");
+  const revokedTokens = (fixture: AuthFixture) =>
+    fixture.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
+
   for (const [what, options] of [
     ["refuses", { revokeStatus: 503 }],
     ["doesn't answer in time", { revokeDelayMs: 4_000 }],
   ] as const) {
-    test(`a logout whose revocation the server ${what} says the tokens may stay valid`, async () => {
+    test(`a logout whose revocation the server ${what} keeps it to try again later`, async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url, options);
       const root = createRoot(auth);
       seedV2Credential(root, auth);
       const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
-      expect(logout.stdout).toBe("Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
+      expect(logout.stdout).toBe(unconfirmedLogout);
       expect(logout.stderr).toBe("");
       expect(logout.code).toBe(0);
       expect(auth.revocations).toBe(1);
       expect(await statusOf(root)).toBe("not_started");
+      // Kept in a private file, with the refresh token the revocation sent.
+      expect(statSync(keptSignOuts(root)).mode & 0o777).toBe(0o600);
+      expect(readFileSync(keptSignOuts(root), "utf8")).toContain(`"refresh_token":"${REFRESH_INITIAL}"`);
     }, 60_000);
   }
 
-  test("a logout whose revocation can't reach the server says the tokens may stay valid", async () => {
+  test("a logout whose revocation can't reach the server keeps it to try again later", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
@@ -1068,11 +1078,52 @@ describe("MCP login", () => {
     closed.stop(true);
     seedV2Credential(root, auth, { revocation_endpoint: revokeUrl });
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
-    expect(logout.stdout).toBe("Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
+    expect(logout.stdout).toBe(unconfirmedLogout);
     expect(logout.stderr).toBe("");
     expect(logout.code).toBe(0);
     expect(auth.revocations).toBe(0);
     expect(await statusOf(root)).toBe("not_started");
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+  }, 60_000);
+
+  test("the next fx mcp logout revokes a sign-out its server didn't confirm, and forgets it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const first = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(first.stdout).toBe(unconfirmedLogout);
+    // The logout's own retry leaves the sign-out it just kept to itself.
+    expect(auth.revocations).toBe(1);
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+
+    // The server works again. The next logout has nothing of its own to
+    // sign out of, and sends the kept revocation.
+    delete options.revokeStatus;
+    const second = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(second.stdout).toBe("fixture wasn't signed in.\n");
+    expect(second.stderr).toBe("");
+    expect(second.code).toBe(0);
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+
+    // Nothing is kept, so a third sends nothing.
+    const third = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(third);
+    expect(auth.revocations).toBe(2);
+  }, 60_000);
+
+  test("a confirmed logout keeps nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture.\n");
+    expect(auth.revocations).toBe(1);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
   }, 60_000);
 
   test("fx mcp login says why the server refused the sign-in, in its words", async () => {

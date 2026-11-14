@@ -8,12 +8,18 @@
 //! every TUI start, on a worker. A sign-out kept longer than `max_age_ms` is
 //! dropped without a request.
 //!
+//! MCP logins keep theirs the same way, with what their revocation needs
+//! (`mcp_host/kept_sign_outs.zig`), and `fx mcp login` and `fx mcp logout`
+//! retry them.
+//!
 //! Codex and Grok keep theirs in a private file in the profile folder, next to
 //! their logins. The fx login keeps its in the macOS Keychain when its login is
-//! there, with a marker file that holds no token, so that a start with nothing
-//! kept reads no Keychain item; otherwise in a private profile file. Each
-//! source's record changes only under its own lock file, which is held for one
-//! read and one write but never across a request to the provider.
+//! there, and MCP logins keep theirs where their credential store is
+//! (`mcpPlace`), each with a marker file that holds no token, so that a start
+//! with nothing kept reads no Keychain item; otherwise in a private profile
+//! file. Each source's record changes only under its own lock file, which is
+//! held for one read and one write but never across a request to the
+//! provider.
 //!
 //! The fx that sends a sign-out leases it for as long as that can take, so
 //! another fx's retry at the same time does not send it again. A lease whose
@@ -41,12 +47,14 @@ pub const Source = enum {
     codex,
     grok,
     fx_login,
+    mcp,
 
     fn files(self: Source) Files {
         return switch (self) {
             .codex => .{ .record = "chatgpt-revocations.json", .lock = "chatgpt-revocations.lock", .label = "Codex kept sign-outs" },
             .grok => .{ .record = "grok-revocations.json", .lock = "grok-revocations.lock", .label = "Grok kept sign-outs" },
-            .fx_login => .{ .record = "auth-revocations.json", .lock = "auth-revocations.lock", .label = "fx login kept sign-outs" },
+            .fx_login => .{ .record = "auth-revocations.json", .lock = "auth-revocations.lock", .label = "fx login kept sign-outs", .keychain_marker = "auth-revocations.keychain" },
+            .mcp => .{ .record = "mcp-revocations.json", .lock = "mcp-revocations.lock", .label = "MCP kept sign-outs", .keychain_marker = "mcp-revocations.keychain" },
         };
     }
 };
@@ -56,10 +64,10 @@ const Files = struct {
     lock: []const u8,
     /// Names the lock in debug trace lines.
     label: []const u8,
+    /// The marker file while the record is in the Keychain. Empty for a
+    /// source that never keeps it there.
+    keychain_marker: []const u8 = "",
 };
-
-/// The fx login's marker file while its record is in the Keychain.
-const keychain_marker = "auth-revocations.keychain";
 
 /// What a warning adds when a sign-out's tokens are kept to revoke later.
 pub const retry_later = "fx will try again later";
@@ -69,33 +77,53 @@ pub const retry_later = "fx will try again later";
 pub const max_age_ms: i64 = 30 * std.time.ms_per_day;
 /// The most sign-outs kept for one source. Keeping one more drops the oldest.
 pub const max_entries: usize = 8;
-/// One sign-out always fits: its four fields, each escaped six bytes for one
-/// at most, take under 100 KiB.
-pub const max_record_bytes: usize = 128 * 1024;
+/// One sign-out always fits: its nine fields, each escaped six bytes for one
+/// at most, take under 220 KiB.
+pub const max_record_bytes: usize = 256 * 1024;
 const max_field_bytes: usize = 4 * 1024;
 const schema_version: i64 = 1;
 /// The lock is held for one read and one write, a Keychain call at most each,
 /// and its holder stamps it before each (`leased_lock`).
 const lock_wait_ms: i64 = native_keychain.keychain_call_ms + leased_lock.slack_ms;
 
-/// The tokens of one sign-out. Borrowed.
+/// The tokens of one sign-out, and what sending its revocation again takes.
+/// Borrowed. A field its source does not use is empty.
 pub const Tokens = struct {
-    /// Identifies the sign-out.
+    /// Identifies the sign-out. For an MCP login, the token its revocation
+    /// sends: the refresh token when it has one, else the access token.
     refresh_token: []const u8,
-    /// The fx login's access token, issuer, and client id. Empty for Codex
-    /// and Grok.
+    /// The fx login's access token and issuer, and the client id of the fx
+    /// login and of an MCP login.
     access_token: []const u8 = "",
     issuer: []const u8 = "",
     client_id: []const u8 = "",
+    /// An MCP login's revocation (`mcp_host/kept_sign_outs.zig`): the kind of
+    /// token `refresh_token` is, where it goes, how the client authenticates,
+    /// and the server signed in to, which decides the endpoints it may use.
+    token_type_hint: []const u8 = "",
+    revocation_endpoint: []const u8 = "",
+    client_secret: []const u8 = "",
+    client_auth: []const u8 = "",
+    server_url: []const u8 = "",
 
     fn valid(self: Tokens) bool {
         if (self.refresh_token.len == 0) return false;
-        inline for (.{ "refresh_token", "access_token", "issuer", "client_id" }) |name| {
+        inline for (field_names) |name| {
             if (@field(self, name).len > max_field_bytes) return false;
         }
         return true;
     }
 };
+
+/// Every field of `Tokens`, in the order a record writes them.
+const field_names = .{ "refresh_token", "access_token", "issuer", "client_id", "token_type_hint", "revocation_endpoint", "client_secret", "client_auth", "server_url" };
+/// The fields after `refresh_token`, which a record leaves out when empty.
+const optional_field_names = .{ "access_token", "issuer", "client_id", "token_type_hint", "revocation_endpoint", "client_secret", "client_auth", "server_url" };
+
+comptime {
+    std.debug.assert(field_names.len == @typeInfo(Tokens).@"struct".field_names.len);
+    std.debug.assert(optional_field_names.len + 1 == field_names.len);
+}
 
 /// The fx that is sending a sign-out now, until `until_ms` on the wall clock.
 const Lease = struct {
@@ -130,13 +158,20 @@ fn processAlive(alloc: Allocator, pid: i64) bool {
     return process_tree.processIsAlive(alloc, @intCast(pid)) catch true;
 }
 
-/// One kept sign-out. Every field is owned; release it with `deinit`.
+/// One kept sign-out. Every field is owned and zeroed when released; release
+/// it with `deinit`.
 const Entry = struct {
     saved_at_ms: i64,
-    refresh_token: []u8,
-    access_token: []u8,
-    issuer: []u8,
-    client_id: []u8,
+    /// The fields of `Tokens`, by the same names.
+    refresh_token: []u8 = &.{},
+    access_token: []u8 = &.{},
+    issuer: []u8 = &.{},
+    client_id: []u8 = &.{},
+    token_type_hint: []u8 = &.{},
+    revocation_endpoint: []u8 = &.{},
+    client_secret: []u8 = &.{},
+    client_auth: []u8 = &.{},
+    server_url: []u8 = &.{},
     /// Who is sending it now, when anyone is.
     lease: ?Lease = null,
 
@@ -153,37 +188,25 @@ const Entry = struct {
     }
 
     fn init(alloc: Allocator, saved_at_ms: i64, tokens: Tokens) !Entry {
-        const refresh_token = try alloc.dupe(u8, tokens.refresh_token);
-        errdefer secret.zeroAndFree(alloc, refresh_token);
-        const access_token = try alloc.dupe(u8, tokens.access_token);
-        errdefer secret.zeroAndFree(alloc, access_token);
-        const issuer = try alloc.dupe(u8, tokens.issuer);
-        errdefer alloc.free(issuer);
-        const client_id = try alloc.dupe(u8, tokens.client_id);
-        return .{
-            .saved_at_ms = saved_at_ms,
-            .refresh_token = refresh_token,
-            .access_token = access_token,
-            .issuer = issuer,
-            .client_id = client_id,
-        };
+        var entry: Entry = .{ .saved_at_ms = saved_at_ms };
+        // A field not copied yet is empty, which `deinit` skips.
+        errdefer entry.deinit(alloc);
+        inline for (field_names) |name| {
+            const value = @field(tokens, name);
+            if (value.len != 0) @field(entry, name) = try alloc.dupe(u8, value);
+        }
+        return entry;
     }
 
     fn deinit(self: *Entry, alloc: Allocator) void {
-        secret.zeroAndFree(alloc, self.refresh_token);
-        secret.zeroAndFree(alloc, self.access_token);
-        alloc.free(self.issuer);
-        alloc.free(self.client_id);
+        inline for (field_names) |name| secret.zeroAndFree(alloc, @field(self, name));
         self.* = undefined;
     }
 
     fn asTokens(self: Entry) Tokens {
-        return .{
-            .refresh_token = self.refresh_token,
-            .access_token = self.access_token,
-            .issuer = self.issuer,
-            .client_id = self.client_id,
-        };
+        var tokens: Tokens = .{ .refresh_token = self.refresh_token };
+        inline for (optional_field_names) |name| @field(tokens, name) = @field(self, name);
+        return tokens;
     }
 };
 
@@ -280,12 +303,8 @@ fn parse(alloc: Allocator, bytes: []const u8) !List {
         if (item != .object) return error.InvalidKeptSignOuts;
         const saved_at = item.object.get("saved_at_ms") orelse return error.InvalidKeptSignOuts;
         if (saved_at != .integer) return error.InvalidKeptSignOuts;
-        const tokens: Tokens = .{
-            .refresh_token = try field(item.object, "refresh_token", .required),
-            .access_token = try field(item.object, "access_token", .optional),
-            .issuer = try field(item.object, "issuer", .optional),
-            .client_id = try field(item.object, "client_id", .optional),
-        };
+        var tokens: Tokens = .{ .refresh_token = try field(item.object, "refresh_token", .required) };
+        inline for (optional_field_names) |name| @field(tokens, name) = try field(item.object, name, .optional);
         if (!tokens.valid()) return error.InvalidKeptSignOuts;
         const pid = try integerField(item.object, "sender_pid");
         const until_ms = try integerField(item.object, "sending_until_ms");
@@ -322,7 +341,7 @@ fn stringify(alloc: Allocator, list: List) ![]u8 {
         if (index != 0) try out.writer.writeByte(',');
         try out.writer.print("{{\"saved_at_ms\":{d},\"refresh_token\":", .{entry.saved_at_ms});
         try std.json.Stringify.value(entry.refresh_token, .{}, &out.writer);
-        inline for (.{ "access_token", "issuer", "client_id" }) |name| {
+        inline for (optional_field_names) |name| {
             const value = @field(entry, name);
             if (value.len != 0) {
                 try out.writer.writeAll(",\"" ++ name ++ "\":");
@@ -380,16 +399,42 @@ fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) anyerror!void {
     _ = try native_keychain.deleteOAuthPendingRevocations(alloc);
 }
 
+/// MCP logins' record, in its own Keychain item.
+const mcp_keychain_backend: KeychainBackend = .{
+    .load_fn = mcpKeychainLoad,
+    .store_fn = mcpKeychainStore,
+    .delete_fn = mcpKeychainDelete,
+};
+
+fn mcpKeychainLoad(_: ?*anyopaque, alloc: Allocator) anyerror!?[]u8 {
+    return native_keychain.loadMcpPendingRevocations(alloc) catch |err| switch (err) {
+        error.KeychainItemNotFound => null,
+        else => err,
+    };
+}
+
+fn mcpKeychainStore(_: ?*anyopaque, value: []const u8) anyerror!void {
+    return native_keychain.storeMcpPendingRevocations(value);
+}
+
+fn mcpKeychainDelete(_: ?*anyopaque, alloc: Allocator) anyerror!void {
+    _ = try native_keychain.deleteMcpPendingRevocations(alloc);
+}
+
 /// Whether opening a record may create the profile folder.
 const Open = enum { existing, create };
 
 /// Where a source's record is.
-const Place = struct {
+pub const Place = struct {
     source: Source,
-    /// Set for the fx login when its login is in the Keychain.
+    /// Set for the fx login when its login is in the Keychain, and for MCP
+    /// logins when their credential store is.
     keychain: ?KeychainBackend = null,
-    /// The folder that holds the profile folder: the home folder, unless a
-    /// test sets it.
+    /// The home folder whose profile folder holds the record; null for the
+    /// process's own.
+    home: ?[]const u8 = null,
+    /// The folder that holds the profile folder, in place of `home`'s, set
+    /// by tests.
     parent: ?std.Io.Dir = null,
 
     fn of(source: Source) Place {
@@ -405,7 +450,7 @@ const Place = struct {
         var opened: ?std.Io.Dir = null;
         defer if (opened) |dir| dir.close(io_mod.getIo());
         const parent = self.parent orelse blk: {
-            const home = io_mod.homeDir() orelse return null;
+            const home = self.home orelse io_mod.homeDir() orelse return null;
             opened = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| switch (err) {
                 error.FileNotFound => return null,
                 else => return err,
@@ -425,7 +470,8 @@ const Place = struct {
     fn recordExists(self: Place) !bool {
         var fx_dir = (try self.openProfile(.existing)) orelse return false;
         defer fx_dir.close();
-        const name = if (self.keychain != null) keychain_marker else self.source.files().record;
+        const files = self.source.files();
+        const name = if (self.keychain != null) files.keychain_marker else files.record;
         var current = (try session_presence.openCurrent(fx_dir.dir, name)) orelse return false;
         current.file.close(io_mod.getIo());
         return true;
@@ -502,7 +548,7 @@ const Mutation = struct {
         if (self.place.keychain) |keychain| {
             self.restamp();
             try keychain.store_fn(keychain.context, text);
-            try io_mod.durableReplaceVerified(alloc, &self.fx_dir, keychain_marker, "1\n");
+            try io_mod.durableReplaceVerified(alloc, &self.fx_dir, self.place.source.files().keychain_marker, "1\n");
             return;
         }
         try io_mod.durableReplaceVerified(alloc, &self.fx_dir, self.place.source.files().record, text);
@@ -512,7 +558,7 @@ const Mutation = struct {
         if (self.place.keychain) |keychain| {
             self.restamp();
             try keychain.delete_fn(keychain.context, alloc);
-            return self.deleteFile(keychain_marker);
+            return self.deleteFile(self.place.source.files().keychain_marker);
         }
         try self.deleteFile(self.place.source.files().record);
     }
@@ -529,13 +575,39 @@ const Mutation = struct {
     }
 };
 
+/// Where MCP logins keep their sign-outs: beside their credential store, in
+/// the profile folder under `home`, or in the Keychain when `keychain` says
+/// the store is there (`mcp_host/credentials.zig`). `home` is borrowed.
+pub fn mcpPlace(home: []const u8, keychain: bool) Place {
+    if (comptime host_target.is_wasm) return .{ .source = .mcp, .home = home };
+    return .{ .source = .mcp, .home = home, .keychain = if (keychain) mcp_keychain_backend else null };
+}
+
+/// Whether MCP logins may have sign-outs kept under `home`, in the Keychain
+/// or a file, checked by the file or marker alone, without the lock.
+pub fn mcpMayHaveKept(home: []const u8) bool {
+    for ([_]bool{ false, true }) |keychain| {
+        const exists = mcpPlace(home, keychain).recordExists() catch |err| blk: {
+            debug_trace.logf("auth", "kept sign-outs not looked for source=mcp err={s}", .{@errorName(err)});
+            break :blk false;
+        };
+        if (exists) return true;
+    }
+    return false;
+}
+
 /// Keeps a sign-out's tokens before its revocation is sent, leased to this
 /// process while it sends them. Returns whether they were kept; when they
-/// were not, the debug trace says why.
+/// were not, the debug trace says why. Not for `.mcp`, which uses `keepIn`.
 pub fn keep(alloc: Allocator, source: Source, tokens: Tokens) bool {
+    return keepIn(alloc, .of(source), tokens);
+}
+
+/// `keep`, at `place`.
+pub fn keepIn(alloc: Allocator, place: Place, tokens: Tokens) bool {
     const now_ms = io_mod.milliTimestamp();
-    keepAt(alloc, .of(source), tokens, now_ms, .mine(source, now_ms)) catch |err| {
-        debug_trace.logf("auth", "sign-out not kept source={t} err={s}", .{ source, @errorName(err) });
+    keepAt(alloc, place, tokens, now_ms, .mine(place.source, now_ms)) catch |err| {
+        debug_trace.logf("auth", "sign-out not kept source={t} err={s}", .{ place.source, @errorName(err) });
         return false;
     };
     return true;
@@ -557,8 +629,13 @@ fn keepAt(alloc: Allocator, place: Place, tokens: Tokens, now_ms: i64, lease: ?L
 /// forgotten stays kept, and a later retry revokes it again, which is
 /// harmless.
 pub fn forget(alloc: Allocator, source: Source, refresh_token: []const u8) void {
-    forgetAt(alloc, .of(source), refresh_token) catch |err| {
-        debug_trace.logf("auth", "kept sign-out not forgotten source={t} err={s}", .{ source, @errorName(err) });
+    forgetIn(alloc, .of(source), refresh_token);
+}
+
+/// `forget`, at `place`.
+pub fn forgetIn(alloc: Allocator, place: Place, refresh_token: []const u8) void {
+    forgetAt(alloc, place, refresh_token) catch |err| {
+        debug_trace.logf("auth", "kept sign-out not forgotten source={t} err={s}", .{ place.source, @errorName(err) });
     };
 }
 
@@ -606,8 +683,13 @@ pub const RetryOutcome = struct {
 /// failure, since the provider is likely down, and the rest wait for the next
 /// retry. Runs `before` once, before the first request.
 pub fn retry(alloc: Allocator, source: Source, revoker: Revoker, before: ?oauth.BeforeRevocation) RetryOutcome {
-    return retryAt(alloc, .of(source), io_mod.milliTimestamp(), revoker, before) catch |err| {
-        debug_trace.logf("auth", "kept sign-outs not retried source={t} err={s}", .{ source, @errorName(err) });
+    return retryIn(alloc, .of(source), revoker, before);
+}
+
+/// `retry`, at `place`.
+pub fn retryIn(alloc: Allocator, place: Place, revoker: Revoker, before: ?oauth.BeforeRevocation) RetryOutcome {
+    return retryAt(alloc, place, io_mod.milliTimestamp(), revoker, before) catch |err| {
+        debug_trace.logf("auth", "kept sign-outs not retried source={t} err={s}", .{ place.source, @errorName(err) });
         return .{ .failed = true };
     };
 }
@@ -665,6 +747,8 @@ fn retryAt(alloc: Allocator, place: Place, now_ms: i64, revoker: Revoker, before
 
 const testing = std.testing;
 const day_ms = std.time.ms_per_day;
+/// The fx login's marker file while its record is in the Keychain.
+const keychain_marker = Source.fx_login.files().keychain_marker;
 
 fn testPlace(tmp: *testing.TmpDir, source: Source) Place {
     return .{ .source = source, .parent = tmp.dir };
@@ -930,6 +1014,67 @@ test "the fx login's sign-out keeps its issuer, client id, and both tokens" {
     try testing.expectEqualStrings("cl_1", kept.client_id);
 }
 
+test "an MCP login's sign-out keeps its revocation in its own private record" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const place = testPlace(&tmp, .mcp);
+    const tokens: Tokens = .{
+        .refresh_token = "refresh",
+        .client_id = "client",
+        .token_type_hint = "refresh_token",
+        .revocation_endpoint = "https://auth.example.com/revoke",
+        .client_secret = "secret \"quoted\"",
+        .client_auth = "client_secret_basic",
+        .server_url = "https://mcp.example.com/mcp",
+    };
+    try keepAt(testing.allocator, place, tokens, 1, null);
+    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.json"));
+    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "auth-revocations.json"));
+
+    var mutation = (try Mutation.begin(place, .existing)).?;
+    defer mutation.deinit();
+    var list = try mutation.load(testing.allocator);
+    defer list.deinit(testing.allocator);
+    const kept = list.entries.items[0].asTokens();
+    inline for (field_names) |name| try testing.expectEqualStrings(@field(tokens, name), @field(kept, name));
+}
+
+test "MCP sign-outs are kept under their credential store's home, and found there without the lock" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
+    defer testing.allocator.free(home);
+    try testing.expect(!mcpMayHaveKept(home));
+    const place = mcpPlace(home, false);
+    try keepAt(testing.allocator, place, .{ .refresh_token = "r", .revocation_endpoint = "https://as/revoke" }, 1, null);
+    try testing.expect(mcpMayHaveKept(home));
+    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.json"));
+
+    var fake: FakeRevoker = .{};
+    defer fake.deinit();
+    _ = try retryAt(testing.allocator, place, 2, fake.revoker(), null);
+    try testing.expectEqual(@as(usize, 1), fake.sent.items.len);
+    try testing.expect(!mcpMayHaveKept(home));
+}
+
+test "an MCP Keychain record has its own marker, apart from the fx login's" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var keychain: MemoryKeychain = .{};
+    defer keychain.deinit();
+    const place: Place = .{ .source = .mcp, .keychain = keychain.backend(), .parent = tmp.dir };
+    try keepAt(testing.allocator, place, .{ .refresh_token = "r", .revocation_endpoint = "https://as/revoke" }, 1, null);
+    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.keychain"));
+    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, keychain_marker));
+    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "mcp-revocations.json"));
+    // The fx login's record, which is somewhere else, still reads as empty.
+    var fake: FakeRevoker = .{};
+    defer fake.deinit();
+    _ = try retryAt(testing.allocator, testPlace(&tmp, .fx_login), 2, fake.revoker(), null);
+    try testing.expectEqual(@as(usize, 0), fake.sent.items.len);
+}
+
 test "a sign-out a live fx is sending is left to it until its lease ends" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1004,7 +1149,7 @@ test "a retry leases what it sends, so a retry at the same time skips it" {
 test "a retry with nothing kept sends nothing and creates no file" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    for ([_]Source{ .codex, .grok, .fx_login }) |source| {
+    for (std.enums.values(Source)) |source| {
         var fake: FakeRevoker = .{};
         defer fake.deinit();
         const outcome = try retryAt(testing.allocator, testPlace(&tmp, source), 1, fake.revoker(), null);
@@ -1230,8 +1375,7 @@ fn fuzzRecord(_: void, smith: *testing.Smith) !void {
     try testing.expectEqual(list.entries.items.len, again.entries.items.len);
     for (list.entries.items, again.entries.items) |want, got| {
         try testing.expectEqual(want.saved_at_ms, got.saved_at_ms);
-        try testing.expectEqualStrings(want.refresh_token, got.refresh_token);
-        try testing.expectEqualStrings(want.access_token, got.access_token);
+        inline for (field_names) |name| try testing.expectEqualStrings(@field(want, name), @field(got, name));
     }
 
     // Any saved time expires without overflow, at any clock reading.
@@ -1248,6 +1392,8 @@ test "a kept sign-out record parses or is refused on fuzzed bytes, and what pars
             "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\"}]}",
             "{\"version\":1,\"entries\":[{\"saved_at_ms\":-9223372036854775808,\"refresh_token\":\"r\",\"access_token\":\"a\",\"issuer\":\"https://vercel.com\",\"client_id\":\"c\"}]}",
             "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\"},{\"saved_at_ms\":2,\"refresh_token\":\"r\"}]}",
+            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\",\"client_id\":\"c\",\"token_type_hint\":\"refresh_token\",\"revocation_endpoint\":\"https://as/revoke\",\"client_secret\":\"s\",\"client_auth\":\"client_secret_basic\",\"server_url\":\"https://mcp\"}]}",
+            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\",\"client_secret\":7}]}",
             "{\"version\":1,\"entries\":[{\"saved_at_ms\":1.5,\"refresh_token\":\"r\"}]}",
             "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"\\u0000\\ud800\"}]}",
             "[1,2,3]",
