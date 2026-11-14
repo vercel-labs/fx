@@ -53,6 +53,7 @@ pub const usage_options = [_]command_specs.OptionDoc{
 pub const doctor_options = [_]command_specs.OptionDoc{
     json_option,
     .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
 pub const upgrade_options = [_]command_specs.OptionDoc{
@@ -348,7 +349,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json] [--fix]",
+        .usage = "doctor [--json] [--fix] [--deep]",
         .summary = "Check that fx can work here, with a fix for each problem",
         .options = &doctor_options,
     },
