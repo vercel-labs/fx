@@ -16,6 +16,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -1122,6 +1123,7 @@ pub fn Commands(comptime App: type) type {
             ultrafast_mode: bool,
         ) !void {
             try setResolvedModelRuntime(app, agent, model);
+            settleStartModel(app);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.providerOf(app, agent),
                 .model = model,
@@ -1389,6 +1391,7 @@ pub fn Commands(comptime App: type) type {
         fn setResolvedModel(app: *App, agent: *AppAgent, resolved: []const u8, announce: bool) !void {
             const model_changed = !std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved);
             try setResolvedModelRuntime(app, agent, resolved);
+            settleStartModel(app);
             if (model_changed and app.fast_mode) {
                 try applyFastMode(app, agent, false, false, false);
             }
@@ -1499,6 +1502,20 @@ pub fn Commands(comptime App: type) type {
             app_session_runtime.Runtime(App).syncTerminalTitle(app, agent);
         }
 
+        /// A model the user chose keeps its place: the Token Pass check no
+        /// longer picks the start model (`src/core/app/token_pass_check.zig`).
+        fn settleStartModel(app: *App) void {
+            if (comptime @hasField(App, "token_pass_check")) app.token_pass_check.settle("model_choice");
+        }
+
+        /// Puts `agent` on `model` at `fast_mode` for this run, without a
+        /// notice and without saving either: the model a new session starts
+        /// on for its team (`src/core/app/token_pass_check.zig`).
+        pub fn adoptStartModel(app: *App, agent: *AppAgent, model: []const u8, fast_mode: bool) !void {
+            try setResolvedModelRuntime(app, agent, model);
+            if (app.fast_mode != fast_mode) try applyFastMode(app, agent, fast_mode, false, false);
+        }
+
         fn announceModelSelection(app: *App, agent: *AppAgent) !void {
             const selected = provider_runtime.modelOf(app, agent);
             const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
@@ -1516,33 +1533,20 @@ pub fn Commands(comptime App: type) type {
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
         }
 
-        /// After a switch to a Token Pass model: a warning when Fast mode
-        /// would bill AI Gateway credits instead, or else one line that
-        /// Token Pass covers the model, until fx sees this team use it.
+        /// After a switch to a Token Pass model of a team with Token Pass: a
+        /// warning when Fast mode would bill AI Gateway credits instead.
         fn announceTokenPass(app: *App, agent: *AppAgent, selected: []const u8) !void {
             if (!isGatewayTokenPassModel(app, agent, selected)) return;
-            if (tokenPassModelRunsFast(app, agent, selected)) {
-                try warnTokenPassFast(app);
-                return;
-            }
-            const status: token_pass.Status = if (comptime @hasField(App, "model_cache"))
-                app.model_cache.tokenPassStatus()
-            else
-                .unknown;
-            if (status == .active) return;
-            try app.writeDomainNotice(.{
-                .topic = "",
-                .tone = .neutral,
-                .body = "Token Pass covers this model: " ++ token_pass.docs_url,
-            }, true);
+            if (tokenPassModelRunsFast(app, agent, selected)) try warnTokenPassFast(app);
         }
 
         /// Whether Token Pass credit can pay for `model` on the agent's
-        /// provider. Only AI Gateway serves Token Pass.
+        /// provider: only AI Gateway serves Token Pass, and only for a model
+        /// the team's catalog marks.
         fn isGatewayTokenPassModel(app: *App, agent: *AppAgent, model: []const u8) bool {
             if (comptime !provider_runtime.supported(App)) return false;
             if (provider_runtime.providerOf(app, agent) != .gateway) return false;
-            return token_pass.isFeaturedModel(model);
+            return token_pass_team.paysFor(model);
         }
 
         /// Whether the agent's speed setting sends `model` at a speed Token
