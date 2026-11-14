@@ -1852,6 +1852,10 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
     const kind = record.activity_kind orelse return .{};
     switch (kind) {
         .command => {
+            // A denied or cancelled command did not run, so it keeps its own
+            // row instead of counting as a run of the same command. A failed
+            // run still joins, so a row can say "passed on the 3rd run".
+            if (record.outcome) |outcome| if (outcome == .denied or outcome == .cancelled) return .{};
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
             if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
                 .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
@@ -4784,7 +4788,7 @@ test "a call joins its row at once, without a row of its own first" {
     }
 }
 
-test "a denied or cancelled read or search keeps its own row" {
+test "a denied or cancelled read, search, or command keeps its own row" {
     const alloc = std.testing.allocator;
     const read_a = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/a.zig\n", .class = .tool_status } };
     const denied_b = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Denied read /Users/example/b.zig\n", .class = .tool_status } };
@@ -4810,6 +4814,20 @@ test "a denied or cancelled read or search keeps its own row" {
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "a.zig, c.zig") == null);
         try std.testing.expect(std.mem.find(u8, text, "Read a.zig") != null);
+    }
+    // A denied command keeps its own row and is not counted as a run of the
+    // same command.
+    {
+        const denied_run = TranscriptEntry{ .raw_bytes = .{ .id = 6, .bytes = "● Denied zig build\n", .class = .tool_status } };
+        const ran = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● Ran zig build\n", .class = .tool_status } };
+        const denied_run_detail = ToolDetailRecord{ .entry_id = 6, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("Ran"), .outcome = .denied };
+        const ran_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("Ran"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } };
+        const text = try groupTextForTest(alloc, &.{ denied_run, ran }, &.{ denied_run_detail, ran_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "×2") == null);
+        try std.testing.expect(std.mem.find(u8, text, "1 denied") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Denied") != null);
     }
     // A denied search keeps its own row beside the searches that ran.
     {
