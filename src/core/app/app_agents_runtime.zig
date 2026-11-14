@@ -493,7 +493,8 @@ pub const Post = struct {
     message: []const u8 = "",
     state: std.atomic.Value(State) = .init(.posted),
     /// Set once the main loop holds the run back while a turn of its child's
-    /// is going. Only the main loop reads or writes it.
+    /// is going or a scrollback handoff is pending. Only the main loop reads
+    /// or writes it.
     held: bool = false,
 
     /// Set when the main loop settles the post, to wake the slot thread.
@@ -805,22 +806,32 @@ pub fn Runtime(comptime App: type) type {
         /// own context, so it keeps working while another is on screen:
         /// main while a subagent is on screen, and every subagent but the one
         /// on screen. The agent on screen is handled in the loop's own context.
+        /// While a scrollback handoff is pending, the hidden agents' work
+        /// waits for a later pass: visiting swaps an agent's transcript onto
+        /// the screen, which the handoff's rows still own.
         pub fn tickChildren(
             app: *App,
             context: anytype,
             comptime body: fn (@TypeOf(context), *App, *agents.Agent) anyerror!void,
         ) !void {
+            const handoff_pending = app.shell.sessionScrollbackHandoffPending();
+            var deferred: usize = 0;
             if (app.agent_on_screen != null and
                 (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
                     approvalOutOfDate(&app.main_agent, false)))
             {
-                try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
+                if (handoff_pending) deferred += 1 else try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
                 if (!hasPendingWork(child) and !approvalOutOfDate(&child.agent, app.approval_lender == child)) continue;
+                if (handoff_pending) {
+                    deferred += 1;
+                    continue;
+                }
                 try visit(app, child, context, body);
             }
+            if (deferred > 0) debug_trace.eventf("host", "hidden_tick_deferred", .{}, "reason=scrollback_handoff_pending agents={d}", .{deferred});
         }
 
         /// Whether `agent`'s approval prompt no longer matches its worker: the
@@ -1865,6 +1876,13 @@ pub fn Runtime(comptime App: type) type {
         /// it started (`closeBranch`). Cheap when none is. Returns whether it
         /// dropped any.
         pub fn dropClosedSubagents(app: *App) !bool {
+            // Dropping a branch swaps each agent's transcript in, and can put
+            // another agent on screen, which a pending scrollback handoff does
+            // not allow. The hosts keep the closed ones for a later pass.
+            if (app.shell.sessionScrollbackHandoffPending()) {
+                if (anyClosedWaiting(app)) debug_trace.eventf("host", "closed_drop_deferred", .{}, "reason=scrollback_handoff_pending", .{});
+                return false;
+            }
             var dropped = false;
             // Dropping a branch can free hosts, so each pass looks afresh.
             while (try takeAnyClosed(app)) |ids| {
@@ -1878,6 +1896,14 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             return dropped;
+        }
+
+        /// Whether some host closed a child since it was last asked.
+        fn anyClosedWaiting(app: *App) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (firstOpen(app)) if (app.main_agent.session_persistence.subagent_host) |host| if (host.hasClosed()) return true;
+            for (app.child_agents.items) |child| if (child.agent.session_persistence.subagent_host) |host| if (host.hasClosed()) return true;
+            return false;
         }
 
         /// The children some host closed since it was last asked, or null.
@@ -2226,6 +2252,14 @@ pub fn Runtime(comptime App: type) type {
             return child.workGoing() or pacerOf(app, child).hasPending();
         }
 
+        /// Why a run handed to `child` waits for a later pass, or null when
+        /// it can start now.
+        fn runHoldReason(app: *App, child: *ChildAgent) ?[]const u8 {
+            if (turnGoing(app, child)) return "turn_going";
+            if (app.shell.sessionScrollbackHandoffPending()) return "scrollback_handoff_pending";
+            return null;
+        }
+
         /// The pacer that holds `child`'s assistant text: the app's while the
         /// child is on screen, its own slot's otherwise.
         fn pacerOf(app: *App, child: *ChildAgent) *AssistantPacer {
@@ -2340,6 +2374,7 @@ pub fn Runtime(comptime App: type) type {
         /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
             noteQuitting(app);
+            releaseScreenForShutdown(app);
             attach(app, null);
             closeHandoffs(app);
             // A slot thread still reads its child's worker while it detaches,
@@ -2364,6 +2399,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Gives up a scrollback handoff that still has rows to write, as
+        /// shutdown swaps each agent's transcript in to close it. A closed
+        /// terminal fails the handoff's write and then ends the loop, so the
+        /// handoff can still be pending here. Nothing is drawn after this.
+        fn releaseScreenForShutdown(app: *App) void {
+            app.shell.cancelSessionScrollbackHandoff("shutdown");
+        }
+
         /// Logs `child`, kept allocated because a slot thread still holds its
         /// worker after `release_timeout_ms`: its finished turns are saved and
         /// its session is closed, but its agent and worker are not freed.
@@ -2382,6 +2425,7 @@ pub fn Runtime(comptime App: type) type {
         /// run's turn context once the slot thread frees it.
         pub fn stopChildren(app: *App, comptime mode: enum { cooperative, force }) void {
             noteQuitting(app);
+            releaseScreenForShutdown(app);
             // Main's own shutdown writes to its transcript, so it goes back on
             // screen first.
             attach(app, null);
@@ -2527,13 +2571,15 @@ pub fn Runtime(comptime App: type) type {
             for (posts.items) |post| {
                 // A run waits while a turn of its child's is going: the run
                 // replaces the child's installed run, which that turn reads.
-                if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (turnGoing(app, child)) {
+                // It also waits while a scrollback handoff is pending, since
+                // starting it swaps the child's transcript onto the screen.
+                if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (runHoldReason(app, child)) |reason| {
                     held.append(handoff_alloc, post) catch {
                         debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
                         post.settle(.failed);
                         continue;
                     };
-                    if (!post.held) debug_trace.eventf("host", "child_run_held", .{}, "agent={s} reason=turn_going", .{child.id});
+                    if (!post.held) debug_trace.eventf("host", "child_run_held", .{}, "agent={s} reason={s}", .{ child.id, reason });
                     post.held = true;
                     continue;
                 };
