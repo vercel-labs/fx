@@ -125,6 +125,13 @@ function startFakeCreditsGateway(options: { delayMs?: number } = {}) {
   };
 }
 
+/// Waits until the fake has seen `count` requests.
+async function waitForRequestCount(requests: unknown[], count: number) {
+  const deadline = Date.now() + 10_000;
+  while (requests.length < count && Date.now() < deadline) await Bun.sleep(25);
+  expect(requests).toHaveLength(count);
+}
+
 describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
   test(
     "/credits shows actionable Gateway denial and returns to prompt",
@@ -138,22 +145,25 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
             AI_GATEWAY_API_KEY: "credits-fake-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_TEST_GATEWAY_CREDITS_URL: gateway.url,
+            // A chosen model skips the startup Token Pass check, so the only
+            // credits requests are the ones /credits sends.
+            FX_MODEL: FAKE_GATEWAY_MODEL,
           },
           width: 120,
           height: 40,
         });
         await session.waitForComposer(10_000);
+        // fx asks once at launch whether the team has Token Pass; that
+        // denial says nothing about Token Pass, so the screen shows nothing.
+        await waitForRequestCount(gateway.requests, 1);
 
         await session.sendText("/credits");
         await session.waitForText("Buy credits to use AI Gateway.", 10_000);
         await session.waitForComposer(10_000);
 
         const scrollback = await session.captureFullScrollback();
-        expect(gateway.requests).toEqual([{
-          method: "GET",
-          path: "/v1/credits",
-          authorizationMatchesExpected: true,
-        }]);
+        const credits = { method: "GET", path: "/v1/credits", authorizationMatchesExpected: true };
+        expect(gateway.requests).toEqual([credits, credits]);
         expect(scrollback).toContain("API access denied");
         expect(scrollback).toContain("HTTP 403");
         expect(scrollback).toContain("Buy credits to use AI Gateway.");
@@ -187,12 +197,18 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
             AI_GATEWAY_API_KEY: "credits-fake-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_TEST_GATEWAY_CREDITS_URL: gateway.url,
+            // A chosen model skips the startup Token Pass check, so the only
+            // credits requests are the ones /credits sends.
+            FX_MODEL: FAKE_GATEWAY_MODEL,
           },
           stderrPath,
           width: 120,
           height: 40,
         });
         await session.waitForComposer(10_000);
+        // The launch check for Token Pass is in flight too, and does not
+        // hold /credits.
+        await waitForRequestCount(gateway.requests, 1);
 
         await session.sendText("/credits");
         await session.waitForText("Checking credits…", 1_000);
@@ -206,7 +222,7 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
 
         await session.waitForText("Buy credits to use AI Gateway.", 10_000);
         await session.waitForComposer(10_000);
-        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests).toHaveLength(2);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();

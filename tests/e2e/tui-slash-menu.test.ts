@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync, execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
@@ -456,6 +457,98 @@ function createModelsMenuFixture() {
   writeFileSync(settingsPath, "{}\n");
   writeFileSync(stderrPath, "");
   return { home, workspace, settingsPath, tapePath, stderrPath };
+}
+
+/// The models the Token Pass picker tests list: two Token Pass models that
+/// offer Fast mode, and two others.
+const tokenPassPickerModels = [
+  {
+    id: "zai/glm-5.3",
+    type: "language",
+    released: 300,
+    tags: ["reasoning", "tool-use"],
+    reasoning_options: [{ type: "effort", values: ["high"] }],
+    fast_options: [{ type: "toggle" }],
+    context_window: 200_000,
+  },
+  { id: "deepseek/deepseek-v4.1-flash", type: "language", released: 250, tags: ["tool-use"], fast_options: [{ type: "toggle" }], context_window: 128_000 },
+  { id: "provider/fast-model", type: "language", released: 200, tags: ["tool-use"], fast_options: [{ type: "toggle" }], context_window: 128_000 },
+  { id: "provider/plain-model", type: "language", released: 100, tags: ["tool-use"], context_window: 128_000 },
+];
+
+/// The picker catalog as AI Gateway sends it to a team with Token Pass: GLM
+/// 5.3 and DeepSeek V4.1 Flash carry `token_pass: true` while `marked` says
+/// the team has an active pass.
+function markedPickerModels(marked: () => boolean = () => true) {
+  const paid = ["zai/glm-5.3", "deepseek/deepseek-v4.1-flash"];
+  return () => tokenPassPickerModels.map((model) => marked() && paid.includes(model.id) ? { ...model, token_pass: true } : model);
+}
+
+/// A credits reply for a team with Token Pass, or for one without
+/// (`token_pass: null`), after `delayMs`.
+function tokenPassCredits(hasPass: () => boolean, delayMs = 0, onRequest?: () => void) {
+  return (url: URL) => {
+    if (url.pathname !== "/coding-agent/v1/credits") return null;
+    onRequest?.();
+    const reply = () => Response.json({
+      balance: "12.50",
+      total_used: "1.25",
+      token_pass: hasPass() ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
+    });
+    return delayMs > 0 ? Bun.sleep(delayMs).then(reply) : reply();
+  };
+}
+
+/// The name fx saves an API key's Token Pass answer under, as
+/// `token_pass.identity` in src/core/gateway/token_pass.zig writes it.
+function tokenPassIdentity(apiKey: string): string {
+  return createHash("sha256").update(`api_key\0${apiKey}\0`).digest("hex").slice(0, 32);
+}
+
+function savedTokenPassAnswer(home: string, apiKey: string): string | undefined {
+  const path = join(home, ".fx", "token-pass.json");
+  if (!existsSync(path)) return undefined;
+  return JSON.parse(readFileSync(path, "utf8")).teams?.[tokenPassIdentity(apiKey)];
+}
+
+/// Waits until fx has taken the Token Pass check's answer, which its trace
+/// records.
+async function waitForTokenPassAnswer(tracePath: string, answer: "has_pass" | "no_pass") {
+  const line = `check answered answer=${answer}`;
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(line)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`Timed out waiting for "${line}" in ${tracePath}`);
+}
+
+function tokenPassEnv(fixture: { home: string }, gateway: { baseUrl: string; chatUrl: string }, apiKey: string, tracePath: string) {
+  return {
+    HOME: fixture.home,
+    AI_GATEWAY_API_KEY: apiKey,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+    FX_TRACE_LOG: tracePath,
+    FX_TRACE_SCOPES: "token_pass",
+    FX_AUTO_UPGRADE: "0",
+  };
+}
+
+const chatModelOf = (request: { headers: Headers }) => request.headers.get("ai-language-model-id");
+
+/// The answers saved in the profile's `token-pass.json`, one per team.
+function savedTokenPassAnswers(home: string): string[] {
+  const path = join(home, ".fx", "token-pass.json");
+  if (!existsSync(path)) return [];
+  try {
+    return Object.values(JSON.parse(readFileSync(path, "utf8")).teams ?? {}) as string[];
+  } catch {
+    return [];
+  }
 }
 
 // The menu matcher searches skill paths, so this fixture's home directory must
@@ -3274,197 +3367,162 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "model picker keeps Token Pass models on Token Pass credit",
+    "a team without Token Pass sees nothing about Token Pass and keeps the built-in default and Fast mode",
     async () => {
       const fixture = createModelsMenuFixture();
-      const tokenPassModel = "zai/glm-5.3";
-      const fastModel = "provider/fast-model";
-      const plainModel = "provider/plain-model";
-      const covers = "Token Pass covers this model: https://vercel.com/docs/ai-gateway/token-pass";
-      const fastWarning = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.";
-      const creditsRequests: string[] = [];
-      gateway = startFakeGateway([
-        fakeGatewaySse([
-          { type: "text-delta", id: "answer_1", delta: "TOKEN_PASS_REPLY" },
-          {
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-            usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
-            providerMetadata: {
-              gateway: { routing: { resolvedProvider: "token-pass", finalProvider: "token-pass" } },
-            },
-          },
-        ]),
-        Response.json(
-          { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
-          { status: 403 },
-        ),
-      ], {
-        models: [
-          {
-            id: tokenPassModel,
-            type: "language",
-            released: 300,
-            tags: ["reasoning", "tool-use"],
-            reasoning_options: [{ type: "effort", values: ["high"] }],
-            fast_options: [{ type: "toggle" }],
-            context_window: 200_000,
-          },
-          {
-            id: fastModel,
-            type: "language",
-            released: 200,
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-            context_window: 128_000,
-          },
-          {
-            id: plainModel,
-            type: "language",
-            released: 100,
-            tags: ["tool-use"],
-            context_window: 128_000,
-          },
-        ],
-        usage: (url) => {
-          if (url.pathname !== "/coding-agent/v1/credits") return null;
-          creditsRequests.push(url.pathname);
-          // A reply from before the Gateway reported Token Pass credit.
-          return Response.json({ balance: "12.50", total_used: "1.25" });
-        },
+      const apiKey = "fake-no-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      gateway = startFakeGateway([fakeGatewayFinalText("PLAIN_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false),
+        titleResponses: [fakeGatewayFinalText("Plain title")],
       });
       session = await TmuxSession.create({
         cwd: fixture.workspace,
         stderrPath: fixture.stderrPath,
-        env: {
-          HOME: fixture.home,
-          AI_GATEWAY_API_KEY: "fake-token-pass-picker-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
-          FX_MODEL: plainModel,
-          FX_AUTO_UPGRADE: "0",
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+
+      // The session starts on the built-in default.
+      await session.sendText("Hello.");
+      await session.waitForText("PLAIN_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+
+      // The catalog's order, no headings, no tags, and Fast mode.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      const row = (model: string) => menu.find((line) => !isComposerLine(line) && line.includes(model)) ?? "";
+      expect(menu.join("\n")).not.toContain("Token Pass");
+      expect(menu.join("\n")).not.toContain("All Models");
+      expect(row("zai/glm-5.3")).toContain("200K context   Fast mode");
+      expect(row("deepseek/deepseek-v4.1-flash")).toContain("128K context   Fast mode");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      // A Token Pass model starts its speed stage on Fast, as any model
+      // that offers Fast mode does, with no warning.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes("zai/glm-5.3")), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, "/model zai/glm-5.3") && pane.includes("high"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("normal") && pane.includes("fast"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to zai/glm-5.3 (effort: default, speed: fast)", 5_000);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain("Token Pass");
+      expect(gateway.titleRequests.map(chatModelOf)).toEqual(["openai/gpt-5.6-luna"]);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a team with Token Pass starts on the Token Pass default, sees its models first without Fast mode, and stays on Token Pass credit",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-token-pass-picker-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const fastWarning = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.";
+      // The team loses its pass with the 403 below, and its catalog loses
+      // the marks with it.
+      let denied = false;
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("TOKEN_PASS_REPLY"),
+        () => {
+          denied = true;
+          return Response.json(
+            { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
+            { status: 403 },
+          );
         },
+      ], {
+        models: markedPickerModels(() => !denied),
+        usage: tokenPassCredits(() => true),
+        titleResponses: [fakeGatewayFinalText("Token Pass title")],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
         width: 160,
         height: 40,
       });
       await session.waitForComposer(10_000);
 
-      const readSettings = () =>
-        JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { fast_mode?: boolean };
-      const scrollbackCount = async (text: string) =>
-        (await session!.captureFullScrollback()).split(text).length - 1;
-      const waitForScrollbackCount = async (text: string, count: number) => {
-        const deadline = Date.now() + 5_000;
-        let seen = await scrollbackCount(text);
-        while (seen !== count && Date.now() < deadline) {
-          await Bun.sleep(50);
-          seen = await scrollbackCount(text);
-        }
-        expect(seen).toBe(count);
-      };
-      // Opens the menu on `query` and walks every stage with Enter, or types
-      // `speed` at the speed stage.
-      const pickModel = async (query: string, model: string, stages: "effort" | "speed", speed?: string) => {
-        await session!.sendKeys("C-p");
-        await waitForModelsMenu(session!, 3);
-        await session!.sendLiteralText(query);
-        await session!.waitForPane(
-          (pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(model)),
-          5_000,
-        );
-        await session!.sendKeys("Enter");
-        if (stages === "effort") {
-          await session!.waitForPane(
-            (pane) => composerContains(pane, `/model ${model}`) && pane.includes("high"),
-            5_000,
-          );
-          await session!.sendKeys("Enter");
-        }
-        await session!.waitForPane((pane) => pane.includes("normal") && pane.includes("fast"), 5_000);
-        if (speed) await session!.sendLiteralText(speed);
-        await session!.sendKeys("Enter");
-      };
+      // The first prompt goes out on the Token Pass default. The catalog does
+      // not mark GLM 5.3 Flash, fx's Token Pass title model, so the title
+      // keeps fx's usual model.
+      await session.sendText("Use Token Pass.");
+      await session.waitForText("TOKEN_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      const titleDeadline = Date.now() + 5_000;
+      while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
+      expect(gateway.titleRequests.map(chatModelOf)).toEqual(["openai/gpt-5.6-luna"]);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+      // fx starts the model for this run only: nothing in settings chose it.
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models).toBeUndefined();
 
-      // The menu lists the Token Pass model under its own heading, so its
-      // row leaves the tag out, and the facts line up in columns.
+      // Token Pass models lead under their own heading, without Fast mode;
+      // the others keep it.
       await session.sendKeys("C-p");
-      const menu = await waitForModelsMenu(session, 3);
-      const row = (model: string) => menu.find((line) => line.includes(model)) ?? "";
-      expect(menu.some((line) => /^\s*Token Pass\s+1\s*$/.test(line))).toBe(true);
+      const menu = await waitForModelsMenu(session, 4);
+      const row = (model: string) => menu.find((line) => !isComposerLine(line) && line.includes(model)) ?? "";
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
       expect(menu.some((line) => /^\s*All Models\s+2\s*$/.test(line))).toBe(true);
-      expect(row(tokenPassModel)).toContain("200K context   Fast mode");
-      expect(row(tokenPassModel)).not.toContain("Token Pass");
-      expect(row(fastModel)).toContain("128K context   Fast mode");
-      expect(row(fastModel)).not.toContain("Token Pass");
-      expect(row(plainModel)).not.toContain("Token Pass");
-      expect(row(plainModel).indexOf(" context")).toBe(row(tokenPassModel).indexOf(" context"));
+      expect(row("zai/glm-5.3")).toContain("200K context");
+      expect(row("zai/glm-5.3")).not.toContain("Fast");
+      expect(row("deepseek/deepseek-v4.1-flash")).not.toContain("Fast");
+      expect(row("provider/fast-model")).toContain("128K context   Fast mode");
+      expect(row("zai/glm-5.3").indexOf(" context")).toBe(row("provider/plain-model").indexOf(" context"));
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
 
-      // A Token Pass model starts its speed stage on normal speed, and names
-      // Token Pass while fx has not seen this team use it.
-      await pickModel("glm", tokenPassModel, "effort");
-      await session.waitForText(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 5_000);
-      await session.waitForText(covers, 5_000);
-      expect(readSettings().fast_mode).toBe(false);
+      // A Token Pass model has no speed stage: the pick sets normal speed.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes("zai/glm-5.3")), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, "/model zai/glm-5.3") && pane.includes("high"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to zai/glm-5.3 (effort: default, speed: normal)", 5_000);
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).fast_mode).toBe(false);
 
-      // Other models still start on Fast.
-      await pickModel("fast-model", fastModel, "speed");
-      await session.waitForPane(
-        (pane) => pane.split("\n").some((line) => line.includes(`Switched to ${fastModel}`) && line.includes("speed: fast")),
-        5_000,
-      );
-      expect(readSettings().fast_mode).toBe(true);
-
-      // Fast is still a choice for a Token Pass model, with a warning, and
-      // the speed stage starts on normal even with Fast mode on.
-      await pickModel("glm", tokenPassModel, "effort", "fast");
-      await session.waitForText(`Switched to ${tokenPassModel} (effort: default, speed: fast)`, 5_000);
-      await session.waitForText(fastWarning, 5_000);
-      expect(await scrollbackCount(covers)).toBe(1);
-
-      await session.sendText("/fast off");
-      const deadline = Date.now() + 5_000;
-      while (readSettings().fast_mode !== false && Date.now() < deadline) await Bun.sleep(50);
-      expect(readSettings().fast_mode).toBe(false);
+      // Fast mode is still there by command, with a warning.
       await session.sendText("/fast on");
-      await waitForScrollbackCount(fastWarning, 2);
+      await session.waitForText(fastWarning, 5_000);
       await session.sendText("/fast off");
+      const fastDeadline = Date.now() + 5_000;
+      while (JSON.parse(readFileSync(fixture.settingsPath, "utf8")).fast_mode !== false && Date.now() < fastDeadline) await Bun.sleep(50);
 
-      // A response Token Pass served shows the team has it: the next switch
-      // does not name Token Pass again, and /credits points at its balance.
-      await session.sendText("Use Token Pass.");
-      await session.waitForText("TOKEN_PASS_REPLY", 10_000);
-      // The session's title comes from a Token Pass model too.
-      const titleDeadline = Date.now() + 5_000;
-      while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
-      expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
-        .toEqual(["zai/glm-5.3-flash"]);
-      await pickModel("glm", tokenPassModel, "effort");
-      await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 2);
-      expect(await scrollbackCount(covers)).toBe(1);
-
-      // This reply does not mention Token Pass, so /credits points at the
-      // dashboard tab instead.
-      await session.sendText("/credits");
-      await session.waitForText("Token Pass credit is a separate balance.", 10_000);
-      expect(creditsRequests).toHaveLength(1);
-
-      // AI Gateway denies a request because the team has no active Token
-      // Pass: fx forgets that it has one, so the next switch names it again.
+      // AI Gateway says the team has no active Token Pass: fx forgets it,
+      // and the menu has no Token Pass heading.
       await session.sendText("Use Token Pass again.");
       await session.waitForText("requires an active Vercel Token Pass", 10_000);
-      // The turn waits on the rejection until the user presses Esc.
       await session.waitForText("press Esc", 5_000);
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("press Esc"), 5_000);
       await session.sendKeys("C-u");
-      await pickModel("glm", tokenPassModel, "effort");
-      await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 3);
-      await waitForScrollbackCount(covers, 2);
+      await session.sendKeys("C-p");
+      const plain = await waitForModelsMenu(session, 4);
+      expect(plain.join("\n")).not.toContain("All Models");
+      // The transcript's Token Pass default line also names the model; read
+      // the picker's row.
+      expect(plain.find((line) => !isComposerLine(line) && !line.includes("Token Pass is active") && line.includes("deepseek/deepseek-v4.1-flash"))).toContain("Fast mode");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
 
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -3476,45 +3534,361 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "/credits shows the Token Pass balance and marks the team as having Token Pass",
+    "a saved Token Pass answer starts the session on the Token Pass default at once, and a new check replaces it",
     async () => {
       const fixture = createModelsMenuFixture();
-      const tokenPassModel = "zai/glm-5.3-flash";
-      let creditsReplies = 0;
-      gateway = startFakeGateway([], {
-        models: [
-          { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
-          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
-        ],
+      const apiKey = "fake-saved-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".fx", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      let creditsAnsweredAt = 0;
+      const reply = tokenPassCredits(() => false, 3_000);
+      gateway = startFakeGateway([fakeGatewayFinalText("SAVED_REPLY"), fakeGatewayFinalText("AFTER_CHECK_REPLY")], {
+        models: tokenPassPickerModels,
         usage: (url) => {
-          if (url.pathname !== "/coding-agent/v1/credits") return null;
-          creditsReplies += 1;
-          // The second reply says the team no longer has an active Token Pass.
-          return Response.json({
-            balance: "12.50",
-            total_used: "1.25",
-            token_pass: creditsReplies === 1 ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
-          });
+          const answer = reply(url);
+          return answer instanceof Promise ? answer.then((response) => { creditsAnsweredAt = Date.now(); return response; }) : answer;
         },
       });
       session = await TmuxSession.create({
         cwd: fixture.workspace,
         stderrPath: fixture.stderrPath,
-        env: {
-          HOME: fixture.home,
-          AI_GATEWAY_API_KEY: "fake-token-pass-credits-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
-          FX_MODEL: "provider/plain-model",
-          FX_AUTO_UPGRADE: "0",
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // The saved answer decides the model while the check is still out.
+      await session.sendText("Use the saved answer.");
+      await session.waitForText("SAVED_REPLY", 10_000);
+      expect(creditsAnsweredAt).toBe(0);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+
+      // The check then says the team has no Token Pass: fx saves that and
+      // drops the headings, and the session keeps the model it started on.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.join("\n")).not.toContain("All Models");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.sendText("Keep going.");
+      await session.waitForText("AFTER_CHECK_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash"]);
+      // Only a saved answer ever said the team has Token Pass, so the
+      // transcript never did.
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer the check says has ended moves the session back without saying Token Pass is active",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-ended-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".fx", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      gateway = startFakeGateway([fakeGatewayFinalText("ENDED_PASS_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false, 1_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // The team's pass has ended: the check's answer moves the session back
+      // to the built-in default before the first prompt.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      await session.waitForPane((pane) => pane.includes("grok-4.7"), 10_000);
+      await session.sendText("Use the built-in default.");
+      await session.waitForText("ENDED_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer the check confirms says Token Pass is active once",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-confirmed-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".fx", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      gateway = startFakeGateway([fakeGatewayFinalText("CONFIRMED_PASS_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => true, 1_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      const notice = "Token Pass is active, so fx uses deepseek/deepseek-v4.1-flash. Change it with /model.";
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+      await session.waitForText(notice, 10_000);
+      await session.sendText("Use the Token Pass default.");
+      await session.waitForText("CONFIRMED_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      expect((await session.captureFullScrollback()).split(notice).length - 1).toBe(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "without a saved answer the first prompt waits at most two seconds for the Token Pass check",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-slow-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      let chatRequestAt = 0;
+      let creditsRequestedAt = 0;
+      gateway = startFakeGateway([
+        () => {
+          chatRequestAt = Date.now();
+          return fakeGatewayFinalText("UNWAITED_REPLY");
         },
+      ], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => true, 6_000, () => { creditsRequestedAt = Date.now(); }),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Do not wait long.");
+      await session.waitForText("UNWAITED_REPLY", 10_000);
+      // The prompt waited about two seconds from the check's start, then
+      // went out on the built-in default before the check answered.
+      expect(creditsRequestedAt).toBeGreaterThan(0);
+      expect(chatRequestAt - creditsRequestedAt).toBeGreaterThanOrEqual(1_500);
+      expect(chatRequestAt - creditsRequestedAt).toBeLessThan(4_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+      expect(readFileSync(tracePath, "utf8")).toContain("first prompt sent before the check answered");
+
+      // The late answer still counts for the next session. This catalog
+      // marks no model, so the menu has no Token Pass group.
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.join("\n")).not.toContain("All Models");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a model picked while the Token Pass check runs keeps its place when the check answers",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-pick-during-check-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const picked = "deepseek/deepseek-v4.1-flash";
+      gateway = startFakeGateway([fakeGatewayFinalText("PICKED_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false, 8_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // Before the check answers, pick the model a team with Token Pass
+      // would start on.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("deepseek");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(picked)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, `/model ${picked}`) && pane.includes("normal") && pane.includes("fast"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${picked}`, 5_000);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("check answered");
+
+      // The check then says the team has no Token Pass, and the pick stays.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("start model settled reason=model_choice");
+      expect(trace).not.toContain("start model=");
+      await session.sendText("Use the picked model.");
+      await session.waitForText("PICKED_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual([picked]);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the catalog's Token Pass marks decide the Token Pass group",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-catalog-marks-key";
+      const tracePath = join(fixture.home, "trace.log");
+      // AI Gateway marks GLM 5.3 and a model fx has never heard of, and not
+      // DeepSeek V4.1 Flash.
+      const paid = ["zai/glm-5.3", "provider/plain-model"];
+      gateway = startFakeGateway([], {
+        models: tokenPassPickerModels.map((model) => paid.includes(model.id) ? { ...model, token_pass: true } : model),
+        usage: tokenPassCredits(() => true),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: { ...tokenPassEnv(fixture, gateway, apiKey, tracePath), FX_MODEL: "provider/fast-model" },
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      const index = (model: string) => menu.findIndex((line) => !isComposerLine(line) && line.split(/\s+/).includes(model));
+      const tokenPassHeading = menu.findIndex((line) => /^\s*Token Pass\s+2\s*$/.test(line));
+      const allModelsHeading = menu.findIndex((line) => /^\s*All Models\s+2\s*$/.test(line));
+      expect(tokenPassHeading).toBeGreaterThanOrEqual(0);
+      expect(allModelsHeading).toBeGreaterThan(tokenPassHeading);
+      for (const model of paid) {
+        expect(index(model)).toBeGreaterThan(tokenPassHeading);
+        expect(index(model)).toBeLessThan(allModelsHeading);
+      }
+      // DeepSeek is not marked, so it sits with the other models and keeps
+      // Fast mode.
+      expect(index("deepseek/deepseek-v4.1-flash")).toBeGreaterThan(allModelsHeading);
+      expect(menu[index("deepseek/deepseek-v4.1-flash")]).toContain("Fast mode");
+      expect(menu[index("zai/glm-5.3")]).not.toContain("Fast");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a catalog with Token Pass marks tells fx the team has Token Pass when the credits check fails",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-catalog-only-key";
+      const tracePath = join(fixture.home, "trace.log");
+      gateway = startFakeGateway([fakeGatewayFinalText("CATALOG_PASS_REPLY")], {
+        models: markedPickerModels(),
+        // The credits endpoint fails at once, before the catalog loads.
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? new Response("unavailable", { status: 503 })
+          : null,
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      const savedDeadline = Date.now() + 10_000;
+      while (savedTokenPassAnswer(fixture.home, apiKey) !== "has_pass" && Date.now() < savedDeadline) await Bun.sleep(50);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+
+      // The marks start the session on the Token Pass default without
+      // waiting for the credits check.
+      await session.sendText("Use the catalog's answer.");
+      await session.waitForText("CATALOG_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("first prompt sent before the check answered");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "/credits shows the Token Pass balance, and a reply without Token Pass drops its headings",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-token-pass-credits-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const tokenPassModel = "zai/glm-5.3-flash";
+      let creditsReplies = 0;
+      gateway = startFakeGateway([], {
+        // The catalog marks the Token Pass model while the credits replies
+        // say the team has a pass.
+        models: () => [
+          { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000, ...(creditsReplies <= 2 ? { token_pass: true } : {}) },
+        ],
+        // The launch check and the first /credits see Token Pass; the
+        // second /credits says the team no longer has an active one.
+        usage: tokenPassCredits(() => creditsReplies <= 2, 0, () => { creditsReplies += 1; }),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: { ...tokenPassEnv(fixture, gateway, apiKey, tracePath), FX_MODEL: "provider/plain-model" },
         width: 140,
         height: 32,
       });
       await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
 
       await session.sendText("/credits");
       await session.waitForText("token_pass_remaining=79.92906", 10_000);
@@ -3527,27 +3901,185 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(rows).toHaveLength(2);
       expect(rows[0]).toContain(tokenPassModel);
       expect(rows[1]).toContain("provider/plain-model");
-
-      // fx now knows the team has Token Pass, so a switch to a Token Pass
-      // model does not point at the Token Pass docs.
-      await session.sendLiteralText("glm");
-      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
-      await session.sendKeys("Enter");
-      await session.waitForText(`Switched to ${tokenPassModel}`, 5_000);
-      expect(await session.captureFullScrollback()).not.toContain("Token Pass covers this model");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
 
       // `token_pass: null` means the team has no active Token Pass, so fx
-      // forgets it and the next switch names Token Pass again.
+      // forgets it: no headings and no tags.
       await session.sendText("/credits");
-      await session.waitForPane(() => creditsReplies === 2, 10_000);
+      await session.waitForPane(() => creditsReplies === 3, 10_000);
       await session.waitForPane((pane) => (pane.match(/balance=12\.50/g) ?? []).length >= 2, 10_000);
       await session.sendKeys("C-p");
-      await waitForModelsMenu(session, 2);
-      await session.sendLiteralText("glm");
-      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
-      await session.sendKeys("Enter");
-      await session.waitForText("Token Pass covers this model", 5_000);
+      const plain = await waitForModelsMenu(session, 2);
+      expect(plain.join("\n")).not.toContain("Token Pass");
+      expect(plain.join("\n")).not.toContain("All Models");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
       expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  for (const chosen of [null, "provider/plain-model"] as const) {
+    test(
+      chosen === null
+        ? "a team with Token Pass and no chosen model starts on the Token Pass default model"
+        : "a chosen model stays when the team has Token Pass",
+      async () => {
+        const fixture = createModelsMenuFixture();
+        const tokenPassDefault = "deepseek/deepseek-v4.1-flash";
+        let creditsReplies = 0;
+        gateway = startFakeGateway([], {
+          models: [
+            { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+            { id: tokenPassDefault, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+          ],
+          usage: (url) => {
+            if (url.pathname !== "/coding-agent/v1/credits") return null;
+            creditsReplies += 1;
+            return Response.json({
+              balance: "12.50",
+              total_used: "1.25",
+              token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+            });
+          },
+        });
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath: fixture.stderrPath,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-token-pass-default-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+            FX_MODEL: chosen ?? undefined,
+            FX_AUTO_UPGRADE: "0",
+          },
+          width: 140,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+
+        const notice = `Token Pass is active, so fx uses ${tokenPassDefault}. Change it with /model.`;
+        if (chosen === null) {
+          await session.waitForText(notice, 10_000);
+          await session.waitForPane((pane) => pane.includes("deepseek-v4.1-flash"), 5_000);
+          expect(creditsReplies).toBe(1);
+          // The run uses the default; it is not saved as the user's choice.
+          const settingsPath = join(fixture.home, ".fx", "settings.json");
+          const saved = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : "";
+          expect(saved).not.toContain(tokenPassDefault);
+        } else {
+          // fx still learns the team's Token Pass, for the picker and side
+          // calls, but the chosen model keeps its place.
+          await session.waitForPane(() => savedTokenPassAnswers(fixture.home).includes("has_pass"), 10_000);
+          await session.waitForComposer(5_000);
+          expect(creditsReplies).toBe(1);
+          expect(await session.capturePane()).toContain("plain-model");
+          expect(await session.captureFullScrollback()).not.toContain(notice);
+        }
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      },
+      TEST_TIMEOUT,
+    );
+  }
+
+  test(
+    "a resumed session keeps its own model when the team has Token Pass",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const chosen = "provider/plain-model";
+      let creditsReplies = 0;
+      let hasTokenPass = false;
+      const usage = (url: URL) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        creditsReplies += 1;
+        return Response.json({
+          balance: "12.50",
+          total_used: "1.25",
+          token_pass: hasTokenPass ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
+        });
+      };
+      const models = [
+        { id: chosen, type: "language", released: 200, tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+      ];
+      const env = {
+        HOME: fixture.home,
+        AI_GATEWAY_API_KEY: "fake-token-pass-resume-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+      };
+
+      // Before the team has Token Pass, the user picks a model; the session
+      // saves it with its own preferences.
+      gateway = startFakeGateway([fakeGatewayFinalText("RESUME_MODEL_REPLY")], { models, usage });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          ...env,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForPane(() => creditsReplies === 1, 10_000);
+      await session.sendText(`/model ${chosen}`);
+      await session.waitForText(`Switched to ${chosen}`, 10_000);
+      await session.sendText("remember this model");
+      await session.waitForText("RESUME_MODEL_REPLY", 15_000);
+      await session.waitForStableComposer();
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      const sessionIds = savedSessionIds(fixture.home);
+      expect(sessionIds).toHaveLength(1);
+      gateway.stop();
+
+      // The profile no longer names a model, and the team now has Token
+      // Pass. The resumed session still runs its own model, so fx learns
+      // the team's Token Pass but does not move it to the Token Pass default.
+      writeFileSync(fixture.settingsPath, "{}\n");
+      hasTokenPass = true;
+      creditsReplies = 0;
+      gateway = startFakeGateway([], { models, usage });
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          ...env,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForPane((pane) => pane.includes("plain-model"), 5_000);
+      await session.waitForPane(() => savedTokenPassAnswers(fixture.home).includes("has_pass"), 10_000);
+      await session.waitForComposer(5_000);
+      expect(creditsReplies).toBe(1);
+      expect(await session.capturePane()).toContain("plain-model");
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3568,6 +4100,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         { id: "amazon/nova-pro", key: "nova-pro", context: 300_000, output: 8_192, fast: false },
         { id: "anthropic/claude-opus-5.5-fast", key: "5.5-fast", context: 1_000_000, output: 128_000, fast: false },
       ];
+      const tracePath = join(fixture.home, "trace.log");
       gateway = startFakeGateway([], {
         models: models.map((model, index) => ({
           id: model.id,
@@ -3577,25 +4110,21 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           context_window: model.context,
           max_tokens: model.output,
           ...(model.fast ? { fast_options: [{ type: "toggle" }] } : {}),
+          // The team's pass pays for the first two.
+          ...(index < 2 ? { token_pass: true } : {}),
         })),
+        // The headings show only for a team with Token Pass.
+        usage: tokenPassCredits(() => true),
       });
       session = await TmuxSession.create({
         cwd: fixture.workspace,
         stderrPath: fixture.stderrPath,
-        env: {
-          HOME: fixture.home,
-          AI_GATEWAY_API_KEY: "fake-model-columns-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_MODEL: "amazon/nova-pro",
-          FX_AUTO_UPGRADE: "0",
-        },
+        env: { ...tokenPassEnv(fixture, gateway, "fake-model-columns-key", tracePath), FX_MODEL: "amazon/nova-pro" },
         width: 120,
         height: 32,
       });
       await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
 
       const row = (lines: string[], key: string) => lines.find((line) => !isComposerLine(line) && line.includes(key)) ?? "";
       const columnsOf = (lines: string[], label: string) => models.map((model) => row(lines, model.key).indexOf(label));
@@ -3611,14 +4140,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let menu = await waitForModelsMenu(session, 5);
       expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
       expect(menu.some((line) => /^\s*All Models\s+3\s*$/.test(line))).toBe(true);
-      expect(row(menu, "kimi-k3")).toContain("   1M context   128K output   Fast mode");
+      // A Token Pass model leaves Fast mode out for a team with Token Pass.
+      expect(row(menu, "kimi-k3")).toContain("   1M context   128K output");
+      expect(row(menu, "kimi-k3")).not.toContain("Fast");
       expect(row(menu, "kimi-k3")).not.toContain("Token Pass");
       expect(row(menu, "gpt-6.1-terra")).toContain("1.05M context   128K output   Fast mode");
       expect(row(menu, "nova-pro")).toContain("300K context     8K output");
       expect(row(menu, "5.5-fast")).toContain("1M context   128K output   Fast");
       expectOneColumn(menu, " context");
       expectOneColumn(menu, " output");
-      expect(new Set([row(menu, "kimi-k3").indexOf("Fast mode"), row(menu, "5.5-fast").indexOf("Fast", row(menu, "5.5-fast").indexOf(" output"))]).size).toBe(1);
+      expect(new Set([row(menu, "gpt-6.1-terra").indexOf("Fast mode"), row(menu, "5.5-fast").indexOf("Fast", row(menu, "5.5-fast").indexOf(" output"))]).size).toBe(1);
 
       // Narrow: the speed column goes first, then the output column, and the
       // columns that stay still line up.
@@ -3634,14 +4165,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       menu = await session.capturePaneGrid();
       expectOneColumn(menu, " context");
 
-      // Short: with only a few rows the menu still shows the selected model
-      // and marks it as Token Pass, by heading or by tag.
+      // Short: with only a few rows the menu still shows the selected model,
+      // the first one the catalog marks in the picker's order, and marks it
+      // as Token Pass, by heading or by tag.
       await session.resizeWindow(56, 12);
-      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes("kimi-k3"), 5_000);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes("glm-5.3-flash"), 5_000);
       menu = await session.capturePaneGrid();
       expect(menu.length).toBeLessThanOrEqual(12);
       expect(menu.some((line) => line.includes("Token Pass"))).toBe(true);
-      expect(row(menu, "kimi-k3")).not.toBe("");
+      expect(row(menu, "glm-5.3-flash")).not.toBe("");
 
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);

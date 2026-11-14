@@ -392,6 +392,9 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
+            if (comptime @hasDecl(App, "stopSteeringDetachedCommands")) {
+                deps.stop_steering_detached_commands = agentStopSteeringDetachedCommands;
+            }
             return deps;
         }
 
@@ -399,6 +402,15 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             return app.releaseAgentTerminalLease(agent, session_id);
+        }
+
+        /// Main's and each subagent's turns end here. Only an explicit
+        /// cancel stops what steering detached; a turn steering ended keeps
+        /// its commands.
+        fn agentStopSteeringDetachedCommands(ctx: *anyopaque, turn_id: u64) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            if (!agent.worker.turnEndsByExplicitCancel(turn_id)) return;
+            return appOf(agent).stopSteeringDetachedCommands(agent, turn_id);
         }
 
         fn refreshGatewayCredential(

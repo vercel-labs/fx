@@ -55,7 +55,7 @@ export class Recorder {
     this.painted = [...new Set([...base, ...paintedBy(shown.out)])].sort((a, b) => a - b);
     this.states.push({
       cycle: s.cycle, cycleFirst: s.cycleFirst, prevFirst: s.prevFirst === -1 ? this.none : s.prevFirst,
-      nextSeq: s.nextSeq, savedThrough: s.savedThrough, live: shown.live, turnOpen: s.turnOpen,
+      nextSeq: s.nextSeq, savedThrough: s.savedThrough, live: shown.live, turnOpen: s.turnOpen, prevWaits: s.prevWaits,
       paintedThrough: s.paintedThrough, reprinting: s.reprinting, coOpen: s.coOpen, coLo: s.coLo, coHi: s.coHi,
       coAtStart: s.coAtStart, pending: s.pending, pendingDir: s.pendingDir, nextToken: s.nextToken,
       out: shown.out, act, alive: true, cycleStarts: [...this.cycleStarts], painted: [...this.painted],
@@ -258,8 +258,8 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
       name: "the --no-save shape: Ctrl+O is open while the previous cycle drops",
       steps: [
         E("turn_started"), E("block_finished", { id: 1 }), E("ctrlo_opened"), E("block_finished", { id: 2 }), E("turn_ended"),
-        E("compacted"), E("block_finished", { id: 3 }), E("ctrlo_scrolled", { dir: "newer" }), E("ctrlo_scrolled", { dir: "older" }),
-        E("saved_through", { seq: 99 }),
+        E("compacted"), E("turn_started"), E("block_finished", { id: 3 }), E("turn_ended"),
+        E("ctrlo_scrolled", { dir: "newer" }), E("ctrlo_scrolled", { dir: "older" }), E("saved_through", { seq: 99 }),
       ],
     },
   ];

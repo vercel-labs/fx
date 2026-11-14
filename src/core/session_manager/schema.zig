@@ -611,11 +611,16 @@ pub fn blobHash(bytes: []const u8) [blob_hash_len]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-/// A fresh id: 9 random bytes as base64url, as v1 does.
+/// A fresh id: 9 random bytes as base64url, as v1 does. It never starts
+/// with `-`, so no command reads it as a flag, as `fx session` reads an id
+/// that starts with `--`.
 pub fn newId(io: std.Io, out: *[new_id_len]u8) void {
     var random_bytes: [9]u8 = undefined;
-    io.random(&random_bytes);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(out, &random_bytes);
+    while (true) {
+        io.random(&random_bytes);
+        _ = std.base64.url_safe_no_pad.Encoder.encode(out, &random_bytes);
+        if (out[0] != '-') return;
+    }
 }
 
 const Cursor = struct {
@@ -803,6 +808,15 @@ test "ids follow v1's alphabet and avoid the reserved names" {
     var id: [new_id_len]u8 = undefined;
     newId(testing.io, &id);
     try testing.expect(validId(&id));
+}
+
+test "a fresh id never starts with a dash" {
+    // One random id in 64 would start with `-`.
+    var id: [new_id_len]u8 = undefined;
+    for (0..4096) |_| {
+        newId(testing.io, &id);
+        try testing.expect(id[0] != '-');
+    }
 }
 
 test "header parsing never panics on arbitrary bytes" {

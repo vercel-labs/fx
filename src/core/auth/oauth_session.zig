@@ -727,11 +727,7 @@ pub fn load(alloc: Allocator) !?Session {
         return null;
     };
     if (storageBackend() == .macos_keychain) {
-        if (try beginExistingNativeMutation()) |existing| {
-            var mutation = existing;
-            defer mutation.deinit();
-            return mutation.load(alloc);
-        }
+        if (try openExistingNativeFxDir()) |fx_dir| return loadKeychainProfile(alloc, fx_dir, native_keychain_backend);
         return loadKeychainWithoutProfile(alloc);
     }
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
@@ -811,28 +807,67 @@ pub fn beginExistingMutation() !?Mutation {
 }
 
 fn beginExistingNativeMutation() !?Mutation {
+    const fx_dir = (try openExistingNativeFxDir()) orelse return null;
+    return @as(?Mutation, try lockMutation(fx_dir));
+}
+
+/// The fx profile folder, null when it does not exist.
+fn openExistingNativeFxDir() !?io_mod.VerifiedDir {
     const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
     defer home_dir.close();
 
-    const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return session_presence.storageError(auth_file_name, err),
+    return openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => session_presence.storageError(auth_file_name, err),
     };
-    return @as(?Mutation, try lockMutation(fx_dir));
+}
+
+/// Reads the login in `fx_dir` and `keychain`, and takes `fx_dir`. Under the
+/// fx login lock, when it is free, a valid profile file also migrates into the
+/// Keychain. A read never waits for the lock: while another fx process holds
+/// it, such as through a refresh's token request, the read takes the file and
+/// the Keychain as they are and leaves the migration to a later load. Writers
+/// replace the file in one rename and the Keychain item in one call, so the
+/// read gets the login from before or after the write.
+fn loadKeychainProfile(alloc: Allocator, fx_dir: io_mod.VerifiedDir, keychain: KeychainBackend) !?Session {
+    var read_dir = fx_dir;
+    defer read_dir.close();
+    const lock_dir: io_mod.VerifiedDir = .{
+        .dir = read_dir.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
+    };
+    var mutation = lockMutationWithBackend(lock_dir, 0, .{}, .macos_keychain, keychain) catch |err| {
+        if (err != error.LockBusy) return err;
+        debug_trace.logf("auth", "session load read without the fx login lock reason=lock_busy", .{});
+        return loadKeychainUnlocked(alloc, &read_dir.dir, keychain);
+    };
+    defer mutation.deinit();
+    return mutation.load(alloc);
+}
+
+/// The login as the profile file and the Keychain hold it now, read without
+/// the fx login lock. A valid file wins, as under the lock, but does not
+/// migrate.
+fn loadKeychainUnlocked(alloc: Allocator, fx_dir: *std.Io.Dir, keychain: KeychainBackend) !?Session {
+    var file = try observeAuthFile(alloc, fx_dir);
+    defer file.deinit(alloc);
+    var observed = try observeKeychain(alloc, keychain);
+    defer observed.deinit(alloc);
+    return switch (selectResolution(file.state(), observed.state())) {
+        .missing => null,
+        .keychain => observed.takeSession().?,
+        .file_migrate, .file_defer_migration => file.takeSession().?,
+        .storage_error => observed.storageError(),
+    };
 }
 
 fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
     var keychain = try observeKeychain(alloc, native_keychain_backend);
     defer keychain.deinit(alloc);
 
-    if (try beginExistingNativeMutation()) |existing| {
-        var mutation = existing;
-        defer mutation.deinit();
-        return mutation.load(alloc);
-    }
+    if (try openExistingNativeFxDir()) |fx_dir| return loadKeychainProfile(alloc, fx_dir, native_keychain_backend);
 
     return switch (selectResolution(.absent, keychain.state())) {
         .missing => null,
@@ -1473,6 +1508,50 @@ test "OAuth migration keeps a valid file authoritative until verified cleanup" {
     var updated = try parse(alloc, fake.value.?);
     defer updated.deinit(alloc);
     try std.testing.expectEqualStrings("keychain-only-update", updated.access_token);
+}
+
+test "a Keychain login read never waits for another process's fx login lock and migrates once the lock is free" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+    var fake = FakeOAuthKeychain{ .alloc = alloc };
+    defer fake.deinit();
+
+    // Another fx process holds the lock, as through a refresh's token request.
+    var holder = try testKeychainMutation(tmp.dir, fake.backend());
+    const started = io_mod.milliTimestamp();
+    var busy = (try loadKeychainProfile(alloc, .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, fake.backend())).?;
+    defer busy.deinit(alloc);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 1_000);
+    try std.testing.expectEqualStrings("access", busy.access_token);
+    // Without the lock the file is read as it is: it does not migrate.
+    try std.testing.expectEqual(@as(usize, 0), fake.store_calls);
+    _ = try tmp.dir.statFile(std.testing.io, auth_file_name, .{});
+    holder.deinit();
+
+    var free = (try loadKeychainProfile(alloc, .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, fake.backend())).?;
+    defer free.deinit(alloc);
+    try std.testing.expectEqualStrings("access", free.access_token);
+    try std.testing.expectEqual(@as(usize, 1), fake.store_calls);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, auth_file_name, .{}));
+}
+
+test "a Keychain login read while another process holds the fx login lock returns the Keychain login" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .value = try alloc.dupe(u8, alternate_test_session_json) };
+    defer fake.deinit();
+    var holder = try testKeychainMutation(tmp.dir, fake.backend());
+    defer holder.deinit();
+
+    var loaded = (try loadKeychainProfile(alloc, .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, fake.backend())).?;
+    defer loaded.deinit(alloc);
+    var expected = try parse(alloc, alternate_test_session_json);
+    defer expected.deinit(alloc);
+    try std.testing.expectEqualStrings(expected.access_token, loaded.access_token);
+    try std.testing.expectEqual(@as(usize, 0), fake.store_calls);
 }
 
 test "new OAuth login replaces an existing file before deferred migration" {

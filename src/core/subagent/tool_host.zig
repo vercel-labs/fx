@@ -3559,9 +3559,8 @@ test "trace children show each subagent's work phase, last outcome, and closing"
         try std.testing.expect(traced.len <= 1);
         if (traced.len == 1) try std.testing.expect(traced[0].closing);
     }
-    // The close is written as the slot ends, a moment after the host stops
-    // counting the child as working.
-    try waitForSlotEnd(runtime, child_id);
+    try waitUntilQuiet(runtime);
+    try waitUntilClosed(runtime, child_id);
     const taken = try runtime.takeClosed(alloc);
     defer {
         for (taken) |id| alloc.free(id);
@@ -3597,9 +3596,8 @@ test "the parent's close ends a working subagent's turn without a report and rem
     const listing = try runtime.listChildren(alloc);
     defer Runtime.freeChildListing(alloc, listing);
     try std.testing.expectEqual(@as(usize, 0), listing.len);
-    // The close is written as the slot ends, after the host stops counting
-    // the child as working.
-    try waitForSlotEnd(runtime, child_id);
+    try waitUntilQuiet(runtime);
+    try waitUntilClosed(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
     {
@@ -3640,9 +3638,8 @@ test "the user's close of a working subagent reports that the user closed it" {
     const child_id = try reviewerId(runtime, arena);
     const closed = (try runtime.closeChild(child_id, .user)).?;
     try std.testing.expect(closed.stopped);
-    // The close is written as the slot ends, after the host stops counting
-    // the child as working.
-    try waitForSlotEnd(runtime, child_id);
+    try waitUntilQuiet(runtime);
+    try waitUntilClosed(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
     try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, fixture.ends.items[0]);
     try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user closed it before it finished.") != null);
@@ -5438,7 +5435,6 @@ test "a subagent's message its parent can't take says so, and keeps nothing of w
     try std.testing.expectEqual(@as(usize, 1), worker.typed_this_turn.items.len);
 }
 
-/// Waits, in a test, until no child of `runtime` works.
 /// Waits until `child_id`'s work in the parent's log is `work_id`.
 fn waitForActiveWork(runtime: *Runtime, arena: Allocator, child_id: []const u8, work_id: []const u8) !void {
     for (0..5000) |_| {
@@ -5467,9 +5463,30 @@ fn waitForSlotEnd(runtime: *Runtime, child_id: []const u8) !void {
     try std.testing.expect(!runtime.managed.hasRunningChild(child_id));
 }
 
+/// Waits, in a test, until no child of `runtime` works and no message waits
+/// for one. A close of a working child is not written by then: its slot
+/// writes the close once the work has ended and stopped counting as working,
+/// so a test that reads the registry after such a close waits with
+/// `waitUntilClosed` too.
 fn waitUntilQuiet(runtime: *Runtime) !void {
     for (0..5000) |_| {
         if (runtime.quiet()) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Waits, in a test, until the registry no longer holds `child_id`, which is
+/// when the close of a working child has been written.
+fn waitUntilClosed(runtime: *Runtime, child_id: []const u8) !void {
+    for (0..5000) |_| {
+        {
+            var lock = runtime.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try runtime.managed.state_store.load(std.testing.allocator);
+            defer registry.deinit(std.testing.allocator);
+            if (registry.findById(child_id) == null) return;
+        }
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.Timeout;
