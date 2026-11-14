@@ -91,7 +91,7 @@ function allReports(raw: string): Record<string, unknown>[] {
   }
   return out;
 }
-const DEFAULT_MODEL = "spacexai/grok-4.7";
+const DEFAULT_MODEL = "openai/gpt-6.1-sol";
 /** What fx says when it cannot connect to the model catalog and drops fast
  * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
 const CATALOG_CONNECT_FAST_NOTICE =
@@ -1617,7 +1617,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask uses Grok 4.7 as the default model", async () => {
+  test("ask uses GPT-6.1 Sol as the default model", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(

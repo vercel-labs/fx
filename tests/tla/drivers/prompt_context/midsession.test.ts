@@ -229,7 +229,7 @@ test("with GPT-5.6 or later, rules delivered mid-session ride on the tool result
   await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["deliver"]);
 }, TIMEOUT);
 
-test("with fx's default model, which gets no cache markers, rules delivered mid-session ride on the tool result", async () => {
+test("with Grok 4.7, which gets no cache markers, rules delivered mid-session ride on the tool result", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["deliver"]);
 }, TIMEOUT);
 
@@ -241,7 +241,7 @@ test("with GPT-5.6 or later, a resumed turn carries the stale-shell note on its 
   await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["resume"]);
 }, TIMEOUT);
 
-test("with fx's default model, a resumed turn carries the stale-shell note on its own message", async () => {
+test("with Grok 4.7, a resumed turn carries the stale-shell note on its own message", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["resume"]);
 }, TIMEOUT);
 
@@ -253,7 +253,7 @@ test("with GPT-5.6 or later, an agent branch switch rides on the step's tool res
   await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["switch"]);
 }, TIMEOUT);
 
-test("with fx's default model, an agent branch switch rides on the step's tool result", async () => {
+test("with Grok 4.7, an agent branch switch rides on the step's tool result", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["switch"]);
 }, TIMEOUT);
 
@@ -265,7 +265,7 @@ test("with GPT-5.6 or later, a permission mode changed between turns rides on th
   await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["outside"]);
 }, TIMEOUT);
 
-test("with fx's default model, a permission mode changed between turns rides on the next turn's message", async () => {
+test("with Grok 4.7, a permission mode changed between turns rides on the next turn's message", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["outside"]);
 }, TIMEOUT);
 
@@ -277,7 +277,7 @@ test("with GPT-5.6 or later, a named skill's text rides on its turn's message an
   await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["skill"]);
 }, TIMEOUT);
 
-test("with fx's default model, a named skill's text rides on its turn's message", async () => {
+test("with Grok 4.7, a named skill's text rides on its turn's message", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["skill"]);
 }, TIMEOUT);
 
