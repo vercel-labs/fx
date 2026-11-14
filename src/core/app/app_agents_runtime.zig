@@ -33,6 +33,7 @@ const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -3272,6 +3273,72 @@ test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches th
     cancel.store(false, .seq_cst);
     try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
     try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
+}
+
+test "the cancel a run's wait repeats ends the question that run waits on" {
+    const alloc = std.testing.allocator;
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var completion: agents.ChildRunCompletion = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+
+    const Side = struct {
+        fn ask(
+            runtime: *worker_runtime.WorkerRuntime,
+            batch: []const types.QuestionBatchEntry,
+            answered: *std.atomic.Value(bool),
+            returned: *std.Io.Event,
+        ) void {
+            defer returned.set(io_mod.getIo());
+            const answers = (runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, batch) catch return) orelse return;
+            for (answers) |answer| std.testing.allocator.free(answer);
+            std.testing.allocator.free(answers);
+            answered.store(true, .release);
+        }
+
+        fn wait(
+            done: *agents.ChildRunCompletion,
+            flag: *std.atomic.Value(bool),
+            runtime: *worker_runtime.WorkerRuntime,
+            outcome: *agents.ChildRunCompletion.Outcome,
+        ) void {
+            outcome.* = waitForCompletion(done, flag, runtime);
+        }
+
+        /// Whether the question opens within a bounded time. Nothing signals it, so
+        /// it is polled; the end of the wait is waited for on an event.
+        fn questionOpens(runtime: *worker_runtime.WorkerRuntime) bool {
+            for (0..2000) |_| {
+                var snapshot = runtime.snapshotPendingQuestionBatch(std.testing.allocator) catch return false;
+                if (snapshot) |*batch| {
+                    batch.deinit(std.testing.allocator);
+                    return true;
+                }
+                io_mod.sleep(1 * std.time.ns_per_ms);
+            }
+            return false;
+        }
+    };
+
+    var answered = std.atomic.Value(bool).init(false);
+    var returned: std.Io.Event = .unset;
+    const asker = try std.Thread.spawn(.{}, Side.ask, .{ &worker, &entries, &answered, &returned });
+    var outcome: agents.ChildRunCompletion.Outcome = .completed;
+    const waiter = try std.Thread.spawn(.{}, Side.wait, .{ &completion, &cancel, &worker, &outcome });
+    const opened = Side.questionOpens(&worker);
+    cancel.store(true, .seq_cst);
+    const ended = opened and testing_event.setInTime(&returned);
+    // A question that stayed open is released, so the test fails instead of hanging.
+    if (!ended) worker.requestStop();
+    completion.finish(.cancelled);
+    waiter.join();
+    asker.join();
+    try std.testing.expect(opened);
+    try std.testing.expect(ended);
+    try std.testing.expect(!answered.load(.acquire));
+    try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.cancelled, outcome);
 }
 
 test "the switch list follows the registry's start order, with an unlisted agent kept after it" {

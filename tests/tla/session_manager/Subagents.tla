@@ -14,6 +14,11 @@
 (* items are new spawn/finish pairs with the next work number. fx's       *)
 (* `data` on these lines is opaque to the manager and not modeled.        *)
 (*                                                                         *)
+(* The thread can fail to start after the spawn line is written. fx then  *)
+(* finishes the work as `failed`, with no child log, so the child is idle *)
+(* and takes a new work (`StartFail`); a work left unfinished with no     *)
+(* thread is what `NoIndeterminate` rules out.                            *)
+(*                                                                         *)
 (* Design: system-design.md kinds table, "Reliability And Recovery" and   *)
 (* D22.                                                                    *)
 (***************************************************************************)
@@ -75,6 +80,16 @@ ChildStart(c) ==
     /\ thread' = [thread EXCEPT ![c] = "running"]
     /\ UNCHANGED <<plog, up, repairing>>
 
+\* 2'. The thread cannot start: the parent finishes the work as failed. The
+\*     child never started a turn, so it has no log; it keeps its name and
+\*     takes a new work (D33).
+StartFail(c) ==
+    /\ Normal
+    /\ thread[c] = "starting"
+    /\ plog' = Append(plog, [k |-> "finished", c |-> c, w |-> Works(c), o |-> "failed"])
+    /\ thread' = [thread EXCEPT ![c] = "none"]
+    /\ UNCHANGED <<childLog, up, repairing>>
+
 \* 3. The child finishes and appends child_finished to the parent.
 ChildFinish(c) ==
     /\ Normal
@@ -126,6 +141,7 @@ Next ==
     \/ \E c \in Children :
           \/ Spawn(c)
           \/ ChildStart(c)
+          \/ StartFail(c)
           \/ ChildFinish(c)
           \/ Cancel(c)
           \/ RepairChild(c)
