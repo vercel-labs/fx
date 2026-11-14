@@ -564,6 +564,29 @@ test "transcript window: between turns the newest Ctrl+O page reads the cycle it
     try std.testing.expect(runtime.transcript_archive_generation != generation);
 }
 
+test "transcript window: when the held entries fill the newest page, the joined cycle keeps none of its entries" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try runtime.enableTranscriptWindow(alloc, true);
+    var buf: [32]u8 = undefined;
+    for (0..full_transcript_page.max_source_entries) |index| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, try std.mem.print(&buf, "held {d}\n", .{index}), .tool_status);
+    }
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 3), false);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript_archive.?.runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), runtime.transcript_archive.?.trimmed);
+    const newest = try pageTexts(alloc, &runtime, .tail);
+    defer alloc.free(newest);
+    try std.testing.expect(std.mem.startsWith(u8, newest, "held 0\n"));
+    try std.testing.expect(std.mem.endsWith(u8, newest, "held 255\n"));
+    // The page above reaches the cycle, which then loads whole.
+    _ = runtime.requestFullTranscriptOpen();
+    runtime.moveToFullTranscriptPage(.{ .entry_index = 2 }, .last);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+}
+
 test "transcript window: a cycle read for a Ctrl+O that closed since stays only when the newest page joins it" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);

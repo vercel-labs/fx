@@ -900,7 +900,8 @@ pub const TranscriptArchiveRead = struct {
     };
 
     pub const Task = struct {
-        thread: ?std.Thread = null,
+        /// The read's `std.Io` task, which `completed` and `cancel` await.
+        future: ?std.Io.Future(void) = null,
         done: std.atomic.Value(bool) = .init(false),
         cancel_requested: std.atomic.Value(bool) = .init(false),
         reader: session_adapter.CycleReader,
@@ -976,7 +977,7 @@ pub const TranscriptArchiveRead = struct {
         if (comptime builtin.single_threaded or host_target.is_wasm) {
             task.run();
         } else {
-            task.thread = std.Thread.spawn(.{}, Task.run, .{task}) catch |err| {
+            task.future = io_mod.getIo().concurrent(Task.run, .{task}) catch |err| {
                 task.deinit();
                 return err;
             };
@@ -989,26 +990,26 @@ pub const TranscriptArchiveRead = struct {
     pub fn completed(self: *TranscriptArchiveRead) ?*Task {
         const task = self.task orelse return null;
         if (!task.done.load(.acquire)) return null;
-        if (task.thread) |thread| thread.join();
-        task.thread = null;
+        if (task.future) |*future| future.await(io_mod.getIo());
+        task.future = null;
         return task;
     }
 
     /// Frees the finished read `completed` returned.
     pub fn finish(self: *TranscriptArchiveRead) void {
         const task = self.task orelse return;
-        std.debug.assert(task.thread == null);
+        std.debug.assert(task.future == null);
         self.task = null;
         task.deinit();
     }
 
-    /// Stops a running read and waits for its thread. The turns it read are
+    /// Stops a running read and waits for its task. The turns it read are
     /// dropped; the log keeps them.
     pub fn cancel(self: *TranscriptArchiveRead) void {
         const task = self.task orelse return;
         self.task = null;
         task.cancel_requested.store(true, .release);
-        if (task.thread) |thread| thread.join();
+        if (task.future) |*future| future.await(io_mod.getIo());
         debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=cancelled turns={d}", .{ task.request.back, task.turns.items.len });
         task.deinit();
     }
