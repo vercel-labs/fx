@@ -1523,7 +1523,7 @@ const Session = struct {
         var login_shell_buffer: [4096]u8 = undefined;
         const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         var fallback_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const invocation = try shell_resolver.resolveInto(&fallback_buffer, configured, request.shell);
+        const invocation = try shell_resolver.resolve(&fallback_buffer, configured, request.shell);
         const shell = try alloc.dupe(u8, invocation.path);
         errdefer alloc.free(shell);
         const cwd = try alloc.dupe(u8, request.cwd);
@@ -1650,7 +1650,7 @@ const Session = struct {
     }
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
-        var invocation = try shell_resolver.resolveInto(
+        var invocation = try shell_resolver.resolve(
             &.{},
             null,
             pinnedShell(request.shell, self.shell),
