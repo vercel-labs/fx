@@ -210,6 +210,9 @@ def instrumented_link_argv(
         "-isysroot",
         str(toolchain.tools.sdk),
         "-Wl,-dead_strip",
+        # The map names the function at each address of the stripped
+        # binary, for its crash reports.
+        f"-Wl,-map,{paths.logs / 'instrumented-link.map'}",
         *PROFILE_SECTION_ALIGNMENTS,
         str(paths.instrumented_object),
         str(toolchain.profile_runtime),

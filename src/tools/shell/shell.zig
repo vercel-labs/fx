@@ -388,12 +388,12 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     if (raw.object.get("request")) |wrapper| {
         try problems.append(arena, "Put the action fields at the top level; shell takes no request wrapper.");
         var request = wrapper;
-        if (request == .string) {
-            request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return correction_json(alloc, problems.items, null),
-            };
-        }
+        // A wrapper written as JSON text is read like intake reads it, with
+        // the same depth limit.
+        tool_args.normalizeCompositeObjectValue(arena, &request) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return correction_json(alloc, problems.items, null),
+        };
         if (request != .object or request.object.count() > 32) {
             return correction_json(alloc, problems.items, null);
         }
@@ -773,6 +773,7 @@ fn callRun(
         .on_output_chunk = ctx.on_output_chunk,
         .yield_time_ms = input.yield_time_ms,
         .cancel_flag = ctx.cancel_flag,
+        .tool_yield_flag = ctx.tool_yield_flag,
     }) catch |err| {
         if (err == error.Cancelled and
             ctx.cancel_flag != null and
@@ -783,7 +784,7 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    const result = try finishPrepared(ctx, runtime, &prepared, .command);
+    const result = try finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
     return attachSnapshotNotice(ctx.allocator, result) catch |err| {
         result.deinit(ctx.allocator);
         return err;
@@ -803,19 +804,160 @@ fn attachSnapshotNotice(
     if (body.len == 0 or body[body.len - 1] != '}') return result;
     const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
     defer alloc.free(notice);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"notice\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeByte('}') catch return error.OutOfMemory;
-    const updated = try out.toOwnedSlice();
+    const updated = (try withJsonStringField(alloc, body, "notice", notice)).?;
     alloc.free(body);
     return switch (result) {
         .success => .{ .success = updated },
         .failure => .{ .failure = updated },
         .rich => unreachable,
     };
+}
+
+/// Returns a copy of the JSON object `body` with the string field `name`,
+/// a plain key, set to `value` at its end, or null when `body` does not end
+/// in `}`. The caller owns the copy; `body` is left as it is.
+fn withJsonStringField(
+    alloc: Allocator,
+    body: []const u8,
+    comptime name: []const u8,
+    value: []const u8,
+) Allocator.Error!?[]u8 {
+    if (body.len == 0 or body[body.len - 1] != '}') return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"" ++ name ++ "\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+const steering_notice = "New steering arrived, so this call returned while the command keeps running. " ++
+    "Read the steering first. The session stays yours: use interact with this session_id to follow it, or stop to end it.";
+
+fn steerYieldRequested(ctx: tool_dispatch.DispatchContext) bool {
+    const flag = ctx.tool_yield_flag orelse return false;
+    return flag.load(.seq_cst);
+}
+
+/// Adds `steering_notice` to a JSON result of a command that returned
+/// running for steering. Frees `body` only when it returns the new one.
+fn attachSteeringNotice(alloc: Allocator, body: []u8) Allocator.Error![]u8 {
+    const updated = (try withJsonStringField(alloc, body, "steering_notice", steering_notice)) orelse return body;
+    alloc.free(body);
+    return updated;
+}
+
+/// `attachSteeringNotice` for a result of `prepared` when its command still
+/// runs and steering asked it to yield. When `started_here` is set, the
+/// call started the command, so steering moved a command of this turn to
+/// the background: it is marked as detached by steering in this call's
+/// turn, and an explicit cancel of that turn stops it
+/// (`stopSteeringDetached`). An `interact` poll passes false, so a command
+/// the model left in the background itself, or one from an earlier turn,
+/// keeps running. On failure it gives up the result's delivery, and the
+/// caller still owns `body`.
+fn noteSteeringYield(
+    ctx: tool_dispatch.DispatchContext,
+    runtime: *managed_execution.Runtime,
+    prepared: *managed_execution.PreparedSnapshot,
+    body: []u8,
+    started_here: bool,
+) Allocator.Error![]u8 {
+    if (prepared.snapshot.state != .running or !steerYieldRequested(ctx)) return body;
+    const updated = attachSteeringNotice(ctx.allocator, body) catch |err| {
+        runtime.cancelDelivery(
+            prepared.snapshot.execution_id,
+            prepared.reservation_id,
+        ) catch {};
+        return err;
+    };
+    if (!started_here) return updated;
+    if (ctx.output_chunk_lifecycle_id) |lifecycle_id| {
+        runtime.markSteeringDetached(prepared.snapshot.execution_id, lifecycle_id.turn_id);
+    }
+    return updated;
+}
+
+/// A call that asked to return at once (`yield_time_ms` 0) never waited, so
+/// steering did not move its command to the background: its result gets no
+/// steering notice, and a cancel of the turn leaves the command running.
+fn withoutSteeringYield(ctx: tool_dispatch.DispatchContext, yield_time_ms: u32) tool_dispatch.DispatchContext {
+    var result = ctx;
+    if (yield_time_ms == 0) result.tool_yield_flag = null;
+    return result;
+}
+
+/// Stops every command that steering moved to the background during turn
+/// `turn_id`, after an explicit cancel of that turn, the way the `stop`
+/// action does: gracefully first, then by force if the command still runs.
+/// Commands the model left in the background itself and those of other
+/// turns keep running. `ctx` must not carry the cancelled turn's cancel
+/// flag, or the stop itself would be cancelled.
+pub fn stopSteeringDetached(
+    ctx: tool_dispatch.DispatchContext,
+    turn_id: u64,
+) Allocator.Error!void {
+    const runtime = ctx.managed_executions orelse return;
+    const ids = try runtime.takeSteeringDetached(ctx.allocator, turn_id);
+    defer {
+        for (ids) |id| ctx.allocator.free(id);
+        ctx.allocator.free(ids);
+    }
+    for (ids) |session_id| {
+        debug_trace.logf(
+            "shell",
+            "stopping steering-detached command session_id={s} turn_id={d} reason=turn_cancelled",
+            .{ session_id, turn_id },
+        );
+        if (try stopDetachedOnce(ctx, session_id, false)) continue;
+        debug_trace.logf(
+            "shell",
+            "graceful stop left steering-detached command running session_id={s} turn_id={d} next=force",
+            .{ session_id, turn_id },
+        );
+        if (!try stopDetachedOnce(ctx, session_id, true)) {
+            debug_trace.logf(
+                "shell",
+                "steering-detached command stop failed session_id={s} turn_id={d}",
+                .{ session_id, turn_id },
+            );
+        }
+    }
+}
+
+/// Runs the `stop` action on `session_id` and reports whether it ended.
+fn stopDetachedOnce(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+    force: bool,
+) Allocator.Error!bool {
+    const result = callStop(ctx, .{
+        .action = .stop,
+        .session_id = session_id,
+        .force = force,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "shell",
+                "steering-detached command stop errored session_id={s} force={s} err={s}",
+                .{ session_id, if (force) "true" else "false", @errorName(err) },
+            );
+            return false;
+        },
+    };
+    defer result.deinit(ctx.allocator);
+    const ended = switch (result) {
+        .success => true,
+        .failure, .rich => false,
+    };
+    debug_trace.logf(
+        "shell",
+        "stopped steering-detached command session_id={s} force={s} ended={s}",
+        .{ session_id, if (force) "true" else "false", if (ended) "true" else "false" },
+    );
+    return ended;
 }
 
 fn callInteract(
@@ -845,14 +987,15 @@ fn callInteract(
         return callTtyInteract(ctx, input, yield_time_ms);
     }
     if (chars.len != 0) return runtimeFailure(ctx, error.InvalidBackend);
-    var prepared = runtime.wait(
+    var prepared = runtime.waitOrYield(
         ctx.allocator,
         session_id,
         yield_time_ms,
         ctx.cancel_flag,
+        ctx.tool_yield_flag,
     ) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    return finishPrepared(withoutSteeringYield(ctx, yield_time_ms), runtime, &prepared, .command);
 }
 
 fn callStop(
@@ -957,12 +1100,16 @@ fn callTtyRun(
         .lifetime = .session,
     }) catch |err| return runtimeFailure(ctx, err);
     defer persistence.deinit();
+    // With a steering yield flag, the start returns once the command runs
+    // and a separate wait, which steering can end, waits for its exit.
+    // Cancelling the start itself would end the command.
+    const split_wait = ctx.tool_yield_flag != null and input.yield_time_ms != 0;
     const request = terminal_contracts.ActionRequest{ .start = .{
         .cwd = cwd,
         .command = command,
         .shell = shell,
         .backend = .native,
-        .return_when = if (input.yield_time_ms == 0) .started else .exit,
+        .return_when = if (input.yield_time_ms == 0 or split_wait) .started else .exit,
         .wait_ceiling_ms = @max(@as(u64, 1), input.yield_time_ms),
         .timeout_ms = input.timeout_ms,
         .persistence = persistence.view(),
@@ -979,7 +1126,13 @@ fn callTtyRun(
     };
     var session_owned = true;
     defer if (session_owned) closeTtyBestEffort(ctx, started.session.session_id);
-    const initial_state = terminal_managed_observer.snapshotState(started.session, started.outcome);
+    var initial_state = terminal_managed_observer.snapshotState(started.session, started.outcome);
+    if (split_wait and initial_state == .running) {
+        switch (try waitTtyExitOrYield(ctx, started.session.session_id, input.yield_time_ms)) {
+            .state => |state| initial_state = state,
+            .failure => |failure| return failure,
+        }
+    }
     var observed = terminal_managed_observer.observe(
         ttyObserverContext(ctx, runtime) orelse return unavailable(ctx),
         started.session.session_id,
@@ -1008,7 +1161,7 @@ fn callTtyRun(
     session_owned = false;
     defer prepared.deinit(ctx.allocator);
     _ = owner;
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    return finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
 }
 
 fn callTtyInteract(
@@ -1097,21 +1250,10 @@ fn callTtyInteract(
         return runtimeFailure(ctx, err);
     defer runtime.releaseExternalWait(session_id, waiter_id);
     if (state == .running and yield_time_ms != 0) {
-        var waited = executeAuthorizedTerminal(ctx, session_id, .{ .wait = .{
-            .session_id = session_id,
-            .return_when = .exit,
-            .safety_ceiling_ms = yield_time_ms,
-            .authority = null,
-        } }) catch |err| return runtimeFailure(ctx, err);
-        defer waited.deinit(ctx.allocator);
-        const result = switch (waited.result.view()) {
-            .failure => return cloneTerminalFailure(ctx, waited.result.view()),
-            .success => |success| switch (success) {
-                .wait => |value| value,
-                else => return runtimeFailure(ctx, error.InvalidTerminalResult),
-            },
-        };
-        state = terminal_managed_observer.snapshotState(result.session, result.outcome);
+        switch (try waitTtyExitOrYield(ctx, session_id, yield_time_ms)) {
+            .state => |waited_state| state = waited_state,
+            .failure => |failure| return failure,
+        }
     }
     if (accepted_bytes != null and yield_time_ms == 0) {
         io_mod.sleep(100 * std.time.ns_per_ms);
@@ -1142,10 +1284,11 @@ fn callTtyInteract(
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
+    const finish_ctx = withoutSteeringYield(ctx, yield_time_ms);
     return if (accepted_bytes) |count|
-        finishPreparedWithAccepted(ctx, runtime, &prepared, count)
+        finishPreparedWithAccepted(finish_ctx, runtime, &prepared, count)
     else
-        finishPrepared(ctx, runtime, &prepared, .command);
+        finishPrepared(finish_ctx, runtime, &prepared, .command);
 }
 
 fn callTtyStop(
@@ -1312,6 +1455,52 @@ fn executeAuthorizedTerminal(
     return executeTerminal(ctx, authorized);
 }
 
+const TtyWaitOutcome = union(enum) {
+    state: managed_execution.SnapshotState,
+    failure: tool_dispatch.ToolResult,
+};
+
+/// Waits up to `ceiling_ms` for tty session `session_id` to exit. Steering
+/// (`ctx.tool_yield_flag`) ends the wait early with the session still
+/// running; only the wait is cancelled, never the session.
+fn waitTtyExitOrYield(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+    ceiling_ms: u32,
+) tool_dispatch.DispatchError!TtyWaitOutcome {
+    var authority = reloadTerminalAuthority(ctx, session_id) catch |err|
+        return .{ .failure = try runtimeFailure(ctx, err) };
+    defer authority.deinit();
+    var waited: ParsedTerminalExecution = .{ .result = terminal_action_executor.execute(.{
+        .alloc = ctx.allocator,
+        .lifecycle_allocator = ctx.lifecycle_allocator,
+        .runtime = ctx.terminal_client orelse return .{ .failure = try unavailable(ctx) },
+        .cancel_flag = ctx.cancel_flag,
+        .yield_flag = ctx.tool_yield_flag,
+        .yield_grace_ms = managed_execution.steerYieldGraceMs(),
+    }, .{ .wait = .{
+        .session_id = session_id,
+        .return_when = .exit,
+        .safety_ceiling_ms = ceiling_ms,
+        .authority = authority.view(),
+    } }) catch |err| return .{ .failure = try runtimeFailure(ctx, err) } };
+    defer waited.deinit(ctx.allocator);
+    switch (waited.result.view()) {
+        .failure => |failure| {
+            const user_cancelled = if (ctx.cancel_flag) |flag| flag.load(.seq_cst) else false;
+            if (failure.code == .cancelled and !user_cancelled and steerYieldRequested(ctx)) {
+                debug_trace.logf("shell", "tty wait yielded for steering session={s}", .{session_id});
+                return .{ .state = .running };
+            }
+            return .{ .failure = try cloneTerminalFailure(ctx, waited.result.view()) };
+        },
+        .success => |success| switch (success) {
+            .wait => |value| return .{ .state = terminal_managed_observer.snapshotState(value.session, value.outcome) },
+            else => return .{ .failure = try runtimeFailure(ctx, error.InvalidTerminalResult) },
+        },
+    }
+}
+
 fn reloadTerminalAuthority(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
@@ -1423,7 +1612,12 @@ fn closeTtyBestEffort(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
 ) void {
-    var closed = executeAuthorizedTerminal(ctx, session_id, .{ .close = .{
+    // The close ignores `cancel_flag`. A user cancel is when this cleanup
+    // matters most, and with the flag set the executor would cancel the
+    // close too and leave the command running.
+    var close_ctx = ctx;
+    close_ctx.cancel_flag = null;
+    var closed = executeAuthorizedTerminal(close_ctx, session_id, .{ .close = .{
         .session_id = session_id,
         .policy = .force,
         .authority = null,
@@ -1444,7 +1638,7 @@ fn finishPreparedWithAccepted(
     prepared: *managed_execution.PreparedSnapshot,
     accepted_bytes: u32,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = formatSnapshotWithLimit(
+    var body = formatSnapshotWithLimit(
         ctx.allocator,
         prepared.snapshot,
         accepted_bytes,
@@ -1458,6 +1652,7 @@ fn finishPreparedWithAccepted(
         return runtimeFailure(ctx, err);
     };
     errdefer ctx.allocator.free(body);
+    body = try noteSteeringYield(ctx, runtime, prepared, body, false);
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1554,9 +1749,11 @@ fn finishPrepared(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
     prepared: *managed_execution.PreparedSnapshot,
-    action: enum { command, stop },
+    /// `run` is the result of the call that started the command, `command`
+    /// a later observation of it, and `stop` the result of a stop.
+    action: enum { run, command, stop },
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = formatSnapshotWithLimit(
+    var body = formatSnapshotWithLimit(
         ctx.allocator,
         prepared.snapshot,
         null,
@@ -1570,6 +1767,10 @@ fn finishPrepared(
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result is unavailable") };
     };
     errdefer ctx.allocator.free(body);
+    switch (action) {
+        .run, .command => body = try noteSteeringYield(ctx, runtime, prepared, body, action == .run),
+        .stop => {},
+    }
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1582,7 +1783,7 @@ fn finishPrepared(
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
     const failed = switch (action) {
-        .command => snapshotFailed(prepared.snapshot),
+        .run, .command => snapshotFailed(prepared.snapshot),
         .stop => stop_result_failed(prepared.snapshot.state),
     };
     return if (failed)
@@ -1601,7 +1802,7 @@ fn publishSnapshotMetadata(
         .completed => |value| value,
         .stopped => |value| value,
         .lost => .indeterminate,
-        .running => return,
+        .running => return publishQuietCrossing(ctx, snapshot),
     };
     const projection: command_contract.StatusProjection = if (status) |value|
         command_contract.projectStatus(value)
@@ -1668,6 +1869,22 @@ fn publishSnapshotMetadata(
     if (ctx.tool_result_memory_sink != null) {
         tool_dispatch.reportToolResultMemory(ctx, memory);
     }
+}
+
+/// A running result carries metadata only when its wait ended at the quiet
+/// crossing: the command and its quiet time, for the note fx relays to a
+/// subagent's parent (`noteChildQuiet` in `src/core/subagent/tool_host.zig`).
+fn publishQuietCrossing(
+    ctx: tool_dispatch.DispatchContext,
+    snapshot: managed_execution.Snapshot,
+) !void {
+    if (!snapshot.quiet_crossed or ctx.tool_result_memory_sink == null) return;
+    const command = try ctx.allocator.dupe(u8, snapshot.command);
+    debug_trace.eventf("shell", "quiet_crossing", .{}, "session={s} quiet_ms={d}", .{ snapshot.execution_id, snapshot.quiet_ms orelse 0 });
+    tool_dispatch.reportToolResultMemory(ctx, .{ .quiet_crossing = .{
+        .command = command,
+        .quiet_ms = snapshot.quiet_ms orelse 0,
+    } });
 }
 
 fn handoffPreparedDelivery(
@@ -2081,15 +2298,14 @@ fn resolveCwd(
     ctx: tool_dispatch.DispatchContext,
     requested: ?[]const u8,
 ) ![]const u8 {
-    const scope = ctx.access_scope orelse
-        workspace_access.AccessScope.primaryOnly(ctx.workspace_root);
-    const value = requested orelse return arena.dupe(u8, scope.primary_directory);
+    const primary = workspace_access.AccessScope.primaryDirectoryOf(ctx.access_scope, ctx.workspace_root);
+    const value = requested orelse return arena.dupe(u8, primary);
     if (std.mem.eql(u8, value, ".")) {
-        return arena.dupe(u8, scope.primary_directory);
+        return arena.dupe(u8, primary);
     }
     return pathing.resolveWorkspaceOrExternalPath(
         arena,
-        scope.primary_directory,
+        primary,
         value,
     );
 }
@@ -2240,6 +2456,11 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"},\"command\":\"false\"}", .retry = null },
+        // Text nested deeper than tool input may be, and an object encoded
+        // twice, are refused without a suggestion.
+        .{ .input = "{\"request\":\"" ++ text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300) ++ "\",\"yield_time_ms\":1}", .retry = null },
+        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\",\\\"x\\\":" ++ text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300) ++ "}\",\"yield_time_ms\":1}", .retry = null },
+        .{ .input = "{\"request\":\"\\\"{\\\\\\\"action\\\\\\\":\\\\\\\"run\\\\\\\",\\\\\\\"command\\\\\\\":\\\\\\\"true\\\\\\\"}\\\"\"}", .retry = null },
         .{ .input = "{", .retry = null },
         .{ .input = "[]", .retry = null },
     };
@@ -2276,6 +2497,28 @@ test "shell request correction suggests only unambiguous repairs without executi
             try std.testing.expect(detail.get("retry_with") == null);
         }
     }
+}
+
+test "shell request correction does not read a text wrapper nested deeper than tool input may be" {
+    const alloc = std.testing.allocator;
+    const deep = text_utils.repeat("{\\\"a\\\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    const input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\",\\\"x\\\":" ++ deep ++ "}\",\"yield_time_ms\":1}";
+    const failure = switch (try decode(.{ .allocator = alloc }, input)) {
+        .failure => |failure| failure,
+        .input => |decoded| {
+            decoded.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(failure);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+    defer parsed.deinit();
+    const detail = parsed.value.object.get("error").?.object;
+    // Only the wrapper is named: nothing inside the text was read.
+    const problems = detail.get("problems").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), problems.len);
+    try std.testing.expectEqualStrings("Put the action fields at the top level; shell takes no request wrapper.", problems[0].string);
+    try std.testing.expect(detail.get("retry_with") == null);
 }
 
 fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8) !void {
@@ -2607,6 +2850,23 @@ test "shell decoder applies action specific observation defaults" {
     }
 }
 
+test "a command returned for steering tells the model it still runs" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.dupe(u8, "{\"state\":\"running\",\"session_id\":\"shell-1\"}");
+    const updated = try attachSteeringNotice(alloc, body);
+    defer alloc.free(updated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("shell-1", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings(steering_notice, parsed.value.object.get("steering_notice").?.string);
+
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!steerYieldRequested(.{ .allocator = alloc }));
+    try std.testing.expect(!steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
+    flag.store(true, .seq_cst);
+    try std.testing.expect(steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
+}
+
 test "shell interaction wait bounds empty observations without delaying writes" {
     const cases = [_]struct {
         has_input: bool,
@@ -2721,6 +2981,39 @@ test "stopped execution is a successful shell observation without command failur
             .output_truncated = false,
         });
         try std.testing.expect(memory != null);
+        try std.testing.expect(memory.?.command_process_presentation == null);
+    }
+}
+
+test "only a running result that ended its wait at the quiet crossing carries the crossing" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |crossed| {
+        var memory: ?types.ToolResultMemory = null;
+        try publishSnapshotMetadata(.{
+            .allocator = alloc,
+            .tool_result_memory_sink = &memory,
+        }, .{
+            .execution_id = @constCast("shell-quiet"),
+            .command = @constCast("node verify.mjs --mock"),
+            .cwd = @constCast("/tmp"),
+            .retained = true,
+            .state = .running,
+            .output_delta = @constCast(""),
+            .output_truncated = false,
+            .running_ms = 130_000,
+            .quiet_ms = 125_000,
+            .quiet_notice = true,
+            // A later wait in the same spell gets the notice without crossing.
+            .quiet_crossed = crossed,
+        });
+        if (!crossed) {
+            try std.testing.expect(memory == null);
+            continue;
+        }
+        defer types.freeToolResultMemory(alloc, memory.?);
+        const crossing = memory.?.quiet_crossing.?;
+        try std.testing.expectEqualStrings("node verify.mjs --mock", crossing.command);
+        try std.testing.expectEqual(@as(u64, 125_000), crossing.quiet_ms);
         try std.testing.expect(memory.?.command_process_presentation == null);
     }
 }
@@ -3357,6 +3650,212 @@ test "registered shell empty observation waits through one managed execution" {
     const replay = tool_result_memory.?.command_output_replay orelse
         return error.TestExpectedEqual;
     try std.testing.expect(replay == .available);
+}
+
+test "a turn cancel stops the command steering detached and keeps a background one" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = managed_execution.Runtime.init(alloc);
+    defer runtime.deinit();
+    const spec = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .activity_kind = .command,
+        .requires_approval = true,
+        .decode = decode,
+        .validate = validate,
+        .call = call,
+        .captured_command_action = "run",
+        .captured_command_fn = isCapturedCommand,
+        .process_local_fn = isProcessLocal,
+        .reads_only_fn = readsOnly,
+        .irreversible_fn = isIrreversible,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{spec} };
+    var environment_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer environment_arena_state.deinit();
+    const environment = try commandEnvironment(
+        environment_arena_state.allocator(),
+        .{ .allocator = alloc, .workspace_root = "/tmp" },
+        .clean,
+    );
+    // Steering waits for the turn the whole time, as it does when the user
+    // types while a command runs.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    const Run = struct {
+        fn start(
+            run_alloc: Allocator,
+            rt: *managed_execution.Runtime,
+            reg: tool_dispatch.Registry,
+            env: command_environment.Environment,
+            flag: *std.atomic.Value(bool),
+            command: []const u8,
+            yield_time_ms: u32,
+        ) !struct { id: []u8, notice: bool } {
+            const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
+                .fingerprint = .init(.{
+                    .command = command,
+                    .resolved_cwd = "/tmp",
+                    .target_os = @import("builtin").target.os.tag,
+                    .environment = env,
+                }),
+                .source = .yolo,
+            } };
+            const arguments = try run_alloc.print(
+                "{{\"action\":\"run\",\"command\":\"{s}\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":{d}}}",
+                .{ command, yield_time_ms },
+            );
+            defer run_alloc.free(arguments);
+            const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+                .allocator = run_alloc,
+                .workspace_root = "/tmp",
+                .tool_call_id = "steered-run",
+                .managed_executions = rt,
+                .execution_authority = .{ .run_command = authority },
+                .max_command_output_bytes = 4096,
+                .tool_yield_flag = flag,
+                .output_chunk_lifecycle_id = .{ .turn_id = 5, .call_id = "steered-run" },
+            }, reg, .{ .id = "steered-run", .name = "shell", .arguments_json = arguments });
+            defer result.deinit(run_alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, run_alloc, result.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("running", parsed.value.object.get("state").?.string);
+            return .{
+                .id = try run_alloc.dupe(u8, parsed.value.object.get("session_id").?.string),
+                .notice = parsed.value.object.get("steering_notice") != null,
+            };
+        }
+    };
+    const steered = try Run.start(alloc, &runtime, registry, environment, &yield_flag, "sleep 30", 30_000);
+    defer alloc.free(steered.id);
+    try std.testing.expect(steered.notice);
+    // A call that asked to return at once was not moved by steering.
+    const background = try Run.start(alloc, &runtime, registry, environment, &yield_flag, "sleep 31", 0);
+    defer alloc.free(background.id);
+    try std.testing.expect(!background.notice);
+
+    // A cancel of another turn stops nothing.
+    try stopSteeringDetached(.{ .allocator = alloc, .managed_executions = &runtime }, 6);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, runtime.stateFor(steered.id).?);
+
+    try stopSteeringDetached(.{ .allocator = alloc, .managed_executions = &runtime }, 5);
+    const deadline_ms = io_mod.milliTimestamp() + 10_000;
+    while (runtime.stateFor(steered.id)) |state| {
+        if (state != .running) break;
+        if (io_mod.milliTimestamp() > deadline_ms) return error.TestUnexpectedResult;
+        io_mod.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, runtime.stateFor(background.id).?);
+}
+
+test "a turn cancel keeps a command that steering cut short only in an interact poll" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = managed_execution.Runtime.init(alloc);
+    defer runtime.deinit();
+    const spec = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .activity_kind = .command,
+        .requires_approval = true,
+        .decode = decode,
+        .validate = validate,
+        .call = call,
+        .captured_command_action = "run",
+        .captured_command_fn = isCapturedCommand,
+        .process_local_fn = isProcessLocal,
+        .reads_only_fn = readsOnly,
+        .irreversible_fn = isIrreversible,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{spec} };
+    var environment_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer environment_arena_state.deinit();
+    const environment = try commandEnvironment(
+        environment_arena_state.allocator(),
+        .{ .allocator = alloc, .workspace_root = "/tmp" },
+        .clean,
+    );
+    var yield_flag = std.atomic.Value(bool).init(true);
+    const Call = struct {
+        /// Dispatches one shell call in turn `turn_id` while steering waits,
+        /// and returns whether its running result got the steering notice.
+        fn dispatch(
+            call_alloc: Allocator,
+            rt: *managed_execution.Runtime,
+            reg: tool_dispatch.Registry,
+            env: command_environment.Environment,
+            flag: *std.atomic.Value(bool),
+            command: []const u8,
+            arguments: []const u8,
+            turn_id: u64,
+        ) !struct { id: []u8, notice: bool } {
+            const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
+                .fingerprint = .init(.{
+                    .command = command,
+                    .resolved_cwd = "/tmp",
+                    .target_os = @import("builtin").target.os.tag,
+                    .environment = env,
+                }),
+                .source = .yolo,
+            } };
+            const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+                .allocator = call_alloc,
+                .workspace_root = "/tmp",
+                .tool_call_id = "poll-call",
+                .managed_executions = rt,
+                .execution_authority = .{ .run_command = authority },
+                .max_command_output_bytes = 4096,
+                .tool_yield_flag = flag,
+                .output_chunk_lifecycle_id = .{ .turn_id = turn_id, .call_id = "poll-call" },
+            }, reg, .{ .id = "poll-call", .name = "shell", .arguments_json = arguments });
+            defer result.deinit(call_alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, call_alloc, result.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("running", parsed.value.object.get("state").?.string);
+            return .{
+                .id = try call_alloc.dupe(u8, parsed.value.object.get("session_id").?.string),
+                .notice = parsed.value.object.get("steering_notice") != null,
+            };
+        }
+    };
+
+    // The model starts a server in the background itself, then polls it
+    // while steering waits. The poll returns for steering, but the cancel
+    // of its turn keeps the server.
+    const background = try Call.dispatch(alloc, &runtime, registry, environment, &yield_flag, "sleep 30", "{\"action\":\"run\",\"command\":\"sleep 30\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}", 5);
+    defer alloc.free(background.id);
+    try std.testing.expect(!background.notice);
+    const poll_arguments = try alloc.print(
+        "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":30000}}",
+        .{background.id},
+    );
+    defer alloc.free(poll_arguments);
+    const polled = try Call.dispatch(alloc, &runtime, registry, environment, &yield_flag, "sleep 30", poll_arguments, 5);
+    defer alloc.free(polled.id);
+    try std.testing.expect(polled.notice);
+    try stopSteeringDetached(.{ .allocator = alloc, .managed_executions = &runtime }, 5);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, runtime.stateFor(background.id).?);
+
+    // A command steering cut short in turn 7 and polled in turn 8 stays
+    // with turn 7: the cancel of turn 8 keeps it.
+    const steered = try Call.dispatch(alloc, &runtime, registry, environment, &yield_flag, "sleep 31", "{\"action\":\"run\",\"command\":\"sleep 31\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":30000}", 7);
+    defer alloc.free(steered.id);
+    try std.testing.expect(steered.notice);
+    const later_poll_arguments = try alloc.print(
+        "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":30000}}",
+        .{steered.id},
+    );
+    defer alloc.free(later_poll_arguments);
+    const later_poll = try Call.dispatch(alloc, &runtime, registry, environment, &yield_flag, "sleep 31", later_poll_arguments, 8);
+    defer alloc.free(later_poll.id);
+    try std.testing.expect(later_poll.notice);
+    try stopSteeringDetached(.{ .allocator = alloc, .managed_executions = &runtime }, 8);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, runtime.stateFor(steered.id).?);
+    try std.testing.expectEqual(managed_execution.SnapshotState.running, runtime.stateFor(background.id).?);
 }
 
 test "shell delivery advances only after result commit" {

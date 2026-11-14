@@ -31,12 +31,17 @@ pub fn validateSessionId(session_id: []const u8) !void {
     }
 }
 
+/// A fresh id: 9 random bytes as base64url. It never starts with `-`, so no
+/// command reads it as a flag, as `fx session` reads an id that starts with
+/// `--`. The caller owns the id.
 pub fn generateSessionId(alloc: Allocator) ![]u8 {
     var random_bytes: [session_id_random_bytes]u8 = undefined;
-    io_mod.getIo().random(&random_bytes);
     const id = try alloc.alloc(u8, session_id_encoded_bytes);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(id, &random_bytes);
-    return id;
+    while (true) {
+        io_mod.getIo().random(&random_bytes);
+        _ = std.base64.url_safe_no_pad.Encoder.encode(id, &random_bytes);
+        if (id[0] != '-') return id;
+    }
 }
 
 pub fn generateTerminalSessionId(alloc: Allocator) ![]u8 {
@@ -63,6 +68,15 @@ test "generated session id is a compact url-safe token" {
     }
 
     try validateSessionId("1786460757753-1786460757753277000-ef75d8fd94fdab1");
+}
+
+test "a generated session id never starts with a dash" {
+    // One random id in 64 would start with `-`.
+    for (0..4096) |_| {
+        const id = try generateSessionId(std.testing.allocator);
+        defer std.testing.allocator.free(id);
+        try std.testing.expect(id[0] != '-');
+    }
 }
 
 test "generated terminal session id is compact and path safe" {
