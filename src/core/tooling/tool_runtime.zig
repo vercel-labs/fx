@@ -36,6 +36,7 @@ const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
+const subagent_refusal = @import("../subagent/refusal.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
@@ -2770,15 +2771,11 @@ test "subagent session title is derived only from the current request identity" 
     }
 }
 
-fn subagentProviderFailure(
+fn subagentProviderRefusal(
     alloc: Allocator,
-    error_code: []const u8,
+    why: subagent_refusal.Refusal,
 ) Allocator.Error!subagent_tool_provider.Result {
-    const body = subagent_model_contract.encodeResultAlloc(alloc, .{
-        .ok = false,
-        .error_code = error_code,
-    }) catch return error.OutOfMemory;
-    return .{ .status = .failure, .body = body };
+    return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
 fn executeSubagentProvider(
@@ -2790,9 +2787,9 @@ fn executeSubagentProvider(
     const state: *SubagentProviderState = @ptrCast(@alignCast(raw_context.?));
     const ctx = state.runtime;
     const host = ctx.subagent_host orelse
-        return subagentProviderFailure(arena, "host_unavailable");
+        return subagentProviderRefusal(arena, .host_unavailable);
     const caller_id = ctx.subagent_caller_id orelse
-        return subagentProviderFailure(arena, "caller_unavailable");
+        return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
@@ -2822,7 +2819,8 @@ fn executeSubagentProvider(
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
-        return subagentProviderFailure(arena, "host_failure");
+        debug_trace.logf("subagent", "host failure err={s}", .{@errorName(err)});
+        return subagentProviderRefusal(arena, .{ .host_failure = .internal });
     };
     if (output.final_status) |status_value| {
         var status = status_value;

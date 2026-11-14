@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_contract = @import("../../core/subagent/model_contract.zig");
+const refusal = @import("../../core/subagent/refusal.zig");
 const tool_provider = @import("../../core/subagent/tool_provider.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -50,7 +51,7 @@ pub fn decode(
     const arena = arena_state.allocator();
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena, args_json, .{}) catch {
-        return decodeFailure(ctx, "invalid_json", null) catch return error.OutOfMemory;
+        return refused(ctx, .invalid_json);
     };
     defer parsed.deinit();
 
@@ -62,9 +63,9 @@ pub fn decode(
         return decodeFailure(ctx, decodeErrorCode(err), correction) catch return error.OutOfMemory;
     };
     const request = model_contract.validateRequest(ctx.allocator, request_input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf("subagent", "request validation rejected code={s}", .{validationErrorCode(err)});
-        return decodeFailure(ctx, validationErrorCode(err), null) catch return error.OutOfMemory;
+        const refused_with = try refusal.fromValidation(err);
+        debug_trace.logf("subagent", "request validation rejected code={s}", .{refused_with.code()});
+        return refused(ctx, refused_with);
     };
     errdefer {
         var owned = request;
@@ -85,13 +86,17 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
 fn decodeFailure(
     ctx: tool_dispatch.DispatchContext,
     code: []const u8,
-    correction: ?[]const u8,
+    correction: []const u8,
 ) !tool_dispatch.DecodeResult {
     return .{ .failure = try model_contract.encodeResultAlloc(ctx.allocator, .{
         .ok = false,
         .result = correction,
         .error_code = code,
     }) };
+}
+
+fn refused(ctx: tool_dispatch.DispatchContext, why: refusal.Refusal) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    return .{ .failure = why.body(ctx.allocator) catch return error.OutOfMemory };
 }
 
 /// Pure: the correction a model sees for a call that failed to decode.
@@ -128,20 +133,6 @@ fn decodeErrorCode(err: DecodeError) []const u8 {
         error.MissingField => "missing_field",
         error.UnknownField => "unknown_field",
         error.InvalidEnum => "invalid_enum",
-    };
-}
-
-fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
-    return switch (err) {
-        error.OutOfMemory => unreachable,
-        error.InvalidAgent => "invalid_agent",
-        error.InvalidReport => "invalid_report",
-        error.InvalidParentMessage => "invalid_parent_message",
-        error.InvalidInstructions => "invalid_instructions",
-        error.InvalidMessage => "invalid_message",
-        error.InvalidModel => "invalid_model",
-        error.InvalidEffort => "invalid_effort",
-        error.InvalidProfile => "invalid_profile",
     };
 }
 
@@ -279,10 +270,8 @@ pub fn call(
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const provider = ctx.subagent_provider orelse {
-        const body = model_contract.encodeResultAlloc(ctx.allocator, .{
-            .ok = false,
-            .error_code = "host_unavailable",
-        }) catch return error.OutOfMemory;
+        const unavailable: refusal.Refusal = .host_unavailable;
+        const body = unavailable.body(ctx.allocator) catch return error.OutOfMemory;
         return .{ .failure = body };
     };
     const request = &erased.as(Input).request;
@@ -481,6 +470,62 @@ test "decode rejects invalid creation overrides and report rules" {
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
     try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"report\":\"often\"}", "invalid_report");
     try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"done\",\"report\":\"never\"}", "invalid_parent_message");
+}
+
+/// Adds a line to `problems` unless `args_json` fails to decode with `code`
+/// and a one-line sentence in `result`.
+fn checkDecodeSentence(problems: *std.ArrayList(u8), args_json: []const u8, code: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, args_json);
+    const body = switch (decoded) {
+        .input => |input| {
+            input.deinit(alloc);
+            return problems.print(alloc, "{s}: decoded, expected {s}\n", .{ args_json, code });
+        },
+        .failure => |message| message,
+    };
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const sentence: ?[]const u8 = if (object.get("result")) |value| (if (value == .string) value.string else null) else null;
+    const got_code = if (object.get("error_code").? == .string) object.get("error_code").?.string else "";
+    const fits = if (sentence) |text|
+        text.len > 0 and text.len <= 400 and text[text.len - 1] == '.' and std.mem.findScalar(u8, text, '\n') == null
+    else
+        false;
+    if (!object.get("ok").?.bool and std.mem.eql(u8, got_code, code) and fits) return;
+    try problems.print(alloc, "{s}: expected a {s} refusal with a one-line sentence, got {s}\n", .{ args_json, code, body });
+}
+
+test "every call the decoder refuses tells the model what is wrong and what to do next" {
+    var problems: std.ArrayList(u8) = .empty;
+    defer problems.deinit(std.testing.allocator);
+    const message = "\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\"";
+    const cases = [_]struct { args: []const u8, code: []const u8 }{
+        // Only a direct call of `decode` reaches this; see `Refusal.invalid_json`.
+        .{ .args = "{not json", .code = "invalid_json" },
+        .{ .args = "[]", .code = "invalid_field_type" },
+        .{ .args = "{\"action\":\"message\",\"agent\":5,\"message\":\"do it\"}", .code = "invalid_field_type" },
+        .{ .args = "{\"agent\":\"reviewer\"}", .code = "missing_field" },
+        .{ .args = "{\"action\":\"stop\"}", .code = "missing_field" },
+        .{ .args = "{\"action\":\"wait\",\"task\":\"x\"}", .code = "unknown_field" },
+        .{ .args = "{\"action\":\"fly\"}", .code = "invalid_enum" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"Bad Name\",\"message\":\"do it\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"status\",\"agent\":\"Bad Name\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"Ghost\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"parent\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"parent\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"\"}", .code = "invalid_message" },
+        .{ .args = "{" ++ message ++ ",\"instructions\":\"a\\u0000b\"}", .code = "invalid_instructions" },
+        .{ .args = "{" ++ message ++ ",\"report\":\"often\"}", .code = "invalid_report" },
+        .{ .args = "{" ++ message ++ ",\"model\":\"a\\u0000b\"}", .code = "invalid_model" },
+        .{ .args = "{" ++ message ++ ",\"effort\":\"not an effort!\"}", .code = "invalid_effort" },
+        .{ .args = "{" ++ message ++ ",\"profile\":\"Bad Profile\"}", .code = "invalid_profile" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"done\",\"report\":\"never\"}", .code = "invalid_parent_message" },
+    };
+    for (cases) |case| try checkDecodeSentence(&problems, case.args, case.code);
+    try std.testing.expectEqualStrings("", problems.items);
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {
