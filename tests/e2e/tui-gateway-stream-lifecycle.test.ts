@@ -7654,6 +7654,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         if (userText.includes(task) && !userText.includes(rootPrompt) && !userText.startsWith(header)) {
           await childGate;
+          // Main's wait row names the subagents working when the wait
+          // begins. The gate opens as main receives its wait call, so a fast
+          // build could finish the child before that wait starts. The reply
+          // waits until main's row shows the wait on the working child.
+          await session?.waitForText("waiting for helper", TIMEOUT);
           return fakeGatewayFinalText("JOINED_CHILD_REPLY");
         }
         // The report joined main's running turn after its wait.
