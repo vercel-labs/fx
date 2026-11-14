@@ -148,6 +148,15 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 
+    /// Whether the turn's end must stop the commands steering moved to the
+    /// background: only when the user cancelled it.
+    fn stops_steering_detached_commands(self: *TurnFinalizationGuard, outcome: types.TurnPresentationOutcome) bool {
+        if (outcome != .interrupted) return false;
+        if (self.deps.stop_steering_detached_commands == null) return false;
+        const explicit = self.deps.turn_ends_by_explicit_cancel orelse return false;
+        return explicit(self.deps.ctx, self.turn_id);
+    }
+
     fn stop_steering_detached_commands(self: *TurnFinalizationGuard) void {
         const stop = self.deps.stop_steering_detached_commands orelse return;
         stop(self.deps.ctx, self.turn_id) catch |err| {
@@ -178,10 +187,15 @@ pub const TurnFinalizationGuard = struct {
         }
 
         self.cleanup_agent_terminal_leases();
-        if (outcome == .interrupted) self.stop_steering_detached_commands();
+        // Decided before the report, since a prompt typed once the turn is
+        // reported can join its ending as steering. The stops run after it:
+        // a command that ignores SIGTERM takes seconds to stop, and the user
+        // sees the turn end without waiting for it.
+        const stop_detached = self.stops_steering_detached_commands(outcome);
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;
+            if (stop_detached) self.stop_steering_detached_commands();
             if (finished_prompt) |finished| {
                 types.freeFinishedPrompt(std.heap.c_allocator, finished);
             }
@@ -190,6 +204,8 @@ pub const TurnFinalizationGuard = struct {
         self.state = .emitted;
         self.outcome = outcome;
 
+        // Runs last, after the finish event and the post-turn checkpoint.
+        defer if (stop_detached) self.stop_steering_detached_commands();
         defer lifecycle_runtime.dispatchPostTurnEndCheckpoint(self.lifecycle, .{
             .turn_id = self.turn_id,
             .outcome = outcome,
