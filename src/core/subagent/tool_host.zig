@@ -772,7 +772,8 @@ pub const Runtime = struct {
                 },
                 .start_failed => |failed| {
                     var buf: [start_failed_result_bytes]u8 = undefined;
-                    return self.encodeManaged(alloc, .{ .ok = false, .error_code = "start_failed", .result = startFailedResult(&buf, agent, failed.cause, failed.ended) });
+                    const result = if (failed.ended) startFailedResult(&buf, agent, failed.cause) else startFailedStuckResult(&buf, agent, failed.cause);
+                    return self.encodeManaged(alloc, .{ .ok = false, .error_code = "start_failed", .result = result });
                 },
                 .completed => |completed| {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
@@ -4642,6 +4643,45 @@ const FaultAllocator = struct {
     }
 };
 
+/// A host whose allocations, and its owner's, fail at one index of the
+/// calling thread's: `arm` installs the failing allocator and `disarm` puts the
+/// host's own back. `deinit` disarms and frees the host, and may be called
+/// earlier to end it before a restart.
+const FaultedHost = struct {
+    runtime: ?*Runtime,
+    fault: FaultAllocator,
+    original: Allocator,
+    original_owner: Allocator,
+
+    fn init(runtime: *Runtime) FaultedHost {
+        return .{
+            .runtime = runtime,
+            .fault = .{ .backing = std.testing.allocator, .thread = std.Thread.getCurrentId() },
+            .original = runtime.alloc,
+            .original_owner = runtime.managed.alloc,
+        };
+    }
+
+    fn arm(self: *FaultedHost, fail_at: usize) void {
+        const runtime = self.runtime.?;
+        self.fault.fail_at = fail_at;
+        runtime.alloc = self.fault.allocator();
+        runtime.managed.alloc = self.fault.allocator();
+    }
+
+    fn disarm(self: *FaultedHost) void {
+        const runtime = self.runtime orelse return;
+        runtime.alloc = self.original;
+        runtime.managed.alloc = self.original_owner;
+    }
+
+    fn deinit(self: *FaultedHost) void {
+        self.disarm();
+        if (self.runtime) |runtime| runtime.deinit();
+        self.runtime = null;
+    }
+};
+
 /// `reviewer`'s phase in the registry, and whether the host counts it as
 /// busy. A child that is running in the registry and not busy has no slot.
 /// Read under the host's admission lock, as `status` reads them, so a slot
@@ -5012,13 +5052,8 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
     var fixture = MailboxFixture{};
     defer fixture.deinit();
     const runtime = try mailboxRuntime(alloc, &fixture, &parent);
-    const original = runtime.alloc;
-    const original_owner = runtime.managed.alloc;
-    defer {
-        runtime.alloc = original;
-        runtime.managed.alloc = original_owner;
-        runtime.deinit();
-    }
+    var faulted = FaultedHost.init(runtime);
+    defer faulted.deinit();
     var reports_before: usize = 0;
     if (!create) {
         _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
@@ -5026,16 +5061,13 @@ fn sweepStart(create: bool, fail_at: usize) !bool {
         reports_before = fixture.reportCount();
     }
 
-    var fault: FaultAllocator = .{ .backing = alloc, .thread = std.Thread.getCurrentId(), .fail_at = fail_at };
-    runtime.alloc = fault.allocator();
-    runtime.managed.alloc = fault.allocator();
-    var call_arena = std.heap.ArenaAllocator.init(fault.allocator());
+    faulted.arm(fail_at);
+    var call_arena = std.heap.ArenaAllocator.init(faulted.fault.allocator());
     const call_result = callTool(runtime, call_arena.allocator(), .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-1", null);
-    runtime.alloc = original;
-    runtime.managed.alloc = original_owner;
+    faulted.disarm();
     const copy = if (call_result) |body| try arena.dupe(u8, body) else |_| "";
     call_arena.deinit();
-    const failed = fault.fired;
+    const failed = faulted.fault.fired;
     // Whatever the call answered, the child is working or idle, never marked
     // running with no slot behind it.
     if (create and !failed) return false;
@@ -5073,6 +5105,69 @@ test "a message whose start fails at any allocation leaves its subagent idle or 
     }
 }
 
+/// One try of the sweep below: a message makes a new subagent, its start fails
+/// where its thread would spawn, and the `fail_at`-th allocation the call's
+/// thread makes fails too. Counts in `stuck` the tries where the end of the
+/// failed start was not recorded, and checks what the answer says of them.
+/// Returns whether the allocation failed.
+fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var faulted = FaultedHost.init(runtime);
+    defer faulted.deinit();
+
+    start_test_controls.test_fail_spawn = true;
+    defer start_test_controls.test_fail_spawn = false;
+    faulted.arm(fail_at);
+    var call_arena = std.heap.ArenaAllocator.init(faulted.fault.allocator());
+    const call_result = callTool(runtime, call_arena.allocator(), .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    faulted.disarm();
+    start_test_controls.test_fail_spawn = false;
+    const answer = if (call_result) |body| try arena.dupe(u8, body) else |_| "";
+    call_arena.deinit();
+    if (!faulted.fault.fired) return false;
+    if (std.mem.find(u8, answer, "fx could not reset reviewer") == null) return true;
+
+    stuck.* += 1;
+    try expectBodyHas(answer, "\"error_code\":\"start_failed\"");
+    try expectBodyHas(answer, "reviewer did not start: ");
+    try expectBodyHas(answer, "Your message did not run, and fx could not reset reviewer: it refuses messages until fx restarts, and a close of it cannot be saved either.");
+    // What the answer says holds: the registry keeps the work, no message is
+    // taken, and the close is not saved.
+    const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
+    try expectBodyHas(again, "\"error_code\":\"state_unavailable\"");
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try expectBodyHas(closed, "\"error_code\":\"close_not_saved\"");
+    // A restart clears it: the new host recovers the work as interrupted.
+    faulted.deinit();
+    const restarted = try mailboxRuntime(alloc, &fixture, &parent);
+    defer restarted.deinit();
+    const after = try callTool(restarted, arena, .{ .message = .{ .agent = "reviewer", .message = "after the restart" } }, "call-4", null);
+    try expectBodyHas(after, "Sent to reviewer");
+    try waitUntilQuiet(restarted);
+    const closed_after = try callTool(restarted, arena, .{ .close = .{ .agent = "reviewer" } }, "call-5", null);
+    try expectBodyHas(closed_after, "\"ok\":true");
+    return true;
+}
+
+test "a message whose start failed and whose end was not recorded says the subagent refuses messages until fx restarts" {
+    var at: usize = 0;
+    var stuck: usize = 0;
+    while (try sweepUnrecorded(at, &stuck)) : (at += 1) {}
+    // The call allocates in more places than the few that matter, and some of
+    // them leave the end unrecorded: a sweep that found none proves nothing.
+    try std.testing.expect(at > 8);
+    try std.testing.expect(stuck > 0);
+}
+
 /// One try of the sweep below: the user's turn begins on an idle child, and the
 /// `fail_at`-th allocation the call's thread makes fails. Returns whether it
 /// failed.
@@ -5087,13 +5182,8 @@ fn sweepTurnWork(fail_at: usize) !bool {
     var fixture = MailboxFixture{};
     defer fixture.deinit();
     const runtime = try mailboxRuntime(alloc, &fixture, &parent);
-    const original = runtime.alloc;
-    const original_owner = runtime.managed.alloc;
-    defer {
-        runtime.alloc = original;
-        runtime.managed.alloc = original_owner;
-        runtime.deinit();
-    }
+    var faulted = FaultedHost.init(runtime);
+    defer faulted.deinit();
     _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
     try waitUntilQuiet(runtime);
     const child_id = try reviewerId(runtime, arena);
@@ -5101,13 +5191,10 @@ fn sweepTurnWork(fail_at: usize) !bool {
     defer worker.deinit(alloc);
     try std.testing.expect(worker.beginDirectProcessing(5));
 
-    var fault: FaultAllocator = .{ .backing = alloc, .thread = std.Thread.getCurrentId(), .fail_at = fail_at };
-    runtime.alloc = fault.allocator();
-    runtime.managed.alloc = fault.allocator();
+    faulted.arm(fail_at);
     const begun = runtime.beginTurnWork(arena, child_id, .user, &worker);
-    runtime.alloc = original;
-    runtime.managed.alloc = original_owner;
-    const failed = fault.fired;
+    faulted.disarm();
+    const failed = faulted.fault.fired;
     if (begun) |work_id| runtime.endUserWork(child_id, work_id, .completed, "");
     // Whether or not the work opened, the child is working or idle, never
     // marked running with no work of the host's behind it.
@@ -6501,12 +6588,18 @@ fn startCauseText(err: anyerror) []const u8 {
     };
 }
 
-/// `message`'s answer when the subagent's slot could not start the work. The
-/// work is ended, so the subagent is idle, unless the registry could not
-/// record that.
-fn startFailedResult(buf: []u8, agent: []const u8, cause: []const u8, ended: bool) []const u8 {
-    if (ended) return std.mem.print(buf, "{s} did not start: {s}. Your message did not run. {s} is idle, so send the message again if it is still needed.", .{ agent, cause, agent }) catch "The subagent did not start, and your message did not run. It is idle, so send the message again if it is still needed.";
-    return std.mem.print(buf, "{s} did not start: {s}. Your message did not run, and fx could not reset {s}, which may refuse messages. Close it and send the message again.", .{ agent, cause, agent }) catch "The subagent did not start, and your message did not run. Close it and send the message again.";
+/// `message`'s answer when the subagent's slot could not start the work and
+/// the work was ended, so the subagent is idle (`Owner.endUnstarted`).
+fn startFailedResult(buf: []u8, agent: []const u8, cause: []const u8) []const u8 {
+    return std.mem.print(buf, "{s} did not start: {s}. Your message did not run. {s} is idle, so send the message again if it is still needed.", .{ agent, cause, agent }) catch "The subagent did not start, and your message did not run. It is idle, so send the message again if it is still needed.";
+}
+
+/// `message`'s answer when the slot could not start the work and its end
+/// could not be recorded: the registry keeps the work running with no slot, so
+/// the subagent refuses messages until fx restarts, and a close of it cannot
+/// be saved either.
+fn startFailedStuckResult(buf: []u8, agent: []const u8, cause: []const u8) []const u8 {
+    return std.mem.print(buf, "{s} did not start: {s}. Your message did not run, and fx could not reset {s}: it refuses messages until fx restarts, and a close of it cannot be saved either.", .{ agent, cause, agent }) catch "The subagent did not start, and your message did not run. It refuses messages until fx restarts, and a close of it cannot be saved either.";
 }
 
 /// A report's text for a work whose slot could not start: the message
