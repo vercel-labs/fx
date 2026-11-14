@@ -10144,6 +10144,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let childRequests = 0;
     let parentId = "";
     let childBlobs = "";
+    let blobsSetAside = "";
     let failureObserved = false;
     const scripted = startDynamicFakeGateway((body) => {
       if (["delegate", "followup"].some((id) => hasCurrentToolResult(body, id))) return fakeGatewayFinalText("SUBAGENT_SENT");
@@ -10156,15 +10157,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (latestUserIsReport(body)) {
         const report = latestUserText(body);
         expect(report).toContain("failed");
-        expect(report).toContain("agent_turn_failed: AccessDenied");
+        expect(report).toContain("agent_turn_failed: SessionCommitFailed");
         expect(report).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
         // The parent's log records the child's work failed, with its cause.
         expect(childWork(root.home, parentId).outcome).toBe("failed");
-        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain("AccessDenied");
+        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain("SessionCommitFailed");
         failureObserved = true;
-        chmodSync(childBlobs, 0o700);
+        rmSync(childBlobs);
+        renameSync(blobsSetAside, childBlobs);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -10179,12 +10181,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-          // The child's next tool result needs a new blob, which a read-only
-          // blobs folder refuses, so the child's turn fails after its effect
-          // and reports that cause.
+          // The child's turn commits through its blobs folder. A file where
+          // that folder must be fails the commit for every user. A read-only
+          // folder does not: root, or any user that holds CAP_DAC_OVERRIDE,
+          // writes into it, and then the child never fails. So the child's
+          // turn fails after its effect and reports that cause.
           parentId = rootSessionIds(root.home)[0]!;
           childBlobs = join(sessionDir(root.home, childWork(root.home, parentId).child), "blobs");
-          chmodSync(childBlobs, 0o500);
+          blobsSetAside = `${childBlobs}.aside`;
+          renameSync(childBlobs, blobsSetAside);
+          writeFileSync(childBlobs, "");
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -10204,7 +10210,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The message was sent; its failure is saved as the report's turn.
       const persisted = savedToolResults(history).find((entry) => entry.tool_call_id === "delegate");
       expect(persisted?.status).toBe("success");
-      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes("agent_turn_failed: AccessDenied"))).toBe(true);
+      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes("agent_turn_failed: SessionCommitFailed"))).toBe(true);
       // Parent call, two child requests, the receipt, the failure's report
       // turn, the follow-up's receipt, the child, and its report's turn.
       expect(scripted.requestCount()).toBe(8);
