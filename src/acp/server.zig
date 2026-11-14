@@ -319,6 +319,8 @@ pub const ServerState = struct {
     initialized: bool = false,
     /// Selects fx's terminal or embedded base prompt for this connection.
     terminal_ui: bool = true,
+    /// Command output chunks keep their ANSI escapes (`_meta.fx.ansiOutput`).
+    ansi_output: bool = false,
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
@@ -2702,6 +2704,9 @@ const InitializeRequest = struct {
     /// False when the client presents fx inside an application rather than a
     /// terminal, set through `_meta.fx.terminal`.
     terminal_ui: bool = true,
+    /// True when the client renders terminal escapes in command output chunks,
+    /// set through `_meta.fx.ansiOutput`.
+    ansi_output: bool = false,
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
@@ -2737,6 +2742,7 @@ fn parseInitializeRequest(
 
     var request = InitializeRequest{
         .terminal_ui = acp_types.fxMetaBool(parsed.value.object, "terminal") orelse true,
+        .ansi_output = acp_types.fxMetaBool(parsed.value.object, "ansiOutput") orelse false,
     };
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
@@ -3123,6 +3129,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (!try applyUltrafastOverride(state, alloc, msg, state.ultrafast_mode)) return;
 
     state.terminal_ui = request.terminal_ui;
+    state.ansi_output = request.ansi_output;
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
@@ -3146,6 +3153,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .image_prompts = !host_target.is_wasm,
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
+        .ansi_output = true,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
         // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.
@@ -4530,6 +4538,12 @@ test "ACP initialize request validation requires a uint16 protocol version" {
     try std.testing.expect(valid.client_fs_read);
     try std.testing.expect(!valid.client_fs_write);
     try std.testing.expect(valid.client_terminal);
+    try std.testing.expect(!valid.ansi_output);
+
+    const ansi = try parseInitializeRequest(alloc, "{\"protocolVersion\":1,\"_meta\":{\"fx\":{\"ansiOutput\":true}}}", false);
+    try std.testing.expect(ansi.ansi_output);
+    const ansi_not_bool = try parseInitializeRequest(alloc, "{\"protocolVersion\":1,\"_meta\":{\"fx\":{\"ansiOutput\":\"yes\"}}}", false);
+    try std.testing.expect(!ansi_not_bool.ansi_output);
 
     _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":0}", false);
     _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":2}", false);
