@@ -41,7 +41,7 @@
 - Toolbox raised prompt cache reads from 61.3% to 82.0% of later input in live tests across 9 model families.
 - Built-in tool definitions are 48.0% smaller than in 0.0.16, and a new session's first request is 32.4% smaller.
 - libfx's native addons are 10.1% to 12.9% smaller than in 0.0.16.
-- The Linux arm64 and x86_64 binaries are 37.6% and 32.2% smaller than in 0.0.16.
+- The Linux arm64 and x86_64 binaries are 36.6% and 31.1% smaller than in 0.0.16.
 - libfx requests now use AI Gateway's prompt cache.
 - A shell result for a command with no output is about 70 characters instead of about 340.
 - Skill descriptions in the toolbox menu stop at 200 characters, down from 1,024.
@@ -84,6 +84,7 @@
 - Menus and pickers match letters in order, so `/mdl` finds `/model`.
 - The model picker labels Fast models and Fast mode apart and lists newer GPT versions first.
 - Ordered lists in replies align their numbers.
+- Tool group headers say what the group did, such as `Edited a file, ran commands`, instead of a tool-call count.
 - Skill discovery warnings no longer show at startup.
 - MCP config changes made outside a session load at the next prompt.
 - `fx mcp add` signs in to a new server that needs it, and `--no-login` skips that.

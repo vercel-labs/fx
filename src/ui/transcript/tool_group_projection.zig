@@ -468,7 +468,8 @@ noinline fn entryShowsDiffStats(detail: ?*const ToolDetailRecord) bool {
         std.mem.eql(u8, record.tool_name, "edit_file");
 }
 
-/// Matches a trailing " +N" or " -N" diff count in a plain status phrase.
+/// Matches a trailing " +N" or " -N" diff count in a plain status phrase, or
+/// the "-M" of a row's "+N/-M".
 fn trailingStatToken(text: []const u8) ?StatToken {
     var index = text.len;
     while (index > 0 and std.ascii.isDigit(text[index - 1])) : (index -= 1) {}
@@ -476,20 +477,41 @@ fn trailingStatToken(text: []const u8) ?StatToken {
     if (index < 2) return null;
     const sign = text[index - 1];
     if (sign != '+' and sign != '-') return null;
-    if (text[index - 2] != ' ') return null;
-    return .{ .start = index - 1, .added = sign == '+' };
+    const token: StatToken = .{ .start = index - 1, .added = sign == '+' };
+    if (text[index - 2] == ' ') return token;
+    // A row joins its two counts with a bare slash.
+    if (sign == '-' and text[index - 2] == '/') if (trailingStatToken(text[0 .. index - 2])) |first| if (first.added) return token;
+    return null;
 }
 
-/// The "+N" of a "+N / -M" pair that ends in `last`, if there is one.
+/// The "+N" of a "+N / -M" or "+N/-M" pair that ends in `last`, if there is
+/// one.
 fn pairedAddedStat(text: []const u8, last: StatToken) ?StatToken {
-    if (last.added or last.start < 2 or text[last.start - 2] != '/') return null;
-    const before_slash = std.mem.trimEnd(u8, text[0 .. last.start - 2], " ");
+    if (last.added or last.start < 2) return null;
+    const before_slash = if (text[last.start - 1] == '/')
+        text[0 .. last.start - 1]
+    else if (text[last.start - 2] == '/')
+        std.mem.trimEnd(u8, text[0 .. last.start - 2], " ")
+    else
+        return null;
     const first = trailingStatToken(before_slash) orelse return null;
     return if (first.added) first else null;
 }
 
-/// Index of the space before the trailing "+N", "-N", or "+N / -M" diff
-/// counts of a plain status phrase, or null when it has none.
+/// The index just past the digits of a stat token.
+fn statEnd(text: []const u8, token: StatToken) usize {
+    var end = token.start + 1;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    return end;
+}
+
+/// The number of a stat token.
+fn statValue(text: []const u8, token: StatToken) usize {
+    return std.fmt.parseInt(usize, text[token.start + 1 .. statEnd(text, token)], 10) catch 0;
+}
+
+/// Index of the space before the trailing "+N", "-N", "+N / -M", or "+N/-M"
+/// diff counts of a plain status phrase, or null when it has none.
 fn diffStatsSuffixStart(text: []const u8) ?usize {
     const last = trailingStatToken(text) orelse return null;
     const first = pairedAddedStat(text, last) orelse last;
@@ -520,8 +542,9 @@ fn clipKeepingDiffStats(
 /// grouped lines stay uniform; the counts keep their green/red so file edits
 /// stay scannable inside collapsed and expanded groups. `ambient_style` is
 /// re-applied between the two counts so the " / " separator keeps the line's
-/// surrounding style. Returns `text` unchanged when no diff count suffix is
-/// present. Caller owns the returned slice.
+/// surrounding style, whether it is core's " / " or a row's "/". Returns
+/// `text` unchanged when no diff count suffix is present. Caller owns the
+/// returned slice.
 fn accentTrailingDiffStats(
     alloc: std.mem.Allocator,
     text: []const u8,
@@ -534,14 +557,14 @@ fn accentTrailingDiffStats(
 
     const last = trailingStatToken(text) orelse return try alloc.dupe(u8, text);
     if (pairedAddedStat(text, last)) |first| {
-        const before_slash = std.mem.trimEnd(u8, text[0 .. last.start - 2], " ");
+        const first_end = statEnd(text, first);
         return try std.mem.concat(alloc, u8, &.{
-            before_slash[0..first.start],
+            text[0..first.start],
             added_style,
-            before_slash[first.start..],
+            text[first.start..first_end],
             reset,
             ambient_style,
-            " / ",
+            text[first_end..last.start],
             removed_style,
             text[last.start..],
             reset,
@@ -864,12 +887,9 @@ const DiffTotals = struct { added: usize = 0, removed: usize = 0 };
 fn diffTotalsOfPhrase(phrase: []const u8) DiffTotals {
     var totals: DiffTotals = .{};
     const last = trailingStatToken(phrase) orelse return totals;
-    const last_value = std.fmt.parseInt(usize, phrase[last.start + 1 ..], 10) catch 0;
+    const last_value = statValue(phrase, last);
     if (last.added) totals.added = last_value else totals.removed = last_value;
-    if (pairedAddedStat(phrase, last)) |first| {
-        const before_slash = std.mem.trimEnd(u8, phrase[0 .. last.start - 2], " ");
-        totals.added = std.fmt.parseInt(usize, before_slash[first.start + 1 ..], 10) catch 0;
-    }
+    if (pairedAddedStat(phrase, last)) |first| totals.added = statValue(phrase, first);
     return totals;
 }
 
@@ -1359,6 +1379,9 @@ const StoryRowKind = enum {
     /// Every search with the same tool in the group, wherever it is: one row
     /// that names each pattern once, and a single pattern's folders.
     search,
+    /// Every edit or write of the same file in the group, wherever it is: one
+    /// row that adds up their counts.
+    edit,
     /// Different commands, one after the other, that share a label such as
     /// "Ran" and did not fail: one row that names their steps.
     commands,
@@ -1385,6 +1408,10 @@ const StoryRow = struct {
     /// The files a `.read` row read, or the patterns a `.search` row looked
     /// for, each once, in the order of their first call.
     names: std.ArrayList([]const u8) = .empty,
+    /// The counts of an `.edit` row's calls, added up.
+    diff: DiffTotals = .{},
+    /// How many of an `.edit` row's calls were writes.
+    writes: usize = 0,
 };
 
 /// The name a call adds to a `.read` or `.search` row: the file's path, or
@@ -1591,6 +1618,37 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     return out.written();
 }
 
+/// An edit or write row by the file's name and its counts, such as
+/// "Edited main.zig +10/-3", in place of the whole path. The name links to
+/// the file like a read row's. A row for several changes to one file adds up
+/// their counts, even when core names the file another way, such as a long
+/// path cut short. Null for a row of one call whose phrase does not end with
+/// the path it changed and its counts.
+fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
+    if (!entryShowsDiffStats(row.detail)) return null;
+    const path = storyArgString(scratch, row.detail.?, "path") orelse return null;
+    // Core writes the path terminal-safe, so a control byte in it shows
+    // escaped.
+    const shown = try terminalSafeText(scratch, path);
+    const named = if (diffStatsSuffixStart(phrase)) |at| phrase[0..at] else phrase;
+    const merged = row.identity.kind == .edit and row.count > 1;
+    const label = if (named.len > shown.len and std.mem.endsWith(u8, named, shown) and named[named.len - shown.len - 1] == ' ')
+        named[0 .. named.len - shown.len]
+    else if (merged)
+        // The row's calls are completed or running changes, whose verb is
+        // one word, such as "Edited".
+        if (findByte(named, ' ')) |space| named[0 .. space + 1] else return null
+    else
+        return null;
+    const totals = if (merged) row.diff else diffTotalsOfPhrase(phrase);
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    try out.writer.writeAll(label);
+    try writeFileName(&out.writer, path);
+    if (totals.added > 0) try out.writer.print(" +{d}", .{totals.added});
+    if (totals.removed > 0) try out.writer.print("{s}-{d}", .{ if (totals.added > 0) "/" else " ", totals.removed });
+    return out.written();
+}
+
 /// Extensions of files that macOS runs, installs, or follows when one is
 /// opened, so a Cmd+click on a link to one would act on it.
 const runnable_extensions = [_][]const u8{
@@ -1761,6 +1819,15 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             const path = storyArgString(scratch, record, "path") orelse return .{};
             return .{ .kind = .read, .key = path };
         },
+        .edit, .write => {
+            // A change that failed, was denied, or was cancelled keeps its
+            // own row, so what happened to it shows. One still running joins
+            // the file's row, where it stays when it completes.
+            if (record.outcome) |outcome| if (outcome != .completed) return .{};
+            if (!entryShowsDiffStats(detail)) return .{};
+            const path = storyArgString(scratch, record, "path") orelse return .{};
+            return .{ .kind = .edit, .key = path };
+        },
         .subagent => {
             if (storyArgString(scratch, record, "agent")) |agent| return .{ .kind = .subagent, .key = agent };
             // A report row carries no call; only a bare wait or status
@@ -1831,6 +1898,12 @@ fn collectStoryRows(
         target.detail = detail;
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addDistinct(&target.names, scratch, name);
+        if (identity.kind == .edit) {
+            const totals = diffTotalsOfPhrase(try entryStatus(scratch, entry) orelse "");
+            target.diff.added +|= totals.added;
+            target.diff.removed +|= totals.removed;
+            if (std.mem.eql(u8, detail.?.tool_name, "write_file")) target.writes += 1;
+        }
     }
     return rows;
 }
@@ -1882,6 +1955,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record) else null;
     const phrase = if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
         read
+    else if (try editRowPhrase(scratch, full_phrase, row)) |edit|
+        edit
     else if (agent_phrase) |agent|
         agent
     else if (try shortenCommandPhrase(scratch, full_phrase, row.detail, style.text_style)) |short|
@@ -1906,6 +1981,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .session => try countNote(scratch, " · ", row.count, " calls"),
         .read => try countNote(scratch, " · ", row.count, " parts"),
         .search => if (many_folders) "" else try countNote(scratch, " ×", row.count, ""),
+        .edit => try countNote(scratch, " · ", row.count, if (row.writes == 0) " edits" else if (row.writes == row.count) " writes" else " changes"),
         .single, .subagent, .subagent_wait, .commands => "",
     };
     return .{
@@ -2267,13 +2343,15 @@ fn writeGroupBlock(
 /// after it, accented like the status line it stands for. The merge note and
 /// the mark stay when the phrase is clipped, like the diff counts.
 fn clipStoryRow(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryRow, text: *const StoryRowText, mark: []const u8, cols: u16, style: SummaryStyle) ![]const u8 {
+    const tail = try std.mem.concat(scratch, u8, &.{ text.suffix, mark });
     if (!entryShowsDiffStats(row.detail))
-        return clipKeepingTail(scratch, try std.mem.concat(scratch, u8, &.{ lead, text.body }), try std.mem.concat(scratch, u8, &.{ text.suffix, mark }), cols, style.text_style);
-    const mark_width: u16 = @intCast(display_width.visibleWidthIgnoringAnsi(mark));
-    const phrase_cols = if (cols > mark_width * 2) cols - mark_width else cols;
-    const clipped_phrase = try clipKeepingDiffStats(scratch, try std.mem.concat(scratch, u8, &.{ lead, text.display }), phrase_cols);
-    const clipped = if (phrase_cols == cols) clipped_phrase else try std.mem.concat(scratch, u8, &.{ clipped_phrase, mark });
-    return accentTrailingDiffStats(scratch, clipped, style.text_style);
+        return clipKeepingTail(scratch, try std.mem.concat(scratch, u8, &.{ lead, text.body }), tail, cols, style.text_style);
+    const tail_width = display_width.visibleWidthIgnoringAnsi(tail);
+    const phrase_cols: u16 = if (cols > tail_width * 2) @intCast(cols - tail_width) else cols;
+    const clipped_phrase = try clipKeepingDiffStats(scratch, try std.mem.concat(scratch, u8, &.{ lead, text.body }), phrase_cols);
+    const accented = try accentTrailingDiffStats(scratch, clipped_phrase, style.text_style);
+    // The counts end their color, so the tail takes the row's style again.
+    return if (phrase_cols == cols or tail.len == 0) accented else try std.mem.concat(scratch, u8, &.{ accented, style.text_style, tail });
 }
 
 /// The lines under a row: a subagent's model line and the reason its latest
@@ -3741,6 +3819,15 @@ test "accentTrailingDiffStats re-applies add and remove marker styles" {
     defer alloc.free(both);
     try std.testing.expectEqualStrings("Edited main.zig [G]+12\x1b[0m[dim] / [R]-3\x1b[0m", both);
 
+    const compact = try accentTrailingDiffStats(alloc, "Edited main.zig +12/-3", "[dim]");
+    defer alloc.free(compact);
+    try std.testing.expectEqualStrings("Edited main.zig [G]+12\x1b[0m[dim]/[R]-3\x1b[0m", compact);
+    try std.testing.expectEqual(DiffTotals{ .added = 12, .removed = 3 }, diffTotalsOfPhrase("Edited main.zig +12/-3"));
+
+    const bare_slash = try accentTrailingDiffStats(alloc, "Wrote notes/-3", "");
+    defer alloc.free(bare_slash);
+    try std.testing.expectEqualStrings("Wrote notes/-3", bare_slash);
+
     const plain = try accentTrailingDiffStats(alloc, "Read runtime.zig", "");
     defer alloc.free(plain);
     try std.testing.expectEqualStrings("Read runtime.zig", plain);
@@ -3849,15 +3936,16 @@ test "a collapsed group's header keeps its edits' diff counts" {
     ui_render.diff_removed_marker_style = "[R]";
 
     const path = "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture.ts";
-    const status = "● Edited " ++ path ++ " +1 / -1\n";
+    const other = "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-other.ts";
     const arguments = "{\"path\":\"" ++ path ++ "\"}";
+    const other_arguments = "{\"path\":\"" ++ other ++ "\"}";
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = status, .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = status, .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited " ++ path ++ " +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited " ++ other ++ " +1 / -1\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed, .arguments_json = @constCast(arguments) },
-        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed, .arguments_json = @constCast(arguments) },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed, .arguments_json = @constCast(other_arguments) },
     };
     const cols: u16 = 60;
 
@@ -3865,12 +3953,12 @@ test "a collapsed group's header keeps its edits' diff counts" {
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
     const header = bytes[0 .. std.mem.findScalar(u8, bytes, '\n') orelse bytes.len];
-    // The rows under the header name the file and its counts.
-    try std.testing.expectEqualStrings("● Edited a file", header);
+    // The rows under the header name the files and their counts.
+    try std.testing.expectEqualStrings("● Edited files", header);
 
     var collapsed = try buildWithStyleAndStats(alloc, &entries, &details, cols, null, true, .{}, .{}, .compact, null, null);
     defer collapsed.deinit(alloc);
-    try std.testing.expectEqualStrings("● Edited a file [G]+2\x1b[0m [R]-2\x1b[0m", collapsed.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● Edited files [G]+2\x1b[0m [R]-2\x1b[0m", collapsed.entry_actions.items[0].override.bytes);
 }
 
 test "a failed call whose row does not say so gets a failure mark" {
@@ -4186,6 +4274,165 @@ test "a command still running when its call returned gets no check mark" {
     );
 }
 
+test "edit rows name the file, and changes to one file share a row" {
+    const alloc = std.testing.allocator;
+    const main_path = "/Users/example/fx/src/main.zig";
+    const notes_path = "/Users/example/fx/notes.md";
+    const app_path = "/Users/example/fx/src/app.zig";
+    const edit_args = "{\"path\":\"" ++ main_path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const write_args = "{\"path\":\"" ++ notes_path ++ "\",\"content\":\"x\"}";
+    const failed_args = "{\"path\":\"" ++ app_path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited " ++ main_path ++ " +4 / -2\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote " ++ notes_path ++ " +7\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited " ++ main_path ++ " +1 / -1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed " ++ app_path ++ ": old_string not found\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(failed_args), .outcome = .failed },
+    };
+
+    var group = try build(alloc, &entries, &details, 120);
+    defer group.deinit(alloc);
+    var painted: std.ArrayList(u8) = .empty;
+    defer painted.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(alloc, override.bytes);
+            try painted.append(alloc, '\n');
+        },
+        else => {},
+    };
+    const group_text = try visibleLinesForTest(alloc, painted.items, 120);
+    defer alloc.free(group_text);
+    errdefer std.debug.print("group:\n{s}\n", .{group_text});
+    const trimmed = std.mem.trim(u8, group_text, "\n");
+    // Each file shows by its name. The two edits of main.zig share one row
+    // with their counts added up; the failed edit keeps its own row and its
+    // reason.
+    try std.testing.expect(std.mem.find(u8, trimmed, "├ Edited main.zig +5/-3 · 2 edits\n") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "├ Wrote notes.md +7\n") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "└ Failed app.zig") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "old_string not found") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "/Users/example") == null);
+    // The name links to the file, as a read row's does.
+    try std.testing.expect(std.mem.find(u8, painted.items, "\x1b]8;;file://" ++ main_path ++ "\x1b\\main.zig" ++ link_close) != null);
+
+    // Alone, the edit is the header line, by its name and counts.
+    var single = try build(alloc, entries[0..1], details[0..1], 120);
+    defer single.deinit(alloc);
+    const single_line = try std.mem.concat(alloc, u8, &.{ single.entry_actions.items[0].override.bytes, "\n" });
+    defer alloc.free(single_line);
+    const single_text = try visibleLinesForTest(alloc, single_line, 120);
+    defer alloc.free(single_text);
+    try std.testing.expectEqualStrings("● Edited main.zig +4/-2", std.mem.trim(u8, single_text, "\n"));
+
+    // Two edits of one file are one row, so the group is that one line.
+    const same_entries = [_]TranscriptEntry{ entries[0], entries[2] };
+    const same_details = [_]ToolDetailRecord{ details[0], details[2] };
+    var same = try build(alloc, &same_entries, &same_details, 120);
+    defer same.deinit(alloc);
+    const same_line = try std.mem.concat(alloc, u8, &.{ same.entry_actions.items[0].override.bytes, "\n" });
+    defer alloc.free(same_line);
+    const same_text = try visibleLinesForTest(alloc, same_line, 120);
+    defer alloc.free(same_text);
+    try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, same_text, "\n"));
+}
+
+test "an edit row adds up its counts when core names the file another way" {
+    const alloc = std.testing.allocator;
+    // A tab in the path shows escaped in core's status.
+    const odd = "/Users/example/fx/odd\tname.zig";
+    const odd_args = "{\"path\":\"/Users/example/fx/odd\\tname.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const first = try alloc.print("● Edited {f} +4 / -2\n", .{text_utils.terminalSafe(odd)});
+    defer alloc.free(first);
+    const second = try alloc.print("● Edited {f} +1 / -1\n", .{text_utils.terminalSafe(odd)});
+    defer alloc.free(second);
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = first, .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = second, .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(odd_args), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(odd_args), .outcome = .completed },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Edited odd\\x09name.zig +5/-3 · 2 edits", std.mem.trim(u8, text, "\n"));
+    }
+    // A status that names the file in another form still gets the row's
+    // added-up counts.
+    {
+        const args = "{\"path\":\"/Users/example/fx/src/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited …/src/main.zig +4 / -2\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited …/src/main.zig +1 / -1\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .completed },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, text, "\n"));
+    }
+}
+
+test "a denied or cancelled change keeps its own row beside the file's edits" {
+    const alloc = std.testing.allocator;
+    const path = "/Users/example/fx/src/main.zig";
+    const args = "{\"path\":\"" ++ path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const edited = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Edited " ++ path ++ " +3 / -2\n", .class = .tool_status } };
+    const denied = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Denied edit " ++ path ++ "\n", .class = .tool_status } };
+    const cancelled = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Cancelled edit " ++ path ++ "\n", .class = .tool_status } };
+    const running = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● Editing " ++ path ++ "\n", .class = .tool_status } };
+    const edited_detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .completed };
+    const denied_detail = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .denied };
+    const cancelled_detail = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .cancelled };
+    const running_detail = ToolDetailRecord{ .entry_id = 4, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args) };
+
+    // In either order, the denial keeps its row and the edit counts once.
+    const orders = [_][2]usize{ .{ 0, 1 }, .{ 1, 0 } };
+    const pair_entries = [_]TranscriptEntry{ edited, denied };
+    const pair_details = [_]ToolDetailRecord{ edited_detail, denied_detail };
+    for (orders) |order| {
+        const entries = [_]TranscriptEntry{ pair_entries[order[0]], pair_entries[order[1]] };
+        const details = [_]ToolDetailRecord{ pair_details[order[0]], pair_details[order[1]] };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Edited main.zig +3/-2") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Denied edit main.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, " edits") == null);
+    }
+
+    // A cancelled change does not join the file's row either.
+    {
+        const entries = [_]TranscriptEntry{ edited, cancelled };
+        const details = [_]ToolDetailRecord{ edited_detail, cancelled_detail };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Edited main.zig +3/-2") != null);
+        try std.testing.expect(std.mem.find(u8, text, " edits") == null);
+    }
+
+    // One still running joins the row, which shows its state and the counts
+    // so far.
+    {
+        const entries = [_]TranscriptEntry{ edited, running };
+        const details = [_]ToolDetailRecord{ edited_detail, running_detail };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings("● Editing main.zig +3/-2 · 2 edits", std.mem.trim(u8, text, "\n"));
+    }
+}
+
 test "completed command rows shell-highlight quoted strings without coloring the action" {
     const alloc = std.testing.allocator;
     const command = "printf 'hello world'";
@@ -4433,6 +4680,23 @@ fn paintedTreeTextForTest(
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// The visible text of the group `build` makes from `entries`, one line per
+/// row, without colors. The caller owns the result.
+fn groupTextForTest(alloc: std.mem.Allocator, entries: []const TranscriptEntry, details: []const ToolDetailRecord) ![]u8 {
+    var group = try build(alloc, entries, details, 120);
+    defer group.deinit(alloc);
+    var painted: std.ArrayList(u8) = .empty;
+    defer painted.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(alloc, override.bytes);
+            try painted.append(alloc, '\n');
+        },
+        else => {},
+    };
+    return visibleLinesForTest(alloc, painted.items, 120);
 }
 
 /// The visible text of `bytes` as the terminal paints it, one line per row,
