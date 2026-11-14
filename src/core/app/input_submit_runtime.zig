@@ -351,6 +351,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 pending = &agent.submission.pending.?;
             }
 
+            if (comptime @hasDecl(App, "collectPendingTokenPass")) {
+                if (App.collectPendingTokenPass(app, agent) == .pending) return;
+            }
+
             if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
                 const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| {
                     finishPendingSubmissionFailure(app, agent, err);

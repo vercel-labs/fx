@@ -277,6 +277,21 @@ pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
     return if (capabilities.reasoning_efforts.len == 0) 0 else capabilities.reasoning_efforts.len + 1;
 }
 
+/// The effort after `current` in the cycle `default`, then each level the
+/// model declares in its order, then `default` again. The Gateway catalog
+/// lists levels lowest first; a custom connection keeps the order of its
+/// settings. Null when the model declares no levels.
+///
+/// A level the model does not declare, such as one saved for another model,
+/// goes back to `default`. The `/settings` cycle reads such a level as
+/// `default` and steps to the first level instead.
+pub fn nextReasoningEffort(capabilities: Capabilities, current: types.ReasoningEffort) ?types.ReasoningEffort {
+    const count = reasoningEffortOptionCount(capabilities);
+    if (count == 0) return null;
+    if (!reasoningEffortSupported(capabilities, current)) return .auto;
+    return reasoningEffortAtIndex(capabilities, (reasoningEffortIndex(capabilities, current) + 1) % count);
+}
+
 pub fn resolveProviderOptionsForCapabilities(
     capabilities: Capabilities,
     effort: types.ReasoningEffort,
@@ -418,6 +433,28 @@ test "reasoning effort picker helpers prepend default and preserve Gateway order
     try std.testing.expectEqualStrings("high", reasoningEffortLabelAtIndex(&capabilities, 2));
     try std.testing.expectEqual(@as(usize, 1), reasoningEffortIndex(capabilities, types.ReasoningEffort.literal("future-tier")));
     try std.testing.expectEqual(@as(usize, 0), reasoningEffortIndex(capabilities, types.ReasoningEffort.literal("stale")));
+}
+
+test "next reasoning effort steps from default through the declared levels and back to default" {
+    const low = types.ReasoningEffort.literal("low");
+    const medium = types.ReasoningEffort.literal("medium");
+    const high = types.ReasoningEffort.literal("high");
+    const capabilities = Capabilities{ .reasoning_efforts = .fromSlice(&.{ low, medium, high }) };
+
+    try std.testing.expect(nextReasoningEffort(capabilities, .auto).?.eql(low));
+    try std.testing.expect(nextReasoningEffort(capabilities, low).?.eql(medium));
+    try std.testing.expect(nextReasoningEffort(capabilities, medium).?.eql(high));
+    try std.testing.expect(nextReasoningEffort(capabilities, high).?.isDefault());
+    // A level saved for another model is not in the list.
+    try std.testing.expect(nextReasoningEffort(capabilities, types.ReasoningEffort.literal("stale")).?.isDefault());
+
+    // One level toggles with `default`.
+    const single = Capabilities{ .reasoning_efforts = .fromSlice(&.{high}) };
+    try std.testing.expect(nextReasoningEffort(single, .auto).?.eql(high));
+    try std.testing.expect(nextReasoningEffort(single, high).?.isDefault());
+
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), nextReasoningEffort(.{}, .auto));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), nextReasoningEffort(.{}, high));
 }
 
 test "request controls form a total fail-closed state machine" {
