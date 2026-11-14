@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -848,11 +849,14 @@ pub const WorkerRuntime = struct {
 
     /// Cancels the turn in flight without stopping the worker, which goes on
     /// to run later turns, as a subagent's agent does: every wait wakes to
-    /// see the cancel, and a permission request the turn is waiting on is
-    /// declined.
+    /// see the cancel, a permission request the turn is waiting on is
+    /// declined, and a question it is waiting on is cancelled.
     pub fn requestTurnCancel(self: *WorkerRuntime) void {
         self.requestCancel();
         self.cancelApprovalTurn();
+        if (self.cancelPendingQuestionBatch()) {
+            debug_trace.logf("worker", "pending question cancelled reason=turn_cancel", .{});
+        }
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
@@ -1263,6 +1267,40 @@ pub const WorkerRuntime = struct {
         }
         debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
         return prompt;
+    }
+
+    /// Drops the queued prompts for which `drop` answers true, oldest first,
+    /// and keeps the others in their order. `drop` gets each prompt's place in
+    /// the queue as it stood on entry. It runs under the queue's lock, so it
+    /// must not call into this worker. Returns how many it dropped. A host
+    /// that gives up some of the mail it queued uses this, where
+    /// `takeQueuedPrompt` takes only the oldest.
+    pub fn discardQueuedWhere(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        context: anytype,
+        comptime drop: fn (@TypeOf(context), usize, *const QueuedPrompt) bool,
+    ) usize {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var dropped: usize = 0;
+        var index: usize = 0;
+        var place: usize = 0;
+        while (index < self.queued_prompts.items.len) : (place += 1) {
+            if (!drop(context, place, &self.queued_prompts.items[index])) {
+                index += 1;
+                continue;
+            }
+            const prompt = self.queued_prompts.orderedRemove(index);
+            debug_trace.eventf("worker", "queued_prompt_discarded", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
+            discardQueuedPrompt(alloc, prompt, &.{});
+            dropped += 1;
+        }
+        if (dropped > 0 and self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        return dropped;
     }
 
     /// As `takeQueuedPrompt`, and marks turn `turn_id`, which runs the
@@ -8105,9 +8143,12 @@ test "semantic notice enqueue frees partial topic body and queue allocations" {
 const PermissionThreadState = struct {
     decision: ?types.ToolPermissionDecision = null,
     err: ?anyerror = null,
+    /// Set when the asking thread's blocking call has returned.
+    returned: std.Io.Event = .unset,
 };
 
 fn runPermissionRequest(state: *PermissionThreadState, runtime: *WorkerRuntime, label: []const u8) void {
+    defer state.returned.set(io_mod.getIo());
     var response = runtime.requestPermissionBlocking(
         std.testing.allocator,
         .{ .label = label },
@@ -8476,9 +8517,12 @@ test "text enqueue allocation failure preserves active interactive state" {
 const QuestionThreadState = struct {
     answers: ?[][]u8 = null,
     err: ?anyerror = null,
+    /// Set when the asking thread's blocking call has returned.
+    returned: std.Io.Event = .unset,
 };
 
 fn runQuestionRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    defer state.returned.set(io_mod.getIo());
     state.answers = runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, entries) catch |err| {
         state.err = err;
         return;
@@ -8486,6 +8530,7 @@ fn runQuestionRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entr
 }
 
 fn runRouteRecoveryRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    defer state.returned.set(io_mod.getIo());
     state.answers = runtime.requestRouteRecoveryAnswerBlocking(std.testing.allocator, entries) catch |err| {
         state.err = err;
         return;
@@ -8544,6 +8589,96 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+fn runPermissionRequestWithReview(
+    state: *PermissionThreadState,
+    runtime: *WorkerRuntime,
+    label: []const u8,
+    review: *const diff_mod.FileReview,
+) void {
+    defer state.returned.set(io_mod.getIo());
+    var response = runtime.requestPermissionBlockingWithReview(
+        std.testing.allocator,
+        .{ .label = label },
+        review,
+    ) catch |err| {
+        state.err = err;
+        return;
+    };
+    defer response.deinit();
+    state.decision = response.decision;
+}
+
+fn runMcpElicitationRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    defer state.returned.set(io_mod.getIo());
+    state.answers = runtime.requestMcpElicitationAnswerBlocking(std.testing.allocator, entries) catch |err| {
+        state.err = err;
+        return;
+    };
+}
+
+test "cancelling a turn ends the question it waits on, whoever asked it" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    const Asker = enum { agent, mcp_server, failed_request };
+    for (std.enums.values(Asker)) |asker| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        var state = QuestionThreadState{};
+        const thread = switch (asker) {
+            .agent => try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries }),
+            .mcp_server => try std.Thread.spawn(.{}, runMcpElicitationRequest, .{ &state, &runtime, &entries }),
+            .failed_request => try std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ &state, &runtime, &entries }),
+        };
+        var snapshot = try waitForQuestionSnapshot(&runtime);
+        snapshot.deinit(alloc);
+        runtime.requestTurnCancel();
+        const ended = testing_event.setInTime(&state.returned);
+        // A wait that did not end is released, so the test fails instead of hanging.
+        if (!ended) runtime.requestStop();
+        thread.join();
+        defer freeAnswers(alloc, state.answers);
+        try std.testing.expect(ended);
+        try std.testing.expect(state.answers == null);
+    }
+}
+
+test "cancelling a turn declines the permission request it waits on" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+    _ = try waitForPermissionLabel(&runtime, "Allow?");
+    runtime.requestTurnCancel();
+    const ended = testing_event.setInTime(&state.returned);
+    // A request that stayed open is released, so the test fails instead of hanging.
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
+}
+
+test "cancelling a turn declines a permission request that waits on a file review" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var review = try diff_mod.FileReview.init(alloc, "", "line 1\n");
+    defer review.deinit(alloc);
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequestWithReview, .{ &state, &runtime, "file_mutation", &review });
+    _ = try waitForPermissionLabel(&runtime, "file_mutation");
+    runtime.requestTurnCancel();
+    const ended = testing_event.setInTime(&state.returned);
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
+    try std.testing.expect(runtime.pending_permission_review == null);
 }
 
 test "question resume observer runs only for accepted answers before releasing the worker" {

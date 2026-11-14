@@ -21,6 +21,19 @@
 #   drop-waiting-at-end  the stopped turn's end drops the waiting messages      NoSilentLoss
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
 #   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
+#   late-rearm           the slot clears the stop flags after the end hook
+#                        installed the next work, so a stop in between is erased  StopHoldsForQueued
+#   leftover-gap         a stop of a turn that ended, whose slot kept its unread
+#                        messages, reaches nothing: the hook installs them and
+#                        arms the work, so they run after the stop      StopHoldsForQueued
+#   leftover-uncounted   a stop or close of such a turn drops the kept
+#                        messages and does not count them                NoSilentLoss
+#   user-ended-uncounted the user's stop of a turn that ended, while its slot
+#                        kept its unread messages, drops them and counts none  NoSilentLoss
+#   user-before-lock     the user's stop lands between the end hook's install
+#                        and arm, where the arm erases it                       StopHoldsForQueued
+#   user-next-runs       the user's stop only flags a next work that no turn
+#                        has begun on, and the work runs                        StopHoldsForQueued
 #   note-after-take      the idle note is decided after the next turn took the
 #                        waiting messages, so it says idle while a turn starts   IdleNoteHonest
 #   names-busy           a new subagent's start names every other open one      NamesTheIdle
@@ -92,6 +105,20 @@
 #
 # tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
 # against it (MainMailTrace.tla).
+#
+# The WaitNudge configs:
+#
+# WaitNudge models main's wait against subagent works that end with nothing
+# to post (Runtime.waitForMail, workEnded, nudgeWaiter in tool_host.zig, and
+# WorkerRuntime.waitForPostOrNudge): wait always returns, so TLC never reaches
+# a blocked wait that nothing can wake (a deadlock). wait-nudge.cfg is the
+# design and must pass. wait-nudge-today.cfg is fx before it: the end nudged
+# before it cleared the busy flag, so a wait that began in between blocked for
+# good. wait-nudge-mutation-check-first.cfg plants one defect, a wait that
+# reads the busy flags before it registers. Both must reach a deadlock. No
+# trace driver runs fx along it: the inline tests in tool_host.zig and
+# "a wait that starts as a subagent's work ends with nothing to report still
+# returns" in tests/e2e/gateway-stream-lifecycle.test.ts hold fx in the gap.
 
 set -eu
 
@@ -124,6 +151,12 @@ StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
 StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
+StopMessage stop-message-mutation-late-rearm StopHoldsForQueued
+StopMessage stop-message-mutation-leftover-gap StopHoldsForQueued
+StopMessage stop-message-mutation-leftover-uncounted NoSilentLoss
+StopMessage stop-message-mutation-user-ended-uncounted NoSilentLoss
+StopMessage stop-message-mutation-user-before-lock StopHoldsForQueued
+StopMessage stop-message-mutation-user-next-runs StopHoldsForQueued
 StopMessage stop-message-before-idle IdleNoteHonest
 StopMessage stop-message-before-names NamesTheIdle
 StopMessage stop-message-mutation-note-after-take IdleNoteHonest
@@ -142,4 +175,7 @@ QuietRelay quiet-relay-mutation-relay-after-close NoRelayAfterClose
 QuietRelay quiet-relay-mutation-silent-drop EveryCrossingAccounted
 QuietRelay quiet-relay-mutation-no-cap MailboxBounded
 QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
+WaitNudge wait-nudge -
+WaitNudge wait-nudge-today deadlock
+WaitNudge wait-nudge-mutation-check-first deadlock
 VERDICTS

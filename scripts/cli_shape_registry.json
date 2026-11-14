@@ -289,6 +289,30 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_NEXT_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_NEXT_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_RUN_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_RUN_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_SETTLE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_SETTLE_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_START_HELD": {
       "job": "test",
       "stability": "internal"
@@ -298,6 +322,10 @@
       "stability": "internal"
     },
     "FX_TEST_SUBAGENT_START_WAIT_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_USER_STOP": {
       "job": "test",
       "stability": "internal"
     },

@@ -12,13 +12,25 @@
 (*   "send", "stop", "close"                                               *)
 (*             one call of that step ran, and main heard `answer`, with    *)
 (*             the `count` of messages a stop or close dropped;            *)
+(*   "rearm"   subagent `sub`'s end hook installed its next work and armed *)
+(*             it: the slot is held there (FX_TEST_SUBAGENT_NEXT_HELD);    *)
 (*   "begin"   subagent `sub`'s starting turn began: the driver let go of  *)
-(*             its start hold (FX_TEST_SUBAGENT_START_HELD);               *)
+(*             its start hold (FX_TEST_SUBAGENT_START_HELD), and the turn  *)
+(*             read the messages `msgs` that made it, if any did;          *)
 (*   "read"    subagent `sub`'s running turn read the messages `msgs`;     *)
 (*   "finish"  its turn ended with nothing more to read;                  *)
-(*   "end"     its stopped or closed work ended, and its next turn read    *)
-(*             the waiting messages `msgs` (none when nothing waited).     *)
-(* A finish or end carries `note`, what fx told main of it: "none" when it *)
+(*   "user_stop"  the user stopped a turn on subagent `sub`'s screen while  *)
+(*             the slot held it between two works, the driver holds that *)
+(*             slot there (FX_TEST_SUBAGENT_USER_STOP), and `count` is   *)
+(*             what fx dropped and counted;                              *)
+(*   "fail"    its turn ended without reading the messages that joined   *)
+(*             it, and its slot kept them: the driver holds the slot     *)
+(*             there (FX_TEST_SUBAGENT_RUN_HELD);                         *)
+(*   "hook"    the end hook of that turn queued the kept messages as its  *)
+(*             next work, to begin after a "rearm";                       *)
+(*   "end"     its stopped or closed work ended, and the waiting messages  *)
+(*             became its next work, to begin after a "rearm".            *)
+(* A finish, hook or end carries `note`, what fx told main of it: "none" when it *)
 (* queued no report, "idle" when its report said the subagent is idle,    *)
 (* "plain" otherwise. A send carries `named`, the idle subagents its       *)
 (* answer named, and `more`, how many it counted past them.                *)
@@ -55,6 +67,7 @@ Observable(o) ==
      /\ Write(AsCalls(o.calls))
      /\ UNCHANGED <<phase, unread, waitq, read, dropped, toldDropped, told,
                     refusedOpen, coverBroken, lateStart>>
+     /\ UNCHANGED heldVars
      /\ UNCHANGED idleVars
   \/ /\ o.op \in {"send", "stop", "close"}
      /\ Exec
@@ -64,14 +77,25 @@ Observable(o) ==
      /\ last'.answer = o.answer
      /\ last'.count = o.count
      /\ o.op = "send" => NamedMatches(o)
+  \/ /\ o.op = "rearm"
+     /\ Rearm(o.sub)
   \/ /\ o.op = "begin"
      /\ Begin(o.sub)
+     /\ read' \ read = o.msgs
   \/ /\ o.op = "read"
      /\ Read(o.sub)
      /\ read' \ read = o.msgs
   \/ /\ o.op = "finish"
      /\ Finish(o.sub)
      /\ read' \ read = o.msgs
+     /\ note' = o.note
+  \/ /\ o.op = "user_stop"
+     /\ UserStop(o.sub)
+     /\ last'.count = o.count
+  \/ /\ o.op = "fail"
+     /\ Fail(o.sub)
+  \/ /\ o.op = "hook"
+     /\ Hook(o.sub)
      /\ note' = o.note
   \/ /\ o.op = "end"
      /\ EndStopped(o.sub)
