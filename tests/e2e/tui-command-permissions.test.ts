@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import {
   execFileSync,
   spawn as nodeSpawn,
@@ -19,6 +20,7 @@ import {
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { LineQueue } from "./line-queue";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
@@ -4646,8 +4648,7 @@ describe("effect-aware command permissions", () => {
 
 class AcpClient {
   private buffer = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private closed = false;
   private stderrChunks: Buffer[] = [];
   private activeSessionId: string | null = null;
@@ -4659,9 +4660,7 @@ class AcpClient {
       this.buffer = parts.pop() ?? "";
       for (const line of parts) {
         if (!line.trim()) continue;
-        const waiter = this.waiters.shift();
-        if (waiter) waiter(line);
-        else this.lines.push(line);
+        this.queue.push(line);
       }
     });
     proc.stderr!.on("data", (chunk: Buffer) => this.stderrChunks.push(chunk));
@@ -4703,18 +4702,7 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
-    const line = await new Promise<string>((resolve, reject) => {
-      const buffered = this.lines.shift();
-      if (buffered) {
-        resolve(buffered);
-        return;
-      }
-      const timer = setTimeout(() => reject(new Error("ACP read timeout")), timeoutMs);
-      this.waiters.push((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      });
-    });
+    const line = await this.queue.next(timeoutMs, () => new Error("ACP read timeout"));
     const message = JSON.parse(line);
     if (message.method === "session/request_permission" && message.id !== undefined) {
       this.send({
@@ -4773,3 +4761,18 @@ async function runAcpPrompt(client: AcpClient, text: string) {
     messages.push(message);
   }
 }
+
+describe("the ACP test client's reader", () => {
+  test("a read that timed out does not take the next line", async () => {
+    // A stand-in for `fx acp`: no fx runs.
+    const proc = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      stdin: { write() {} },
+    });
+    const client = new (AcpClient as any)(proc);
+    await expect(client.readLine(30)).rejects.toThrow("ACP read timeout");
+    proc.stdout.emit("data", Buffer.from(`${JSON.stringify({ id: 7, result: {} })}\n`));
+    expect(await client.readLine(500)).toEqual({ id: 7, result: {} });
+  });
+});
