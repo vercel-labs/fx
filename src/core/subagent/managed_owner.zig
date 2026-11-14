@@ -626,6 +626,13 @@ pub const Owner = struct {
         }
         self.mutex.unlock(io_mod.getIo());
 
+        // A slot's thread ends its work in the host's end hook, which walks
+        // every slot in `self.slots`, so each slot stays listed and alive
+        // until all the threads have ended. Freeing one slot as soon as its
+        // own thread has been joined would leave it listed for the others.
+        for (self.slots.items) |slot| {
+            joinSlot(self, slot);
+        }
         for (self.slots.items) |slot| {
             destroySlot(self, slot);
         }
@@ -713,8 +720,19 @@ pub const Owner = struct {
     }
 };
 
+/// Joins the slot's thread, once.
+fn joinSlot(owner: *Owner, slot: *Slot) void {
+    const thread = slot.thread orelse return;
+    thread.join();
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    slot.thread = null;
+    owner.mutex.unlock(io_mod.getIo());
+}
+
+/// Frees the slot. The caller has taken it out of `owner.slots`, or no slot
+/// thread runs any more.
 fn destroySlot(owner: *Owner, slot: *Slot) void {
-    if (slot.thread) |thread| thread.join();
+    joinSlot(owner, slot);
     owner.mutex.lockUncancelable(io_mod.getIo());
     while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     owner.mutex.unlock(io_mod.getIo());
@@ -722,6 +740,117 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
     freeLeftovers(owner.alloc, slot);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
+}
+
+/// An allocator that notes each block of a slot's size that is freed through
+/// it, so a test can tell whether the owner still lists a slot it freed.
+const SlotFreeWatch = struct {
+    backing: Allocator,
+    mutex: std.Io.Mutex = .init,
+    freed: [4]usize = @splat(0),
+    freed_count: usize = 0,
+    /// Set when the first slot is freed.
+    first_freed: std.Io.Event = .unset,
+
+    fn allocator(self: *SlotFreeWatch) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SlotFreeWatch = @ptrCast(@alignCast(raw));
+        if (memory.len == @sizeOf(Slot)) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            if (self.freed_count < self.freed.len) {
+                self.freed[self.freed_count] = @intFromPtr(memory.ptr);
+                self.freed_count += 1;
+            }
+            self.mutex.unlock(io_mod.getIo());
+            self.first_freed.set(io_mod.getIo());
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    fn wasFreed(self: *SlotFreeWatch, slot: *const Slot) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.freed[0..self.freed_count]) |address| {
+            if (address == @intFromPtr(slot)) return true;
+        }
+        return false;
+    }
+};
+
+/// Slot threads that end their work once the owner cancels it, as `slotMain`
+/// ends a work that has no next one: the host's end hook walks the owner's
+/// slots (`Owner.markEnding`). The last thread first waits for the owner to
+/// free the first slot, so its work ends while that slot is being destroyed.
+const TeardownTest = struct {
+    watch: *SlotFreeWatch,
+    checks: std.atomic.Value(usize) = .init(0),
+    listed_freed: std.atomic.Value(usize) = .init(0),
+
+    fn slotMain(self: *TeardownTest, slot: *Slot, last: bool) void {
+        const owner = slot.owner;
+        while (!slot.cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        if (last) self.countListedFreed(owner);
+        owner.markEnding(slot.child_id);
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        slot.completion = .unpublished;
+        slot.done.set(io_mod.getIo());
+        owner.waiters_changed.broadcast(io_mod.getIo());
+        owner.mutex.unlock(io_mod.getIo());
+    }
+
+    /// An owner that frees its slots only once no slot thread runs never
+    /// sets the event, so the wait ends at its limit.
+    fn countListedFreed(self: *TeardownTest, owner: *Owner) void {
+        self.watch.first_freed.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(50) } }) catch {};
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        defer owner.mutex.unlock(io_mod.getIo());
+        for (owner.slots.items) |slot| {
+            if (self.watch.wasFreed(slot)) _ = self.listed_freed.fetchAdd(1, .seq_cst);
+        }
+        _ = self.checks.fetchAdd(1, .seq_cst);
+    }
+};
+
+test "closing the owner frees no slot that another slot's thread can still reach" {
+    // The first call builds the process's Io, which two threads must not race to do.
+    _ = io_mod.getIo();
+    var watch = SlotFreeWatch{ .backing = std.testing.allocator };
+    const alloc = watch.allocator();
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var fixture = TeardownTest{ .watch = &watch };
+    var closed = false;
+    defer if (!closed) owner.deinit();
+    for ([_][]const u8{ "child-1", "child-2" }, 0..) |name, index| {
+        const slot = try alloc.create(Slot);
+        slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, name) };
+        try owner.slots.append(alloc, slot);
+        slot.thread = try std.Thread.spawn(.{}, TeardownTest.slotMain, .{ &fixture, slot, index == 1 });
+    }
+
+    // The owner cancels both works, joins and frees the first slot, and the
+    // second work ends while it does.
+    closed = true;
+    owner.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.checks.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.listed_freed.load(.seq_cst));
 }
 
 test "a cancelled work's cause is the user's stop, else fx's quit, else unknown" {
