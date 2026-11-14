@@ -10941,7 +10941,10 @@ test "delivery certainty stays definitely unsent when request setup fails" {
 }
 
 test "delivery certainty becomes possibly sent before response head" {
-    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 500);
+    // The server holds the response head well past the deadline, and the
+    // deadline leaves a slow runner time to connect and send the request
+    // first; a deadline that ends before the send finds it definitely unsent.
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 1000);
     defer fixture.deinit();
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
@@ -10965,7 +10968,7 @@ test "delivery certainty becomes possibly sent before response head" {
                 .payload = "{}",
                 .delivery = &delivery,
             },
-            testAwakeDeadlineAfter(20),
+            testAwakeDeadlineAfter(250),
             &cancel_flag,
         ),
     );
