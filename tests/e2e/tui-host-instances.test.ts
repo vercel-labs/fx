@@ -410,8 +410,11 @@ function held(): Gate {
 }
 
 // What the model does when main works in the turn that started a subagent,
-// over `grantRuns`. The first word names how, `RUN[...]`, `FILE[...]` or
-// `MCP[]` what, and `GRANT_<n>` the turn:
+// over `grantRuns`. The first word names how, `RUN[...]`, `FILE[...]`, `MCP[]`
+// or `MCPCALL[]` what, and `GRANT_<n>` the turn. For `MCPCALL[]` the subagent
+// runs the fixture's MCP tool, and main's work is two commands that each end in
+// `fx mcp call` of that tool (`mcpCallCommand`): the first waits for the file
+// `go` in the workspace, the second does not.
 // - LATER[name]: main starts `name`, waits for `gates.later`, then does the
 //   work itself, in that same turn, and a second command `THEN[...]` when the
 //   prompt names one.
@@ -432,6 +435,11 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
   const steps = (...calls: object[]) => fakeGatewaySse([...calls, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } }]);
   // One step of doing `kind`'s work in the turn, `done` results in.
   const work = (turn: string, kind: string, what: string, done: number, then?: string): Response => {
+    if (kind === "MCPCALL") {
+      if (done === 0) return shellRun(`call_${turn}`, mcpCallCommand(1, true));
+      if (done === 1) return shellRun(`then_${turn}`, mcpCallCommand(2, false));
+      return text(`done_${turn}`, `GRANT_DONE_${turn}`);
+    }
     if (kind === "MCP") {
       if (done === 0) return call(`open_${turn}`, "toolbox", { open: "mcp_fixture_echo" });
       if (done === 1) return call(`mcp_${turn}`, "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
@@ -462,7 +470,9 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
     if (!typed || !how) return base(body);
     const [, mode, name] = how as unknown as [string, string, string | undefined];
     const turn = typed.text.match(/GRANT_(\d+)/)?.[1] ?? "0";
-    const [, kind, what] = (typed.text.match(/(RUN|FILE|MCP)\[(.*?)\]/) ?? ["", "RUN", "true"]) as string[];
+    const [, kind, what] = (typed.text.match(/(RUN|FILE|MCPCALL|MCP)\[(.*?)\]/) ?? ["", "RUN", "true"]) as string[];
+    // The subagent runs the tool itself when main's work is a command that calls it.
+    const taskKind = kind === "MCPCALL" ? "MCP" : kind;
     const results = typed.results;
     if (mode === "TYPED" && last.includes('"agent":"giver"')) return text("ack", "GRANT_ACK");
     switch (mode) {
@@ -474,11 +484,11 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
         }
         return text(`done_${turn}`, `GRANT_DONE_${turn}`);
       case "LATER":
-        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_${turn} ${kind}[${what}]`, `start_${turn}`));
+        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_${turn} ${taskKind}[${what}]`, `start_${turn}`));
         if (results === 1) await gates.later!.promise;
         return work(turn, kind!, what!, results - 1, typed.text.match(/THEN\[(.*?)\]/)?.[1]);
       case "BEFORE":
-        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_2 ${kind}[${what}]`, `start_${turn}`));
+        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_2 ${taskKind}[${what}]`, `start_${turn}`));
         return work(turn, kind!, what!, results - 1);
       case "PAIR":
         if (results === 0) return steps(give("alpha", "runner", `GRANT_TASK_1 RUN[${what}]`, `alpha_${turn}`), give("beta", "runner", `GRANT_TASK_2 RUN[${what}]`, `beta_${turn}`));
@@ -511,6 +521,53 @@ async function mainGoesOn(session: TmuxSession, gate: Gate, done: string) {
   const pane = await waitShows(session, "main's work or its prompt", (value) => approvalOpen(value) || value.includes(done), 45_000);
   expect(approvalOpen(pane)).toBe(false);
   expect(pane).toContain(done);
+}
+
+// A command of main's that calls the fixture's MCP tool through `fx mcp call`
+// and records how the call ended in `mcp-exit-<n>.txt`. With `wait` it first
+// waits for the file `go` in the workspace, so the test decides when the call is
+// made.
+function mcpCallCommand(n: number, wait: boolean): string {
+  const hold = wait ? "until [ -f go ]; do sleep 0.1; done; " : "";
+  return `${hold}"${FX_BIN}" mcp call mcp_fixture_echo '{"text":"hello"}' > mcp-out-${n}.txt 2> mcp-err-${n}.txt; echo "exit=$?" > mcp-exit-${n}.txt`;
+}
+
+// Which prompt of main's an open approval is: the MCP tool's, or the one of
+// the command whose file `mcp-exit-<n>.txt` it names.
+const mainPromptOf = (pane: string) => (pane.includes("Allow this MCP tool call?") ? "mcp" : (pane.match(/mcp-exit-(\d)/)?.[1] ?? "?"));
+
+// Answers the approval open on screen with option 1, which takes effect at
+// once, and waits until that prompt is gone, whether or not another follows.
+async function allowOnce(session: TmuxSession, pane: string) {
+  const prompt = mainPromptOf(pane);
+  await session.sendKeys("1");
+  await waitShows(session, "the prompt answered", (value) => !approvalOpen(value) || mainPromptOf(value) !== prompt, 15_000);
+}
+
+// Main's turn in `ask` mode, once its commands are running: answers each
+// command's own prompt once and counts the prompts the MCP tool asked itself,
+// until `done` shows with no prompt open.
+async function answerMainCommands(session: TmuxSession, done: string): Promise<{ commands: number; mcp: number }> {
+  const asked = { commands: 0, mcp: 0 };
+  for (;;) {
+    const pane = await waitShows(session, "main's prompt or the end of its turn", (value) => approvalOpen(value) || value.includes(done), 60_000);
+    if (!approvalOpen(pane)) return asked;
+    if (pane.includes("Allow this MCP tool call?")) asked.mcp += 1;
+    else {
+      expect(pane).toContain(COMMAND_APPROVAL_PROMPT);
+      asked.commands += 1;
+    }
+    await allowOnce(session, pane);
+  }
+}
+
+// Registers the fixture MCP server for the instance, and a subagent profile that uses it.
+function useMcpFixture(home: string) {
+  const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+  writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
+    mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
+  }));
+  writeProfile(home, "runner", { description: "Uses the fixture", tools: ["read_file", "mcp_select_tool"], mcp_servers: ["fixture"], permission_mode: "ask" });
 }
 
 // The permissions panel's "Session grants" line, as `/permissions` shows it
@@ -1247,6 +1304,94 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("2");
         await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
         await mainGoesOn(session, gates.later, "GRANT_DONE_1");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of an MCP tool reaches main's running turn: main's command calls it with fx mcp call later in that turn with no prompt",
+    async () => {
+      const finished = new Set<string>();
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        useMcpFixture(home);
+        // Main's commands do not wait: the call is made as soon as they start.
+        writeFileSync(join(workspace, "go"), "");
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 LATER[alpha] MCPCALL[]");
+        await session.waitForText("Subagent alpha needs permission", 45_000);
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
+        await waitShows(session, "the subagent's prompt gone", (pane) => !approvalOpen(pane));
+        gates.later.release();
+        // Each of main's two commands asks for itself; neither call of the tool does.
+        expect(await answerMainCommands(session, "GRANT_DONE_1")).toEqual({ commands: 2, mcp: 0 });
+        for (const n of [1, 2]) {
+          expect(readFileSync(join(workspace, `mcp-exit-${n}.txt`), "utf8").trim()).toBe("exit=0");
+          expect(readFileSync(join(workspace, `mcp-out-${n}.txt`), "utf8").length).toBeGreaterThan(0);
+        }
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval given while main's command runs does not reach that command's fx mcp call, which asks, and main's next command's call does not",
+    async () => {
+      const finished = new Set<string>();
+      const gates = { child: held(), childTask: "2" };
+      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        useMcpFixture(home);
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 BEFORE[alpha] MCPCALL[]");
+        // Main's first command asks for itself, then runs and waits for `go`.
+        await allowOnce(session, await waitShows(session, "main's command prompt", (pane) => pane.includes(COMMAND_APPROVAL_PROMPT) && !pane.includes("Subagent"), 45_000));
+        // The subagent's approval comes while that command runs.
+        gates.child.release();
+        await session.waitForText("Subagent alpha needs permission", 45_000);
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two calls", () => finished.has("2"), 45_000, session);
+        await waitShows(session, "the subagent's prompt gone", (pane) => !approvalOpen(pane));
+        expect(existsSync(join(workspace, "mcp-exit-1.txt"))).toBe(false);
+        writeFileSync(join(workspace, "go"), "");
+        // The command began before the approval, so its own call asks.
+        await allowOnce(session, await waitShows(session, "the command's own MCP prompt", (pane) => pane.includes("Allow this MCP tool call?") && !pane.includes("Subagent"), 45_000));
+        await waitUntil("the first command's call", () => existsSync(join(workspace, "mcp-exit-1.txt")), 30_000, session);
+        // Main's next command starts after the approval, so its call does not.
+        expect(await answerMainCommands(session, "GRANT_DONE_1")).toEqual({ commands: 1, mcp: 0 });
+        for (const n of [1, 2]) expect(readFileSync(join(workspace, `mcp-exit-${n}.txt`), "utf8").trim()).toBe("exit=0");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/permissions reset while main's command runs does not reach that command's fx mcp call, and main's next command's call asks",
+    async () => {
+      const finished = new Set<string>();
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        useMcpFixture(home);
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 LATER[alpha] MCPCALL[]");
+        await session.waitForText("Subagent alpha needs permission", 45_000);
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
+        await waitShows(session, "the subagent's prompt gone", (pane) => !approvalOpen(pane));
+        gates.later.release();
+        // Main's first command asks for itself, then runs and waits for `go`.
+        await allowOnce(session, await waitShows(session, "main's command prompt", (pane) => pane.includes(COMMAND_APPROVAL_PROMPT) && !pane.includes("Subagent"), 45_000));
+        const grants = await resetSessionGrants(session);
+        expect(grants.before).toMatch(/Session grants +1$/);
+        expect(grants.after).toMatch(/Session grants +none$/);
+        writeFileSync(join(workspace, "go"), "");
+        // The command read the approvals when it started, so its call does not ask.
+        await waitUntil("the first command's call", () => existsSync(join(workspace, "mcp-exit-1.txt")), 30_000, session);
+        expect(readFileSync(join(workspace, "mcp-exit-1.txt"), "utf8").trim()).toBe("exit=0");
+        // The next command starts after the reset, so its call asks.
+        expect(await answerMainCommands(session, "GRANT_DONE_1")).toEqual({ commands: 1, mcp: 1 });
+        expect(readFileSync(join(workspace, "mcp-exit-2.txt"), "utf8").trim()).toBe("exit=0");
       });
     },
     TIMEOUT,

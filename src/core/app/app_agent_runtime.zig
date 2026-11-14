@@ -205,6 +205,17 @@ pub fn Runtime(comptime App: type) type {
             return app_permission_runtime.Runtime(App).copyGrantsAfter(app, agent, arena, own) catch own;
         }
 
+        /// The request an execution of `request` runs under: the call's own
+        /// approvals, followed by a copy of its instance's taken now, in
+        /// `arena`. `executeToolCallAuthorized` takes the list a call runs
+        /// under from the request and overwrites any list set on the context,
+        /// so the nested check of a command's own `fx mcp call` reads this one.
+        pub fn requestForExecution(app: *App, agent: *AppAgent, arena: Allocator, request: agent_runtime.ToolExecutionRequest) agent_runtime.ToolExecutionRequest {
+            var execution = request;
+            execution.session_grants = mergeLiveGrants(app, agent, arena, request.session_grants);
+            return execution;
+        }
+
         /// A subagent's tools work under its run's admission, never main's
         /// permission engine.
         fn childToolAuthority(agent: *AppAgent) ?ToolAuthorityView {
@@ -1040,13 +1051,15 @@ pub fn Runtime(comptime App: type) type {
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
             ctx.root_user_evidence_complete = request.root_user_evidence_complete;
-            // The execution reads the list only while it runs, so the copy ends with it.
+            // The execution reads the approvals the call began with, from the
+            // request, and the copy ends with the call. A command's
+            // `fx mcp call` borrows it only while the call runs, since
+            // `mcp_call_bridge.unregister` waits for its borrowers.
             var copy = std.heap.ArenaAllocator.init(app.alloc);
             defer copy.deinit();
-            ctx.session_grants = mergeLiveGrants(app, agent, copy.allocator(), request.session_grants);
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
-            return tool_runtime.executeToolCallAuthorized(ctx, request);
+            return tool_runtime.executeToolCallAuthorized(ctx, requestForExecution(app, agent, copy.allocator(), request));
         }
 
         fn applyCredentialLease(
@@ -2456,6 +2469,38 @@ test "a check and an execution free their copy of the approvals when they return
     const limit = 256 * 1024;
     try callsAgainstTurnArena(0, limit);
     try callsAgainstTurnArena(200, limit);
+}
+
+test "the request an execution runs under holds the call's approvals, then the instance's, so a command's own check reads both" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    try app.permission_engine.allow(alloc, "skill", "granted");
+    var own = [_]PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    const request: agent_runtime.ToolExecutionRequest = .{
+        .call_allocator = alloc,
+        .result_allocator = alloc,
+        .call = .{ .id = "run", .name = "shell", .arguments_json = "{}" },
+        .authority = .ordinary,
+        .session_grants = &own,
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 2048,
+    };
+    var copy = std.heap.ArenaAllocator.init(alloc);
+    defer copy.deinit();
+    const execution = Runtime(FakeApp).requestForExecution(&app, app.agent(), copy.allocator(), request);
+    try std.testing.expect(permissions.sessionGrantAllowed(execution.session_grants, "skill", "own"));
+    try std.testing.expect(permissions.sessionGrantAllowed(execution.session_grants, "skill", "granted"));
+    try std.testing.expect(!permissions.sessionGrantAllowed(execution.session_grants, "skill", "other"));
+    // Nothing else of the request changes.
+    try std.testing.expectEqualStrings("shell", execution.call.name);
+    try std.testing.expectEqual(@as(usize, 2048), execution.max_tool_result_bytes);
+    // A copy that cannot be made leaves the call's own approvals alone, so what
+    // only the instance holds is asked for.
+    var no_memory = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const alone = Runtime(FakeApp).requestForExecution(&app, app.agent(), no_memory.allocator(), request);
+    try std.testing.expect(permissions.sessionGrantAllowed(alone.session_grants, "skill", "own"));
+    try std.testing.expect(!permissions.sessionGrantAllowed(alone.session_grants, "skill", "granted"));
 }
 
 test "an approval in the instance's list never makes a tool that main's turn does not offer available" {
