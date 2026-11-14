@@ -185,6 +185,21 @@ pub const CapabilityResolver = struct {
         model_catalog.freeModelCatalog(alloc, &self.catalog);
     }
 
+    /// A copy of this resolver that a reader owns: it shares no memory with
+    /// this one, so an adoption or refresh here leaves the copy as it was.
+    /// A load in flight is not copied. The copy loads for itself if it is
+    /// asked before anything loaded. Free it with `deinit`.
+    pub fn snapshot(self: *const CapabilityResolver, alloc: Allocator) Allocator.Error!CapabilityResolver {
+        return .{
+            .catalog = try model_catalog.cloneModelCatalog(alloc, self.catalog.items),
+            .state = self.state,
+            .last_attempt_ms = self.last_attempt_ms,
+            .requested_access = self.requested_access,
+            .provider_id = self.provider_id,
+            .last_failure = self.last_failure,
+        };
+    }
+
     /// Why the catalog is down, or null while it has entries or has not been
     /// asked yet.
     pub fn downFailure(self: *const CapabilityResolver) ?model_catalog.FailureCategory {
@@ -656,6 +671,49 @@ const FakeCatalog = struct {
         };
     }
 };
+
+fn testCatalogOf(alloc: Allocator, ids: []const []const u8) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    for (ids) |id| {
+        const owned_id = try alloc.dupe(u8, id);
+        errdefer alloc.free(owned_id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{ .id = owned_id, .model_type = model_type, .has_vision = true, .context_window = 1000 });
+    }
+    return entries;
+}
+
+test "a snapshot of the capability resolver keeps its catalog when the resolver adopts another" {
+    const alloc = std.testing.allocator;
+    var fake = FakeCatalog{ .outcome = .ready };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    var first = try testCatalogOf(alloc, &.{ "provider/old", "provider/other" });
+    resolver.adoptOwnedCatalog(alloc, fake.provider(), .host_managed, &first);
+
+    var copy = try resolver.snapshot(alloc);
+    defer copy.deinit(alloc);
+    // A switch of the provider adopts another catalog and frees the old entries.
+    var second = try testCatalogOf(alloc, &.{"provider/new"});
+    resolver.adoptOwnedCatalog(alloc, fake.provider(), .host_managed, &second);
+    try std.testing.expectEqual(@as(usize, 1), resolver.catalogEntries().?.len);
+
+    // The copy has what the resolver held when it was taken, in memory of its own.
+    const entries = copy.catalogEntries().?;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("provider/old", entries[0].id);
+    try std.testing.expectEqualStrings("provider/other", entries[1].id);
+    try std.testing.expect(copy.available("provider/old", .{}).supports_vision);
+    try std.testing.expect(!copy.available("provider/new", .{}).supports_vision);
+    try std.testing.expect(copy.downFailure() == null);
+    // A snapshot of a resolver that never loaded has nothing, and is as idle as the resolver.
+    var idle: CapabilityResolver = .{};
+    var idle_copy = try idle.snapshot(alloc);
+    defer idle_copy.deinit(alloc);
+    try std.testing.expectEqual(CapabilityResolverState.idle, idle_copy.state);
+}
 
 test "capability resolver refreshes expired snapshots at the owner boundary and retains a usable catalog" {
     const alloc = std.testing.allocator;

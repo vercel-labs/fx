@@ -40,6 +40,17 @@ const callDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
 );
+// FX_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
+// FX_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
+// test can act while a call is out and then let it end.
+const callReleasePath = process.env.FX_MCP_CALL_RELEASE_PATH;
+const callStartedPath = process.env.FX_MCP_CALL_STARTED_PATH;
+// A held call ends with its input: fx closing a stopped server's input must
+// still let the process exit.
+const heldCalls = new Set();
+process.stdin.on("end", () => {
+  for (const timer of heldCalls) clearInterval(timer);
+});
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -949,7 +960,16 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.subarray(lineEnd + 1);
     if (line.length === 0) continue;
     const message = JSON.parse(line);
-    if (callDelayMs > 0 && message.method === "tools/call") {
+    if (callReleasePath && message.method === "tools/call") {
+      if (callStartedPath) appendFileSync(callStartedPath, `${process.pid}\n`);
+      const timer = setInterval(() => {
+        if (!existsSync(callReleasePath)) return;
+        clearInterval(timer);
+        heldCalls.delete(timer);
+        handle(message);
+      }, 20);
+      heldCalls.add(timer);
+    } else if (callDelayMs > 0 && message.method === "tools/call") {
       setTimeout(() => handle(message), callDelayMs);
     } else {
       handle(message);

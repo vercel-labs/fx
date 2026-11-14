@@ -166,6 +166,7 @@ pub const Catalog = struct {
     pub fn wire(c: *Catalog, tc: *tool_runtime.Context) void {
         tc.mcp_ctx = c;
         tc.mcp_has_tool = hasToolFn;
+        tc.mcp_access_changed = accessChangedFn;
         tc.mcp_validate_tool = validateToolFn;
         tc.mcp_call_tool = callToolFn;
         tc.mcp_search_tools = searchToolsFn;
@@ -256,6 +257,8 @@ pub const Catalog = struct {
         access: Access,
         cancel: Cancel,
     ) !tool_mcp_runtime.SearchResult {
+        // A subagent's view from before the servers changed finds none of them, and says why.
+        if (c.accessChanged(access)) return .{ .model_output = try tool_search.writeServersChanged(alloc, tool_mcp_runtime.servers_changed_reason) };
         const servers = c.currentServers();
         if (request.server) |name| {
             for (servers) |s| {
@@ -554,6 +557,15 @@ pub const Catalog = struct {
             break :found .{ c.servers[found.server].name, c.lists[found.server].epoch };
         };
         return epoch == c.runtime.toolsEpoch(server);
+    }
+
+    /// Whether `access` is a subagent's view from before the servers last
+    /// changed: a server dropped since, so the view allows nothing now.
+    fn accessChanged(c: *const Catalog, access: Access) bool {
+        return switch (access) {
+            .scoped => |scope| scope.captured.runtime_generation != c.currentGeneration(),
+            .unrestricted, .servers, .disabled => false,
+        };
     }
 
     /// False when `access` can allow nothing here: no MCP, or a subagent's
@@ -928,6 +940,10 @@ fn hasToolFn(raw: *anyopaque, name: []const u8, access: Access) bool {
     return catalog(raw).hasTool(name, access);
 }
 
+fn accessChangedFn(raw: *anyopaque, access: Access) bool {
+    return catalog(raw).accessChanged(access);
+}
+
 fn validateToolFn(raw: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: Access) anyerror!tool_mcp_runtime.ValidationResult {
     return catalog(raw).validateTool(arena, name, arguments_json, access);
 }
@@ -1132,6 +1148,138 @@ test "a reload keeps a kept server's list and the bindings made from it, until a
     // The kept server's list stays without asking it again.
     try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a, .{})).len);
     try testing.expect(c.hasTool("mcp_late_echo", .unrestricted));
+}
+
+const ReadsPast = struct { reads: *const std.atomic.Value(usize), above: usize };
+
+fn readsPast(progress: ReadsPast) bool {
+    return progress.reads.load(.monotonic) > progress.above;
+}
+
+fn slowCallsOut(f: *const Fixture) bool {
+    return f.slowCalls() >= 2;
+}
+
+/// Waits for the event that makes `holds` true, for up to ten seconds.
+fn waitUntil(context: anytype, comptime holds: fn (@TypeOf(context)) bool) !void {
+    var waited_ms: u64 = 0;
+    while (!holds(context)) : (waited_ms += 5) {
+        try testing.expect(waited_ms < 10_000);
+        std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+}
+
+test "a reload beside a call that is out and a reader of the access view ends only the dropped server's call" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const kept: mcp_contract.McpServerConfig = .{ .name = "kept", .command = f.server };
+    const gone: mcp_contract.McpServerConfig = .{ .name = "gone", .command = f.server };
+    const late: mcp_contract.McpServerConfig = .{ .name = "late", .command = f.server };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &.{ kept, gone }, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A subagent's admission: the view it was given.
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
+    defer view.deinit(testing.allocator);
+    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+
+    // Its calls, one on each server, which never answer.
+    const Caller = struct {
+        catalog: *Catalog,
+        tool: []const u8,
+        access: Access,
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            _ = self.catalog.callTool(scratch.allocator(), self.tool, "{\"text\":\"slow\"}", 4096, .{
+                .access = self.access,
+                .cancel_flag = &self.cancel,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    // What the host's authority resolver reads for each tool call a subagent makes.
+    const Reader = struct {
+        catalog: *Catalog,
+        stop: std.atomic.Value(bool) = .init(false),
+        reads: std.atomic.Value(usize) = .init(0),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                var seen = self.catalog.snapshotAccessView(testing.allocator, "child", "parent", .{}) catch return;
+                seen.deinit(testing.allocator);
+                const names = self.catalog.snapshotToolNames(testing.allocator, .{}) catch return;
+                for (names) |name| testing.allocator.free(name);
+                testing.allocator.free(names);
+                _ = self.reads.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var kept_call: Caller = .{ .catalog = &c, .tool = "mcp_kept_echo", .access = child };
+    var gone_call: Caller = .{ .catalog = &c, .tool = "mcp_gone_echo", .access = child };
+    var reader: Reader = .{ .catalog = &c };
+    const kept_thread = try std.Thread.spawn(.{}, Caller.run, .{&kept_call});
+    var kept_joined = false;
+    // A failed wait stops and joins what still runs before the catalog and the runtime they use go.
+    errdefer if (!kept_joined) {
+        kept_call.cancel.store(true, .release);
+        kept_thread.join();
+    };
+    const gone_thread = try std.Thread.spawn(.{}, Caller.run, .{&gone_call});
+    var gone_joined = false;
+    errdefer if (!gone_joined) {
+        gone_call.cancel.store(true, .release);
+        gone_thread.join();
+    };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    errdefer if (!reader_joined) {
+        reader.stop.store(true, .release);
+        reader_thread.join();
+    };
+    // Both calls are out at their servers, and the reader has read once.
+    const fake: *const Fixture = &f;
+    try waitUntil(fake, slowCallsOut);
+    try waitUntil(ReadsPast{ .reads = &reader.reads, .above = 0 }, readsPast);
+
+    // One server goes and one comes, as a session's reload with a working subagent does.
+    const generation = c.currentGeneration();
+    const reads_at_reload = reader.reads.load(.monotonic);
+    try c.reload(try r.reload(&.{ kept, late }, &f.inherited));
+    gone_thread.join();
+    gone_joined = true;
+    try testing.expectEqual(@as(?anyerror, error.Cancelled), gone_call.err);
+
+    // The reader reads on through the reload, and the kept server's call is still out.
+    try waitUntil(ReadsPast{ .reads = &reader.reads, .above = reads_at_reload }, readsPast);
+    try testing.expect(!kept_call.done.load(.acquire));
+    reader.stop.store(true, .release);
+    reader_thread.join();
+    reader_joined = true;
+
+    // A server went, so the view the subagent was given holds no longer, and its next call is refused.
+    try testing.expect(generation != c.currentGeneration());
+    try testing.expect(c.accessChanged(child));
+    try testing.expect(!c.accessChanged(.unrestricted));
+    try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_kept_echo", "{}", 4096, .{ .access = child }));
+    kept_call.cancel.store(true, .release);
+    kept_thread.join();
+    kept_joined = true;
+    try testing.expectEqual(@as(?anyerror, error.Cancelled), kept_call.err);
 }
 
 test "a search says why a server it names has no tools, and calls that end say how" {
