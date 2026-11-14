@@ -148,6 +148,17 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 
+    fn stop_steering_detached_commands(self: *TurnFinalizationGuard) void {
+        const stop = self.deps.stop_steering_detached_commands orelse return;
+        stop(self.deps.ctx, self.turn_id) catch |err| {
+            debug_trace.logf(
+                "shell",
+                "steering-detached command cleanup failed turn_id={d} err={s} dropped=background_command_stop",
+                .{ self.turn_id, @errorName(err) },
+            );
+        };
+    }
+
     pub fn finish(
         self: *TurnFinalizationGuard,
         outcome: types.TurnPresentationOutcome,
@@ -167,6 +178,7 @@ pub const TurnFinalizationGuard = struct {
         }
 
         self.cleanup_agent_terminal_leases();
+        if (outcome == .interrupted) self.stop_steering_detached_commands();
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;

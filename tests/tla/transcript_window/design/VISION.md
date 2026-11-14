@@ -40,7 +40,7 @@ session log.
 
 | Choice | Cost accepted | Why |
 |---|---|---|
-| Drop the previous cycle at the first turn end after a compaction | Memory briefly holds two cycles during that turn | A tool line can still be updating when a compaction lands mid-turn |
+| Drop the previous cycle at the first turn end after a compaction | Memory holds two cycles until that turn ends | A tool line can still be updating when a compaction lands mid-turn, and a resize before that turn end reprints the previous cycle |
 | Ctrl+O reads older cycles from disk | A read when scrolling past memory | Full history without holding it; the newest part opens from memory |
 | No per-cycle byte cap | A pathological cycle could be large | Compaction is always on and bounds a cycle by the model's context; measured at most 3.9 MB of text (assumption A1) |
 | `--no-save` keeps only the held cycles | Ctrl+O cannot reach older cycles there | There is no log to read, and the user asked not to save one |

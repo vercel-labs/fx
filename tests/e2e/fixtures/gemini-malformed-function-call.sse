@@ -1,0 +1,20 @@
+data: {"type":"stream-start","warnings":[]}
+
+data: {"type":"response-metadata","id":"response_fixture_1"}
+
+data: {"type":"reasoning-start","id":"0"}
+
+data: {"type":"reasoning-delta","id":"0","delta":"I need to read a.txt with the read_file tool to find its second line."}
+
+data: {"type":"reasoning-end","id":"0"}
+
+data: {"type":"text-start","id":"1"}
+
+data: {"type":"text-delta","id":"1","delta":"I will read `a.txt` to inspect its contents and identify the second line."}
+
+data: {"type":"text-end","id":"1"}
+
+data: {"type":"finish","finishReason":{"unified":"error","raw":"MALFORMED_FUNCTION_CALL"},"usage":{"inputTokens":{"total":2076,"noCache":2076,"cacheRead":0},"outputTokens":{"total":470,"text":54,"reasoning":416}},"providerMetadata":{"googleVertex":{"finishMessage":null},"gateway":{"routing":{"originalModelId":"google/gemini-4-carbon","finalProvider":"vertex","modelAttempts":[{"canonicalSlug":"google/gemini-4-carbon","success":false,"providerAttempts":[{"provider":"vertex","success":false,"error":"stream finished with error: MALFORMED_FUNCTION_CALL"}]}]}}}}
+
+DONE
+
