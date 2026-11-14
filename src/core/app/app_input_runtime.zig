@@ -1133,7 +1133,9 @@ pub fn Runtime(comptime App: type) type {
                     if (effortCycleShortcutBlocked(app, agent)) return .done;
                     // The `/effort` menu marks the level that was in use
                     // when it opened.
-                    _ = cancelEffortMenu(app);
+                    if (cancelEffortMenu(app)) {
+                        debug_trace.logf("input", "effort menu closed without applying its highlight reason=ctrl_t_cycle", .{});
+                    }
                     try session_commands.Commands(App).cycleEffort(app, agent);
                     app.shell.render_requests.request(.footer);
                 },
@@ -2222,9 +2224,16 @@ pub fn Runtime(comptime App: type) type {
         /// while the model picker or an `/effort ` query previews a level in
         /// the status line that is not the one in use.
         fn effortCycleShortcutBlocked(app: *App, agent: *AppAgent) bool {
-            if (modelPickerShortcutBlocked(app, agent)) return true;
-            if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null) return true;
-            return completion_rt.hasModelQuery(app);
+            const reason: []const u8 = if (modelPickerShortcutBlocked(app, agent))
+                "surface_owns_input"
+            else if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null)
+                "model_picker_open"
+            else if (completion_rt.hasModelQuery(app))
+                "model_query"
+            else
+                return false;
+            debug_trace.logf("input", "ctrl+t effort cycle ignored reason={s}", .{reason});
+            return true;
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App, agent: *AppAgent) !bool {
