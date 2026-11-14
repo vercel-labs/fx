@@ -1810,8 +1810,11 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             return .{ .kind = .read, .key = path };
         },
         .edit, .write => {
-            // A failed change keeps its own row, so its reason shows.
-            if (storyCallFailed(detail) or !entryShowsDiffStats(detail)) return .{};
+            // A change that failed, was denied, or was cancelled keeps its
+            // own row, so what happened to it shows. One still running joins
+            // the file's row, where it stays when it completes.
+            if (record.outcome) |outcome| if (outcome != .completed) return .{};
+            if (!entryShowsDiffStats(detail)) return .{};
             const path = storyArgString(scratch, record, "path") orelse return .{};
             return .{ .kind = .edit, .key = path };
         },
@@ -4329,6 +4332,57 @@ test "edit rows name the file, and changes to one file share a row" {
     try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, same_text, "\n"));
 }
 
+test "a denied or cancelled change keeps its own row beside the file's edits" {
+    const alloc = std.testing.allocator;
+    const path = "/Users/example/fx/src/main.zig";
+    const args = "{\"path\":\"" ++ path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const edited = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Edited " ++ path ++ " +3 / -2\n", .class = .tool_status } };
+    const denied = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Denied edit " ++ path ++ "\n", .class = .tool_status } };
+    const cancelled = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Cancelled edit " ++ path ++ "\n", .class = .tool_status } };
+    const running = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● Editing " ++ path ++ "\n", .class = .tool_status } };
+    const edited_detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .completed };
+    const denied_detail = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .denied };
+    const cancelled_detail = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .cancelled };
+    const running_detail = ToolDetailRecord{ .entry_id = 4, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args) };
+
+    // In either order, the denial keeps its row and the edit counts once.
+    const orders = [_][2]usize{ .{ 0, 1 }, .{ 1, 0 } };
+    const pair_entries = [_]TranscriptEntry{ edited, denied };
+    const pair_details = [_]ToolDetailRecord{ edited_detail, denied_detail };
+    for (orders) |order| {
+        const entries = [_]TranscriptEntry{ pair_entries[order[0]], pair_entries[order[1]] };
+        const details = [_]ToolDetailRecord{ pair_details[order[0]], pair_details[order[1]] };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Edited main.zig +3/-2") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Denied edit main.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, " edits") == null);
+    }
+
+    // A cancelled change does not join the file's row either.
+    {
+        const entries = [_]TranscriptEntry{ edited, cancelled };
+        const details = [_]ToolDetailRecord{ edited_detail, cancelled_detail };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Edited main.zig +3/-2") != null);
+        try std.testing.expect(std.mem.find(u8, text, " edits") == null);
+    }
+
+    // One still running joins the row, which shows its state and the counts
+    // so far.
+    {
+        const entries = [_]TranscriptEntry{ edited, running };
+        const details = [_]ToolDetailRecord{ edited_detail, running_detail };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings("● Editing main.zig +3/-2 · 2 edits", std.mem.trim(u8, text, "\n"));
+    }
+}
+
 test "completed command rows shell-highlight quoted strings without coloring the action" {
     const alloc = std.testing.allocator;
     const command = "printf 'hello world'";
@@ -4576,6 +4630,23 @@ fn paintedTreeTextForTest(
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// The visible text of the group `build` makes from `entries`, one line per
+/// row, without colors. The caller owns the result.
+fn groupTextForTest(alloc: std.mem.Allocator, entries: []const TranscriptEntry, details: []const ToolDetailRecord) ![]u8 {
+    var group = try build(alloc, entries, details, 120);
+    defer group.deinit(alloc);
+    var painted: std.ArrayList(u8) = .empty;
+    defer painted.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(alloc, override.bytes);
+            try painted.append(alloc, '\n');
+        },
+        else => {},
+    };
+    return visibleLinesForTest(alloc, painted.items, 120);
 }
 
 /// The visible text of `bytes` as the terminal paints it, one line per row,
