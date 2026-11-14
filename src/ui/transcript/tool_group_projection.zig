@@ -4347,9 +4347,9 @@ test "an edit row adds up its counts when core names the file another way" {
     // A tab in the path shows escaped in core's status.
     const odd = "/Users/example/fx/odd\tname.zig";
     const odd_args = "{\"path\":\"/Users/example/fx/odd\\tname.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
-    const first = try std.fmt.allocPrint(alloc, "● Edited {f} +4 / -2\n", .{text_utils.terminalSafe(odd)});
+    const first = try alloc.print("● Edited {f} +4 / -2\n", .{text_utils.terminalSafe(odd)});
     defer alloc.free(first);
-    const second = try std.fmt.allocPrint(alloc, "● Edited {f} +1 / -1\n", .{text_utils.terminalSafe(odd)});
+    const second = try alloc.print("● Edited {f} +1 / -1\n", .{text_utils.terminalSafe(odd)});
     defer alloc.free(second);
     {
         const entries = [_]TranscriptEntry{
