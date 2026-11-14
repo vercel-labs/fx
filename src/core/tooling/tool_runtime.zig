@@ -8896,7 +8896,7 @@ test "a command's fx mcp call is checked against the approvals its tool call beg
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 }
 
-test "in auto mode a command's fx mcp call skips the safety review for the approved tool only" {
+test "in auto mode a command's fx mcp call skips the safety check for the approved tool only" {
     if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
     const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
     var counting = McpFixture.CountingContext{};
