@@ -1082,12 +1082,12 @@ fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8
 /// reads is set under `subagent_authority_mutex`, which `runSubagentChild`
 /// reads it under: the mode, the permission mode, the hook config and the MCP
 /// host. A child reads its model route, credential and model catalog from its
-/// own copy (`ModelRoute` in prompt.zig), so the reload's catalog refresh,
-/// which waits until no subagent works, and the switches of
-/// `session/set_config_option` free nothing a child reads. The rest the reload
-/// writes is atomic or under its own lock: the cancel flag, and the pending
-/// outbound requests of a kept child, such as an MCP elicitation, which end
-/// cancelled as they do after `session/cancel`.
+/// own copy (`ModelRoute` in prompt.zig), so a catalog refresh, which the
+/// reload skips while a subagent works, and the switches of
+/// `session/set_config_option`, which replace the catalog, free nothing a
+/// child reads. The rest the reload writes is atomic or under its own lock:
+/// the cancel flag, and the pending outbound requests of a kept child, such as
+/// an MCP elicitation, which end cancelled as they do after `session/cancel`.
 ///
 /// A child that waits on an approval is stopped, as the reload always did,
 /// since in ACP an approval reaches no client and the wait would last until

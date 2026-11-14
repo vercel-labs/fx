@@ -4036,9 +4036,11 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     std.debug.assert(state.active_prompt == null);
     // A refresh replaces the catalog's entries. A working subagent reads its
     // own copy of the catalog (`ModelRoute` in prompt.zig), so a refresh frees
-    // nothing it reads; the refresh still waits until none works, so that a
-    // reload and a model option leave working subagents alone. A switch of the
-    // provider, which must replace the catalog, does it under
+    // nothing it reads. The refresh is skipped while a subagent works, so that
+    // a reload and a model option leave the catalog as it is for the run. It
+    // is not run again when the subagent ends: a refresh that was due stays
+    // due, and the next call that finds no subagent working makes it. A
+    // switch of the provider, which must replace the catalog, does it under
     // `subagent_authority_mutex` in `handleSetConfigOption`.
     if (state.subagent_host) |subagents| if (!subagents.quiet()) {
         debug_trace.logf("acp", "event=model_catalog_refresh_skipped session={s} reason=subagents_working", .{active.session_id});
