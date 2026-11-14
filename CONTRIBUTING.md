@@ -14,7 +14,7 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 You need:
 
-- [Zig 0.17.1](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build, because an older Zig fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
+- [Zig 0.17.1](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build. Zig 0.17.0 still builds fx without a warning, but CI tests only 0.17.1, and the PGSO pipeline stops on any other version. A Zig older than 0.17 fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
 - [Bun](https://bun.sh) and [tmux](https://github.com/tmux/tmux) for the end-to-end tests.
 - [hyperfine](https://github.com/sharkdp/hyperfine), if you want to run the startup benchmark locally.
 
