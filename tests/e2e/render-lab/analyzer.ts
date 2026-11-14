@@ -11,8 +11,11 @@ import type {
   RenderLabManifest,
 } from "./types";
 
-export const ACTIVE_TOOL_MARKER = "Running sleep 1; i=1";
-export const TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
+// The scenario's command row shows its steps in short form.
+export const ACTIVE_TOOL_MARKER = "Running sleep, printf, sleep";
+export const TERMINAL_TOOL_MARKER = "Ran sleep, printf, sleep";
+// Ctrl+O shows the scenario's command in full.
+export const EXPANDED_TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
@@ -481,7 +484,7 @@ function assertActiveToolPlacementScenario(
   ].includes(frame.event)) {
     assertMarkerCount(failures, frame, activeMarker, 0);
     if (frame.event !== "active-tool-command-output-expanded-shrink") {
-      assertMarkerCount(failures, frame, terminalMarker, 1);
+      assertMarkerCount(failures, frame, EXPANDED_TERMINAL_TOOL_MARKER, 1);
     }
     assertSemanticScrollbackMarkerCount(
       failures,
@@ -494,7 +497,7 @@ function assertActiveToolPlacementScenario(
       assertSemanticScrollbackMarkerCount(
         failures,
         frame,
-        terminalMarker,
+        EXPANDED_TERMINAL_TOOL_MARKER,
         1,
         "active-tool-terminal-scrollback-once",
       );
@@ -565,8 +568,13 @@ function assertActiveActivitySequence(
   const submittedRows = lines.flatMap((line, row) =>
     line.includes(submittedMarker) ? [row] : []
   );
+  // A group with one call has no summary row: the call is the group's
+  // header, so its activity row is also its group row.
   const groupRows = lines.flatMap((line, row) =>
-    line.includes("tool call") && row < lines.length - 1 ? [row] : []
+    (line.includes("tool call") || (line.startsWith("● ") && line.includes(activeMarker))) &&
+      row < lines.length - 1
+      ? [row]
+      : []
   );
   const activityRows = lines.flatMap((line, row) =>
     line.includes(activeMarker) ? [row] : []
@@ -584,7 +592,7 @@ function assertActiveActivitySequence(
   const submittedRow = submittedRows[0]!;
   const groupRow = groupRows[0]!;
   const activityRow = activityRows[0]!;
-  if (submittedRow >= groupRow || groupRow >= activityRow) {
+  if (submittedRow >= groupRow || groupRow > activityRow) {
     push(
       failures,
       "active-tool-activity-marker-order",

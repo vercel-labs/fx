@@ -329,12 +329,12 @@ test("render-lab analyzer enforces active-tool placement and uniqueness", () => 
   const cases = [
     {
       event: "active-tool-visible",
-      grid: ["Run /help for commands", "", "● Running sleep 1; i=1", "  sleep 0.03; done; sleep 4", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["Run /help for commands", "", "● Running sleep, printf, sleep", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
       rejected: false,
     },
     {
       event: "active-tool-clipped",
-      grid: ["│ ACTIVE_TOOL_LINE_05", "│ … 27 lines more (ctrl+o to view)", "", "● Running sleep 1; i=1", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["│ ACTIVE_TOOL_LINE_05", "│ … 27 lines more (ctrl+o to view)", "", "● Running sleep, printf, sleep", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
       rejected: false,
     },
     {
@@ -344,7 +344,7 @@ test("render-lab analyzer enforces active-tool placement and uniqueness", () => 
     },
     {
       event: "active-tool-visible",
-      grid: ["Run /help for commands", "● Running sleep 1; i=1", "● Running sleep 1; i=1", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["Run /help for commands", "● Running sleep, printf, sleep", "● Running sleep, printf, sleep", "", "────────────────", "❯", "────────────────", "test"],
       rejected: true,
     },
   ];
@@ -367,7 +367,7 @@ test("render-lab analyzer rejects activity marker corruption", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const submitted = "exercise one active command placement";
   const group = "● 1 tool call · 1 command";
-  const activity = "└ Running sleep 1; i=1";
+  const activity = "└ Running sleep, printf, sleep";
   const cases = [
     {
       name: "missing",
@@ -458,6 +458,7 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
   ];
   for (const entry of cases) {
     const grid = [
+      // The expanded view shows the command in full.
       "● Ran sleep 1; i=1",
       "────────────────",
       "❯",
@@ -470,7 +471,7 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
       null,
       [],
       "active-tool-command-output-expanded",
-      ["● Ran sleep 1; i=1", ...entry.lines].join("\n"),
+      ["● Ran sleep, printf, sleep", ...entry.lines].join("\n"),
     );
     configureActiveToolManifest(manifest);
     const failures = analyzeRun(manifest).failures.map(

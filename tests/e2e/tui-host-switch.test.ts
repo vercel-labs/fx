@@ -414,7 +414,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // The footer names main, not the subagent.
         expect(main).not.toMatch(/^reviewer \u00b7 /m);
         // The subagent's report of main's message shows as a subagent row.
-        expect(main).toContain("reviewer completed");
+        expect(main).toContain("reviewer finished");
       });
 
       // Main's model never sees the answer to a message it did not send: its
@@ -826,8 +826,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // The gateway sees main's request before fx runs the message it
           // returns. Close only once main shows the message working, which it
           // does while the message waits for the start; a close before that
-          // makes the message start a new worker instead.
-          await session.waitForPane((pane) => pane.includes("worker working \u00b7 SWITCH_START_NOTE"), 15_000);
+          // makes the message start a new worker instead. The worker's row
+          // reads "Messaged worker" after the first message and "worker
+          // working" while the second one waits.
+          await session.waitForPane((pane) => /^[●├└] worker working$/m.test(pane), 15_000);
           await selectAgent(session, "worker");
           await session.sendKeys("BSpace");
           await session.waitForText("press delete again to close this subagent", 10_000);
@@ -1649,7 +1651,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         first.release();
         // Main's turn ended with the receipt; the report comes once the
         // subagent's write is done.
-        await session.waitForText("follower completed", 30_000);
+        await session.waitForText("follower finished", 30_000);
         expect(readFileSync(join(workspace, "followed.txt"), "utf8")).toBe("FOLLOWED\n");
         expect(await session.captureFullScrollback()).not.toContain("needs permission");
 
@@ -2435,7 +2437,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("BSpace");
         await session.sendKeys("Down");
         const working = await session.waitForText("enter switch     delete close     esc back", 10_000);
-        expect(working).toContain("Review src/parser.zig for bugs");
+        // Behind the list is main's conversation, whose row names the
+        // reviewer it messaged, or the highlighted reviewer's, which starts
+        // with that message; which one shows first depends on timing.
+        expect(working).toMatch(/Messaged reviewer|Review src\/parser\.zig for bugs/);
         expectRowOrder(working, mainRow(), subagentRow("reviewer"));
         expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
         await session.sendKeys("BSpace");
@@ -2689,7 +2694,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, async (session) => {
         await session.sendText("SWITCH_USER start them, then close tester");
         await until("main's turn that closes tester", () => mainCalls >= 3);
-        await session.waitForPane((pane) => pane.includes("sent to tester"), 15_000);
+        await session.waitForPane((pane) => pane.includes("Messaged tester"), 15_000);
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         const rows = agentRows(await session.capturePaneEscapes()).map((row) => row.name);
@@ -2767,15 +2772,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // The name has arrived and the rest of the call has not.
           await session.waitForText("Managing reviewer", 15_000);
           nameSent.release();
-          await session.waitForText("sent to reviewer", 15_000);
+          await session.waitForText("Messaged reviewer", 15_000);
           // Both are working when main checks on them and then waits.
-          await session.waitForText("checked reviewer, builder", 15_000);
-          await session.waitForText("waiting for reviewer, builder", 15_000);
+          await session.waitForText("Checked reviewer, builder", 15_000);
+          await session.waitForText("Waiting for reviewer, builder", 15_000);
           children.reviewer.release();
           children.builder.release();
-          const done = await session.waitForPane((pane) => pane.includes("waited for reviewer, builder"), 30_000);
-          expect(done).not.toContain("waiting for subagents");
-          expect(await session.captureFullScrollback()).not.toContain("checked subagents");
+          const done = await session.waitForPane((pane) => pane.includes("Waited for reviewer, builder"), 30_000);
+          expect(done).not.toContain("Waiting for subagents");
+          expect(await session.captureFullScrollback()).not.toContain("Checked subagents");
         });
       } finally {
         nameSent.release();
@@ -2800,7 +2805,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, async (session) => {
         await session.sendText("SWITCH_USER run them");
         const pane = await session.waitForText("MAIN_CLOSE_DONE", 60_000);
-        expect(pane).toContain("\u2514 closed tester");
+        // The close is its group's only row, so it is the group's header.
+        expect(pane).toContain("\u25cf Closed tester");
         // Main alone again: no agent indicator, and ↓ opens no list, which
         // would take the next key; the composer shows it instead.
         await session.waitForPane((value) => !value.includes("main \u2193"), 10_000);
@@ -2849,7 +2855,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(laneSteps).toBe(2);
         const screen = await session.captureFullScrollback();
         expect(screen).toContain("lane4 failed");
-        expect(screen).not.toContain("lane4 completed");
+        expect(screen).not.toContain("lane4 finished");
         // Main's model hears that lane4 failed and why, so it can recover
         // or tell the user.
         const fields = JSON.parse(report.slice(report.indexOf("{")));
