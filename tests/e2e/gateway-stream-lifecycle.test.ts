@@ -9842,8 +9842,24 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
     let phase = 0;
-    const gateway = startDynamicFakeGateway((body) => {
-      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_SEED_DONE");
+    // Whether the seed run saved its first turn. A report that comes while
+    // that turn is open joins it at its next step boundary, even after its
+    // final answer, so the worker answers only once the turn is saved.
+    const seedTurnSaved = () => {
+      try {
+        return rootSessionIds(root.home).some((id) =>
+          readFileSync(join(sessionDir(root.home, id), "log.jsonl"), "utf8").includes('"kind":"turn_committed"'));
+      } catch {
+        // A session fx is still creating has no log or first line yet.
+        return false;
+      }
+    };
+    let workerWaitedForSeedTurn = false;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        if (phase === 0) workerWaitedForSeedTurn = await waitUntil(seedTurnSaved, 10_000);
+        return fakeGatewayFinalText("CHILD_SEED_DONE");
+      }
       if (phase === 0) {
         // The worker's report starts the seed run's second turn.
         if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_SEED_SENTINEL");
@@ -9859,7 +9875,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const seeded = await runFx(["ask", "--json", "--auto", "Start a saved conversation with a worker."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
-      expect(seeded.code).toBe(0);
+      if (seeded.code !== 0) {
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+        throw new Error(`seed run failed: code=${seeded.code}\nstdout=${seeded.stdout}\nstderr=${seeded.stderr}\ntrace=${trace}`);
+      }
+      expect(workerWaitedForSeedTurn).toBe(true);
       const id = parseAskJson(seeded.stdout).session_id;
       expect(id).not.toBe("");
       // The child's own session is gone, so nothing of it can come back.
