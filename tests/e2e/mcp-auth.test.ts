@@ -1485,18 +1485,14 @@ describe("MCP login", () => {
     await tui.waitForComposer(15_000);
     // The shell starts the server on its own; the status line says why it needs a login.
     await tui.waitForText("fixture refused the saved login · /mcp", 20_000);
-    const reports = () => readdirSync(traceDir).filter(name => name.startsWith("fx-trace-") && name.endsWith(".md")).sort();
-    const before = new Set(reports());
+    const before = new Set(traceReportNames(traceDir));
     await tui.sendText("/trace");
-    let report = "";
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline && !report.includes("## Transcript Timeline")) {
-      const fresh = reports().filter(name => !before.has(name));
-      if (fresh.length > 0) report = readFileSync(join(traceDir, fresh[fresh.length - 1]), "utf8");
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    expect(report).toContain("- mcp server refused the saved login name=fixture");
-    expect(report).toContain(REFUSED_SAVED);
+    const report = await waitForNewTraceReport(traceDir, before);
+    // The trace's problem for the server names the refusal in the server's words, as the status line does.
+    const problem = report.problems("mcp_server").find((p) => p.name === "fixture");
+    expect(problem?.issue).toBe("needs_login");
+    expect(problem?.error).toContain(REFUSED_SAVED);
+    expect(report.text).not.toContain(ACCESS_INITIAL);
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 90_000);
 
