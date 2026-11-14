@@ -7680,7 +7680,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           // begins. The gate opens as main receives its wait call, so a fast
           // build could finish the child before that wait starts. The reply
           // waits until main's row shows the wait on the working child.
-          await session?.waitForText("waiting for helper", TIMEOUT);
+          await session?.waitForText("Waiting for helper", TIMEOUT);
           return fakeGatewayFinalText("JOINED_CHILD_REPLY");
         }
         // The report joined main's running turn after its wait.
@@ -7691,6 +7691,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         if (parentStep < 4) {
           parentStep += 1;
+          releaseChild();
           return fakeGatewayToolCall(`joined_wait_${parentStep}`, "subagent", { request: { action: "wait" } });
         }
         return fakeGatewayFinalText("REPORT_NEVER_JOINED");
@@ -7712,10 +7713,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
-        // The child answers only once main's wait runs. A child that
-        // finished first would leave the wait no subagent to name.
-        await session.waitForText(/waiting for helper/i, TIMEOUT);
-        releaseChild();
         await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
         await session.waitForText(row, TIMEOUT);
         const live = await session.captureFullScrollback();
