@@ -844,13 +844,11 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("history feedback live complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      expect(scrollback.indexOf("first command completed")).toBeGreaterThanOrEqual(0);
-      expect(scrollback.indexOf("second command completed")).toBeGreaterThan(
-        scrollback.indexOf("first command completed"),
-      );
-      expect(scrollback.indexOf(feedback)).toBeGreaterThan(
-        scrollback.indexOf("second command completed"),
-      );
+      // The two commands share one row by their steps, and the feedback comes
+      // after it.
+      const commandsRow = scrollback.indexOf("└ Ran touch, printf");
+      expect(commandsRow).toBeGreaterThanOrEqual(0);
+      expect(scrollback.indexOf(feedback)).toBeGreaterThan(commandsRow);
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
       expect(rawAnsiScrollback).toContain(feedback);
       expect(existsSync(join(root.workspace, "history-feedback-first.txt"))).toBe(true);
@@ -905,13 +903,9 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendKeys("Enter");
       await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
-      expect(pickerScrollback.indexOf("first command completed")).toBeGreaterThanOrEqual(0);
-      expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(
-        pickerScrollback.indexOf("first command completed"),
-      );
-      expect(pickerScrollback.indexOf("second command completed")).toBeGreaterThan(
-        pickerScrollback.indexOf(feedback),
-      );
+      const pickerCommandsRow = pickerScrollback.indexOf("Ran touch, printf");
+      expect(pickerCommandsRow).toBeGreaterThanOrEqual(0);
+      expect(pickerScrollback.indexOf(feedback)).toBeGreaterThan(pickerCommandsRow);
       await activeSession.sendText("Continue through interactive resume.");
       await activeSession.waitForText("history feedback picker resume complete", TIMEOUT);
       expect(pickerGateway.requests).toHaveLength(1);
@@ -1098,7 +1092,8 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("direct auto complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      const completedIndex = scrollback.indexOf("└ Ran pwd");
+      // The group's only call is its header.
+      const completedIndex = scrollback.indexOf("● Ran pwd");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
       expect(streamTextIndex).toBeGreaterThanOrEqual(0);
@@ -1221,10 +1216,12 @@ describe("effect-aware command permissions", () => {
       expect(running).toContain("Running ./fxc110-stream.sh");
       expectNoOutputRows(running);
 
-      await activeSession.waitForText("1 failed", TIMEOUT);
+      // The last command failed, so the group ends in ✗, and its reason line
+      // shows one line of the error while the full output stays in Ctrl-O.
+      const header = "● Ran commands ✗";
+      await activeSession.waitForText(header, TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
-      expect(completed).toContain("3 tool calls");
-      expect(completed).toContain("1 failed");
+      expect(completed).toContain("✗ exit 7 · FXC110_FAILED_STDERR");
       for (const script of scripts) expect(completed).toContain(script.name);
       expectNoOutputRows(completed);
 
@@ -1239,7 +1236,7 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendKeys("C-o");
       await activeSession.waitForPane(
-        pane => pane.includes("3 tool calls") && !pane.includes("esc close · pgup/pgdn scroll"),
+        pane => pane.includes(header) && !pane.includes("esc close · pgup/pgdn scroll"),
         TIMEOUT,
       );
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -1259,7 +1256,7 @@ describe("effect-aware command permissions", () => {
         height: 32,
       });
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.waitForText("3 tool calls", TIMEOUT);
+      await activeSession.waitForText(header, TIMEOUT);
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
@@ -1312,24 +1309,25 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
-      const narrowRow = narrow.split("\n").find((line) => line.includes("└ Ran printf ok"));
-      expect(narrowRow).toBeDefined();
-      expect(narrowRow).toEndWith("…");
-      expect(narrowRow).not.toContain("omega >/dev/null");
+      // The command is long, so its row shows its steps in short form at every
+      // width; Ctrl-O keeps the full command.
+      const narrowRow = narrow.split("\n").find((line) => line.includes("● Ran printf"));
+      expect(narrowRow).toBe("● Ran printf ✓");
 
       await activeSession.resizeWindow(240, 32);
+      // The resize redraws the row on a later frame, so wait for it.
+      await activeSession.waitForPane((pane) => pane.includes("● Ran printf ✓"), TIMEOUT);
       const wide = await activeSession.captureFullScrollback();
-      const wideRow = wide.split("\n").find((line) => line.includes("└ Ran printf ok"));
-      expect(wideRow).toBe(`└ Ran ${command}`);
+      const wideRow = wide.split("\n").find((line) => line.includes("● Ran printf"));
+      expect(wideRow).toBe("● Ran printf ✓");
 
       await activeSession.sendText("Run the next prepared command.");
       await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
-      const workspaceRow = workspaceWide.split("\n").find((line) =>
-        line.includes("└ Ran printf '%s' absolute-path-prefix-"),
-      );
-      expect(workspaceRow).toContain(" ./file >/dev/null");
-      expect(workspaceRow).not.toContain(root.workspace);
+      // The second command is long too, and its row never shows the
+      // workspace path.
+      expect(workspaceWide.split("\n").filter((line) => line === "● Ran printf ✓")).toHaveLength(2);
+      expect(workspaceWide).not.toContain(root.workspace);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -2615,7 +2613,7 @@ describe("effect-aware command permissions", () => {
       expect(compactScrollback).not.toContain(
         "Auto agent approved this request: Running command.",
       );
-      expect(compactScrollback).toContain("└ Ran");
+      expect(compactScrollback).toContain("● Ran printf approved");
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -2862,7 +2860,8 @@ describe("effect-aware command permissions", () => {
           foregroundFxRow(ttyPath, binary);
           process.kill(fixture.pid, 0);
 
-          await activeSession.waitForText("Running exec python3", TIMEOUT);
+          // `exec` drops out of the short form; the script's name stays.
+          await activeSession.waitForText("Running python3 terminal-session-fixture.py", TIMEOUT);
           await activeSession.sendLiteralText("q");
           await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
@@ -2907,7 +2906,7 @@ describe("effect-aware command permissions", () => {
         expect(JSON.parse(pwdResult).output_delta).toContain(root.workspace);
 
         const scrollback = await activeSession.captureFullScrollback();
-        const completedIndex = scrollback.indexOf("Ran exec python3");
+        const completedIndex = scrollback.indexOf("Ran python3 terminal-session-fixture.py");
         const finalIndex = scrollback.indexOf(`TTY_SESSION_FINAL_${sandbox}`);
         const followupIndex = scrollback.indexOf("Run pwd through the user profile.");
         const pwdFinalIndex = scrollback.indexOf(`TTY_SESSION_PWD_FINAL_${sandbox}`);
@@ -3015,7 +3014,8 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
-      expect(pane).toContain("1 denied");
+      // The held call is its group's header, which names the caution.
+      expect(pane).toContain(`● Safety caution ${command}`);
       expect(pane).toContain(`Safety caution ${command}`);
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
@@ -3051,7 +3051,7 @@ describe("effect-aware command permissions", () => {
         (value) => value.includes(`Safety caution ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain("1 denied");
+      expect(resumedPane).toContain(`● Safety caution ${command}`);
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
@@ -3520,7 +3520,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendKeys("3");
       const reported = await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
       // The report shows as a finished subagent row, not as the user's prompt.
-      expect(reported).toContain("helper completed");
+      expect(reported).toContain("helper finished");
       expect(reported).not.toContain("Subagent report (untrusted");
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendText("/quit");
@@ -3697,7 +3697,9 @@ describe("effect-aware command permissions", () => {
       const foregroundRawAnsi = await activeSession.captureFullScrollbackEscapes();
       expect(foregroundScrollback).toContain("large TUI foreground complete");
       expect(foregroundScrollback).not.toContain("integer does not fit in destination type");
-      expect(foregroundRawAnsi).toContain("…");
+      // The comment lines drop out of the short form, so the row is short.
+      expect(foregroundScrollback).toContain("● Ran printf ✓");
+      expect(foregroundRawAnsi).not.toContain("large lifecycle");
       expect(existsSync(join(foregroundRoot.workspace, foregroundMarker))).toBe(true);
       expect(foregroundGateway.requests).toHaveLength(2);
       expect(readFileSync(foregroundStderr, "utf8")).toBe("");

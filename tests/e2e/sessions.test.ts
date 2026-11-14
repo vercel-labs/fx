@@ -4608,7 +4608,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     held.release("HELD_CHILD_RESULT");
     const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
-    expect(reported).toContain("worker completed");
+    expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
     // The report's turn: its tool call, then its reply.
     expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);

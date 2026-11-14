@@ -2395,8 +2395,10 @@ test "auto permission notice is retained without changing compact transcript geo
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Auto agent approved") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
+    // The group's only row is its header.
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "●") != null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Ran printf done") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "└") == null);
 
     var projection = try runtime.buildFullTranscriptProjection(alloc, null);
     defer projection.deinit(alloc);
@@ -2971,7 +2973,8 @@ test "compact run command group stays width safe after resize" {
                 else => {},
             }
         }
-        try std.testing.expectEqual(@as(usize, 2), status_line_count);
+        // The group's only row is its header, one line long.
+        try std.testing.expectEqual(@as(usize, 1), status_line_count);
         try std.testing.expect(output_line == null);
 
         try std.testing.expect(status_line != null);
@@ -3743,7 +3746,9 @@ test "command output consolidation preserves current compact ownership" {
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "STREAM 001") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
+    // The running command is still its compact group's header.
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "●") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "run_command") != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,

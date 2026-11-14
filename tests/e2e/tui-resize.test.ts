@@ -1833,7 +1833,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("stream the resize marker command");
-      await session.waitForText("Running for i in $(seq 1 96)", TIMEOUT);
+      // The loop's row shows its steps in short form.
+      await session.waitForText("Running printf, sleep", TIMEOUT);
 
       const resizeCount = committedResizeFrameCount(tracePath);
       await new Promise((resolve) => setTimeout(resolve, 350));
@@ -1846,8 +1847,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
       expect(scrollback).toContain("stream the resize marker command");
       expect(scrollback).not.toContain(preFxMarker);
-      expect(scrollback).toContain("● 1 tool call · 1 command");
-      expect(scrollback).toContain("Ran for i in $(seq 1 96)");
+      expect(scrollback).toMatch(/^● Ran printf, sleep ✓$/m);
       expect(scrollback).not.toContain("resize-stream-marker 001");
       expect(scrollback).not.toContain("resize-stream-marker 096");
       expect(scrollback).toContain(finalResponse);
@@ -1948,7 +1948,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ];
         expect(ids).toEqual(expected);
         if (tailCount > 0) {
-          expect(full.match(/3 tool calls/g)).toHaveLength(1);
+          expect(full.match(/● Read files/g)).toHaveLength(1);
           for (const path of children) expect(full).not.toContain(path);
         }
       };
@@ -1967,7 +1967,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await assertRows(0);
       await session.sendText("Second deterministic response.");
       await waitStream(2);
-      await session.waitForText("3 tool calls", 10_000);
+      await session.waitForText("● Read files", 10_000);
       send(1, tail(0));
       await session.waitForText("RETAIN_TAIL_0000", 10_000);
       expect(await session.capturePane()).not.toContain("xxxxxxxx");
