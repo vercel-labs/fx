@@ -127,7 +127,9 @@ pub const Event = union(enum) {
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
     /// `oversized` says a lost call's answer was over the message limit: a
     /// stdio line over `max_line`, or an HTTP answer over `max_message`.
-    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
+    /// `refused_bytes` is the length of the line that gave a `malformed` call its grace, 0 for any
+    /// other (see `request.Timeouts.refused_ms`).
+    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0 },
     /// A call's server reported progress that the request core accepted.
     /// `message` is terminal-safe and cut to 160 bytes, valid until the
     /// next `next`.
@@ -194,6 +196,9 @@ const Logical = struct {
     name: []const u8 = "",
     arguments: ?[]const u8 = null,
     timed_out: bool = false,
+    /// The server's answer could not be read: an HTTP body fx refused, or the grace of a refused
+    /// line ran out. The call ends as `malformed` where it would end `cancelled` or `http_failure`.
+    malformed: bool = false,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -282,6 +287,8 @@ pub const Server = struct {
     /// The message of an invalid reply's answer, kept as long as the line it
     /// came from: until the process is read again.
     refused_reply: [512]u8 = undefined,
+    /// The length of the last refused line that named no request.
+    refused_bytes: u32 = 0,
     /// An excerpt of the last stdout line that answered nothing, since the
     /// server was last ready: what a failed start wrote instead.
     stray: [excerpt_max + 3]u8 = undefined,
@@ -746,6 +753,10 @@ pub const Server = struct {
                 try r.onEventId(m.key, m.event_id, m.retry_ms);
                 try r.onMessage(m.key, m.status, m.message);
             },
+            .refused => |m| {
+                try r.onEventId(m.key, m.event_id, m.retry_ms);
+                try r.onRefusedLine(m.err, m.bytes);
+            },
             .mark => |m| try r.onEventId(m.key, m.event_id, m.retry_ms),
             .session => |s| try r.onSession(s.key, s.id),
             .opened => |key| if (r.legacy != null and key == r.listen_key) try r.listenSettled(),
@@ -774,11 +785,17 @@ pub const Server = struct {
 
     /// A line `decode` refused that names a request in flight is that
     /// request's answer, an invalid one: the request fails with what was
-    /// wrong and the start of the line. Any other is ignored.
+    /// wrong and the start of the line. One that names a request not in
+    /// flight is ignored. One that names none gives each normal request in
+    /// flight a short deadline (`request.Timeouts.refused_ms`).
     fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8) Error!void {
         // Empty for a process that has gone since.
         if (line.len == 0) return;
-        const id = wire.responseId(line) orelse return r.keepStray(line);
+        const id = wire.responseId(line) orelse {
+            r.keepStray(line);
+            r.refused_bytes = @intCast(@min(line.len, std.math.maxInt(u32)));
+            return r.stepRequest(.refused_line);
+        };
         if (r.logicalFor(id) == null) return r.keepStray(line);
         const why = switch (err) {
             error.NotJsonRpc2 => "its jsonrpc isn't \"2.0\"",
@@ -869,7 +886,7 @@ pub const Server = struct {
         if (r.legacyEra() and (l.what == .call or l.what == .list)) return r.legacyDelivered(id, switch (outcome) {
             .result, .peer_error => .result,
             .none, .lost, .ended => .lost,
-            .timed_out, .cancelled => .cancelled,
+            .timed_out, .cancelled, .malformed => .cancelled,
         });
         l.id = null;
         switch (l.what) {
@@ -884,7 +901,7 @@ pub const Server = struct {
                 .result => .result,
                 .peer_error => .failure,
                 .none, .lost, .ended => .lost,
-                .timed_out, .cancelled => .cancelled,
+                .timed_out, .cancelled, .malformed => .cancelled,
             }),
         }
         l.used = false;
@@ -1229,7 +1246,11 @@ pub const Server = struct {
                 try r.runAuth(null);
             }
         }
-        try r.onEndedDomain(key, status, if (how == .rejected) .http_failure else how);
+        // An answer fx could not read ends the call like any other HTTP failure, but as malformed.
+        if (how == .unreadable) if (r.logicalFor(key)) |l| {
+            l.malformed = true;
+        };
+        try r.onEndedDomain(key, status, if (how == .rejected or how == .unreadable) .http_failure else how);
     }
 
     fn onEndedDomain(r: *Server, key: u64, status: u16, how: http.Ending) Error!void {
@@ -1342,15 +1363,17 @@ pub const Server = struct {
                 r.emit(.{
                     .called = .{
                         .handle = l.handle,
-                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else if (l.unrenewed and o == .http_failure) .auth_unavailable else switch (o) {
+                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else if (l.unrenewed and o == .http_failure) .auth_unavailable else if (l.malformed and (o == .cancelled or o == .http_failure)) .malformed else switch (o) {
                             .none => .failure,
                             inline else => |tag| @field(CallOutcome, @tagName(tag)),
                         },
-                        // Only a lost stream leaves the call maybe run.
-                        .maybe_ran = o == .lost,
+                        // Only a lost stream leaves the call maybe run, and a server that
+                        // answered something fx could not read.
+                        .maybe_ran = o == .lost or l.malformed,
                         .timed_out = l.timed_out,
                         .answer = if (o == .result or o == .failure) r.held_answer else null,
                         .oversized = o == .lost and r.losing_oversized,
+                        .refused_bytes = if (l.malformed and o == .cancelled) r.refused_bytes else 0,
                     },
                 });
                 l.used = false;
@@ -1668,7 +1691,7 @@ pub const Server = struct {
             .complete, .accepted, .broken => .{ .broke = key },
             // Resuming would bring the same answer again (LHTTP-11).
             .too_large => .{ .too_large = key },
-            .http_failure, .rejected => .{ .refused = key },
+            .http_failure, .rejected, .unreadable => .{ .refused = key },
         };
         r.losing_oversized = event == .too_large;
         defer r.losing_oversized = false;
@@ -1707,14 +1730,16 @@ pub const Server = struct {
                         else => .result,
                     } else .result,
                     .lost => .lost,
-                    .failed, .none => if (l.needs_auth) .needs_auth else if (l.unrenewed) .auth_unavailable else .http_failure,
-                    .cancelled => .cancelled,
+                    .failed, .none => if (l.needs_auth) .needs_auth else if (l.unrenewed) .auth_unavailable else if (l.malformed) .malformed else .http_failure,
+                    .cancelled => if (l.malformed) .malformed else .cancelled,
                 },
-                // Only a lost stream leaves the call maybe run.
-                .maybe_ran = outcome == .lost,
+                // Only a lost stream leaves the call maybe run, and a server that answered
+                // something fx could not read.
+                .maybe_ran = outcome == .lost or l.malformed,
                 .timed_out = l.timed_out,
                 .answer = if (outcome == .result) r.held_answer else null,
                 .oversized = outcome == .lost and r.losing_oversized,
+                .refused_bytes = if (l.malformed and outcome == .cancelled) r.refused_bytes else 0,
             },
         });
         if (l.what == .list and outcome != .result) {
@@ -1981,9 +2006,16 @@ pub const Server = struct {
         var out: request.Output = .{};
         r.table.step(event, &out) catch return;
         if (r.tracer()) |t| try request.writeTrace(t, "remote", &out);
-        // A timeout comes with its cancel first: mark it before either runs.
-        for (out.effects()) |effect| if (effect == .deliver and effect.deliver.outcome == .timed_out) {
-            if (r.logicalFor(effect.deliver.id)) |l| l.timed_out = true;
+        // A timeout comes with its cancel first: mark it before either runs. So does a grace
+        // that ran out, which ends the call as malformed.
+        for (out.effects()) |effect| if (effect == .deliver) switch (effect.deliver.outcome) {
+            .timed_out => if (r.logicalFor(effect.deliver.id)) |l| {
+                l.timed_out = true;
+            },
+            .malformed => if (r.logicalFor(effect.deliver.id)) |l| {
+                l.malformed = true;
+            },
+            else => {},
         };
         for (out.effects()) |effect| switch (effect) {
             .write_request => {},
@@ -2002,7 +2034,7 @@ pub const Server = struct {
             .deliver => |d| if (r.stdio) try r.stdioDelivered(d.id, d.outcome) else switch (d.outcome) {
                 // 2026: closing the stream cancels it. 2025: a call or list's
                 // cancel goes through the session, but initialize has none.
-                .timed_out => if (r.logicalFor(d.id)) |l| {
+                .timed_out, .malformed => if (r.logicalFor(d.id)) |l| {
                     if (r.legacy == null) try r.stepExchange(l, .cancel) else if (l.what == .initialize) try r.onInitializeTimedOut(l, d.id);
                 },
                 // The server ended the listen; its stream closes.

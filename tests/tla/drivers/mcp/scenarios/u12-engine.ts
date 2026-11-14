@@ -698,4 +698,133 @@ export const scenarios: Scenario[] = [
     machines: { a: ["engine"] },
     control: { server: "a", maxAttempts: 3 },
   }),
+  // ---- a line the engine refuses that names no request: the grace (tests/tla/mcp/Request.tla) ----
+  // Setup: the lab flag --refused-ms is read and ignored until the engine has the grace.
+  engineScenario({
+    name: "u12-refused-grace-silent",
+    description: "A stdio line the engine refuses and cannot attach to a call, then silence: the call ends as malformed when the grace runs out, long before its idle timer, and the server is told it was cancelled",
+    servers: { a: { rules: modern({ method: "tools/call", tool: "silent", rawBytes: 40, noReply: true }) } },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a silent", "expect a.called.1.malformed 5000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        same(event(lines, "a.called.1")?.timed_out, false, "timed out"),
+        same(received(logs.a, "notifications/cancelled").length, 1, "cancel notices the server got"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "refused_line"), "no refused_line step in the request trace"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-progress",
+    description: "Progress for the call's own token after the refused line clears its grace: a call that works for longer than the grace returns its result, and no grace ends it",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          tool: "alive",
+          rawBytes: 40,
+          before: Array.from({ length: 10 }, (_, n) => ({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: n + 1 } })),
+          beforeEveryMs: 150,
+          result: { resultType: "complete", content: [{ type: "text", text: "fine" }] },
+        }),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a alive", "expect a.called.1.result 6000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "a grace ended a call that had progress"),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-later-call",
+    description: "A call sent after the refused line gets no grace: a slow call started after it returns its result, long after the grace would have run out",
+    servers: {
+      a: {
+        rules: modern(
+          { method: "tools/call", tool: "once", rawBytes: 40, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+          { method: "tools/call", tool: "slow", delayMs: 1500, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+        ),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a once", "expect a.called.1.result 3000", "call a slow", "expect a.called.2.result 5000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "the grace ended a call"),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-valid-reply",
+    description: "A valid reply inside the grace still matches its call: the line, a notification 400 ms later, then the reply, with the grace at 600 ms",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          tool: "late",
+          rawBytes: 40,
+          before: [
+            { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "one" } },
+            { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "two" } },
+          ],
+          beforeEveryMs: 400,
+          result: { resultType: "complete", content: [{ type: "text", text: "fine" }] },
+        }),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a late", "expect a.called.1.result 3000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "the grace ended a call that was answered inside it"),
+  }),
+  engineScenario({
+    name: "u12-refused-http-json-body",
+    description: "An HTTP JSON body the engine cannot read ends its call at once as malformed, not as an HTTP failure",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", raw: '{"jsonrpc":"2.0","result":{"bad":,"id":1}', contentType: "application/json" },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h echo", "expect h.called.1.malformed 3000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-readable-id",
+    description: "An SSE event with the call's id and a jsonrpc that is not 2.0 ends the call at once as -32600, as on stdio, though the stream stays open",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, before: [{ jsonrpc: "1.0", id: "$id", result: {} }], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h echo", "expect h.called.1.failure 3000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-no-id",
+    description: "An SSE event that names no request, on a stream that stays open: the call ends as malformed when the grace runs out, as a stdio call does",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, before: ["not an object"], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h echo", "expect h.called.1.malformed 5000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (_lines, _logs, trace) =>
+      expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+  }),
 ];

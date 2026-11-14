@@ -42,6 +42,9 @@ pub const Ending = enum {
     accepted,
     /// A status with no JSON-RPC message in the body.
     http_failure,
+    /// A 2xx JSON body that is not a JSON-RPC message fx can read: the server answered, but what
+    /// it sent is not a valid message. The request failed like `http_failure`, with other words.
+    unreadable,
     /// The connection or stream broke.
     broken,
     /// A message was over `max_message`, so the rest of the stream was left
@@ -57,6 +60,10 @@ pub const Incoming = union(enum) {
     /// A JSON-RPC message in the answer to request `key`, with the answer's
     /// status, and the SSE event's id and `retry` when it set them.
     message: struct { key: u64, status: u16, bytes: []const u8, message: wire.Message, event_id: ?[]const u8, retry_ms: ?u32 },
+    /// An SSE event on `key`'s stream whose data `wire.decode` refused with `err`, as a client
+    /// would a line a stdio server wrote: it may answer the request, or be anything else. It
+    /// carries the event's id and `retry` too.
+    refused: struct { key: u64, err: wire.DecodeError, bytes: []const u8, event_id: ?[]const u8, retry_ms: ?u32 },
     /// An SSE event on `key`'s stream with an id or `retry` but no JSON-RPC
     /// message, such as a priming event.
     mark: struct { key: u64, event_id: ?[]const u8, retry_ms: ?u32 },
@@ -300,7 +307,13 @@ pub const Client = struct {
                     .message = message,
                     .event_id = e.event_id,
                     .retry_ms = e.retry_ms,
-                } } else |_| {};
+                } } else |err| if (data.len > 0) return .{ .refused = .{
+                    .key = e.key,
+                    .err = err,
+                    .bytes = data,
+                    .event_id = e.event_id,
+                    .retry_ms = e.retry_ms,
+                } };
                 if (e.event_id == null and e.retry_ms == null) {
                     c.release();
                     return null;
@@ -481,7 +494,7 @@ pub const Client = struct {
             try c.put(.{ .event = .{ .key = key, .status = status, .data = bytes, .event_id = null, .retry_ms = null } });
             return .{ .status = status, .how = .complete };
         } else |_| {
-            return .{ .status = status, .how = .http_failure };
+            return .{ .status = status, .how = if (status / 100 == 2) .unreadable else .http_failure };
         }
     }
 
@@ -790,6 +803,10 @@ fn serveEvents(server: *Io.net.Server, count: usize) !void {
 
 /// Answers one request on `server` with `body` as `content_type`, and closes.
 fn serveBody(server: *Io.net.Server, content_type: []const u8, body: []const u8) !void {
+    return serveStatusBody(server, "200 OK", content_type, body);
+}
+
+fn serveStatusBody(server: *Io.net.Server, status: []const u8, content_type: []const u8, body: []const u8) !void {
     const stream = try server.accept(testing.io);
     defer stream.close(testing.io);
     var in: [4096]u8 = undefined;
@@ -797,7 +814,7 @@ fn serveBody(server: *Io.net.Server, content_type: []const u8, body: []const u8)
     while ((try r.interface.takeDelimiterInclusive('\n')).len > 2) {}
     var out: [1024]u8 = undefined;
     var w = stream.writer(testing.io, &out);
-    try w.interface.print("HTTP/1.1 200 OK\r\ncontent-type: {s}\r\nconnection: close\r\n\r\n", .{content_type});
+    try w.interface.print("HTTP/1.1 {s}\r\ncontent-type: {s}\r\nconnection: close\r\n\r\n", .{ status, content_type });
     try w.interface.writeAll(body);
     try w.interface.flush();
 }
@@ -829,6 +846,66 @@ test "an answer over max_message ends too_large, not broken, in a JSON body and 
             else => {},
         };
     }
+}
+
+test "a 200 body that is no JSON-RPC message ends unreadable, and an SSE event that is none comes as refused" {
+    const Case = struct { content_type: []const u8, body: []const u8 };
+    for ([_]Case{
+        .{ .content_type = "application/json", .body = "not json at all" },
+        .{ .content_type = "application/json", .body = "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{}}" },
+        .{ .content_type = "text/event-stream", .body = "id: e1\nretry: 50\ndata: not json at all\n\n" },
+    }, 0..) |case, n| {
+        var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = try address.listen(testing.io, .{ .reuse_address = true });
+        defer server.deinit(testing.io);
+        var serving = try testing.io.concurrent(serveBody, .{ &server, case.content_type, case.body });
+        defer serving.cancel(testing.io) catch {};
+        var url: [64]u8 = undefined;
+        var c: Client = undefined;
+        try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}) });
+        defer c.deinit();
+        try c.send(1, .post, "{}", &.{});
+        var refused = false;
+        while (true) switch (try c.next(5_000)) {
+            .refused => |r| {
+                // The event's own bytes and ids, not an ending: the engine decides what it was.
+                try testing.expectEqual(@as(usize, 2), n);
+                try testing.expectEqualStrings("not json at all", r.bytes);
+                try testing.expectEqualStrings("e1", r.event_id.?);
+                try testing.expectEqual(@as(?u32, 50), r.retry_ms);
+                refused = true;
+            },
+            .ended => |e| {
+                try testing.expectEqual(if (n == 2) Ending.complete else Ending.unreadable, e.how);
+                try testing.expectEqual(n == 2, refused);
+                break;
+            },
+            .timeout => return error.TestTimeout,
+            else => {},
+        };
+    }
+}
+
+test "an error status whose JSON body is no JSON-RPC message stays an http_failure: the server did not answer the request" {
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var serving = try testing.io.concurrent(serveStatusBody, .{ &server, "500 Internal Server Error", "application/json", "{\"error\":\"boom\"}" });
+    defer serving.cancel(testing.io) catch {};
+    var url: [64]u8 = undefined;
+    var c: Client = undefined;
+    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}) });
+    defer c.deinit();
+    try c.send(1, .post, "{}", &.{});
+    while (true) switch (try c.next(5_000)) {
+        .ended => |e| {
+            try testing.expectEqual(@as(u16, 500), e.status);
+            try testing.expectEqual(Ending.http_failure, e.how);
+            break;
+        },
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
 }
 
 test "events past the budget all arrive, each once the one before it is taken" {

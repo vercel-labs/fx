@@ -106,3 +106,41 @@ describe("controls", () => {
     expect(check(handTrace(`${line(1, "cancel_requested", "pending", "cancelled", 1)}\n`), "selftest", "NoSuchTrace").verdict).toBe("TOOL_ERROR");
   });
 });
+
+// The request model's grace for a refused line that names no request (Request.tla RefusedLine and
+// GraceExpired). The steps are written by hand, as the Table writes them: a refused line has id 0.
+describe("request grace controls", () => {
+  const REQUEST_SPEC_DIR = join(ROOT, "tests/tla/mcp");
+  const step = (seq: number, event: string, from: string, to: string, data: Record<string, number | boolean | string>): string =>
+    JSON.stringify({ v: 1, seq, machine: "request", inst: "grace", event, from, to, effects: [], data });
+  const send = (seq: number, id: number) => step(seq, "send", "unused", "inflight", { id, kind: "normal", outcome: "none", delivered: 0, cancel_sent: false, progress: 0 });
+  const refused = (seq: number) => step(seq, "refused_line", "unused", "unused", { id: 0 });
+  const progress = (seq: number, id: number) => step(seq, "progress_received", "inflight", "inflight", { id, kind: "normal", outcome: "none", delivered: 0, cancel_sent: false, progress: 1 });
+  const expired = (seq: number, id: number) => step(seq, "grace_expired", "inflight", "done", { id, kind: "normal", outcome: "malformed", delivered: 1, cancel_sent: true, progress: 0 });
+  const idle = (seq: number, id: number) => step(seq, "timer_fired", "inflight", "done", { id, kind: "normal", outcome: "timed_out", delivered: 1, cancel_sent: true, progress: 1 });
+  const run = (...lines: string[]): TraceResult => {
+    counter += 1;
+    const path = handTrace(lines.join("\n") + "\n");
+    return checkTrace({ trace: path, machine: "request", specDir: REQUEST_SPEC_DIR, wrapper: "RequestTrace", reportDir: join(work, `report-${counter}`) });
+  };
+
+  test("a silent request ends malformed with a cancel when its grace runs out: ACCEPTED", () => {
+    expect(run(send(1, 1), refused(2), expired(3, 1)).verdict).toBe("ACCEPTED");
+  }, TIMEOUT);
+
+  test("progress for its own token clears the grace, and the request goes on to its own deadline: ACCEPTED", () => {
+    expect(run(send(1, 1), refused(2), progress(3, 1), idle(4, 1)).verdict).toBe("ACCEPTED");
+  }, TIMEOUT);
+
+  test("a grace that runs out with no refused line before it is REJECTED", () => {
+    expect(run(send(1, 1), expired(2, 1)).verdict).toBe("REJECTED");
+  }, TIMEOUT);
+
+  test("a grace that runs out after the request's own progress is REJECTED", () => {
+    expect(run(send(1, 1), refused(2), progress(3, 1), expired(4, 1)).verdict).toBe("REJECTED");
+  }, TIMEOUT);
+
+  test("a request sent after the refused line gets no grace: REJECTED", () => {
+    expect(run(refused(1), send(2, 1), expired(3, 1)).verdict).toBe("REJECTED");
+  }, TIMEOUT);
+});

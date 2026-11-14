@@ -8,6 +8,8 @@
 \*   - A step on an id that is not in flight is one of the model's ignore
 \*     branches, which leave every variable unchanged. So are a stale idle
 \*     timer and progress that doesn't increase.
+\*   - A refused_line step has id 0 and is the model's RefusedLine. A grace_expired step
+\*     is GraceExpired: the request ends as malformed with a cancel signal.
 \*   - Fields the core no longer knows (outcome and counters of a finished
 \*     request) are absent from the record and not compared.
 EXTENDS Request, TraceObs, Naturals, Sequences
@@ -17,10 +19,12 @@ VARIABLE i
 Recs == {ObsTrace[k] : k \in 1..Len(ObsTrace)}
 Has(r, f) == f \in DOMAIN r.data
 
-ObsIds == {r.data.id : r \in Recs}
+\* A refused line names no request: the core writes it with id 0.
+ObsIds == {r.data.id : r \in Recs} \ {0}
 ObsInitIds == {r.data.id : r \in {x \in Recs : Has(x, "kind") /\ x.data.kind = "initialize"}}
 ObsListenIds == {r.data.id : r \in {x \in Recs : Has(x, "kind") /\ x.data.kind = "listen"}}
 ObsProgress == {r.data.progress : r \in {x \in Recs : Has(x, "progress")}}
+ObsMaxRefusals == Cardinality({k \in 1..Len(ObsTrace) : ObsTrace[k].event = "refused_line"})
 ObsMaxProgress == IF ObsProgress = {} THEN 0 ELSE CHOOSE m \in ObsProgress : \A q \in ObsProgress : q <= m
 
 Step(r, id) ==
@@ -33,6 +37,8 @@ Step(r, id) ==
     \* values, so the "only when it increases" rule is checked by the Zig tests.
     \/ r.event = "progress_received" /\ ((\E p \in 1..MaxProgress : ProgressReceived(id, p)) \/ UNCHANGED vars)
     \/ r.event = "server_cancel_received" /\ ServerCancelReceived(id)
+    \* The grace of a silent request ran out (the trace has no ticks: Timed is FALSE here).
+    \/ r.event = "grace_expired" /\ GraceExpired(id)
 
 Matches(r, id) ==
     /\ req'[id] = r.to
@@ -49,10 +55,13 @@ TraceNext ==
     /\ i < Len(ObsTrace)
     /\ LET r == ObsTrace[i + 1]
            id == r.data.id
-       IN /\ id \in Ids
-          /\ req[id] = r.from
-          /\ Step(r, id)
-          /\ Matches(r, id)
+       IN \/ /\ r.event = "refused_line"
+             /\ RefusedLine
+          \/ /\ r.event # "refused_line"
+             /\ id \in Ids
+             /\ req[id] = r.from
+             /\ Step(r, id)
+             /\ Matches(r, id)
     /\ i' = i + 1
 
 \* Sentinel: violated exactly when every observed step has been matched.
