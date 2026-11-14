@@ -120,6 +120,9 @@ interface Host {
   home: string;
   workspace: string;
   session: TmuxSession;
+  // The safety reviews the fake gateway has received so far, one for each
+  // action that main's `auto` mode sent to its reviewer.
+  classifierRequests: Array<{ body: string; headers: Headers }>;
 }
 
 async function withHost(
@@ -167,7 +170,7 @@ async function withHost(
       remainOnExit: options.remainOnExit ?? false,
     });
     await session.waitForComposer(30_000);
-    await run({ home, workspace, session });
+    await run({ home, workspace, session, classifierRequests: gateway.classifierRequests });
     options.requests?.push(...gateway.requests);
     return gateway.requests.map((request) => request.body);
   } finally {
@@ -351,6 +354,271 @@ const shownAnswers = (pane: string) => ANSWERS.filter((answer) => pane.includes(
 async function waitForAnswers(session: TmuxSession, answers: readonly string[], ms = 10_000): Promise<string> {
   return await session.waitForPane((pane) => JSON.stringify(shownAnswers(pane)) === JSON.stringify(answers), ms);
 }
+
+// The tool results the model has seen since the user message that matches
+// `marker`. A report from a subagent reaches its parent as a user message too,
+// and it can arrive in the middle of the parent's turn, so a count from the last
+// user message would start again.
+function resultsSince(body: string, marker: RegExp): number {
+  const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
+  const prompt = request.prompt ?? [];
+  const users = userTexts(body);
+  let seen = -1;
+  let at = -1;
+  prompt.forEach((message, index) => {
+    if (message.role !== "user") return;
+    seen += 1;
+    if (marker.test(users[seen] ?? "")) at = index;
+  });
+  return at < 0 ? 0 : prompt.slice(at + 1).filter((message) => message.role === "tool").length;
+}
+
+// The turn the user typed last, which names itself GRANT_<n>, and the tool
+// results the model has seen since. A subagent's report that reaches main
+// during its turn does not start another.
+function typedTurn(body: string): { text: string; results: number } | null {
+  const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
+  const prompt = request.prompt ?? [];
+  const users = userTexts(body);
+  let seen = -1;
+  let found: { text: string; at: number } | null = null;
+  prompt.forEach((message, at) => {
+    if (message.role !== "user") return;
+    seen += 1;
+    const typed = users[seen] ?? "";
+    if (/GRANT_\d+ /.test(typed)) found = { text: typed, at };
+  });
+  if (!found) return null;
+  const turn = found as { text: string; at: number };
+  return { text: turn.text, results: prompt.slice(turn.at + 1).filter((message) => message.role === "tool").length };
+}
+
+// A model step that runs `command` with the shell tool.
+function shellRun(id: string, command: string): Response {
+  return call(id, "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command } });
+}
+
+// A reply the test holds back until it calls `release`.
+interface Gate {
+  promise: Promise<void>;
+  release: () => void;
+}
+function held(): Gate {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => (release = resolve));
+  return { promise, release };
+}
+
+// What the model does when main works in the turn that started a subagent,
+// over `grantRuns`. The first word names how, `RUN[...]`, `FILE[...]` or
+// `MCP[]` what, and `GRANT_<n>` the turn:
+// - LATER[name]: main starts `name`, waits for `gates.later`, then does the
+//   work itself, in that same turn, and a second command `THEN[...]` when the
+//   prompt names one.
+// - TWICE: main runs `what` itself, waits for `gates.later`, and runs it again,
+//   in that same turn.
+// - BEFORE[name]: main starts `name`, whose first request waits for
+//   `gates.child`, and does the work itself at once.
+// - PAIR: main starts alpha, task 1, and beta, task 2, whose first request waits
+//   for `gates.child`.
+// - BOSS[name]: main starts `name`, a lead that does the work itself and then
+//   starts `inner` to do it.
+// - TYPED: main starts giver, task 1, and waits for `gates.later`, then ends
+//   its turn. The test types the next prompt, which names the work, while that
+//   turn runs, so fx takes it into the turn.
+function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child?: Gate; childTask?: string }) {
+  const give = (agent: string, profile: string, message: string, id: string) =>
+    ({ type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "message", agent, profile, message } } });
+  const steps = (...calls: object[]) => fakeGatewaySse([...calls, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } }]);
+  // One step of doing `kind`'s work in the turn, `done` results in.
+  const work = (turn: string, kind: string, what: string, done: number, then?: string): Response => {
+    if (kind === "MCP") {
+      if (done === 0) return call(`open_${turn}`, "toolbox", { open: "mcp_fixture_echo" });
+      if (done === 1) return call(`mcp_${turn}`, "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
+    } else if (done === 0) {
+      return kind === "RUN" ? shellRun(`run_${turn}`, what) : call(`write_${turn}`, "write_file", { path: `${what}.txt`, content: "GRANT\n" });
+    }
+    if (then !== undefined && done === 1) return shellRun(`then_${turn}`, then);
+    return text(`done_${turn}`, `GRANT_DONE_${turn}`);
+  };
+  return async (body: string): Promise<Response> => {
+    const joined = userTexts(body).join("\n");
+    const task = joined.match(/GRANT_TASK_(\d+) /)?.[1];
+    if (task) {
+      if (gates.child && task === gates.childTask && resultsSince(body, /GRANT_TASK_\d+ /) === 0) await gates.child.promise;
+      return base(body);
+    }
+    const boss = joined.match(/GRANT_BOSS_(\d+) RUN\[(.*?)\]/);
+    if (boss) {
+      const [, turn, what] = boss as unknown as [string, string, string];
+      const done = resultsSince(body, /GRANT_BOSS_\d+ /);
+      if (done === 0) return shellRun(`boss_${turn}`, what);
+      if (done === 1) return steps(give("inner", "runner", `GRANT_TASK_${turn} RUN[${what}]`, `inner_${turn}`));
+      return text(`boss_done_${turn}`, `GRANT_BOSS_DONE_${turn}`);
+    }
+    const last = userTexts(body).at(-1) ?? "";
+    const typed = typedTurn(body);
+    const how = typed?.text.match(/\b(LATER|BEFORE|PAIR|BOSS|TYPED|TWICE)\b(?:\[(\w+)\])?/);
+    if (!typed || !how) return base(body);
+    const [, mode, name] = how as unknown as [string, string, string | undefined];
+    const turn = typed.text.match(/GRANT_(\d+)/)?.[1] ?? "0";
+    const [, kind, what] = (typed.text.match(/(RUN|FILE|MCP)\[(.*?)\]/) ?? ["", "RUN", "true"]) as string[];
+    const results = typed.results;
+    if (mode === "TYPED" && last.includes('"agent":"giver"')) return text("ack", "GRANT_ACK");
+    switch (mode) {
+      case "TWICE":
+        if (results === 0) return shellRun(`first_${turn}`, what!);
+        if (results === 1) {
+          await gates.later!.promise;
+          return shellRun(`second_${turn}`, what!);
+        }
+        return text(`done_${turn}`, `GRANT_DONE_${turn}`);
+      case "LATER":
+        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_${turn} ${kind}[${what}]`, `start_${turn}`));
+        if (results === 1) await gates.later!.promise;
+        return work(turn, kind!, what!, results - 1, typed.text.match(/THEN\[(.*?)\]/)?.[1]);
+      case "BEFORE":
+        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_2 ${kind}[${what}]`, `start_${turn}`));
+        return work(turn, kind!, what!, results - 1);
+      case "PAIR":
+        if (results === 0) return steps(give("alpha", "runner", `GRANT_TASK_1 RUN[${what}]`, `alpha_${turn}`), give("beta", "runner", `GRANT_TASK_2 RUN[${what}]`, `beta_${turn}`));
+        return text(`done_${turn}`, `GRANT_DONE_${turn}`);
+      case "BOSS":
+        if (results === 0) return steps(give(name!, "lead", `GRANT_BOSS_${turn} RUN[${what}]`, `start_${turn}`));
+        return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+      default:
+        if (results === 0) return steps(give("giver", "runner", `GRANT_TASK_1 RUN[${what}]`, `giver_${turn}`));
+        if (results === 1) await gates.later!.promise;
+        return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+    }
+  };
+}
+
+// Whether the trace log at `path` holds `text` yet.
+function traceHas(path: string, text: string): boolean {
+  return existsSync(path) && readFileSync(path, "utf8").includes(text);
+}
+
+// Whether an approval prompt is open on screen, whoever asks.
+const approvalOpen = (pane: string) => pane.includes("choose now");
+
+// Lets main's turn go on, in the turn that started the subagent, once the
+// subagent's prompt is answered: main does the same work, and must finish it
+// with `done` on screen and no prompt of its own.
+async function mainGoesOn(session: TmuxSession, gate: Gate, done: string) {
+  await waitShows(session, "the subagent's prompt gone", (pane) => !approvalOpen(pane));
+  gate.release();
+  const pane = await waitShows(session, "main's work or its prompt", (value) => approvalOpen(value) || value.includes(done), 45_000);
+  expect(approvalOpen(pane)).toBe(false);
+  expect(pane).toContain(done);
+}
+
+// The permissions panel's "Session grants" line, as `/permissions` shows it
+// while main's turn runs. The panel is modal, so each look closes it again.
+async function sessionGrantsNow(session: TmuxSession): Promise<string> {
+  await session.sendText("/permissions");
+  const pane = await waitShows(session, "the permissions panel", (value) => /Session grants/.test(value), 15_000);
+  const line = pane.split("\n").find((row) => /Session grants/.test(row))!.trim();
+  await session.sendKeys("Escape");
+  await waitShows(session, "the panel closed", (value) => !/esc close/.test(value), 10_000);
+  return line;
+}
+
+// Types `/permissions reset` while main's turn runs, and returns the grants line
+// before it and the one after it. fx takes typed commands in order, so the panel
+// the second look opens shows the list after the reset.
+async function resetSessionGrants(session: TmuxSession): Promise<{ before: string; after: string }> {
+  const before = await sessionGrantsNow(session);
+  await session.sendText("/permissions reset");
+  const after = await sessionGrantsNow(session);
+  return { before, after };
+}
+
+// Subagents run one thing twice in their turn: a command (`RUN[...]`), a
+// file write (`FILE[name]`), or the fixture's MCP tool (`MCP[]`). The second
+// run comes at once after the first, so it can only skip approval if the
+// approval given for the first was already kept. A turn is named GRANT_<n>,
+// and `SUB[name]` makes main start that subagent with the task GRANT_TASK_<n>
+// instead of doing it itself. `finished` is filled with each subagent turn's
+// number when its report is sent.
+function grantRuns(finished: Set<string>) {
+  const shell = shellRun;
+  return (body: string): Response => {
+    const results = resultsSince(body, /GRANT_TASK_\d+ /);
+    const texts = userTexts(body);
+    const task = texts.join("\n").match(/GRANT_TASK_(\d+) (RUN|FILE|MCP)\[(.*?)\]/);
+    if (task) {
+      const [, turn, kind, what] = task as unknown as [string, string, string, string];
+      if (kind === "MCP") {
+        if (results === 0) return call(`open_${turn}`, "toolbox", { open: "mcp_fixture_echo" });
+        if (results < 3) return call(`mcp_${turn}_${results}`, "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
+      } else if (results < 2) {
+        if (kind === "RUN") return shell(`sub_${turn}_${results}`, what);
+        return call(`sub_${turn}_${results}`, "write_file", { path: `${what}-${results}.txt`, content: "GRANT\n" });
+      }
+      finished.add(turn);
+      return text(`sub_done_${turn}`, `GRANT_CHILD_DONE_${turn}`);
+    }
+    // A lead starts its own subagent once, and its turn ends there.
+    const nest = texts.join("\n").match(/GRANT_NEST_(\d+) RUN\[(.*?)\]/);
+    if (nest) {
+      const [, turn, what] = nest as unknown as [string, string, string];
+      if (body.includes(`nest_${turn}`)) return text(`nest_done_${turn}`, `GRANT_NEST_SENT_${turn}`);
+      return call(`nest_${turn}`, "subagent", { request: { action: "message", agent: "inner", profile: "runner", message: `GRANT_TASK_${turn} RUN[${what}]` } });
+    }
+    const typed = typedTurn(body);
+    if (!typed) return text("ack", "GRANT_ACK");
+    const turn = typed.text.match(/GRANT_(\d+)/)?.[1] ?? "0";
+    const sub = typed.text.match(/SUB\[(\w+)\]/)?.[1];
+    const lead = typed.text.match(/LEAD\[(\w+)\]/)?.[1];
+    const again = typed.text.match(/AGAIN\[(\w+)\]/)?.[1];
+    const work = typed.text.match(/(RUN|FILE|MCP)\[(.*?)\]/);
+    const [kind, what] = [work?.[1] ?? "RUN", work?.[2] ?? "true"];
+    if (lead) {
+      if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: lead, profile: "lead", message: `GRANT_NEST_${turn} RUN[${what}]` } });
+    }
+    if (again) {
+      if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: again, message: `GRANT_TASK_${turn} ${kind}[${what}]` } });
+    }
+    if (sub) {
+      if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: sub, profile: "runner", message: `GRANT_TASK_${turn} ${kind}[${what}]` } });
+    }
+    if (kind === "MCP") {
+      if (typed.results === 0) return call(`open_${turn}`, "toolbox", { open: "mcp_fixture_echo" });
+      if (typed.results === 1) return call(`mcp_${turn}`, "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
+      return text(`done_${turn}`, `GRANT_DONE_${turn}`);
+    }
+    if (typed.results >= 1) return text(`done_${turn}`, `GRANT_DONE_${turn}`);
+    if (kind === "RUN") return shell(`run_${turn}`, what);
+    return call(`write_${turn}`, "write_file", { path: `${what}.txt`, content: "GRANT\n" });
+  };
+}
+
+// Waits until `done()` holds, and fails with `what` when it does not.
+async function waitUntil(what: string, done: () => boolean, ms = 30_000, session?: TmuxSession, detail?: () => string) {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${what}${session ? `; the pane:\n${await session.capturePane()}` : ""}${detail ? `\n${detail()}` : ""}`);
+    }
+    await Bun.sleep(25);
+  }
+}
+
+// Waits until the pane holds what `test` looks for. A timeout names it and
+// shows the pane.
+async function waitShows(session: TmuxSession, what: string, test: (pane: string) => boolean, ms = 30_000): Promise<string> {
+  try {
+    return await session.waitForPane(test, ms);
+  } catch {
+    throw new Error(`timed out waiting for ${what}; the pane:\n${await session.capturePane()}`);
+  }
+}
+
+const countLines = (path: string) => (existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).length : 0);
 
 describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   test(
@@ -647,6 +915,436 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(await runTurn(session, 4, "touch shared-marker")).toBe("done");
         expect(existsSync(marker)).toBe(true);
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of a command is kept: it is not asked again, nor is its sibling or main",
+    async () => {
+      const command = "echo RAN >> grant.log";
+      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "grant.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        // Its second run comes at once after the first and is not asked.
+        await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session, () => `workspace: ${readdirSync(workspace).join(" ")}; log: ${existsSync(log) ? readFileSync(log, "utf8") : "none"}`);
+
+        // A sibling runs the same command with no prompt.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_2 SUB[beta] RUN[${command}]`);
+        await waitUntil("the sibling's two runs", () => countLines(log) === 4, 30_000, session);
+
+        // So does main, which is in ask mode itself.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_3 RUN[${command}]`);
+        await session.waitForText("GRANT_DONE_3", 30_000);
+        expect(countLines(log)).toBe(5);
+
+        // The grant shows in the session's permissions.
+        await session.sendText("/permissions");
+        const panel = await waitShows(session, "the session grants", (pane) => /^ {2}Session grants {2,}\S/m.test(pane), 15_000);
+        expect(panel).not.toMatch(/^ {2}Session grants {2,}none/m);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of a file change is kept: it is not asked again, nor is its sibling or main",
+    async () => {
+      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Writes files", tools: ["write_file"], permission_mode: "ask" });
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 SUB[alpha] FILE[grant-a]");
+        await waitShows(session, "alpha's file prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes("Apply this change?"));
+        await session.sendKeys("2");
+        // Its second write comes at once after the first and is not asked.
+        await waitUntil("the subagent's two writes", () => existsSync(join(workspace, "grant-a-1.txt")), 30_000, session);
+        expect(existsSync(join(workspace, "grant-a-0.txt"))).toBe(true);
+
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_2 SUB[beta] FILE[grant-b]");
+        await waitUntil("the sibling's two writes", () => existsSync(join(workspace, "grant-b-1.txt")), 30_000, session);
+
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_3 FILE[grant-main]");
+        await session.waitForText("GRANT_DONE_3", 30_000);
+        expect(existsSync(join(workspace, "grant-main.txt"))).toBe(true);
+
+        await session.sendText("/permissions");
+        const panel = await waitShows(session, "the session grants", (pane) => /^ {2}Session grants {2,}\S/m.test(pane), 15_000);
+        expect(panel).not.toMatch(/^ {2}Session grants {2,}none/m);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of an MCP tool is kept: it is not asked again, nor is its sibling or main",
+    async () => {
+      const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+      const finished = new Set<string>();
+      await withHost(grantRuns(finished), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, session }) => {
+        writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
+          mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
+        }));
+        writeProfile(home, "runner", { description: "Uses the fixture", tools: ["read_file", "mcp_select_tool"], mcp_servers: ["fixture"], permission_mode: "ask" });
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 SUB[alpha] MCP[]");
+        await session.waitForText("Subagent alpha needs permission", 45_000);
+        await session.sendKeys("2");
+        // Its second call comes at once after the first and is not asked.
+        await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
+
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_2 SUB[beta] MCP[]");
+        await waitUntil("the sibling's two calls", () => finished.has("2"), 45_000, session);
+
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_3 MCP[]");
+        await session.waitForText("GRANT_DONE_3", 45_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a nested subagent's always approval is kept: its parent subagent and main are not asked again",
+    async () => {
+      const command = "echo RAN >> grant.log";
+      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        // `boss` may start subagents; `inner` runs the command.
+        writeProfile(home, "lead", { description: "Starts a subagent and runs a command", tools: ["shell", "subagent"], permission_mode: "ask" });
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "grant.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 LEAD[boss] RUN[${command}]`);
+        await waitShows(session, "inner's command prompt", (pane) => pane.includes("Subagent inner needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("the nested subagent's two runs", () => countLines(log) === 2, 30_000, session, () => `workspace: ${readdirSync(workspace).join(" ")}`);
+
+        // The subagent that started it runs the same command with no prompt.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_2 AGAIN[boss] RUN[${command}]`);
+        await waitUntil("the parent subagent's two runs", () => countLines(log) === 4, 30_000, session);
+
+        // So does main, which is in ask mode itself.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_3 RUN[${command}]`);
+        await session.waitForText("GRANT_DONE_3", 30_000);
+        expect(countLines(log)).toBe(5);
+
+        await session.sendText("/permissions");
+        const panel = await waitShows(session, "the session grants", (pane) => /^ {2}Session grants {2,}\S/m.test(pane), 15_000);
+        expect(panel).not.toMatch(/^ {2}Session grants {2,}none/m);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval stays in its instance: another instance's subagent still asks",
+    async () => {
+      const command = "echo RAN >> grant.log";
+      await withHost(grantRuns(new Set()), { instances: 2, env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "grant.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("the first instance's subagent's two runs", () => countLines(log) === 2, 30_000, session);
+
+        // The second instance is another session: its subagent asks.
+        await switchAgent(session, 2);
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_2 SUB[alpha] RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        expect(countLines(log)).toBe(2);
+        await session.sendKeys("1");
+        // Its second run asks again, since a one-time answer keeps nothing.
+        await waitUntil("the second instance's first run", () => countLines(log) === 3, 30_000, session);
+        await waitShows(session, "the second run's prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("1");
+        await waitUntil("the second instance's second run", () => countLines(log) === 4, 30_000, session);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's one-time approval is not kept: its next run, and main's, ask again",
+    async () => {
+      const command = "echo RAN >> grant.log";
+      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "grant.log");
+        const asking = (pane: string, who: string) => pane.includes(who) && pane.includes(COMMAND_APPROVAL_PROMPT);
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => asking(pane, "Subagent alpha needs permission"));
+        await session.sendKeys("1");
+        // Its second run asks again once the first has run.
+        await waitUntil("the first run", () => countLines(log) === 1, 30_000, session);
+        await waitShows(session, "alpha's command prompt", (pane) => asking(pane, "Subagent alpha needs permission"));
+        await session.sendKeys("1");
+        await waitUntil("the second run", () => countLines(log) === 2, 30_000, session);
+
+        // Main asks too.
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_2 RUN[${command}]`);
+        await waitShows(session, "main's command prompt", (pane) => asking(pane, "") && !pane.includes("Subagent"));
+        await session.sendKeys("1");
+        await session.waitForText("GRANT_DONE_2", 30_000);
+
+        await session.sendText("/permissions");
+        await waitShows(session, "no session grants", (pane) => /^ {2}Session grants {2,}none/m.test(pane), 15_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of a command reaches main's running turn: main runs it later in that turn with no prompt",
+    async () => {
+      const command = "echo RAN >> same.log";
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 LATER[alpha] RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
+        await mainGoesOn(session, gates.later, "GRANT_DONE_1");
+        expect(countLines(log)).toBe(3);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "in auto mode a subagent's always approval of a command lets main run it later in its running turn with no safety check, and another command still gets one",
+    async () => {
+      const granted = "echo RAN >> same.log";
+      const other = "echo OTHER >> other.log";
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "auto" } }, async ({ home, workspace, session, classifierRequests }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 LATER[alpha] RUN[${granted}] THEN[${other}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
+        const reviewed = classifierRequests.length;
+        // Main's turn goes on: it runs the granted command, then another one.
+        await mainGoesOn(session, gates.later, "GRANT_DONE_1");
+        expect(countLines(log)).toBe(3);
+        expect(countLines(join(workspace, "other.log"))).toBe(1);
+        // Only the other command went to the safety check: the one review
+        // names its call.
+        const fresh = classifierRequests.slice(reviewed);
+        expect(fresh).toHaveLength(1);
+        expect(fresh[0]!.body).toMatch(/target_tool_call_id: [\\"]+then_1/);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/permissions reset in main's running turn clears an approval a subagent gave: main's later check asks",
+    async () => {
+      const command = "echo RAN >> same.log";
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 LATER[alpha] RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
+        await waitShows(session, "the subagent's prompt gone", (pane) => !approvalOpen(pane));
+        const grants = await resetSessionGrants(session);
+        expect(grants.before).toMatch(/Session grants +1$/);
+        expect(grants.after).toMatch(/Session grants +none$/);
+        // The turn goes on and asks for what only the instance's list held.
+        gates.later.release();
+        await waitShows(session, "main's own prompt", (pane) => pane.includes(COMMAND_APPROVAL_PROMPT) && !pane.includes("Subagent"), 45_000);
+        expect(countLines(log)).toBe(2);
+        await session.sendKeys("1");
+        await session.sendKeys("Enter");
+        await session.waitForText("GRANT_DONE_1", 30_000);
+        expect(countLines(log)).toBe(3);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/permissions reset in main's running turn keeps the approvals the turn's own answers made: main runs its command again with no prompt",
+    async () => {
+      const command = "echo RAN >> same.log";
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ workspace, session }) => {
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 TWICE RUN[${command}]`);
+        await waitShows(session, "main's command prompt", (pane) => pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("main's first run", () => countLines(log) === 1, 30_000, session);
+        await waitShows(session, "the prompt gone", (pane) => !approvalOpen(pane));
+        const grants = await resetSessionGrants(session);
+        expect(grants.before).toMatch(/Session grants +1$/);
+        expect(grants.after).toMatch(/Session grants +none$/);
+        // The turn's own list still holds the answer, so the second run asks nothing.
+        await mainGoesOn(session, gates.later, "GRANT_DONE_1");
+        expect(countLines(log)).toBe(2);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of a file change reaches main's running turn: main writes later in that turn with no prompt",
+    async () => {
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Writes files", tools: ["write_file"], permission_mode: "ask" });
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 LATER[alpha] FILE[same-a]");
+        await waitShows(session, "alpha's file prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes("Apply this change?"));
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two writes", () => existsSync(join(workspace, "same-a-1.txt")), 30_000, session);
+        await mainGoesOn(session, gates.later, "GRANT_DONE_1");
+        expect(existsSync(join(workspace, "same-a.txt"))).toBe(true);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval of an MCP tool reaches main's running turn: main calls it later in that turn with no prompt",
+    async () => {
+      const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+      const finished = new Set<string>();
+      const gates = { later: held() };
+      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, session }) => {
+        writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
+          mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
+        }));
+        writeProfile(home, "runner", { description: "Uses the fixture", tools: ["read_file", "mcp_select_tool"], mcp_servers: ["fixture"], permission_mode: "ask" });
+        await session.waitForComposer(15_000);
+        await session.sendText("GRANT_1 LATER[alpha] MCP[]");
+        await session.waitForText("Subagent alpha needs permission", 45_000);
+        await session.sendKeys("2");
+        await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
+        await mainGoesOn(session, gates.later, "GRANT_DONE_1");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's always approval reaches a subagent that is running, which runs the same command with no prompt",
+    async () => {
+      const command = "echo RAN >> same.log";
+      const finished = new Set<string>();
+      const gates = { child: held(), childTask: "2" };
+      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        // Main starts alpha, whose first request is held, and asks for its own command.
+        await session.sendText(`GRANT_1 BEFORE[alpha] RUN[${command}]`);
+        await waitShows(session, "main's command prompt", (pane) => pane.includes(COMMAND_APPROVAL_PROMPT) && !pane.includes("needs permission"));
+        await session.sendKeys("2");
+        await session.waitForText("GRANT_DONE_1", 30_000);
+        expect(countLines(log)).toBe(1);
+        // Alpha runs now, and is not asked.
+        gates.child.release();
+        await waitUntil("the running subagent's two runs", () => finished.has("2"), 30_000, session);
+        expect(countLines(log)).toBe(3);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's always approval reaches a sibling that is running, which runs the same command with no prompt",
+    async () => {
+      const command = "echo RAN >> same.log";
+      const finished = new Set<string>();
+      const gates = { child: held(), childTask: "2" };
+      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        // Alpha asks first; beta is running, with its first request held.
+        await session.sendText(`GRANT_1 PAIR RUN[${command}]`);
+        await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        await waitUntil("alpha's two runs", () => finished.has("1"), 30_000, session);
+        expect(countLines(log)).toBe(2);
+        gates.child.release();
+        await waitUntil("beta's two runs", () => finished.has("2"), 30_000, session);
+        expect(countLines(log)).toBe(4);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a lead subagent's always approval reaches the subagent it starts: inner is not asked",
+    async () => {
+      const command = "echo RAN >> same.log";
+      await withHost(sameTurn(grantRuns(new Set()), {}), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+        writeProfile(home, "lead", { description: "Runs a command and starts a subagent", tools: ["shell", "subagent"], permission_mode: "ask" });
+        writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+        const log = join(workspace, "same.log");
+        await session.waitForComposer(15_000);
+        await session.sendText(`GRANT_1 BOSS[boss] RUN[${command}]`);
+        await waitShows(session, "boss's command prompt", (pane) => pane.includes("Subagent boss needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+        await session.sendKeys("2");
+        // Boss runs it once, then inner runs it twice, with no prompt.
+        await waitUntil("boss's run and inner's two runs", () => countLines(log) === 3, 30_000, session);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a prompt typed in main's running turn is taken into it, and runs a command a subagent was just given always for with no prompt",
+    async () => {
+      const command = "echo RAN >> same.log";
+      const trace = join(tmpdir(), `fx-same-turn-${process.pid}-${Date.now()}.log`);
+      const gates = { later: held() };
+      try {
+        await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask", FX_TRACE_LOG: trace } }, async ({ home, workspace, session }) => {
+          writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+          const log = join(workspace, "same.log");
+          await session.waitForComposer(15_000);
+          await session.sendText(`GRANT_1 TYPED RUN[${command}]`);
+          await waitShows(session, "giver's command prompt", (pane) => pane.includes("Subagent giver needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+          await session.sendKeys("2");
+          await waitUntil("giver's two runs", () => countLines(log) === 2, 30_000, session);
+          // Main's turn is still running, held on its request. The user types the next prompt.
+          await waitShows(session, "giver's prompt gone", (pane) => !approvalOpen(pane));
+          await session.sendText(`GRANT_2 RUN[${command}]`);
+          await waitUntil("the prompt taken into the running turn", () => traceHas(trace, "steering_admission"), 30_000, session);
+          await mainGoesOn(session, gates.later, "GRANT_DONE_2");
+          expect(countLines(log)).toBe(3);
+        });
+      } finally {
+        rmSync(trace, { force: true });
+      }
     },
     TIMEOUT,
   );

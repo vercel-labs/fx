@@ -12481,7 +12481,12 @@ fn processQueuedPromptLoop(
                 );
             }
 
-            if (decision == .always and live_authority == null) {
+            // An "always" answer keeps its grants whoever asked. A subagent's
+            // live authority reads its instance's grants at every call, so the
+            // grants kept here are what its next call, its siblings, and main
+            // find (`src/core/agent/runtime/tests/tool_flow.zig`, "a subagent's
+            // always approval of a command stores the session grant").
+            if (decision == .always) {
                 if (execution_authority == .file_mutation) {
                     const offer = execution_authority.file_mutation.grant_offer orelse
                         return error.MissingToolExecutionAuthority;
