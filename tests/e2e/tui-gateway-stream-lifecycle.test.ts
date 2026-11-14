@@ -5805,7 +5805,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
           FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt",
+          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,context",
         },
       });
 
@@ -5821,9 +5821,24 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("attached image: steering-snapshot.png", TIMEOUT);
       await session.sendText(steeringPrompt);
 
+      const traced = (matches: (line: string) => boolean) =>
+        existsSync(tracePath) && readFileSync(tracePath, "utf8").split("\n").some(matches);
+      // fx reads the project's rules once, when the steering is submitted;
+      // its enqueue line follows that read. A rewrite from then on must not
+      // reach the steering request.
+      await waitForCondition(
+        () => traced((line) => line.includes("[prompt] enqueue ") && line.includes(steeringPrompt)),
+        "the steering's submission",
+      );
       writeFileSync(join(home, ".fx", "AGENTS.md"), `${newGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${newAncestorRule}\n`);
       writeFileSync(join(workspace, "AGENTS.md"), `${newRootRule}\n`);
+      // The image folder's rules come with the steering's turn (D93), which
+      // reads them when it starts, after the held turn ends.
+      await waitForCondition(
+        () => traced((line) => line.includes("[context] attached folder rules images=1 ")),
+        "the steering turn's image folder rules",
+      );
       writeFileSync(join(nested, "AGENTS.md"), `${newNestedRule}\n`);
       writeFileSync(join(sibling, "AGENTS.md"), `${newSiblingRule}\n`);
 
@@ -7654,6 +7669,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         if (userText.includes(task) && !userText.includes(rootPrompt) && !userText.startsWith(header)) {
           await childGate;
+          // Main's wait row names the subagents working when the wait
+          // begins. The gate opens as main receives its wait call, so a fast
+          // build could finish the child before that wait starts. The reply
+          // waits until main's row shows the wait on the working child.
+          await session?.waitForText("waiting for helper", TIMEOUT);
           return fakeGatewayFinalText("JOINED_CHILD_REPLY");
         }
         // The report joined main's running turn after its wait.
