@@ -3492,6 +3492,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // The agent list's rows by name, top to bottom, as the screen shows them now.
+  const rowNames = async (session: TmuxSession) => agentRows(await session.capturePaneEscapes()).map((row) => row.name);
+
   test(
     "a failed or stopped row that a search finds keeps its label when a held Backspace clears the search and goes on, and nothing closes",
     async () => {
@@ -3499,7 +3502,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // `broken` failed, `fine` completed, and `cut` works. A search that
         // only `broken` matches leaves it as the one row, still `failed`.
         await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("cut", "working").test(pane)
+          && subagentRow("broken", "failed").test(pane) && subagentRow("fine", "idle").test(pane), 10_000);
+        // Rows that do not work sort by their latest reply, so which of `broken`
+        // and `fine` comes first is not fixed. The list must come back in the
+        // order it opened in, and the working row is above the two that ended.
+        const openedOrder = await rowNames(session);
+        expect(openedOrder.slice(0, 2)).toEqual(["main", "cut"]);
         await session.sendLiteral("bro");
         const found = await session.waitForPane((pane) => composerContains(pane, "bro") && pane.includes("Agents 1")
           && subagentRow("broken", "failed").test(pane), 10_000);
@@ -3512,8 +3521,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const failed = await paneAtRest(session);
         expect(composerContains(failed, "bro")).toBe(false);
         expect(failed).toContain("Agents 4");
-        // `cut` still works, so it sorts above the two that ended.
-        expectRowOrder(failed, mainRow(), subagentRow("cut", "working"), subagentRow("broken", "failed"), subagentRow("fine", "idle"));
+        for (const [name, state] of [["cut", "working"], ["broken", "failed"], ["fine", "idle"]] as const) expect(failed).toMatch(subagentRow(name, state));
+        expect(await rowNames(session)).toEqual(openedOrder);
         expect(failed).not.toContain("press delete again");
         expect(failed).toContain("delete close");
         expect(eventCount(trace(), "agents_menu_close_ignored")).toBe(4);
@@ -3525,7 +3534,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // the search leave it alone.
         await stopCut(session);
         await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("cut", "stopped").test(pane)
+          && subagentRow("broken", "failed").test(pane) && subagentRow("fine", "idle").test(pane), 10_000);
+        const stoppedOrder = await rowNames(session);
         await session.sendLiteral("cut");
         const stopped = await session.waitForPane((pane) => composerContains(pane, "cut") && pane.includes("Agents 1")
           && subagentRow("cut", "stopped").test(pane), 10_000);
@@ -3536,7 +3547,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const after = await paneAtRest(session);
         expect(composerContains(after, "cut")).toBe(false);
         expect(after).toContain("Agents 4");
-        expectRowOrder(after, mainRow(), subagentRow("broken", "failed"), subagentRow("fine", "idle"), subagentRow("cut", "stopped"));
+        for (const [name, state] of [["broken", "failed"], ["fine", "idle"], ["cut", "stopped"]] as const) expect(after).toMatch(subagentRow(name, state));
+        expect(await rowNames(session)).toEqual(stoppedOrder);
         expect(after).not.toContain("press delete again");
         expect(after).toContain("delete close");
         const log = trace();
