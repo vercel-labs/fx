@@ -40,11 +40,20 @@ pub fn stdoutIsTerminal() bool {
 /// The width of the terminal stdout writes to, in columns; null when stdout
 /// is not a terminal or the terminal does not say.
 pub fn stdoutColumns() ?usize {
+    return terminalColumns(std.posix.STDOUT_FILENO);
+}
+
+/// `stdoutColumns`, for the terminal stderr writes to.
+pub fn stderrColumns() ?usize {
+    return terminalColumns(std.posix.STDERR_FILENO);
+}
+
+fn terminalColumns(fd: std.posix.fd_t) ?usize {
     if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
 
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws);
+    const rc = std.c.ioctl(fd, req, &ws);
     if (rc == -1 or ws.col == 0) return null;
     return @intCast(ws.col);
 }

@@ -1049,6 +1049,13 @@ pub const Doctor = struct {
     checked: usize = 0,
     /// Checked sessions with a damaged line or a stale snapshot.
     damaged: std.ArrayList([]u8) = .empty,
+    /// Sessions within the limit whose check the caller's stop cut short or
+    /// never started, with no damage found in what was read.
+    unfinished: usize = 0,
+    /// The caller's stop ended the scan of the sessions an older fx saved,
+    /// so `unconverted`, `keeps_left_out`, and `kept_children` count only
+    /// the folders read before it.
+    v1_incomplete: bool = false,
     /// Side folders removed because their session is gone.
     removed: usize = 0,
     /// Side folders whose session is gone that `fx doctor --fix` would
@@ -1105,9 +1112,49 @@ pub const OrphanSweep = enum {
 /// folders whose session is gone, counting or removing them as `orphans`
 /// says. Rebuilds nothing. Caller owns the report.
 pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphans: OrphanSweep) !Doctor {
+    return doctorWith(store, alloc, .{ .limit = limit, .now_ms = now_ms, .orphans = orphans });
+}
+
+pub const DoctorOptions = struct {
+    /// The most sessions whose log is checked.
+    limit: usize,
+    now_ms: i64,
+    orphans: OrphanSweep,
+    /// `hash` reads every blob; `exists` only checks that each is a file.
+    blobs: @FieldType(sm.VerifyOptions, "blobs") = .hash,
+    /// When it says stop, the session being checked and the ones after it
+    /// are counted in `Doctor.unfinished`, not checked.
+    stop: ?sm.Stop = null,
+    /// Told before each session's check, with how many are done and how
+    /// many will be checked, so a long check can show where it is.
+    progress: ?Progress = null,
+
+    pub const Progress = struct {
+        context: *anyopaque,
+        report: *const fn (context: *anyopaque, done: usize, total: usize) void,
+    };
+
+    fn stopRequested(options: DoctorOptions) bool {
+        return sm.Stop.now(options.stop);
+    }
+
+    fn tell(options: DoctorOptions, done: usize, total: usize) void {
+        const progress = options.progress orelse return;
+        progress.report(progress.context, done, total);
+    }
+};
+
+/// `doctor`, with the blob check, stop, and progress `options` choose.
+pub fn doctorWith(store: *Store, alloc: Allocator, options: DoctorOptions) !Doctor {
     var report: Doctor = .{};
     errdefer report.deinit(alloc);
     var latest_ms: u64 = 0;
+    // The sessions to check, listed first so progress can say how many.
+    var to_check: std.ArrayList([]u8) = .empty;
+    defer {
+        for (to_check.items) |id| alloc.free(id);
+        to_check.deinit(alloc);
+    }
     var cursor: ?sm.ListCursor = null;
     while (true) {
         var page = try store.manager.list(alloc, .all, cursor, list_page_size);
@@ -1121,33 +1168,59 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphan
                 report.latest = id;
                 latest_ms = item.updated_ms;
             }
-            if (report.checked == limit) continue;
-            report.checked += 1;
-            const verified = store.manager.verify(item.id) catch |err| switch (err) {
-                error.NotFound => continue,
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ item.id, @errorName(err) });
-                    try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
-                    continue;
-                },
-            };
-            if (verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0) try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
+            if (to_check.items.len == options.limit) continue;
+            try to_check.ensureUnusedCapacity(alloc, 1);
+            to_check.appendAssumeCapacity(try alloc.dupe(u8, item.id));
         }
         cursor = page.next orelse break;
     }
-    try doctorV1(store, alloc, &report, limit);
-    report.kept_children = try keptChildren(store, alloc);
+    for (to_check.items, 0..) |id, done| {
+        options.tell(done, to_check.items.len);
+        if (options.stopRequested()) {
+            report.unfinished += 1;
+            continue;
+        }
+        const verified = store.manager.verifyWith(id, .{ .blobs = options.blobs, .stop = options.stop }) catch |err| switch (err) {
+            error.NotFound => {
+                report.checked += 1;
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                report.checked += 1;
+                debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ id, @errorName(err) });
+                try report.damaged.append(alloc, try alloc.dupe(u8, id));
+                continue;
+            },
+        };
+        // What the check read before it stopped still reports damage.
+        const damaged = verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0;
+        if (damaged) try report.damaged.append(alloc, try alloc.dupe(u8, id));
+        if (verified.stopped_at != null and !damaged) {
+            debug_trace.logf("session", "event=sessions_v2_doctor_stopped session={s} at={d}", .{ id, verified.stopped_at.? });
+            report.unfinished += 1;
+        } else report.checked += 1;
+    }
+    options.tell(to_check.items.len, to_check.items.len);
+    const limit = options.limit -| report.unfinished;
+    try doctorV1(store, alloc, &report, limit, options.stop);
+    var kept_complete = true;
+    report.kept_children = try keptChildrenUntil(store, alloc, options.stop, &kept_complete);
+    if (!kept_complete) report.v1_incomplete = true;
     for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
-    try store.sweepFiles(alloc, &report, now_ms, orphans);
+    try store.sweepFiles(alloc, &report, options.now_ms, options.orphans);
     return report;
 }
 
 /// Counts the roots an older fx saved that v2 does not hold yet, and names
 /// each checked one that can't be converted with what `fx session recover`
 /// copies of it (D73). Reads only; a busy family is left out.
-fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !void {
-    const roots = v1_conversion.rootIds(alloc, store.home) catch |err| switch (err) {
+fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize, stop: ?sm.Stop) !void {
+    var complete = true;
+    defer if (!complete) {
+        report.v1_incomplete = true;
+    };
+    const roots = v1_conversion.rootIdsUntil(alloc, store.home, stop, &complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("session", "event=doctor_v1_unlisted err={s}", .{@errorName(err)});
@@ -1159,6 +1232,10 @@ fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !voi
         alloc.free(roots);
     }
     for (roots) |root| {
+        if (sm.Stop.now(stop)) {
+            complete = false;
+            break;
+        }
         if (store.manager.peek(alloc, root.id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -4620,7 +4697,13 @@ pub fn freeKeptChildren(alloc: Allocator, kept: []KeptChild) void {
 /// whose parent is gone or does not list it. Reads only. Caller owns the
 /// result; free it with `freeKeptChildren`.
 fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
-    const strays = v1_conversion.strayChildren(alloc, store.home) catch |err| switch (err) {
+    var complete = true;
+    return keptChildrenUntil(store, alloc, null, &complete);
+}
+
+/// `keptChildren`, ended early when `stop` says so; `complete` is then false.
+fn keptChildrenUntil(store: *Store, alloc: Allocator, stop: ?sm.Stop, complete: *bool) ![]KeptChild {
+    const strays = v1_conversion.strayChildren(alloc, store.home, stop, complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("convert", "action=ChildrenUnlisted err={s}", .{@errorName(err)});
@@ -9897,6 +9980,101 @@ test "recover copies a v1 conversation without saved rules it can't read and lea
         defer alloc.free(after);
         try testing.expectEqualStrings(rules, after);
     }
+}
+
+test "doctor told to stop leaves no older-fx scan unfinished when no older fx saved anything" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const Always = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    var report = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &context, .requested = Always.requested },
+    });
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.sessions);
+    try testing.expectEqual(@as(usize, 0), report.unfinished);
+    try testing.expect(!report.v1_incomplete);
+}
+
+test "doctor told to stop counts the sessions it did not finish, and reports its progress" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    for ([_][]const u8{ "first", "second" }) |text| {
+        const s = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        try s.commitTurn(assistantTurn(text, "a"), types.ConversationLanguage.default());
+    }
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("plain", 2);
+
+    const Watch = struct {
+        stop: bool,
+        calls: [4][2]usize = undefined,
+        len: usize = 0,
+
+        fn requested(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.stop;
+        }
+
+        fn report(context: *anyopaque, done: usize, total: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.len < self.calls.len) self.calls[self.len] = .{ done, total };
+            self.len += 1;
+        }
+    };
+
+    var stopped: Watch = .{ .stop = true };
+    var cut = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &stopped, .requested = Watch.requested },
+        .progress = .{ .context = &stopped, .report = Watch.report },
+    });
+    defer cut.deinit(alloc);
+    // However many of the older fx's sessions a read converted, the stop
+    // leaves every saved session unchecked and the older scan unfinished.
+    const total = cut.sessions;
+    try testing.expect(total >= 2);
+    try testing.expectEqual(@as(usize, 0), cut.checked);
+    try testing.expectEqual(total, cut.unfinished);
+    try testing.expect(cut.v1_incomplete);
+    try testing.expectEqual(@as(usize, 0), cut.damaged.items.len);
+    // Told before each session and once at the end.
+    try testing.expectEqual(total + 1, stopped.len);
+    for (stopped.calls[0..stopped.len], 0..) |call, done| try testing.expectEqualSlices(usize, &.{ done, total }, &call);
+
+    var running: Watch = .{ .stop = false };
+    var whole = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &running, .requested = Watch.requested },
+    });
+    defer whole.deinit(alloc);
+    // The limit's count covers the older fx's unconverted sessions too (D73).
+    try testing.expectEqual(whole.sessions + whole.unconverted, whole.checked);
+    try testing.expectEqual(@as(usize, 0), whole.unfinished);
+    try testing.expect(!whole.v1_incomplete);
+    try testing.expectEqual(@as(usize, 4), whole.sessions + whole.unconverted);
+    try testing.expectEqual(@as(usize, 0), whole.damaged.items.len);
 }
 
 test "doctor counts sessions an older fx saved and names each that can't be converted with what recover copies (D73)" {
