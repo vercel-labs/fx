@@ -7790,6 +7790,20 @@ const MailFixture = struct {
         self.app.auth.picker_stage = .api_key;
     }
 
+    /// Opens a prompt and runs the loop's passes, with the posts offered and
+    /// every agent ticked, until `child`'s finish event is applied. The
+    /// prompt pauses the pacer, which keeps the finished turn. Nothing waits
+    /// in the worker, so the loop's own tick does not release its hold.
+    fn applyFinishWithPromptOpen(self: *MailFixture, child: *app_agents_runtime.ChildAgent) !void {
+        self.openPrompt();
+        for (0..20) |_| {
+            if (!child.agent.worker.hasPendingFinishEvent()) break;
+            self.takePosts();
+            try self.tickAgents();
+        }
+        try std.testing.expect(!child.agent.worker.hasPendingFinishEvent());
+    }
+
     /// A scrollback handoff with rows left to write, as a session change
     /// leaves it for a few frames.
     fn beginHandoff(self: *MailFixture) void {
@@ -7949,13 +7963,7 @@ test "a held report is offered again once the loop applied its finish, though an
     // The loop applies the rest of the turn. The open prompt pauses the pacer,
     // which keeps the finished turn with its last line, and nothing waits in
     // the worker, so the loop's own tick does not release the hold.
-    fixture.openPrompt();
-    for (0..20) |_| {
-        if (!child.agent.worker.hasPendingFinishEvent()) break;
-        fixture.takePosts();
-        try fixture.tickAgents();
-    }
-    try std.testing.expect(!child.agent.worker.hasPendingFinishEvent());
+    try fixture.applyFinishWithPromptOpen(child);
     try std.testing.expect(child.agent.worker.finishAwaitsHost());
     try std.testing.expect(child.screen.pacer.holdsFinish());
     try std.testing.expectEqual(@as(usize, 0), child.agent.session.agent.history.items.len);
@@ -7992,12 +8000,7 @@ test "a held report released after the pacer kept the finished turn goes before 
     try std.testing.expectEqualStrings("w1", fixture.app.child_handoffs.reports.items[0].work_id);
     try std.testing.expectEqualStrings("w3", fixture.app.child_handoffs.reports.items[1].work_id);
 
-    fixture.openPrompt();
-    for (0..20) |_| {
-        if (!child.agent.worker.hasPendingFinishEvent()) break;
-        fixture.takePosts();
-        try fixture.tickAgents();
-    }
+    try fixture.applyFinishWithPromptOpen(child);
     try std.testing.expect(child.screen.pacer.holdsFinish());
     try std.testing.expect(child.agent.worker.finishAwaitsHost());
     try std.testing.expectEqual(@as(usize, 2), fixture.heldPosts());
