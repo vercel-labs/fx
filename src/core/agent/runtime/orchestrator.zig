@@ -153,19 +153,18 @@ fn malformedToolCallFeedback(arena: Allocator, attempt: usize, tool_name: ?[]con
     );
 }
 
-/// What fx shows for a malformed tool call: that it asks the model again, or,
-/// once the feedback is spent, that the turn failed and the next step is the
-/// user's.
-fn malformedToolCallNotice(arena: Allocator, failed: bool) ![]const u8 {
-    if (!failed) return try arena.print(
-        "The model's tool call could not be read (provider reason: {s}). {s}",
-        .{ types.malformed_function_call_reason, malformed_tool_call_asking },
-    );
-    return try arena.print(
-        "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
-        .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
-    );
-}
+/// What fx shows when it asks the model again after a malformed tool call.
+const malformed_tool_call_retry_notice = std.fmt.comptimePrint(
+    "The model's tool call could not be read (provider reason: {s}). {s}",
+    .{ types.malformed_function_call_reason, malformed_tool_call_asking },
+);
+
+/// What fx shows once the feedback is spent: the turn failed, and the next
+/// step is the user's.
+const malformed_tool_call_failed_notice = std.fmt.comptimePrint(
+    "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
+    .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
+);
 
 /// The tool a malformed reply's call named, when it is one fx knows; a name
 /// the provider made up stays out of the feedback.
@@ -190,11 +189,11 @@ test "malformed tool call feedback names the tool, then asks for smaller calls" 
     );
     try std.testing.expectEqualStrings(
         "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
-        try malformedToolCallNotice(arena, false),
+        malformed_tool_call_retry_notice,
     );
     try std.testing.expectEqualStrings(
         "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL). Continue with a follow-up prompt if needed.",
-        try malformedToolCallNotice(arena, true),
+        malformed_tool_call_failed_notice,
     );
 }
 
@@ -9757,12 +9756,12 @@ fn processQueuedPromptLoop(
                                 &summary_accumulator,
                                 stop_state,
                                 &finish_trace,
-                                try malformedToolCallNotice(arena, true),
+                                malformed_tool_call_failed_notice,
                                 "malformed_tool_call",
                             );
                             return;
                         }
-                        try deps.push_text(deps.ctx, .{ .operational = try malformedToolCallNotice(arena, false) });
+                        try deps.push_text(deps.ctx, .{ .operational = malformed_tool_call_retry_notice });
                         try deps.push_text(deps.ctx, .{ .operational = "\n" });
                         // The feedback stays in the turn, so a later request
                         // in it still explains the earlier stall.
