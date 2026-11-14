@@ -42,6 +42,9 @@ pub const SemanticNotice = struct {
     tone: NoticeTone,
     body: []const u8,
     visibility: NoticeVisibility = .compact_and_full,
+    /// An optional dim line under the body, indented like a wrapped body row
+    /// and without its own glyph.
+    detail: []const u8 = "",
 };
 
 /// Status glyph leading every semantic notice, keyed by tone. Tool activity
@@ -59,22 +62,26 @@ pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     };
 }
 
-/// Returns a duplicate with owned topic and body bytes. The caller frees it
+/// Returns a duplicate with owned topic, body, and detail bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
     const topic = try alloc.dupe(u8, notice.topic);
     errdefer alloc.free(topic);
+    const body = try alloc.dupe(u8, notice.body);
+    errdefer alloc.free(body);
     return .{
         .topic = topic,
         .tone = notice.tone,
-        .body = try alloc.dupe(u8, notice.body),
+        .body = body,
         .visibility = notice.visibility,
+        .detail = try alloc.dupe(u8, notice.detail),
     };
 }
 
 pub fn freeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) void {
     alloc.free(notice.topic);
     alloc.free(notice.body);
+    alloc.free(notice.detail);
 }
 
 /// Converts legacy context-notice text into a semantic notice body while
@@ -1368,6 +1375,19 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// Set on a running shell result whose wait ended when its command
+    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
+    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// reads it; the session never saves it.
+    quiet_crossing: ?QuietCrossing = null,
+};
+
+/// A shell command that crossed the quiet limit during a wait: its command
+/// line and how long it had printed nothing. Each quiet spell crosses once
+/// (`tests/tla/subagent/QuietRelay.tla`).
+pub const QuietCrossing = struct {
+    command: []const u8,
+    quiet_ms: u64,
 };
 
 pub const ToolExecutionStep = struct {
@@ -1618,6 +1638,10 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const quiet_crossing: ?QuietCrossing = if (memory.quiet_crossing) |crossing|
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+    else
+        null;
     return .{
         .review_feedback = memory.review_feedback,
         .tool_images = tool_images,
@@ -1632,6 +1656,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
+        .quiet_crossing = quiet_crossing,
     };
 }
 
@@ -1644,6 +1669,7 @@ pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     if (memory.preview) |value| alloc.free(value);
     if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
     if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    if (memory.quiet_crossing) |crossing| alloc.free(crossing.command);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {
@@ -1829,10 +1855,11 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
-    /// A prompt fx sent on its own to a turn that stopped without a final
-    /// answer, as plain user text. A save of the turn keeps it in the
+    /// A message fx sent the model on its own, as plain user text: a prompt
+    /// to a turn that stopped without a final answer, a tool's notice, or a
+    /// Stop hook's message to continue. A save of the turn keeps it in the
     /// steering list inside a marker (`recovery_prompt.saved`), and a
-    /// restored one comes back with this flag and the bare prompt.
+    /// restored one comes back with this flag and the bare text.
     recovery_prompt: bool = false,
     /// A `.system` message fx added after the conversation started, which
     /// only the messages lane carries (D93). Plain text content only.
@@ -1999,6 +2026,34 @@ pub const ProviderFinishRaw = struct {
     }
 };
 
+/// Gemini's stop reason for a function call it could not write, which the AI
+/// SDK reports as the finish `error`.
+pub const malformed_function_call_reason = "MALFORMED_FUNCTION_CALL";
+
+/// Whether a reply ended because the provider could not read the model's tool
+/// call. The reply's calls never ran, and the same request can fail the same
+/// way, so fx gives the model feedback instead of a plain resend.
+pub fn isMalformedToolCallFinish(
+    finish_reason: ?ProviderFinishReason,
+    finish_reason_raw: ProviderFinishRaw,
+) bool {
+    const reason = finish_reason orelse return false;
+    return reason == .provider_error and
+        std.mem.eql(u8, finish_reason_raw.slice(), malformed_function_call_reason);
+}
+
+test "only a provider error named MALFORMED_FUNCTION_CALL is a malformed tool call" {
+    const malformed = ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL");
+    try std.testing.expect(isMalformedToolCallFinish(.provider_error, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.other, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.stop, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(null, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("provider_error")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("malformed_function_call")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL_X")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("")));
+}
+
 test "provider finish raw keeps a bounded printable copy" {
     try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
     try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
@@ -2018,12 +2073,20 @@ fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
         try std.testing.expectEqual(if (source >= 0x21 and source <= 0x7e) source else '?', byte);
     }
+    // Only the exact reason marks a malformed tool call: a longer one cut to
+    // the capacity, or one whose unprintable bytes became '?', does not.
+    try std.testing.expectEqual(
+        std.mem.eql(u8, input, malformed_function_call_reason),
+        isMalformedToolCallFinish(.provider_error, raw),
+    );
+    try std.testing.expect(!isMalformedToolCallFinish(.other, raw));
 }
 
 test "fuzz provider finish raw" {
     try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
         .corpus = &(@import("fuzz_seed").slices(.{
             "UNEXPECTED_TOOL_CALL",
+            "MALFORMED_FUNCTION_CALL",
             "",
             "BAD\x07REASON",
             "\xc3\xa9 \x00\xff",

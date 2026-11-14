@@ -266,6 +266,10 @@ pub const DispatchContext = struct {
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
     change_tracker: ?*change_tracker.ChangeTracker = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// Set when steering waits for this turn behind a running tool
+    /// (`WorkerRuntime.tool_yield_requested`). The shell tool then stops
+    /// waiting and returns its command running; it never stops the command.
+    tool_yield_flag: ?*const std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?core_types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,

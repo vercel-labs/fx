@@ -10,12 +10,14 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
@@ -257,6 +259,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn runLogoutCommand(app: *App, agent: *AppAgent, target: []const u8) !void {
             if (try rejectPendingPreparation(app)) return;
+            if (try rejectFinishingSignInRefresh(app)) return;
             if (hostManagesAuth(app)) {
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
                 return;
@@ -335,10 +338,10 @@ pub fn Runtime(comptime App: type) type {
                 .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
-                try writeRemoteRevocationWarning(app, .chatgpt_subscription);
+                try writeRemoteRevocationWarning(app, .chatgpt_subscription, false);
             }
             try reconcileSubscriptionLogout(app, agent, .codex);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// Signs out of Grok locally, then revokes its refresh token at the
@@ -366,10 +369,10 @@ pub fn Runtime(comptime App: type) type {
                 .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
-                try writeRemoteRevocationWarning(app, .grok_subscription);
+                try writeRemoteRevocationWarning(app, .grok_subscription, false);
             }
             try reconcileSubscriptionLogout(app, agent, .grok);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// Signs out of fx login locally, then revokes the session at the
@@ -388,19 +391,20 @@ pub fn Runtime(comptime App: type) type {
             var revocation: ?auth_runtime.RemoteRevocation = if (local.session) |session| .{ .fx_login = session } else null;
             defer if (revocation) |pending| releaseRemoteRevocation(pending);
             try applyLogoutResult(app, local.result);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// The local sign-out is already done. Revoking the session at its
         /// issuer can take seconds, so it runs off the input loop, and a
         /// failure is reported when `collectRemoteRevocationFacts` sees it.
         /// Takes `pending`, leaving null so the caller's release skips it.
-        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation) !void {
+        /// `kept` says whether its tokens are kept to revoke later.
+        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation, kept: bool) !void {
             const revocation = pending.* orelse return;
             pending.* = null;
             const source = revocation.source();
-            if (!app.auth.beginRemoteRevocation(revocation)) {
-                try writeRemoteRevocationWarning(app, source);
+            if (!app.auth.beginRemoteRevocation(revocation, kept)) {
+                try writeRemoteRevocationWarning(app, source, kept);
             }
         }
 
@@ -415,18 +419,23 @@ pub fn Runtime(comptime App: type) type {
         /// Reports a remote revocation that finished with a failure.
         pub fn collectRemoteRevocationFacts(app: *App) !void {
             while (app.auth.takeRemoteRevocation()) |outcome| {
-                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source);
+                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source, outcome.retry_kept);
             }
         }
 
-        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source) !void {
+        /// `retry_kept` says whether the tokens are kept, so fx revokes them
+        /// later (`pending_revocation`).
+        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source, retry_kept: bool) !void {
+            const grok = "The local Grok session was removed, but remote revocation could not be confirmed.";
+            const codex = "The local Codex session was removed, but remote revocation could not be confirmed.";
+            const retry_later = " " ++ pending_revocation.retry_later ++ ".";
             try writeAuthNotice(app, .{
                 .topic = "auth",
                 .tone = .warning,
                 .body = switch (source) {
-                    .grok_subscription => "The local Grok session was removed, but remote revocation could not be confirmed.",
-                    .chatgpt_subscription => "The local Codex session was removed, but remote revocation could not be confirmed.",
-                    else => login_flow.remote_revocation_warning,
+                    .grok_subscription => if (retry_kept) grok ++ retry_later else grok,
+                    .chatgpt_subscription => if (retry_kept) codex ++ retry_later else codex,
+                    else => if (retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning,
                 },
             });
         }
@@ -1313,6 +1322,20 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Refuses an action that takes a sign-in's lock on the input loop,
+        /// such as a logout or a team change, while a refresh nothing waits
+        /// for may hold it (`auth_runtime.Runtime.signInRefreshFinishing`).
+        fn rejectFinishingSignInRefresh(app: *App) !bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "signInRefreshFinishing")) return false;
+            if (!app.auth.signInRefreshFinishing()) return false;
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "A sign-in refresh is still finishing. Try again in a moment.",
+            }, true);
+            return true;
+        }
+
         fn beginPreparation(app: *App, input: auth_runtime.ProviderPreparationInput) !void {
             app.auth.beginProviderPreparation(app.alloc, input) catch |err| {
                 debug_trace.logf("provider", "preparation start failed err={s}", .{@errorName(err)});
@@ -1323,21 +1346,14 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try app.alloc.print("Preparing {s}.", .{provider_catalog.label(input.target())});
-            defer app.alloc.free(body);
-            try app.writeDomainNotice(.{
-                .topic = "provider",
-                .tone = .neutral,
-                .body = body,
-            }, true);
         }
 
         pub fn collectProviderPreparationFacts(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
             if (pendingPromptNeedsAdoption(app, agent)) return;
-            const task = app.auth.takeProviderPreparation() orelse return;
-            defer task.deinit();
-            if (task.cancel_requested.load(.seq_cst)) {
+            // A cancelled preparation ends at once, even one in the middle of
+            // a sign-in refresh, which keeps running until it saves the login.
+            if (app.auth.takeCancelledProviderPreparation()) {
                 holdPromptAfterPreparationFailure(app, agent);
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1346,6 +1362,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            const task = app.auth.takeProviderPreparation() orelse return;
+            defer task.deinit();
             const applied = switch (task.input.intent) {
                 .provider => try finishProviderSwitch(app, agent, task),
                 .team => try finishTeamPreparation(app, agent, task),
@@ -1665,6 +1683,7 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
             if (try rejectPendingPreparation(app)) return false;
+            if (try rejectFinishingSignInRefresh(app)) return false;
             if (try reject_provider_picker_if_busy(app, agent)) return false;
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
@@ -1770,7 +1789,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!try finishProviderSwitch(app, agent, task)) return false;
                     rememberCredentialSource(app, .fx_login);
                     app.auth.closePicker(app.alloc);
-                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+                    try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body, .detail = tokenPassOffer(app) }, true);
                     return true;
                 }
             }
@@ -1817,12 +1836,22 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .warning,
                 .body = "The Vercel team changed and a valid model was selected for this run, but the model preference could not be saved.",
             } else .{
-                .topic = "auth",
+                .topic = "",
                 .tone = .neutral,
                 .body = body,
+                .detail = tokenPassOffer(app),
             }, true);
             try resumePromptAfterAuth(app, agent);
             return true;
+        }
+
+        /// The Token Pass offer under the team notice, or "" when fx already
+        /// knows this team has an active Token Pass.
+        fn tokenPassOffer(app: *App) []const u8 {
+            if (comptime @hasField(App, "model_cache") and @hasDecl(@FieldType(App, "model_cache"), "tokenPassStatus")) {
+                if (app.model_cache.tokenPassStatus() == .active) return "";
+            }
+            return token_pass.offer_line;
         }
 
         /// Whether fx already sends with an fx login on this team, so choosing

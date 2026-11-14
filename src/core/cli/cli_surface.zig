@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -40,6 +41,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -1210,7 +1212,17 @@ fn activateProviderSelection(
     };
 }
 
+/// `FX_TRACE` and `FX_TRACE_LOG` keep a trace for the auth commands too, such
+/// as why a sign-in starts on the first team or whether a sign-out forgot the
+/// kept team. Without a working directory the command goes on without one.
+fn configureAuthCommandTrace(alloc: Allocator) void {
+    const workspace_root = io_mod.realpathAlloc(alloc, ".") catch return;
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+}
+
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    configureAuthCommandTrace(alloc);
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
@@ -1642,6 +1654,7 @@ fn runNonInteractiveWithDeps(
                 .provider_login,
                 if (login_provider == .gateway) .fx_login else null,
             )) return .handled_failure;
+            retryKeptSignOuts(alloc, cfg, deps, login_provider);
             try writeStdout(deps, switch (login_provider) {
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
@@ -1659,6 +1672,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
@@ -1668,7 +1682,12 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, if (outcome.retry_kept)
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                    else
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                } else {
+                    retryKeptSignOuts(alloc, cfg, deps, .codex);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1692,7 +1711,12 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, if (outcome.retry_kept)
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                    else
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                } else {
+                    retryKeptSignOuts(alloc, cfg, deps, .grok);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1744,8 +1768,10 @@ fn runNonInteractiveWithDeps(
                 );
             }
             if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
+                try writeStderr(deps, if (result.retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning);
                 try writeStderr(deps, "\n");
+            } else {
+                retryKeptSignOuts(alloc, cfg, deps, .gateway);
             }
             return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
@@ -1758,6 +1784,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
             login_flow.runTeams(
                 alloc,
@@ -3299,6 +3326,22 @@ fn writeJsonCommandFailureCode(
     try writeJsonLine(deps, json);
 }
 
+/// How `fx sessions` prints for a person: in color and fitted to the window
+/// when it writes to a terminal that takes color, with ages counted from
+/// now. A pipe, `NO_COLOR`, or `TERM=dumb` gets plain text with whole titles,
+/// and output a test captures is plain, so it reads the same everywhere.
+fn sessionListStyle(deps: RunDeps) output_contracts.ListStyle {
+    const styled = deps.write_stdout == &writeRealStdout and
+        terminal_env.stdoutIsTerminal() and
+        !terminal_env.colorDisabled();
+    return .{
+        .color = styled,
+        .columns = if (styled) terminal_env.stdoutColumns() else null,
+        .now_ms = io_mod.milliTimestamp(),
+        .home = io_mod.homeDir(),
+    };
+}
+
 fn writeSessionList(
     alloc: Allocator,
     deps: RunDeps,
@@ -3320,6 +3363,7 @@ fn writeSessionList(
         .next_cursor = next_cursor,
         .skipped_invalid = page.skipped_invalid,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -3408,6 +3452,7 @@ fn runLiveSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions)
     const text = try (output_contracts.LiveSessionListSnapshot{
         .sessions = list.sessions,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -4437,6 +4482,12 @@ const LogoutWaitLine = struct {
     /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
     const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
 
+    /// Before a retry of sign-outs that earlier logouts kept
+    /// (`pending_revocation.retry`), which sends one sign-out after another.
+    const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
+    const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
+    const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
+
     fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
         if (builtin.is_test or !stderrIsTerminal()) return null;
         return .{ .context = self, .run = write };
@@ -4449,6 +4500,28 @@ const LogoutWaitLine = struct {
         };
     }
 };
+
+/// Revokes the provider's sign-outs that earlier logouts kept because it did
+/// not confirm them (`pending_revocation`). A refused retry keeps them for the
+/// next one and prints nothing: the logout that kept them already warned.
+fn retryKeptSignOuts(alloc: Allocator, cfg: Config, deps: RunDeps, provider: model_provider.ProviderId) void {
+    const transport = cfg.gateway_provider.oauth_transport;
+    switch (provider) {
+        .codex => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex_kept };
+            _ = chatgpt_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .grok => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok_kept };
+            _ = grok_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .gateway => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login_kept };
+            _ = login_flow.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        else => {},
+    }
+}
 
 /// Whether doctor's stderr is a terminal, for its wait notice.
 fn stderrIsTerminal() bool {

@@ -29,6 +29,39 @@ fn quietLimitMs() u64 {
     return quiet_notice.limitFromValue(io_mod.getenv("FX_TEST_SHELL_QUIET_NOTICE_MS"));
 }
 
+/// How long a wait still runs after it starts when steering asks it to
+/// yield, so a quick command, shell startup included, returns its result
+/// instead of a session. A command already past it yields at once.
+const default_steer_yield_grace_ms: i64 = 1_000;
+
+/// The steering yield grace, or the one the end-to-end tests set with
+/// `FX_TEST_STEER_YIELD_GRACE_MS` to hold steering behind a running command.
+/// Read once per wait.
+pub fn steerYieldGraceMs() i64 {
+    return steerYieldGraceFromValue(io_mod.getenv("FX_TEST_STEER_YIELD_GRACE_MS"));
+}
+
+/// The grace `value` names in whole milliseconds, or the default when it is
+/// missing, not a number, or negative.
+fn steerYieldGraceFromValue(value: ?[]const u8) i64 {
+    const raw = value orelse return default_steer_yield_grace_ms;
+    const parsed = std.fmt.parseInt(i64, raw, 10) catch return default_steer_yield_grace_ms;
+    return if (parsed < 0) default_steer_yield_grace_ms else parsed;
+}
+
+/// Whether a wait that began at `started_ms` stops now for steering: the
+/// flag is set and `grace_ms` has passed.
+pub fn steerYieldDue(
+    flag: ?*const std.atomic.Value(bool),
+    started_ms: i64,
+    now_ms: i64,
+    grace_ms: i64,
+) bool {
+    const yield_flag = flag orelse return false;
+    if (!yield_flag.load(.seq_cst)) return false;
+    return now_ms - started_ms >= grace_ms;
+}
+
 pub const StartCapturedInput = struct {
     execution_id: []const u8,
     command: []const u8,
@@ -44,6 +77,9 @@ pub const StartCapturedInput = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// When set, `startCaptured` stops waiting before `yield_time_ms` and
+    /// returns the command running (`steerYieldDue`). It never stops it.
+    tool_yield_flag: ?*const std.atomic.Value(bool) = null,
     /// Added to the command's environment. Copied before `startCaptured`
     /// returns.
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
@@ -108,6 +144,11 @@ pub const Snapshot = struct {
     running_ms: ?u64 = null,
     quiet_ms: ?u64 = null,
     quiet_notice: bool = false,
+    /// Set when this snapshot ends a wait at the quiet crossing: the
+    /// command still runs and its quiet spell crossed the limit during this
+    /// wait. A spell crosses once, so a later wait in it leaves this false
+    /// (`tests/tla/managed_execution/QuietWait.tla`).
+    quiet_crossed: bool = false,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.execution_id);
@@ -229,6 +270,10 @@ const Entry = struct {
     /// Serializes joins of `thread`; see `Runtime.joinEntry`.
     join_mutex: std.Io.Mutex = .init,
     published_running: bool = false,
+    /// The turn whose steering returned this command running, if one did.
+    /// An explicit cancel of that turn stops the command
+    /// (`Runtime.takeSteeringDetached`).
+    steering_detached_turn_id: ?u64 = null,
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
@@ -613,6 +658,7 @@ pub const Runtime = struct {
         entry.start_gate.set(io_mod.getIo());
 
         const started_ms = io_mod.milliTimestamp();
+        const yield_grace_ms = if (input.tool_yield_flag != null) steerYieldGraceMs() else 0;
         const zio = io_mod.getIo();
         while (true) {
             entry.mutex.lockUncancelable(zio);
@@ -631,9 +677,14 @@ pub const Runtime = struct {
                     return prepared;
                 }
             }
-            const elapsed = io_mod.milliTimestamp() - started_ms;
+            const now_ms = io_mod.milliTimestamp();
+            const elapsed = now_ms - started_ms;
             const held = if (input.yield_hold) |hold| hold.load(.acquire) > 0 else false;
             if (elapsed >= input.yield_time_ms and !held) break;
+            if (!held and steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {
+                debug_trace.logf("managed-execution", "run yielded for steering execution={s} elapsed_ms={d}", .{ entry.execution_id, elapsed });
+                break;
+            }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
 
@@ -899,6 +950,21 @@ pub const Runtime = struct {
         wait_ceiling_ms: u32,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !PreparedSnapshot {
+        // `waitOrYield` without steering, for callers no steering reaches,
+        // such as tests.
+        return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null);
+    }
+
+    /// `wait`, which also returns the command running once `tool_yield_flag`
+    /// is set and `steerYieldDue` passes, so steering need not wait for it.
+    pub fn waitOrYield(
+        self: *Runtime,
+        alloc: Allocator,
+        execution_id: []const u8,
+        wait_ceiling_ms: u32,
+        cancel_flag: ?*std.atomic.Value(bool),
+        tool_yield_flag: ?*const std.atomic.Value(bool),
+    ) !PreparedSnapshot {
         if (wait_ceiling_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidWaitCeiling;
         }
@@ -920,7 +986,9 @@ pub const Runtime = struct {
         // The wait ends at its ceiling, or when the command reaches the quiet
         // limit after the wait saw it under it (`quiet_notice.poll`).
         const limit_ms = quietLimitMs();
-        var quiet_wait = quiet_notice.beginWait(io_mod.milliTimestamp(), entry.last_output_ms, wait_ceiling_ms, limit_ms);
+        const wait_started_ms = io_mod.milliTimestamp();
+        const yield_grace_ms = if (tool_yield_flag != null) steerYieldGraceMs() else 0;
+        var quiet_wait = quiet_notice.beginWait(wait_started_ms, entry.last_output_ms, wait_ceiling_ms, limit_ms);
         entry.mutex.unlock(zio);
         defer self.clearActiveWaiter(entry, waiter_id);
         while (true) {
@@ -934,9 +1002,22 @@ pub const Runtime = struct {
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) return error.Cancelled;
             }
-            const step = quiet_notice.poll(quiet_wait, io_mod.milliTimestamp(), last_output_ms, limit_ms);
+            const now_ms = io_mod.milliTimestamp();
+            if (steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
+                debug_trace.logf("managed-execution", "wait yielded for steering execution={s} elapsed_ms={d}", .{ execution_id, now_ms - wait_started_ms });
+                break;
+            }
+            const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
             quiet_wait = step.wait;
-            if (step.end != null) break;
+            if (step.end) |end| {
+                if (end == .quiet) {
+                    var prepared = try self.prepareSnapshotForEntry(alloc, entry);
+                    // A command that ended as the wait crossed is no crossing.
+                    prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
+                    return prepared;
+                }
+                break;
+            }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
@@ -1043,6 +1124,59 @@ pub const Runtime = struct {
                 .backend = entry.backend(),
                 .persistence = entry.persistence(),
             });
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// Records that steering in turn `turn_id` returned the running command
+    /// `execution_id` to the model, so it now runs in the background. A
+    /// later mark replaces an earlier one. A missing or ended command is
+    /// left alone.
+    pub fn markSteeringDetached(
+        self: *Runtime,
+        execution_id: []const u8,
+        turn_id: u64,
+    ) void {
+        const entry = self.acquireEntry(execution_id) orelse return;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        if (entry.isTerminal()) return;
+        entry.steering_detached_turn_id = turn_id;
+    }
+
+    /// The ids of the commands steering detached in turn `turn_id` that
+    /// still run, for an explicit cancel of that turn to stop. Their marks
+    /// are cleared, so each id is returned once. Commands the model left in
+    /// the background itself, and those of other turns, are not returned.
+    /// The caller owns the slice and each id.
+    pub fn takeSteeringDetached(
+        self: *Runtime,
+        alloc: Allocator,
+        turn_id: u64,
+    ) Allocator.Error![][]u8 {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |id| alloc.free(id);
+            result.deinit(alloc);
+        }
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            defer entry.mutex.unlock(zio);
+            const marked = entry.steering_detached_turn_id orelse continue;
+            if (marked != turn_id) continue;
+            if (entry.isTerminal()) {
+                entry.steering_detached_turn_id = null;
+                continue;
+            }
+            try result.ensureUnusedCapacity(alloc, 1);
+            result.appendAssumeCapacity(try alloc.dupe(u8, entry.execution_id));
+            entry.steering_detached_turn_id = null;
         }
         return result.toOwnedSlice(alloc);
     }
@@ -1943,6 +2077,165 @@ test "captured managed execution capacity rejects before spawn" {
         error.ExecutionCapacityExceeded,
         runtime.startCaptured(alloc, overflow),
     );
+}
+
+test "steering yield returns a captured command running and keeps it running" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var input = StartCapturedInput{
+        .execution_id = "managed-steer-yield",
+        .command = "sleep 4; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .tool_yield_flag = &yield_flag,
+    };
+    input.authority = testAuthority(input);
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    // It returns after the grace time, long before `yield_time_ms`.
+    const returned_after_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(returned_after_ms >= steerYieldGraceMs());
+    try std.testing.expect(returned_after_ms < 3_000);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    // A follow-up wait yields too, and the command still runs.
+    var followed = try runtime.waitOrYield(alloc, input.execution_id, 30_000, null, &yield_flag);
+    defer followed.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, followed.snapshot.state);
+    try runtime.commitDelivery(followed.snapshot.execution_id, followed.reservation_id);
+
+    // Once the turn takes its steering, a wait sees the command finish.
+    yield_flag.store(false, .seq_cst);
+    var completed = try runtime.wait(alloc, input.execution_id, 10_000, null);
+    defer completed.deinit(alloc);
+    switch (completed.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, completed.snapshot.output_delta, "done") != null);
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "a command that ends inside the steering grace returns its result" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var input = StartCapturedInput{
+        .execution_id = "managed-steer-grace",
+        .command = "printf quick",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .tool_yield_flag = &yield_flag,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    switch (started.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "a cancel takes only the running commands steering detached in its turn" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    const ids = [_][]const u8{ "steered-in-7", "steered-in-8", "background", "ended" };
+    for (ids) |id| {
+        var input = StartCapturedInput{
+            .execution_id = id,
+            .command = if (std.mem.eql(u8, id, "ended")) "printf done" else "sleep 30",
+            .cwd = "/tmp",
+            .environment = .legacy,
+            .authority = undefined,
+            .max_output_bytes = 4096,
+            .timeout_ms = 60_000,
+            .command_artifact_dir = null,
+            .yield_time_ms = 0,
+        };
+        input.authority = testAuthority(input);
+        var started = try runtime.startCaptured(alloc, input);
+        defer started.deinit(alloc);
+        try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    }
+    var ended = try runtime.wait(alloc, "ended", 10_000, null);
+    defer ended.deinit(alloc);
+    try std.testing.expect(ended.snapshot.state != .running);
+    try runtime.commitDelivery(ended.snapshot.execution_id, ended.reservation_id);
+
+    runtime.markSteeringDetached("steered-in-7", 7);
+    runtime.markSteeringDetached("steered-in-8", 8);
+    // An ended command and an unknown id take no mark.
+    runtime.markSteeringDetached("ended", 7);
+    runtime.markSteeringDetached("missing", 7);
+
+    const taken = try runtime.takeSteeringDetached(alloc, 7);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("steered-in-7", taken[0]);
+
+    // Each id is taken once, and a turn with no steered command takes none.
+    const again = try runtime.takeSteeringDetached(alloc, 7);
+    defer alloc.free(again);
+    try std.testing.expectEqual(@as(usize, 0), again.len);
+    const unmarked = try runtime.takeSteeringDetached(alloc, 9);
+    defer alloc.free(unmarked);
+    try std.testing.expectEqual(@as(usize, 0), unmarked.len);
+
+    // A later steering mark moves the command to its own turn.
+    runtime.markSteeringDetached("steered-in-8", 9);
+    const moved_from = try runtime.takeSteeringDetached(alloc, 8);
+    defer alloc.free(moved_from);
+    try std.testing.expectEqual(@as(usize, 0), moved_from.len);
+    const moved_to = try runtime.takeSteeringDetached(alloc, 9);
+    defer {
+        for (moved_to) |id| alloc.free(id);
+        alloc.free(moved_to);
+    }
+    try std.testing.expectEqual(@as(usize, 1), moved_to.len);
+    try std.testing.expectEqualStrings("steered-in-8", moved_to[0]);
+    try std.testing.expectEqual(SnapshotState.running, runtime.stateFor("background").?);
+}
+
+test "steering yield waits out its grace time" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!steerYieldDue(&flag, 0, 10_000, 1_000));
+    flag.store(true, .seq_cst);
+    try std.testing.expect(!steerYieldDue(&flag, 0, 999, 1_000));
+    try std.testing.expect(steerYieldDue(&flag, 0, 1_000, 1_000));
+    try std.testing.expect(!steerYieldDue(null, 0, 10_000, 1_000));
+}
+
+test "the steering grace falls back to the default for a bad test value" {
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue(null));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue(""));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue("-5"));
+    try std.testing.expectEqual(default_steer_yield_grace_ms, steerYieldGraceFromValue("abc"));
+    try std.testing.expectEqual(@as(i64, 0), steerYieldGraceFromValue("0"));
+    try std.testing.expectEqual(@as(i64, 2_500), steerYieldGraceFromValue("2500"));
 }
 
 test "captured managed execution exposes full output only by opaque replay handle" {

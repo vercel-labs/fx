@@ -38,6 +38,14 @@ const ISOLATED_KEYS = [
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
+  // A developer's terminal recording and the bridge of the fx session that
+  // started their tmux server must not reach a test's fx.
+  "FX_DEBUG_RECORD",
+  "FX_DEBUG_RECORD_SILENT_BANNER",
+  "FX_RECORD",
+  "FX_RECORD_INPUT",
+  "FX_MCP_CALL_SOCKET",
+  "FX_MCP_CALL_TOKEN",
 ] as const;
 
 test("pane exit matching requires the expected observed status", () => {
@@ -249,6 +257,7 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     for (const key of ISOLATED_KEYS) delete process.env[key];
 
     const explicitCredential = "explicit-auth-sentinel";
+    const explicitRecordInput = "explicit-record-input-sentinel";
     writeFileSync(
       probePath,
       `await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({\n` +
@@ -263,6 +272,7 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
       socketName,
       env: {
         AI_GATEWAY_API_KEY: explicitCredential,
+        FX_RECORD_INPUT: explicitRecordInput,
       },
     });
 
@@ -273,10 +283,12 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     expect(existsSync(resultPath)).toBe(true);
     const observed = JSON.parse(readFileSync(resultPath, "utf8"));
     expect(observed.AI_GATEWAY_API_KEY).toBe(explicitCredential);
-    expect(observed.VERCEL_OIDC_TOKEN).toBeNull();
-    expect(observed.FX_TEST_GATEWAY_CHAT_URL).toBeNull();
-    expect(observed.FX_TEST_GATEWAY_MODELS_URL).toBeNull();
-    expect(observed.FX_TEST_GATEWAY_CREDITS_URL).toBeNull();
+    // A key the test sets itself is kept; every other stale one is gone.
+    expect(observed.FX_RECORD_INPUT).toBe(explicitRecordInput);
+    for (const key of ISOLATED_KEYS) {
+      if (key === "AI_GATEWAY_API_KEY" || key === "FX_RECORD_INPUT") continue;
+      expect(observed[key], `${key} reached the pane`).toBeNull();
+    }
 
     const startCommand = execFileSync(
       "tmux",

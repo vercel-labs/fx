@@ -416,7 +416,7 @@ pub const ModelOrigin = enum {
         };
     }
 
-    fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
+    pub fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
         if (env_model != null) return .env;
         return if (settings.models.get(provider) != null) .settings else .default;
     }
@@ -1019,7 +1019,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.fx_version,
     ) catch |err| {
         debug_trace.logf("record", "startup recording failed err={s}", .{@errorName(err)});
-        return error.RecordingStartFailed;
+        return record_tape.startFailure(err);
     };
 
     // The shadow VT is load-bearing: frame commit diffs the target
