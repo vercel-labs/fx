@@ -1627,6 +1627,7 @@ pub const Runtime = struct {
         // lock released, and the next one waiting is tried.
         while (self.startPendingAfterTurn(child_id)) |failed| {
             defer failed.deinit(self.alloc);
+            start_test_controls.failedStartEnded(child_id);
             _ = self.deliverEnd(.{
                 .child_id = child_id,
                 .work_id = failed.work_id,
@@ -2965,6 +2966,8 @@ const MailboxFixture = struct {
     reports: std.ArrayList([]u8) = .empty,
     /// Each report's facts, in the same order.
     ends: std.ArrayList(child_state.EndFacts) = .empty,
+    /// Whether each report said its subagent is idle, in the same order.
+    idles: std.ArrayList(bool) = .empty,
     /// When set, each report is also posted to this worker, as `fx ask`'s sink does.
     worker: ?*worker_runtime.WorkerRuntime = null,
 
@@ -2974,6 +2977,7 @@ const MailboxFixture = struct {
         for (self.reports.items) |line| std.testing.allocator.free(line);
         self.reports.deinit(std.testing.allocator);
         self.ends.deinit(std.testing.allocator);
+        self.idles.deinit(std.testing.allocator);
     }
 
     fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
@@ -3072,8 +3076,10 @@ const MailboxFixture = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         try self.ends.ensureUnusedCapacity(std.testing.allocator, 1);
+        try self.idles.ensureUnusedCapacity(std.testing.allocator, 1);
         try self.reports.append(std.testing.allocator, line);
         self.ends.appendAssumeCapacity(report.end);
+        self.idles.appendAssumeCapacity(report.idle);
         if (self.worker) |worker| {
             worker.postMail(std.testing.allocator, .{
                 .prompt = try std.testing.allocator.dupe(u8, line),
@@ -4400,11 +4406,185 @@ test "a message that waited for the user's turn and could not start is reported 
     try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
     const line = fixture.reports.items[1];
     try expectBodyHas(line, "reviewer call-2 ");
-    try expectBodyHas(line, " failed The subagent could not start the work your message made: fx could not start a thread for it. It never ran. The subagent is idle");
+    try expectBodyHas(line, " failed " ++ start_failed_report_text);
     try std.testing.expect(fixture.ends.items[1].started_by == .parent);
     const state = try reviewerPhase(runtime, arena);
     try std.testing.expectEqual(child_state.Phase.idle, state.phase);
     try std.testing.expectEqual(@as(?child_state.Outcome, .failed), state.outcome);
+}
+
+/// Where the close tests below land a close: after a waiting message's failed
+/// start is ended, before its report is built.
+const WindowClose = struct {
+    var runtime: ?*Runtime = null;
+    var by: Runtime.CloseBy = .parent;
+    var closed: ?Runtime.Closed = null;
+    var calls: usize = 0;
+
+    fn hook(child_id: []const u8) void {
+        calls += 1;
+        if (calls != 1) return;
+        closed = (runtime.?.closeChild(child_id, by) catch return) orelse return;
+    }
+};
+
+const start_failed_report_text = "The subagent could not start the work your message made: fx could not start a thread for it. It never ran. Send the message again if it is still needed.";
+
+test "each report of a waiting message that could not start says its subagent is idle only when it is" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    // Two messages wait for the user's turn. They would start as one work, so
+    // the allocation that joins them fails, which leaves the second waiting
+    // as the first starts, and no start succeeds.
+    const messages = [_][]const u8{ "first waiting", "second waiting" };
+    for (messages, 0..) |text, index| {
+        const call = if (index == 0) "call-2" else "call-3";
+        const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = text } }, call, null);
+        try expectBodyHas(queued, "is busy");
+    }
+    var fault: FaultAllocator = .{ .backing = alloc, .thread = std.Thread.getCurrentId(), .len = messages[0].len + 2 + messages[1].len, .fail_at = 0 };
+    const original = runtime.alloc;
+    runtime.alloc = fault.allocator();
+    defer runtime.alloc = original;
+    start_test_controls.test_fail_spawn = true;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    start_test_controls.test_fail_spawn = false;
+    runtime.alloc = original;
+    try std.testing.expect(fault.fired);
+    try waitUntilQuiet(runtime);
+
+    try std.testing.expectEqual(@as(usize, 3), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[1], "reviewer call-2 ");
+    try expectBodyHas(fixture.reports.items[2], "reviewer call-3 ");
+    // The first is built while the second still waits, so that subagent is
+    // not idle then; the second leaves nothing waiting.
+    try std.testing.expect(!fixture.idles.items[1]);
+    try std.testing.expect(fixture.idles.items[2]);
+    for (fixture.reports.items[1..], fixture.idles.items[1..]) |line, idle| {
+        // The words of a report claim idleness only when its flag does.
+        try expectAt(if (idle) "a report whose idle flag is set" else "a report whose idle flag is clear", "does not say the subagent is idle", if (idle or std.mem.find(u8, line, "is idle") == null) "does not say the subagent is idle" else line);
+        try expectBodyHas(line, start_failed_report_text);
+    }
+}
+
+fn expectCloseInReportWindow(by: Runtime.CloseBy) !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try expectBodyHas(queued, "is busy");
+
+    WindowClose.runtime = runtime;
+    WindowClose.by = by;
+    WindowClose.closed = null;
+    WindowClose.calls = 0;
+    start_test_controls.test_failed_start_ended = WindowClose.hook;
+    defer start_test_controls.test_failed_start_ended = null;
+    start_test_controls.test_fail_spawn = true;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    start_test_controls.test_fail_spawn = false;
+    try waitUntilQuiet(runtime);
+
+    // The close landed after the start's failure was ended: nothing waited
+    // for it any more, and the close is written once the turn is settled.
+    try std.testing.expect(WindowClose.closed != null);
+    try std.testing.expectEqual(@as(usize, 0), WindowClose.closed.?.dropped);
+    {
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expect(registry.findById(child_id) == null);
+    }
+    // The report of the failed start is the one the parent hears, and it does
+    // not call the subagent idle: a close of it was under way.
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[1], "reviewer call-2 ");
+    try std.testing.expect(!fixture.idles.items[1]);
+    try expectAt("a report built while a close is under way", "does not say the subagent is idle", if (std.mem.find(u8, fixture.reports.items[1], "is idle") == null) "does not say the subagent is idle" else fixture.reports.items[1]);
+    try expectBodyHas(fixture.reports.items[1], start_failed_report_text);
+    // What main reads when it sends the message again: the name starts a new
+    // subagent. The user's close is named in the answer; the parent's own
+    // close needs no note.
+    const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-3", null);
+    switch (by) {
+        .user => try expectBodyHas(again, "The user closed the earlier reviewer, so this one starts with no history."),
+        .parent => {
+            try expectBodyHas(again, "Sent to reviewer, which works on it now.");
+            try std.testing.expect(std.mem.find(u8, again, "closed") == null);
+        },
+    }
+    try waitUntilQuiet(runtime);
+}
+
+test "the parent's close that lands after a failed start is ended leaves a report that does not call the subagent idle" {
+    try expectCloseInReportWindow(.parent);
+}
+
+test "the user's close that lands after a failed start is ended leaves a report that does not call the subagent idle" {
+    try expectCloseInReportWindow(.user);
+}
+
+test "a message whose start failed says its subagent is idle only while nothing waits for it, runs it or closes it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    start_test_controls.test_fail_spawn = true;
+    defer start_test_controls.test_fail_spawn = false;
+    // The first message makes the child, the second goes to the child it
+    // left idle: the answer is the same, and so are the facts behind it.
+    for ([_][]const u8{ "call-1", "call-2" }) |call| {
+        const body = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = call } }, call, null);
+        try expectBodyHas(body, "reviewer did not start: fx could not start a thread for it. Your message did not run. reviewer is idle");
+        const child_id = try reviewerId(runtime, arena);
+        {
+            runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer runtime.admission_mutex.unlock(io_mod.getIo());
+            try std.testing.expect(!runtime.isBusyLocked(child_id));
+            try std.testing.expect(!runtime.hasPendingLocked(child_id));
+            try std.testing.expect(!runtime.inTurnWorkLocked(child_id));
+            try std.testing.expect(runtime.closingIndexLocked(child_id) == null);
+        }
+        try std.testing.expect(!runtime.anyWorking());
+        // The host's own test for an idle child, as a report applies it.
+        try std.testing.expect(runtime.idleAfterEnd(arena, .{ .child_id = child_id, .work_id = call, .outcome = .failed, .report_owed = false }));
+    }
 }
 
 test "a subagent whose waiting message could not start after the user's turn takes the next message" {
@@ -6667,9 +6847,11 @@ fn startFailedResult(buf: []u8, agent: []const u8, cause: []const u8, ended: boo
 }
 
 /// A report's text for a work whose slot could not start: the message
-/// never ran. Allocated in `a`.
+/// never ran. It does not say whether the subagent is idle, which the host
+/// reads after it builds this text, and the report's `next` says when it is.
+/// Allocated in `a`.
 fn startFailedReport(a: Allocator, cause: []const u8) ![]const u8 {
-    return a.print("The subagent could not start the work your message made: {s}. It never ran. The subagent is idle, so send the message again if it is still needed.", .{cause});
+    return a.print("The subagent could not start the work your message made: {s}. It never ran. Send the message again if it is still needed.", .{cause});
 }
 
 /// What decides whether a child is idle once its work's report goes
