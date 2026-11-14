@@ -16,8 +16,9 @@ current code.
   the live blocks. A finished block is kept as drawn text; the shell owns that
   text, keyed by the block's sequence number. Tool records are not kept.
 - D2: The previous cycle stays held after a compaction until the first turn end
-  at which the log holds it. A compaction can land mid-turn while a tool line is
-  still changing.
+  after it, once the log holds it. A compaction can land mid-turn while a tool
+  line is still changing, and between turns a resize before the next turn end
+  still reprints the cycle.
 - D3: A settled resize clears the screen and reprints every held block in finish
   order, at most `Slice` blocks per loop iteration, then repaints the live blocks.
 - D4: Ctrl+O opens on the newest `Window` blocks from memory, reads older blocks
@@ -64,8 +65,9 @@ current code.
   turn shows whole in the cycle the compaction opens, as Ctrl+O shows it.
   When no turn finished after the newest compaction, resume replays the cycle
   before it and then applies that compaction as a live one is applied: the
-  screen shows what it showed before, and those entries leave memory as they
-  scroll off. For the model this is Resumed from a log without the newest
+  screen shows what it showed before, a resize before the next turn end
+  reprints those entries, and after it they leave memory as they scroll
+  off. For the model this is Resumed from a log without the newest
   compaction, then Compacted.
 - Ctrl+O does not run `ctrlo_*`, `read_log` or `log_read_*`: it pages by
   entries, 256 to a page. Its newest pages show the held cycle together with
@@ -180,7 +182,7 @@ maps it onto the TLA+ variables.
 
 | Law | Statement |
 |---|---|
-| L1 HeldIsRecentCycles | When no turn is open and the log holds the previous cycles (or the session is unsaved), no block before `cycle_first` is held. |
+| L1 HeldIsRecentCycles | When no turn is open, a turn has ended since the last compaction, and the log holds the previous cycles (or the session is unsaved), no block before `cycle_first` is held. |
 | L2 LiveNeverDropped | No drop range contains a live block, and a drop never changes `live`. |
 | L3 DropOnlySaved | In a saved session every drop range is below `saved_through`. |
 | L4 UpdateIsLocal | `block_changed(id)` emits exactly `repaint_block(id)` and changes no state. |
@@ -192,14 +194,15 @@ maps it onto the TLA+ variables.
 | L10 OpenReadsNothing | `ctrlo_opened` shows the newest held blocks (`hi = next_seq`, `lo >= held_first`) and never emits `read_log`. |
 | L11 StaleReadIgnored | A read reply whose token is not the pending one leaves the state unchanged. |
 | L12 NoReadWhenUnsaved | An unsaved session never emits `read_log`. |
-| L13 RecoveredFromLog | After `resumed`, the held blocks are all in the log, and nothing of the earlier state survives: no previous cycle, live block, open turn, Ctrl+O, or pending read. |
-| L14 PreviousCycleDropped | After a compaction, once the turn ends and saves land, the previous cycle is dropped (liveness). |
+| L13 RecoveredFromLog | After `resumed`, the held blocks are all in the log, and nothing of the earlier state survives: no previous cycle or wait for its turn end, live block, open turn, Ctrl+O, or pending read. |
+| L14 PreviousCycleDropped | After a compaction, once the next turn ends and saves land, the previous cycle is dropped, unless a compaction between turns starts a new wait (liveness). |
 | L15 ReprintFinishes | A reprint that no later resize or resume starts over finishes (liveness). |
 | L16 CtrlOReachesStart | Scrolling older while the log answers each read with the true count eventually reaches the start of the log (liveness). |
 | L18 DropBetweenTurns | Every drop happens while no turn is open, so a resize mid-turn reprints the whole current turn, the prompt included. |
 | L19 ScreenHoldsHeld | Outside a reprint, every held block is on the screen. |
 | L20 PaintedOnce | No step paints a block already on the screen in this epoch. |
 | L21 ReadBounded | One log reply moves the window by at most `Step` blocks, so a reply costs a bounded amount of work. |
+| L22 PreviousWaitsForTurnEnd | Until the first turn end after a compaction, the previous cycle is held, even when the log holds it, so a resize before that turn end reprints it. |
 | L17 PureCore | `transcript_window.zig` imports only `std` and reads no clock, environment, or global. |
 
 ## Enforcement
@@ -226,6 +229,7 @@ maps it onto the TLA+ variables.
 | L19 | `inv:ScreenHoldsHeld`, `trace:ScreenHoldsHeld` |
 | L20 | `prop:PaintedOnce`, `trace:PaintedOnce` |
 | L21 | `prop:ReadBounded`, `trace:ReadBounded` |
+| L22 | `inv:PreviousWaitsForTurnEnd`, `trace:PreviousWaitsForTurnEnd` |
 | L17 | `check:pure-core-imports` (the verify source check), not model checkable |
 
 Prefixes: `inv:` is an invariant in `spec/TranscriptWindow.tla` checked by

@@ -121,14 +121,15 @@ const ModelMenuLayout = struct {
 };
 
 /// How many Token Pass models lead the list when it shows them under their
-/// own heading: only while nothing is typed, since a search ranks models by
-/// match, and only when other models follow them.
+/// own heading: only for a team that has Token Pass, only while nothing is
+/// typed, since a search ranks models by match, and only when other models
+/// follow them.
 fn tokenPassLeadCount(projection: ModelMenuProjection, match_count: usize) ?usize {
-    if (projection.query.len > 0) return null;
+    if (!projection.token_pass or projection.query.len > 0) return null;
     var count: usize = 0;
     while (count < match_count) : (count += 1) {
         const item = projection.itemAt(count) orelse break;
-        if (!token_pass.isFeaturedModel(item.id)) break;
+        if (!item.token_pass) break;
     }
     if (count == 0 or count == match_count) return null;
     return count;
@@ -379,6 +380,8 @@ const FactColumns = struct {
     /// The cell where the first column starts.
     start: usize = 0,
     token_pass: bool = false,
+    /// Whether the team has Token Pass, which drops Fast mode from its models.
+    token_pass_team: bool = false,
     context_digits: usize = 0,
     output_digits: usize = 0,
     speed: usize = 0,
@@ -392,13 +395,13 @@ const FactColumns = struct {
     fn build(projection: ModelMenuProjection, row_width: u16, headings: Headings) ?FactColumns {
         const indent: usize = if (row_width <= 2) 0 else 2;
         const filter = projection.providerFilter();
-        var columns: FactColumns = .{};
+        var columns: FactColumns = .{ .token_pass_team = projection.token_pass };
         var longest_id: usize = 8;
         var tab_has_token_pass = false;
         for (projection.items) |item| {
             if (!model_cache_runtime.modelProviderFilterKeeps(item, filter)) continue;
             longest_id = @max(longest_id, display_width.visibleWidth(item.id));
-            if (token_pass.isFeaturedModel(item.id)) tab_has_token_pass = true;
+            if (projection.token_pass and item.token_pass) tab_has_token_pass = true;
             var buf: [32]u8 = undefined;
             if (item.capabilities.context_window) |tokens| {
                 const text: []const u8 = formatTokenCount(&buf, tokens) catch "";
@@ -408,7 +411,7 @@ const FactColumns = struct {
                 const text: []const u8 = formatTokenCount(&buf, tokens) catch "";
                 columns.output_digits = @max(columns.output_digits, text.len);
             }
-            columns.speed = @max(columns.speed, speedFacts(&buf, item.capabilities).len);
+            columns.speed = @max(columns.speed, speedFacts(&buf, itemSpeed(item, projection.token_pass)).len);
         }
         // Under the Token Pass heading the tag says nothing new.
         columns.token_pass = tab_has_token_pass and headings == .hidden;
@@ -459,7 +462,7 @@ const FactColumns = struct {
     fn appendCells(self: FactColumns, alloc: Allocator, out: *std.ArrayList(u8), item: model_cache_runtime.ModelMenuItem) !void {
         var cells: CellWriter = .{ .alloc = alloc, .out = out };
         if (self.token_pass) {
-            try cells.cell(if (token_pass.isFeaturedModel(item.id)) token_pass_fact else "", token_pass_fact.len);
+            try cells.cell(if (item.token_pass) token_pass_fact else "", token_pass_fact.len);
         }
         var buf: [32]u8 = undefined;
         if (self.context_digits > 0) {
@@ -468,7 +471,7 @@ const FactColumns = struct {
         if (self.output_digits > 0) {
             try cells.cell(try tokenCell(&buf, item.capabilities.max_output_tokens, self.output_digits, output_label), self.output_digits + output_label.len);
         }
-        if (self.speed > 0) try cells.cell(speedFacts(&buf, item.capabilities), self.speed);
+        if (self.speed > 0) try cells.cell(speedFacts(&buf, itemSpeed(item, self.token_pass_team)), self.speed);
     }
 };
 
@@ -502,6 +505,15 @@ fn tokenCell(buf: *[32]u8, tokens: ?u32, digits: usize, label: []const u8) ![]co
     @memcpy(buf[pad..][0..text.len], text);
     @memcpy(buf[pad + text.len ..][0..label.len], label);
     return buf[0 .. pad + text.len + label.len];
+}
+
+/// The capabilities whose speed facts `item` shows. Token Pass credit does
+/// not pay for Fast mode, so for a team with Token Pass its models leave
+/// Fast mode out.
+fn itemSpeed(item: model_cache_runtime.ModelMenuItem, token_pass_team: bool) model_capabilities.Capabilities {
+    var capabilities = item.capabilities;
+    capabilities.supports_fast_mode = token_pass.offersFastMode(token_pass_team and item.token_pass, capabilities.supports_fast_mode);
+    return capabilities;
 }
 
 /// The speed options a model has, as one cell: `Fast` for a model that
@@ -1143,13 +1155,14 @@ test "model menu labels -fast models Fast and models that offer Fast mode as Fas
     try std.testing.expect(std.mem.find(u8, fast_with_option.items, "1M context   Fast, Fast mode") != null);
 }
 
-test "model menu tags Token Pass models first and no other model" {
+test "model menu tags Token Pass models for a team with Token Pass and leaves their Fast mode out" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
             .id = @constCast("zai/glm-5.3"),
             .provider = "zai",
             .capabilities = .{ .context_window = 200_000, .supports_fast_mode = true },
+            .token_pass = true,
         },
         .{
             .id = @constCast("zai/glm-5.3-fast"),
@@ -1161,15 +1174,18 @@ test "model menu tags Token Pass models first and no other model" {
         .active = true,
         .load_state = .ready,
         .items = &items,
+        .token_pass = true,
     };
     const rows = menuRowCount(projection, 100, 20);
     try std.testing.expectEqual(@as(u16, 7), rows);
 
-    // Under the Token Pass heading the rows leave the tag out.
+    // Under the Token Pass heading the rows leave the tag out, and Fast mode
+    // too, since Token Pass credit does not pay for it.
     var featured = try composeModelMenuRow(alloc, projection, 3, 100, rows);
     defer featured.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, featured.items, "zai/glm-5.3") != null);
-    try std.testing.expect(std.mem.find(u8, featured.items, "200K context   Fast mode") != null);
+    try std.testing.expect(std.mem.find(u8, featured.items, "200K context") != null);
+    try std.testing.expect(std.mem.find(u8, featured.items, "Fast mode") == null);
     try std.testing.expect(std.mem.find(u8, featured.items, "Token Pass") == null);
 
     var other = try composeModelMenuRow(alloc, projection, 6, 100, rows);
@@ -1184,7 +1200,8 @@ test "model menu tags Token Pass models first and no other model" {
     const searched_rows = menuRowCount(searched, 100, 20);
     var tagged = try composeModelMenuRow(alloc, searched, 2, 100, searched_rows);
     defer tagged.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, tagged.items, "Token Pass   200K context   Fast mode") != null);
+    try std.testing.expect(std.mem.find(u8, tagged.items, "Token Pass   200K context") != null);
+    try std.testing.expect(std.mem.find(u8, tagged.items, "Fast mode") == null);
     var untagged = try composeModelMenuRow(alloc, searched, 3, 100, searched_rows);
     defer untagged.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, untagged.items, "zai/glm-5.3-fast") != null);
@@ -1222,8 +1239,8 @@ fn gridColumnOf(alloc: Allocator, grid: *vt_emulator.Grid, row: u16, needle: []c
 }
 
 const column_test_items = [_]model_cache_runtime.ModelMenuItem{
-    .{ .id = @constCast("moonshotai/kimi-k3"), .provider = "moonshotai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_072, .supports_fast_mode = true } },
-    .{ .id = @constCast("zai/glm-5.3-flash"), .provider = "zai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_000 } },
+    .{ .id = @constCast("moonshotai/kimi-k3"), .provider = "moonshotai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_072, .supports_fast_mode = true }, .token_pass = true },
+    .{ .id = @constCast("zai/glm-5.3-flash"), .provider = "zai", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 131_000 }, .token_pass = true },
     .{ .id = @constCast("openai/gpt-6.1-terra"), .provider = "openai", .capabilities = .{ .context_window = 1_050_000, .max_output_tokens = 128_000, .supports_fast_mode = true } },
     .{ .id = @constCast("amazon/nova-pro"), .provider = "amazon", .capabilities = .{ .context_window = 300_000, .max_output_tokens = 8_192 } },
     .{ .id = @constCast("anthropic/claude-opus-5.5-fast"), .provider = "anthropic", .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 128_000, .intrinsic_fast = true } },
@@ -1231,7 +1248,7 @@ const column_test_items = [_]model_cache_runtime.ModelMenuItem{
 
 test "model menu facts line up in columns through the VT and drop whole columns as the terminal narrows" {
     const alloc = std.testing.allocator;
-    const projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items };
+    const projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items, .token_pass = true };
     // Grid rows: 1 header, 2 gap, 3 Token Pass heading, 4-5 its models, 6 gap,
     // 7 All Models heading, 8-10 the rest.
     const model_rows = [_]u16{ 4, 5, 8, 9, 10 };
@@ -1268,10 +1285,12 @@ test "model menu facts line up in columns through the VT and drop whole columns 
             }
         }
         try std.testing.expectEqual(case.output, output_column != null);
-        try std.testing.expectEqual(case.speed, (try gridColumnOf(alloc, &grid, 4, "Fast mode")) != null);
+        try std.testing.expectEqual(case.speed, (try gridColumnOf(alloc, &grid, 8, "Fast mode")) != null);
         if (case.speed) {
-            try std.testing.expectEqual(try gridColumnOf(alloc, &grid, 4, "Fast mode"), try gridColumnOf(alloc, &grid, 10, "Fast"));
+            try std.testing.expectEqual(try gridColumnOf(alloc, &grid, 8, "Fast mode"), try gridColumnOf(alloc, &grid, 10, "Fast"));
         }
+        // The Token Pass model that offers Fast mode leaves it out.
+        try std.testing.expect((try gridColumnOf(alloc, &grid, 4, "Fast")) == null);
     }
 
     // At 120 columns the cells read as the design shows them.
@@ -1280,7 +1299,7 @@ test "model menu facts line up in columns through the VT and drop whole columns 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(alloc);
     const expected = [_]struct { row: u16, text: []const u8 }{
-        .{ .row = 4, .text = "moonshotai/kimi-k3                  1M context   128K output   Fast mode" },
+        .{ .row = 4, .text = "moonshotai/kimi-k3                  1M context   128K output" },
         .{ .row = 5, .text = "zai/glm-5.3-flash                   1M context   131K output" },
         .{ .row = 8, .text = "openai/gpt-6.1-terra             1.05M context   128K output   Fast mode" },
         .{ .row = 9, .text = "amazon/nova-pro                   300K context     8K output" },
@@ -1295,7 +1314,7 @@ test "model menu facts line up in columns through the VT and drop whole columns 
 
 test "model menu fits a short terminal and keeps the Token Pass tag when a search narrows the row" {
     const alloc = std.testing.allocator;
-    var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items };
+    var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items, .token_pass = true };
 
     // Too few rows for headings and two models: a plain list that still
     // shows the selection.
@@ -1340,9 +1359,9 @@ test "model menu groups Token Pass models under their own heading until a search
             2 => @constCast("zai/glm-5.3-flash"),
             else => try std.mem.print(&ids[index - 3], "acme/model-{d:0>2}", .{index - 3}),
         };
-        item.* = .{ .id = id, .provider = "other", .capabilities = .{} };
+        item.* = .{ .id = id, .provider = "other", .capabilities = .{}, .token_pass = index < 3 };
     }
-    var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items };
+    var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items, .token_pass = true };
 
     // Header, gap, then the Token Pass group, a gap, and every other model.
     const all_rows = menuRowCount(projection, 100, 40);
@@ -1390,4 +1409,38 @@ test "model menu groups Token Pass models under their own heading until a search
     var first = try composeModelMenuRow(alloc, projection, 2, 100, searched_rows);
     defer first.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, first.items, "/") != null);
+}
+
+test "model menu for a team without Token Pass shows no Token Pass heading or tag and keeps Fast mode" {
+    const alloc = std.testing.allocator;
+    var projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &column_test_items };
+
+    // Header, gap, then the models as the catalog lists them.
+    const rows = menuRowCount(projection, 120, 20);
+    try std.testing.expectEqual(@as(u16, 2 + column_test_items.len), rows);
+    var grid = try renderMenuGrid(alloc, projection, 120, 20);
+    defer grid.deinit();
+    var row: u16 = 1;
+    while (row <= rows) : (row += 1) {
+        try std.testing.expect((try gridColumnOf(alloc, &grid, row, "Token Pass")) == null);
+        try std.testing.expect((try gridColumnOf(alloc, &grid, row, "All Models")) == null);
+    }
+    // Grid rows: 1 header, 2 gap, 3 the first model.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    try grid.rowTextTrimmed(3, &text);
+    try std.testing.expectEqualStrings(
+        "moonshotai/kimi-k3                  1M context   128K output   Fast mode",
+        std.mem.trimStart(u8, text.items, " "),
+    );
+
+    // A search has no tag column either.
+    projection.query = "kimi";
+    var searched = try renderMenuGrid(alloc, projection, 120, 20);
+    defer searched.deinit();
+    text.clearRetainingCapacity();
+    try searched.rowTextTrimmed(3, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "kimi-k3") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Token Pass") == null);
+    try std.testing.expect(std.mem.find(u8, text.items, "1M context   128K output   Fast mode") != null);
 }

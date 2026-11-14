@@ -8,6 +8,7 @@ const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const vercel_model_policy = @import("../../gateway/vercel_model_policy.zig");
 const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
 const token_pass = @import("../../core/gateway/token_pass.zig");
+const token_pass_team = @import("../../core/gateway/token_pass_team.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -53,9 +54,10 @@ fn reviewGateway(
     // other value stays on this gateway chat path with that model id. Every
     // composition site selects this provider, so the override covers
     // interactive, ask, and subagent reviews uniformly. Without one, a
-    // session on a Token Pass model is reviewed by a Token Pass model, so its
-    // reviews stay on Token Pass credit too.
-    const selected = selectedReviewerModel(input.reviewer_model, request.review_turn.model);
+    // session on a Token Pass model of a team with Token Pass is reviewed by
+    // a Token Pass model, so its reviews stay on Token Pass credit too.
+    const team = token_pass_team.snapshot();
+    const selected = selectedReviewerModel(input.reviewer_model, request.review_turn.model, &team);
     if (typesafe_permission_reviewer.isJevModelId(selected)) {
         debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
         return typesafe_permission_reviewer.review(null, alloc, input, request);
@@ -69,15 +71,20 @@ fn reviewGateway(
     }, alloc, request, selected);
 }
 
-fn selectedReviewerModel(override: []const u8, session_model: []const u8) []const u8 {
+fn selectedReviewerModel(override: []const u8, session_model: []const u8, team: *const token_pass.Team) []const u8 {
     if (override.len > 0) return override;
-    return token_pass.modelForSideCall(.review, session_model, reviewer_model);
+    return token_pass.modelForSideCall(.review, session_model, reviewer_model, team);
 }
 
 test "the reviewer follows the override, then Token Pass, then the default" {
-    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "anthropic/claude-opus-4.8"));
-    try std.testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", selectedReviewerModel("", "zai/glm-5.3"));
-    try std.testing.expectEqualStrings("openai/gpt-6-sol", selectedReviewerModel("openai/gpt-6-sol", "zai/glm-5.3"));
+    var team: token_pass.Team = .{ .has_pass = true };
+    for ([_][]const u8{ "zai/glm-5.3", "deepseek/deepseek-v4.1-flash" }) |id| try std.testing.expect(team.models.add(id));
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "anthropic/claude-opus-4.8", &team));
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", selectedReviewerModel("", "zai/glm-5.3", &team));
+    try std.testing.expectEqualStrings("openai/gpt-6-sol", selectedReviewerModel("openai/gpt-6-sol", "zai/glm-5.3", &team));
+    // A team without Token Pass keeps the default reviewer.
+    team.has_pass = false;
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", selectedReviewerModel("", "zai/glm-5.3", &team));
 }
 
 fn reviewGatewayConfig(

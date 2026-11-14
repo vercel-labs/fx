@@ -860,14 +860,24 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
-        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        self.markExplicitCancellation();
+        // The worker sets `worker_processing` under this lock as it takes and
+        // ends turns, so the trace reads it under the lock too.
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const processing = if (self.worker_processing) "true" else "false";
+        const queued = self.queuedWorkCountLocked();
+        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ processing, queued });
+        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ processing, queued });
+        self.markExplicitCancellationLocked();
     }
 
     fn markExplicitCancellation(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        self.markExplicitCancellationLocked();
+    }
+
+    fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
@@ -947,6 +957,19 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         return self.worker_cancel_requested.load(.seq_cst) and
             self.steering_cancel_turn_id != self.active_turn_id;
+    }
+
+    /// Whether the running turn `turn_id` ends because it was explicitly
+    /// cancelled, as by Escape, rather than because steering ended it to
+    /// hand off to an image or `$skill`.
+    pub fn turnEndsByExplicitCancel(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return turn_id != 0 and
+            turn_id == self.active_turn_id and
+            self.worker_cancel_requested.load(.seq_cst) and
+            self.steering_cancel_turn_id != turn_id and
+            self.handed_off_turn_id != turn_id;
     }
 
     pub fn pushEvent(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -6566,6 +6589,27 @@ test "request shutdown sets stop and cancel flags" {
     runtime.requestShutdown();
     try std.testing.expect(runtime.worker_stop_requested);
     try std.testing.expect(runtime.worker_cancel_requested.load(.seq_cst));
+}
+
+test "only an explicit cancel of the running turn counts as one" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    runtime.active_turn_id = 7;
+    // A turn that ends with no cancel, such as normally.
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(7));
+    runtime.requestCancel();
+    try std.testing.expect(runtime.turnEndsByExplicitCancel(7));
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(6));
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(0));
+    // Steering that joins the turn, or hands it off to an image or
+    // `$skill`, ends the wait the same way but is not a user cancel.
+    runtime.steering_cancel_turn_id = 7;
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(7));
+    runtime.steering_cancel_turn_id = null;
+    runtime.handed_off_turn_id = 7;
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(7));
 }
 
 test "takeEventBatch snapshots cancellation with detached events" {
