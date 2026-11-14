@@ -10410,6 +10410,71 @@ describe("acp: model-independent", () => {
     );
   }
 
+  // Every other lookup of a tool or server the changed view no longer holds says the same: `toolbox
+  // open` of a tool and of a server, and `toolbox search`. (A subagent has MCP tools through toolbox
+  // only: a direct call of one ends the subagent as an unsupported tool before any lookup.)
+  test(
+    "ACP session/load with a server changed in place gives a subagent's open and search the stale cause too",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-reload-mcp-lookups-");
+      const hold = { started: join(root.root, "call-started"), release: join(root.root, "call-release") };
+      // Behind toolbox, the subagent's menu lists the server and `open` can name it.
+      const behind = (server: ReturnType<typeof reloadMcpServer>) => ({ ...server, _meta: { fx: { alwaysLoaded: false } } });
+      const held = behind(reloadMcpServer(root, "fixture", hold));
+      const changed = behind(reloadMcpServer(root, "fixture"));
+      const calls: Array<[string, string, object]> = [
+        ["child_mcp_held", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "child_mcp_held" } }],
+        ["child_open_tool", "toolbox", { open: MCP_TOOL_NAME, kind: "tool" }],
+        ["child_open_server", "toolbox", { open: "fixture", kind: "mcp_server" }],
+        ["child_search", "toolbox", { search: "echo" }],
+      ];
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) {
+          const next = calls.find(([id]) => !body.includes(`"toolCallId":"${id}"`));
+          return next ? fakeGatewayToolCall(next[0], next[1], next[2]) : finalText("RELOAD_MCP_CHILD_DONE");
+        }
+        if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_MCP_REPORT_SEEN");
+        if (body.includes(reloadCallId)) return finalText("ACP_RELOAD_MCP_PARENT_DONE");
+        return fakeGatewayToolCall(reloadCallId, "subagent", {
+          request: { action: "message", agent: "caller", message: "Call the MCP tools." },
+        });
+      });
+      let pid = 0;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [held], _meta: { fx: { hooks: { captureContent: true } } } }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+
+        sendPrompt(client, 7631, "Start the subagent that calls MCP tools.");
+        await waitForPath(hold.started, TIMEOUT);
+        pid = Number(readFileSync(join(root.root, "fixture.pid"), "utf8").trim());
+        client.send({ jsonrpc: "2.0", id: 7632, method: "session/load", params: { sessionId, mcpServers: [changed] } });
+        const reloaded = await readUntilResponses(client, [7631, 7632], TIMEOUT);
+        expect(reloaded.responses.get(7632).error).toBeUndefined();
+        await waitForCondition("the subagent's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
+
+        const reason = "the session's MCP servers changed after it began. Work that starts later sees the current servers.";
+        expect(reloadMcpResult(gateway, "child_open_tool")).toBe(staleMcpRefusal(MCP_TOOL_NAME));
+        expect(reloadMcpResult(gateway, "child_open_server")).toBe(`MCP server fixture is not available to this work: ${reason}`);
+        const search = JSON.parse(reloadMcpResult(gateway, "child_search"));
+        expect(search.mcp_state).toBe("servers_changed");
+        expect(search.mcp_error).toBe(`MCP search is not available to this work: ${reason}`);
+        expect(client.stderr).toBe("");
+      } finally {
+        writeFileSync(hold.release, "");
+        await client?.close();
+        gateway.stop();
+        if (pid && processAlive(pid)) process.kill(pid, "SIGKILL");
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
   // A session with no MCP host that is loaded again with servers while a
   // subagent works gets its host set under the lock the subagent reads it with.
   // The subagent keeps the tools it began with; the next work gets the servers.

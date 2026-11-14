@@ -257,6 +257,8 @@ pub const Catalog = struct {
         access: Access,
         cancel: Cancel,
     ) !tool_mcp_runtime.SearchResult {
+        // A subagent's view from before the servers changed finds none of them, and says why.
+        if (c.accessChanged(access)) return .{ .model_output = try tool_search.writeServersChanged(alloc, tool_mcp_runtime.servers_changed_reason) };
         const servers = c.currentServers();
         if (request.server) |name| {
             for (servers) |s| {
@@ -559,7 +561,7 @@ pub const Catalog = struct {
 
     /// Whether `access` is a subagent's view from before the servers last
     /// changed: a server dropped since, so the view allows nothing now.
-    pub fn accessChanged(c: *const Catalog, access: Access) bool {
+    fn accessChanged(c: *const Catalog, access: Access) bool {
         return switch (access) {
             .scoped => |scope| scope.captured.runtime_generation != c.currentGeneration(),
             .unrestricted, .servers, .disabled => false,

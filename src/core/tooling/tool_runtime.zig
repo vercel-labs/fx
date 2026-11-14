@@ -1070,7 +1070,10 @@ fn describeToolboxTool(raw: *anyopaque, arena: Allocator, tool: []const u8) anye
     const spec = state.runtime.tool_registry.lookup(tool) orelse return switch (try lookupToolboxMcpTool(state.runtime, arena, tool)) {
         .found => |found| .{ .definition = .{ .json = found.tool.schema_json, .notice = found.notice } },
         .rejected => |why| .{ .unavailable = why },
-        .missing => null,
+        .missing => if (types.isMcpToolName(tool) and mcpAccessChanged(state.runtime))
+            .{ .unavailable = try staleViewRefusal(arena, tool) }
+        else
+            null,
     };
     if (!spec.model_visible) return null;
     return .{ .definition = .{ .json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(arena, spec.model_schema) } };
@@ -1122,10 +1125,16 @@ fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerr
         .rejected => |why| why,
         .found => arena.print("{f} is available now; run it again with toolbox.", .{model_context_encoding.scalar(tool)}),
         .missing => if (mcpAccessChanged(ctx))
-            arena.print("{f} is not available to this work: the session's MCP servers changed after it began. Work that starts later sees the current servers.", .{model_context_encoding.scalar(tool)})
+            staleViewRefusal(arena, tool)
         else
             arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)}),
     };
+}
+
+/// What a subagent hears for an MCP tool its view of the session's servers no
+/// longer holds: the cause, not that the tool is missing.
+fn staleViewRefusal(arena: Allocator, tool: []const u8) Allocator.Error![]const u8 {
+    return arena.print("{f} is not available to this work: {s}", .{ model_context_encoding.scalar(tool), tool_mcp_runtime.servers_changed_reason });
 }
 
 /// Whether this run's MCP view is one the session's servers have changed
@@ -1692,6 +1701,32 @@ test "a toolbox run whose MCP definition changed before it ran says to open it a
     try std.testing.expectEqualStrings("mcp_fixture_echo's definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", gone.model_output);
 }
 
+fn accessAlwaysChanged(_: *anyopaque, _: tool_mcp_runtime.Access) bool {
+    return true;
+}
+
+test "a subagent whose MCP view the servers changed under hears why for toolbox open of a tool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var host: u8 = 0;
+    var rt = TestRuntime{ .mcp_ctx = &host, .mcp_tool_schema = goneMcpSchema, .mcp_access_changed = accessAlwaysChanged };
+    defer rt.deinit(std.testing.allocator);
+
+    const refusal = "mcp_fixture_echo is not available to this work: " ++ tool_mcp_runtime.servers_changed_reason;
+    // `toolbox {open}` of an MCP tool says the servers changed, not that the toolbox has no such tool.
+    const opened = try executeToolCall(rt.context(), arena, .{ .id = "1", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_fixture_echo\",\"kind\":\"tool\"}" });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, opened.status);
+    try std.testing.expectEqualStrings(refusal, opened.model_output);
+    // A name that is no MCP tool of any view keeps its answer.
+    const typo = try executeToolCall(rt.context(), arena, .{ .id = "3", .name = "toolbox", .arguments_json = "{\"open\":\"nothing_here\",\"kind\":\"tool\"}" });
+    try expectContains(typo.model_output, "No tool named nothing_here is in the toolbox menu.");
+    // And a view the servers did not change under keeps it for an MCP tool too.
+    rt.mcp_access_changed = null;
+    const same = try executeToolCall(rt.context(), arena, .{ .id = "4", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_fixture_echo\",\"kind\":\"tool\"}" });
+    try expectContains(same.model_output, "No tool named mcp_fixture_echo is in the toolbox menu.");
+}
+
 const ContextNoticeSinkState = struct {
     allocator: Allocator,
     notices: std.ArrayList([]const u8) = .empty,
@@ -1769,6 +1804,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .mcp_search_tools = ctx.mcp_search_tools,
         .mcp_tool_schema = ctx.mcp_tool_schema,
         .mcp_access = ctx.mcp_access,
+        .mcp_access_changed = ctx.mcp_access_changed,
         .mcp_input_responder = ctx.mcp_input_responder,
         .mcp_permission_rules = if (ctx.permission_mode == .yolo)
             .{}
@@ -3050,6 +3086,7 @@ const TestRuntime = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
@@ -3123,6 +3160,7 @@ const TestRuntime = struct {
             .mcp_call_tool = self.mcp_call_tool,
             .mcp_search_tools = self.mcp_search_tools,
             .mcp_tool_schema = self.mcp_tool_schema,
+            .mcp_access_changed = self.mcp_access_changed,
             .mcp_snapshot_tool = self.mcp_snapshot_tool,
             .mcp_input_responder = self.mcp_input_responder,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,

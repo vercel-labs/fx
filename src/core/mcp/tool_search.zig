@@ -615,6 +615,33 @@ pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []
     return try out.toOwnedSlice();
 }
 
+/// A search by a subagent whose view of the session's servers has changed
+/// under it: nothing, and why. Its `state` and `error` go to the model as the
+/// search of a server that is down gives them.
+pub fn writeServersChanged(alloc: Allocator, reason: []const u8) ![]u8 {
+    const message = try alloc.print("MCP search is not available to this work: {s}", .{reason});
+    defer alloc.free(message);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"servers_changed\",\"error\":",
+    );
+    try writeEncodedJsonScalar(alloc, &out.writer, message);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+test "MCP search of a changed view says the servers changed" {
+    const alloc = std.testing.allocator;
+    const output = try writeServersChanged(alloc, "the servers changed.");
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"servers_changed\"," ++
+            "\"error\":\"MCP search is not available to this work: the servers changed.\"}",
+        output,
+    );
+}
+
 test "MCP search names why the server it names is down" {
     const alloc = std.testing.allocator;
     const output = try writeServerFailure(alloc, "devtools", "MCP server exited with code 1 before completing startup: npm error code E401");

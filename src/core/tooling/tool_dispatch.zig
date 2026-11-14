@@ -310,6 +310,8 @@ pub const DispatchContext = struct {
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
+    /// Set for a subagent's work: whether `mcp_access` is a view from before the servers changed.
+    mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
     mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
@@ -461,6 +463,14 @@ pub const ToolboxDescription = union(enum) {
         notice: ?[]const u8 = null,
     };
 };
+
+/// Whether this call's MCP view is a subagent's from before the session's
+/// servers changed, so it finds none of them.
+pub fn mcpViewChanged(ctx: DispatchContext) bool {
+    const changed = ctx.mcp_access_changed orelse return false;
+    const runtime_context = ctx.mcp_ctx orelse return false;
+    return changed(runtime_context, ctx.mcp_access);
+}
 
 /// Lent by the tool runtime to each call it dispatches, for `toolbox`. The
 /// agent loop runs what a `toolbox {run}` carries as its own direct call of
