@@ -2503,7 +2503,7 @@ pub fn Runtime(comptime App: type) type {
             }
             // A report that waits here, held or not, is still owed in the
             // log: the next open of the session posts it.
-            for (dropped.items) |post| dropPost(app, post, reportReceiver(app, post), "shutdown", true);
+            for (dropped.items) |post| dropPost(app, post, reportReceiver(app, post), "shutdown", .held);
         }
 
         /// Gives each posted delivery to its agent, in the order they were
@@ -2516,7 +2516,9 @@ pub fn Runtime(comptime App: type) type {
         /// also settles a turn the agent's pacer still keeps). Posts behind it for the same agent
         /// wait with it, so that agent gets them in order; other agents' posts
         /// go on. An agent that is stopping holds nothing: its post fails as it
-        /// always did. A held post ends in one of four ways: it is delivered;
+        /// always did. Mail for a hidden agent also waits while a scrollback
+        /// handoff is pending, as a run handed to one does. A held post ends in
+        /// one of four ways: it is delivered;
         /// its agent is gone, and it is dropped here; its host closes, and
         /// `dropReportsOf` drops it; fx quits, and `closeHandoffs` drops it.
         /// Each drop is traced. A dropped report is still owed in the parent's
@@ -2538,6 +2540,15 @@ pub fn Runtime(comptime App: type) type {
             for (posted.items) |post| {
                 const receiver = reportReceiver(app, post);
                 if (receiver) |target| {
+                    // The offer's settle visits a hidden agent, which swaps its
+                    // transcript onto the screen, and a pending scrollback
+                    // handoff does not allow that (`tickChildren`). The agent on
+                    // screen is settled in the loop's own context, so its mail
+                    // goes: it starts a turn, and the handoff yields to it.
+                    if (target != app.screenAgent() and app.shell.sessionScrollbackHandoffPending()) {
+                        holdReport(app, post, target, "scrollback_handoff_pending", &held, &waiting);
+                        continue;
+                    }
                     const behind_held = std.mem.indexOfScalar(*AppAgent, waiting.items, target) != null;
                     // A held post's agent applies its events in the loop's own
                     // tick: no tick here while its finish event is still queued.
@@ -2556,7 +2567,7 @@ pub fn Runtime(comptime App: type) type {
                         holdReport(app, post, target, "finish_unapplied", &held, &waiting);
                         continue;
                     };
-                    dropPost(app, post, receiver, @errorName(err), false);
+                    dropPost(app, post, receiver, @errorName(err), .spent);
                     continue;
                 };
                 post.destroy();
@@ -2566,9 +2577,9 @@ pub fn Runtime(comptime App: type) type {
             app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
             defer app.child_handoffs.mutex.unlock(io_mod.getIo());
             if (app.child_handoffs.closed) {
-                for (held.items) |post| dropPost(app, post, reportReceiver(app, post), "shutdown", true);
+                for (held.items) |post| dropPost(app, post, reportReceiver(app, post), "shutdown", .held);
             } else app.child_handoffs.reports.insertSlice(handoff_alloc, 0, held.items) catch {
-                for (held.items) |post| dropPost(app, post, reportReceiver(app, post), "OutOfMemory", true);
+                for (held.items) |post| dropPost(app, post, reportReceiver(app, post), "OutOfMemory", .held);
             };
         }
 
@@ -2586,17 +2597,21 @@ pub fn Runtime(comptime App: type) type {
             if (!post.held) {
                 debug_trace.logf("host", "report held receiver={s} child={s} work_id={s} kind={s} reason={s}", .{ nameOf(hostedOf(app, target)), post.child_id, post.work_id, @tagName(post.kind), reason });
             }
-            if (std.mem.indexOfScalar(*AppAgent, waiting.items, target) == null) waiting.append(handoff_alloc, target) catch return dropPost(app, post, target, "OutOfMemory", true);
-            held.append(handoff_alloc, post) catch return dropPost(app, post, target, "OutOfMemory", true);
+            if (std.mem.indexOfScalar(*AppAgent, waiting.items, target) == null) waiting.append(handoff_alloc, target) catch return dropPost(app, post, target, "OutOfMemory", .held);
+            held.append(handoff_alloc, post) catch return dropPost(app, post, target, "OutOfMemory", .held);
             post.held = true;
         }
 
+        /// Whether a message still holds the place it reserved in its agent's
+        /// queue when it is dropped. A failed delivery has given the place back
+        /// already (`App.postAgentMessage`), and giving it back twice would take
+        /// another message's place.
+        const Place = enum { held, spent };
+
         /// Ends `post` without a delivery, and says so: who it was for, what
-        /// kind of mail it was, and why. A message holds a place in the queue
-        /// it was going to, which goes back when `holds_place`. A failed
-        /// delivery already gave it back (`App.postAgentMessage`), and giving
-        /// it back twice would take another message's place.
-        fn dropPost(app: *App, post: *ReportPost, receiver: ?*AppAgent, reason: []const u8, holds_place: bool) void {
+        /// kind of mail it was, and why. A message with its `place` still held
+        /// gives it back.
+        fn dropPost(app: *App, post: *ReportPost, receiver: ?*AppAgent, reason: []const u8, place: Place) void {
             debug_trace.logf("host", "report dropped receiver={s} child={s} work_id={s} kind={s} reason={s} held={}", .{
                 if (receiver) |target| nameOf(hostedOf(app, target)) else "gone",
                 post.child_id,
@@ -2605,7 +2620,7 @@ pub fn Runtime(comptime App: type) type {
                 reason,
                 post.held,
             });
-            if (holds_place and post.kind == .message) if (receiver) |target| target.worker.releaseAgentMessage();
+            if (place == .held and post.kind == .message) if (receiver) |target| target.worker.releaseAgentMessage();
             post.destroy();
         }
 
@@ -2620,6 +2635,8 @@ pub fn Runtime(comptime App: type) type {
         /// deliver the report into another session. The pointer is only
         /// compared, never read. A report stays owed in the log of the session
         /// that is closing, and is posted again when that session is opened.
+        /// An agent has a host only with a session, so closing the session
+        /// (`closeV2Session`) is how every host the app made goes.
         pub fn dropReportsOf(app: *App, host: *const subagent_tool_host.Runtime) void {
             var dropped: std.ArrayList(*ReportPost) = .empty;
             defer dropped.deinit(handoff_alloc);
@@ -2634,10 +2651,10 @@ pub fn Runtime(comptime App: type) type {
                         continue;
                     }
                     _ = app.child_handoffs.reports.orderedRemove(index);
-                    dropped.append(handoff_alloc, post) catch dropPost(app, post, reportReceiver(app, post), "OutOfMemory", true);
+                    dropped.append(handoff_alloc, post) catch dropPost(app, post, reportReceiver(app, post), "OutOfMemory", .held);
                 }
             }
-            for (dropped.items) |post| dropPost(app, post, reportReceiver(app, post), "host_closed", true);
+            for (dropped.items) |post| dropPost(app, post, reportReceiver(app, post), "host_closed", .held);
         }
 
         /// The agent a subagent's delivery from `host` goes to: the host's
