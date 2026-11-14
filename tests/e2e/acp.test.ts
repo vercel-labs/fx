@@ -11158,6 +11158,84 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  // A switch away from a session stops its subagents and joins their threads. The first subagent ends
+  // at once and the second only after its command's grace period, which is when the owner has already
+  // freed the first one's slot. The subagents start in two model turns, so they stay in that order.
+  for (const via of ["session/new", "session/load", "session/close"] as const) {
+    test(
+      `ACP ${via} away from two subagents inside shell commands stops both and answers`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-switch-two-");
+        const startedOne = join(root.root, "shell-started-one");
+        const startedTwo = join(root.root, "shell-started-two");
+        const gateway = startDynamicFakeGateway((body) => {
+          if (!body.includes('"name":"subagent"')) {
+            return body.includes("RUN_COMMAND_ONE")
+              ? fakeShellRun("switch_shell_one", `touch '${startedOne}'; sleep 30`)
+              : fakeShellRun("switch_shell_two", `trap '' TERM; touch '${startedTwo}'; sleep 30`);
+          }
+          const text = acpPromptText(body);
+          if (text.includes("Prepare a session to load")) return finalText("ACP_SWITCH_PREPARED");
+          if (text.includes("Answer in the next session")) return finalText("ACP_SWITCH_NEXT_OK");
+          if (body.includes("switch_call_two")) return finalText("ACP_SWITCH_PARENT_DONE");
+          if (body.includes("switch_call_one")) {
+            return fakeGatewayToolCall("switch_call_two", "subagent", {
+              request: { action: "message", agent: "second", message: "RUN_COMMAND_TWO" },
+            });
+          }
+          return fakeGatewayToolCall("switch_call_one", "subagent", {
+            request: { action: "message", agent: "first", message: "RUN_COMMAND_ONE" },
+          });
+        });
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          let savedId = "";
+          if (via === "session/load") {
+            const prepared = (await client.request("session/new", { mcpServers: [] }, 2)) as any;
+            savedId = prepared.result.sessionId;
+            const run = await runPrompt(client, "Prepare a session to load.", TIMEOUT);
+            expect(run.promptResult.result.stopReason).toBe("end_turn");
+          }
+          const first = (await client.request("session/new", { mcpServers: [] }, 3)) as any;
+          const firstId: string = first.result.sessionId;
+          await client.request("session/set_mode", { modeId: "full-access" }, 4);
+          sendPrompt(client, 8411, "Start the two subagents that run the commands.");
+          await waitForPath(startedOne, TIMEOUT);
+          await waitForPath(startedTwo, TIMEOUT);
+
+          // A crash ends the test at once, with its exit code, instead of at the read timeout.
+          const died = client.waitForExit(TIMEOUT).then((code) => {
+            throw new Error(`process ended early: code=${code} stderr=${client!.stderr.slice(0, 200)}`);
+          });
+          died.catch(() => {});
+          const switchRequest = via === "session/new"
+            ? client.request("session/new", { mcpServers: [] }, 5)
+            : via === "session/load"
+              ? client.request("session/load", { sessionId: savedId, cwd: root.workspace, mcpServers: [] }, 5)
+              : client.request("session/close", { sessionId: firstId }, 5);
+          switchRequest.catch(() => {});
+          const switched = (await Promise.race([switchRequest, died])) as any;
+          expect(switched.error).toBeUndefined();
+          if (via !== "session/close") {
+            const next = await runPrompt(client, "Answer in the next session.", TIMEOUT);
+            expect(next.promptResult.result.stopReason).toBe("end_turn");
+          }
+          // Both works ended with the switch, whatever their outcome.
+          const finished = (logLines(root.home, firstId) as any[]).filter((line) => line.kind === "child_finished");
+          expect(finished).toHaveLength(2);
+          client.endStdin();
+          const code = await client.waitForExit(TIMEOUT);
+          expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT * 2,
+    );
+  }
 
   test(
     "stdin shutdown cancels a pending permission request",
