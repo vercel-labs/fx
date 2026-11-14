@@ -3194,13 +3194,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, async (session) => {
         await session.sendText("SWITCH_USER");
         await until("the child's first wait", () => childWaiting);
-        // The row of the working subagent shows its current call and how
-        // long it has run.
+        // The row of the working subagent keeps its title, not its current
+        // call, and shows how long that call has run.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         const list = await session.waitForPane((pane) =>
-          /^ {2}[\u251c\u2514] worker .*Waiting for sh -c .*\b\d+s\b/m.test(pane), 15_000);
-        expect(list).toMatch(/^ {2}[\u251c\u2514] worker .*TUI-QUIET-READY/m);
+          /^ {2}[\u251c\u2514] worker .*working \d+s\b/m.test(pane), 15_000);
+        const workerRow = list.split("\n").find((line) => /^ {2}[\u251c\u2514] worker /.test(line)) ?? "";
+        expect(workerRow).not.toContain("Waiting for");
+        expect(workerRow).not.toContain("TUI-QUIET-READY");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
         // The child's command crosses the quiet limit while main waits, and

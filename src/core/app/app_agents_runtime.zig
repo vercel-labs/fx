@@ -39,7 +39,6 @@ const shared_theme = @import("../shared/theme.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const ascii_case = @import("../shared/ascii_case.zig");
 const types = @import("../shared/types.zig");
-const live_metrics = @import("../subagent/live_metrics.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 
 const Allocator = std.mem.Allocator;
@@ -195,9 +194,9 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
-/// Room for a subagent row's current call, then its state with the call's
-/// time, such as "working 59m59s".
-const activity_bytes = live_metrics.max_label_bytes + 32;
+/// Room for a subagent row's state with its call's time, such as
+/// "working 59m59s".
+const activity_bytes = 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
@@ -1769,7 +1768,7 @@ pub fn Runtime(comptime App: type) type {
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
-                const activity = rowActivity(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
+                const activity_state = rowActivityState(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
@@ -1779,9 +1778,8 @@ pub fn Runtime(comptime App: type) type {
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = listedProfile(if (subagent) |child| child.profile else agent.profile.profile.name),
-                    .state = activity.state orelse state.label(),
+                    .state = activity_state orelse state.label(),
                     .state_tone = state.tone(),
-                    .activity = activity.call,
                     .model = model,
                     .effort = effortLabel(app, agent, model),
                 });
@@ -2340,22 +2338,18 @@ pub fn Runtime(comptime App: type) type {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
-        const RowActivity = struct { call: []const u8 = "", state: ?[]const u8 = null };
-
-        /// A working subagent's current call and its state with that call's
-        /// time, such as "working 12s", from its host, written into `buf`;
-        /// nothing for any other row.
-        fn rowActivity(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) RowActivity {
-            if (state != .working) return .{};
-            const child = subagent orelse return .{};
-            const host = hostOf(app, child) orelse return .{};
-            const call = host.childCall(child.id) orelse return .{};
-            const label = call.label();
-            @memcpy(buf[0..label.len], label);
-            var writer = std.Io.Writer.fixed(buf[label.len..]);
-            writer.print("{s} ", .{state.label()}) catch return .{ .call = buf[0..label.len] };
-            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return .{ .call = buf[0..label.len] };
-            return .{ .call = buf[0..label.len], .state = writer.buffered() };
+        /// A working subagent's state with its current call's time, such as
+        /// "working 12s", from its host, written into `buf`; null for any
+        /// other row.
+        fn rowActivityState(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
+            if (state != .working) return null;
+            const child = subagent orelse return null;
+            const host = hostOf(app, child) orelse return null;
+            const call = host.childCall(child.id) orelse return null;
+            var writer = std.Io.Writer.fixed(buf);
+            writer.print("{s} ", .{state.label()}) catch return null;
+            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return null;
+            return writer.buffered();
         }
 
         /// Whether the turn `child`'s worker has finished is still being
