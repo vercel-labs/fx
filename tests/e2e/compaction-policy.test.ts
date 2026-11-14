@@ -130,7 +130,7 @@ const BIG_REPLY = Array.from({ length: 14_000 }, (_, n) => `Reference line ${n}:
 
 type Script = (request: any, raw: string, phase: string) => Response;
 
-async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script, readLog = logLines) {
+async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script, readLog = logLines, exitCode = 0) {
   const root = mkdtempSync(join(tmpdir(), "fx-toolbox-menu-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
@@ -153,6 +153,7 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
   };
   let sessionId = "";
   const outputs: string[] = [];
+  const errors: (string | undefined)[] = [];
   let passed = false;
   try {
     for (const step of phases) {
@@ -161,9 +162,10 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
       const args = ["ask", "--json", "--full-access", ...(step.resume ? ["--resume", sessionId] : []), step.prompt];
       const child = Bun.spawn([binary, ...args], { cwd, env: { ...env, ...step.env }, stdin: "ignore", stdout: Bun.file(out), stderr: Bun.file(err) });
       const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-      try { expect(await child.exited).toBe(0); } finally { clearTimeout(timer); }
+      try { expect(await child.exited).toBe(exitCode); } finally { clearTimeout(timer); }
       const answer = JSON.parse(readFileSync(out, "utf8"));
       outputs.push(answer.output);
+      errors.push(answer.error);
       if (!step.resume) sessionId = answer.session_id;
     }
     const menus = agentBodies.map((raw) => {
@@ -171,7 +173,7 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
       const found = request.prompt.find((message: any) => message.role === "system" && typeof message.content === "string" && message.content.startsWith(TOOLBOX_MENU));
       return found?.content ?? null;
     });
-    const result = { home, sessionId, bodies: agentBodies, menus, outputs, compactions: readLog(home, sessionId).filter((line: any) => line.kind === "compacted").length };
+    const result = { home, sessionId, bodies: agentBodies, menus, outputs, errors, compactions: readLog(home, sessionId).filter((line: any) => line.kind === "compacted").length };
     passed = true;
     return result;
   } finally {
@@ -269,4 +271,61 @@ for (const refuseFirst of [false, true]) test(`automatic compaction clips a tool
   expect(run.bodies.at(-1)!.length).toBeLessThan(100_000);
   expect(run.bodies.at(-1)!).not.toContain("x".repeat(10_000));
   expectMenuKept(run);
+}, 120_000);
+
+// A provider can count more tokens than fx's estimate, and then refuses a
+// compaction request fx thought would fit. fx writes the turns out again,
+// smaller, and the turn goes on. Each family words the refusal its own way.
+const tooLongRefusals: Record<string, object> = {
+  "openai/gpt-6.1-sol": { type: "invalid_request_error", code: "context_length_exceeded", message: "This model's maximum context length is 128000 tokens. The request exceeds the context window." },
+  "anthropic/claude-sonnet-5.5": { type: "invalid_request_error", message: "prompt is too long: 140000 tokens > 128000 maximum" },
+};
+for (const [model, refusal] of Object.entries(tooLongRefusals)) test(`a compaction request the provider refuses as too long is sent again smaller (${model})`, async () => {
+  const content = "x".repeat(1_000_000);
+  const summaries: number[] = [];
+  let agentRequests = 0;
+  const run = await toolboxRun(model, `too long ${model}`, [
+    { phase: "seed", prompt: "Write big.txt.", resume: false },
+  ], (_request, raw, phase) => {
+    if (phase === "summary") {
+      summaries.push(raw.length);
+      if (raw.length > 200_000) return Response.json({ error: refusal }, { status: 400 });
+      return fakeGatewayFinalText("Turn 1\nIn between: none");
+    }
+    agentRequests += 1;
+    return agentRequests === 1 ? fakeGatewayToolCall("big-write", "write_file", { path: "big.txt", content }) : fakeGatewayFinalText("TOO_LONG_RECOVERED");
+  }, logLinesAfterCompaction);
+  expect(run.outputs).toEqual(["TOO_LONG_RECOVERED"]);
+  expect(run.compactions).toBe(1);
+  // The refused request is followed by a smaller one that fits.
+  expect(summaries.filter((bytes) => bytes > 200_000).length).toBeGreaterThan(0);
+  expect(summaries.at(-1)!).toBeLessThanOrEqual(200_000);
+  expect(run.bodies.at(-1)!).not.toContain("x".repeat(10_000));
+}, 120_000);
+
+// The smaller requests are bounded: a provider that refuses every compaction
+// request as too long ends the turn after three of them, each sent to the
+// conversation's model and then the fallback. A refusal for another reason
+// is not retried smaller.
+const boundCases: [string, object, number][] = [
+  ["too long every time", tooLongRefusals["openai/gpt-6.1-sol"], 8],
+  ["refused for another reason", { type: "invalid_request_error", message: "invalid tool schema" }, 2],
+];
+for (const [label, refusal, requests] of boundCases) test(`a compaction request ${label} ends the turn after ${requests} requests`, async () => {
+  const content = "x".repeat(1_000_000);
+  const summaries: number[] = [];
+  let agentRequests = 0;
+  const run = await toolboxRun("openai/gpt-6.1-sol", label, [
+    { phase: "seed", prompt: "Write big.txt.", resume: false },
+  ], (_request, raw, phase) => {
+    if (phase === "summary") {
+      summaries.push(raw.length);
+      return Response.json({ error: refusal }, { status: 400 });
+    }
+    agentRequests += 1;
+    return agentRequests === 1 ? fakeGatewayToolCall("big-write", "write_file", { path: "big.txt", content }) : fakeGatewayFinalText("NOT_REACHED");
+  }, logLinesAfterCompaction, 1);
+  expect(run.errors).toEqual(["ModelFailed"]);
+  expect(summaries.length).toBe(requests);
+  expect(run.compactions).toBe(0);
 }, 120_000);

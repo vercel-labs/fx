@@ -2601,6 +2601,22 @@ const App = struct {
         );
     }
 
+    pub fn stopSteeringDetachedCommands(self: *App, agent: *agents.Agent, turn_id: u64) !void {
+        return AgentAppRuntime.stopSteeringDetachedCommands(
+            self,
+            agent,
+            turn_id,
+            &ignored_list_entries,
+            max_list_entries,
+            max_read_file_bytes,
+            max_read_file_lines,
+            max_read_file_line_len,
+            max_command_output_bytes,
+            builtin_gateway.retry_count,
+            builtin_gateway.defaultChatUrl(),
+        );
+    }
+
     pub fn formatToolExecutionErrorForAgent(self: *App, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
         return app_process_runtime.Runtime(App).formatToolExecutionError(arena, tool_name, err);
@@ -6051,6 +6067,210 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     defer app.approval_lender = null;
     try std.testing.expectEqualStrings("needs approval", try menuRowState(runtime.menuProjection(&app), "asking"));
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
+}
+
+/// Sends `bytes` to `app` one at a time, as the terminal does, so each goes
+/// through the decoder and the open list's key routing.
+fn sendTerminalBytes(app: *App, bytes: []const u8) !void {
+    for (bytes) |byte| try App.InputAppRuntime.handleTerminalByteWithLimits(app, byte, App.input_limits, max_prompt_history);
+}
+
+/// Sends `key`, a whole key's bytes, `count` times.
+fn sendTerminalKey(app: *App, key: []const u8, count: usize) !void {
+    for (0..count) |_| try sendTerminalBytes(app, key);
+}
+
+/// Fails, saying after which step, unless the list has armed a close for
+/// `expected`, or for nothing when it is null.
+fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []const u8) !void {
+    const armed: ?*app_agents_runtime.ChildAgent = if (app.instances.agents_menu.close_armed) |listed| listed.agent else null;
+    if (armed == expected) return;
+    const alloc = std.testing.allocator;
+    const want = try alloc.print("after {s}: a close is armed for {s}", .{
+        step,
+        if (expected) |child| child.displayName() else "nothing",
+    });
+    defer alloc.free(want);
+    const got = try alloc.print("after {s}: a close is armed for {s}", .{
+        step,
+        if (armed) |child| child.displayName() else "nothing",
+    });
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+    return error.TestUnexpectedResult;
+}
+
+test "a run of Backspace presses that edited the agent list's search never arms a close, held or not, in any encoding, and another key ends the run" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const menu = &app.instances.agents_menu;
+    const edit = &app.input_runtime.edit_state;
+    const first = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    first.name = try alloc.dupe(u8, "reviewer");
+    const backspace = "\x7f";
+    const down = "\x1b[B";
+
+    // The list opens on main; ↓ shows the reviewer, which Backspace can close.
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(menu.highlight.agent == first);
+
+    // With nothing searched, the first Backspace arms the close and the second
+    // goes on to close it. This test app has no subagent host, so the close
+    // finds nothing to close and only disarms; what shows is the arming.
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace on a list nothing was searched in");
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "the second Backspace, which closes");
+
+    // Backspace as a key held past the search: "rev" takes three presses to
+    // empty, and none of the presses after arms anything.
+    try sendTerminalBytes(&app, "rev");
+    try std.testing.expectEqualStrings("rev", edit.input.items);
+    try std.testing.expect(menu.highlight.agent == first);
+    try sendTerminalKey(&app, backspace, 3);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "three Backspaces that emptied the search");
+    for (1..5) |extra| {
+        try sendTerminalKey(&app, backspace, 1);
+        var step: [48]u8 = undefined;
+        try expectArmedFor(&app, null, try std.mem.print(&step, "Backspace {d} past the emptied search", .{extra}));
+    }
+    try std.testing.expectEqualStrings("", edit.input.items);
+
+    // A sequence fx ignores is no key: the run goes on.
+    _ = try App.InputAppRuntime.handleTerminalInputIngressWithLimits(&app, .{ .event = .{ .action = .{ .action = .ignore } } }, App.input_limits, max_prompt_history);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "Backspace after an ignored sequence");
+
+    // Another key, here ↓ to the next row, ends the run: two Backspaces arm
+    // and close that row, as on any list.
+    try sendTerminalKey(&app, down, 1);
+    try std.testing.expect(menu.highlight.agent == second);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, second, "Backspace after the run ended with a key");
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "the second Backspace, which closes");
+
+    // Typing ends a run too, and the next run is as good as the first: "rev"
+    // goes by Backspace, which then does nothing again.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, backspace, 3 + 2);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "a second run of Backspaces");
+
+    // The same keys as Kitty sends them, which go through the router once as
+    // the key they stand for and again as the byte they are replayed as, and
+    // as a repeat of a held key: still one Backspace each.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, "\x1b[127u", 1);
+    try sendTerminalKey(&app, "\x1b[127;1u", 1);
+    try sendTerminalKey(&app, "\x1b[127;1:2u", 1);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "three Kitty Backspaces that emptied the search");
+    for ([_][]const u8{ "\x1b[127u", "\x1b[127;1:2u", "\x08", "\x7f" }) |key| {
+        try sendTerminalKey(&app, key, 1);
+        try expectArmedFor(&app, null, key);
+    }
+
+    // The byte 8 is Backspace too, and arms once the run is over.
+    try sendTerminalKey(&app, down, 1);
+    try sendTerminalKey(&app, "\x08", 1);
+    try expectArmedFor(&app, second, "the byte 8 after the run ended with a key");
+}
+
+test "a run of forward Delete presses that edited the agent list's search never arms a close either, and Delete after a Backspace run arms as on any list" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const menu = &app.instances.agents_menu;
+    const edit = &app.input_runtime.edit_state;
+    const first = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    first.name = try alloc.dupe(u8, "reviewer");
+    const backspace = "\x7f";
+    const delete = "\x1b[3~";
+    const left = "\x1b[D";
+    const down = "\x1b[B";
+
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(menu.highlight.agent == first);
+
+    // Delete takes text away when the cursor is not at the end of the search,
+    // so it can empty the search as Backspace does.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, left, 3);
+    try sendTerminalKey(&app, delete, 1);
+    try std.testing.expectEqualStrings("ev", edit.input.items);
+    try sendTerminalKey(&app, delete, 2);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "three Deletes that emptied the search");
+    for (1..5) |extra| {
+        try sendTerminalKey(&app, delete, 1);
+        var step: [48]u8 = undefined;
+        try expectArmedFor(&app, null, try std.mem.print(&step, "Delete {d} past the emptied search", .{extra}));
+    }
+
+    // A key other than Delete ends its run: Backspace is one, and arms.
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace after a Delete run");
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, null, "the second Backspace, which closes");
+
+    // Delete after a Backspace run is another key: it arms, and the next
+    // Delete goes on to close, as on any list.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, backspace, 3 + 2);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try expectArmedFor(&app, null, "a Backspace run");
+    try sendTerminalKey(&app, delete, 1);
+    try expectArmedFor(&app, first, "Delete after a Backspace run");
+    try sendTerminalKey(&app, delete, 1);
+    try expectArmedFor(&app, null, "the second Delete, which closes");
+
+    // And Backspace after a Delete run arms, since it is another key too.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, left, 3);
+    try sendTerminalKey(&app, delete, 3);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace after a Delete run");
+
+    // Any other key disarms.
+    try sendTerminalKey(&app, down, 1);
+    try expectArmedFor(&app, null, "a key that disarms");
+    try std.testing.expect(menu.highlight.agent == second);
+
+    // The list closing ends a run too, with no key to do it: a paste or
+    // another surface closes the list in the middle of one, and the list
+    // opened again arms on its first press.
+    try sendTerminalBytes(&app, "rev");
+    try sendTerminalKey(&app, backspace, 3);
+    try std.testing.expectEqualStrings("", edit.input.items);
+    try std.testing.expect(try runtime.backMenu(&app));
+    try std.testing.expect(!runtime.menuActive(&app));
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(menu.highlight.agent == first);
+    try sendTerminalKey(&app, backspace, 1);
+    try expectArmedFor(&app, first, "Backspace on the list opened again");
 }
 
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {

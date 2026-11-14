@@ -35,7 +35,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -2960,8 +2960,13 @@ const isReportTurn = (body: string) => {
 
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
-  const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      // A report that arrives while the parent's first turn runs joins that
+      // turn, so the child answers only once that turn is saved.
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayFinalText("CHILD_ANSWER_5521");
+    }
     if (isReportTurn(body)) {
       expect(body).toContain("CHILD_ANSWER_5521");
       return fakeGatewayFinalText("PARENT_DONE");

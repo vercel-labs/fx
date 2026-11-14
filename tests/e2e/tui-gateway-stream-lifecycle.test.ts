@@ -1721,16 +1721,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Move the project and rename it.");
-    await session.waitForText("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL).", TIMEOUT);
+    // The first empty reply shows the same stop line before fx asks the model
+    // to continue, so wait for the notice that ends the turn, however it wraps.
+    const failedTurn = "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.";
+    await session.waitForPane((pane) => pane.replace(/\s+/g, " ").includes(failedTurn), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(2);
     const scrollback = await session.captureFullScrollback();
     expect(scrollback).toContain("Asking it to continue.");
     expect(scrollback).not.toContain("Done.");
-    // The failed turn says what the user can do next, however the line wraps.
-    expect(scrollback.replace(/\s+/g, " ")).toContain(
-      "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.",
-    );
+    // The failed turn says what the user can do next.
+    expect(scrollback.replace(/\s+/g, " ")).toContain(failedTurn);
 
     await session.sendText("/trace");
     const report = await waitForNewTraceReport(root);
@@ -5249,6 +5250,310 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(session.isPaneAlive()).toBe(true);
       } finally {
         writeFileSync(releasePath, "release\n");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  for (const tty of [false, true]) test(
+    `Escape stops a command that steering moved to the background with tty=${tty}`,
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steered-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const pidPath = join(workspace, "steered-escape-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const steering = "Check the config while that command runs.";
+      // The shell becomes `sleep`, so the pid it writes is the command's own.
+      const command = `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`;
+      // The turn's next step stays open, so the Escape pair cancels the same
+      // turn whose steering moved the command to the background.
+      const hold: HoldState = { started: false, cancelled: false };
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("steered_escape_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            tty,
+            command,
+          },
+        }),
+        () => heldGatewayResponse(hold),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-steered-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,shell",
+        },
+      });
+
+      let commandPid = 0;
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Run the steered escape fixture.");
+        await session.waitForText("Running printf", TIMEOUT);
+        await waitForCondition(
+          () => existsSync(pidPath) && readTrimmed(pidPath) !== "",
+          "steered escape command pid",
+        );
+        commandPid = Number(readTrimmed(pidPath));
+        expect(isProcessAlive(commandPid)).toBe(true);
+        await session.sendText(steering);
+
+        // Steering returns the command running, and the turn goes on to its
+        // next step with the steering while the command keeps running.
+        await waitForCondition(
+          () => steeringGateway.requests.length === 2 && hold.started,
+          "steering request while the command runs",
+        );
+        const continuedBody = steeringGateway.requests[1]!.body;
+        expect(continuedBody).toContain("steering_notice");
+        expect(continuedBody).toContain(steering);
+        expect(isProcessAlive(commandPid)).toBe(true);
+
+        await session.sendInterruptEscapePair(TIMEOUT);
+        await waitForCondition(() => hold.cancelled, "held steering request cancellation");
+        // The cancel stops the command steering detached in this turn.
+        await waitForCondition(
+          () => !isProcessAlive(commandPid),
+          "steering-detached command exit after Escape",
+        );
+        await waitForCondition(
+          () => {
+            const trace = readFileSync(tracePath, "utf8");
+            return /stopping steering-detached command session_id=\S+ turn_id=\d+ reason=turn_cancelled/.test(trace) &&
+              trace.includes("outcome_kind=interrupted");
+          },
+          "steering-detached stop trace",
+        );
+        expect(steeringGateway.requests).toHaveLength(2);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(session.isAlive()).toBe(true);
+        expect(session.isPaneAlive()).toBe(true);
+      } finally {
+        if (commandPid > 0 && isProcessAlive(commandPid)) process.kill(commandPid, "SIGKILL");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "Escape keeps a command the model started in the background",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-background-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const backgroundPidPath = join(workspace, "background-tool.pid");
+      const steeredPidPath = join(workspace, "steered-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const steering = "Check the config while those commands run.";
+      const pidCommand = (path: string) => `printf %s $$ > ${JSON.stringify(path)}; exec sleep 90`;
+      const hold: HoldState = { started: false, cancelled: false };
+      const steeringGateway = startFakeGateway([
+        // The model leaves this one in the background itself.
+        fakeGatewayToolCall("background_escape_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 0,
+            timeout_ms: 600_000,
+            command: pidCommand(backgroundPidPath),
+          },
+        }),
+        fakeGatewayToolCall("steered_escape_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command: pidCommand(steeredPidPath),
+          },
+        }),
+        () => heldGatewayResponse(hold),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-background-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,shell",
+        },
+      });
+
+      const pids: number[] = [];
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Run the background escape fixture.");
+        await waitForCondition(
+          () => existsSync(steeredPidPath) && readTrimmed(steeredPidPath) !== "" &&
+            existsSync(backgroundPidPath) && readTrimmed(backgroundPidPath) !== "",
+          "both command pids",
+        );
+        const backgroundPid = Number(readTrimmed(backgroundPidPath));
+        const steeredPid = Number(readTrimmed(steeredPidPath));
+        pids.push(backgroundPid, steeredPid);
+        expect(isProcessAlive(backgroundPid)).toBe(true);
+        expect(isProcessAlive(steeredPid)).toBe(true);
+        await session.sendText(steering);
+        await waitForCondition(
+          () => steeringGateway.requests.length === 3 && hold.started,
+          "steering request while the commands run",
+        );
+        expect(steeringGateway.requests[2]!.body).toContain("steering_notice");
+
+        await session.sendInterruptEscapePair(TIMEOUT);
+        await waitForCondition(() => hold.cancelled, "held steering request cancellation");
+        await waitForCondition(
+          () => !isProcessAlive(steeredPid),
+          "steering-detached command exit after Escape",
+        );
+        await waitForCondition(
+          () => readFileSync(tracePath, "utf8").includes("outcome_kind=interrupted"),
+          "interrupted turn outcome",
+        );
+        // Only the steered command was stopped.
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace.match(/stopping steering-detached command /g) ?? []).toHaveLength(1);
+        expect(isProcessAlive(backgroundPid)).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(session.isAlive()).toBe(true);
+        expect(session.isPaneAlive()).toBe(true);
+      } finally {
+        for (const pid of pids) if (isProcessAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "Escape keeps a background command the model was polling when steering came",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-polled-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const backgroundPidPath = join(workspace, "polled-tool.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const steering = "Check the config while that server runs.";
+      const hold: HoldState = { started: false, cancelled: false };
+      const steeringGateway = startFakeGateway([
+        // The model starts a server in the background itself, then waits on
+        // its output, and steering cuts that wait short.
+        fakeGatewayToolCall("polled_start_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 0,
+            timeout_ms: 600_000,
+            command: `printf %s $$ > ${JSON.stringify(backgroundPidPath)}; exec sleep 90`,
+          },
+        }),
+        fakeGatewayToolCall("polled_wait_tool", "shell", {
+          request: { action: "interact", session_id: "shell-1", yield_time_ms: 30_000 },
+        }),
+        () => heldGatewayResponse(hold),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-polled-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,shell",
+        },
+      });
+
+      let backgroundPid = 0;
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Start the server and watch it.");
+        await waitForCondition(
+          () => existsSync(backgroundPidPath) && readTrimmed(backgroundPidPath) !== "",
+          "background command pid",
+        );
+        backgroundPid = Number(readTrimmed(backgroundPidPath));
+        await waitForCondition(
+          () => /execution_start[^\n]*call_id=polled_wait_tool/.test(readFileSync(tracePath, "utf8")),
+          "interact poll start",
+        );
+        await session.sendText(steering);
+        await waitForCondition(
+          () => steeringGateway.requests.length === 3 && hold.started,
+          "steering request while the poll waits",
+        );
+        // Steering cut the poll short, so its result carries the notice.
+        expect(steeringGateway.requests[2]!.body).toContain("steering_notice");
+        await waitForCondition(() => isProcessAlive(backgroundPid), "background command alive before Escape");
+
+        await session.sendInterruptEscapePair(TIMEOUT);
+        await waitForCondition(() => hold.cancelled, "held steering request cancellation");
+        // The stop of steering-detached commands runs before this event.
+        await waitForCondition(
+          () => readFileSync(tracePath, "utf8").includes("finish_event_emitted"),
+          "interrupted turn finish",
+        );
+        await waitForCondition(
+          () => isProcessAlive(backgroundPid) &&
+            !readFileSync(tracePath, "utf8").includes("stopping steering-detached command"),
+          "background command kept after Escape",
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(session.isAlive()).toBe(true);
+        expect(session.isPaneAlive()).toBe(true);
+      } finally {
+        if (backgroundPid > 0 && isProcessAlive(backgroundPid)) process.kill(backgroundPid, "SIGKILL");
       }
     },
     TIMEOUT * 2,

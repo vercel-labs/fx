@@ -1,7 +1,8 @@
 ---- MODULE AgentsMenu ----
 \* The agent list that Down on an empty composer, Ctrl+X, and /agents open
 \* (src/core/app/app_agents_runtime.zig: AgentsMenu, openMenu, moveMenu,
-\* submitMenu, backMenu, closeMenu, searchChanged, pressCloseKey, switchList).
+\* submitMenu, backMenu, closeMenu, searchChanged, noteKeyPress,
+\* noteSearchEditKey, pressCloseKey, switchList).
 \*
 \* The list shows every open agent: each instance in launch order, followed
 \* by its own subagents. It opens on the agent on screen, and its highlight is
@@ -40,6 +41,16 @@
 \* shown, so the highlight moves there too. The first row has none above, so
 \* the next open instance takes its place.
 \*
+\* A close key is Backspace or forward Delete. With no search, the first press
+\* arms a close and the second closes the row, as above. With a search, either
+\* edits it, and can empty it (SearchEdit). The presses of one such key, one
+\* after another, are a run, and `run` names the key whose run has edited the
+\* search. A run that edited the search never arms or closes a row, however
+\* many presses go on past the emptied search, until a key other than it is
+\* pressed (RunNeverCloses): a key held down to clear a search is such a run,
+\* and it must not go on to close an agent. A search typed, or an agent chosen,
+\* by any other key ends the run, and so does the list closing.
+\*
 \* The environment acts at any time, with the list open or closed: a subagent
 \* starts, its instance's subagents reorder (one starts or finishes work), the
 \* main agent closes one, or, under a search, an agent's title changes.
@@ -68,6 +79,8 @@
 \*   row           the highlight stays on its row, not its agent, when
 \*                 the rows change                                     SelectionKept
 \*   stale_sel     the highlight stays on an agent that closed         SelListed
+\*   run_closes    a run of a close key that edited the search goes on
+\*                 to arm and close a row, as fx did before the run    RunNeverCloses
 EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS
@@ -88,13 +101,18 @@ VARIABLES
     origin,     \* the agent the list opened on while it is open, or None
     searching,  \* whether a search is typed
     hidden,     \* the open agents the search hides
+    run,        \* the close key whose run has edited the search, or None
+    pressed,    \* the close key the step pressed, or None
     act         \* the step that led here
 
-vars == <<order, onScreen, open, sel, armed, origin, searching, hidden, act>>
+vars == <<order, onScreen, open, sel, armed, origin, searching, hidden, run, pressed, act>>
 
 None == "none"
+\* Backspace and forward Delete.
+Keys == {"bs", "del"}
 Acts == {"init", "open", "down", "up", "enter", "back", "close", "search", "arm",
-         "delete", "slash_close", "env_start", "env_reorder", "env_close", "env_retitle"}
+         "delete", "ignored", "slash_close", "env_start", "env_reorder", "env_close",
+         "env_retitle"}
 
 Range(s) == {s[i] : i \in DOMAIN s}
 Pos(s, x) == CHOOSE i \in DOMAIN s : s[i] = x
@@ -167,8 +185,12 @@ Kept(rows) ==
          THEN rows[Clamp(Pos(Rows, sel), Len(rows))]
          ELSE Pick(rows, sel, onScreen)
 
-\* The list closes, and with it the highlight, an armed close, its origin, and
-\* the search.
+\* A key other than a close key: the run of a close key, if there is one, is
+\* over.
+OtherKey == /\ run' = None /\ pressed' = None
+
+\* The list closes, and with it the highlight, an armed close, its origin, the
+\* search, and a run. Only a key other than a close key, or a paste, does it.
 Ends ==
     /\ open' = FALSE
     /\ sel' = None
@@ -176,6 +198,7 @@ Ends ==
     /\ origin' = None
     /\ searching' = FALSE
     /\ hidden' = {}
+    /\ OtherKey
 
 Init ==
     /\ order = InitOrder
@@ -186,6 +209,8 @@ Init ==
     /\ origin = None
     /\ searching = FALSE
     /\ hidden = {}
+    /\ run = None
+    /\ pressed = None
     /\ act = "init"
 
 \* Down on an empty composer, Ctrl+X, or /agents, with another agent open.
@@ -196,6 +221,7 @@ OpenList ==
     /\ sel' = IF Mutation = "open_first" THEN order[1] ELSE onScreen
     /\ origin' = onScreen
     /\ armed' = None
+    /\ OtherKey
     /\ act' = "open"
     /\ UNCHANGED <<order, onScreen, searching, hidden>>
 
@@ -214,6 +240,7 @@ Move(d) ==
                /\ onScreen' = IF Mutation = "move_only" THEN onScreen ELSE to
                /\ armed' = None
                /\ UNCHANGED <<order, open, origin, searching, hidden>>
+    /\ OtherKey
     /\ act' = IF d > 0 THEN "down" ELSE "up"
 
 \* Enter: the list closes and the highlighted agent stays on screen.
@@ -242,33 +269,68 @@ Close ==
     /\ act' = "close"
     /\ UNCHANGED order
 
-\* A letter starts or grows the search, Backspace or Delete takes one off, and
-\* Esc clears it. Each match of the search is one set of hidden agents.
+\* The search becomes `s`, typed or not, and hides `h`: each match of the search
+\* is one set of hidden agents. The highlight and the agent on screen follow it.
+Retype(s, h) ==
+    /\ searching' = s
+    /\ hidden' = h
+    /\ LET rows == Filter(order, h)
+           to == Pick(rows, sel, onScreen)
+       IN /\ sel' = to
+          /\ onScreen' = IF rows # << >> /\ Mutation # "search_stays" THEN to ELSE onScreen
+
+\* A letter starts or grows the search, or Esc clears it: a key other than
+\* Backspace and Delete, which edit it as SearchEdit does.
 Search ==
     /\ open
     /\ SearchKeys
     /\ \E s \in BOOLEAN, h \in SUBSET Range(order) :
          /\ s \/ searching
          /\ s \/ h = {}
-         /\ searching' = s
-         /\ hidden' = h
-         /\ LET rows == Filter(order, h)
-                to == Pick(rows, sel, onScreen)
-            IN /\ sel' = to
-               /\ onScreen' = IF rows # << >> /\ Mutation # "search_stays" THEN to ELSE onScreen
+         /\ Retype(s, h)
     /\ armed' = None
+    /\ OtherKey
     /\ act' = "search"
     /\ UNCHANGED <<order, open, origin>>
 
-\* The first Delete on a row that can close, with no search.
-Arm ==
+\* Close key k pressed while the search holds text: it takes some away, maybe
+\* all, and starts or goes on with k's run.
+SearchEdit(k) ==
+    /\ open
+    /\ SearchKeys
+    /\ searching
+    /\ \E s \in BOOLEAN, h \in SUBSET Range(order) :
+         /\ s \/ h = {}
+         /\ Retype(s, h)
+    /\ armed' = None
+    /\ run' = k
+    /\ pressed' = k
+    /\ act' = "search"
+    /\ UNCHANGED <<order, open, origin>>
+
+\* The first press of close key k on a row that can close, with no search and
+\* no run of k that edited it.
+Arm(k) ==
     /\ open
     /\ ~searching
     /\ Closable(sel)
     /\ armed # sel
+    /\ (run # k \/ Mutation = "run_closes")
     /\ armed' = sel
+    /\ run' = IF run = k THEN k ELSE None
+    /\ pressed' = k
     /\ act' = "arm"
     /\ UNCHANGED <<order, onScreen, open, sel, origin, searching, hidden>>
+
+\* A press of close key k that goes on past a search its run emptied: nothing
+\* happens.
+Ignored(k) ==
+    /\ open
+    /\ ~searching
+    /\ run = k
+    /\ pressed' = k
+    /\ act' = "ignored"
+    /\ UNCHANGED <<order, onScreen, open, sel, armed, origin, searching, hidden, run>>
 
 \* Closes x and what it takes. When the agent on screen closes with it, the
 \* row above x takes its place; the first row has none, so the next open
@@ -293,14 +355,17 @@ CloseAgent(x, label) ==
        /\ act' = label
        /\ UNCHANGED <<open, searching>>
 
-\* The second Delete closes the armed row.
-Delete ==
+\* The second press of close key k closes the armed row.
+Delete(k) ==
     /\ open
     /\ ~searching
     /\ armed = sel
     /\ armed # None
     /\ Closable(sel)
+    /\ (run # k \/ Mutation = "run_closes")
     /\ CloseAgent(sel, "delete")
+    /\ run' = IF run = k THEN k ELSE None
+    /\ pressed' = k
 
 \* /close on an instance's screen, with the list closed and another instance
 \* open.
@@ -309,6 +374,8 @@ SlashClose ==
     /\ IsInst(onScreen)
     /\ Cardinality(AliveInsts) > 1
     /\ CloseAgent(onScreen, "slash_close")
+    /\ UNCHANGED run
+    /\ pressed' = None
 
 \* A subagent starts, and takes a place among its instance's subagents. Under
 \* a search it may match it or not.
@@ -321,8 +388,9 @@ EnvStart(a) ==
          /\ order' = WithGroup(Parent[a], g)
          /\ hidden' = IF shown THEN hidden ELSE hidden \cup {a}
     /\ sel' = Kept(Filter(order', hidden'))
+    /\ pressed' = None
     /\ act' = "env_start"
-    /\ UNCHANGED <<onScreen, open, armed, origin, searching>>
+    /\ UNCHANGED <<onScreen, open, armed, origin, searching, run>>
 
 \* An instance's subagents reorder: one starts or finishes work.
 \* tests/tla/agents_menu/spec/RowOrder.tla models what makes them reorder.
@@ -334,8 +402,9 @@ EnvReorder(p) ==
           /\ g # Group(order, p)
           /\ order' = WithGroup(p, g)
     /\ sel' = Kept(Filter(order', hidden))
+    /\ pressed' = None
     /\ act' = "env_reorder"
-    /\ UNCHANGED <<onScreen, open, armed, origin, searching, hidden>>
+    /\ UNCHANGED <<onScreen, open, armed, origin, searching, hidden, run>>
 
 \* The main agent closes one of its subagents.
 EnvClose(a) ==
@@ -343,6 +412,8 @@ EnvClose(a) ==
     /\ a \in Subs
     /\ a \in Range(order)
     /\ CloseAgent(a, "env_close")
+    /\ UNCHANGED run
+    /\ pressed' = None
 
 \* Under a search, an agent's title changes, and it starts or stops matching.
 EnvRetitle(a) ==
@@ -351,8 +422,9 @@ EnvRetitle(a) ==
     /\ a \in Range(order)
     /\ hidden' = IF a \in hidden THEN hidden \ {a} ELSE hidden \cup {a}
     /\ sel' = Kept(Filter(order, hidden'))
+    /\ pressed' = None
     /\ act' = "env_retitle"
-    /\ UNCHANGED <<order, onScreen, open, armed, origin, searching>>
+    /\ UNCHANGED <<order, onScreen, open, armed, origin, searching, run>>
 
 Next ==
     \/ OpenList
@@ -362,8 +434,7 @@ Next ==
     \/ Back
     \/ Close
     \/ Search
-    \/ Arm
-    \/ Delete
+    \/ \E k \in Keys : SearchEdit(k) \/ Arm(k) \/ Delete(k) \/ Ignored(k)
     \/ SlashClose
     \/ \E a \in Subs : EnvStart(a) \/ EnvClose(a)
     \/ \E p \in Instances : EnvReorder(p)
@@ -383,6 +454,8 @@ TypeOK ==
     /\ origin \in Agents \cup {None}
     /\ searching \in BOOLEAN
     /\ hidden \subseteq Agents
+    /\ run \in {None} \cup Keys
+    /\ pressed \in {None} \cup Keys
     /\ act \in Acts
 
 \* The rows are the open instances in launch order, each followed by its own
@@ -396,9 +469,9 @@ OnScreenListed == onScreen \in Range(order)
 LastInstanceStays == AliveInsts # {}
 
 \* While open, the highlight is on a row whenever there is one; while closed,
-\* nothing is highlighted, armed, searched, or kept to go back to.
+\* nothing is highlighted, armed, searched, kept to go back to, or in a run.
 SelListed == (open /\ Rows # << >>) => sel \in Range(Rows)
-ClosedNoSel == ~open => (sel = None /\ armed = None /\ origin = None /\ ~searching)
+ClosedNoSel == ~open => (sel = None /\ armed = None /\ origin = None /\ ~searching /\ run = None)
 
 \* Only a search hides rows, and only open agents.
 SearchHides == hidden \subseteq Range(order) /\ (~searching => hidden = {})
@@ -463,6 +536,10 @@ SelectionKept ==
 \* screen, when that one is a row.
 FallbackToScreen ==
     [][(open /\ open' /\ sel \notin Range(order') /\ onScreen' \in Range(Rows')) => sel' = onScreen']_vars
+
+\* A run of a close key that edited the search never arms or closes a row: a
+\* press of its key that arms or closes comes only after another key ended it.
+RunNeverCloses == [][act' \in {"arm", "delete"} => run # pressed']_vars
 
 \* A move that keeps the list open goes one row, and stops at the last row.
 MoveOneRow ==

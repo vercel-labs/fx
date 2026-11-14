@@ -33,7 +33,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -9447,20 +9447,23 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      // The summary and its fallback are both rejected, so the turn fails
+      // A 413 refuses the request as too large, so the summary is asked for
+      // again smaller three times, each time from the conversation's model
+      // and then the fallback. Every one is rejected, so the turn fails
       // without running the completed tool again.
       expect(serializedError).toContain("ModelFailed");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(4);
-      for (const index of [2, 3]) {
+      expect(gateway.requestCount()).toBe(10);
+      for (let index = 2; index < 10; index += 1) {
         const summaryRequest = JSON.parse(gateway.requests[index]!.body);
         expect(summaryRequest.tools).toEqual([]);
         expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+        const fallback = gateway.requests[index]!.headers.get("ai-language-model-id") === "anthropic/claude-sonnet-5";
+        expect(fallback).toBe(index % 2 === 1);
       }
-      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -9842,8 +9845,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
     let phase = 0;
-    const gateway = startDynamicFakeGateway((body) => {
-      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_SEED_DONE");
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // A report that arrives while the parent's first turn runs joins that
+        // turn, so the worker answers only once that turn is saved.
+        await waitForRootTurnCommitted(root.home);
+        return fakeGatewayFinalText("CHILD_SEED_DONE");
+      }
       if (phase === 0) {
         // The worker's report starts the seed run's second turn.
         if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_SEED_SENTINEL");

@@ -198,6 +198,11 @@ fn completionOf(outcome: subagent_child_state.Outcome) agents.ChildRunCompletion
     };
 }
 
+/// A key that arms, and then closes, the highlighted row of the agent list
+/// when the search is empty, and edits the search when it holds text:
+/// Backspace, in any encoding of it, or forward Delete.
+pub const CloseKey = enum { backspace, delete };
+
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
 /// is doing now. It opens on the agent on screen, and its highlight is a
@@ -222,6 +227,12 @@ pub const AgentsMenu = struct {
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?ListedAgent = null,
+    /// The close key whose presses have edited the search since a key other
+    /// than it was last pressed in the list. While it is set, that key does
+    /// nothing on an empty search, so one held down to clear a search never
+    /// goes on to arm and close an agent
+    /// (`tests/tla/agents_menu/spec/AgentsMenu.tla` RunNeverCloses).
+    edit_run: ?CloseKey = null,
     /// The draft of the agent on screen, set aside while the composer is
     /// the list's search box, and back in the composer once the list closes.
     draft: ?composer_stash.State = null,
@@ -1739,6 +1750,7 @@ pub fn Runtime(comptime App: type) type {
             menu.highlight = .{ .agent = app.agent_on_screen };
             menu.origin = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
+            menu.edit_run = null;
             setDraftAside(app);
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
@@ -1764,6 +1776,7 @@ pub fn Runtime(comptime App: type) type {
             menu.highlight = .on_screen;
             menu.origin = .on_screen;
             menu.close_armed = null;
+            menu.edit_run = null;
             putDraftBack(app);
             app.shell.render_requests.request(.footer);
         }
@@ -1951,12 +1964,38 @@ pub fn Runtime(comptime App: type) type {
             return if (std.mem.eql(u8, name, profiles.main_name)) "" else name;
         }
 
+        /// A key was pressed in the open list. A run of close key presses
+        /// that edited the search goes on only through that key, so a key
+        /// other than it ends the run; `pressed` is the close key it is, or
+        /// null for any other key.
+        pub fn noteKeyPress(app: *App, pressed: ?CloseKey) void {
+            if (comptime !@hasField(App, "instances")) return;
+            const menu = &app.instances.agents_menu;
+            const run = menu.edit_run orelse return;
+            if (pressed == run) return;
+            menu.edit_run = null;
+        }
+
+        /// Close key `key` was pressed while the composer, the list's search
+        /// box, holds text, so it edits the search: its run of presses starts
+        /// or goes on, and none of them arms a close, even once the search is
+        /// empty, until another key is pressed.
+        pub fn noteSearchEditKey(app: *App, key: CloseKey) void {
+            if (comptime !@hasField(App, "instances")) return;
+            app.instances.agents_menu.edit_run = key;
+        }
+
         /// Delete in the agent list: the first press on a row arms its close,
         /// and the second closes it: a subagent for good (`closeSubagent`), an
         /// instance as `/close` does (`closeInstanceFromMenu`). The last open
-        /// instance stays, since closing it would end fx.
-        pub fn pressCloseKey(app: *App) !bool {
+        /// instance stays, since closing it would end fx. A press of `key`
+        /// while its run is editing the search does nothing.
+        pub fn pressCloseKey(app: *App, key: CloseKey) !bool {
             if (!menuActive(app)) return false;
+            if (app.instances.agents_menu.edit_run == key) {
+                debug_trace.eventf("host", "agents_menu_close_ignored", .{}, "key={s} reason=search_run", .{@tagName(key)});
+                return true;
+            }
             var order: std.ArrayList(?*ChildAgent) = .empty;
             defer order.deinit(app.alloc);
             try switchList(app, &order);

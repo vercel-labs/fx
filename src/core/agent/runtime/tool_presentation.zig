@@ -1476,10 +1476,18 @@ pub fn runningCommandDecision(
 ) !?ToolOutcomeDecision {
     if (!std.mem.eql(u8, call.name, "shell")) return null;
     if (std.mem.find(u8, output, "\"running\"") == null) return null;
-    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
+    // Only text that is not JSON gives no decision; running out of memory is
+    // reported, so the row does not read "Ran" for a command that still runs.
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     const action = tool_args.optionalStringArg(args, "action") orelse "run";
     if (!std.mem.eql(u8, action, "run")) return null;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (parsed != .object) return null;
     const state = parsed.object.get("state") orelse return null;
     if (state != .string or !std.mem.eql(u8, state.string, "running")) return null;
@@ -1506,6 +1514,23 @@ test "a shell run that returns its command running reads Still running" {
     const read = ToolCall{ .id = "r", .name = "read_file", .arguments_json = "{}" };
     try std.testing.expect((try runningCommandDecision(arena, read, running)) == null);
     try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
+}
+
+fn checkRunningCommandDecisionAllocationFailures(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\"}";
+    const decision = (try runningCommandDecision(arena_state.allocator(), run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+}
+
+test "a running shell result reports out of memory instead of reading Ran" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkRunningCommandDecisionAllocationFailures,
+        .{},
+    );
 }
 
 pub fn terminalActionOutcomeDecision(
