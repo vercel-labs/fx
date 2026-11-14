@@ -22,18 +22,20 @@ function storeHoldsLogin(f: Fixture): boolean {
  * The model's `check` record for the first request that carried each token the fake
  * issued, and `store`: whether the login is kept. `ended` is when fx exited.
  */
-function confirmRecords(f: Fixture, fake: { entries: () => import("./driver").FakeEntry[] }, ended: number, login = 1): TraceRecord[] {
+function confirmRecords(f: Fixture, fake: { entries: () => import("./driver").FakeEntry[] }, ended: number, login = 1, unrenewed = false): TraceRecord[] {
   const answers = checkAnswers(fake.entries());
+  // `unrenewed`: the 401 started a refresh, and the token endpoint gave it no usable answer. The model's
+  // answer for that is `refuse_unrenewed`: the 401 stands.
   return [
-    ...answers.map((a) => ({ event: "check", data: { login, result: a.result }, at: Math.min(a.t, ended - 1) })),
+    ...answers.map((a) => ({ event: "check", data: { login, result: unrenewed && a.result === "refuse" ? "refuse_unrenewed" : a.result }, at: Math.min(a.t, ended - 1) })),
   ];
 }
 
 const storeRecord = (f: Fixture, ended: number, login = 1): TraceRecord => ({ event: "store", data: { login, saved: storeHoldsLogin(f) }, at: ended });
 
-async function signInScenario(name: string, tamper: boolean, opts: { gate?: Record<string, unknown>; web?: Record<string, unknown> } = {}) {
+async function signInScenario(name: string, tamper: boolean, opts: { gate?: Record<string, unknown>; web?: Record<string, unknown>; server?: Record<string, unknown>; unrenewed?: boolean } = {}) {
   const f = fixture(artifacts, name);
-  const fake = await startFake(f, {}, opts.gate ?? {});
+  const fake = await startFake(f, opts.server ?? {}, opts.gate ?? {});
   writeProfile(f, { web: { type: "http", url: fake.url, ...(opts.web ?? {}) } });
   const records: TraceRecord[] = [];
   const at = () => Date.now();
@@ -76,7 +78,7 @@ async function signInScenario(name: string, tamper: boolean, opts: { gate?: Reco
     const ended = at();
     const tokens = redemptions(fake.entries());
     for (const t of tokens) records.push({ event: "redeem", data: { login: 1 }, at: Math.min(t.t, ended - 2) });
-    records.push(...confirmRecords(f, fake, ended));
+    records.push(...confirmRecords(f, fake, ended, 1, opts.unrenewed));
     records.push({ event: code === 0 ? "signed_in" : "failed", data: { login: 1 }, at: ended });
     records.push(storeRecord(f, ended));
     const after = await probe(port);
@@ -319,9 +321,23 @@ test("contract: a server that refuses the new login ends the sign-in with its er
   const r = await signInScenario("signin-refused", false, { gate: REFUSE });
   expect(r.checks.map((c) => c.result)).toEqual(["refuse"]);
   expect(r.out).not.toContain("Signed in");
-  expect(r.err).toContain("Couldn't sign in to web: web refused the new login (invalid_token: No authorization provided).");
+  expect(r.err).toContain("Couldn't sign in to web: web refused the new login (invalid_token: \"No authorization provided\").");
   expect(r.code).toBe(1);
   // A refused token is never written, so no other fx process can take it (NeverTakeRefused).
+  expect(r.saved).toBe(false);
+  expect(r.tokens.length).toBe(1);
+  expect(r.verdict.verdict).toBe("ACCEPTED");
+}, 120_000);
+
+// The 401 starts a refresh, and the token endpoint gives it no usable answer (a 500). The 401 is still the
+// server's answer to the new login, so the sign-in ends refused and nothing is saved. Before the fix the
+// failed refresh ended the check as "couldn't check": the refused token was saved and reported as signed in.
+test("contract: a server that refuses the new login, whose refresh then answers 500, still ends the sign-in with its error, exit 1, and the login is never saved (trace ACCEPTED)", async () => {
+  const r = await signInScenario("signin-refused-unrenewed", false, { gate: REFUSE, server: { refreshError: "server_error", refreshStatus: 500 }, unrenewed: true });
+  expect(r.checks.map((c) => c.result)).toEqual(["refuse"]);
+  expect(r.out).not.toContain("Signed in");
+  expect(r.err).toContain("Couldn't sign in to web: web refused the new login (invalid_token: \"No authorization provided\").");
+  expect(r.code).toBe(1);
   expect(r.saved).toBe(false);
   expect(r.tokens.length).toBe(1);
   expect(r.verdict.verdict).toBe("ACCEPTED");
@@ -341,7 +357,7 @@ for (const fault of ["500", "drop"] as const) {
   test(`contract: a check request that fails (${fault}) keeps the login and says it couldn't check, exit 0 (trace ACCEPTED)`, async () => {
     const r = await signInScenario(`signin-check-${fault}`, false, { gate: { tokenFault: fault } });
     expect(r.checks.map((c) => c.result)).toEqual(["fail"]);
-    expect(r.out).toContain("Signed in to web, but fx couldn't reach it to check the login.");
+    expect(r.out).toContain("Signed in to web, but fx couldn't check the login with it.");
     expect(r.code).toBe(0);
     expect(r.saved).toBe(true);
     expect(r.verdict.verdict).toBe("ACCEPTED");
@@ -352,7 +368,7 @@ test("contract: a check request that gets no answer ends at the server's timeout
   // operation_timeout_ms and startup_timeout_ms accept 1 ms and up, so the real timeout path runs in seconds.
   const r = await signInScenario("signin-check-hang", false, { gate: { tokenFault: "hang" }, web: { startup_timeout_ms: 1500, operation_timeout_ms: 1500 } });
   expect(r.checks.map((c) => c.result)).toEqual(["fail"]);
-  expect(r.out).toContain("Signed in to web, but fx couldn't reach it to check the login.");
+  expect(r.out).toContain("Signed in to web, but fx couldn't check the login with it.");
   expect(r.code).toBe(0);
   expect(r.saved).toBe(true);
   expect(r.verdict.verdict).toBe("ACCEPTED");
@@ -398,7 +414,7 @@ test("stress: repeated sign-ins to a server that refuses every login never repor
       const redirect = await fetch(url, { redirect: "manual" });
       await (await fetch(new URL(redirect.headers.get("location")!).toString())).text();
       const code = await login.done();
-      expect({ n, code, out: login.out().includes("Signed in"), err: login.err().includes("web refused the new login (invalid_token: No authorization provided).") }).toEqual({ n, code: 1, out: false, err: true });
+      expect({ n, code, out: login.out().includes("Signed in"), err: login.err().includes('web refused the new login (invalid_token: "No authorization provided").') }).toEqual({ n, code: 1, out: false, err: true });
       expect(storeHoldsLogin(f)).toBe(false);
     }
     expect(redemptions(fake.entries()).length).toBe(rounds);
@@ -431,6 +447,12 @@ describe("the trace check holds SignIn.tla's check rules", () => {
   }, 120_000);
   test("a refused check, then the sign-in fails, with nothing kept", async () => {
     expect(await verdictOf("refuse", [check("refuse"), ended("failed"), store(false)])).toBe("ACCEPTED");
+  }, 120_000);
+  test("a refused check whose refresh then failed, then the sign-in fails, with nothing kept", async () => {
+    expect(await verdictOf("refuse-unrenewed", [check("refuse_unrenewed"), ended("failed"), store(false)])).toBe("ACCEPTED");
+  }, 120_000);
+  test("a refused check whose refresh then failed, kept and reported as signed in, is not a behavior (the failed refresh read as a check that couldn't be made)", async () => {
+    expect(await verdictOf("unrenewed-kept", [check("refuse_unrenewed"), ended("signed_in"), store(true)])).toBe("REJECTED");
   }, 120_000);
   test("signed in with no check before it is not a behavior (fx before the fix)", async () => {
     expect(await verdictOf("no-check", [ended("signed_in"), store(true)])).toBe("REJECTED");

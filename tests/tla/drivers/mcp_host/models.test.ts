@@ -30,11 +30,12 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it. SignIn's four findings are fx before the check request
+  // configs check it. SignIn's five findings are fx before the check request
   // (a login reported as signed in before the server took it, a refused login
-  // saved, a refused login another fx takes) and the branch for an unreadable
-  // store answering a sign-in's check request first; its repair witness is the code.
-  expect(count("finding", "FINDING")).toBe(6);
+  // saved, a refused login another fx takes), the branch for an unreadable
+  // store answering a sign-in's check request first, and a failed refresh after a
+  // 401 read as a check that couldn't be made; its repair witness is the code.
+  expect(count("finding", "FINDING")).toBe(7);
   expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 

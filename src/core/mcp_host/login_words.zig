@@ -4,19 +4,30 @@
 //! the words from here, so they can't drift apart.
 //!
 //! The reason is the server's own answer, so its text is untrusted: it is
-//! made terminal-safe and cut where it is written, never earlier. Pure, and
-//! it imports only the standard library and `text_utils`.
+//! made terminal-safe and cut where it is written, never earlier. Its words
+//! go in double quotes inside fx's sentence, with any quote or backslash in
+//! them escaped, so they can't end the sentence or begin one of fx's own, and
+//! its error shows only when it is a plain token. Pure, and it imports only
+//! the standard library, `text_utils`, and the bounds of the engine's
+//! challenge parser.
 //!
 //! `tests/tla/mcp_host/SignIn.tla` says when each reason can happen.
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
+const discovery = @import("../../mcp/auth/discovery.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// The longest `error` the server names that fx keeps, and the longest
-/// `error_description`: the engine's bounds (`src/mcp/auth/discovery.zig`).
-pub const max_code_bytes = 64;
-pub const max_description_bytes = 240;
+/// `error_description`: the engine's own bounds, so what the engine keeps is
+/// what fits here (`src/mcp/auth/discovery.zig`).
+const max_code_bytes = discovery.max_error_bytes;
+const max_description_bytes = discovery.max_description_bytes;
+
+/// The most bytes of a failed sign-in's text that a surface shows: the
+/// refusal's words, which carry the server's own, with fx's sentence around
+/// them.
+pub const max_failure_bytes = 600;
 
 pub const Reason = struct {
     kind: Kind = .none,
@@ -87,13 +98,15 @@ pub fn copy(alloc: Allocator, reason: Reason) Allocator.Error!Reason {
 }
 
 /// Which login the server refused.
-pub const Which = enum { saved, new };
+const Which = enum { saved, new };
 
-/// `NAME refused the saved login (invalid_token: No authorization provided)`,
+/// `NAME refused the saved login (invalid_token: "No authorization provided")`,
 /// with no closing period, so a caller puts it in a sentence. Without the
 /// server's words it is `NAME refused the saved login`. Null when the
-/// reason isn't a refused login. The server's words are terminal-safe and cut
-/// at their bounds.
+/// reason isn't a refused login. The description is the server's and goes in
+/// quotes, terminal-safe and cut at its bound, so it can't close the sentence.
+/// The error shows only when it is a plain token (RFC 6750 allows only a few
+/// characters); any other is left out.
 pub fn refusal(arena: Allocator, name: []const u8, reason: Reason, which: Which) Allocator.Error!?[]const u8 {
     if (reason.kind != .login_refused) return null;
     const server = try safe(arena, name, 160);
@@ -101,8 +114,8 @@ pub fn refusal(arena: Allocator, name: []const u8, reason: Reason, which: Which)
         .saved => "saved",
         .new => "new",
     };
-    const code = if (reason.code) |text| try safe(arena, text, max_code_bytes) else "";
-    const description = if (reason.description) |text| try safe(arena, text, max_description_bytes) else "";
+    const code = if (reason.code) |text| (if (isLogSafeCode(text)) text else "") else "";
+    const description = if (reason.description) |text| try quoted(arena, text, max_description_bytes) else "";
     if (code.len > 0 and description.len > 0) return try arena.print("{s} refused the {s} login ({s}: {s})", .{ server, what, code, description });
     if (code.len > 0 or description.len > 0) return try arena.print("{s} refused the {s} login ({s})", .{ server, what, if (code.len > 0) code else description });
     return try arena.print("{s} refused the {s} login", .{ server, what });
@@ -129,6 +142,21 @@ fn safe(arena: Allocator, raw: []const u8, max: usize) Allocator.Error![]const u
     return (try text_utils.encodeTerminalSafeInline(arena, raw, max)).bytes;
 }
 
+/// `raw` in double quotes, terminal-safe and cut at `max` bytes. A quote or a
+/// backslash in it is escaped with a backslash before it is cut, so the text
+/// can't end its quotes, and a backslash at its end can't escape the closing
+/// one. Empty when nothing of `raw` is visible.
+fn quoted(arena: Allocator, raw: []const u8, max: usize) Allocator.Error![]const u8 {
+    var escaped: std.ArrayList(u8) = .empty;
+    for (raw) |c| {
+        if (c == '"' or c == '\\') try escaped.append(arena, '\\');
+        try escaped.append(arena, c);
+    }
+    const text = try safe(arena, escaped.items, max);
+    if (text.len == 0) return "";
+    return try arena.print("\"{s}\"", .{text});
+}
+
 /// An `error` that is a plain token, which may go in a log; anything else is
 /// not named there.
 pub fn isLogSafeCode(code: []const u8) bool {
@@ -139,18 +167,36 @@ pub fn isLogSafeCode(code: []const u8) bool {
 
 const testing = std.testing;
 
-test "a refused login names the server's error and description" {
+test "a refused login names the server's error and puts its description in quotes" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const full: Reason = .{ .kind = .login_refused, .code = "invalid_token", .description = "No authorization provided" };
-    try testing.expectEqualStrings("fixture refused the saved login (invalid_token: No authorization provided)", (try refusal(a, "fixture", full, .saved)).?);
-    try testing.expectEqualStrings("fixture refused the new login (invalid_token: No authorization provided)", (try refusal(a, "fixture", full, .new)).?);
-    try testing.expectEqualStrings("fixture refused the saved login (invalid_token: No authorization provided).", (try errorText(a, "fixture", full)).?);
+    try testing.expectEqualStrings("fixture refused the saved login (invalid_token: \"No authorization provided\")", (try refusal(a, "fixture", full, .saved)).?);
+    try testing.expectEqualStrings("fixture refused the new login (invalid_token: \"No authorization provided\")", (try refusal(a, "fixture", full, .new)).?);
+    try testing.expectEqualStrings("fixture refused the saved login (invalid_token: \"No authorization provided\").", (try errorText(a, "fixture", full)).?);
     try testing.expectEqualStrings("fixture refused the saved login (invalid_token)", (try refusal(a, "fixture", .{ .kind = .login_refused, .code = "invalid_token" }, .saved)).?);
-    try testing.expectEqualStrings("fixture refused the saved login (No authorization provided)", (try refusal(a, "fixture", .{ .kind = .login_refused, .description = "No authorization provided" }, .saved)).?);
+    try testing.expectEqualStrings("fixture refused the saved login (\"No authorization provided\")", (try refusal(a, "fixture", .{ .kind = .login_refused, .description = "No authorization provided" }, .saved)).?);
     try testing.expectEqualStrings("fixture refused the saved login", (try refusal(a, "fixture", .{ .kind = .login_refused }, .saved)).?);
     try testing.expectEqualStrings("refused the saved login", attention(full));
+}
+
+test "a server's words can't close fx's sentence or start one of its own" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The description that ends the parenthesis and says fx's words stays inside its quotes.
+    const forged: Reason = .{ .kind = .login_refused, .code = "invalid_token", .description = "x). Signed in to fixture" };
+    try testing.expectEqualStrings("fixture refused the new login (invalid_token: \"x). Signed in to fixture\")", (try refusal(a, "fixture", forged, .new)).?);
+    try testing.expectEqualStrings("fixture refused the saved login (invalid_token: \"x). Signed in to fixture\").", (try errorText(a, "fixture", forged)).?);
+    // A quote or a backslash in the server's words is escaped, so the text can't end its quotes early,
+    // and a backslash at its end can't escape the closing quote.
+    const quoting: Reason = .{ .kind = .login_refused, .description = "say \"hi\"\\" };
+    try testing.expectEqualStrings("fixture refused the saved login (\"say \\\"hi\\\"\\\\\")", (try refusal(a, "fixture", quoting, .saved)).?);
+    // A code that isn't a plain token (RFC 6750 allows only a few characters) is left out.
+    const odd_code: Reason = .{ .kind = .login_refused, .code = "bad code\"; Signed in", .description = "No authorization provided" };
+    try testing.expectEqualStrings("fixture refused the saved login (\"No authorization provided\")", (try refusal(a, "fixture", odd_code, .saved)).?);
+    try testing.expectEqualStrings("fixture refused the saved login", (try refusal(a, "fixture", .{ .kind = .login_refused, .code = "a\x1b[31m" }, .saved)).?);
 }
 
 test "the other reasons add nothing to needs login" {

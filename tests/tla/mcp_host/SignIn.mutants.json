@@ -74,19 +74,19 @@
   },
   {
     "description": "A refused login is saved with the accepted ones",
-    "old": "          /\\ saved' = IF a # \"refuse\" THEN saved \\cup {k} ELSE saved\n",
+    "old": "          /\\ saved' = IF a \\notin Refusals THEN saved \\cup {k} ELSE saved\n",
     "new": "          /\\ saved' = saved \\cup {k}\n",
     "invariant": "RefusedNeverSaved"
   },
   {
     "description": "A refused login is reported as signed in",
-    "old": "![k].notified = (a # \"refuse\")]",
+    "old": "![k].notified = (a \\notin Refusals)]",
     "new": "![k].notified = TRUE]",
     "invariant": "NoticeMatchesAnswer"
   },
   {
     "description": "An accepted login isn't saved once the check request ends: the held save is lost",
-    "old": "          /\\ saved' = IF a # \"refuse\" THEN saved \\cup {k} ELSE saved\n",
+    "old": "          /\\ saved' = IF a \\notin Refusals THEN saved \\cup {k} ELSE saved\n",
     "new": "          /\\ saved' = saved\n",
     "invariant": "AnsweredKeptAndReported"
   },
@@ -116,8 +116,8 @@
   },
   {
     "description": "The branch for an unreadable store answers a sign-in's check request first and swallows a refusal",
-    "old": "a == IF UnreadFirst /\\ unread /\\ ck[k].srv = \"refuse\"",
-    "new": "a == IF unread /\\ ck[k].srv = \"refuse\"",
+    "old": "a == IF UnreadFirst /\\ unread /\\ ck[k].srv \\in Refusals",
+    "new": "a == IF unread /\\ ck[k].srv \\in Refusals",
     "invariant": "NoticeMatchesAnswer"
   },
   {
@@ -125,5 +125,17 @@
     "old": "            /\\ phase' = Ended(live[cur])\n            /\\ live' = [live EXCEPT ![cur] = 0]\n            /\\ indicator' = FALSE\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
     "new": "            /\\ phase' = phase\n            /\\ live' = live\n            /\\ indicator' = indicator\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
     "invariant": "LoggedOutNeverSaved"
+  },
+  {
+    "description": "A 401 whose refresh then gets no usable answer is read as a check that couldn't be made: the refused token is saved and reported as signed in (the engine's `.failed`, or `.phase` backoff, taken for `unchecked`)",
+    "old": "RefreshFailAsUnchecked == FALSE\n",
+    "new": "RefreshFailAsUnchecked == TRUE\n",
+    "invariant": "NoticeMatchesAnswer"
+  },
+  {
+    "description": "A refused token is saved when the refresh its 401 started gets no usable answer (the save the host made for a check that couldn't be made)",
+    "old": "          /\\ saved' = IF a \\notin Refusals THEN saved \\cup {k} ELSE saved\n",
+    "new": "          /\\ saved' = IF a \\notin Refusals \\/ ck[k].srv = \"refuse_unrenewed\" THEN saved \\cup {k} ELSE saved\n",
+    "invariant": "RefusedNeverSaved"
   }
 ]

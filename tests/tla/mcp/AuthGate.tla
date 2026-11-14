@@ -21,10 +21,15 @@
 \*   - Signing in brings a new token; signing out cancels the refresh in flight.
 \*   - A request that ends needing sign-in says why (`why`): it carried no token
 \*     (`no_token`), the server refused the token it carried (`refused`: its 401
-\*     challenge's error and description are kept, client.zig `ended`), the
-\*     refresh that would have fixed it was refused (`refresh_refused`), or the
-\*     user signed out (`signed_out`). One words function in the host turns the
-\*     reason into the text each surface shows (src/core/mcp_host/login_words.zig).
+\*     challenge's error and description are kept, `src/mcp/auth/client.zig`
+\*     `ended`), the refresh that would have fixed it was refused
+\*     (`refresh_refused`), or the user signed out (`signed_out`). One words
+\*     function in the host turns the reason into the text each surface shows
+\*     (`src/core/mcp_host/login_words.zig`). A refresh that gets no usable
+\*     answer fails the requests waiting, but the 401 it followed is still kept
+\*     until the server accepts a request or a sign-in or sign-out comes: a new login's check request asks the
+\*     engine for it (`Engine.loginRejected`), and a 401 that stands refuses the
+\*     login (`tests/tla/mcp_host/SignIn.tla` `RefusedNeverSaved`).
 EXTENDS Naturals
 
 CONSTANTS

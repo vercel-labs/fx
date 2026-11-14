@@ -23,7 +23,12 @@
 \*     server's answer: `.tools` ok (accept), `.auth_required` that isn't a
 \*     step-up (refuse: discardLogin, nothing saved, `.sign_in_failed`),
 \*     `.tools` not ok, `.failed`, or `.phase` backoff or failed (fail: saved,
-\*     `.signed_in_unchecked`), or expireLogins after 45 s (fail). A `.credential`
+\*     `.signed_in_unchecked`), or expireLogins after 45 s (fail). A 401 to the check
+\*     request starts a refresh. When that refresh gets no usable answer (a 5xx, a 429,
+\*     no answer in time) the engine ends the request as `.failed` (`auth_unavailable`),
+\*     which also moves the server to `.phase` backoff, or as a `.tools` that is not ok,
+\*     but it still holds the 401 (`Engine.loginRejected`): whichever of these the host
+\*     sees first, `checkFailed` takes it as a refusal too (refuse_unrenewed). A `.credential`
 \*     meanwhile is held. PickUp is pickUpLogin in another fx process.
 \*   - src/core/mcp_host/runtime.zig, the read again for an unreadable store (PR #1793):
 \*     `store_unread` (restoreCredentials, adoptSaved) is StoreUnreadable; pickUpLogin
@@ -50,10 +55,12 @@
 \* host sends one request with it (the connect and tools/list `fx mcp show`
 \* uses) and the server's answer ends the sign-in:
 \*   - accepted: the login is saved, then "Signed in to NAME." (`.signed_in`);
-\*   - refused (a 401, or a 403 that isn't a step-up): `.sign_in_failed` with
-\*     the server's error, and the token is never saved;
-\*   - no answer in time, a 5xx, or a dropped connection: the login is saved,
-\*     and "Signed in to NAME" says it couldn't be checked.
+\*   - refused (a 401, whether or not the refresh it starts then works):
+\*     `.sign_in_failed` with the server's error, and the token is never saved;
+\*   - no answer in time, a 5xx, a dropped connection, or a 403 that isn't a step-up
+\*     (the server answered, but not about the token): that is a check that
+\*     failed, not a refusal. The login is saved, and "Signed in to NAME" says fx
+\*     couldn't check the login with it.
 \* Before the fix (CheckFirst FALSE) the exchange saved and reported at once.
 \* The server's answer to a request with login k's token is `srv`, fixed when
 \* the run starts. Another fx process takes any login that is saved
@@ -87,8 +94,18 @@ States == 0..MaxLogins
 Kinds == {"get", "form_ours", "form_foreign", "other"}
 Phases == {"unused", "open", "consumed", "redeeming", "confirming", "closed"}
 \* What the server answers a request with a login's token: accepts it, refuses
-\* it (401), or fails (a 5xx, a dropped connection, no answer in time).
-Answers == {"accept", "refuse", "fail"}
+\* it (401), refuses it and then the refresh the 401 starts gets no usable answer
+\* (refuse_unrenewed), or fails (a 5xx, a dropped connection, no answer in time,
+\* a 403 that isn't a step-up).
+Answers == {"accept", "refuse", "fail", "refuse_unrenewed"}
+\* The answers that refuse the token. The 401 stands whatever the refresh does after it.
+Refusals == {"refuse", "refuse_unrenewed"}
+\* The host's reading of a 401 whose refresh got no usable answer. fx has it as a
+\* refusal (`Runtime.checkFailed` asks the engine for the 401 it holds). With
+\* RefreshFailAsUnchecked the host would read the failed refresh as a check that
+\* couldn't be made, as fx did before: a findings config sets it to TRUE.
+RefreshFailAsUnchecked == FALSE
+RefreshFailAsUncheckedYes == TRUE
 
 VARIABLES
     cur, alive, retired, leases,
@@ -249,20 +266,22 @@ Redeemed(k, ok) ==
 
 \* The server answers the check request with the new login's token (runtime.zig
 \* `.signed_in`, once the engine's request with it ended). An accepted or an
-\* unanswered one keeps the login, then reports it; a refused one reports the
-\* refusal (`.sign_in_failed`) and the token goes with the login: it is never
-\* saved.
+\* unanswered one keeps the login, then reports it; a refused one, with or without
+\* a failed refresh after it, reports the refusal (`.sign_in_failed`) and the token
+\* goes with the login: it is never saved.
 Confirm(k) ==
     /\ phase[k] = "confirming" /\ alive[hostOf[k]]
     /\ LET h == hostOf[k]
            \* What the host acts on: a refusal the unreadable-store branch swallowed is
            \* no answer, and the sign-in ends by its timeout (a login kept, with a note).
-           a == IF UnreadFirst /\ unread /\ ck[k].srv = "refuse" THEN "fail" ELSE ck[k].srv
+           a == IF UnreadFirst /\ unread /\ ck[k].srv \in Refusals THEN "fail"
+                ELSE IF RefreshFailAsUnchecked /\ ck[k].srv = "refuse_unrenewed" THEN "fail"
+                ELSE ck[k].srv
        IN /\ phase' = Ended(k)
           /\ live' = [live EXCEPT ![h] = 0]
           /\ indicator' = FALSE
-          /\ saved' = IF a # "refuse" THEN saved \cup {k} ELSE saved
-          /\ ck' = [ck EXCEPT ![k].asked = TRUE, ![k].notified = (a # "refuse")]
+          /\ saved' = IF a \notin Refusals THEN saved \cup {k} ELSE saved
+          /\ ck' = [ck EXCEPT ![k].asked = TRUE, ![k].notified = (a \notin Refusals)]
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, flow, shownUrl, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
 \* Another fx process takes a login that is saved (pickUpLogin).
@@ -432,18 +451,18 @@ KeptSignInGoesOn == [][ReloadKeeps => \A k \in Logins : Open(k) => Open(k)']_var
 SignedInOnlyAfterCheck == \A k \in Logins : ck[k].notified => ck[k].asked
 
 \* The server never hears "Signed in" for a login it refuses.
-NoticeMatchesAnswer == \A k \in Logins : ck[k].notified => ck[k].srv # "refuse"
+NoticeMatchesAnswer == \A k \in Logins : ck[k].notified => ck[k].srv \notin Refusals
 
 \* A token the server refuses is never kept in the store.
-RefusedNeverSaved == \A k \in Logins : ck[k].srv = "refuse" => k \notin saved
+RefusedNeverSaved == \A k \in Logins : ck[k].srv \in Refusals => k \notin saved
 
 \* So no other fx process can take a login the server refuses
 \* (SharedLogins.tla's pickUpLogin).
-NeverTakeRefused == \A k \in Logins : ck[k].taken => ck[k].srv # "refuse"
+NeverTakeRefused == \A k \in Logins : ck[k].taken => ck[k].srv \notin Refusals
 
 \* A login the server accepted, or didn't answer (the note case), is kept and
 \* reported once its request ended: the held save can't lose it.
-AnsweredKeptAndReported == \A k \in Logins : (ck[k].asked /\ ck[k].srv # "refuse") => k \in saved /\ ck[k].notified
+AnsweredKeptAndReported == \A k \in Logins : (ck[k].asked /\ ck[k].srv \notin Refusals) => k \in saved /\ ck[k].notified
 
 \* The login a sign-in holds is never replaced by one read from the store, so the
 \* check request is answered for the token the person just got (PR #1793's re-read

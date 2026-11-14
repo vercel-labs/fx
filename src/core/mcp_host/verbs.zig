@@ -14,6 +14,7 @@ const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
 const secret = @import("../auth/secret.zig");
 const slack = @import("slack.zig");
+const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
@@ -687,7 +688,7 @@ fn safe(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
 
 /// A refusal's reason carries the server's own error, which runs past `safe`'s bound.
 fn safeLong(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
-    return (try text_utils.encodeTerminalSafeInline(arena, raw, 600)).bytes;
+    return (try text_utils.encodeTerminalSafeInline(arena, raw, login_words.max_failure_bytes)).bytes;
 }
 
 /// A sign-in address is only useful whole, so it isn't shortened.
@@ -1160,7 +1161,7 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
             };
             if (ok) {
                 if (unchecked) {
-                    try c.out.print("Signed in to {s}, but fx couldn't reach it to check the login.\n", .{try safe(arena, name)});
+                    try c.out.print("Signed in to {s}, but fx couldn't check the login with it.\n", .{try safe(arena, name)});
                 } else try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
                 return 0;
             }

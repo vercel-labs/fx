@@ -178,8 +178,9 @@ pub const Notice = union(enum) {
     /// The URL to sign in at; opened in the browser when the login asked for that.
     authorize: struct { server: []const u8, url: []const u8 },
     signed_in: []const u8,
-    /// The login is new and kept, but the server gave no answer to the
-    /// request that checks it: a failure that isn't a refusal.
+    /// The login is new and kept, but the request that checks it didn't show
+    /// whether the server takes the token (no answer, a 5xx, a 403 that isn't a
+    /// step-up): a failure that isn't a refusal.
     signed_in_unchecked: []const u8,
     sign_in_failed: struct { server: []const u8, reason: []const u8 },
     needs_login: []const u8,
@@ -490,6 +491,9 @@ pub const Runtime = struct {
         relisting: bool = false,
         /// Why the server needs a login, while `needs_login`.
         login: login_words.Held = .{},
+        /// A new login of this server was just refused, so the saved login the host takes back
+        /// next is the one it had before, not a sign-in.
+        refused_new: bool = false,
     };
 
     /// A refresh the engine said was due: waiting for its login's refresh lock,
@@ -1227,12 +1231,14 @@ pub const Runtime = struct {
     /// nothing saved, and the sign-in fails with the server's words, so no
     /// other fx can take it (`tests/tla/mcp_host/SignIn.tla`
     /// `SignedInOnlyAfterCheck`, `RefusedNeverSaved`, `NeverTakeRefused`).
+    /// A 401 refuses the login whatever the refresh it started does after
+    /// (`checkFailed`, the answer `refuse_unrenewed`).
     fn concludeSignIn(r: *Runtime, i: usize, how: SignInEnd) !void {
         if (!r.confirmingLogin(i)) return;
         const name = r.resolved.servers[i].name;
         switch (how) {
             .accepted, .unchecked => {
-                if (how == .unchecked) debug_trace.logf("mcp", "MCP login kept server={s} reason=the server gave no answer to check it", .{name});
+                if (how == .unchecked) debug_trace.logf("mcp", "MCP login kept server={s} reason=the check request didn't show whether the server takes the token", .{name});
                 try r.saveCredential(i);
                 r.flags[i] = .{ .signed_in = true };
                 r.endLogin(i);
@@ -1240,19 +1246,34 @@ pub const Runtime = struct {
             },
             .refused => |reason| {
                 debug_trace.logf("mcp", "MCP new login dropped server={s} reason=server refused the new login status=401 error={s}", .{ name, logCode(reason.code) });
-                r.engine.discardLogin(name) catch |err| debug_trace.logf("mcp", "MCP new login not forgotten server={s} err={s}", .{ name, @errorName(err) });
-                // Nothing was saved, so there is nothing to say beyond the sign-in's failure.
-                r.flags[i] = .{ .needs_login = true };
+                // The words first: the reason can borrow the engine's, and forgetting the login ends that.
                 var arena: std.heap.ArenaAllocator = .init(r.gpa);
                 defer arena.deinit();
                 const words = (login_words.refusal(arena.allocator(), name, reason, .new) catch null) orelse "the server refused the new login";
-                var buffer: [512]u8 = undefined;
+                var buffer: [login_words.max_failure_bytes]u8 = undefined;
                 const text = std.mem.print(&buffer, "{s}", .{words}) catch words[0..@min(words.len, buffer.len)];
+                r.engine.discardLogin(name) catch |err| debug_trace.logf("mcp", "MCP new login not forgotten server={s} err={s}", .{ name, @errorName(err) });
+                // Nothing was saved, so there is nothing to say beyond the sign-in's failure.
+                r.flags[i] = .{ .needs_login = true, .refused_new = true };
                 r.endLogin(i);
                 r.notify(.{ .sign_in_failed = .{ .server = name, .reason = text } });
                 r.endToolWaiters(i, .needs_login);
             },
         }
+    }
+
+    /// The request that checks server `i`'s new login failed, and the server didn't say it needs
+    /// a login. A 401 to the new token still refused it when the refresh that 401 started then got
+    /// no usable answer (a 5xx, a 429, none): the engine holds that 401, so the sign-in ends
+    /// refused with the server's words and nothing saved, as if the refresh had never run
+    /// (`tests/tla/mcp_host/SignIn.tla` `RefusedNeverSaved`, answer `refuse_unrenewed`). With no 401
+    /// held, the server was never heard on the token: a 5xx, a drop, a timeout, or a refresh that
+    /// failed before anything was sent. The login is kept, with a note.
+    fn checkFailed(r: *Runtime, i: usize) !void {
+        const name = r.resolved.servers[i].name;
+        const rejected = r.engine.loginRejected(name) orelse return r.concludeSignIn(i, .unchecked);
+        debug_trace.logf("mcp", "MCP login check ended without an answer but the server had refused the token server={s} status={d} error={s}", .{ name, rejected.status, logCode(rejected.code) });
+        try r.concludeSignIn(i, .{ .refused = .{ .kind = .login_refused, .code = rejected.code, .description = rejected.description } });
     }
 
     /// The login task: waits for the browser, then hands its address to the owner.
@@ -1354,8 +1375,9 @@ pub const Runtime = struct {
             // engine keeps trying, so a later request may still get them.
             .phase => |phase| if (phase == .backoff or phase == .failed) {
                 r.endToolWaiters(i, .failed);
-                // The request that checks a new login failed to get an answer: not a refusal.
-                try r.concludeSignIn(i, .unchecked);
+                // The request that checks a new login failed to get an answer. Not a refusal,
+                // unless the server's 401 stands (`checkFailed`).
+                try r.checkFailed(i);
             },
             .called => |c| {
                 const entry = r.calls.fetchRemove(c.call) orelse return r.releaseRequired(i);
@@ -1453,13 +1475,13 @@ pub const Runtime = struct {
                 // The request that checks a new login: what the server says to
                 // the new tokens ends the sign-in. A refusal comes as `auth_required`.
                 if (r.confirmingLogin(i)) {
-                    if (t.ok) try r.concludeSignIn(i, .accepted) else if (!t.needs_auth) try r.concludeSignIn(i, .unchecked);
+                    if (t.ok) try r.concludeSignIn(i, .accepted) else if (!t.needs_auth) try r.checkFailed(i);
                 }
             },
             .failed => |why| if (r.confirmingLogin(i)) switch (why) {
                 // The refusal arrives as `auth_required`.
                 .needs_auth => {},
-                else => try r.concludeSignIn(i, .unchecked),
+                else => try r.checkFailed(i),
             },
             .auth_required => |required| {
                 // A new login waits for the answer to its check request: that answer ends the
@@ -2323,9 +2345,18 @@ pub const Runtime = struct {
         const s = r.resolved.servers[i];
         if (s.transport != .http or s.held != null or r.loginFor(i) != null) return false;
         if (!try r.takeSaved(i)) return false;
+        // A new login was just refused: the saved login back in use is the one from before it.
+        // That is no sign-in, and "Signed in to NAME." after "Couldn't sign in to NAME" would be
+        // false. A login another fx saved in that window is taken the same way, without the notice.
+        const after_refusal = r.flags[i].refused_new;
         r.flags[i].needs_login = false;
         r.flags[i].login.clear();
         r.flags[i].signed_in = true;
+        r.flags[i].refused_new = false;
+        if (after_refusal) {
+            debug_trace.logf("mcp", "MCP saved login taken again after a refused new login server={s}", .{s.name});
+            return true;
+        }
         debug_trace.logf("mcp", "MCP login saved by another fx taken server={s}", .{s.name});
         r.notify(.{ .signed_in = s.name });
         return true;

@@ -342,6 +342,14 @@ pub const Engine = struct {
         try (try e.ensureServer(try e.find(name))).discardLogin();
     }
 
+    /// The 401 server `name` gave to a request that carried its login's token, with the words its
+    /// challenge named, when the server has accepted nothing since: null when there is none. A
+    /// failed refresh after the 401 leaves it. Valid until the next call into the engine.
+    pub fn loginRejected(e: *Engine, name: []const u8) ?auth_client.Rejected {
+        const server = (e.find(name) catch return null).server orelse return null;
+        return server.loginRejection();
+    }
+
     /// What server `name` said to tell the model about it, from its
     /// last discover or initialize result; null when it said nothing. Valid
     /// until the next call into the engine.

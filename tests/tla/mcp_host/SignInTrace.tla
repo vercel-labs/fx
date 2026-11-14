@@ -13,9 +13,11 @@
 \*   redeem {login}            the fake's token endpoint got that login's code
 \*   check {login, result}     the fake's MCP endpoint answered the first request that
 \*                             carried the token it issued for that login (the check
-\*                             request): "accept" (2xx), "refuse" (401 or 403), or "fail"
-\*                             (a 5xx, a dropped connection, no answer in time). The token
-\*                             endpoint's own answer isn't traced: it comes before the check.
+\*                             request): "accept" (2xx), "refuse" (a 401), "refuse_unrenewed"
+\*                             (a 401 whose refresh the token endpoint then gave no usable
+\*                             answer), or "fail" (a 5xx, a dropped connection, no answer in
+\*                             time, a 403 that isn't a step-up). The token endpoint's own
+\*                             answer to the code isn't traced: it comes before the check.
 \*   signed_in {login}         "Signed in to NAME." (with a note when the check "fail"ed)
 \*   failed {login}            "Couldn't sign in to NAME: ..."; after a "refuse" check, the
 \*                             one that names the refusal

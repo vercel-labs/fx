@@ -653,6 +653,14 @@ pub const Server = struct {
         try r.runAuth(null);
     }
 
+    /// The 401 the server gave to a request that carried the login's token, when it did and the
+    /// server has accepted nothing since. A refresh the 401 started that got no usable answer
+    /// ends the request as unrenewed, but the 401 stands. Borrows `r`: copy before the next call.
+    pub fn loginRejection(r: *const Server) ?auth_client.Rejected {
+        if (r.stdio) return null;
+        return r.auth.rejection();
+    }
+
     /// Ends a 2025 session with a DELETE, waiting at most 2 s for
     /// it. Nothing goes out afterwards.
     pub fn close(r: *Server) Error!void {

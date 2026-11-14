@@ -357,8 +357,10 @@ pub const Auth = struct {
         }
     }
 
-    /// Why the server refused the token, if it did since the login came.
-    fn rejection(a: *const Auth) ?Rejected {
+    /// Why the server refused the token, if it did since the login came and nothing the server
+    /// accepted has come since. It stays when a refresh that the 401 started gets no usable
+    /// answer. Borrows `a`: copy the words before the next call into it.
+    pub fn rejection(a: *const Auth) ?Rejected {
         if (a.rejection_status == 0) return null;
         return .{
             .status = a.rejection_status,
