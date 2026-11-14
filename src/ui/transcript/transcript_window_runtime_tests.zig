@@ -329,6 +329,8 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     try rawEntries(alloc, &runtime, &.{ "held one\n", "held two\n" });
     runtime.transcript_archive_available = true;
     try std.testing.expect(runtime.ctrlOJoinsPreviousCycle());
+    // Ctrl+O is opening, so the cycles it reads stay whole.
+    _ = runtime.requestFullTranscriptOpen();
 
     // The newest pages need the cycle before the compaction from the log.
     try std.testing.expectError(error.TranscriptArchiveNotLoaded, runtime.snapshotFullTranscriptPage(.{ .anchor = .tail, .content_revision = 0, .cols = 80 }, null, null));
@@ -401,10 +403,12 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     runtime.closeFullTranscriptState();
     try std.testing.expect(!runtime.transcript_archive_failed);
     try std.testing.expect(runtime.transcript_archive_damaged);
-    try std.testing.expect(runtime.transcript_archive == null);
+    // The cycle the newest pages join stays for the next open.
+    try std.testing.expectEqual(@as(u32, 1), runtime.transcript_archive.?.back);
     try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
     runtime.clearFullTranscriptDetails(alloc);
     try std.testing.expect(!runtime.transcript_archive_damaged);
+    try std.testing.expect(runtime.transcript_archive == null);
 }
 
 test "transcript window: Ctrl+O pages the cycles before one the window still holds" {
@@ -417,6 +421,7 @@ test "transcript window: Ctrl+O pages the cycles before one the window still hol
     // Until the turn across the compaction ends, the window holds both cycles.
     runtime.transcript_window.?.state.prev_first = 0;
     try std.testing.expect(!runtime.ctrlOJoinsPreviousCycle());
+    _ = runtime.requestFullTranscriptOpen();
     const held = try pageTexts(alloc, &runtime, .tail);
     defer alloc.free(held);
     try std.testing.expectEqualStrings("previous cycle\nnew cycle\n", held);
@@ -493,7 +498,19 @@ test "transcript window: each command's output is bounded on its own" {
     try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) > cap);
 }
 
-test "transcript window: Ctrl+O reads the log only while it is open, and forgets on compaction" {
+/// An older cycle of `count` entries, `older 0` first.
+fn numberedCycle(alloc: Allocator, count: usize) !TranscriptRuntime {
+    var archived = testRuntime(alloc);
+    errdefer archived.deinit(alloc);
+    archived.notebook.next_entry_id = runtime_mod.archiveEntryIdBase(1);
+    var buf: [32]u8 = undefined;
+    for (0..count) |index| {
+        _ = try archived.appendRawTranscriptEntryClassified(alloc, try std.mem.print(&buf, "older {d}\n", .{index}), .tool_status);
+    }
+    return archived;
+}
+
+test "transcript window: between turns the newest Ctrl+O page reads the cycle it joins, and keeps only what it shows" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
@@ -501,19 +518,113 @@ test "transcript window: Ctrl+O reads the log only while it is open, and forgets
     try rawEntries(alloc, &runtime, &.{"held\n"});
     runtime.transcript_archive_available = true;
 
-    // Closed: preparing the newest page reads nothing from the log.
+    // During a turn, a closed Ctrl+O reads nothing from the log.
+    runtime.transcript_window.?.state.turn_open = true;
     try runtime.prewarmFullTranscriptPage(null, null);
     try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
-    // Opening: it asks for the cycle the page joins.
-    _ = runtime.requestFullTranscriptOpen();
+    // Between turns it asks for the cycle the newest page joins, so the
+    // next Ctrl+O opens without reading the log.
+    runtime.transcript_window.?.state.turn_open = false;
     try runtime.prewarmFullTranscriptPage(null, null);
     try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
 
-    // A compaction makes that cycle two back, so it is let go.
-    try runtime.installTranscriptArchive(alloc, 1, false, try archivedCycle(alloc, 1, &.{"older\n"}), false);
-    try std.testing.expect(runtime.transcript_archive != null);
+    // Read while closed, the cycle keeps only what the newest page shows:
+    // a page of 256 entries, which the held one ends.
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 300), false);
+    try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
+    try std.testing.expectEqual(@as(usize, 255), runtime.transcript_archive.?.runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 45), runtime.transcript_archive.?.trimmed);
+    const newest = try pageTexts(alloc, &runtime, .tail);
+    defer alloc.free(newest);
+    try std.testing.expect(std.mem.startsWith(u8, newest, "older 45\nolder 46\n"));
+    try std.testing.expect(std.mem.endsWith(u8, newest, "older 299\nheld\n"));
+
+    // A page that reaches into what was let go reads the whole cycle again,
+    // whose indexes are the same, and lands on the entry it asked for.
+    _ = runtime.requestFullTranscriptOpen();
+    try std.testing.expectError(error.TranscriptArchiveNotLoaded, runtime.snapshotFullTranscriptPage(.{ .anchor = .{ .entry_index = 44 }, .content_revision = 0, .cols = 80 }, null, null));
+    runtime.moveToFullTranscriptPage(.{ .entry_index = 44 }, .last);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 300), false);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript_archive.?.trimmed);
+    try std.testing.expectEqual(@as(?u32, runtime_mod.archiveEntryIdBase(1) + 44), runtime.full_transcript.bookmark_entry_id);
+    const above = try pageTexts(alloc, &runtime, .{ .entry_index = 44 });
+    defer alloc.free(above);
+    try std.testing.expect(std.mem.startsWith(u8, above, "older 0\n"));
+
+    // Closing trims it again.
+    runtime.closeFullTranscriptState();
+    try std.testing.expectEqual(@as(usize, 45), runtime.transcript_archive.?.trimmed);
+
+    // A compaction makes that cycle two back: it goes, and a read started
+    // before it is stale.
+    const generation = runtime.transcript_archive_generation;
     try runtime.transcriptWindowCompacted(alloc);
     try std.testing.expect(runtime.transcript_archive == null);
+    try std.testing.expect(runtime.transcript_archive_generation != generation);
+}
+
+test "transcript window: when the held entries fill the newest page, the joined cycle keeps none of its entries" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try runtime.enableTranscriptWindow(alloc, true);
+    var buf: [32]u8 = undefined;
+    for (0..full_transcript_page.max_source_entries) |index| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, try std.mem.print(&buf, "held {d}\n", .{index}), .tool_status);
+    }
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 3), false);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript_archive.?.runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), runtime.transcript_archive.?.trimmed);
+    const newest = try pageTexts(alloc, &runtime, .tail);
+    defer alloc.free(newest);
+    try std.testing.expect(std.mem.startsWith(u8, newest, "held 0\n"));
+    try std.testing.expect(std.mem.endsWith(u8, newest, "held 255\n"));
+    // The page above reaches the cycle, which then loads whole.
+    _ = runtime.requestFullTranscriptOpen();
+    runtime.moveToFullTranscriptPage(.{ .entry_index = 2 }, .last);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+}
+
+test "transcript window: a cycle read for a Ctrl+O that closed since stays only when the newest page joins it" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try runtime.enableTranscriptWindow(alloc, true);
+    try rawEntries(alloc, &runtime, &.{"held\n"});
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{"joined\n"}), false);
+    // An older page's cycle that finished reading after the close goes, and
+    // the joined one stays.
+    try runtime.installTranscriptArchive(alloc, 2, false, try archivedCycle(alloc, 2, &.{"oldest\n"}), false);
+    try std.testing.expectEqual(@as(u32, 1), runtime.transcript_archive.?.back);
+    // A failed read for a closed Ctrl+O says nothing, and the newest page
+    // stops asking until the cycle changes.
+    runtime.discardTranscriptArchive();
+    runtime.failTranscriptArchive();
+    try std.testing.expect(!runtime.transcript_archive_failed);
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
+    try runtime.transcriptWindowCompacted(alloc);
+    runtime.transcript_window.?.state.prev_first = null;
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+}
+
+test "transcript window: the cycle Ctrl+O read moves with its transcript when another agent's takes the screen" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try rawEntries(alloc, &runtime, &.{"held\n"});
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{"mine\n"}), false);
+    var hidden: runtime_mod.TranscriptSlot = .{};
+    defer TranscriptRuntime.deinitSlot(&hidden, alloc);
+    runtime.swapSlot(&hidden);
+    try std.testing.expect(runtime.transcript_archive == null);
+    runtime.swapSlot(&hidden);
+    try std.testing.expectEqual(@as(u32, 1), runtime.transcript_archive.?.back);
 }
 
 test "a transcript window drop that runs out of memory leaves the transcript as it was" {
