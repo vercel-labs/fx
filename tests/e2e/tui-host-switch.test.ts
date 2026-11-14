@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { startFakeIssuer, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
@@ -201,10 +202,36 @@ function toolResultText(body: string, id: string): string {
   return found;
 }
 
+// The row of `agent` in main's list of subagents, as the latest user message of
+// a request carries it in a runtime context update; "" when it has none.
+function teamRow(body: string, agent: string): string {
+  const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
+  const carriers = (request.prompt ?? [])
+    .filter((message) => message.role === "user")
+    .map((message) => (typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content) ? message.content.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("") : ""))
+    .filter((text) => text.includes("Runtime context: your subagents"));
+  const latest = carriers.at(-1) ?? "";
+  return latest.split("\n").find((line) => line.startsWith(`- ${agent}:`)) ?? "";
+}
+
+// The gateway's answer to a request that has no credit left to run on.
+function outOfCredits(): Response {
+  return new Response(JSON.stringify({
+    error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." },
+  }), { status: 402, headers: { "content-type": "application/json" } });
+}
+
 // One model step that calls the subagent tool once per message, in order.
-function messageSteps(calls: Array<{ id: string; agent: string; message: string }>): Response {
+function messageSteps(calls: Array<{ id: string; agent: string; message: string; profile?: string }>): Response {
   return fakeGatewaySse([
-    ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: "subagent", input: { request: { action: "message", agent: call.agent, message: call.message } } })),
+    ...calls.map((call) => ({
+      type: "tool-call",
+      toolCallId: call.id,
+      toolName: "subagent",
+      input: { request: { action: "message", agent: call.agent, message: call.message, ...(call.profile ? { profile: call.profile } : {}) } },
+    })),
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
@@ -1716,6 +1743,157 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       expect(waiting).not.toContain("asker: working");
       expect(answered).toContain("asker: idle");
       expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says a subagent waits for the user's answer while the out-of-credits picker is open",
+    async () => {
+      const [waiting, answered] = await mainReadsStatus(
+        outOfCredits(),
+        "payer",
+        "SWITCH_PAY_TASK",
+        async (session) => {
+          await session.waitForPane((pane) => pane.includes("Out of credits. What should fx do?") && pane.includes("I added credits, retry"), 30_000);
+        },
+        async (session) => {
+          await session.sendKeys("1");
+        },
+      );
+      expect(waiting).toContain("payer: waiting for the user's answer");
+      expect(waiting).not.toContain("payer: working");
+      expect(answered).toContain("payer: idle");
+      expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says working for a subagent whose request waits for a sign-in, and main is told only the user can continue it",
+    async () => {
+      const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
+      const waitShows = held();
+      const statuses: string[] = [];
+      let stage = 0;
+      let told = "";
+      try {
+        await withFx(async (body) => {
+          // The subagent's request is refused, and the login cannot be refreshed.
+          if (!isMainRequest(body)) return unauthorized();
+          told ||= userTexts(body).find((message) => message.includes("Only the user can continue it")) ?? "";
+          stage += 1;
+          if (stage === 1) return messageSteps([{ id: "main_sign", agent: "signer", message: "SWITCH_SIGN_TASK" }]);
+          if (stage === 2) {
+            await waitShows.promise;
+            return toolCall("main_status", "subagent", { request: { action: "status" } });
+          }
+          if (stage === 3) statuses.push(toolResultText(body, "main_status"));
+          return text(`main_done_${stage}`, "SWITCH_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForPane((pane) => pane.includes("signer needs you"), 30_000);
+          waitShows.release();
+          await until("main's status", () => statuses.length === 1, 60_000);
+          await until("main being told", () => told !== "", 60_000);
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+        });
+      } finally {
+        issuer.stop();
+      }
+      expect(statuses[0]).toContain("signer: working");
+      expect(statuses[0]).not.toContain("waiting for");
+      expect(told).toContain("waits for the user (Sign-in expired). Only the user can continue it");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's list of subagents says a wait began when the turn started, also once the wait is over, and the next turn's list says working",
+    async () => {
+      let stage = 0;
+      let childCalls = 0;
+      const promptShows = held();
+      const answered = held();
+      const writerResumes = held();
+      const rows: Record<string, string> = {};
+      let statusDuring = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // The helper finishes once the writer's prompt is on screen, and its
+          // report starts main's second turn while the writer still waits.
+          if (body.includes("SWITCH_HELPER_TASK")) {
+            await promptShows.promise;
+            return text("helper_done", "SWITCH_HELPER_DONE");
+          }
+          childCalls += 1;
+          if (childCalls === 1) return toolCall("child_write", "write_file", { path: "switch-row.txt", content: "SWITCH_ROW\n" });
+          // After its approval the writer works until the test lets it end.
+          await writerResumes.promise;
+          return text("writer_done", "SWITCH_WRITER_DONE");
+        }
+        stage += 1;
+        if (stage === 1) {
+          return messageSteps([
+            { id: "main_writer", agent: "writer", message: "SWITCH_WRITE_TASK", profile: "writer" },
+            { id: "main_helper", agent: "helper", message: "SWITCH_HELPER_TASK" },
+          ]);
+        }
+        if (stage === 2) return text("main_started", "SWITCH_MAIN_STARTED");
+        if (stage === 3) {
+          // Main's second turn begins with the writer waiting for its approval.
+          rows.start = teamRow(body, "writer");
+          await answered.promise;
+          return toolCall("main_status", "subagent", { request: { action: "status", agent: "writer" } });
+        }
+        if (stage === 4) {
+          rows.later = teamRow(body, "writer");
+          statusDuring = toolResultText(body, "main_status");
+          return text("main_second_done", "SWITCH_MAIN_SECOND_DONE");
+        }
+        if (stage === 5) {
+          rows.next = teamRow(body, "writer");
+          return text("main_third_done", "SWITCH_MAIN_THIRD_DONE");
+        }
+        return text("main_reported", "SWITCH_MAIN_REPORTED");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("Subagent writer needs permission", 30_000);
+        promptShows.release();
+        // Main's second turn is under way, held on its first request.
+        await until("main's second turn", () => stage === 3, 60_000);
+        // The user answers the approval while that turn runs.
+        await session.sendKeys("1");
+        await until("the writer's next request", () => childCalls === 2, 60_000);
+        answered.release();
+        await until("main's status", () => rows.later !== undefined, 60_000);
+        await session.waitForText("SWITCH_MAIN_SECOND_DONE", 30_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_USER once more");
+        await until("main's third turn", () => rows.next !== undefined, 60_000);
+        writerResumes.release();
+        await until("the writer's report", () => stage >= 6, 60_000);
+      }, (home) => {
+        const folder = join(home, ".fx", "agents", "writer");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "profile.json"), JSON.stringify({
+          description: "Writes one file",
+          tools: ["read_file", "write_file"],
+          permission_mode: "ask",
+        }));
+      });
+      // The wait is in the list of the turn it began in, with when it was true.
+      expect(rows.start).toContain("- writer: waiting for an approval when this turn started.");
+      // The user answered during that turn: the list still says so, and `status` says working.
+      expect(rows.later).toBe(rows.start);
+      expect(statusDuring).toContain("writer: working");
+      expect(statusDuring).not.toContain("waiting for");
+      // The next turn's list is built again, and has no wait in it.
+      expect(rows.next).toContain("- writer: working.");
+      expect(rows.next).not.toContain("waiting for");
     },
     TIMEOUT,
   );
