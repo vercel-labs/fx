@@ -129,6 +129,75 @@ test "empty reply notice names the provider's reason and the next step" {
     );
 }
 
+// Gemini ends a reply with MALFORMED_FUNCTION_CALL when it cannot write a
+// valid function call. The provider answered, so this is the model's output,
+// not a server failure: fx tells the model at once, with tools on, that the
+// call could not be read and did not run. A second malformed reply in the same
+// step asks for smaller calls, and a third ends the turn
+// (`tests/tla/agent_runtime/MalformedToolCall.tla` EveryStallGetsFeedback,
+// FeedbackRightAway, EndsAfterThird).
+const malformed_tool_call_max_feedbacks = 2;
+const malformed_tool_call_asking = "Asking it to try again.";
+
+/// What fx tells the model after its `attempt`-th malformed tool call in a
+/// step. `tool_name` is a registered tool the call named, or null.
+fn malformedToolCallFeedback(arena: Allocator, attempt: usize, tool_name: ?[]const u8) ![]const u8 {
+    const call = if (tool_name) |name| try arena.print(" to {s}", .{name}) else "";
+    if (attempt <= 1) return try arena.print(
+        "Your last tool call{s} could not be read: the provider reported {s}, and fx did not run it. Call the tool again with arguments that are valid JSON and match its schema, or answer in text.",
+        .{ call, types.malformed_function_call_reason },
+    );
+    return try arena.print(
+        "Your tool call{s} could not be read again ({s}), and fx did not run it. Long or deeply nested arguments often cause this: make smaller calls with short arguments, such as writing a large file in several steps, or answer in text.",
+        .{ call, types.malformed_function_call_reason },
+    );
+}
+
+/// What fx shows for a malformed tool call: that it asks the model again, or,
+/// once the feedback is spent, that the turn failed and the next step is the
+/// user's.
+fn malformedToolCallNotice(arena: Allocator, failed: bool) ![]const u8 {
+    if (!failed) return try arena.print(
+        "The model's tool call could not be read (provider reason: {s}). {s}",
+        .{ types.malformed_function_call_reason, malformed_tool_call_asking },
+    );
+    return try arena.print(
+        "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
+        .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
+    );
+}
+
+/// The tool a malformed reply's call named, when it is one fx knows; a name
+/// the provider made up stays out of the feedback.
+fn malformedCallToolName(registry: tool_dispatch.Registry, completion: types.ModelCompletion) ?[]const u8 {
+    for (completion.tool_calls) |call| {
+        if (registry.lookup(call.name) != null) return call.name;
+    }
+    return null;
+}
+
+test "malformed tool call feedback names the tool, then asks for smaller calls" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "Your last tool call to read_file could not be read: the provider reported MALFORMED_FUNCTION_CALL, and fx did not run it. Call the tool again with arguments that are valid JSON and match its schema, or answer in text.",
+        try malformedToolCallFeedback(arena, 1, "read_file"),
+    );
+    try std.testing.expectEqualStrings(
+        "Your tool call could not be read again (MALFORMED_FUNCTION_CALL), and fx did not run it. Long or deeply nested arguments often cause this: make smaller calls with short arguments, such as writing a large file in several steps, or answer in text.",
+        try malformedToolCallFeedback(arena, 2, null),
+    );
+    try std.testing.expectEqualStrings(
+        "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
+        try malformedToolCallNotice(arena, false),
+    );
+    try std.testing.expectEqualStrings(
+        "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL). Continue with a follow-up prompt if needed.",
+        try malformedToolCallNotice(arena, true),
+    );
+}
+
 /// Asks the model to go on after a step with no tool call: the reply's
 /// provider state, when it has any, stays in the turn so the provider can
 /// resume from it, then `prompt` follows as the next user message. A save of
@@ -3919,20 +3988,37 @@ noinline fn effectiveRecoveryToolEvidence(
 /// ended in a provider error never ran them. A completed attempt keeps
 /// `effectiveRecoveryToolEvidence`: its calls run next, and one may start
 /// before fx saves its intent. A call the provider runs itself may have run
-/// either way.
+/// either way, but when each one only reads, as a search does, running it
+/// again is safe (`tests/tla/agent_runtime/MalformedToolCall.tla`
+/// SearchKeepsTools). A stream that threw has no completion.
 fn settledAttemptToolEvidence(
+    registry: tool_dispatch.Registry,
     preserved: resend_strategy.ToolEvidence,
-    completion: types.ModelCompletion,
+    completion: ?types.ModelCompletion,
     disposition: types.ProviderCompletionDisposition,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) resend_strategy.ToolEvidence {
     const evidence = effectiveRecoveryToolEvidence(preserved, completion, stream_ctx);
     if (disposition != .interrupted and disposition != .provider_failure) return evidence;
-    if (evidence != .uncertain or completion.tool_calls.len == 0) return evidence;
-    if (stream_ctx.saw_provider_tool_start or hasProviderExecutedCall(completion.tool_calls)) {
-        return .uncertain;
+    if (evidence != .uncertain) return evidence;
+    const calls: []const types.ToolCall = if (completion) |value| value.tool_calls else &.{};
+    if (!stream_ctx.saw_provider_tool_start and !hasProviderExecutedCall(calls)) {
+        return if (calls.len == 0) evidence else .proven_unexecuted;
     }
-    return .proven_unexecuted;
+    if (stream_ctx.saw_unrepeatable_provider_tool_start) return .uncertain;
+    for (calls) |call| {
+        if (call.provenance != .provider_executed) continue;
+        if (!runtime_tool_presentation.providerToolOnlyReads(registry, call.name)) return .uncertain;
+    }
+    return .repeatable;
+}
+
+/// Whether a resend follows an attempt whose local calls never ran, so their
+/// streamed rows settle as unexecuted once the resend's own reply settles.
+/// A provider-run call's row is left alone either way.
+fn resendFollowsUnexecutedCalls(strategy: ?resend_strategy.Strategy) bool {
+    const selected = strategy orelse return false;
+    return selected == .regenerate_tool or selected == .repeat_read_only_tool;
 }
 
 fn restoredRecoveryToolEvidence(
@@ -4087,6 +4173,7 @@ fn checkpointAction(
         .retry_request => .retrying_request,
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
+        .repeat_read_only_tool => .regenerating_tool,
         .reconcile_tool => .reconciling_tool,
     };
 }
@@ -4098,7 +4185,9 @@ fn checkpointToolState(
         .none => .none,
         .proven_unexecuted => .proven_unexecuted,
         .confirmed => .confirmed,
-        .uncertain => .uncertain,
+        // Saved as uncertain, a value every version reads: a resumed turn
+        // reconciles instead of searching again.
+        .repeatable, .uncertain => .uncertain,
     };
 }
 
@@ -4814,7 +4903,7 @@ fn needsUserFailureKind(
     {
         return .quota;
     }
-    if (isContextOverflowFailure(failure)) return .too_long;
+    if (agent_stream_provider.isContextOverflow(failure)) return .too_long;
     return switch (failure.kind) {
         .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
         // fx tried to refresh the credential once, and the refresh failed:
@@ -4933,25 +5022,6 @@ fn waitForUser(
     return if (try request_recovery.waitForSend() != null) .resend else .cancelled;
 }
 
-fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
-    if (failure.kind == .request_too_large) return true;
-    if (failure.kind != .invalid_request) return false;
-    const detail = failure.detail orelse return false;
-    inline for (.{
-        "context_length_exceeded",
-        "exceeds the context window",
-        "exceeded the context window",
-        "maximum context length",
-        "maximum prompt length",
-        "input is too long",
-        "prompt is too long",
-        "too many input tokens",
-    }) |needle| {
-        if (text_utils.containsIgnoreCase(detail, needle)) return true;
-    }
-    return false;
-}
-
 const ContextOverflowRecoveryState = enum {
     ready,
     pending,
@@ -4969,7 +5039,7 @@ fn shouldRecoverContextOverflow(
         recovery_available and
         has_compactable_context and
         replay_safe and
-        isContextOverflowFailure(failure);
+        agent_stream_provider.isContextOverflow(failure);
 }
 
 test "context overflow recovery is typed safe and bounded" {
@@ -8131,6 +8201,8 @@ fn processQueuedPromptLoop(
         // screen; its resends do not repeat it.
         var auth_reason_shown = false;
         var assistant_prefill_recovery_used = false;
+        // Malformed tool calls this step has answered with feedback.
+        var malformed_tool_call_feedbacks: usize = 0;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var request_size_retries: usize = 0;
@@ -8857,9 +8929,11 @@ fn processQueuedPromptLoop(
                 else
                     recovery_cause;
                 const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
-                const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                const failure_tool_evidence = settledAttemptToolEvidence(
+                    deps.tool_registry,
                     preserved_tool_evidence,
                     null,
+                    .interrupted,
                     &stream_ctx,
                 );
                 const next_strategy: ?resend_strategy.Strategy = if (network_failure) |evidence|
@@ -8971,7 +9045,7 @@ fn processQueuedPromptLoop(
                     preserved_tool_evidence = failure_tool_evidence;
                     recovery_strategy = next_strategy;
                     recovery_cause = failure_cause;
-                    if (recovery_strategy == .regenerate_tool) {
+                    if (resendFollowsUnexecutedCalls(recovery_strategy)) {
                         recovery_has_unexecuted_tool_start = true;
                     }
                     reset_stream_for_next_attempt = true;
@@ -9276,6 +9350,7 @@ fn processQueuedPromptLoop(
                     recovery_cause,
                     recovery_strategy,
                     settledAttemptToolEvidence(
+                        deps.tool_registry,
                         preserved_tool_evidence,
                         response_completion,
                         settled_disposition,
@@ -9614,8 +9689,98 @@ fn processQueuedPromptLoop(
                         retries,
                     );
                 }
+                if (attempt_disposition == .provider_failure and
+                    types.isMalformedToolCallFinish(attempt_completion.finish_reason, attempt_completion.finish_reason_raw) and
+                    !config.cancel_flag.load(.seq_cst))
+                {
+                    if (recovery_strategy == .reconcile_tool) {
+                        // The model wanted a tool while tools were off, so the
+                        // same request would fail the same way
+                        // (`tests/tla/agent_runtime/MalformedToolCall.tla`
+                        // ReconcileMalformedStops).
+                        debug_trace.eventf("agent", "malformed_tool_call_rejected", step_ctx, "tool_choice=none", .{});
+                        try persistRecoveryCheckpoint(
+                            deps,
+                            finalization,
+                            job,
+                            within_turn_suffix.items,
+                            stream_ctx.interruption_source_or(""),
+                            gateway_model,
+                            selected_fast_mode,
+                            attempt_fast_mode,
+                            request_recovery.attempt(),
+                            false,
+                            recovery_cause,
+                            .reconcile_tool,
+                            .uncertain,
+                            step_ctx,
+                            .keep,
+                        );
+                        try finishUncertainToolReview(
+                            deps,
+                            &request_recovery,
+                            finalization,
+                            &stream_ctx,
+                            arena,
+                            &finish_trace,
+                            types.ModelFailureDiagnostic.init("MalformedToolCallDuringReconciliation"),
+                        );
+                        return;
+                    }
+                    const malformed_evidence = settledAttemptToolEvidence(
+                        deps.tool_registry,
+                        preserved_tool_evidence,
+                        attempt_completion,
+                        attempt_disposition,
+                        &stream_ctx,
+                    );
+                    // A provider tool that does more than read may have run:
+                    // the resend below reconciles it with tools off.
+                    if (malformed_evidence != .uncertain) {
+                        malformed_tool_call_feedbacks += 1;
+                        const feedback = malformed_tool_call_feedbacks <= malformed_tool_call_max_feedbacks;
+                        const tool_name = malformedCallToolName(deps.tool_registry, attempt_completion);
+                        debug_trace.eventf("agent", if (feedback) "malformed_tool_call_feedback" else "malformed_tool_call_failed", step_ctx, "count={d} tool={s} tool_call_count={d}", .{
+                            malformed_tool_call_feedbacks,
+                            tool_name orelse "",
+                            attempt_completion.tool_calls.len,
+                        });
+                        // The streamed rows settle as calls that never ran.
+                        if (stream_ctx.saw_tool_start) recovery_has_unexecuted_tool_start = true;
+                        if (!feedback) {
+                            try finishFailedTurnWithNotice(
+                                deps,
+                                finalization,
+                                arena,
+                                job,
+                                within_turn_suffix.items,
+                                &summary_accumulator,
+                                stop_state,
+                                &finish_trace,
+                                try malformedToolCallNotice(arena, true),
+                                "malformed_tool_call",
+                            );
+                            return;
+                        }
+                        try deps.push_text(deps.ctx, .{ .operational = try malformedToolCallNotice(arena, false) });
+                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                        // The feedback stays in the turn, so a later request
+                        // in it still explains the earlier stall.
+                        try within_turn_suffix.append(arena, .{
+                            .role = .user,
+                            .content = try malformedToolCallFeedback(arena, malformed_tool_call_feedbacks, tool_name),
+                            .recovery_prompt = true,
+                        });
+                        preserved_tool_evidence = malformed_evidence;
+                        recovery_strategy = null;
+                        recovery_cause = cause;
+                        reset_stream_for_next_attempt = true;
+                        continue;
+                    }
+                }
                 if (retries) {
                     const failure_tool_evidence = settledAttemptToolEvidence(
+                        deps.tool_registry,
                         preserved_tool_evidence,
                         attempt_completion,
                         attempt_disposition,
@@ -9626,7 +9791,7 @@ fn processQueuedPromptLoop(
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
-                        if (recovery_strategy == .regenerate_tool) {
+                        if (resendFollowsUnexecutedCalls(recovery_strategy)) {
                             recovery_has_unexecuted_tool_start = true;
                         }
                         reset_stream_for_next_attempt = true;
