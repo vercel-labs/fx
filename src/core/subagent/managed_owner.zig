@@ -362,6 +362,28 @@ pub const Owner = struct {
         }
     }
 
+    /// A child whose running turn waits for the user, and what for.
+    pub const UserWaiting = struct {
+        child_id: []const u8,
+        wait: worker_runtime.WorkerRuntime.UserWait,
+    };
+
+    /// The children whose running turns wait for the user now, in `alloc`,
+    /// which should be an arena. It reads each worker's wait with no worker
+    /// lock but takes the owner's, so call it with no state-store lock held:
+    /// an approval commit takes the owner's lock first (`submitWorkerApproval`).
+    pub fn userWaits(self: *Owner, alloc: Allocator) Allocator.Error![]const UserWaiting {
+        var waits: std.ArrayList(UserWaiting) = .empty;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            const worker = slot.worker orelse continue;
+            const waiting_for = worker.userWait() orelse continue;
+            try waits.append(alloc, .{ .child_id = try alloc.dupe(u8, slot.child_id), .wait = waiting_for });
+        }
+        return waits.items;
+    }
+
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
         // A single-threaded build, such as the WebAssembly terminal, has no
         // slot threads, and its subagent tool is off, so no child is started.
