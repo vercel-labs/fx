@@ -20,6 +20,7 @@ const session_list_text = @import("session_list_text.zig");
 const usage = @import("../../usage/usage.zig");
 const local_time = @import("../shared/local_time.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const display_width = @import("../shared/display_width.zig");
 const types = @import("../shared/types.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -2107,6 +2108,10 @@ pub const DoctorSnapshot = struct {
         /// Colors the status marks, headings, and fixes; for a terminal
         /// that allows color.
         color: bool = false,
+        /// The terminal's width. A long value, detail, or fix then wraps
+        /// at a space and goes on under its own column, so the columns
+        /// stay whole. Null, as for a pipe, writes each on one line.
+        columns: ?usize = null,
     };
 
     /// The report a person reads: what doctor ran with, then each check
@@ -2129,7 +2134,7 @@ pub const DoctorSnapshot = struct {
         }
         try w.writeAll("\n\n");
 
-        try writeDoctorField(w, alloc, "Workspace", self.workspace_root);
+        try writeDoctorField(w, alloc, "Workspace", self.workspace_root, style.columns);
         try writeDoctorFieldLabel(w, "Model");
         try writeTerminalSafe(w, alloc, self.model);
         if (self.provider != .gateway) {
@@ -2145,7 +2150,7 @@ pub const DoctorSnapshot = struct {
         }
         if (self.auth.expired) try w.writeAll(" \u{00b7} expired");
         try w.writeByte('\n');
-        try writeDoctorField(w, alloc, "Permissions", permissions.permissionModeDisplayLabel(self.permission_mode));
+        try writeDoctorField(w, alloc, "Permissions", permissions.permissionModeDisplayLabel(self.permission_mode), style.columns);
         try writeDoctorFieldLabel(w, "Step limit");
         if (self.agent_step_limit == 0) try w.writeAll("none\n") else try w.print("{d}\n", .{self.agent_step_limit});
         if (self.mcp) |mcp| {
@@ -2186,7 +2191,7 @@ pub const DoctorSnapshot = struct {
                 try writeTerminalSafe(w, alloc, entry.name);
                 try paint.end(w);
                 try w.splatByteAll(' ', @max(1, doctor_name_width -| entry.name.len));
-                try writeTerminalSafe(w, alloc, entry.detail);
+                try writeDoctorWrapped(w, alloc, entry.detail, doctor_detail_column, style.columns);
                 try w.writeByte('\n');
                 if (entry.fix) |fix| {
                     try w.splatByteAll(' ', doctor_detail_column);
@@ -2194,7 +2199,7 @@ pub const DoctorSnapshot = struct {
                     try w.writeAll("fix:");
                     try paint.end(w);
                     try w.writeByte(' ');
-                    try writeTerminalSafe(w, alloc, fix);
+                    try writeDoctorWrapped(w, alloc, fix, doctor_fix_column, style.columns);
                     try w.writeByte('\n');
                 }
             }
@@ -2670,6 +2675,60 @@ const doctor_field_width = 13;
 const doctor_name_width = 11;
 /// Where a check's detail starts: two spaces, the mark, a space, the name.
 const doctor_detail_column = 4 + doctor_name_width;
+/// Where a fix's text starts, after `fix: ` under the detail.
+const doctor_fix_column = doctor_detail_column + "fix: ".len;
+/// Below this many columns for the text, wrapping would leave too little on
+/// each line, so the text is written whole and the terminal wraps it.
+const doctor_min_wrap_width = 20;
+
+/// Writes `raw` made terminal-safe, starting at column `indent`. With a
+/// known `columns`, it breaks at spaces before the edge and starts each next
+/// line at `indent`; a word wider than a whole line is broken where the edge
+/// falls.
+fn writeDoctorWrapped(w: *std.Io.Writer, alloc: Allocator, raw: []const u8, indent: usize, columns: ?usize) !void {
+    const width = columns orelse return writeTerminalSafe(w, alloc, raw);
+    if (width < indent + doctor_min_wrap_width) return writeTerminalSafe(w, alloc, raw);
+    var encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+    defer encoded.deinit(alloc);
+    var col = indent;
+    var first = true;
+    var words = std.mem.splitScalar(u8, encoded.bytes, ' ');
+    while (words.next()) |word| {
+        if (word.len == 0) continue;
+        const word_width = display_width.visibleWidth(word);
+        if (!first) {
+            if (col + 1 + word_width > width) {
+                try w.writeByte('\n');
+                try w.splatByteAll(' ', indent);
+                col = indent;
+            } else {
+                try w.writeByte(' ');
+                col += 1;
+            }
+        }
+        first = false;
+        if (col + word_width <= width) {
+            try w.writeAll(word);
+            col += word_width;
+            continue;
+        }
+        // Wider than what is left of a whole line: break it at the edge.
+        var rest = word;
+        while (rest.len > 0) {
+            const len = std.unicode.utf8ByteSequenceLength(rest[0]) catch 1;
+            const unit = rest[0..@min(len, rest.len)];
+            const unit_width = display_width.visibleWidth(unit);
+            if (col + unit_width > width and col > indent) {
+                try w.writeByte('\n');
+                try w.splatByteAll(' ', indent);
+                col = indent;
+            }
+            try w.writeAll(unit);
+            col += unit_width;
+            rest = rest[unit.len..];
+        }
+    }
+}
 
 fn writeDoctorFieldLabel(w: *std.Io.Writer, label: []const u8) !void {
     try w.writeAll("  ");
@@ -2677,9 +2736,9 @@ fn writeDoctorFieldLabel(w: *std.Io.Writer, label: []const u8) !void {
     try w.splatByteAll(' ', doctor_field_width -| label.len);
 }
 
-fn writeDoctorField(w: *std.Io.Writer, alloc: Allocator, label: []const u8, value: []const u8) !void {
+fn writeDoctorField(w: *std.Io.Writer, alloc: Allocator, label: []const u8, value: []const u8, columns: ?usize) !void {
     try writeDoctorFieldLabel(w, label);
-    try writeTerminalSafe(w, alloc, value);
+    try writeDoctorWrapped(w, alloc, value, 2 + doctor_field_width, columns);
     try w.writeByte('\n');
 }
 
@@ -3918,6 +3977,42 @@ test "core doctor snapshot text and json stay stable" {
         "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"version\":\"0.0.16\",\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\",\"fix\":\"install gh from https://cli.github.com\"}]}",
         json,
     );
+}
+
+test "doctor text wraps long values, details, and fixes under their own columns on a narrow terminal" {
+    const checks = [_]doctor_runtime.Check{.{
+        .name = "install",
+        .status = .warn,
+        .detail = "another fx at /usr/local/bin/fx is on PATH; a shell may run it instead",
+        .fix = "remove the copy you do not use, so one fx is on PATH",
+    }};
+    const snapshot = DoctorSnapshot{
+        .workspace_root = "/Users/example/Developer/a-very-long-folder-name-for-wrapping",
+        .model = "alpha",
+        .permission_mode = .ask,
+        .agent_step_limit = 0,
+        .checks = &checks,
+    };
+    const text = try snapshot.renderTextStyled(std.testing.allocator, .{ .columns = 50 });
+    defer std.testing.allocator.free(text);
+    // The path has no space, so it breaks at the edge.
+    const workspace =
+        "  Workspace    /Users/example/Developer/a-very-lon\n" ++
+        "               g-folder-name-for-wrapping\n";
+    const check =
+        "  ! install    another fx at /usr/local/bin/fx is\n" ++
+        "               on PATH; a shell may run it instead\n" ++
+        "               fix: remove the copy you do not\n" ++
+        "                    use, so one fx is on PATH\n";
+    try std.testing.expect(std.mem.find(u8, text, workspace) != null);
+    try std.testing.expect(std.mem.find(u8, text, check) != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try std.testing.expect(display_width.visibleWidth(line) <= 50);
+
+    // Without a width, as for a pipe, each stays on one line.
+    const piped = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(piped);
+    try std.testing.expect(std.mem.find(u8, piped, "  ! install    another fx at /usr/local/bin/fx is on PATH; a shell may run it instead\n") != null);
 }
 
 test "doctor text escapes hostile check details while json preserves data" {

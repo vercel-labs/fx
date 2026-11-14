@@ -313,6 +313,30 @@ describe("fx doctor exit code and output", () => {
     expect(result.code).toBe(0);
   }, TIMEOUT);
 
+  test.skipIf(!tmuxAvailable())("on a narrow terminal, a long line wraps under its own column and the groups stay whole", async () => {
+    const r = makeRoot();
+    // Another fx on PATH gives a long install warning and fix.
+    writeScript(join(r.bin, "fx"), "exit 0");
+    const cmd = `/bin/sh -c ${JSON.stringify(`${JSON.stringify(FX_BIN)} doctor; echo DOCTOR-ENDED`)}`;
+    const session = await TmuxSession.create({ cmd, cwd: r.workspace, env: env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }), remainOnExit: true, width: 60 });
+    try {
+      await session.waitForText("DOCTOR-ENDED", 15_000);
+      const screen = await session.captureFullScrollback();
+      const report = screen.slice(screen.indexOf("fx doctor"), screen.indexOf("DOCTOR-ENDED")).trimEnd().split("\n").map((line) => line.trimEnd());
+      // Every line is a heading, a blank line, an indented line, or the
+      // totals; none goes on at the left edge.
+      const loose = report.filter((line) => line !== "" && !/^ {2}/.test(line) && !/^(fx doctor|[A-Z][a-z]+( [a-z]+)*$|\d+ ok )/.test(line));
+      expect(loose).toEqual([]);
+      const warning = report.findIndex((line) => line.startsWith("  ! install    another fx at"));
+      expect(warning).toBeGreaterThan(-1);
+      expect(report[warning + 1]).toMatch(/^ {15}\S/);
+      expect(report.some((line) => line.startsWith(`${FIX}remove the copy`))).toBe(true);
+      expect(report.some((line) => /^ {20}\S/.test(line))).toBe(true);
+    } finally {
+      await session.kill();
+    }
+  }, TIMEOUT);
+
   test("--help names --fix and --deep, and a bad flag still exits 2, named as the flag that is wrong", async () => {
     const r = makeRoot();
     const help = await doctor(r, env(r), ["--help"]);

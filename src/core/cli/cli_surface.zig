@@ -4744,8 +4744,11 @@ const DoctorProgress = struct {
 
 fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
     if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
-    const color = !builtin.is_test and !terminal_env.colorDisabled() and terminal_env.stdoutIsTerminal();
-    const text = try snapshot.renderTextStyled(alloc, .{ .color = color });
+    const terminal = !builtin.is_test and terminal_env.stdoutIsTerminal();
+    const text = try snapshot.renderTextStyled(alloc, .{
+        .color = terminal and !terminal_env.colorDisabled(),
+        .columns = if (terminal) terminal_env.stdoutColumns() else null,
+    });
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
 }
