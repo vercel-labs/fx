@@ -2960,10 +2960,7 @@ fn shell_action_for_call(arena: Allocator, call: ToolCall) ?ShellAction {
         .object => |object| object,
         else => return null,
     };
-    const request = if (root.get("request")) |value| switch (value) {
-        .object => |object| object,
-        else => return null,
-    } else root;
+    const request = (tool_args.unwrapRequest(arena, root) catch return null) orelse return null;
     const action = switch (request.get("action") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -8165,6 +8162,7 @@ test "shell diagnostic action projection accepts only current actions" {
         .{ .arguments_json = "{\"action\":\"run\"}", .expected = .run },
         .{ .arguments_json = "{\"action\":\"interact\"}", .expected = .interact },
         .{ .arguments_json = "{\"request\":{\"action\":\"stop\"}}", .expected = .stop },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"interact\\\"}\"}", .expected = .interact },
     };
     for (cases) |case| {
         try std.testing.expectEqual(

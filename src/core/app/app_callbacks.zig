@@ -1037,6 +1037,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 
@@ -1054,6 +1055,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_output = model_output,
                 .outcome = .tool_failed,
                 .started_at_ms = io_mod.milliTimestamp(),
+                .call_id = call.id,
             });
         }
 

@@ -51,6 +51,7 @@ const runtime_config = @import("config.zig");
 const cache_warming = @import("cache_warming.zig");
 const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
+const credential_renewal = @import("credential_renewal.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const runtime_context_state = @import("runtime_context.zig");
@@ -456,7 +457,8 @@ fn normalize_terminal_model_input(
 }
 
 /// Returns the top-level arguments of an exact {"request":{...}}
-/// read_tool_result call, or null to replay the call as it was sent.
+/// read_tool_result call, its wrapper an object or JSON text of one, or null
+/// to replay the call as it was sent.
 fn projected_read_tool_result_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -472,12 +474,12 @@ fn projected_read_tool_result_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.get("request") orelse return null;
-    if (request != .object) return null;
+    if (parsed.value.object.get("request") == null) return null;
+    const request = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request, .{}, &out.writer) catch
+    std.json.Stringify.value(std.json.Value{ .object = request }, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -1329,7 +1331,8 @@ fn project_read_tool_result_request_messages(
 }
 
 /// Returns the arguments a shell call is stored and admitted with: an exact
-/// {"request":{...}} unwrapped, and a missing action filled in when
+/// {"request":{...}} unwrapped, its wrapper an object or JSON text of one,
+/// and a missing action filled in when
 /// `infer_action` names exactly one. Null keeps the call as it was sent.
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
@@ -1345,13 +1348,10 @@ fn normalized_terminal_request_arguments(
     const arena = parsed.arena.allocator();
     var args = parsed.value;
     var changed = false;
-    if (args.object.count() == 1) {
-        if (args.object.get("request")) |request| {
-            if (request != .object) return null;
-            args = request;
-            _ = try normalize_terminal_model_input(arena, &args.object);
-            changed = true;
-        }
+    if (args.object.count() == 1 and args.object.get("request") != null) {
+        args = .{ .object = (try tool_args.unwrapRequest(arena, args.object)) orelse return null };
+        _ = try normalize_terminal_model_input(arena, &args.object);
+        changed = true;
     }
     if (infer_action) |infer| {
         if (infer(args.object)) |action| {
@@ -1682,7 +1682,8 @@ test "wrapped read_tool_result history replays with top-level arguments" {
         .{ .id = "flat", .name = "read_tool_result", .arguments_json = "{\"handle\":\"flat.bin\",\"start_byte\":1,\"byte_count\":160}" },
         .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
         .{ .id = "beside", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"a.bin\"},\"query\":\"b\"}" },
-        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"{}\"}" },
+        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"[1]\"}" },
+        .{ .id = "text", .name = "read_tool_result", .arguments_json = "{\"request\":\"{\\\"handle\\\":\\\"text.bin\\\",\\\"query\\\":\\\"needle\\\"}\"}" },
     };
     const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
 
@@ -1697,9 +1698,13 @@ test "wrapped read_tool_result history replays with top-level arguments" {
         "{\"handle\":\"new.bin\",\"query\":\"needle\"}",
         projected[0].tool_calls[1].arguments_json,
     );
-    // Only an exact wrapper around an object is unwrapped.
+    // Only an exact wrapper around an object, or JSON text of one, is unwrapped.
     try std.testing.expectEqual(calls[2].arguments_json.ptr, projected[0].tool_calls[2].arguments_json.ptr);
     try std.testing.expectEqual(calls[3].arguments_json.ptr, projected[0].tool_calls[3].arguments_json.ptr);
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"text.bin\",\"query\":\"needle\"}",
+        projected[0].tool_calls[4].arguments_json,
+    );
     try std.testing.expectEqualStrings(
         "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}",
         messages[0].tool_calls[1].arguments_json,
@@ -2169,6 +2174,93 @@ test "terminal request projection cleans every partial allocation failure" {
         check_terminal_request_projection_allocation_failures,
         .{},
     );
+}
+
+const max_fuzz_request_text_bytes: usize = 16 * 1024;
+
+fn fuzzRequestWrapperText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_request_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before request is read.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+    const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
+    const wrapped = try tool_args.unwrapRequest(arena, args);
+    const expected = if (wrapped) |object|
+        try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = object }, .{})
+    else
+        null;
+
+    // History replays read_tool_result with the arguments the wrapper holds,
+    // exactly when tool_args reads some.
+    const replayed = try projected_read_tool_result_arguments(alloc, args_json);
+    defer if (replayed) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, replayed == null);
+    if (expected) |json| try std.testing.expectEqualStrings(json, replayed.?);
+
+    // Shell intake unwraps the same wrappers.
+    const shell = try normalized_terminal_request_arguments(alloc, args_json, null);
+    defer if (shell) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, shell == null);
+}
+
+test "request wrappers sent as JSON text unwrap as tool_args reads them" {
+    try std.testing.fuzz({}, fuzzRequestWrapperText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"action\":\"run\",\"command\":\"printf ok\"}",
+            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}",
+            "{\"handle\":\"h.txt\",\"query\":\"needle\"}",
+            "{}",
+            "[1]",
+            "\"{\\\"action\\\":\\\"run\\\"}\"",
+            "{",
+        }) ++ @import("fuzz_corpus").request_wrapper_text.*),
+    });
+}
+
+test "terminal request normalization reads a wrapper written as JSON text" {
+    const alloc = std.testing.allocator;
+    const run = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"printf ok\\\"}\"}",
+        null,
+    )).?;
+    defer alloc.free(run);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", run);
+    // The write input is read from a text wrapper as from an object.
+    const write = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":\"{\\\"action\\\":\\\"write\\\",\\\"session_id\\\":\\\"terminal-a\\\",\\\"input\\\":{\\\"keys\\\":[\\\"enter\\\"]}}\"}",
+        null,
+    )).?;
+    defer alloc.free(write);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
+        write,
+    );
+
+    // Anything else is kept as it was sent: text of another kind, an object
+    // encoded twice, text nested deeper than tool input may be, and a wrapper
+    // beside other fields.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "{\"action\":\"run\",\"command\":\"true\"}", .{});
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |text| {
+        const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+        try std.testing.expect(try normalized_terminal_request_arguments(alloc, args_json, null) == null);
+    }
+    const beside = try std.json.Stringify.valueAlloc(arena, .{
+        .request = "{\"action\":\"run\",\"command\":\"true\"}",
+        .yield_time_ms = 1000,
+    }, .{});
+    try std.testing.expect(try normalized_terminal_request_arguments(alloc, beside, null) == null);
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {
@@ -5422,9 +5514,6 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
-/// The job's credential from the host in `mode`, owned by the caller. Null
-/// when its source is not refreshable, the host holds none, or the host
-/// refused it, such as a stored sign-in for another account or team.
 fn loadJobCredential(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
@@ -5433,20 +5522,11 @@ fn loadJobCredential(
     rejected_token: ?[]const u8,
     trace_ctx: TraceContext,
 ) !?RefreshedGatewayCredential {
-    const source = job.credential_source orelse return null;
-    if (!credentials.sourceRefreshable(source)) return null;
-    const refresh = deps.refresh_gateway_credential orelse return null;
-    return refresh(deps.ctx, alloc, source, mode, job.account_id, rejected_token) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        debug_trace.eventf(
-            "gateway",
-            "credential_refresh_failed",
-            trace_ctx,
-            "source={s} mode={s} err={s}",
-            .{ @tagName(source), @tagName(mode), @errorName(err) },
-        );
-        return null;
-    };
+    return credential_renewal.load(deps, alloc, jobSignIn(job), mode, rejected_token, trace_ctx);
+}
+
+fn jobSignIn(job: QueuedPrompt) credential_renewal.SignIn {
+    return .{ .source = job.credential_source, .account_id = job.account_id };
 }
 
 /// Takes `credential` for the job, which owns it from here on. When the host
@@ -5493,15 +5573,8 @@ fn adoptJobCredential(
     );
 }
 
-/// Renews the credential the provider rejected with 401 for one replay: the
-/// stored credential when another fx process already replaced the rejected
-/// token, and a forced refresh only when the store still holds it, because
-/// every forced refresh rotates the sign-in all fx processes share
-/// (`tests/e2e/auth-refresh.test.ts` "fx ask replays a rejected request with
-/// the login another fx already renewed, without refreshing"). When the store
-/// holds nothing this job can send, such as another team's sign-in, nothing is
-/// refreshed (`tests/e2e/auth-refresh.test.ts` "fx ask does not refresh the
-/// login another fx signed in to another team when its request is rejected").
+/// Renews the credential the provider rejected with 401 for one replay
+/// (`credential_renewal.renewRejected`).
 fn renewRejectedCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
@@ -5516,16 +5589,15 @@ fn renewRejectedCredentialForJob(
     // comparison.
     const rejected = try alloc.dupe(u8, active_api_key.*);
     defer secret.zeroAndFree(alloc, rejected);
-    const stored = (try loadJobCredential(deps, alloc, job.*, .reload, null, trace_ctx)) orelse {
-        debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
-        return false;
+    const renewal = try credential_renewal.renewRejected(deps, alloc, jobSignIn(job.*), rejected, trace_ctx);
+    // Adopt the stored one even when it is the rejected token: the job then
+    // owns the bytes it holds if the forced refresh gives nothing.
+    if (renewal.stored) |stored| adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx) catch |err| {
+        if (renewal.forced) |forced| credential_renewal.free(alloc, forced);
+        return err;
     };
-    const renewed = !std.mem.eql(u8, stored.token, rejected);
-    // Adopt it even when it is the rejected token: the job then owns the bytes
-    // it holds if the forced refresh gives nothing.
-    try adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx);
-    if (renewed) return true;
-    return refreshGatewayCredentialForJob(deps, alloc, job, job_arena, .force, rejected, active_api_key, owned_api_key, trace_ctx);
+    if (renewal.forced) |forced| try adoptJobCredential(alloc, job, job_arena, .force, forced, active_api_key, owned_api_key, trace_ctx);
+    return renewal.resend;
 }
 
 const ProviderAdmission = struct {
@@ -5757,6 +5829,24 @@ fn traceRouteFailure(
     );
 }
 
+/// How a turn ended: from the error it returned, else from what its
+/// finalization recorded.
+fn observedTurnOutcome(observed_error: ?anyerror, finalized: ?types.TurnPresentationOutcome) observation.TurnOutcome {
+    if (observed_error) |err| return switch (err) {
+        error.TurnYielded => .yielded,
+        error.Cancelled => .cancelled,
+        error.SessionWriterChanged, error.SessionWriterParked => .fenced,
+        else => .failed,
+    };
+    const outcome = finalized orelse return .failed;
+    return switch (outcome) {
+        .completed => .completed,
+        .interrupted => .interrupted,
+        .failed => .failed,
+        .paused => .paused,
+    };
+}
+
 pub fn processAgentPrompt(
     agent: *runtime_agent.Agent,
     deps: *const AgentRuntimeDeps,
@@ -5791,20 +5881,22 @@ pub fn processAgentPrompt(
 
     var observed_error: ?anyerror = null;
     if (deps.observer) |observer| observer.beginTurn(job.prompt, job.recovery_checkpoint != null);
-    defer if (deps.observer) |observer| {
-        const outcome: observation.TurnOutcome = if (observed_error) |err| switch (err) {
-            error.TurnYielded => .yielded,
-            error.Cancelled => .cancelled,
-            error.SessionWriterChanged, error.SessionWriterParked => .fenced,
-            else => .failed,
-        } else if (finalization.outcome) |outcome| switch (outcome) {
-            .completed => .completed,
-            .interrupted => .interrupted,
-            .failed => .failed,
-            .paused => .paused,
-        } else .failed;
-        observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
-    };
+    // A subagent's turn is recorded for `/trace`, which says which subagent
+    // each `subagent_id` in its tool and network records belongs to.
+    const traced_subagent_id: u64 = if (effective_config.origin == .subagent) effective_config.subagent_id else 0;
+    if (traced_subagent_id != 0) diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = traced_subagent_id,
+        .session_id = effective_lifecycle.scope.session_id orelse "",
+        .model = effective_job.model,
+        .effort = effective_config.effort.label(),
+        .prompt = effective_job.prompt,
+        .started_at_ms = io_mod.milliTimestamp(),
+    });
+    defer {
+        const outcome = observedTurnOutcome(observed_error, finalization.outcome);
+        if (deps.observer) |observer| observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
+        if (traced_subagent_id != 0) diagnostics.recordSubagentTurnEnd(traced_subagent_id, @tagName(outcome));
+    }
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         observed_error = err;
@@ -8499,9 +8591,11 @@ fn processQueuedPromptLoop(
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
+                        .renewal_deps = deps,
                     };
+                    defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
-                    const compacted = compactContext(arena, deps, .{
+                    const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
                         .before_summary = source.hook(),
@@ -8515,7 +8609,22 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
-                    }) catch |err| {
+                    });
+                    // A summary request the provider rejected with 401 renewed
+                    // the sign-in; the rest of the turn sends the renewed one.
+                    // Taken first: renewing can free the credential the turn
+                    // borrowed, such as ACP's.
+                    if (summary_model.takeRenewed()) |renewed| try adoptJobCredential(
+                        std.heap.c_allocator,
+                        &job,
+                        arena,
+                        renewed.mode,
+                        renewed.credential,
+                        &active_api_key,
+                        &owned_refreshed_api_key,
+                        step_ctx,
+                    );
+                    const compacted = compaction_result catch |err| {
                         if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(
@@ -10218,9 +10327,13 @@ fn processQueuedPromptLoop(
                         arena,
                         context,
                     );
+                    // The reply stays in the turn, and the hook's message
+                    // follows it as fx's own: the saved turn keeps it
+                    // (`recovery_prompt`) where the request carried it.
                     try within_turn_suffix.append(arena, .{
                         .role = .user,
                         .content = synthetic,
+                        .recovery_prompt = true,
                     });
                     continue;
                 },
@@ -12664,11 +12777,12 @@ fn processQueuedPromptLoop(
                 result_commit_pending = false;
             }
             replay_handed_off = true;
+            // The notice joins the turn when the step's results are in, as
+            // steering the saved turn restores there, and the step's notes
+            // join before it at the next step (`insertBoundaryNotes`), so the
+            // saved turn matches the request.
             if (execution.system_notice) |notice| {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = notice,
-                });
+                try runtime_tool_batch.appendToolNotice(arena, &step_batch, notice);
             }
             if (execution.interactive_notice) |notice| {
                 if (deps.push_interactive_notice) |push_notice| {
@@ -12927,9 +13041,13 @@ fn processQueuedPromptLoop(
                         arena,
                         context,
                     );
+                    // The reply stays in the turn, and the hook's message
+                    // follows it as fx's own: the saved turn keeps it
+                    // (`recovery_prompt`) where the request carried it.
                     try within_turn_suffix.append(arena, .{
                         .role = .user,
                         .content = synthetic,
+                        .recovery_prompt = true,
                     });
                     continue;
                 },

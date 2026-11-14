@@ -1616,7 +1616,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared watcher and stop it.");
       const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(live).toContain("Ran cat <<'EOF' launch marker line EOF sleep 300");
+      expect(live).toContain("Still running cat <<'EOF' launch marker line EOF sleep 300");
       expect(live).toContain("Observed cat <<'EOF'");
       expect(live).not.toContain("Observed shell-1");
 
@@ -1635,7 +1635,7 @@ test.skipIf(!tmuxAvailable())(
         height: 30,
       });
       const resumed = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(resumed).toContain("Ran cat <<'EOF' launch marker line EOF sleep 300");
+      expect(resumed).toContain("Still running cat <<'EOF' launch marker line EOF sleep 300");
       expect(resumed).toContain("Observed cat <<'EOF'");
       expect(resumed).toContain("Stopped cat <<'EOF'");
       expect(resumed).not.toContain("Observed shell-1");
@@ -8979,7 +8979,7 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     const scrollback = await waitForScrollback(active, "RECLIP_MOVED_REPLY");
     // The replayed row abbreviates against the live workspace and reclips to
     // the live width instead of keeping the frozen compact-bound marker.
-    const row = scrollback.split("\n").find((line) => line.includes("Ran cd ./alpha"));
+    const row = scrollback.split("\n").find((line) => line.includes("Still running cd ./alpha"));
     expect(row).toBeDefined();
     expect(row!).toContain(tail);
     expect(row!).not.toContain("...");

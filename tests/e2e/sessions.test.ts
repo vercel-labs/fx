@@ -5344,9 +5344,12 @@ const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost,
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  // The app's pattern leaves out the terminal recording's line, which names
+  // the same fault: a recording that started on the full disk is a leak from
+  // the environment, not the session's refusal this row checks.
   full: REAL_FULL_DISK
-    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
-    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|(?<!terminal recording: )the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|(?<!terminal recording: )a file-size limit was reached/, acp: /a file-size limit was reached/ },
 };
 
 /// A first reply over the blob limit, so every base session has a blob.

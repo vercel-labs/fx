@@ -43,7 +43,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var parsed = decoder.parse(args_json) catch |err| return .{ .failure = try decoder.takeFailure(err) };
     defer parsed.deinit();
     // The row reads the request the same way (read_tool_result_presentation.zig).
-    const args = (try read_result_presentation.requestObject(parsed.arena.allocator(), parsed.value.object)) orelse {
+    const args = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
     };
     if (args.get("search")) |value| {
@@ -412,7 +412,7 @@ fn fuzzRequestText(_: void, smith: *std.testing.Smith) !void {
 
     const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
     const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
-    const request = try read_result_presentation.requestObject(arena, args);
+    const request = try tool_args.unwrapRequest(arena, args);
 
     // decode refuses the request exactly when the row finds no object in it.
     switch (try decode(.{ .allocator = alloc }, args_json)) {

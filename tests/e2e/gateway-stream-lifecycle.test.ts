@@ -7901,6 +7901,96 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 100_000);
 
+  test("a shell request wrapper the model wrote as JSON text runs its command", async () => {
+    const root = createFixtureRoot("shell-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const marker = join(root.workspace, "request-text-marker.txt");
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("text_request", "shell", {
+            request: JSON.stringify({
+              action: "run",
+              command: "printf REQUEST_TEXT_OK > request-text-marker.txt && cat request-text-marker.txt",
+              profile: "clean",
+              yield_time_ms: 30000,
+            }),
+          });
+        case 1:
+          expect(shellResult(body, "text_request")).toMatchObject({
+            state: "completed", exit_code: 0, output_delta: "REQUEST_TEXT_OK",
+          });
+          return fakeGatewayFinalText("REQUEST_TEXT_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Run the fixture command."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("REQUEST_TEXT_COMPLETE");
+      expect(readFileSync(marker, "utf8")).toBe("REQUEST_TEXT_OK");
+      expect(gateway.requests).toHaveLength(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a shell request wrapper as JSON text with extra fields or nested too deep gets the correction", async () => {
+    const root = createFixtureRoot("shell-request-text-correction");
+    const tracePath = join(root.root, "trace.log");
+    const command = "printf NOT_RUN > request-text-correction.txt";
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("text_with_extra", "shell", {
+            request: JSON.stringify({ action: "run", command, profile: "clean" }),
+            yield_time_ms: 1000,
+          });
+        case 1: {
+          const correction = JSON.parse(toolResultOutput(body, "text_with_extra")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.problems).toContain("Put the action fields at the top level; shell takes no request wrapper.");
+          expect(correction.retry_with).toEqual({ action: "run", command, profile: "clean", yield_time_ms: 1000 });
+          return fakeGatewayToolCall("text_too_deep", "shell", {
+            request: "{\"a\":".repeat(300) + "1" + "}".repeat(300),
+          });
+        }
+        case 2: {
+          const correction = JSON.parse(toolResultOutput(body, "text_too_deep")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.retry_with).toBeUndefined();
+          return fakeGatewayFinalText("REQUEST_TEXT_CORRECTED");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Run the fixture command."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("REQUEST_TEXT_CORRECTED");
+      expect(existsSync(join(root.workspace, "request-text-correction.txt"))).toBe(false);
+      expect(gateway.requests).toHaveLength(3);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   test.skipIf(!tmuxAvailable())(
     "a read_tool_result request the model wrote as JSON text reads the saved output",
     async () => {
@@ -7910,6 +8000,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const marker = "READ_TEXT_MATCH";
       let step = 0;
       let readOutput = "";
+      let replayedInput: unknown = null;
       const gateway = startDynamicFakeGateway((body) => {
         switch (step++) {
           case 0:
@@ -7923,9 +8014,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               request: JSON.stringify({ handle: source.full_output_handle, query: marker }),
             });
           }
-          case 2:
+          case 2: {
             readOutput = toolResultOutput(body, "read-text-page");
+            const parts = (JSON.parse(body) as { prompt: Array<{ content?: Array<Record<string, unknown>> }> })
+              .prompt.flatMap((message) => message.content ?? []);
+            replayedInput = parts.find((part) =>
+              part.type === "tool-call" && part.toolCallId === "read-text-page"
+            )?.input;
             return fakeGatewayFinalText("READ_TEXT_COMPLETE");
+          }
           default:
             return new Response("unexpected request", { status: 500 });
         }
@@ -7943,6 +8040,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readOutput).not.toContain("must be an object");
         // The row names the output it searches, as it does for an object request.
         expect(pane).toContain(`output for "${marker}"`);
+        // History replays the call with the top-level arguments the schema
+        // advertises, as it does for a wrapper that is an object.
+        expect(replayedInput).toMatchObject({ query: marker });
+        expect(replayedInput).not.toHaveProperty("request");
         await tui.sendText("/quit");
         expect(await tui.waitForSessionEnd(15000)).toBe(true);
         tui = null;

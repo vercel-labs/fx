@@ -12,5 +12,19 @@
     "old": "Retain(e) == e.valid /\\ e.kind # \"plain\"",
     "new": "Retain(e) == e.valid",
     "invariant": "SavedExactlyMarkedTail"
+  },
+  {
+    "module": "PR1092Steering",
+    "description": "Cancellation drops a tool's notice to the model",
+    "old": "Retain(e) == e.valid /\\ e.kind # \"plain\"",
+    "new": "Retain(e) == e.valid /\\ e.kind \\notin {\"plain\", \"notice\"}",
+    "invariant": "SavedExactlyMarkedTail"
+  },
+  {
+    "module": "PR1092Steering",
+    "description": "Cancellation drops a Stop hook's message",
+    "old": "Retain(e) == e.valid /\\ e.kind # \"plain\"",
+    "new": "Retain(e) == e.valid /\\ e.kind \\notin {\"plain\", \"hook\"}",
+    "invariant": "SavedExactlyMarkedTail"
   }
 ]

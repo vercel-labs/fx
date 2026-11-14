@@ -1848,10 +1848,11 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
-    /// A prompt fx sent on its own to a turn that stopped without a final
-    /// answer, as plain user text. A save of the turn keeps it in the
+    /// A message fx sent the model on its own, as plain user text: a prompt
+    /// to a turn that stopped without a final answer, a tool's notice, or a
+    /// Stop hook's message to continue. A save of the turn keeps it in the
     /// steering list inside a marker (`recovery_prompt.saved`), and a
-    /// restored one comes back with this flag and the bare prompt.
+    /// restored one comes back with this flag and the bare text.
     recovery_prompt: bool = false,
     /// A `.system` message fx added after the conversation started, which
     /// only the messages lane carries (D93). Plain text content only.

@@ -1,5 +1,5 @@
 ---- MODULE SharedLoginRefreshTrace ----
-\* Real runs of fx processes that share one saved fx login, checked against
+\* Real runs of fx processes that share one saved fx, Codex, or Grok login, checked against
 \* SharedLoginRefresh.tla's rules. tests/tla/drivers/auth/trace.ts writes
 \* TraceObs.tla from the ordered log that tests/e2e/shared-login-fakes.ts
 \* keeps of what its fake gateway and issuer saw and what the harness did:
