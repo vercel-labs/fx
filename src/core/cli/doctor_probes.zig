@@ -1422,11 +1422,17 @@ test "stopping a check that keeps starting processes in groups of their own leav
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
     // Each process it starts moves to a group of its own and writes its pid,
-    // like a stdio server an `fx mcp show` child starts. It starts one every
-    // 5 ms. Started as fast as the machine allows, a stop that is slow to land
-    // lets thousands start, and the load they add slows the stop and the exit
-    // of what it killed further, until the processes fill the machine's memory.
-    const script = "while :; do /usr/bin/perl -e 'setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & sleep 0.005; done";
+    // like a stdio server an `fx mcp show` child starts. It starts one about
+    // every millisecond. The pause bounds the storm: started as fast as the
+    // machine allows, a stop that is slow to land lets thousands start, and the
+    // load they add slows the stop and the exit of what it killed further,
+    // until the processes fill the machine's memory. A longer pause leaves too
+    // few starting at the stop to fail a stop path that lists them before it
+    // stops the forker. Each ignores SIGHUP before it moves: the kernel hangs
+    // up a stopped process in a group that its parent's death orphans, which
+    // would end them without fx's own kill of what a check started outside its
+    // group, and this test must prove that kill.
+    const script = "while :; do /usr/bin/perl -e '$SIG{HUP} = \"IGNORE\"; setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & sleep 0.001; done";
     for (0..5) |round| {
         var waiters: std.Io.Group = .init;
         const before = try entryCount(tmp.dir);
