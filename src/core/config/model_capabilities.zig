@@ -280,16 +280,16 @@ pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
 /// The effort after `current` in the cycle `default`, then each level the
 /// model declares in its order, then `default` again. The Gateway catalog
 /// lists levels lowest first; a custom connection keeps the order of its
-/// settings. A level the model does not declare goes back to `default`.
-/// Null when the model declares no levels.
+/// settings. Null when the model declares no levels.
+///
+/// A level the model does not declare, such as one saved for another model,
+/// goes back to `default`. The `/settings` cycle reads such a level as
+/// `default` and steps to the first level instead.
 pub fn nextReasoningEffort(capabilities: Capabilities, current: types.ReasoningEffort) ?types.ReasoningEffort {
-    const levels = capabilities.reasoning_efforts.slice();
-    if (levels.len == 0) return null;
-    if (current.isDefault()) return levels[0];
-    for (levels[0 .. levels.len - 1], 0..) |level, i| {
-        if (level.eql(current)) return levels[i + 1];
-    }
-    return .auto;
+    const count = reasoningEffortOptionCount(capabilities);
+    if (count == 0) return null;
+    if (!reasoningEffortSupported(capabilities, current)) return .auto;
+    return reasoningEffortAtIndex(capabilities, (reasoningEffortIndex(capabilities, current) + 1) % count);
 }
 
 pub fn resolveProviderOptionsForCapabilities(
