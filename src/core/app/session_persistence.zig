@@ -4,6 +4,7 @@
 //! the screen; `app_session_runtime.zig` runs it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
@@ -880,6 +881,140 @@ pub const TranscriptArchiveBoundaries = struct {
     }
 };
 
+/// Reads one older compaction cycle of the session log for Ctrl+O on a
+/// background thread (`loadTranscriptArchive`), so the main thread only
+/// replays the turns it read. One read at a time. The task and its turns use
+/// `std.heap.c_allocator`, which any thread can free with.
+pub const TranscriptArchiveRead = struct {
+    task: ?*Task = null,
+
+    /// What a read is for, which the main thread checks when it finishes.
+    pub const Request = struct {
+        /// Cycles before the held entries: 1 is the newest older one.
+        back: u32,
+        /// The compaction line the cycle opens at, or null at the log's start.
+        start: ?session_adapter.LogCursor,
+        /// The transcript's archive generation when the read started: a
+        /// compaction, resume, or drop since then makes the read stale.
+        generation: u64,
+    };
+
+    pub const Task = struct {
+        /// The read's `std.Io` task, which `completed` and `cancel` await.
+        future: ?std.Io.Future(void) = null,
+        done: std.atomic.Value(bool) = .init(false),
+        cancel_requested: std.atomic.Value(bool) = .init(false),
+        reader: session_adapter.CycleReader,
+        request: Request,
+        started_ns: i128,
+        read_ns: i128 = 0,
+        /// The cycle's turns, oldest first, owned by the task.
+        turns: std.ArrayList(types.HistoryTurn) = .empty,
+        /// Reading stopped at a damaged line, so turns are missing.
+        damaged: bool = false,
+        failure: ?anyerror = null,
+        /// The main thread's replay of the turns read, which runs a few
+        /// turns per loop turn so no frame waits for the whole cycle. The
+        /// app owns its state and frees it through `deinit_fn`.
+        replay: ?Replay = null,
+
+        pub const Replay = struct {
+            state: *anyopaque,
+            deinit_fn: *const fn (*anyopaque) void,
+        };
+
+        const alloc = std.heap.c_allocator;
+
+        fn run(self: *Task) void {
+            defer self.done.store(true, .release);
+            const Visitor = struct {
+                task: *Task,
+
+                pub fn append(visitor: *@This(), turn: types.HistoryTurn) !void {
+                    if (visitor.task.cancel_requested.load(.acquire)) return error.TranscriptArchiveReadCancelled;
+                    try visitor.task.turns.ensureUnusedCapacity(alloc, 1);
+                    visitor.task.turns.appendAssumeCapacity(try types.dupeHistoryTurn(alloc, turn));
+                }
+            };
+            var visitor = Visitor{ .task = self };
+            self.damaged = self.reader.visitHistoryCycle(alloc, self.request.start, &visitor) catch |err| blk: {
+                self.failure = err;
+                break :blk false;
+            };
+            self.read_ns = io_mod.nanoTimestamp() - self.started_ns;
+        }
+
+        pub fn deinit(self: *Task) void {
+            if (self.replay) |replay| replay.deinit_fn(replay.state);
+            for (self.turns.items) |turn| types.freeHistoryTurn(alloc, turn);
+            self.turns.deinit(alloc);
+            self.reader.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    /// Whether a read for `back` at `generation` is running or waits to be
+    /// taken.
+    pub fn pendingFor(self: *const TranscriptArchiveRead, back: u32, generation: u64) bool {
+        const task = self.task orelse return false;
+        return task.request.back == back and task.request.generation == generation;
+    }
+
+    pub fn busy(self: *const TranscriptArchiveRead) bool {
+        return self.task != null;
+    }
+
+    /// Starts reading with `reader`, which the task takes, after stopping
+    /// any read already running. Without threads the read runs here.
+    pub fn start(self: *TranscriptArchiveRead, reader: session_adapter.CycleReader, request: Request) !void {
+        self.cancel();
+        var owned_reader = reader;
+        const task = Task.alloc.create(Task) catch |err| {
+            owned_reader.deinit();
+            return err;
+        };
+        task.* = .{ .reader = owned_reader, .request = request, .started_ns = io_mod.nanoTimestamp() };
+        if (comptime builtin.single_threaded or host_target.is_wasm) {
+            task.run();
+        } else {
+            task.future = io_mod.getIo().concurrent(Task.run, .{task}) catch |err| {
+                task.deinit();
+                return err;
+            };
+        }
+        self.task = task;
+    }
+
+    /// The finished read, which stays here, and busy, while the main thread
+    /// replays its turns; `finish` frees it.
+    pub fn completed(self: *TranscriptArchiveRead) ?*Task {
+        const task = self.task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        if (task.future) |*future| future.await(io_mod.getIo());
+        task.future = null;
+        return task;
+    }
+
+    /// Frees the finished read `completed` returned.
+    pub fn finish(self: *TranscriptArchiveRead) void {
+        const task = self.task orelse return;
+        std.debug.assert(task.future == null);
+        self.task = null;
+        task.deinit();
+    }
+
+    /// Stops a running read and waits for its task. The turns it read are
+    /// dropped; the log keeps them.
+    pub fn cancel(self: *TranscriptArchiveRead) void {
+        const task = self.task orelse return;
+        self.task = null;
+        task.cancel_requested.store(true, .release);
+        if (task.future) |*future| future.await(io_mod.getIo());
+        debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=cancelled turns={d}", .{ task.request.back, task.turns.items.len });
+        task.deinit();
+    }
+};
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
@@ -914,6 +1049,8 @@ pub const Persistence = struct {
     /// Where the older compaction cycles Ctrl+O read start in the session log
     /// (`loadTranscriptArchive`).
     transcript_archive_boundaries: TranscriptArchiveBoundaries = .{},
+    /// The background read of the cycle Ctrl+O asked for.
+    transcript_archive_read: TranscriptArchiveRead = .{},
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
@@ -934,7 +1071,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 32) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 33) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -962,6 +1099,7 @@ pub const Persistence = struct {
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
         storage.transcript_archive_boundaries = .{};
+        storage.transcript_archive_read = .{};
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
@@ -1015,6 +1153,8 @@ pub const Persistence = struct {
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
+        // Before the store, which the read's reader reads through.
+        self.transcript_archive_read.cancel();
         self.transcript_archive_boundaries.deinit(alloc);
         // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |store| {

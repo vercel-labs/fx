@@ -140,17 +140,29 @@ pub fn archiveEntryIdBase(back: u32) u32 {
 }
 
 /// What the newest Ctrl+O pages range over: the cycle before the held one
-/// (from the session log) and then the held entries, as one view.
+/// (from the session log) and then the held entries, as one view. Indexes
+/// count the whole cycle, including the `trimmed` oldest entries that are
+/// not in memory, so a page keeps its place when the whole cycle loads.
 const JoinedPageStore = struct {
+    /// The cycle's oldest entries let go while Ctrl+O was closed.
+    trimmed: usize = 0,
     archived: []const TranscriptEntry,
     held: []const TranscriptEntry,
 
     fn len(self: JoinedPageStore) usize {
-        return self.archived.len + self.held.len;
+        return self.trimmed + self.archived.len + self.held.len;
     }
 
-    fn entryId(self: JoinedPageStore, index: usize) u32 {
-        return if (index < self.archived.len) self.archived[index].id() else self.held[index - self.archived.len].id();
+    /// Where the held entries start.
+    fn heldStart(self: JoinedPageStore) usize {
+        return self.trimmed + self.archived.len;
+    }
+
+    /// The entry at `index`, or null for one let go with the trimmed ones.
+    fn entryId(self: JoinedPageStore, index: usize) ?u32 {
+        if (index < self.trimmed) return null;
+        if (index < self.heldStart()) return self.archived[index - self.trimmed].id();
+        return self.held[index - self.heldStart()].id();
     }
 };
 
@@ -160,6 +172,10 @@ pub const TranscriptArchive = struct {
     back: u32,
     /// Whether the session log holds a cycle before this one.
     has_older: bool,
+    /// How many of the cycle's oldest entries were let go: while Ctrl+O is
+    /// closed, the cycle the newest pages join keeps only what the newest
+    /// page can show (`trimTranscriptArchiveToNewestPage`).
+    trimmed: usize = 0,
     runtime: *TranscriptRuntime,
     alloc: Allocator,
 
@@ -4707,6 +4723,11 @@ const transcript_slot_fields = [_][:0]const u8{
     "transcript_window",
     "transcript_archive_available",
     "transcript_archive_damaged",
+    // The older cycle Ctrl+O read is this transcript's session's, and it
+    // stays while Ctrl+O is closed, so it moves with the transcript.
+    "transcript_archive",
+    "transcript_archive_generation",
+    "transcript_archive_prewarm_spent",
 };
 
 /// Every other field belongs to the physical screen and stays put when a slot
@@ -4746,10 +4767,10 @@ const transcript_screen_fields = [_][:0]const u8{
     "full_transcript_open_request",
     "full_transcript_restore_open_pending",
     "full_transcript_prepared_page_visible",
-    "transcript_archive",
     "transcript_archive_request",
     "transcript_archive_failed",
     "transcript_archive_boundary",
+    "transcript_archive_land_index",
     "collapse_tool_calls",
     "painting",
     "footer_viewport",
@@ -4883,8 +4904,17 @@ pub const TranscriptRuntime = struct {
     full_transcript_window_load: full_transcript_worker.WindowLoad = .{},
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
     /// The older compaction cycle Ctrl+O shows, replayed from the session
-    /// log. One is held at a time.
+    /// log. One is held at a time. The cycle the newest pages join stays
+    /// while Ctrl+O is closed, trimmed to what the newest page shows, so
+    /// Ctrl+O opens without reading the log.
     transcript_archive: ?TranscriptArchive = null,
+    /// Counts the changes that make a cycle read from the log stale: a
+    /// compaction, a resume, a drop of the previous cycle, a clear. The app
+    /// installs a background read only at the generation it started at.
+    transcript_archive_generation: u64 = 0,
+    /// The generation whose joined cycle could not stay trimmed, which the
+    /// newest page then reads only while Ctrl+O is open.
+    transcript_archive_prewarm_spent: ?u64 = null,
     /// Whether the session log holds compaction cycles older than these
     /// entries for Ctrl+O to page into. The app sets it.
     transcript_archive_available: bool = false,
@@ -4900,6 +4930,9 @@ pub const TranscriptRuntime = struct {
     transcript_archive_damaged: bool = false,
     /// Which entry of the requested cycle Ctrl+O lands on once it loads.
     transcript_archive_boundary: ?ArchiveLanding = null,
+    /// The page store index Ctrl+O lands on once the whole cycle loads, for
+    /// a move into the part a trimmed cycle let go.
+    transcript_archive_land_index: ?usize = null,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
     full_transcript_installed_page_retired: bool = false,
     full_transcript_failed_request: ?full_transcript_page.Request = null,
@@ -6938,6 +6971,7 @@ pub const TranscriptRuntime = struct {
 
     pub fn clearFullTranscriptDetails(self: *TranscriptRuntime, alloc: Allocator) void {
         self.notebook.compact_transcript_source_cache.deinit(alloc);
+        self.invalidateTranscriptArchive("cleared");
         self.resetFullTranscriptPageNavigation();
         self.transcript_archive_damaged = false;
         if (self.full_transcript_window_load.busy()) {
@@ -7114,7 +7148,7 @@ pub const TranscriptRuntime = struct {
     /// them, and after it they leave memory as they scroll off.
     pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator, holds_previous_cycle: bool) !void {
         // Which cycle is "one back" changed with the session.
-        self.discardTranscriptArchive();
+        self.invalidateTranscriptArchive("resumed");
         const window = if (self.transcript_window) |*value| value else return;
         try window.resumed(alloc, self.notebook.entries.items);
         if (holds_previous_cycle) try self.transcriptWindowCompacted(alloc);
@@ -7124,7 +7158,7 @@ pub const TranscriptRuntime = struct {
     pub fn transcriptWindowCompacted(self: *TranscriptRuntime, alloc: Allocator) !void {
         // A new newest compaction: the cycle Ctrl+O read as "one back" is
         // now two back.
-        self.discardTranscriptArchive();
+        self.invalidateTranscriptArchive("compacted");
         const window = if (self.transcript_window) |*value| value else return;
         var drops: std.ArrayList(u32) = .empty;
         defer drops.deinit(alloc);
@@ -7144,7 +7178,7 @@ pub const TranscriptRuntime = struct {
     ) !void {
         // The previous cycle left memory: "one back" now means it, not the
         // cycle before it.
-        if (drops.len > 0) self.discardTranscriptArchive();
+        if (drops.len > 0) self.invalidateTranscriptArchive("previous_cycle_dropped");
         try window.pending_drops.appendSlice(alloc, drops);
         if (window.pending_drops.items.len == 0) return;
         var hold = try self.transcriptWindowDropHold(alloc);
@@ -7610,7 +7644,7 @@ pub const TranscriptRuntime = struct {
     fn joinedPageStore(self: *const TranscriptRuntime) ?JoinedPageStore {
         if (!self.ctrlOJoinsPreviousCycle()) return .{ .archived = &.{}, .held = self.notebook.entries.items };
         const previous = self.archiveFor(1) orelse return null;
-        return .{ .archived = previous.runtime.notebook.entries.items, .held = self.notebook.entries.items };
+        return .{ .trimmed = previous.trimmed, .archived = previous.runtime.notebook.entries.items, .held = self.notebook.entries.items };
     }
 
     /// The page above the one at `anchor` over `range`: the previous page of
@@ -7702,7 +7736,18 @@ pub const TranscriptRuntime = struct {
             .entry_index => |value| value,
             .archive => |archive| archive.entry_index,
         };
-        self.full_transcript = self.full_transcript.select_page_boundary(self.pageStoreEntryId(anchor, @min(index, total - 1)).?);
+        const land_index = @min(index, total - 1);
+        const entry_id = self.pageStoreEntryId(anchor, land_index) orelse {
+            // An entry the trimmed cycle let go: the whole cycle loads, and
+            // Ctrl+O lands on that entry, whose index the load keeps.
+            const back = self.pageStoreArchiveBack(anchor) orelse return;
+            self.transcript_archive_request = back;
+            self.transcript_archive_boundary = null;
+            self.transcript_archive_land_index = land_index;
+            debug_trace.logf("full_transcript_cache", "archive_requested back={d} land_index={d} reason=trimmed", .{ back, land_index });
+            return;
+        };
+        self.full_transcript = self.full_transcript.select_page_boundary(entry_id);
     }
 
     /// Installs a cycle the app replayed from the session log for Ctrl+O,
@@ -7721,6 +7766,15 @@ pub const TranscriptRuntime = struct {
         // Its ids are apart from the live ones (`archiveEntryIdBase`), so a
         // page can join it to the held entries.
         std.debug.assert(archived.notebook.entries.items.len == 0 or archived.notebook.entries.items[0].id() >= archiveEntryIdBase(0));
+        if (!self.fullTranscriptOpenOrOpening() and (back != 1 or !self.ctrlOJoinsPreviousCycle())) {
+            // Read for a Ctrl+O that closed since: only the cycle the newest
+            // pages join stays while it is closed, and the one held stays.
+            var dropped = archived;
+            dropped.deinit(alloc);
+            if (self.transcript_archive_request == back) self.transcript_archive_request = null;
+            debug_trace.logf("full_transcript_cache", "archive_dropped back={d} reason=closed_not_joined", .{back});
+            return;
+        }
         const owned = try alloc.create(TranscriptRuntime);
         owned.* = archived;
         self.discardTranscriptArchive();
@@ -7729,6 +7783,20 @@ pub const TranscriptRuntime = struct {
         self.transcript_archive_failed = false;
         if (damaged) self.transcript_archive_damaged = true;
         if (self.transcript_archive_request == back) self.transcript_archive_request = null;
+        // Read while Ctrl+O was closed: keep only what the newest page shows.
+        if (!self.fullTranscriptOpenOrOpening()) {
+            self.keepTranscriptArchiveForNewestPage();
+            return;
+        }
+        if (self.transcript_archive_land_index) |land_index| {
+            self.transcript_archive_land_index = null;
+            self.transcript_archive_boundary = null;
+            const anchor = self.full_transcript_page_anchor;
+            if (self.pageStoreArchiveBack(anchor) != back) return;
+            const entry_id = self.pageStoreEntryId(anchor, land_index) orelse return;
+            self.full_transcript = self.full_transcript.select_page_boundary(entry_id);
+            return;
+        }
         const land = self.transcript_archive_boundary orelse return;
         self.transcript_archive_boundary = null;
         const anchor = self.full_transcript_page_anchor;
@@ -7743,13 +7811,19 @@ pub const TranscriptRuntime = struct {
             .archive => .{ .archive = .{ .back = back, .entry_index = index } },
             .tail, .entry_index => .{ .entry_index = index },
         };
-        self.full_transcript = self.full_transcript.select_page_boundary(self.pageStoreEntryId(anchor, index).?);
+        const entry_id = self.pageStoreEntryId(anchor, index) orelse return;
+        self.full_transcript = self.full_transcript.select_page_boundary(entry_id);
     }
 
     /// The app could not load the requested cycle: Ctrl+O stays on the held
-    /// entries, and its footer says the older history could not load.
+    /// entries, and its footer says the older history could not load. A read
+    /// for a closed Ctrl+O says nothing; the next open reads again.
     pub fn failTranscriptArchive(self: *TranscriptRuntime) void {
-        self.transcript_archive_failed = true;
+        if (self.fullTranscriptOpenOrOpening()) {
+            self.transcript_archive_failed = true;
+        } else {
+            self.transcript_archive_prewarm_spent = self.transcript_archive_generation;
+        }
         self.endTranscriptArchiveRequest();
     }
 
@@ -7764,10 +7838,11 @@ pub const TranscriptRuntime = struct {
     fn endTranscriptArchiveRequest(self: *TranscriptRuntime) void {
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
+        self.transcript_archive_land_index = null;
         if (self.full_transcript_page_anchor == .archive) self.full_transcript_page_anchor = .{ .entry_index = 0 };
     }
 
-    fn fullTranscriptOpenOrOpening(self: *const TranscriptRuntime) bool {
+    pub fn fullTranscriptOpenOrOpening(self: *const TranscriptRuntime) bool {
         return self.full_transcript.depth == .full or
             self.full_transcript_open_request != null or
             self.full_transcript_restore_open_pending;
@@ -7776,6 +7851,66 @@ pub const TranscriptRuntime = struct {
     pub fn discardTranscriptArchive(self: *TranscriptRuntime) void {
         if (self.transcript_archive) |*held| held.deinit();
         self.transcript_archive = null;
+    }
+
+    /// The cycle read from the log no longer matches this transcript: drops
+    /// it, and makes a read already started stale.
+    fn invalidateTranscriptArchive(self: *TranscriptRuntime, reason: []const u8) void {
+        if (self.transcript_archive) |held| debug_trace.logf("full_transcript_cache", "archive_dropped back={d} reason={s}", .{ held.back, reason });
+        self.discardTranscriptArchive();
+        self.transcript_archive_generation +%= 1;
+    }
+
+    /// While Ctrl+O is closed, keeps only the cycle the newest pages join,
+    /// trimmed to what the newest page shows, so the next open reads
+    /// nothing from the log and memory holds at most one page of it.
+    fn keepTranscriptArchiveForNewestPage(self: *TranscriptRuntime) void {
+        const held = if (self.transcript_archive) |*value| value else return;
+        if (held.back != 1 or !self.ctrlOJoinsPreviousCycle()) {
+            debug_trace.logf("full_transcript_cache", "archive_dropped back={d} reason=not_joined", .{held.back});
+            self.discardTranscriptArchive();
+            return;
+        }
+        self.trimTranscriptArchiveToNewestPage() catch |err| {
+            debug_trace.logf("full_transcript_cache", "archive_dropped back=1 reason=trim_failed err={s}", .{@errorName(err)});
+            self.discardTranscriptArchive();
+            // Reading it again would trim it the same way: until the cycle
+            // changes, Ctrl+O reads it when it opens, as it did before.
+            self.transcript_archive_prewarm_spent = self.transcript_archive_generation;
+        };
+    }
+
+    /// Lets go of the joined cycle's oldest entries that the newest page
+    /// cannot reach: a page holds `max_source_entries`, the held entries
+    /// fill its end, and they only grow until the cycle goes stale.
+    fn trimTranscriptArchiveToNewestPage(self: *TranscriptRuntime) !void {
+        const held = &self.transcript_archive.?;
+        const entries = held.runtime.notebook.entries.items;
+        const keep = full_transcript_page.max_source_entries -| self.notebook.entries.items.len;
+        if (entries.len <= keep) return;
+        const drop_count = entries.len - keep;
+        const first_kept: ?u32 = if (keep > 0) entries[drop_count].id() else null;
+        const ids = try held.alloc.alloc(u32, drop_count);
+        defer held.alloc.free(ids);
+        for (entries[0..drop_count], ids) |entry, *id| id.* = entry.id();
+        _ = try transcript_store.dropEntriesAtomic(held.runtime, held.alloc, ids);
+        // Indexes count the whole cycle, so what stays must be its newest
+        // entries; a kept pin would leave a gap.
+        const after = held.runtime.notebook.entries.items;
+        if (after.len != keep) return error.TranscriptArchiveTrimKeptEntries;
+        if (first_kept) |id| if (after[0].id() != id) return error.TranscriptArchiveTrimKeptEntries;
+        held.trimmed += drop_count;
+        debug_trace.logf("full_transcript_cache", "archive_trimmed back=1 dropped={d} kept={d} trimmed={d}", .{ drop_count, keep, held.trimmed });
+    }
+
+    /// Whether the newest page may read the cycle it joins while Ctrl+O is
+    /// closed: between turns, once per cycle, so the next Ctrl+O opens
+    /// without reading the log.
+    fn transcriptArchivePrewarmAllowed(self: *const TranscriptRuntime) bool {
+        if (self.transcript_archive_failed or self.transcript_archive_damaged) return false;
+        if (self.transcript_archive_prewarm_spent == self.transcript_archive_generation) return false;
+        const window = if (self.transcript_window) |*value| value else return false;
+        return !window.state.turn_open;
     }
 
     /// Whether the transcript window still holds the cycle before the newest
@@ -7788,9 +7923,10 @@ pub const TranscriptRuntime = struct {
 
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
         self.full_transcript_page_anchor = .tail;
-        self.discardTranscriptArchive();
+        self.keepTranscriptArchiveForNewestPage();
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
+        self.transcript_archive_land_index = null;
         self.transcript_archive_failed = false;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
@@ -12002,9 +12138,11 @@ pub const TranscriptRuntime = struct {
             full_diff_resolver,
         ) catch |err| switch (err) {
             error.TranscriptArchiveNotLoaded => {
-                // The log is read only for a Ctrl+O that is open or opening:
-                // while it is closed, memory holds the one cycle.
-                if (self.fullTranscriptOpenOrOpening()) self.transcript_archive_request = self.pageStoreArchiveBack(request.anchor);
+                // While Ctrl+O is closed, the newest page reads the cycle it
+                // joins between turns, so the next Ctrl+O opens at once.
+                if (self.fullTranscriptOpenOrOpening() or self.transcriptArchivePrewarmAllowed()) {
+                    self.transcript_archive_request = self.pageStoreArchiveBack(request.anchor);
+                }
                 return;
             },
             error.FullTranscriptPageSnapshotTooLarge => {
@@ -12043,20 +12181,24 @@ pub const TranscriptRuntime = struct {
         }
         const store = self.joinedPageStore() orelse return error.TranscriptArchiveNotLoaded;
         const range = full_transcript_page.sourceRange(request, store.len());
-        if (store.archived.len == 0) return self.snapshotEntryRange(request, range, capability, full_diff_resolver);
+        // A page that reaches into the part a trimmed cycle let go needs the
+        // whole cycle, which loads at the same indexes.
+        if (range.start < store.trimmed) return error.TranscriptArchiveNotLoaded;
+        const held_start = store.heldStart();
+        if (held_start == 0) return self.snapshotEntryRange(request, range, capability, full_diff_resolver);
         // A page across the join: the older cycle's part from its own
         // runtime, the held part from this one. Their entry ids are apart
         // (`archiveEntryIdBase`).
-        const archived_end = @min(range.end, store.archived.len);
+        const archived_end = @min(range.end, held_start);
         var source = if (range.start < archived_end)
-            try self.snapshotArchivedRange(self.archiveFor(1).?, request, .{ .start = range.start, .end = archived_end })
+            try self.snapshotArchivedRange(self.archiveFor(1).?, request, .{ .start = range.start - store.trimmed, .end = archived_end - store.trimmed })
         else
             try self.snapshotEntryRange(request, .{ .start = 0, .end = 0 }, null, null);
         errdefer source.deinit(alloc);
-        if (range.end > store.archived.len) {
+        if (range.end > held_start) {
             var held = try self.snapshotEntryRange(request, .{
-                .start = @max(range.start, store.archived.len) - store.archived.len,
-                .end = range.end - store.archived.len,
+                .start = @max(range.start, held_start) - held_start,
+                .end = range.end - held_start,
             }, capability, full_diff_resolver);
             defer held.deinit(alloc);
             try moveSnapshotParts(alloc, &source, &held);

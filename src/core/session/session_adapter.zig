@@ -1396,6 +1396,17 @@ const BlobHost = struct {
         if (host.records_generation != host.records_written) debug_trace.logf("session", "event=sessions_v2_records_unlisted session={s} count={d}", .{ host.id, host.records_added.items.len });
     }
 
+    /// A page of the session's log for a reader that holds the host: through
+    /// the open session, or through the process's manager once it closed.
+    /// A close waits for a read in flight, as it waits for a store.
+    fn readLog(host: *BlobHost, sa: Allocator, from_cursor: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        if (host.session) |handle| return handle.read(sa, from_cursor, direction, limit);
+        return host.store.manager.read(sa, host.id, from_cursor, direction, limit);
+    }
+
     fn put(ctx: *anyopaque, bytes: []const u8) session_child_store.BlobError!Hash {
         const host = from(ctx);
         const io = io_mod.getIo();
@@ -3022,17 +3033,17 @@ pub const Session = struct {
     /// visited; the next cycle shows it whole (`cycleStart`). Returns true
     /// when reading stopped at a damaged line, so turns are missing.
     pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        var sink: VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
-        const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
-        const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
-        var damaged = false;
-        var replay_sink = ReplaySink.init(&sink);
-        replay_sink.damaged = &damaged;
-        replay(self.source(), alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
-            error.CycleEnd => {},
-            else => |other| return other,
-        };
-        return damaged;
+        return visitCycle(self.source(), alloc, start, visitor);
+    }
+
+    /// A reader of this session's log that another thread can keep after
+    /// this call returns, such as the one that reads a cycle for Ctrl+O.
+    /// Caller owns it; free it with `CycleReader.deinit` on any thread.
+    pub fn cycleReader(self: *Session, alloc: Allocator) !CycleReader {
+        const files_path = try alloc.dupe(u8, self.files_path);
+        errdefer alloc.free(files_path);
+        BlobHost.retain(self.host);
+        return .{ .alloc = alloc, .store = self.store, .host = self.host, .files_path = files_path };
     }
 
     /// This open's report lines, the first time it is asked, so the reports
@@ -3534,6 +3545,9 @@ const Source = struct {
 
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
         if (src.handle) |handle| return handle.read(sa, from, direction, limit);
+        // A `CycleReader` on another thread: through the host, which knows
+        // whether the session is still open.
+        if (src.host) |host| return host.readLog(sa, from, direction, limit);
         return src.store.manager.read(sa, src.id, from, direction, limit);
     }
 
@@ -3659,6 +3673,49 @@ const Source = struct {
         };
     }
 };
+
+/// A session's log as a background thread reads it (`Session.cycleReader`).
+/// It holds the session's blob host, so it reads through the open session
+/// while it is open and through the process's manager after it closes, as a
+/// background reader's capability does (D44). It never touches the
+/// `Session`, which may close and free while the reader works.
+pub const CycleReader = struct {
+    alloc: Allocator,
+    store: *Store,
+    host: *BlobHost,
+    files_path: []u8,
+
+    pub fn deinit(self: *CycleReader) void {
+        self.alloc.free(self.files_path);
+        BlobHost.release(self.host);
+        self.* = undefined;
+    }
+
+    fn source(self: *const CycleReader) Source {
+        return .{ .store = self.store, .id = self.host.id, .host = self.host, .files_path = self.files_path };
+    }
+
+    /// `Session.visitHistoryCycle`, read on the reader's thread.
+    pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+        return visitCycle(self.source(), alloc, start, visitor);
+    }
+};
+
+/// The turns of one compaction cycle from `src`, each handed to
+/// `visitor.append` and freed after it returns (`Session.visitHistoryCycle`).
+fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+    var sink: Session.VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
+    const from: sm.From = if (start) |cursor| .{ .at = try src.cycleStart(alloc, cursor) } else .start;
+    const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
+    var damaged = false;
+    var replay_sink = ReplaySink.init(&sink);
+    replay_sink.damaged = &damaged;
+    replay(src, alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
+        error.CycleEnd => {},
+        else => |other| return other,
+    };
+    return damaged;
+}
 
 // ---------------------------------------------------------------------------
 // Converting v1 sessions (D55 to D61, `tests/tla/session_manager/V1Conversion.tla`)
@@ -6987,6 +7044,67 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
     try visitor.expectPrompts(&.{"four"});
     try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{"four"});
+}
+
+test "a cycle reader reads a compaction cycle on another thread, and after its session closes" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var open = true;
+    defer if (open) s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var summary = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    const newest = (try s.previousCompactionCursor(testing.allocator, null)).cursor.?;
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    const Read = struct {
+        fn run(reader: *const CycleReader, visitor: *Visitor, damaged: *bool, failure: *?anyerror) void {
+            damaged.* = reader.visitHistoryCycle(testing.allocator, null, visitor) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var reader = try s.cycleReader(testing.allocator);
+    defer reader.deinit();
+
+    // While the session is open, through its own log.
+    var visitor: Visitor = .{};
+    var damaged = true;
+    var failure: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{}, Read.run, .{ &reader, &visitor, &damaged, &failure });
+    thread.join();
+    try testing.expectEqual(@as(?anyerror, null), failure);
+    try testing.expect(!damaged);
+    try visitor.expectPrompts(&.{ "one", "two" });
+
+    // The session closes under the reader, which reads on through the manager.
+    s.close();
+    open = false;
+    try testing.expect(!try reader.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try visitor.expectPrompts(&.{"three"});
 }
 
 test "a damaged line in a compaction cycle shows that cycle's turns before it and says so" {

@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
-import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
+import { logLines, onlySessionId, savedText, sessionDir } from "./saved-sessions";
 import { bearer, rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
@@ -722,6 +722,93 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         writeFileSync(join(root, "failure.json"), JSON.stringify({ ordinary: ordinaryBodies.length, summaries: summaryBodies.length }, null, 2));
         if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
         console.error(`compaction steering evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("manual: Ctrl+O after the turn across a compaction opens without reading the session log", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compaction-ctrlo-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    const answers = [
+      "CTRLO_OLDER_FIRST_5c1",
+      "CTRLO_OLDER_SECOND_5c1",
+      Array.from({ length: 40 }, (_, i) => `CTRLO_OLDER_ROW_${i + 1}_5c1`).join("\n\n"),
+      "CTRLO_AFTER_COMPACTION_5c1",
+    ];
+    let turns = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        return fakeGatewayFinalText("Facts:\nF1: CTRLO_SUMMARY_5c1: earlier turns.");
+      }
+      turns += 1;
+      return fakeGatewayFinalText(answers[Math.min(turns, answers.length) - 1]!);
+    });
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_SOUND: "0", FX_AUTO_UPGRADE: "0", NO_COLOR: "1",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "full_transcript_cache",
+    };
+    const command = `/usr/bin/env -i ${Object.entries(env)
+      .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
+    const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: command, cwd: workspace, env, isolated: true, remainOnExit: true,
+        stderrPath, width: 100, height: 32, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(15_000);
+      for (const [index, answer] of answers.slice(0, 3).entries()) {
+        await terminal.sendText(`Answer ${index + 1}.`);
+        await terminal.waitForText(answer.split("\n").at(-1)!, 15_000);
+        await terminal.waitForComposer(15_000);
+      }
+      const id = onlySessionId(home);
+      await terminal.sendText("/compact");
+      await until(() => logLines(home, id).some((line) => line.kind === "compacted"), "the compaction");
+      await terminal.waitForPane((pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
+      // The turn across the compaction ends, so the window lets the older
+      // cycle go and Ctrl+O's newest page joins it from the log.
+      await terminal.sendText("One more turn.");
+      await terminal.waitForText("CTRLO_AFTER_COMPACTION_5c1", 15_000);
+      await terminal.waitForComposer(15_000);
+      // Between turns the cycle is read in the background and kept.
+      await until(() => trace().includes("archive_loaded back=1"), "the background read of the joined cycle", 15_000);
+      const openAt = trace().length;
+      await terminal.sendKeys("C-o");
+      await terminal.waitForText("esc close", 15_000);
+      await terminal.waitForText("CTRLO_OLDER_ROW_40_5c1", 15_000);
+      const atOpen = trace().slice(openAt);
+      await terminal.sendKeys("Escape");
+      await terminal.waitForComposer(15_000);
+      // The open shows the older cycle without reading the log again.
+      expect(atOpen).not.toContain("archive_read_started");
+      expect(atOpen).not.toContain("archive_loaded");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "failure.trace.log"), trace());
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`compaction Ctrl+O evidence retained: ${root}`);
       }
       await terminal?.kill();
       gateway.stop();

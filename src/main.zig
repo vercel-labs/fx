@@ -1293,7 +1293,9 @@ const App = struct {
     }
 
     fn fullTranscriptFocusedWorkActive(self: *App) bool {
-        return self.shell.fullTranscriptFocusedWorkActive();
+        return self.shell.fullTranscriptFocusedWorkActive() or
+            (self.shell.fullTranscriptOpenOrOpening() and
+                self.screenAgent().session_persistence.transcript_archive_read.busy());
     }
 
     fn processNextCooperativePrompt(self: *App, agent: *agents.Agent) !void {
@@ -3384,11 +3386,20 @@ const App = struct {
             if (dropped) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (self.shell.transcript_archive_request) |back| {
-            // A Ctrl+O page needs an older compaction cycle from the log.
+            // A Ctrl+O page needs an older compaction cycle from the log,
+            // which a background thread reads.
             SessionAppRuntime.loadTranscriptArchive(self, self.screenAgent(), back) catch |err| {
                 debug_trace.logf("full_transcript_cache", "archive_load_failed back={d} err={s}", .{ back, @errorName(err) });
                 if (err == error.TranscriptArchiveDamaged) self.shell.damageTranscriptArchive() else self.shell.failTranscriptArchive();
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
             };
+        }
+        const archive_installed = SessionAppRuntime.pollTranscriptArchive(self, self.screenAgent()) catch |err| blk: {
+            debug_trace.logf("full_transcript_cache", "archive_load_failed err={s}", .{@errorName(err)});
+            if (err == error.TranscriptArchiveDamaged) self.shell.damageTranscriptArchive() else self.shell.failTranscriptArchive();
+            break :blk true;
+        };
+        if (archive_installed and self.shell.fullTranscriptActive()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }
         try self.shell.prewarmFullTranscriptPage(
