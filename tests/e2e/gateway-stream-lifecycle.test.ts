@@ -10523,7 +10523,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       const answer = (id: string) => String(JSON.parse(results[id]!).result);
       // The first subagent starts with no other: its answer is as before.
-      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_first")).toBe("Sent to first, which works on it now. Do not call wait. Do any other work you have, then end your turn with a short status. Its report starts your next turn when the work ends.");
       // A new subagent's start names the idle one.
       expect(answer("idle_second")).toContain("second is new and starts with no history.");
       expect(answer("idle_second")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\n`);
@@ -10532,7 +10532,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(answer("idle_third")).toContain(`Idle subagents, each with its own context:\n- first: ${tasks.first}\nGive related work`);
       expect(answer("idle_third")).not.toContain("- second");
       // A message to a subagent that exists starts its turn and names none.
-      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.");
+      expect(answer("idle_again")).toBe("Sent to first, which works on it now. Do not call wait. Do any other work you have, then end your turn with a short status. Its report starts your next turn when the work ends.");
       // Every report of a finished work says its subagent is idle now.
       expect(reports.map((report) => report.agent).sort()).toEqual(["first", "first", "second", "third"]);
       for (const report of reports) {
