@@ -52,6 +52,13 @@ pub fn advanceSelectionWithin(index: *usize, window_start: *usize, count: usize,
     window_start.* = updateEdgeStart(window_start.*, count, index.*, max_rows);
 }
 
+/// Rows left for items when a list of `count` gets `rows` and, if it
+/// overflows, gives one of them to a "↓ N more" row.
+pub fn visibleRowsWithMore(count: usize, rows: u16) u16 {
+    if (count > rows and rows > 1) return rows - 1;
+    return @intCast(@min(count, rows));
+}
+
 pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_rows: u16) usize {
     if (count == 0 or max_rows == 0) return 0;
     const rows: usize = max_rows;
@@ -98,4 +105,11 @@ test "edge window start lets selection move back up before reverse scrolling" {
     start = updateEdgeStart(start, 11, 5, rows);
     try std.testing.expectEqual(@as(usize, 1), start);
     try std.testing.expectEqual(@as(usize, 4), 5 - start);
+}
+
+test "a list that overflows gives one row to its more row" {
+    try std.testing.expectEqual(@as(u16, 5), visibleRowsWithMore(40, 6));
+    try std.testing.expectEqual(@as(u16, 6), visibleRowsWithMore(6, 6));
+    try std.testing.expectEqual(@as(u16, 3), visibleRowsWithMore(3, 6));
+    try std.testing.expectEqual(@as(u16, 1), visibleRowsWithMore(40, 1));
 }

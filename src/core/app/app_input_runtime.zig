@@ -4238,12 +4238,14 @@ test "app_input_runtime slash completion window moves up before reverse scrollin
     while (down < 6) : (down += 1) {
         try std.testing.expect(Runtime(FakeApprovalCancelApp).routeSlashCompletionMove(&app, (&app).agent(), 1));
     }
+    // Five commands show above the "↓ N more" row, so the seventh starts the
+    // window at the third.
     try std.testing.expectEqual(@as(usize, 6), app.input_runtime.picker.slash_completion_index);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.slash_completion_window_start);
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.slash_completion_window_start);
 
     try std.testing.expect(Runtime(FakeApprovalCancelApp).routeSlashCompletionMove(&app, (&app).agent(), -1));
     try std.testing.expectEqual(@as(usize, 5), app.input_runtime.picker.slash_completion_index);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.slash_completion_window_start);
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.slash_completion_window_start);
 }
 
 test "app_input_runtime one-row session picker keeps reverse scrolling sticky" {

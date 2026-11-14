@@ -1496,7 +1496,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("-l '/m'");
       await session.waitForPane(
-        (pane) => pane.includes("Commands ") && pane.includes("/model"),
+        (pane) => /^commands\s*$/m.test(pane) && pane.includes("/model"),
         5_000,
       );
 
@@ -1519,8 +1519,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         line.includes("manage MCP servers and their logins")
       );
       expect(mcpRow).toBeDefined();
+      // Columns fit the longest entry of the whole list, so the category
+      // column stays put as the list scrolls.
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
-      expect(mcpRow!.indexOf("Extensions") + "Extensions".length).toBe(99);
       expect(modelRow).toContain("Model");
       expect(scrolledGrid.join("\n")).toContain("↑↓ navigate     enter use     esc close");
       expect(session.isAlive()).toBe(true);
@@ -1573,7 +1574,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendLiteralText("/m");
       await session.waitForPane(
-        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        (pane) => /^results\s*$/m.test(pane) && pane.includes("/model"),
         5_000,
       );
       grid = await session.capturePaneGrid();
@@ -1603,7 +1604,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendLiteralText("/m");
       await session.waitForPane(
-        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        (pane) => /^results\s*$/m.test(pane) && pane.includes("/model"),
         5_000,
       );
       grid = await session.capturePaneGrid();
@@ -4141,18 +4142,21 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendLiteralText("/");
       await session.waitForPane((pane) => /^commands\s*$/m.test(pane), 5_000);
 
-      for (let i = 0; i < 5; i += 1) {
+      // Five commands show above the "↓ N more" row: the highlight walks to
+      // the last of them before the list scrolls, then stays there.
+      for (let i = 0; i < 4; i += 1) {
         await session.sendKeys("Down");
       }
 
       const selectedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
-      expect(selectedRow).toBeGreaterThanOrEqual(5);
+      expect(selectedRow).toBe(4);
 
       await session.sendKeys("Down");
+      expect(selectedSlashRowIndex(await session.capturePaneEscapes())).toBe(4);
       await session.sendKeys("Up");
 
       const reversedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
-      expect(reversedRow).toBe(4);
+      expect(reversedRow).toBe(3);
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");

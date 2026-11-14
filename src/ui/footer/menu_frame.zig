@@ -86,8 +86,7 @@ pub fn listLayout(item_count: usize, selected: usize, window_start: usize, list_
     };
     if (item_count == 0) return result;
 
-    const overflows = item_count > list_rows;
-    const visible: u16 = if (overflows and list_rows > 1) list_rows - 1 else @intCast(@min(item_count, list_rows));
+    const visible = list_window.visibleRowsWithMore(item_count, list_rows);
     const clamped_selection = @min(selected, item_count - 1);
     const start = list_window.updateEdgeStart(window_start, item_count, clamped_selection, visible);
     result.visible_items = visible;
