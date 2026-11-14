@@ -94,7 +94,8 @@
 //!   session with retained turns, such as a closed one: `open`, `name` (left
 //!   out for a one-off), `session_id`, the name of its folder in the session
 //!   store, `profile`, `state` (what the agent list says: `needs_approval`,
-//!   `has_question`, `needs_you`, `working`, `finished`, or `idle`),
+//!   `has_question`, `needs_you`, `working`, `finished`, `failed`,
+//!   `stopped`, or `idle`),
 //!   `activity` (its host's work phase: `idle`, `running`,
 //!   `awaiting_approval`, `interrupted`, `finished`, `closing`, or `unknown`
 //!   when its host's registry has no entry for it), `last_outcome`

@@ -17,10 +17,14 @@
 // the open agents the last full list showed and the pane does not. With no
 // match there is no row, so the highlight is the agent on screen, as the model
 // keeps it. The agent the list opened on, which Esc goes back to, is what was
-// on screen when it opened, until it closes. The model names instances i1, i2,
-// ... in launch order and subagents by their own names. An instance's row is
-// named `fx N` by its place among the open instances, or `main` when it is the
-// only one.
+// on screen when it opened, until it closes. `run` and `pressed` are the one
+// part no pane shows: which close key, Backspace ("bs") or forward Delete
+// ("del"), the driver pressed last, and whose run of presses has edited the
+// search since another key. They come from the keys the driver sends, so TLC
+// checks what the binary did against what was pressed.
+// The model names instances i1, i2, ... in launch order and subagents by their
+// own names. An instance's row is named `fx N` by its place among the open
+// instances, or `main` when it is the only one.
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,10 +45,20 @@ export type State = {
   origin: string;
   searching: boolean;
   hidden: string[];
+  /// The close key whose run has edited the search, or NONE.
+  run: string;
+  /// The close key the step pressed, or NONE.
+  pressed: string;
   act: string;
 };
 
-/// Letters a search types: each is in some agent's name and not in others'.
+/// The close keys: Backspace and forward Delete.
+export type CloseKey = "bs" | "del";
+export const CLOSE_KEYS: CloseKey[] = ["bs", "del"];
+const KEY_NAMES: Record<CloseKey, string> = { bs: "BSpace", del: "DC" };
+
+/// Letters a search types: each is in some agent's name, title, or purpose
+/// (a subagent's purpose is its task, `AM_TASK_<name> wait`) and not in others'.
 export const SEARCH_LETTERS = ["a", "b", "e", "f", "g", "l", "m", "p", "t", "x", "z"];
 
 export type WorldOptions = { instances: number; subs: string[]; width?: number; height?: number; label: string };
@@ -91,15 +105,15 @@ export function listRows(paneEscapes: string): Array<{ name: string; instance: b
 /// Each row's state as the open list draws it, "working" or "idle": a
 /// subagent that finished counts as idle whether or not the person has seen it
 /// (the list calls that "finished"). Any other state, such as one that waits
-/// for an approval, is an error here, since the drivers that read it start no
-/// such agent.
+/// for an approval, or one whose last turn failed or was stopped, is an error
+/// here, since the drivers that read it start no such agent.
 export function listStates(paneEscapes: string): Array<{ name: string; instance: boolean; state: "working" | "idle" }> {
   const rows: Array<{ name: string; instance: boolean; state: "working" | "idle" }> = [];
   for (const line of paneEscapes.split("\n")) {
     const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
     const row = /^ {2}(?:(fx \d+|main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S(.*)$/.exec(plain);
     if (!row) continue;
-    const state = /(?: {2,})(working|idle|finished|needs approval|has a question|needs you)(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
+    const state = /(?: {2,})(working|idle|finished|failed|stopped|needs approval|has a question|needs you)(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
     if (state === undefined) continue;
     if (state !== "working" && state !== "idle" && state !== "finished") throw new Error(`the list shows a row in state "${state}": ${plain}`);
     rows.push({ name: (row[1] ?? row[2])!, instance: row[1] !== undefined, state: state === "working" ? "working" : "idle" });
@@ -128,6 +142,9 @@ export class World {
   /// The length of the draft each agent's composer holds from pastes.
   private drafts = new Map<string, number>();
   steps: State[] = [];
+  /// How many letters the search box holds, as the driver typed and erased
+  /// them, so a held key can clear it and go on.
+  searchLength = 0;
 
   constructor(readonly options: WorldOptions, readonly out: string) {
     this.instances = Array.from({ length: options.instances }, (_, i) => `i${i + 1}`);
@@ -310,7 +327,10 @@ export class World {
     const armed = open && plain.includes(ARMED_HINT) ? sel : NONE;
     const before = this.state?.origin ?? NONE;
     const origin = !open ? NONE : act === "open" ? onScreen : order.includes(before) ? before : NONE;
-    return { order, onScreen, open, sel, armed, origin, searching, hidden, act };
+    // A step that presses a close key says so after this; any other step
+    // leaves the run as it was, and a closed list has none.
+    const run = open ? (this.state?.run ?? NONE) : NONE;
+    return { order, onScreen, open, sel, armed, origin, searching, hidden, run, pressed: NONE, act };
   }
 
   /// Learns fx's id for every agent by switching to each row with Enter,
@@ -354,7 +374,7 @@ export class World {
     await this.session.waitForPane((pane: string) => !pane.includes(LIST_HINT), 10_000);
     await this.settle([], 1_000);
     this.note(`calibrated ids: ${JSON.stringify(Object.fromEntries(this.ids))}`);
-    this.state = { order, onScreen: "i1", open: false, sel: NONE, armed: NONE, origin: NONE, searching: false, hidden: [], act: "init" };
+    this.state = { order, onScreen: "i1", open: false, sel: NONE, armed: NONE, origin: NONE, searching: false, hidden: [], run: NONE, pressed: NONE, act: "init" };
     if (this.onScreen() !== "i1") throw new Error(`calibration left ${this.onScreen()} on screen`);
     this.steps = [this.state];
     return order;
@@ -406,7 +426,7 @@ export class World {
     const same = JSON.stringify({ ...next, act: "" }) === JSON.stringify({ ...this.state, act: "" });
     this.state = next;
     if (!same || next.act !== this.steps.at(-1)!.act) this.steps.push(next);
-    this.note(`${next.act.padEnd(11)} ${JSON.stringify({ order: next.order, onScreen: next.onScreen, open: next.open, sel: next.sel, armed: next.armed, origin: next.origin, searching: next.searching, hidden: next.hidden })}`);
+    this.note(`${next.act.padEnd(11)} ${JSON.stringify({ order: next.order, onScreen: next.onScreen, open: next.open, sel: next.sel, armed: next.armed, origin: next.origin, searching: next.searching, hidden: next.hidden, run: next.run, pressed: next.pressed })}`);
   }
 
   async capture(): Promise<string> {
@@ -457,6 +477,10 @@ export const STEP_EVENTS: Record<string, string[]> = {
   search: ["agents_menu_search"],
   arm: ["agents_menu_close_armed"],
   delete: ["subagent_closed", "instance_closed"],
+  // A press that goes on past an emptied search is left alone; before fx did
+  // that, it armed the close instead.
+  ignored: ["agents_menu_close_ignored", "agents_menu_close_armed"],
+  run: ["agents_menu_search"],
   slash_close: ["instance_closed"],
 };
 
@@ -468,9 +492,32 @@ function closeInstance(world: World, target: string) {
   if (target === "i1") world.working.clear();
 }
 
+/// `key` sent `count` times in one write, as a held key repeats it: fx reads
+/// them one after the other with nothing between.
+function burst(key: string, count: number): string {
+  return Array.from({ length: count }, () => key).join(" ");
+}
+
+/// The close key a press arms or closes with: not the one whose run has
+/// edited the search, which that run would leave unpressed.
+function freshCloseKey(world: World, random: () => number): CloseKey {
+  const keys = CLOSE_KEYS.filter((key) => key !== world.state.run);
+  return keys[Math.floor(random() * keys.length)]!;
+}
+
 /// Performs one model action on the binary and returns what it shows after.
+///
+/// Besides the model's steps there are two the person takes with a close key:
+/// `run` holds Backspace, or Delete with the cursor at the start, down through
+/// the whole search and past it, in one write; and `ignored` presses the key
+/// of a run that emptied the search once more.
 export async function perform(world: World, act: string, random: () => number): Promise<State> {
   world.mark();
+  const before = world.state;
+  // The close key the step pressed, and the run it leaves, when the step is
+  // one of the close key's; any other step ends a run.
+  let pressed: CloseKey | null = null;
+  let run: string | null = null;
   switch (act) {
     // Down opens the list only from an empty composer.
     case "open": await world.keys(random() < 0.5 || world.hasDraft() ? "C-x" : "Down"); break;
@@ -482,15 +529,47 @@ export async function perform(world: World, act: string, random: () => number): 
     case "close": await world.paste("am-paste "); break;
     case "search": {
       const roll = random();
-      if (world.state.searching && roll < 0.25) await world.keys("BSpace");
-      else if (world.state.searching && roll < 0.4) await world.keys("Escape");
-      else await world.type(SEARCH_LETTERS[Math.floor(random() * SEARCH_LETTERS.length)]!);
+      if (world.state.searching && roll < 0.25) {
+        await world.keys("BSpace");
+        pressed = "bs";
+        run = "bs";
+        world.searchLength = Math.max(0, world.searchLength - 1);
+      } else if (world.state.searching && roll < 0.4) {
+        await world.keys("Escape");
+        world.searchLength = 0;
+      } else {
+        await world.type(SEARCH_LETTERS[Math.floor(random() * SEARCH_LETTERS.length)]!);
+        world.searchLength += 1;
+      }
       break;
     }
-    case "arm": await world.keys("BSpace"); break;
+    case "run": {
+      const key: CloseKey = random() < 0.5 ? "bs" : "del";
+      const extra = 1 + Math.floor(random() * 4);
+      // Delete takes text from the cursor on, so the cursor goes to the start.
+      if (key === "del") await world.keys(burst("Left", world.searchLength));
+      await world.keys(burst(KEY_NAMES[key], world.searchLength + extra));
+      pressed = key;
+      run = key;
+      world.searchLength = 0;
+      break;
+    }
+    case "ignored": {
+      const key = before.run as CloseKey;
+      await world.keys(KEY_NAMES[key]);
+      pressed = key;
+      run = key;
+      break;
+    }
+    case "arm": {
+      pressed = freshCloseKey(world, random);
+      await world.keys(KEY_NAMES[pressed]);
+      break;
+    }
     case "delete": {
       const target = world.state.sel;
-      await world.keys("BSpace");
+      pressed = freshCloseKey(world, random);
+      await world.keys(KEY_NAMES[pressed]);
       if (world.instances.includes(target)) closeInstance(world, target);
       world.working.delete(target);
       break;
@@ -508,7 +587,15 @@ export async function perform(world: World, act: string, random: () => number): 
     default: throw new Error(`no binary step for ${act}`);
   }
   await world.settle(STEP_EVENTS[act] ?? []);
-  return await world.observe(act);
+  // A run is a search edit to the model, whatever its length.
+  const shown = await world.observe(act === "run" ? "search" : act);
+  if (!shown.searching) world.searchLength = 0;
+  // Every other key a step presses ends the run.
+  if (pressed === null) return { ...shown, run: NONE, pressed: NONE };
+  // A press that arms or closes ends the run of the other key and goes on
+  // with its own; an edit or a press left alone sets it.
+  const left = run ?? (before.run === pressed ? pressed : NONE);
+  return { ...shown, run: shown.open ? left : NONE, pressed };
 }
 
 /// TraceData.tla for TLC: the world's constants and every recorded trace.
@@ -516,7 +603,7 @@ export function traceModule(world: World, traces: State[][]): string {
   const str = (value: string) => JSON.stringify(value);
   const seq = (items: string[]) => `<<${items.map(str).join(", ")}>>`;
   const state = (s: State) =>
-    `[order |-> ${seq(s.order)}, onScreen |-> ${str(s.onScreen)}, open |-> ${s.open ? "TRUE" : "FALSE"}, sel |-> ${str(s.sel)}, armed |-> ${str(s.armed)}, origin |-> ${str(s.origin)}, searching |-> ${s.searching ? "TRUE" : "FALSE"}, hidden |-> {${s.hidden.map(str).join(", ")}}, act |-> ${str(s.act)}]`;
+    `[order |-> ${seq(s.order)}, onScreen |-> ${str(s.onScreen)}, open |-> ${s.open ? "TRUE" : "FALSE"}, sel |-> ${str(s.sel)}, armed |-> ${str(s.armed)}, origin |-> ${str(s.origin)}, searching |-> ${s.searching ? "TRUE" : "FALSE"}, hidden |-> {${s.hidden.map(str).join(", ")}}, run |-> ${str(s.run)}, pressed |-> ${str(s.pressed)}, act |-> ${str(s.act)}]`;
   return [
     "---- MODULE TraceData ----",
     "\\* Written by tests/tla/drivers/agents_menu/binary-to-spec.ts for one run.",

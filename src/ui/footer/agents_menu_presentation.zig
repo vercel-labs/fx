@@ -97,10 +97,14 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
-/// A working subagent's current call, else its session's title.
+/// A working subagent's current call, else its session's title, else what a
+/// subagent is for, else `untitled`. The purpose is model-written text like
+/// the title, and `appendCell` draws all of them through the same escaping and
+/// display-width cut.
 fn titleOf(row: AgentsMenuRow) []const u8 {
     if (row.activity.len > 0) return row.activity;
-    return if (row.title.len > 0) row.title else untitled;
+    if (row.title.len > 0) return row.title;
+    return if (row.purpose.len > 0) row.purpose else untitled;
 }
 
 /// The model as the status line names it, then its effort, such as
@@ -508,6 +512,78 @@ test "the state column is as wide as the widest state shown, so the model follow
     });
 }
 
+test "a failed or stopped subagent's state fits the state column, wide and narrow" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active },
+        .{ .name = "builder", .subagent = true, .title = "Build the parser", .state = "failed", .model = "anthropic/claude-opus-4-7" },
+        .{ .name = "tester", .subagent = true, .title = "Run the auth tests", .state = "stopped", .model = "openai/gpt-5.4-mini" },
+        .{ .name = "docs", .subagent = true, .title = "", .state = "idle" },
+    };
+    const projection: AgentsMenuProjection = .{ .rows = &rows };
+    // The column is as wide as the widest state shown, "stopped".
+    try expectRows(projection, 80, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       Fix the login bug   working",
+        "  ├ builder  Build the parser    failed   opus 4-7",
+        "  ├ tester   Run the auth tests  stopped  gpt-5.4-mini",
+        "  └ docs     new session         idle",
+    });
+    // Narrower, the model goes first, and the state always fits.
+    try expectRows(projection, 48, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       Fix the login bug   working",
+        "  ├ builder  Build the parser    failed",
+        "  ├ tester   Run the auth tests  stopped",
+        "  └ docs     new session         idle",
+    });
+    try expectRows(projection, 40, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       Fix the login bug  working",
+        "  ├ builder  Build the parser   failed",
+        "  ├ tester   Run the auth tes…  stopped",
+        "  └ docs     new session        idle",
+    });
+}
+
+test "a stopped row that shows what its subagent is for keeps the state column, wide and narrow" {
+    // After a quit and a resume, a subagent whose turn the quit cut short has
+    // no title yet, so its row shows its purpose and says `stopped`.
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .title = "", .purpose = "日本語日本語日本語日本語", .state = "stopped" },
+        .{ .name = "docs", .subagent = true, .title = "", .purpose = "Write the docs.", .state = "idle" },
+    };
+    const projection: AgentsMenuProjection = .{ .rows = &rows };
+    for ([_]u16{ 80, 48 }) |width| {
+        try expectRows(projection, width, max_inline_rows, &.{
+            "  Agents 3",
+            "",
+            "  main     Fix the login bug         idle",
+            "  ├ scout  日本語日本語日本語日本語  stopped",
+            "  └ docs   Write the docs.           idle",
+        });
+    }
+    // Narrower, the title cell takes what is left: a cut keeps whole wide
+    // characters, and the state column stays under one column on every row.
+    try expectRows(projection, 40, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main     Fix the login bug    idle",
+        "  ├ scout  日本語日本語日本語…  stopped",
+        "  └ docs   Write the docs.      idle",
+    });
+    try expectRows(projection, 34, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main     Fix the logi…  idle",
+        "  ├ scout  日本語日本語…  stopped",
+        "  └ docs   Write the do…  idle",
+    });
+}
+
 test "a narrow agent list leaves out the profile, then the model, and cuts a long title" {
     const projection: AgentsMenuProjection = .{ .rows = &test_team };
     try expectRows(projection, 64, max_inline_rows, &.{
@@ -530,6 +606,60 @@ test "a narrow agent list leaves out the profile, then the model, and cuts a lon
         "  main      Fix the lo…  working",
         "  ├ tester  Run the au…  needs approval",
         "  └ docs    new session  idle",
+    });
+}
+
+test "a row's title comes before what the subagent is for, which comes before new session, and a working call comes first" {
+    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
+    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
+    try std.testing.expectEqualStrings("Review the parser", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .state = "idle" }));
+    try std.testing.expectEqualStrings("You review the parser.", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .state = "idle" }));
+    try std.testing.expectEqualStrings(untitled, titleOf(.{ .name = "a", .title = "", .purpose = "", .state = "idle" }));
+}
+
+test "a subagent with no title shows what it is for in the title's place, and a row with a title or none keeps its text" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "", .state = "idle" },
+        .{ .name = "auditor", .subagent = true, .title = "", .purpose = "You audit the parser.", .state = "working", .state_tone = .active },
+        .{ .name = "writer", .subagent = true, .title = "Write the docs", .purpose = "You write the docs.", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .title = "", .purpose = "", .state = "idle" },
+    };
+    try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       new session            idle",
+        "  ├ auditor  You audit the parser.  working",
+        "  ├ writer   Write the docs         idle",
+        "  └ scout    new session            idle",
+    });
+}
+
+test "a purpose is drawn as a title is: control bytes, bidi overrides, and wide characters are escaped or counted, and a cut keeps whole characters" {
+    // An escape sequence, a right-to-left override, CJK, and an emoji.
+    const wide = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .title = "", .purpose = "Audit \x1b[2J\u{202e}日本語 \u{1F642} logic", .state = "working", .state_tone = .active },
+        .{ .name = "docs", .subagent = true, .title = "", .purpose = "Write", .state = "idle" },
+    };
+    // The state column starts under the same column on every row, so the wide
+    // characters count as the columns they take.
+    try expectRows(.{ .rows = &wide }, 80, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main     Fix the login bug                     idle",
+        "  ├ scout  Audit \\x1b[2J\\u{202e}日本語 \u{1F642} logic  working",
+        "  └ docs   Write                                 idle",
+    });
+    for ([_]u16{ 2, 3, 4 }) |row_index| {
+        const row = try testRow(.{ .rows = &wide }, row_index, 80, max_inline_rows);
+        defer std.testing.allocator.free(row.text);
+        try std.testing.expect(text_utils.isTerminalSafe(row.text));
+    }
+
+    // Too narrow for all of it: the cut lands between whole wide characters.
+    const long = [_]AgentsMenuRow{.{ .name = "scout", .subagent = true, .title = "", .purpose = "日本語日本語日本語日本語", .state = "idle" }};
+    try expectRows(.{ .rows = &long }, 30, 1, &.{
+        "  └ scout  日本語日本…   idle",
     });
 }
 

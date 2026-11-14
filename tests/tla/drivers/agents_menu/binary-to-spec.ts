@@ -8,11 +8,14 @@
 // stands. With the list closed: open it (Ctrl+X, or Down on an empty
 // composer), or /close the instance on screen while another stays open. With
 // it open: Up, Down, Enter, Esc or Ctrl+X, a paste, a search letter,
-// Backspace, or Esc on a search, the first Delete on a row that can close, the
-// second Delete, and, with no search, one held subagent finishing its turn,
-// which can reorder the rows under the highlight. After each step it reads
-// the model's variables from the binary (lib.ts `observe`) and records the
-// state.
+// Backspace, or Esc on a search, the first press of Backspace or forward
+// Delete on a row that can close, the second, a held Backspace or Delete that
+// clears the search and goes on past it, one more press of the key of such a
+// run, and, with no search, one held subagent finishing its turn, which can
+// reorder the rows under the highlight. After each step it reads the model's
+// variables from the binary (lib.ts `observe`) and records the state; which
+// close key was pressed, and whose run edited the search, it records from the
+// keys it sent.
 //
 // Usage:
 //   bun tests/tla/drivers/agents_menu/binary-to-spec.ts [--seed 1] [--runs 3] [--steps 60]
@@ -81,6 +84,10 @@ for (let run = 1; run <= runs; run += 1) {
       // An armed close is mostly confirmed, so closes happen often enough to
       // check the row that takes the closed one's place.
       if (!state.searching && state.armed !== NONE && state.armed === state.sel) choices.push(["delete", 300]);
+      // A close key held down through the search and past it must go on to
+      // nothing; one more press of its key after that is left alone too.
+      if (state.searching) choices.push(["run", 25]);
+      if (!state.searching && state.run !== NONE) choices.push(["ignored", 40]);
       if (releasable.length > 0) choices.push(["release", 10]);
       const act = pick(random, choices);
       if (act === "release") {
