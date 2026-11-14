@@ -5496,13 +5496,15 @@ pub const TranscriptRuntime = struct {
         return self.pending_session_scrollback_handoff != null;
     }
 
-    pub fn cancelSessionScrollbackHandoff(self: *TranscriptRuntime) void {
+    /// Gives up a handoff that still has rows to write, keeping the
+    /// transcript, and redraws it. `reason` names why, for the trace.
+    pub fn cancelSessionScrollbackHandoff(self: *TranscriptRuntime, reason: []const u8) void {
         const pending = self.pending_session_scrollback_handoff orelse return;
         self.pending_session_scrollback_handoff = null;
-        self.resetTranscriptAnchor("session_scrollback_handoff_geometry_changed");
+        self.resetTranscriptAnchor("session_scrollback_handoff_cancelled");
         self.markTranscriptDirty();
         self.render_requests.request(.footer);
-        debug_trace.logf("scroll", "session_scrollback_handoff_cancel remaining_rows={d} reason=geometry_changed", .{pending.remaining_rows});
+        debug_trace.logf("scroll", "session_scrollback_handoff_cancel remaining_rows={d} reason={s}", .{ pending.remaining_rows, reason });
     }
 
     pub fn commitVisibleTranscriptBeforeFreshSession(
