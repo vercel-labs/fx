@@ -7072,8 +7072,8 @@ test "subagents' workers and main's worker add approvals while main's worker and
             return self.writers_left.load(.acquire) > 0;
         }
 
-        /// A subagent's worker: one approval after another, each a new
-        /// target, so the list grows and moves.
+        /// An agent's worker, a subagent's or main's: one approval after
+        /// another, each a new target, so the list grows and moves.
         fn write(self: *@This(), child: *agents.Agent, prefix: []const u8) void {
             defer _ = self.writers_left.fetchSub(1, .release);
             for (0..approvals) |i| {
@@ -7083,24 +7083,6 @@ test "subagents' workers and main's worker add approvals while main's worker and
                     return;
                 };
                 Worker.propagateGrant(self.app, child, "skill", target) catch {
-                    _ = self.torn.fetchAdd(1, .monotonic);
-                    return;
-                };
-            }
-        }
-
-        /// Main's worker: its own answers, each written at once. Main's thread
-        /// writes the same answers below, as it does when it handles the events
-        /// that carry them.
-        fn writeAsMainWorker(self: *@This()) void {
-            defer _ = self.writers_left.fetchSub(1, .release);
-            for (0..approvals) |i| {
-                var buf: [24]u8 = undefined;
-                const target = std.mem.print(&buf, "m-{d}", .{i}) catch {
-                    _ = self.torn.fetchAdd(1, .monotonic);
-                    return;
-                };
-                Worker.propagateGrant(self.app, &self.app.main_agent, "skill", target) catch {
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
@@ -7155,7 +7137,10 @@ test "subagents' workers and main's worker add approvals while main's worker and
     var race = Race{ .app = app };
     const first_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &first.agent, "a" });
     const second_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &second.agent, "b" });
-    const main_writer = try std.Thread.spawn(.{}, Race.writeAsMainWorker, .{&race});
+    // Main's worker writes its own answers, each at once. Main's thread writes
+    // the same answers below, as it does when it handles the events that carry
+    // them.
+    const main_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &app.main_agent, "m" });
     const worker_reader = try std.Thread.spawn(.{}, Race.readAsWorker, .{&race});
     const main_reader = try std.Thread.spawn(.{}, Race.readAsMainThread, .{&race});
     const display_reader = try std.Thread.spawn(.{}, Race.readForDisplay, .{&race});
