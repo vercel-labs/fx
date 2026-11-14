@@ -981,14 +981,16 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
     async () => {
       // A file-size limit of zero fails the tape's first write as a full disk
       // does. The limit also covers a stderr file, so the message is read from
-      // the pane.
+      // the pane. It also stops an instrumented build's profile writer, so the
+      // script unsets LLVM_PROFILE_FILE: the empty profile then goes to this
+      // test's folder, not among the PGSO training profiles.
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-fault-")));
       const home = join(root, "home");
       const limited = join(root, "limited.sh");
       mkdirSync(home, { recursive: true });
       writeFileSync(
         limited,
-        `#!/bin/sh\ntrap '' XFSZ\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
+        `#!/bin/sh\ntrap '' XFSZ\nunset LLVM_PROFILE_FILE\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
         { mode: 0o700 },
       );
 

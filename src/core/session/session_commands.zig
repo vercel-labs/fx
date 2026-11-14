@@ -16,6 +16,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -990,7 +991,18 @@ pub fn Commands(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, announce: bool, persist: bool) !void {
+        /// What the transcript says about an applied effort.
+        const EffortReport = enum {
+            /// One line naming the level and the model.
+            named,
+            /// The settings line saying where the level was saved.
+            saved,
+            /// Nothing unless saving failed or left a warning: the caller
+            /// reports the change, or the status line alone names the level.
+            none,
+        };
+
+        fn applyEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, report: EffortReport, persist: bool) !void {
             agent.effort = effort;
             agent.worker.syncQueuedPromptEffort(agent.effort);
 
@@ -1000,11 +1012,11 @@ pub fn Commands(comptime App: type) type {
                     agent,
                     .{ .effort = agent.effort },
                     "effort",
-                    !announce,
+                    report == .saved,
                 );
             }
 
-            if (announce) try announceEffortSelection(app, agent);
+            if (report == .named) try announceEffortSelection(app, agent);
             app.shell.render_requests.request(.footer);
         }
 
@@ -1020,12 +1032,42 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn selectEffortFromSettings(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
-            try applyEffort(app, agent, effort, false, true);
+            try applyEffort(app, agent, effort, .saved, true);
         }
 
         /// Applies `effort` to `agent`'s model, saves it, and names it.
         pub fn selectEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
-            try applyEffort(app, agent, effort, true, true);
+            try applyEffort(app, agent, effort, .named, true);
+        }
+
+        /// Ctrl+T: moves `agent`'s model to the next effort in the cycle
+        /// `default`, then each level the model lists in its order, then
+        /// `default` again (`model_capabilities.nextReasoningEffort`). Saves
+        /// the effort as `/effort` does and, unless saving fails or leaves a
+        /// warning, writes nothing to the transcript, as Shift+Tab does for
+        /// the permission mode: the status line names the level in use. A
+        /// running turn keeps the effort it started with. A model without
+        /// levels gets a notice saying so.
+        pub fn cycleEffort(app: *App, agent: *AppAgent) !void {
+            const model = provider_runtime.modelOf(app, agent);
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const next = model_capabilities.nextReasoningEffort(capabilities, agent.effort) orelse {
+                try writeNoEffortLevelsNotice(app, model, "ctrl+t");
+                return;
+            };
+            try applyEffort(app, agent, next, .none, true);
+        }
+
+        /// Says why `model` offers no levels: it has none, or its catalog
+        /// entry has not loaded, in which case `retry` names what to try again.
+        fn writeNoEffortLevelsNotice(app: *App, model: []const u8, retry: []const u8) !void {
+            const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
+            const message = if (loading)
+                try app.alloc.print("levels for {s} are still loading; try {s} again in a moment", .{ model, retry })
+            else
+                try app.alloc.print("{s} has no levels to choose from", .{model});
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
         }
 
         /// What `/effort` asks of the shell once its arguments are handled.
@@ -1043,13 +1085,7 @@ pub fn Commands(comptime App: type) type {
             const model = provider_runtime.modelOf(app, agent);
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len == 0) {
-                const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
-                const message = if (loading)
-                    try app.alloc.print("levels for {s} are still loading; try /effort again in a moment", .{model})
-                else
-                    try app.alloc.print("{s} has no levels to choose from", .{model});
-                defer app.alloc.free(message);
-                try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
+                try writeNoEffortLevelsNotice(app, model, "/effort");
                 return .done;
             }
             const level = std.mem.trim(u8, rest, " \t\r\n");
@@ -1087,13 +1123,14 @@ pub fn Commands(comptime App: type) type {
             ultrafast_mode: bool,
         ) !void {
             try setResolvedModelRuntime(app, agent, model);
+            settleStartModel(app);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.providerOf(app, agent),
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len > 0) {
-                try applyEffort(app, agent, effort, false, false);
+                try applyEffort(app, agent, effort, .none, false);
                 patch.effort = effort;
             }
             const selected_ultrafast_mode = capabilities.supports_ultrafast_mode and ultrafast_mode;
@@ -1354,6 +1391,7 @@ pub fn Commands(comptime App: type) type {
         fn setResolvedModel(app: *App, agent: *AppAgent, resolved: []const u8, announce: bool) !void {
             const model_changed = !std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved);
             try setResolvedModelRuntime(app, agent, resolved);
+            settleStartModel(app);
             if (model_changed and app.fast_mode) {
                 try applyFastMode(app, agent, false, false, false);
             }
@@ -1464,6 +1502,20 @@ pub fn Commands(comptime App: type) type {
             app_session_runtime.Runtime(App).syncTerminalTitle(app, agent);
         }
 
+        /// A model the user chose keeps its place: the Token Pass check no
+        /// longer picks the start model (`src/core/app/token_pass_check.zig`).
+        fn settleStartModel(app: *App) void {
+            if (comptime @hasField(App, "token_pass_check")) app.token_pass_check.settle("model_choice");
+        }
+
+        /// Puts `agent` on `model` at `fast_mode` for this run, without a
+        /// notice and without saving either: the model a new session starts
+        /// on for its team (`src/core/app/token_pass_check.zig`).
+        pub fn adoptStartModel(app: *App, agent: *AppAgent, model: []const u8, fast_mode: bool) !void {
+            try setResolvedModelRuntime(app, agent, model);
+            if (app.fast_mode != fast_mode) try applyFastMode(app, agent, fast_mode, false, false);
+        }
+
         fn announceModelSelection(app: *App, agent: *AppAgent) !void {
             const selected = provider_runtime.modelOf(app, agent);
             const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
@@ -1481,33 +1533,20 @@ pub fn Commands(comptime App: type) type {
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
         }
 
-        /// After a switch to a Token Pass model: a warning when Fast mode
-        /// would bill AI Gateway credits instead, or else one line that
-        /// Token Pass covers the model, until fx sees this team use it.
+        /// After a switch to a Token Pass model of a team with Token Pass: a
+        /// warning when Fast mode would bill AI Gateway credits instead.
         fn announceTokenPass(app: *App, agent: *AppAgent, selected: []const u8) !void {
             if (!isGatewayTokenPassModel(app, agent, selected)) return;
-            if (tokenPassModelRunsFast(app, agent, selected)) {
-                try warnTokenPassFast(app);
-                return;
-            }
-            const status: token_pass.Status = if (comptime @hasField(App, "model_cache"))
-                app.model_cache.tokenPassStatus()
-            else
-                .unknown;
-            if (status == .active) return;
-            try app.writeDomainNotice(.{
-                .topic = "",
-                .tone = .neutral,
-                .body = "Token Pass covers this model: " ++ token_pass.docs_url,
-            }, true);
+            if (tokenPassModelRunsFast(app, agent, selected)) try warnTokenPassFast(app);
         }
 
         /// Whether Token Pass credit can pay for `model` on the agent's
-        /// provider. Only AI Gateway serves Token Pass.
+        /// provider: only AI Gateway serves Token Pass, and only for a model
+        /// the team's catalog marks.
         fn isGatewayTokenPassModel(app: *App, agent: *AppAgent, model: []const u8) bool {
             if (comptime !provider_runtime.supported(App)) return false;
             if (provider_runtime.providerOf(app, agent) != .gateway) return false;
-            return token_pass.isFeaturedModel(model);
+            return token_pass_team.paysFor(model);
         }
 
         /// Whether the agent's speed setting sends `model` at a speed Token
@@ -2091,6 +2130,7 @@ const FakeApp = struct {
     fetch_ids: []const []const u8 = &.{},
     fail_fetch: bool = false,
     last_tone: ?types.NoticeTone = null,
+    model_cache_loading: bool = false,
     preference_commit_count: usize = 0,
     last_preference_model: std.ArrayList(u8) = .empty,
     last_preference_provider: ?model_provider.ProviderId = null,
@@ -2203,6 +2243,10 @@ const FakeApp = struct {
             }
         }
         return model_capabilities.capabilitiesForModel(model);
+    }
+
+    pub fn isModelCacheLoading(self: *const FakeApp) bool {
+        return self.model_cache_loading;
     }
 
     fn setGatewayControls(
@@ -3282,6 +3326,64 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     try std.testing.expectEqual(@as(usize, 1), app.agent().worker.effort_sync_count);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands /effort and ctrl+t say why a model offers no levels" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "provider/plain");
+    defer app.deinit();
+
+    try std.testing.expect(try Commands(FakeApp).handleEffort(&app, (&app).agent(), "") == .done);
+    try std.testing.expectEqualStrings("* effort: provider/plain has no levels to choose from\n", app.text());
+    app.clearTranscript();
+    try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+    try std.testing.expectEqualStrings("* effort: provider/plain has no levels to choose from\n", app.text());
+
+    // Until the catalog loads, each names what to try again.
+    app.model_cache_loading = true;
+    app.clearTranscript();
+    try std.testing.expect(try Commands(FakeApp).handleEffort(&app, (&app).agent(), "high") == .done);
+    try std.testing.expectEqualStrings(
+        "* effort: levels for provider/plain are still loading; try /effort again in a moment\n",
+        app.text(),
+    );
+    app.clearTranscript();
+    try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+    try std.testing.expectEqualStrings(
+        "* effort: levels for provider/plain are still loading; try ctrl+t again in a moment\n",
+        app.text(),
+    );
+
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.effort_sync_count);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "session_commands cycleEffort steps through default and the model's levels, syncs queued prompts, and saves each one" {
+    const alloc = std.testing.allocator;
+    const model = "provider/new-reasoning-model";
+    var app = try FakeApp.init(alloc, "/tmp/workspace", model);
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    app.setGatewayControls(model, &efforts, false);
+
+    // `default` steps to the first level, and the last one back to `default`.
+    for ([_]types.ReasoningEffort{ efforts[0], efforts[1], .auto, efforts[0] }, 1..) |effort, press| {
+        try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(@as(?types.ReasoningEffort, effort), app.agent().worker.synced_effort);
+        try std.testing.expectEqual(press, app.agent().worker.effort_sync_count);
+        try std.testing.expectEqual(@as(?types.ReasoningEffort, effort), app.last_preference_effort);
+        try std.testing.expectEqual(press, app.preference_commit_count);
+    }
+    // Only the effort is saved: the model stays the one in use.
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.last_preference_model.items);
+    try std.testing.expect(app.agent().worker.synced_model == null);
 }
 
 test "session_commands model selection clears fast mode when the selected model has no fast control" {

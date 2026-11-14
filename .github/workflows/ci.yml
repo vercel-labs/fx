@@ -16,9 +16,12 @@ on:
 
 concurrency:
   # A manual dispatch gets its own group so it cannot cancel the push run on
-  # main.
+  # main. A push to main runs the durable-session model check, which takes
+  # about 40 minutes, so a newer push waits instead of cancelling it. Without
+  # this, merges land faster than a run can finish and main never reports a
+  # result. GitHub keeps only the newest waiting run.
   group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   zig_mode:
@@ -102,6 +105,9 @@ jobs:
 
       - name: Walk fx ask turns along the empty-reply model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/driver.ts --self-check
+
+      - name: Walk fx ask turns along the malformed tool call model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,

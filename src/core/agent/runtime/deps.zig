@@ -224,6 +224,11 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
+    /// Called when turn `turn_id` ends interrupted, before it is reported.
+    /// When the user cancelled the turn, the host stops the commands that
+    /// steering moved to the background during it; a turn that steering
+    /// ended keeps them. Hosts without steering leave it unset.
+    stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
