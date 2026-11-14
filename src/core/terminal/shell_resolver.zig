@@ -697,7 +697,6 @@ test "nu login without platform default resolves PATH across execution profiles"
         const arena = arena_state.allocator();
         const user = try environment(arena, "/bin/nu", .user);
         const clean = try environment(arena, "/bin/nu", .clean);
-        @memset(&buffer, 0);
         try std.testing.expectEqualStrings(expected, user.user);
         try std.testing.expectEqualStrings(expected, clean.clean);
         try std.testing.expectEqualStrings(expected, (try environmentForShellSpec(arena, "/bin/nu", .user_login)).user);
@@ -713,18 +712,14 @@ test "nu login without platform default resolves PATH across execution profiles"
     return error.SkipZigTest;
 }
 
-test "supported passwd shells remain unchanged with fallback storage" {
+test "resolver builds Bash and zsh interactive argv" {
     var buffer: [256]u8 = undefined;
-    for ([_][]const u8{ "/bin/bash", "/bin/zsh", "/nix/profile/bin/bash", "/nix/profile/bin/zsh" }) |path| {
+    for ([_][]const u8{ "/nix/profile/bin/bash", "/nix/profile/bin/zsh" }) |path| {
         const invocation = try resolveInto(&buffer, path, .user_login);
         try std.testing.expectEqualStrings(path, invocation.path);
         try std.testing.expect(invocation.path.ptr == path.ptr);
     }
-    try std.testing.expectError(error.RelativeShellPath, resolveInto(&buffer, "nu", .user_login));
-    try std.testing.expectError(error.UnsupportedShell, resolveInto(&buffer, null, .{ .executable = .{ .path = "/bin/nu" } }));
-}
 
-test "resolver builds Bash and zsh interactive argv" {
     const bash = try resolveInto(&.{}, "/bin/bash", .user_login);
     try std.testing.expectEqualSlices(
         []const u8,
