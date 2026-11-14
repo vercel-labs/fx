@@ -3155,7 +3155,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a working subagent's row names its current call and time, and its quiet command wakes main's wait",
+    "a working subagent's row keeps its title and shows its call's time, and its quiet command wakes main's wait",
     async () => {
       const command = "sh -c 'printf TUI-QUIET-READY; exec sleep 600'";
       // The shell session the child's run started, from its result.

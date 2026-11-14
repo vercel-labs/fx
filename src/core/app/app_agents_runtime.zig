@@ -169,8 +169,8 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
-    /// Backs each subagent row's current call and its state with the call's
-    /// time, such as "working 12s". Owned.
+    /// Backs each subagent row's state with its current call's time, such
+    /// as "working 12s". Owned.
     activities: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
