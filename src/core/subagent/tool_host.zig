@@ -4376,6 +4376,35 @@ test "the user's stop while the user's turn runs counts the message waiting for 
     try std.testing.expect(!runtime.anyWorking());
 }
 
+test "the user's stop of the user's own turn, with nothing waiting, ends it and the next message starts" {
+    var t: StopFixture = undefined;
+    try t.init(.{});
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    const arena = t.arena();
+    const runtime = t.runtime;
+    const fixture = &t.fixture;
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    runtime.userStopped(child_id, 0);
+    runtime.endUserWork(child_id, work_id, .cancelled, "");
+    try waitUntilQuiet(runtime);
+    // Nothing waited, so the stop dropped nothing and tells the parent of no drop.
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+    for (fixture.reports.items) |report| try std.testing.expect(std.mem.find(u8, report, " dropped=") == null);
+    try std.testing.expect(!runtime.anyWorking());
+    // The child is free again.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
+    try waitForRuns(fixture, 2);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+}
+
 test "the parent's close while a woken turn waits for the work that ends drops that turn, and the close is written" {
     var t: StopFixture = undefined;
     try t.init(.{ .hold = true });
