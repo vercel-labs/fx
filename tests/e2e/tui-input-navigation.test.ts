@@ -1199,6 +1199,22 @@ tmuxTest(
       expect(body).not.toContain(siblingRule);
       expect(body.indexOf(rootRule)).toBeLessThan(body.indexOf(nestedRule));
     };
+    // The folder's rules reach the model as a note on the first image turn's
+    // message, never in the instructions, so every request keeps the
+    // instructions the first one sent and the rules appear once.
+    const instructionsOf = (body: string) =>
+      (JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> }).prompt.filter(
+        (message) => message.role === "system",
+      );
+    const expectRulesOutsideInstructions = (bodies: string[]) => {
+      const first = instructionsOf(bodies[0]!);
+      expect(JSON.stringify(first)).toContain(rootRule);
+      for (const body of bodies) {
+        expect(instructionsOf(body)).toEqual(first);
+        expect(JSON.stringify(instructionsOf(body))).not.toContain(nestedRule);
+        expect(body.split(nestedRule)).toHaveLength(2);
+      }
+    };
     const localGateway = startFakeGateway(
       [
         fakeGatewayFinalText("IMAGE_TYPED_OK"),
@@ -1277,6 +1293,7 @@ tmuxTest(
     expect(localGateway.requests[2]?.body).toContain('"type":"file"');
     expect(localGateway.requests[2]?.body).not.toContain(scopedImage);
     expectScopedContext(localGateway.requests[2]!.body);
+    expectRulesOutsideInstructions(localGateway.requests.map((request) => request.body));
 
     const escapes = await active.captureFullScrollbackEscapes();
     expect(escapes).toContain("\x1b]8;;file://");

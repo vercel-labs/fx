@@ -3,14 +3,15 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { logLines, onlySessionId } from "./saved-sessions";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
 let cleanup: string | null = null;
-let gateway: ReturnType<typeof startFakeGateway> | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | ReturnType<typeof startDynamicFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
 
 afterEach(async () => {
@@ -647,6 +648,80 @@ describe("/mcp in the shell", () => {
     expect(menu(gateway.requests[1]!.body)).toBe(firstMenu);
     expect(notedServers(gateway.requests[1]!.body)).toBe("fixture");
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a change noted in a turn that compaction folds away is noted again, and the menu stays as first sent", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer(), outside: fixtureServer() } });
+    let answered = 0;
+    const dynamic = startDynamicFakeGateway((raw: string) => {
+      const request = JSON.parse(raw);
+      if (request.tools?.length === 0 && request.toolChoice?.type === "none") return fakeGatewayFinalText("Turn 1\nIn between: none");
+      answered += 1;
+      return fakeGatewayFinalText(`done ${answered}`);
+    }, { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    gateway = dynamic;
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: dynamic.baseUrl, FX_GATEWAY_CHAT_URL: dynamic.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    const notedServers = (body: string) => [...text(body).matchAll(/The toolbox now holds[\s\S]*?MCP servers: (.*)\n/g)].map((match) => match[1]);
+    const agentBodies = () => dynamic.requests.map((request) => request.body)
+      .filter((body) => { const request = JSON.parse(body); return !(request.tools?.length === 0 && request.toolChoice?.type === "none"); });
+    // Each turn ends with its status line; the next prompt waits for it, so
+    // no keystroke lands while the turn is still finishing.
+    const prompt = async (words: string) => {
+      const turn = answered + 1;
+      await tui!.sendText(words);
+      const ended = new RegExp(`done ${turn}\\n\\s*\\d+s \\(↑`);
+      await tui!.waitForPane((pane) => ended.test(pane), 15_000);
+      await tui!.waitForComposer(15_000);
+    };
+    const compactions = () => logLines(root.home, onlySessionId(root.home)).filter((line) => line.kind === "compacted").length;
+
+    await prompt("first prompt");
+    const firstMenu = menu(agentBodies()[0]!);
+    expect(firstMenu).toContain("- fixture");
+    expect(firstMenu).toContain("- outside");
+    // The note telling the model that outside is gone goes in this turn.
+    expect((await mcp(root, "remove", "outside")).code).toBe(0);
+    await prompt("NOTED_TURN_PROMPT");
+    expect(notedServers(agentBodies()[1]!)).toEqual(["fixture"]);
+    // Four more turns, so the noted turn is older than the turns compaction keeps.
+    for (const n of [3, 4, 5, 6]) await prompt(`prompt ${n}`);
+
+    await tui.sendText("/compact");
+    for (let i = 0; i < 600 && compactions() === 0; i++) await Bun.sleep(25);
+    expect(compactions()).toBe(1);
+    await tui.waitForComposer(15_000);
+    await prompt("after compaction");
+    const after = agentBodies().at(-1)!;
+    // The noted turn was folded into the summary, and its note with it; the
+    // newer turns follow as sent.
+    const users = JSON.parse(after).prompt.filter((message: any) => message.role === "user")
+      .map((message: any) => typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text ?? "").join(""));
+    expect(users[0]).toStartWith("<compacted_conversation>");
+    expect(users[0]).toContain("NOTED_TURN_PROMPT");
+    expect(users.slice(1, -1)).toEqual(["prompt 3", "prompt 4", "prompt 5", "prompt 6"]);
+    // The note rides the new prompt, after everything earlier requests sent.
+    expect(users.at(-1)).toStartWith("after compaction\n");
+    // The conversation keeps its menu, so fx tells the model again what the
+    // toolbox holds now.
+    expect(menu(after)).toBe(firstMenu);
+    expect(notedServers(after)).toEqual(["fixture"]);
+  }, 120_000);
 
   test.skipIf(!tmuxAvailable())("a prompt sent while a turn runs keeps the current servers, and the next prompt after the turn loads the change", async () => {
     // Only SIGTERM ends it: it never reads stdin, and never answers.

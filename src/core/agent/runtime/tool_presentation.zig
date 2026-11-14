@@ -12,6 +12,7 @@ const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const mcp_tool_result = @import("../../mcp/tool_result.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -45,6 +46,17 @@ pub fn streamStartMayHaveExecutedAtProvider(
     if (isProviderSearchAlias(tool_name)) return true;
     const spec = registry.lookup(tool_name) orelse return false;
     return spec.provider_executed;
+}
+
+/// Whether a tool that may run at the provider only reads, as a search does,
+/// so running it again after a failed attempt is safe.
+pub fn providerToolOnlyReads(
+    registry: tool_dispatch.Registry,
+    tool_name: []const u8,
+) bool {
+    if (isProviderSearchAlias(tool_name)) return true;
+    const spec = registry.lookup(tool_name) orelse return false;
+    return spec.provider_executed and spec.activity_kind == .read;
 }
 
 fn fallbackToolDisplay(
@@ -159,7 +171,18 @@ pub const ProvisionalToolStatuses = struct {
             observed_kind = presentation.activity_kind;
             break :resource formatted;
         } else null;
-        const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
+        // A subagent call's row names its subagent once its arguments hold
+        // the name, while they stream in or once complete, and keeps a name
+        // it already shows; the first string in them is its action.
+        const is_subagent = std.mem.eql(u8, tool_name, "subagent");
+        if (is_subagent) {
+            observed_label = tooling_presentation.subagentStreamedAgent(arguments_json orelse "") orelse self.trackedLabel(tool_id);
+        }
+        const shown_label = if (is_subagent and observed_label != null)
+            (try text_utils.encodeTerminalSafe(scratch.allocator(), observed_label.?, 64)).bytes
+        else
+            observed_label;
+        const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, shown_label);
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
@@ -183,6 +206,33 @@ pub const ProvisionalToolStatuses = struct {
                 .text = label,
             },
         }) catch {};
+    }
+
+    /// Names the subagent a streaming `subagent` call's row is for as soon
+    /// as its arguments so far hold the whole name, so the row reads
+    /// `Managing reviewer` while the rest of the call streams in.
+    pub fn observeArguments(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        turn_id: u64,
+        tool_id: []const u8,
+        arguments: []const u8,
+    ) !void {
+        const index = self.findTracked(tool_id) orelse return;
+        const status = self.tracked.items[index];
+        if (!std.mem.eql(u8, status.tool_name, "subagent") or status.label_value != null) return;
+        if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
+            .ineligible => return,
+            .eligible => |metadata| metadata,
+        };
+        try self.publish(hooks, alloc, turn_id, status.id, status.tool_name, metadata.activity_kind, metadata.action_label, null, arguments);
+    }
+
+    fn trackedLabel(self: *const ProvisionalToolStatuses, id: []const u8) ?[]const u8 {
+        const index = self.findTracked(id) orelse return null;
+        return self.tracked.items[index].label_value;
     }
 
     pub fn finishMalformedToolArguments(
@@ -1142,10 +1192,7 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
         .object => |object| object,
         else => return false,
     };
-    const object = if (outer.get("request")) |request| switch (request) {
-        .object => |value| value,
-        else => return false,
-    } else outer;
+    const object = (try tool_args.unwrapRequest(parsed.arena.allocator(), outer)) orelse return false;
     const action = switch (object.get("action") orelse return false) {
         .string => |value| value,
         else => return false,
@@ -1216,7 +1263,8 @@ pub fn finishExecutedToolStatus(
     if (!status_started) return;
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     const command_decision = if (activity_kind == .command)
-        try commandOutcomeDecision(arena, result_memory.command_process_presentation)
+        (try commandOutcomeDecision(arena, result_memory.command_process_presentation)) orelse
+            try runningCommandDecision(arena, call, result.model_output)
     else
         null;
     const terminal_action_decision = if (std.mem.eql(u8, call.name, "shell"))
@@ -1414,6 +1462,77 @@ pub fn commandOutcomeDecision(
     };
 }
 
+/// The label of a shell `run` whose command was still running when the call
+/// returned, such as when steering moved it to the background or its
+/// `yield_time_ms` ran out. It has no exit status, so it must not read "Ran".
+pub const still_running_label = "Still running";
+
+/// The outcome of a shell `run` call whose result `output` reports
+/// `"state":"running"`, or null for any other call or result.
+pub fn runningCommandDecision(
+    arena: Allocator,
+    call: ToolCall,
+    output: []const u8,
+) !?ToolOutcomeDecision {
+    if (!std.mem.eql(u8, call.name, "shell")) return null;
+    if (std.mem.find(u8, output, "\"running\"") == null) return null;
+    // Only text that is not JSON gives no decision; running out of memory is
+    // reported, so the row does not read "Ran" for a command that still runs.
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const action = tool_args.optionalStringArg(args, "action") orelse "run";
+    if (!std.mem.eql(u8, action, "run")) return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const state = parsed.object.get("state") orelse return null;
+    if (state != .string or !std.mem.eql(u8, state.string, "running")) return null;
+    return .{ .outcome = .completed, .label = still_running_label };
+}
+
+test "a shell run that returns its command running reads Still running" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"steering_notice\":\"New steering arrived\"}";
+    const decision = (try runningCommandDecision(arena, run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, decision.outcome);
+
+    const no_action = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"command\":\"sleep 30\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, no_action, running)) != null);
+
+    const finished = "{\"session_id\":\"shell-1\",\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"running\"}";
+    try std.testing.expect((try runningCommandDecision(arena, run, finished)) == null);
+    const interact = ToolCall{ .id = "i", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, interact, running)) == null);
+    const read = ToolCall{ .id = "r", .name = "read_file", .arguments_json = "{}" };
+    try std.testing.expect((try runningCommandDecision(arena, read, running)) == null);
+    try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
+}
+
+fn checkRunningCommandDecisionAllocationFailures(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\"}";
+    const decision = (try runningCommandDecision(arena_state.allocator(), run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+}
+
+test "a running shell result reports out of memory instead of reading Ran" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkRunningCommandDecisionAllocationFailures,
+        .{},
+    );
+}
+
 pub fn terminalActionOutcomeDecision(
     arena: Allocator,
     presentation: ?types.TerminalActionPresentation,
@@ -1490,7 +1609,10 @@ fn failureStatusDetail(
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
-    const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    // A refused call's parameters read as which fields and types, not as the
+    // start of a protocol dump; the model still gets the server's own words.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -1675,6 +1797,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.toolbox,
+    test_builtin_tools.subagent,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -1861,6 +1984,26 @@ test "stream start execution certainty follows provider ownership" {
     ));
 }
 
+test "only a provider-run tool that reads is safe to run again" {
+    const writing_provider_tool = blk: {
+        var spec = test_builtin_tools.web_search;
+        spec.name = "provider_publish";
+        spec.activity_kind = .write;
+        break :blk spec;
+    };
+    const provider_registry = tool_dispatch.Registry{
+        .tools = &.{ test_builtin_tools.web_search, writing_provider_tool, test_builtin_tools.read_file },
+    };
+
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "web_search"));
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "exa_search"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "provider_publish"));
+    // A local tool is not a provider-run tool, and an unknown name is not
+    // known to read.
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "read_file"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "unknown_tool"));
+}
+
 test "tool lifecycle uses activity metadata from the supplied registry" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2029,6 +2172,49 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
+}
+
+test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, "subagent");
+    const action = eligibleActionLabel("subagent");
+    var named_buf: [512]u8 = undefined;
+    const named = try formatProvisionalProgressLabel(&named_buf, action, "reviewer");
+
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, null);
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("● Managing\x1b[0m", capture.events.items[1].progress.text);
+    // Part of the name is not yet a name.
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"revi");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\"");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expectEqualStrings("sub_1", capture.events.items[2].provisional.id.call_id);
+    try std.testing.expectEqualStrings(named, capture.events.items[3].progress.text);
+    // The rest of the call streams in without another publication.
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    // The stream's final start keeps the name.
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review it\"}}");
+    try std.testing.expectEqualStrings(named, capture.events.items[5].progress.text);
+
+    // A call without `request` starts with its action, which the stream's
+    // hint would name; the row names its subagent instead.
+    try statuses.publish(&hooks, alloc, 7, "sub_2", "subagent", kind, action, "message", "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"Run it\"}");
+    var tester_buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&tester_buf, action, "tester"), capture.events.items[7].progress.text);
+
+    // Other tools and unknown calls are left alone.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
+    const before = capture.events.items.len;
+    try statuses.observeArguments(&hooks, alloc, 7, "read_1", "{\"agent\":\"reviewer\"");
+    try statuses.observeArguments(&hooks, alloc, 7, "missing", "{\"agent\":\"reviewer\"");
+    try std.testing.expectEqual(before, capture.events.items.len);
 }
 
 test "provisional toolbox labels decode escaped UTF-8 and encode terminal controls before copying" {
@@ -3177,6 +3363,27 @@ test "cancelled command ignores malformed artifact metadata" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expect(terminal.command_artifact_handle == null);
+}
+
+test "a shell wait is read from top-level arguments and from either request wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { arguments_json: []const u8, wait: bool }{
+        .{ .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-1\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":{\"action\":\"wait\",\"session_id\":\"shell-1\"}}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\",\\\"session_id\\\":\\\"shell-1\\\"}\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\"}\"}", .wait = false },
+        .{ .arguments_json = "{\"request\":\"[\\\"wait\\\"]\"}", .wait = false },
+        .{ .arguments_json = "not json", .wait = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.wait, try isShellWaitCall(arena, .{
+            .id = "shell-wait",
+            .name = "shell",
+            .arguments_json = case.arguments_json,
+        }));
+    }
 }
 
 test "cancelled shell wait names the observation instead of the process" {

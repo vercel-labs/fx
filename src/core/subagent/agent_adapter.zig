@@ -28,6 +28,7 @@ const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
+const io_mod = @import("../shared/io.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
@@ -675,7 +676,8 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -687,6 +689,7 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
@@ -715,7 +718,8 @@ fn refreshGatewayCredential(
     context.config.tool_context.credential_source = current.source;
     context.config.tool_context.account_id = current.accountId();
     context.config.tool_context.gateway_team = current.gatewayTeam();
-    return worker_token;
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = worker_token };
 }
 
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1023,7 +1027,37 @@ fn pushLiveToolLifecycle(
     event: types.ToolLifecycleEvent,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    noteCallActivity(context, event);
     context.turn.appendLiveEvent(.{ .tool_lifecycle = event });
+}
+
+/// Keeps the turn's current call, with the label its own rows use, for the
+/// parent's status and agent list, and relays a shell command that crossed
+/// the quiet limit to the parent (`Runtime.noteChildQuiet`).
+fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
+    switch (event) {
+        .authoritative_started => |started| {
+            const metrics = context.turn.live_metrics orelse return;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            const call: types.ToolCall = .{
+                .id = started.id.call_id,
+                .name = started.tool_name,
+                .arguments_json = started.arguments_json orelse "{}",
+            };
+            const target = resolveToolActionDisplayTarget(context, arena.allocator(), call) catch null;
+            const label = describeToolAction(context, arena.allocator(), call, target, &.{}) catch started.tool_name;
+            metrics.callStarted(started.id.call_id, label, io_mod.milliTimestamp());
+        },
+        .terminal => |terminal| {
+            if (context.turn.live_metrics) |metrics| metrics.callEnded(terminal.id.call_id);
+            const memory = terminal.result_memory orelse return;
+            const crossing = memory.quiet_crossing orelse return;
+            const child_id = context.turn.child_id orelse return;
+            context.config.host.noteChildQuiet(child_id, context.turn.child_name orelse child_id, crossing);
+        },
+        .provisional, .progress, .turn_finished => {},
+    }
 }
 
 fn pushLiveDiff(

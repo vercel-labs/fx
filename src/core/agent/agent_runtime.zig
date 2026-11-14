@@ -24,6 +24,7 @@ pub const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
 pub const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 pub const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationResult;
 pub const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
+pub const RefreshedGatewayCredential = runtime_deps.RefreshedGatewayCredential;
 pub const TurnProgress = runtime_deps.TurnProgress;
 pub const TextEmission = runtime_deps.TextEmission;
 pub const OutOfCreditsChoice = runtime_deps.OutOfCreditsChoice;

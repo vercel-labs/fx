@@ -126,12 +126,19 @@ async function settled(app: App): Promise<string> {
 }
 
 /// Opens /fork, moves `up` rows from the newest prompt, and forks there.
-async function fork(app: App, up: number) {
+/// When the session had subagents there, fx asks whether the fork takes
+/// copies of them (D97); `bring` answers.
+async function fork(app: App, up: number, bring = false) {
   await app.session.sendText("/fork");
   await app.session.waitForText("enter fork", TIMEOUT);
   for (let n = 0; n < up; n++) await app.session.sendKeys("Up");
   await app.session.sendKeys("Enter");
-  await app.session.waitForText("session forked", TIMEOUT);
+  const pane: string = await app.session.waitForPane(
+    (text: string) => text.includes("session forked") || /Bring \d+ subagents? into the fork\?/.test(text), TIMEOUT);
+  if (!pane.includes("session forked")) {
+    await app.session.sendKeys(bring ? "y" : "n");
+    await app.session.waitForText("session forked", TIMEOUT);
+  }
   await settled(app);
 }
 
@@ -212,37 +219,39 @@ scenario("/fork while a turn runs waits for it and forks nothing", async f => {
   requireAccepted(await f.judge(["turns", "wiring"]));
 });
 
-// The model forks only with no child running (ForkBetweenTurns). A subagent
-// the parent's reply to steering left working keeps that turn open, so /fork
-// must wait for it too.
-scenario("/fork while a subagent still works after steering waits for it", async f => {
+// A subagent's work runs past the turn that sent it, so /fork can start
+// while it works: the fork asks about the subagent, and the switch stops
+// its work before closing the source (D97, Wiring.tla SwitchEnds). The
+// source keeps the subagent, its work saved as cancelled.
+scenario("/fork while a subagent works asks about it, stops its work, and passes the models", async f => {
   const child = heldFakeGatewayFinalText();
   let childAsked = false;
   f.script(raw => {
     const body = JSON.parse(raw);
     const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
     if (latest.includes("FORK_CHILD_TASK")) { childAsked = true; return child.response; }
-    if (raw.includes("FORK_CHILD_RESULT")) return fakeGatewayFinalText("PARENT_AFTER_CHILD");
+    if (raw.includes("fork-delegation") && body.prompt?.at(-1)?.role === "tool") return fakeGatewayFinalText("PARENT_SENT");
     if (latest.includes("Answer now.")) return fakeGatewayFinalText("STEERED");
     if (latest.includes("Delegate the slow work.")) {
-      return fakeGatewayToolCall("fork-delegation", "subagent", { request: { action: "run", task: "FORK_CHILD_TASK" } });
+      return fakeGatewayToolCall("fork-delegation", "subagent", { request: { action: "message", agent: "worker", message: "FORK_CHILD_TASK" } });
     }
     return fakeGatewayFinalText("UNSCRIPTED");
   });
   const app = await f.app();
   await app.session.sendText("Delegate the slow work.");
   await app.session.waitForPane(() => childAsked, TIMEOUT);
+  await app.session.waitForText("PARENT_SENT", TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
   await app.session.sendText("Answer now.");
   await app.session.waitForText("STEERED", TIMEOUT);
-  await app.session.sendText("/fork");
-  const pane: string = await app.session.waitForPane(
-    (text: string) => text.includes("/fork is available once the current turn finishes") || text.includes("enter fork"), TIMEOUT);
-  expect(pane).not.toContain("enter fork");
-  child.release("FORK_CHILD_RESULT");
-  await app.session.waitForText("PARENT_AFTER_CHILD", TIMEOUT);
   await app.session.waitForStableComposer(TIMEOUT);
-  await fork(app, 0);
+  const [source] = f.sessions().filter(id => f.log(id)[0].role === "root");
+  await fork(app, 0, false);
+  await app.session.waitForText("stopped 1 running subagent task", TIMEOUT);
   await f.quit(app);
+  child.release("TOO_LATE");
+  const finished = f.log(source!).filter(line => line.kind === "child_finished");
+  expect(finished.map(line => line.outcome)).toEqual(["cancelled"]);
   requireAccepted(await f.judge(["turns", "children", "wiring", "fork"]));
 });
 
@@ -260,6 +269,90 @@ scenario("a crash right after a fork leaves the fork and its source whole", asyn
     await f.quit(again);
   }
   requireAccepted(await f.judge(["turns", "wiring", "fork"]));
+});
+
+/// Answers a subagent's request by its newest task, and the parent's by the
+/// call it answers, else by its newest prompt (D97 scenarios).
+function withHelper(child: (task: string) => Response | Promise<Response>, parent: Record<string, Response | (() => Response)>): Reply {
+  return raw => {
+    const body = JSON.parse(raw);
+    const users = (body.prompt ?? []).filter((item: any) => item.role === "user");
+    const latest = JSON.stringify(users.at(-1)?.content ?? "");
+    if (latest.includes("HELPER_TASK")) return child(latest);
+    if (latest.includes("Subagent report")) return fakeGatewayFinalText("REPORT_SEEN");
+    const last = (body.prompt ?? []).at(-1);
+    const call = last?.role === "tool" ? last.content?.find((part: any) => part.type === "tool-result")?.toolCallId : undefined;
+    const key = call ?? Object.keys(parent).find(prompt => latest.includes(prompt));
+    const answer = key ? parent[key] : undefined;
+    return answer ? (typeof answer === "function" ? answer() : answer) : fakeGatewayFinalText("UNSCRIPTED");
+  };
+}
+
+const sendToHelper = (call: string, task: string) => () =>
+  fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "helper", message: task } });
+
+// D97: a fork can take copies of the subagents its source had at the fork
+// point. Each copy is the child's log up to that point, which ForkLog checks
+// against the child's own log, and the fork's registration of it is one
+// finished work item, which Subagents checks.
+scenario("a fork that takes a copy of a subagent passes the fork, children and wiring models", async f => {
+  f.script(withHelper(() => fakeGatewayFinalText("HELPER_DONE"), {
+    "Delegate to the helper.": sendToHelper("first-send", "HELPER_TASK one"),
+    "first-send": () => fakeGatewayFinalText("PARENT_SENT"),
+    "Use the helper in the fork.": sendToHelper("fork-send", "HELPER_TASK two"),
+    "fork-send": () => fakeGatewayFinalText("FORK_SENT"),
+    "A plain prompt.": () => fakeGatewayFinalText("PLAIN_DONE"),
+  }));
+  const app = await f.app();
+  await app.session.sendText("Delegate to the helper.");
+  await app.session.waitForText("REPORT_SEEN", TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
+  await app.session.sendText("A plain prompt.");
+  await app.session.waitForText("PLAIN_DONE", TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
+  // Before the plain prompt, which goes back into the composer.
+  await app.session.sendText("/fork");
+  await app.session.waitForText("enter fork", TIMEOUT);
+  await app.session.sendKeys("Enter");
+  await app.session.waitForText("Bring 1 subagent into the fork?", TIMEOUT);
+  await app.session.sendKeys("Enter");
+  await app.session.waitForText("session forked", TIMEOUT);
+  await settled(app);
+  await app.session.sendKeys("C-u");
+  await app.session.sendText("Use the helper in the fork.");
+  await app.session.waitForText("FORK_SENT", TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
+  await f.quit(app);
+  const copies = f.sessions().filter(id => f.log(id)[0].role === "child" && f.log(id)[0].forked_from);
+  expect(copies).toHaveLength(1);
+  requireAccepted(await f.judge(["turns", "children", "wiring", "fork"]));
+});
+
+// D97: a switch stops the session's working subagents before its close
+// joins their threads (Wiring.tla SwitchEnds). The trace shows the child's
+// work done before the close, and the run ends.
+scenario("/new while a subagent works stops it first and passes the wiring model", async f => {
+  const child = heldFakeGatewayFinalText();
+  let childAsked = false;
+  f.script(withHelper(() => { childAsked = true; return child.response; }, {
+    "Delegate to the helper.": sendToHelper("busy-send", "HELPER_TASK slow"),
+    "busy-send": () => fakeGatewayFinalText("PARENT_SENT"),
+    "A prompt after the switch.": () => fakeGatewayFinalText("AFTER_SWITCH"),
+  }));
+  const app = await f.app();
+  await app.session.sendText("Delegate to the helper.");
+  await app.session.waitForText("PARENT_SENT", TIMEOUT);
+  await app.session.waitForPane(() => childAsked, TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
+  await app.session.sendText("/new");
+  await app.session.waitForText("stopped 1 running subagent task", TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
+  await app.session.sendText("A prompt after the switch.");
+  await app.session.waitForText("AFTER_SWITCH", TIMEOUT);
+  await app.session.waitForStableComposer(TIMEOUT);
+  await f.quit(app);
+  child.release("TOO_LATE");
+  requireAccepted(await f.judge(["turns", "children", "wiring"]));
 });
 
 scenario("Esc closes the fork menu without forking", async f => {

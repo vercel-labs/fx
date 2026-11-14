@@ -634,6 +634,29 @@ pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8
     return arena.print("binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
 }
 
+/// Overwrites every occurrence of `secret` in `text` with `*`, in place, so
+/// the text keeps its length. An empty secret masks nothing.
+pub fn maskLiteral(text: []u8, secret: []const u8) void {
+    if (secret.len == 0) return;
+    var rest = text;
+    while (std.mem.find(u8, rest, secret)) |at| {
+        @memset(rest[at..][0..secret.len], '*');
+        rest = rest[at + secret.len ..];
+    }
+}
+
+test "maskLiteral masks every occurrence in place" {
+    var text = "key abc, abcabc, and abc".*;
+    maskLiteral(&text, "abc");
+    try std.testing.expectEqualStrings("key ***, ******, and ***", &text);
+    var unchanged = "abc".*;
+    maskLiteral(&unchanged, "");
+    try std.testing.expectEqualStrings("abc", &unchanged);
+    var shorter = "ab".*;
+    maskLiteral(&shorter, "abc");
+    try std.testing.expectEqualStrings("ab", &shorter);
+}
+
 pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();

@@ -9,8 +9,9 @@
 //! Only `succeeded` finishes a request successfully, and only `user_cancel`
 //! finishes it any other way. Every failure waits instead: for time, or for
 //! the user when only they can fix it (`tests/tla/recovery/Recovery.tla`
-//! NeverGivesUp, Heals). Comments below name the model property that pins
-//! each rule.
+//! NeverGivesUp, Heals). A wait for a sign-in also resends now and then on
+//! its own, since a login can work again without the user (SignInPoll).
+//! Comments below name the model property that pins each rule.
 //!
 //! Outside code imports only this file, and this file imports only `std`.
 //! `scripts/check-recovery-boundary.sh` enforces both in CI.
@@ -28,6 +29,7 @@ pub fn step(state: *State, event: Event, now_ms: u64) Plan {
         .failed => |failure| onFailed(state, failure, now_ms),
         .tick => onTick(state, now_ms),
         .user_continue => onUserContinue(state, now_ms),
+        .sign_in_closed => onSignInClosed(state, now_ms),
         .user_cancel => onUserCancel(state),
         .closing => onClosing(state, now_ms),
     };
@@ -46,6 +48,10 @@ pub const Event = union(enum) {
     tick,
     /// Enter, a successful sign-in, or a picker choice that retries.
     user_continue,
+    /// The sign-in fx opened for this request closed without a new login,
+    /// for example because its code expired. The saved login may still
+    /// work, so a request that waits for a sign-in tries it once now.
+    sign_in_closed,
     /// Esc, or quitting fx.
     user_cancel,
     /// SIGHUP or SIGTERM: fx is exiting, and the request resumes next launch.
@@ -89,6 +95,10 @@ pub const Failure = struct {
         /// The server answered with a stream fx could not read. Waits and
         /// resends as `dropped` does, under its own name.
         unreadable,
+        /// The gateway refused a login that fx had just refreshed, so the
+        /// login itself is good. Waits and resends as `server` does, under
+        /// its own name, and never drops Fast: Fast is not the problem.
+        refused,
     };
 };
 
@@ -182,6 +192,13 @@ pub const State = struct {
     retry_label: RetryLabel = .after_failure,
     /// Key of the status line fx is showing; 0 means clear.
     shown: u32 = 0,
+    /// When the current wait for a sign-in began. A resend that fails the
+    /// same way keeps it, so the status counts the whole wait.
+    asked_ms: u64 = 0,
+    /// The send on the wire is a resend while waiting for a sign-in.
+    polling: bool = false,
+    /// The user continued while that resend was on the wire.
+    continue_pending: bool = false,
 };
 
 const Phase = enum(u8) { idle = 0, sending = 1, waiting = 2, need_user = 3 };
@@ -221,6 +238,13 @@ const handoff_ms: u64 = 2_000;
 pub const escalate_after: u8 = 3;
 /// Abrupt in-flight deaths before asking the user once.
 const crash_loop_after: u8 = 2;
+/// How long a wait for a sign-in lasts before the module resends by itself.
+/// Long, so a login that stays bad costs one refused request every few
+/// minutes (`tests/tla/recovery/RecoveryTimed.tla` PollBounded, PollWaits).
+const sign_in_poll_ms: u64 = 180_000;
+/// The longest wait the sign-in status counts, so its short form always
+/// fits: 999 hours and 59 minutes.
+const max_sign_in_wait_seconds: u64 = 999 * 3600 + 59 * 60;
 const record_version: u8 = 1;
 /// Short forms must fit a 48-column row after the two-column status sign.
 const short_columns = 46;
@@ -269,9 +293,12 @@ fn resumeFrom(state: *State, saved: State, start: Start, now_ms: u64) Plan {
 
 /// The first byte clears any recovery status, so a retry warning never sits
 /// over a streaming answer (`tests/tla/recovery/Recovery.tla` StatusHonest).
+/// A sign-in resend that gets an answer no longer waits for a sign-in.
 fn onResponding(state: *State) Plan {
     if (state.phase != .sending or state.flowing) return .{};
     state.flowing = true;
+    state.polling = false;
+    state.continue_pending = false;
     if (state.shown == 0) return .{};
     return .{ .status = show(state, .{ .kind = .clear }) };
 }
@@ -289,11 +316,32 @@ fn onSucceeded(state: *State) Plan {
 fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
     if (state.phase != .sending) return .{};
     state.flowing = false;
+    const polled = state.polling;
+    const signed_in = state.continue_pending;
+    state.polling = false;
+    state.continue_pending = false;
     return switch (failure.kind) {
-        .offline, .dropped, .unreadable, .server, .rate_limited => waitAfter(state, failure, now_ms),
+        // A sign-in wait's own resend that fails on the way says nothing
+        // about the login, so the request waits for the sign-in again and fx
+        // opens no second one (`tests/tla/recovery/Recovery.tla`
+        // PollKeepsSignIn). After a sign-in that finished while it was on
+        // the wire, it is an ordinary failure: a short wait, then a resend
+        // that loads the new login. The turn loop takes a transient
+        // failure's send from that wait, so none goes out at once here.
+        .offline, .dropped, .unreadable, .server, .rate_limited, .refused => if (polled and !signed_in)
+            waitForSignInAgain(state, now_ms)
+        else
+            waitAfter(state, failure, now_ms),
         .too_long => if (state.flags.compacted) askUser(state, .too_long, now_ms) else compactAndSend(state, now_ms),
         .rejected => askUser(state, .rejected, now_ms),
-        .sign_in => askUser(state, .sign_in, now_ms),
+        // The user signed in while a resend with the old login was on the
+        // wire: resend at once with theirs.
+        .sign_in => if (signed_in)
+            resendAfterSignIn(state, now_ms)
+        else if (polled)
+            waitForSignInAgain(state, now_ms)
+        else
+            askSignIn(state, now_ms),
         .quota => askUser(state, .quota, now_ms),
         .content_filter => askUser(state, .content_filter, now_ms),
     };
@@ -301,22 +349,55 @@ fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
 
 /// While waiting, the countdown changes every second. A resend keeps its
 /// retry status for `handoff_ms`, then clears it so fx shows its thinking
-/// row until the answer arrives.
+/// row until the answer arrives. A wait for a sign-in counts its time and
+/// resends at its end; that resend keeps the sign-in status
+/// (`tests/tla/recovery/RecoveryTimed.tla` StatusFresh, PollBounded).
 fn onTick(state: *State, now_ms: u64) Plan {
     return switch (state.phase) {
         .waiting => if (now_ms >= state.wait_until_ms)
             sendNow(state, now_ms, .{})
         else
             refresh(state, waitingStatus(state, now_ms)),
-        .sending => if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms)
+        .sending => if (state.polling)
+            refresh(state, signInStatus(state, now_ms))
+        else if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms)
             .{ .status = show(state, .{ .kind = .clear }) }
         else
             .{},
-        .idle, .need_user => .{},
+        .need_user => if (state.need != .sign_in)
+            .{}
+        else if (now_ms >= state.wait_until_ms)
+            poll(state, now_ms)
+        else
+            refresh(state, signInStatus(state, now_ms)),
+        .idle => .{},
     };
 }
 
+/// Whether a user's answer would change anything now: `user_continue`
+/// answers a wait for the user, or waits for the answer of a sign-in resend
+/// on the wire, and `sign_in_closed` resends a wait for a sign-in. fx traces
+/// an answer that would not, since that drops what the user did.
+pub fn usesAnswer(state: *const State, event: Event) bool {
+    return switch (event) {
+        .user_continue => state.phase == .need_user or (state.phase == .sending and state.polling),
+        .sign_in_closed => state.phase == .need_user and state.need == .sign_in,
+        else => true,
+    };
+}
+
+fn onSignInClosed(state: *State, now_ms: u64) Plan {
+    if (state.phase != .need_user or state.need != .sign_in) return .{};
+    return poll(state, now_ms);
+}
+
 fn onUserContinue(state: *State, now_ms: u64) Plan {
+    // A sign-in that finishes while a resend is on the wire waits for that
+    // resend's answer, which may already be the good one.
+    if (state.phase == .sending and state.polling) {
+        state.continue_pending = true;
+        return .{};
+    }
     if (state.phase != .need_user) return .{};
     const label: RetryLabel = if (state.need) |need| switch (need) {
         .crash_loop, .stale => .resuming,
@@ -374,7 +455,7 @@ fn waitAfter(state: *State, failure: Failure, now_ms: u64) Plan {
     state.retry_label = .after_failure;
     const delay_ms = switch (failure.kind) {
         .offline => offlineDelay(state),
-        .dropped, .unreadable, .server, .rate_limited => transientDelay(state, failure),
+        .dropped, .unreadable, .server, .rate_limited, .refused => transientDelay(state, failure),
         .too_long, .rejected, .sign_in, .quota, .content_filter => unreachable, // routed by onFailed
     };
     state.wait_until_ms = now_ms +| delay_ms;
@@ -414,6 +495,7 @@ fn compactAndSend(state: *State, now_ms: u64) Plan {
 }
 
 fn askUser(state: *State, need: Status.Need, now_ms: u64) Plan {
+    if (need == .sign_in) return askSignIn(state, now_ms);
     state.phase = .need_user;
     state.need = need;
     state.flowing = false;
@@ -421,6 +503,53 @@ fn askUser(state: *State, need: Status.Need, now_ms: u64) Plan {
         .save = encode(state, now_ms),
         .status = show(state, needStatus(need)),
     };
+}
+
+/// Starts a wait for a sign-in: the status counts from now, and `poll`
+/// resends once `sign_in_poll_ms` passes.
+fn askSignIn(state: *State, now_ms: u64) Plan {
+    state.asked_ms = now_ms;
+    return waitForSignInAgain(state, now_ms);
+}
+
+/// Waits for the sign-in again after one of the wait's own resends failed.
+/// It keeps the wait's start, so the status counts the whole wait.
+fn waitForSignInAgain(state: *State, now_ms: u64) Plan {
+    state.wait_until_ms = now_ms +| sign_in_poll_ms;
+    state.phase = .need_user;
+    state.need = .sign_in;
+    state.flowing = false;
+    return .{
+        .save = encode(state, now_ms),
+        .status = show(state, signInStatus(state, now_ms)),
+    };
+}
+
+/// Resends while waiting for a sign-in, in case the saved login works again:
+/// the gateway stopped refusing it, or another fx process signed in. The
+/// send keeps the sign-in status, so fx opens no second sign-in for it, and
+/// it never hands the line back to the thinking row
+/// (`tests/tla/recovery/Recovery.tla` SignInPoll, StatusHonest). A failure
+/// the same way waits again.
+fn poll(state: *State, now_ms: u64) Plan {
+    state.phase = .sending;
+    state.need = null;
+    state.polling = true;
+    state.continue_pending = false;
+    state.flowing = false;
+    state.sent_ms = now_ms;
+    state.attempt +|= 1;
+    return .{
+        .save = encode(state, now_ms),
+        .send = .{ .no_fast = state.flags.no_fast },
+        .status = show(state, signInStatus(state, now_ms)),
+    };
+}
+
+fn resendAfterSignIn(state: *State, now_ms: u64) Plan {
+    state.need = null;
+    state.retry_label = .after_sign_in;
+    return sendNow(state, now_ms, .{});
 }
 
 fn noteStreak(state: *State, kind: Failure.Kind) void {
@@ -440,7 +569,7 @@ fn escalate(state: *State, kind: Failure.Kind) void {
         .server => if (state.fast) {
             state.flags.no_fast = true;
         },
-        .offline, .dropped, .unreadable, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter => {},
+        .offline, .dropped, .unreadable, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter, .refused => {},
     }
 }
 
@@ -475,6 +604,7 @@ fn reasonText(state: *const State) []const u8 {
         .dropped => "Connection lost",
         .unreadable => "Unreadable reply",
         .server => "Gateway error",
+        .refused => "Gateway refused the login",
         .rate_limited => "Rate limited",
         .too_long => "Conversation too long",
         .rejected, .sign_in, .quota, .content_filter => "Retrying",
@@ -505,9 +635,28 @@ fn retryingStatus(state: *const State) Status {
     return .{ .kind = .retrying, .text = text };
 }
 
+/// The wait for a sign-in, with how long it has lasted and when it resends.
+fn signInStatus(state: *const State, now_ms: u64) Status {
+    const waited = Clock.of(@min((now_ms -| state.asked_ms) / 1000, max_sign_in_wait_seconds));
+    const text = if (state.polling)
+        textOf("Sign-in expired · waiting {s} · trying again", .{waited.slice()})
+    else
+        textOf("Sign-in expired · waiting {s} · next try in {s}", .{
+            waited.slice(),
+            Clock.of(@max(1, (state.wait_until_ms -| now_ms +| 999) / 1000)).slice(),
+        });
+    return .{
+        .kind = .need_user,
+        .need = .sign_in,
+        .text = text,
+        .short = textOf("Sign-in expired · waiting {s}", .{waited.slice()}),
+    };
+}
+
 fn needStatus(need: Status.Need) Status {
     return switch (need) {
-        .sign_in => needOf(need, "Sign-in expired · opening /login", ""),
+        // askUser routes a sign-in to signInStatus, which counts the wait.
+        .sign_in => needOf(need, "Sign-in expired", ""),
         .quota => needOf(need, "Out of credits", ""),
         .content_filter => needOf(
             need,
@@ -950,10 +1099,212 @@ test "sign-in waits, then names the retry" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
     const ask = fail(&state, .sign_in, 1_000);
-    try testing.expectEqualStrings("Sign-in expired · opening /login", ask.status.?.text.slice());
-    try testing.expectEqual(@as(u8, 0), ask.status.?.short.len);
+    try testing.expectEqual(Status.Kind.need_user, ask.status.?.kind);
+    try testing.expectEqual(Status.Need.sign_in, ask.status.?.need.?);
+    try testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", ask.status.?.text.slice());
+    try testing.expectEqualStrings("Sign-in expired · waiting 0s", ask.status.?.short.slice());
     const resumed = step(&state, .user_continue, 64_000);
     try testing.expectEqualStrings("Signed in · retrying · attempt 2", resumed.status.?.text.slice());
+}
+
+test "a wait for a sign-in resends on its own after three minutes and keeps the sign-in status" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .sign_in, 1_000);
+    // The wait counts up every second and sends nothing before its end.
+    const early = step(&state, .tick, 2_000);
+    try testing.expect(early.send == null);
+    try testing.expectEqualStrings("Sign-in expired · waiting 1s · next try in 2m 59s", early.status.?.text.slice());
+    const last_second = step(&state, .tick, 180_999);
+    try testing.expect(last_second.send == null);
+    try testing.expectEqualStrings("Sign-in expired · waiting 2m 59s · next try in 1s", last_second.status.?.text.slice());
+
+    const polled = step(&state, .tick, 181_000);
+    try testing.expectEqual(Send{}, polled.send.?);
+    try testing.expectEqual(Status.Kind.need_user, polled.status.?.kind);
+    try testing.expectEqual(Status.Need.sign_in, polled.status.?.need.?);
+    try testing.expectEqualStrings("Sign-in expired · waiting 3m 00s · trying again", polled.status.?.text.slice());
+    try testing.expectEqual(@as(u16, 2), state.attempt);
+    // The record says a send is in flight, and holds no need.
+    const saved = decode(polled.save.?).?;
+    try testing.expectEqual(Phase.sending, saved.phase);
+    try testing.expect(saved.need == null);
+
+    // The resend never hands the line back to the thinking row.
+    const later = step(&state, .tick, 190_000);
+    if (later.status) |status| try testing.expectEqual(Status.Kind.need_user, status.kind);
+    // A refusal waits again, and the status counts the whole wait.
+    const again = fail(&state, .sign_in, 191_000);
+    try testing.expect(again.send == null);
+    try testing.expectEqualStrings("Sign-in expired · waiting 3m 10s · next try in 3m 00s", again.status.?.text.slice());
+    try testing.expectEqual(@as(u64, 371_000), state.wait_until_ms);
+}
+
+test "a sign-in resend that gets an answer clears the sign-in status" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .sign_in, 1_000);
+    _ = step(&state, .tick, 181_000);
+    const flowing = step(&state, .responding, 182_000);
+    try testing.expectEqual(Status.Kind.clear, flowing.status.?.kind);
+    // A failure after the answer started is an ordinary one.
+    const dropped = fail(&state, .dropped, 183_000);
+    try testing.expectEqual(Status.Kind.waiting, dropped.status.?.kind);
+    _ = tickUntilSend(&state, 183_000);
+    _ = step(&state, .responding, 190_000);
+    const done = step(&state, .succeeded, 191_000);
+    try testing.expectEqual(Finish.succeeded, done.finish.?);
+}
+
+test "a sign-in that finishes during a resend sends again at once when the resend fails" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .sign_in, 1_000);
+    _ = step(&state, .tick, 181_000);
+    // The continue waits for the resend's answer.
+    const early = step(&state, .user_continue, 181_500);
+    try testing.expect(early.send == null and early.status == null);
+    const resent = fail(&state, .sign_in, 182_000);
+    try testing.expectEqual(Send{}, resent.send.?);
+    try testing.expectEqualStrings("Signed in · retrying · attempt 3", resent.status.?.text.slice());
+    // Without a continue, the same failure waits.
+    var other: State = .{};
+    _ = startNew(&other, 0, false);
+    _ = fail(&other, .sign_in, 1_000);
+    _ = step(&other, .tick, 181_000);
+    try testing.expect(fail(&other, .sign_in, 182_000).send == null);
+}
+
+test "a sign-in resend that fails on the way keeps the sign-in wait, so fx opens no second sign-in" {
+    for ([_]Failure.Kind{ .offline, .dropped, .unreadable, .server, .rate_limited, .refused }) |kind| {
+        var state: State = .{};
+        _ = startNew(&state, 0, false);
+        _ = fail(&state, .sign_in, 1_000);
+        _ = step(&state, .tick, 181_000);
+        const kept = fail(&state, kind, 191_000);
+        try testing.expect(kept.send == null);
+        try testing.expectEqual(Status.Kind.need_user, kept.status.?.kind);
+        try testing.expectEqual(Status.Need.sign_in, kept.status.?.need.?);
+        // The status counts the whole wait, and the next resend is a full
+        // wait away.
+        try testing.expectEqualStrings("Sign-in expired · waiting 3m 10s · next try in 3m 00s", kept.status.?.text.slice());
+        try testing.expectEqual(@as(u64, 371_000), state.wait_until_ms);
+        // After a sign-in that finished while that resend was on the wire,
+        // the failure is an ordinary one: a short wait, then a resend with
+        // the new login. `failed` hands back no send, since the turn loop
+        // takes a transient failure's send from the wait.
+        var signed_in: State = .{};
+        _ = startNew(&signed_in, 0, false);
+        _ = fail(&signed_in, .sign_in, 1_000);
+        _ = step(&signed_in, .tick, 181_000);
+        _ = step(&signed_in, .user_continue, 181_500);
+        const waited = fail(&signed_in, kind, 182_000);
+        try testing.expect(waited.send == null);
+        try testing.expectEqual(Status.Kind.waiting, waited.status.?.kind);
+        const retry = tickUntilSend(&signed_in, 182_000);
+        try testing.expect(retry.plan.send != null);
+        try testing.expectEqual(@as(u16, 3), signed_in.attempt);
+    }
+    // A failure of an ordinary resend still waits as before.
+    var ordinary: State = .{};
+    _ = startNew(&ordinary, 0, false);
+    try testing.expectEqual(Status.Kind.waiting, fail(&ordinary, .dropped, 1_000).status.?.kind);
+}
+
+test "an answer the module has no use for is one fx traces as dropped" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    try testing.expect(!usesAnswer(&state, .user_continue));
+    try testing.expect(!usesAnswer(&state, .sign_in_closed));
+    _ = fail(&state, .sign_in, 1_000);
+    try testing.expect(usesAnswer(&state, .user_continue));
+    try testing.expect(usesAnswer(&state, .sign_in_closed));
+    // The wait's own resend keeps a continue for its answer.
+    _ = step(&state, .tick, 181_000);
+    try testing.expect(usesAnswer(&state, .user_continue));
+    try testing.expect(!usesAnswer(&state, .sign_in_closed));
+    var quota: State = .{};
+    _ = startNew(&quota, 0, false);
+    _ = fail(&quota, .quota, 1_000);
+    try testing.expect(usesAnswer(&quota, .user_continue));
+    try testing.expect(!usesAnswer(&quota, .sign_in_closed));
+}
+
+test "the sign-in fx opened closing resends once and keeps the sign-in status" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .sign_in, 1_000);
+    const closed = step(&state, .sign_in_closed, 601_000);
+    try testing.expectEqual(Send{}, closed.send.?);
+    try testing.expectEqual(Status.Need.sign_in, closed.status.?.need.?);
+    // Only a wait for a sign-in resends.
+    try testing.expect(step(&state, .sign_in_closed, 601_500).send == null);
+    for ([_]Failure.Kind{ .quota, .rejected, .content_filter }) |kind| {
+        var asked: State = .{};
+        _ = startNew(&asked, 0, false);
+        _ = fail(&asked, kind, 1_000);
+        try testing.expectEqual(Plan{}, step(&asked, .sign_in_closed, 2_000));
+        // Their waits never resend by themselves.
+        try testing.expectEqual(Plan{}, step(&asked, .tick, 10_000_000));
+    }
+    var waiting: State = .{};
+    _ = startNew(&waiting, 0, false);
+    _ = fail(&waiting, .server, 1_000);
+    try testing.expectEqual(Plan{}, step(&waiting, .sign_in_closed, 1_500));
+}
+
+test "a refused login waits and resends like a gateway error, and keeps Fast" {
+    var state: State = .{};
+    _ = startNew(&state, 0, true);
+    var now_ms: u64 = 0;
+    for (0..4) |i| {
+        now_ms += 1_000;
+        const plan = fail(&state, .refused, now_ms);
+        try testing.expect(plan.send == null);
+        try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
+        try testing.expect(startsWith(plan.status.?.text.slice(), "Gateway refused the login · next try in "));
+        if (i == 0) try testing.expect(state.wait_until_ms - now_ms >= 800 and state.wait_until_ms - now_ms <= 1_000);
+        const retry = tickUntilSend(&state, now_ms);
+        try testing.expect(!retry.plan.send.?.no_fast);
+        try testing.expect(startsWith(retry.plan.status.?.text.slice(), "Gateway refused the login · retrying · attempt "));
+        now_ms = retry.at_ms;
+    }
+    try testing.expect(!state.flags.no_fast);
+    // The record keeps the cause, so a relaunch names it too.
+    const saved = decode(encode(&state, now_ms)).?;
+    try testing.expectEqual(Failure.Kind.refused, saved.cause.?);
+}
+
+test "a resumed wait for a sign-in counts its time from the relaunch" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .sign_in, 1_000);
+    const record = step(&state, .closing, 500_000).save.?;
+    var next: State = .{};
+    const resumed = step(&next, .{ .start = .{ .resume_from = record } }, 9_000_000);
+    try testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", resumed.status.?.text.slice());
+    try testing.expect(resumed.send == null);
+    try testing.expectEqual(Send{}, step(&next, .tick, 9_180_000).send.?);
+}
+
+test "hours of sign-in resends keep the status, the attempt count, and the record bounded" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .sign_in, 0);
+    var now_ms: u64 = 0;
+    for (0..70_000) |_| {
+        now_ms += sign_in_poll_ms;
+        const polled = step(&state, .tick, now_ms);
+        try testing.expect(polled.send != null);
+        try testing.expectEqual(Status.Need.sign_in, polled.status.?.need.?);
+        const again = fail(&state, .sign_in, now_ms);
+        try testing.expect(again.send == null);
+        try testing.expect(columns(again.status.?.short.slice()) <= short_columns);
+        try testing.expect(!std.mem.eql(u8, "Recovering", again.status.?.text.slice()));
+        try testing.expect(decode(again.save.?) != null);
+    }
+    try testing.expectEqual(std.math.maxInt(u16), state.attempt);
+    try testing.expectEqualStrings("Sign-in expired · waiting 999h 59m", signInStatus(&state, now_ms).short.slice());
 }
 
 test "Esc ends the request from every active phase" {
@@ -1157,6 +1508,16 @@ test "every status fits, and every short form fits 46 columns" {
     try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state).text.slice()));
     state.retry_label = .after_sign_in;
     try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state).text.slice()));
+    state.cause = .refused;
+    try testing.expect(!std.mem.eql(u8, "Recovering", waitingStatus(&state, 0).text.slice()));
+    state.retry_label = .after_failure;
+    try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state).text.slice()));
+    for ([_]bool{ false, true }) |polling| {
+        const longest: State = .{ .phase = .need_user, .need = .sign_in, .polling = polling, .wait_until_ms = std.math.maxInt(u64) };
+        const status = signInStatus(&longest, std.math.maxInt(u64));
+        try testing.expect(!std.mem.eql(u8, "Recovering", status.text.slice()));
+        try testing.expect(columns(status.short.slice()) <= short_columns);
+    }
 }
 
 test "durations read 12s, 1m 12s, and 1h 02m" {
@@ -1204,12 +1565,19 @@ const SimHost = struct {
     inflight_deaths: u8 = 0,
     /// When the latest transient failure happened; a retry must wait after it.
     transient_failure_ms: ?u64 = null,
+    /// When the latest wait for a sign-in began; its own resend waits
+    /// `sign_in_poll_ms` after it.
+    sign_in_wait_ms: ?u64 = null,
     /// When the outstanding send went out.
     sent_ms: ?u64 = null,
 
     fn deliver(host: *SimHost, event: Event) !void {
         const was_outstanding = host.outstanding;
         const was_flowing = host.flowing;
+        const was_sign_in_wait = !was_outstanding and host.status == .need_user and host.need == .sign_in;
+        // A sign-in wait's own resend keeps the sign-in status until its
+        // answer flows.
+        const was_sign_in_resend = was_outstanding and !was_flowing and host.status == .need_user and host.need == .sign_in;
         const plan = step(&host.state, event, host.now_ms);
         const consumes_send = switch (event) {
             .succeeded, .failed => true,
@@ -1233,17 +1601,37 @@ const SimHost = struct {
         };
         if (event == .failed and was_outstanding) {
             switch (event.failed.kind) {
-                .offline, .dropped, .unreadable, .server, .rate_limited => {
+                .offline, .dropped, .unreadable, .server, .rate_limited, .refused => {
+                    // Never a send at once: the turn loop takes a transient
+                    // failure's send from the wait. A sign-in wait's own
+                    // resend waits for the sign-in again, unless the user
+                    // signed in while it was on the wire.
                     try testing.expect(plan.send == null);
-                    try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
-                    host.transient_failure_ms = host.now_ms;
+                    if (was_sign_in_resend and plan.status.?.kind == .need_user) {
+                        try testing.expectEqual(Status.Need.sign_in, plan.status.?.need.?);
+                    } else {
+                        try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
+                        host.transient_failure_ms = host.now_ms;
+                    }
                 },
                 .too_long, .rejected, .sign_in, .quota, .content_filter => {},
             }
         }
         if (plan.send != null and event == .tick) {
-            const failed_at = host.transient_failure_ms orelse return error.TestUnexpectedResult;
-            try testing.expect(host.now_ms - failed_at >= 800);
+            if (was_sign_in_wait) {
+                // A wait for a sign-in resends only at its end, and keeps
+                // the sign-in status for that resend.
+                const asked_at = host.sign_in_wait_ms orelse return error.TestUnexpectedResult;
+                try testing.expect(host.now_ms - asked_at >= sign_in_poll_ms);
+                try testing.expectEqual(Status.Need.sign_in, plan.status.?.need.?);
+            } else {
+                const failed_at = host.transient_failure_ms orelse return error.TestUnexpectedResult;
+                try testing.expect(host.now_ms - failed_at >= 800);
+            }
+        }
+        if (event == .sign_in_closed) {
+            try testing.expectEqual(was_sign_in_wait, plan.send != null);
+            if (plan.send != null) try testing.expectEqual(Status.Need.sign_in, plan.status.?.need.?);
         }
         if (plan.status) |status| {
             switch (status.kind) {
@@ -1268,6 +1656,7 @@ const SimHost = struct {
         if (plan.status) |status| {
             host.status = status.kind;
             host.need = status.need;
+            if (plan.send == null and status.need == .sign_in and !was_sign_in_wait) host.sign_in_wait_ms = host.now_ms;
         }
         if (plan.finish != null) {
             host.finished = true;
@@ -1306,6 +1695,7 @@ const SimHost = struct {
         host.status = .clear;
         host.need = null;
         host.transient_failure_ms = null;
+        host.sign_in_wait_ms = null;
         host.sent_ms = null;
         host.now_ms += 5_000;
         const record = host.saved orelse return;
@@ -1318,7 +1708,8 @@ const SimHost = struct {
 fn randomFailure(random: std.Random) Failure {
     const kinds = [_]Failure.Kind{
         .dropped,      .dropped,  .server,   .server,  .offline, .offline,        .unreadable,
-        .rate_limited, .too_long, .rejected, .sign_in, .quota,   .content_filter,
+        .rate_limited, .too_long, .rejected, .sign_in, .quota,   .content_filter, .refused,
+        .sign_in,
     };
     const kind = kinds[random.uintLessThan(usize, kinds.len)];
     const hint: ?u32 = if (kind == .rate_limited and random.boolean())
@@ -1349,7 +1740,8 @@ fn simulate(seed: u64) !void {
                 host.now_ms += 1_000;
                 try host.deliver(.tick);
             },
-            69...73 => try host.userContinue(),
+            69...72 => try host.userContinue(),
+            73 => try host.deliver(.sign_in_closed),
             74...75 => try host.deliver(.user_cancel),
             76...83 => try host.relaunch(false),
             84...90 => try host.relaunch(true),
@@ -1367,11 +1759,13 @@ fn simulate(seed: u64) !void {
     var ticks_waiting: usize = 0;
     while (!host.finished) : (steps += 1) {
         try testing.expect(steps < 400);
-        if (host.status == .need_user) {
-            try host.userContinue();
-        } else if (host.outstanding) {
+        // A resend while waiting for a sign-in shows need_user too, so the
+        // send on the wire is answered first.
+        if (host.outstanding) {
             if (!host.flowing) try host.deliver(.responding);
             try host.deliver(.succeeded);
+        } else if (host.status == .need_user) {
+            try host.userContinue();
         } else {
             host.now_ms += 1_000;
             ticks_waiting += 1;

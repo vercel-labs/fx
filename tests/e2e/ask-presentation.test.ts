@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
@@ -514,11 +515,10 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("Inspect fixture.txt and render the response.");
-      expect(pane.match(/1 tool call · 1 read/g)).toHaveLength(2);
-      expect(pane).toContain("Reading fixture.txt");
+      // Each group's only call is its header, and the failed read is marked.
+      expect(pane).toContain("● Reading fixture.txt");
       expect(pane).toContain("Between groups.");
-      expect(pane).toContain("Reading missing.txt");
-      expect(pane).toContain("failed");
+      expect(pane).toContain("● Failed: Reading missing.txt: Path not found: missing.txt");
       expect(pane).toContain("Ask presentation");
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
@@ -979,7 +979,7 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Run the notice filtering fixture.");
       expect(scrollback).toContain("Notice filtering complete.");
-      expect(scrollback).toContain("1 tool call · 1 command");
+      expect(scrollback).toContain("● Running printf notice-test > ask-notice.txt");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);
@@ -1208,9 +1208,9 @@ describe("fx ask shell startup files", () => {
       }
 
       expect(gateway.requests[1]!.body).toContain("FX_SECRET_VISIBLE");
-      const report = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
-      expect(report).toBeDefined();
-      expect(readFileSync(join(root.root, report!), "utf8")).not.toContain(secret);
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      expect(report.all("tool_call").map((call) => call.name)).toContain("shell");
+      expect(report.text).not.toContain(secret);
       expect(readFileSync(tracePath, "utf8")).toContain("shell snapshot ready");
       expect(readFileSync(tracePath, "utf8")).not.toContain(secret);
       expect(filesContaining(join(root.home, ".fx"), secret)).toEqual([]);

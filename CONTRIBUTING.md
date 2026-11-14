@@ -6,7 +6,7 @@ Code conventions live in [AGENTS.md](AGENTS.md): which module owns which behavio
 
 ## Report a problem
 
-Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, `/trace` copies a private diagnostic trace that you can attach. Issues are public, so review the trace and remove secrets before you post it.
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, run `/trace` to create a private diagnostic trace. Share it as a link from [fx.sh/share](https://fx.sh/share), which hides private data before upload. Or zip the trace file and attach the `.zip`; GitHub does not accept `.jsonl` files. On macOS, `/trace` copies the file itself to the clipboard, so paste it on fx.sh/share rather than in the issue. Issues are public, so review the trace and remove secrets before you post it.
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact), not in a public issue.
 
@@ -254,7 +254,7 @@ The `TLA+ transcript window model` job takes about 4 minutes and runs its checks
 The `TLA+ subagent and session-write models` job takes a few minutes and runs its checks when the change touches:
 
 - `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, or `src/core/agent/runtime/parallel_execution.zig`
-- The models in `tests/tla/subagent/`, the session-write model in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/` and `tests/tla/drivers/session/write.test.ts`
+- The models in `tests/tla/subagent/`, the session-write and live sessions models in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`
 - The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
 All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.

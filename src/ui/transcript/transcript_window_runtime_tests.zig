@@ -8,6 +8,7 @@ const transcript_store = @import("store.zig");
 const source_preparation = @import("source_preparation.zig");
 const frozen_prefix = @import("frozen_prefix.zig");
 const types = @import("../../core/shared/types.zig");
+const render_engine = @import("../render_engine.zig");
 
 const TranscriptRuntime = runtime_mod.TranscriptRuntime;
 const Allocator = std.mem.Allocator;
@@ -106,7 +107,75 @@ fn commitStableFrame(alloc: Allocator, runtime: *TranscriptRuntime) !void {
     } };
 }
 
-test "the transcript window removes a compaction's closed cycle once the session log holds it" {
+/// A frame the terminal accepted without scrolling.
+fn committedFrameResult() render_engine.terminal_diff.FrameCommitResult {
+    return .{
+        .bytes_written = 1,
+        .changed_cells = 1,
+        .full_repaint = false,
+        .terminal_scroll_rows_committed = 0,
+        .document_append_committed = false,
+        .committed_cursor_row = 1,
+        .committed_cursor_col = 1,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    };
+}
+
+/// How many of a frame's rows the terminal history holds after it.
+const ReleasedRows = enum { none, all };
+
+/// A frame that paints the runtime's entries. It paints `resume_flow`, the
+/// pending resume source it borrows, or with null the entries' own flow.
+fn transcriptFrame(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+    resume_flow: ?[]u8,
+    released: ReleasedRows,
+) !runtime_mod.TranscriptTransition {
+    var metrics: types.Metrics = .{};
+    var flow = try source_preparation.prepareRetentionSource(runtime, alloc);
+    defer flow.deinit(alloc);
+    try flow.ensureLineIndex(alloc);
+    const total = flow.transcript_visual_row_offsets[flow.transcript_visual_row_offsets.len - 1];
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(alloc, &metrics, &flow, .{ .top = 1, .bottom = 20 });
+    defer prepared.deinit(alloc);
+    var transition: runtime_mod.TranscriptTransition = .{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(24, 1),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = &.{},
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{ .terminal_rows = 24, .terminal_cols = 80 },
+        .selection = prepared.selection,
+        .visual_offset = total,
+        .history_visual_offset = switch (released) {
+            .none => 0,
+            .all => total,
+        },
+        .total_visual_rows = total,
+        .cursor_row = prepared.cursor.cursor_row,
+        .cursor_col = prepared.cursor.cursor_col,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 1,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 1,
+    };
+    if (resume_flow) |bytes| {
+        transition.target_flow = bytes;
+        transition.target_flow_owned = false;
+        return transition;
+    }
+    transition.target_flow = try alloc.dupe(u8, flow.bytes);
+    errdefer alloc.free(transition.target_flow);
+    transition.retention_identity = try source_preparation.RetentionIdentity.capture(runtime, alloc, &flow);
+    return transition;
+}
+
+test "the transcript window removes a compaction's closed cycle at the next turn end, once the session log holds it" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
@@ -120,11 +189,15 @@ test "the transcript window removes a compaction's closed cycle once the session
     try expectWindowMatchesEntries(&runtime);
 
     // Between turns, with both turns saved and nothing on screen, the closed
-    // cycle leaves at the compaction itself.
+    // cycle still waits for the next turn end, so a resize before it
+    // reprints it.
     try runtime.transcriptWindowCompacted(alloc);
-    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+    try std.testing.expect(runtime.transcriptWindowHoldsPreviousCycle());
+    try std.testing.expect(holds(&runtime, "FIRST_PROMPT") and holds(&runtime, "SECOND_ANSWER"));
+    try expectWindowMatchesEntries(&runtime);
 
     try runTurn(alloc, &runtime, &metrics, "THIRD_PROMPT", "THIRD_ANSWER\n");
+    try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
     try std.testing.expect(!holds(&runtime, "FIRST_PROMPT") and !holds(&runtime, "SECOND_ANSWER"));
     try std.testing.expect(holds(&runtime, "THIRD_PROMPT") and holds(&runtime, "THIRD_ANSWER"));
     try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "FIRST_ANSWER") == null);
@@ -141,10 +214,14 @@ test "the transcript window keeps a dropped entry while a row of it is still on 
     try runtime.enableTranscriptWindow(alloc, true);
     try runTurn(alloc, &runtime, &metrics, "ON_SCREEN_PROMPT", "ON_SCREEN_ANSWER\n");
     try commitStableFrame(alloc, &runtime);
+    const closed_cycle = runtime.notebook.entries.items.len;
 
+    // The turn after the compaction ends and the window drops the closed
+    // cycle, whose rows are still on screen.
     try runtime.transcriptWindowCompacted(alloc);
+    try runTurn(alloc, &runtime, &metrics, "NEXT_PROMPT", "NEXT_ANSWER\n");
     try std.testing.expect(holds(&runtime, "ON_SCREEN_PROMPT") and holds(&runtime, "ON_SCREEN_ANSWER"));
-    try std.testing.expectEqual(runtime.notebook.entries.items.len, runtime.transcript_window.?.pending_drops.items.len);
+    try std.testing.expectEqual(closed_cycle, runtime.transcript_window.?.pending_drops.items.len);
     try expectWindowMatchesEntries(&runtime);
 
     // The rows scroll into terminal history: the next sync removes them.
@@ -197,11 +274,30 @@ test "the transcript window releases its held drops when the screen is cleared f
     try runTurn(alloc, &runtime, &metrics, "HELD_PROMPT", "HELD_ANSWER\n");
     try commitStableFrame(alloc, &runtime);
     try runtime.transcriptWindowCompacted(alloc);
+    try runTurn(alloc, &runtime, &metrics, "NEXT_PROMPT", "NEXT_ANSWER\n");
     try std.testing.expect(holds(&runtime, "HELD_PROMPT"));
     // A resize clears the screen and replays the entries.
     try runtime.transcriptWindowScreenCleared(alloc);
     try std.testing.expect(!holds(&runtime, "HELD_PROMPT"));
+    try std.testing.expect(holds(&runtime, "NEXT_PROMPT"));
     try std.testing.expectEqual(@as(usize, 0), runtime.transcript_window.?.pending_drops.items.len);
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resize between a compaction and the next turn end replays the closed cycle" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "CLOSED_PROMPT", "CLOSED_ANSWER\n");
+    try commitStableFrame(alloc, &runtime);
+    try runtime.transcriptWindowCompacted(alloc);
+    // A resize clears the screen and replays the entries: the closed cycle is
+    // among them until the next turn ends.
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "CLOSED_PROMPT") and holds(&runtime, "CLOSED_ANSWER"));
+    try std.testing.expect(runtime.transcriptWindowHoldsPreviousCycle());
     try expectWindowMatchesEntries(&runtime);
 }
 
@@ -233,6 +329,8 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     try rawEntries(alloc, &runtime, &.{ "held one\n", "held two\n" });
     runtime.transcript_archive_available = true;
     try std.testing.expect(runtime.ctrlOJoinsPreviousCycle());
+    // Ctrl+O is opening, so the cycles it reads stay whole.
+    _ = runtime.requestFullTranscriptOpen();
 
     // The newest pages need the cycle before the compaction from the log.
     try std.testing.expectError(error.TranscriptArchiveNotLoaded, runtime.snapshotFullTranscriptPage(.{ .anchor = .tail, .content_revision = 0, .cols = 80 }, null, null));
@@ -305,10 +403,12 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     runtime.closeFullTranscriptState();
     try std.testing.expect(!runtime.transcript_archive_failed);
     try std.testing.expect(runtime.transcript_archive_damaged);
-    try std.testing.expect(runtime.transcript_archive == null);
+    // The cycle the newest pages join stays for the next open.
+    try std.testing.expectEqual(@as(u32, 1), runtime.transcript_archive.?.back);
     try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
     runtime.clearFullTranscriptDetails(alloc);
     try std.testing.expect(!runtime.transcript_archive_damaged);
+    try std.testing.expect(runtime.transcript_archive == null);
 }
 
 test "transcript window: Ctrl+O pages the cycles before one the window still holds" {
@@ -321,6 +421,7 @@ test "transcript window: Ctrl+O pages the cycles before one the window still hol
     // Until the turn across the compaction ends, the window holds both cycles.
     runtime.transcript_window.?.state.prev_first = 0;
     try std.testing.expect(!runtime.ctrlOJoinsPreviousCycle());
+    _ = runtime.requestFullTranscriptOpen();
     const held = try pageTexts(alloc, &runtime, .tail);
     defer alloc.free(held);
     try std.testing.expectEqualStrings("previous cycle\nnew cycle\n", held);
@@ -397,7 +498,19 @@ test "transcript window: each command's output is bounded on its own" {
     try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) > cap);
 }
 
-test "transcript window: Ctrl+O reads the log only while it is open, and forgets on compaction" {
+/// An older cycle of `count` entries, `older 0` first.
+fn numberedCycle(alloc: Allocator, count: usize) !TranscriptRuntime {
+    var archived = testRuntime(alloc);
+    errdefer archived.deinit(alloc);
+    archived.notebook.next_entry_id = runtime_mod.archiveEntryIdBase(1);
+    var buf: [32]u8 = undefined;
+    for (0..count) |index| {
+        _ = try archived.appendRawTranscriptEntryClassified(alloc, try std.mem.print(&buf, "older {d}\n", .{index}), .tool_status);
+    }
+    return archived;
+}
+
+test "transcript window: between turns the newest Ctrl+O page reads the cycle it joins, and keeps only what it shows" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
@@ -405,19 +518,113 @@ test "transcript window: Ctrl+O reads the log only while it is open, and forgets
     try rawEntries(alloc, &runtime, &.{"held\n"});
     runtime.transcript_archive_available = true;
 
-    // Closed: preparing the newest page reads nothing from the log.
+    // During a turn, a closed Ctrl+O reads nothing from the log.
+    runtime.transcript_window.?.state.turn_open = true;
     try runtime.prewarmFullTranscriptPage(null, null);
     try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
-    // Opening: it asks for the cycle the page joins.
-    _ = runtime.requestFullTranscriptOpen();
+    // Between turns it asks for the cycle the newest page joins, so the
+    // next Ctrl+O opens without reading the log.
+    runtime.transcript_window.?.state.turn_open = false;
     try runtime.prewarmFullTranscriptPage(null, null);
     try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
 
-    // A compaction makes that cycle two back, so it is let go.
-    try runtime.installTranscriptArchive(alloc, 1, false, try archivedCycle(alloc, 1, &.{"older\n"}), false);
-    try std.testing.expect(runtime.transcript_archive != null);
+    // Read while closed, the cycle keeps only what the newest page shows:
+    // a page of 256 entries, which the held one ends.
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 300), false);
+    try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
+    try std.testing.expectEqual(@as(usize, 255), runtime.transcript_archive.?.runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 45), runtime.transcript_archive.?.trimmed);
+    const newest = try pageTexts(alloc, &runtime, .tail);
+    defer alloc.free(newest);
+    try std.testing.expect(std.mem.startsWith(u8, newest, "older 45\nolder 46\n"));
+    try std.testing.expect(std.mem.endsWith(u8, newest, "older 299\nheld\n"));
+
+    // A page that reaches into what was let go reads the whole cycle again,
+    // whose indexes are the same, and lands on the entry it asked for.
+    _ = runtime.requestFullTranscriptOpen();
+    try std.testing.expectError(error.TranscriptArchiveNotLoaded, runtime.snapshotFullTranscriptPage(.{ .anchor = .{ .entry_index = 44 }, .content_revision = 0, .cols = 80 }, null, null));
+    runtime.moveToFullTranscriptPage(.{ .entry_index = 44 }, .last);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 300), false);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript_archive.?.trimmed);
+    try std.testing.expectEqual(@as(?u32, runtime_mod.archiveEntryIdBase(1) + 44), runtime.full_transcript.bookmark_entry_id);
+    const above = try pageTexts(alloc, &runtime, .{ .entry_index = 44 });
+    defer alloc.free(above);
+    try std.testing.expect(std.mem.startsWith(u8, above, "older 0\n"));
+
+    // Closing trims it again.
+    runtime.closeFullTranscriptState();
+    try std.testing.expectEqual(@as(usize, 45), runtime.transcript_archive.?.trimmed);
+
+    // A compaction makes that cycle two back: it goes, and a read started
+    // before it is stale.
+    const generation = runtime.transcript_archive_generation;
     try runtime.transcriptWindowCompacted(alloc);
     try std.testing.expect(runtime.transcript_archive == null);
+    try std.testing.expect(runtime.transcript_archive_generation != generation);
+}
+
+test "transcript window: when the held entries fill the newest page, the joined cycle keeps none of its entries" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try runtime.enableTranscriptWindow(alloc, true);
+    var buf: [32]u8 = undefined;
+    for (0..full_transcript_page.max_source_entries) |index| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, try std.mem.print(&buf, "held {d}\n", .{index}), .tool_status);
+    }
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try numberedCycle(alloc, 3), false);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript_archive.?.runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), runtime.transcript_archive.?.trimmed);
+    const newest = try pageTexts(alloc, &runtime, .tail);
+    defer alloc.free(newest);
+    try std.testing.expect(std.mem.startsWith(u8, newest, "held 0\n"));
+    try std.testing.expect(std.mem.endsWith(u8, newest, "held 255\n"));
+    // The page above reaches the cycle, which then loads whole.
+    _ = runtime.requestFullTranscriptOpen();
+    runtime.moveToFullTranscriptPage(.{ .entry_index = 2 }, .last);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+}
+
+test "transcript window: a cycle read for a Ctrl+O that closed since stays only when the newest page joins it" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try runtime.enableTranscriptWindow(alloc, true);
+    try rawEntries(alloc, &runtime, &.{"held\n"});
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{"joined\n"}), false);
+    // An older page's cycle that finished reading after the close goes, and
+    // the joined one stays.
+    try runtime.installTranscriptArchive(alloc, 2, false, try archivedCycle(alloc, 2, &.{"oldest\n"}), false);
+    try std.testing.expectEqual(@as(u32, 1), runtime.transcript_archive.?.back);
+    // A failed read for a closed Ctrl+O says nothing, and the newest page
+    // stops asking until the cycle changes.
+    runtime.discardTranscriptArchive();
+    runtime.failTranscriptArchive();
+    try std.testing.expect(!runtime.transcript_archive_failed);
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
+    try runtime.transcriptWindowCompacted(alloc);
+    runtime.transcript_window.?.state.prev_first = null;
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
+}
+
+test "transcript window: the cycle Ctrl+O read moves with its transcript when another agent's takes the screen" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    try rawEntries(alloc, &runtime, &.{"held\n"});
+    runtime.transcript_archive_available = true;
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{"mine\n"}), false);
+    var hidden: runtime_mod.TranscriptSlot = .{};
+    defer TranscriptRuntime.deinitSlot(&hidden, alloc);
+    runtime.swapSlot(&hidden);
+    try std.testing.expect(runtime.transcript_archive == null);
+    runtime.swapSlot(&hidden);
+    try std.testing.expectEqual(@as(u32, 1), runtime.transcript_archive.?.back);
 }
 
 test "a transcript window drop that runs out of memory leaves the transcript as it was" {
@@ -467,7 +674,7 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
     try std.testing.expect(fail_after > 0);
 }
 
-test "a resume that brings back the cycle before the newest compaction keeps it until it is painted" {
+test "a resume that brings back the cycle before the newest compaction holds it until the next turn ends" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
@@ -482,17 +689,130 @@ test "a resume that brings back the cycle before the newest compaction keeps it 
         try alloc.dupe(u8, runtime.notebook.transcript.items),
     );
     try runtime.transcriptWindowResumed(alloc, true);
-    // The compaction applied as a live one: the window lets the cycle go, and
-    // the screen keeps it.
-    try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
+    // The compaction applied as a live one: the window holds the cycle until
+    // the next turn ends.
+    try std.testing.expect(runtime.transcriptWindowHoldsPreviousCycle());
     try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
-    // Painted, then scrolled into terminal history: the next sync drops it.
+    // Painted, then scrolled into terminal history: it stays, so a resize
+    // replays it.
     if (runtime.notebook.pending_resume_source) |*source| source.deinit(alloc);
     runtime.notebook.pending_resume_source = null;
     try commitStableFrame(alloc, &runtime);
     const anchor = &runtime.transcript_commit_state.stable;
     anchor.history_visual_offset = anchor.total_visual_rows;
     try runtime.syncTranscriptWindow(alloc);
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    // The next turn ends: the cycle, whose rows are in terminal history,
+    // leaves memory.
+    try runTurn(alloc, &runtime, &metrics, "AFTER_RESUME", "REPLY\n");
+    try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
     try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try std.testing.expect(holds(&runtime, "AFTER_RESUME"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resume from the session picker keeps the cycle before the newest compaction through its screen reset" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    // A turn that ends before the first paint lets the closed cycle go.
+    try runTurn(alloc, &runtime, &metrics, "AFTER_RESUME", "REPLY\n");
+    try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
+    // The picker switches sessions with a terminal reset, which paints the
+    // prepared flow. The entries must outlive it, or the next frame, which
+    // paints from the entries, erases the rows the reset showed.
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+    // Painted and still on screen: the next sync keeps it.
+    if (runtime.notebook.pending_resume_source) |*source| source.deinit(alloc);
+    runtime.notebook.pending_resume_source = null;
+    try commitStableFrame(alloc, &runtime);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    // Scrolled into terminal history: the next sync drops it.
+    const anchor = &runtime.transcript_commit_state.stable;
+    anchor.history_visual_offset = anchor.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript keeps the rows it painted until a frame repaints them from the entries" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The first frame paints the resumed flow and hands it to the anchor,
+    // which stays invalid until the next frame.
+    var handoff = try transcriptFrame(alloc, &runtime, runtime.notebook.pending_resume_source.?.bytes, .none);
+    defer handoff.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &handoff, committedFrameResult());
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingResumeFlow().len);
+    try std.testing.expect(runtime.transcript_commit_state == .invalid);
+    // A turn that ends before the next frame lets the closed cycle go, and
+    // what is on screen stays.
+    try runTurn(alloc, &runtime, &metrics, "AFTER_RESUME", "REPLY\n");
+    try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The next frame repaints from the entries, whose rows are now in
+    // terminal history: the next sync drops them.
+    var repaint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer repaint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &repaint, committedFrameResult());
+    try std.testing.expect(runtime.transcript_commit_state == .stable);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript that leaves the screen before its repaint lets its window drop" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    var handoff = try transcriptFrame(alloc, &runtime, runtime.notebook.pending_resume_source.?.bytes, .none);
+    defer handoff.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &handoff, committedFrameResult());
+
+    // Another agent comes on screen before the next frame, as `attach` does.
+    var hidden: runtime_mod.TranscriptSlot = .{};
+    defer TranscriptRuntime.deinitSlot(&hidden, alloc);
+    runtime.swapSlot(&hidden);
+    TranscriptRuntime.slotLeftScreen(&hidden);
+    // A turn it ends while hidden runs with its transcript swapped in, and
+    // none of its rows are on screen.
+    runtime.swapSlot(&hidden);
+    try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try std.testing.expect(holds(&runtime, "HIDDEN_TURN"));
     try expectWindowMatchesEntries(&runtime);
 }

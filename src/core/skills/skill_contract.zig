@@ -212,6 +212,7 @@ const BlockDescriptionStyle = enum {
     folded_clip,
     folded_strip,
     literal_clip,
+    plain_folded,
 };
 
 pub const BlockDescription = struct {
@@ -221,7 +222,10 @@ pub const BlockDescription = struct {
 
     fn decode_into(self: BlockDescription, raw: []const u8, output: []u8) void {
         std.debug.assert(output.len == self.decoded_len);
-        const written = decode_block_description(raw, self.base_indent, self.style, output);
+        const written = if (self.style == .plain_folded)
+            decode_plain_description(raw, output)
+        else
+            decode_block_description(raw, self.base_indent, self.style, output);
         std.debug.assert(written == output.len);
     }
 };
@@ -313,8 +317,11 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
         line_offset = line.next;
         const trimmed = std.mem.trim(u8, line.bytes, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        if (previous_line_recognized and (line.bytes[0] == ' ' or line.bytes[0] == '\t')) {
-            setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
+        // Recognized keys live only at the top level. An indented line continues
+        // the previous key's value, so a `name` or `description` nested under a
+        // map such as `metadata:` belongs to that map, not to the skill.
+        if (line.bytes[0] == ' ' or line.bytes[0] == '\t') {
+            if (previous_line_recognized) setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
             previous_line_recognized = false;
             continue;
         }
@@ -343,6 +350,12 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
                 line_offset = parsed_block.next_offset;
                 previous_line_recognized = false;
                 if (parsed_block.invalid_cause) |cause| setFirstInvalidCause(&invalid_cause, cause);
+            } else if (parse_plain_description(header, line, raw_value)) |parsed_plain| {
+                description = parsed_plain.value;
+                description_block = parsed_plain.block;
+                line_offset = parsed_plain.next_offset;
+                previous_line_recognized = false;
+                if (parsed_plain.invalid_cause) |cause| setFirstInvalidCause(&invalid_cause, cause);
             } else {
                 previous_line_recognized = true;
                 const parsed_value = parseRecognizedValue(raw_value);
@@ -467,6 +480,125 @@ fn parse_block_description(header: []const u8, start: usize, style: BlockDescrip
     };
 }
 
+// Plain scalars fold continuation lines without the trailing newline of a block.
+// Keep the original slice borrowed so discovery and invocation use the same decoder.
+fn parse_plain_description(header: []const u8, first: HeaderLine, initial: []const u8) ?ParsedBlockDescription {
+    const key_indent = leading_space_count(first.bytes);
+    if (key_indent != 0 or first.bytes[0] == '\t') return null;
+    var offset = first.next;
+    while (headerLineAt(header, offset)) |line| {
+        offset = line.next;
+        if (is_structural_blank(line.bytes)) continue;
+        const indent = leading_space_count(line.bytes);
+        if (line.bytes[indent] == '#') continue;
+        if (indent <= key_indent) return null;
+        break;
+    } else return null;
+
+    var invalid_cause: ?InvalidMetadataCause = null;
+    var ended_by_comment = false;
+    var has_content = false;
+    validate_plain_line(initial, &has_content, &ended_by_comment, &invalid_cause);
+    offset = first.next;
+    while (headerLineAt(header, offset)) |line| {
+        if (is_structural_blank(line.bytes)) {
+            offset = line.next;
+            continue;
+        }
+        const indent = leading_space_count(line.bytes);
+        if (line.bytes[indent] == '#') {
+            offset = line.next;
+            validate_plain_line(line.bytes[indent..], &has_content, &ended_by_comment, &invalid_cause);
+            continue;
+        }
+        if (indent <= key_indent) {
+            if (line.bytes[indent] != '\t') {
+                if (std.mem.findScalar(u8, line.bytes, ':') == null) {
+                    setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
+                }
+                break;
+            }
+            setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
+            offset = line.next;
+            continue;
+        }
+        offset = line.next;
+        const value = std.mem.trim(u8, line.bytes[indent..], " \t");
+        if (ended_by_comment and value.len > 0 and value[0] != '#') {
+            setFirstInvalidCause(&invalid_cause, .unsupported_multiline);
+        }
+        validate_plain_line(value, &has_content, &ended_by_comment, &invalid_cause);
+    }
+    const raw = header[first.start..offset];
+    return .{
+        .value = raw,
+        .block = .{ .style = .plain_folded, .base_indent = 0, .decoded_len = decode_plain_description(raw, null) },
+        .next_offset = offset,
+        .invalid_cause = invalid_cause,
+    };
+}
+
+fn plain_content(value: []const u8) []const u8 {
+    for (value, 0..) |byte, index| {
+        if (byte == '#' and (index == 0 or value[index - 1] == ' ' or value[index - 1] == '\t')) {
+            return std.mem.trimEnd(u8, value[0..index], " \t");
+        }
+    }
+    return value;
+}
+
+fn validate_plain_line(value: []const u8, has_content: *bool, ended_by_comment: *bool, invalid_cause: *?InvalidMetadataCause) void {
+    const content = plain_content(value);
+    if (invalidTextCause(content)) |cause| setFirstInvalidCause(invalid_cause, cause);
+    if (content.len != value.len and (has_content.* or content.len > 0)) ended_by_comment.* = true;
+    if (content.len == 0) return;
+    if (!has_content.* and (std.mem.findScalar(u8, "[]{} ,&*!|>'\"%@`", content[0]) != null or
+        ((content[0] == '-' or content[0] == '?' or content[0] == ':') and
+            (content.len == 1 or content[1] == ' ' or content[1] == '\t'))))
+    {
+        setFirstInvalidCause(invalid_cause, .unsupported_multiline);
+    }
+    has_content.* = true;
+    for (content, 0..) |byte, index| {
+        if (byte == ':' and (index + 1 == content.len or content[index + 1] == ' ' or content[index + 1] == '\t')) {
+            setFirstInvalidCause(invalid_cause, .unsupported_multiline);
+        }
+    }
+}
+
+fn decode_plain_description(raw: []const u8, output: ?[]u8) usize {
+    var emitter: DescriptionEmitter = .{ .output = output };
+    var offset: usize = 0;
+    var first = true;
+    var has_content = false;
+    var blank_lines: usize = 0;
+    while (headerLineAt(raw, offset)) |line| {
+        offset = line.next;
+        const text = if (first) first: {
+            first = false;
+            const colon = std.mem.findScalar(u8, line.bytes, ':').?;
+            break :first line.bytes[colon + 1 ..];
+        } else line.bytes;
+        const trimmed = std.mem.trim(u8, text, " \t");
+        const content = plain_content(trimmed);
+        if (content.len == 0) {
+            if (has_content and trimmed.len == 0) blank_lines += 1;
+            continue;
+        }
+        if (has_content) {
+            if (blank_lines == 0) {
+                emitter.write(" ");
+            } else {
+                for (0..blank_lines) |_| emitter.write("\n");
+            }
+        }
+        emitter.write(content);
+        has_content = true;
+        blank_lines = 0;
+    }
+    return emitter.len;
+}
+
 fn block_description_style(value: []const u8) ?BlockDescriptionStyle {
     if (std.mem.eql(u8, value, ">")) return .folded_clip;
     if (std.mem.eql(u8, value, ">-")) return .folded_strip;
@@ -524,6 +656,7 @@ fn decode_block_description(
             const separator = switch (style) {
                 .literal_clip => "\n",
                 .folded_clip, .folded_strip => if (previous_nonblank and nonblank) " " else "\n",
+                .plain_folded => unreachable,
             };
             emitter.write(separator);
         }
@@ -534,6 +667,7 @@ fn decode_block_description(
     switch (style) {
         .folded_clip, .literal_clip => emitter.write("\n"),
         .folded_strip => {},
+        .plain_folded => unreachable,
     }
     return emitter.len;
 }
@@ -1069,12 +1203,43 @@ test "parseSkillFile classifies invalid recognized metadata" {
     }
 }
 
-test "parseSkillFile rejects indented continuations for recognized metadata" {
+test "parseSkillFile folds multiline plain descriptions" {
+    try expectResolvedDescription(
+        "---\nname: workflow\ndescription:\n  React composition patterns that scale.\n  Use when building components.\nlicense: MIT\n---\nBody",
+        "React composition patterns that scale. Use when building components.",
+    );
+    try expectResolvedDescription(
+        "---\r\nname: workflow\r\ndescription: first line\r\n    second line\r\n\r\n  next paragraph\r\n---\r\nBody",
+        "first line second line\nnext paragraph",
+    );
+    try expectResolvedDescription(
+        "---\nname: workflow\ndescription:\n  See https://example.com/a#part\n  and use it. # comment\nlicense: MIT\n---\nBody",
+        "See https://example.com/a#part and use it.",
+    );
+    try expectResolvedDescription(
+        "---\nname: workflow\ndescription: # explanation\n# another\tcomment\n  first\n  - second\n  [third]\n---\nBody",
+        "first - second [third]",
+    );
+    try std.testing.expectEqual(
+        MetadataStatus{ .invalid = .duplicate_recognized_key },
+        parseSkillFile("---\nname: workflow\ndescription:\n  first\ndescription: second\n---\nBody").status,
+    );
+    try std.testing.expectEqual(
+        MetadataStatus{ .invalid = .invalid_utf8 },
+        parseSkillFile("---\nname: workflow\ndescription:\n  invalid\xff\n---\nBody").status,
+    );
+}
+
+test "parseSkillFile rejects unsupported indented continuations" {
     const cases = [_][]const u8{
         "---\nname: workflow\n  continued name\ndescription: helper\n---\nBody",
-        "---\nname: workflow\ndescription: first line\n  continued description\n---\nBody",
+        "---\nname: workflow\ndescription: 'quoted'\n  continued description\n---\nBody",
         "---\nname: workflow\ndescription: first line\n  continued: description\n---\nBody",
-        "---\nname: workflow\ndescription:\n  continued description\n---\nBody",
+        "---\nname: workflow\ndescription:\n  first # comment\n  second\n---\nBody",
+        "---\nname: workflow\ndescription: first\n  second\n# comment\n  third\n---\nBody",
+        "---\nname: workflow\ndescription: first\n  second\nnot a key\n---\nBody",
+        "---\nname: workflow\ndescription:\n  - nested sequence\n---\nBody",
+        "---\nname: workflow\ndescription:\n  first\n\tsecond\n---\nBody",
     };
 
     for (cases) |content| {
@@ -1083,6 +1248,40 @@ test "parseSkillFile rejects indented continuations for recognized metadata" {
             MetadataStatus{ .invalid = .unsupported_multiline },
             parsed.status,
         );
+    }
+}
+
+test "parseSkillFile ignores recognized keys nested under other keys" {
+    const cases = [_]struct { content: []const u8, description: ?[]const u8 }{
+        .{
+            .content = "---\nname: workflow\ndescription: top\nmetadata:\n  name: nested\n  description: nested\n---\nBody",
+            .description = "top",
+        },
+        .{
+            .content = "---\nmetadata:\n  description: nested\nname: workflow\ndescription: top\n---\nBody",
+            .description = "top",
+        },
+        .{
+            .content = "---\nname: workflow\nmetadata:\n  inner:\n    name: deep\n    description: deep\n---\nBody",
+            .description = null,
+        },
+        // A nested key is not the skill's description, so its continuation
+        // lines are the other key's content, not an unsupported multiline.
+        .{
+            .content = "---\nname: workflow\nmetadata:\n  description: nested\n    words\n---\nBody",
+            .description = null,
+        },
+    };
+
+    for (cases) |case| {
+        const parsed = parseSkillFile(case.content);
+        try std.testing.expectEqual(MetadataStatus.valid, parsed.status);
+        try std.testing.expectEqualStrings("workflow", parsed.name.?);
+        if (case.description) |description| {
+            try std.testing.expectEqualStrings(description, parsed.description.?);
+        } else {
+            try std.testing.expect(parsed.description == null);
+        }
     }
 }
 
@@ -1095,6 +1294,7 @@ test "parseSkillFile keeps fuzzed borrowed slices inside the input" {
             "---\r\nname: \"valid\"\r\n---\r\nbody",
             "---\nname: quoted\ndescription: 'single line'\n---\nbody",
             "---\nname: block\ndescription: >-\n  first line\n  second line\n---\nbody",
+            "---\nname: plain\ndescription:\n  first line\n\n  second line\n---\nbody",
         }) ++ @import("fuzz_corpus").skill_file.*),
     });
 }

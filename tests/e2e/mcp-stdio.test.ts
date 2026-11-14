@@ -21,6 +21,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -80,6 +81,8 @@ type RootOptions = {
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "tool_protocol_error"
+    | "invalid_params"
     | "image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
@@ -106,9 +109,12 @@ type RootOptions = {
     | "startup_exit"
     | "startup_exit_after_delay"
     | "startup_garbage"
-    | "exit_after_result";
+    | "exit_after_result"
+    | "typed_arguments";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
+  /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
+  failureText?: string;
   operationTimeoutMs?: number;
   restartLimit?: number;
   recoveredToolName?: string;
@@ -182,6 +188,10 @@ function createRoot(
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
+            // JSON, so the text can hold bytes an environment variable cannot.
+            FX_MCP_FAILURE_TEXT: options.failureText === undefined
+              ? undefined
+              : JSON.stringify(options.failureText),
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
             FX_MCP_INVALIDATION_RELEASE_PATH: invalidationReleasePath,
@@ -1111,10 +1121,11 @@ describe("modern MCP stdio compatibility", () => {
         { text: "later" },
       ]);
 
-      // Each turn's tool group counts its MCP call as one, never as a command.
+      // Each turn's tool group names its MCP call as MCP work, never as a
+      // command.
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain("1 MCP call");
-      expect(scrollback).not.toMatch(/\b\d+ commands?\b/);
+      expect(scrollback).toContain("● Used an MCP tool");
+      expect(scrollback).not.toMatch(/\b\d+ commands?\b|\b[Rr]an (a )?commands?\b/);
       expect(scrollback).not.toContain("not selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -1627,6 +1638,135 @@ describe("modern MCP stdio compatibility", () => {
     expect(gateway.requests.at(-1)?.body).not.toContain(
       "Repeated MCP tool call blocked: two equivalent attempts failed",
     );
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  for (const retriedLimit of [40, "forty"]) {
+    test(`a 2026 server that refuses a call's arguments with -32602 still answers the next call (${JSON.stringify(retriedLimit)})`, async () => {
+      const root = createRoot("typed-arguments-refused", MODERN_FIXTURE, { mode: "typed_arguments" });
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+        // Text that is not a number stays text, so the server refuses it.
+        fakeGatewayToolCall("refused_call", "toolbox", { run: TOOL_NAME, arguments: { limit: "forty" } }),
+        fakeGatewayToolCall("retried_call", "toolbox", { run: TOOL_NAME, arguments: { limit: retriedLimit } }),
+        fakeGatewayFinalText("Refused MCP arguments complete."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+      );
+
+      const wire = readWire(root.wireLogPath);
+      expect(result.code).toBe(0);
+      expect(toolResultText(gateway.requests[2]!.body, "refused_call")).toContain("-32602");
+      const retried = toolResultText(gateway.requests[3]!.body, "retried_call");
+      expect(retried).toContain(retriedLimit === 40 ? "TYPED_ARGUMENTS_OK" : "-32602");
+      expect(retried).not.toContain("unavailable");
+      // The refusal is about the arguments, so fx keeps the 2026 session.
+      expect(wire.filter((entry) => entry.message.method === "initialize")).toHaveLength(0);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(2);
+      expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
+
+  test("typed MCP arguments the model wrote as text reach the server as their schema's types", async () => {
+    const root = createRoot("typed-arguments-repaired", MODERN_FIXTURE, { mode: "typed_arguments" });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("typed_call", "toolbox", {
+        run: TOOL_NAME,
+        arguments: {
+          text: "40",
+          limit: "40",
+          count: "7",
+          verbose: "true",
+          queries: "[\"sum:requests{*}\"]",
+          filter: "{\"env\":\"prod\"}",
+          either: "40",
+        },
+      }),
+      fakeGatewayFinalText("Typed MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Typed MCP arguments complete.");
+    const wire = readWire(root.wireLogPath);
+    // Only the string fields keep the model's text.
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([{
+        text: "40",
+        limit: 40,
+        count: 7,
+        verbose: true,
+        queries: ["sum:requests{*}"],
+        filter: { env: "prod" },
+        either: "40",
+      }]);
+    const typedResult = toolResultText(gateway.requests[2]!.body, "typed_call");
+    expect(typedResult).toContain("TYPED_ARGUMENTS_OK");
+    expect(typedResult).not.toContain("-32602");
+    // One trace line per changed field, with no argument values in it.
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    const repaired = trace.split("\n").filter((line) => line.includes("MCP argument sent as its schema's type"));
+    expect(repaired.map((line) => line.match(/field=(\S+) type=(\S+)/)?.slice(1))).toEqual([
+      ["limit", "number"],
+      ["count", "integer"],
+      ["verbose", "boolean"],
+      ["queries", "array"],
+      ["filter", "object"],
+    ]);
+    for (const line of repaired) {
+      expect(line).toContain("server=fixture tool=echo");
+      expect(line).not.toContain("requests");
+      expect(line).not.toContain("prod");
+    }
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("MCP arguments that aren't their schema's type reach the server as the model wrote them", async () => {
+    const root = createRoot("typed-arguments-kept", MODERN_FIXTURE, { mode: "typed_arguments" });
+    const sent = {
+      text: "true",
+      limit: "forty",
+      count: "4.5",
+      verbose: "True",
+      queries: "[\"unclosed\"",
+      filter: "[1]",
+      either: "40",
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("kept_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("kept_call", "toolbox", { run: TOOL_NAME, arguments: sent }),
+      fakeGatewayFinalText("Kept MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([sent]);
+    // The server's own error reaches the model.
+    const keptResult = toolResultText(gateway.requests[2]!.body, "kept_call");
+    expect(keptResult).toContain("-32602");
+    expect(keptResult).toContain("validating /properties/limit");
+    expect(readFileSync(root.traceLogPath, "utf8")).not.toContain("MCP argument sent as its schema's type");
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
@@ -2303,13 +2443,15 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the failing MCP fixture once.");
+      // The failed call's reason shows on the line below its row.
       await tui.waitForText(
-        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`,
+        "✗ Invalid input: labels require at least one item retry rejected",
         20_000,
       );
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`└ Failed ${TOOL_NAME}\n  ✗ Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -2325,6 +2467,57 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await expectFixtureProcessesExited(wire);
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
+    async () => {
+      // A 2025 server, as Datadog's is. A 2026 server's -32602 on a call keeps its
+      // session ("a 2026 server that refuses a call's arguments with -32602 still
+      // answers the next call" in this file).
+      const root = createRoot("tui-invalid-params", LEGACY_FIXTURE, {
+        mode: "invalid_params",
+        legacyVersion: "2025-06-18",
+      });
+      const activeGateway = startToolGateway("Rejected arguments complete.");
+      gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 32,
+        stderrPath,
+        // /trace writes its report to TMPDIR.
+        env: { ...fixtureEnv(root, activeGateway), TMPDIR: root.root },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture with a typed argument.");
+      const cause = "arguments rejected: limit is a string, the schema wants a number";
+      // The row names the failed call, and the reason line under it names the
+      // cause.
+      await tui.waitForText(cause, 20_000);
+      await tui.waitForText("Rejected arguments complete.", 20_000);
+      expect(await tui.captureFullScrollback()).toContain(`Failed ${TOOL_NAME}`);
+      // The model still gets the server's own words, which say how to fix the call.
+      expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
+
+      await tui.sendText("/trace");
+      const report = await waitForNewTraceReport(root.root);
+      expect(traceReportNames(root.root)).toHaveLength(1);
+      const problemCalls = report.problems("tool_call").map((problem) => problem.call as Record<string, unknown>);
+      expect(problemCalls.filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(report.all("tool_call").filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(wire);
+    },
+    45_000,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -4054,6 +4247,42 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(1);
   }, 90_000);
 
+  test("a tool error's text with control bytes shows as visible escapes, and its plain lines stay as they are", async () => {
+    // The text is the server's own: a window title, a bell, a clear screen,
+    // a C1 control sequence introducer, DEL, a carriage return that would
+    // overwrite the line, and plain lines around them. (fx drops a text with
+    // NUL in it before the command sees it, so NUL has no case here.)
+    const failureText = "Invalid input: labels require at least one item\nretry rejected\n" +
+      "\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rgood\r\nlast";
+    const root = bridgeRoot("bridge-tool-error-bytes", {}, { mode: "tool_failure", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=6");
+    expect(seen).toContain(
+      `fx mcp call: ${TOOL_NAME} returned an error:\n` +
+        "Invalid input: labels require at least one item\nretry rejected\n" +
+        "\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dgood\nlast\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a protocol error's message with control bytes shows as visible escapes, and the call exits 1", async () => {
+    // The message is the server's own, in a JSON-RPC error that answers
+    // tools/call: a window title, a bell, a clear screen, a C1 control
+    // sequence introducer, DEL, a carriage return that would overwrite the
+    // line, and plain text around them.
+    const failureText = "bad\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rafter\r\nlast line";
+    const root = bridgeRoot("bridge-protocol-error-bytes", {}, { mode: "tool_protocol_error", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain(
+      "fx mcp call: MCP protocol error -32000: " +
+        "bad\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dafter\nlast line\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
   test("a call whose server crashes exits 1, and the command learns why", async () => {
     const root = bridgeRoot("bridge-crash", {}, { mode: "crash_always", restartLimit: 0 });
     const seen = await runBridgeCommand(root, callTo("out.txt"));
@@ -4267,6 +4496,24 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
+  test("a tool name with control bytes shows as visible escapes in a command's messages", async () => {
+    const root = bridgeRoot("bridge-odd-name");
+    // The name is a word the model wrote, so it can hold an escape sequence.
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `name=$(printf 'mcp_fixture_\\033]0;x\\007nope')`,
+      `"${FX_BIN}" mcp call "$name" '{}' 2>&1; echo "call=$?"`,
+      `"${FX_BIN}" mcp call help "$name" 2>&1; echo "help=$?"`,
+    ].join("\n")));
+    const shown = "mcp_fixture_\\x1b]0;x\\x07nope";
+    expect(seen).toContain(`fx mcp call: ${shown} did not run. No MCP tool named ${shown} is available to this agent.`);
+    expect(seen).toContain("call=5");
+    expect(seen).toContain(`No MCP tool named ${shown} is available to this agent. Find tool names with fx mcp call search.`);
+    expect(seen).toContain("help=1");
+    expect(seen).not.toContain("\x1b");
+    expect(seen).not.toContain("\x07");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
   test("list, search, and help hide a tool the permission rules deny", async () => {
     const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
     const seen = shellOutput(await runBridgeCommand(root, [
@@ -4309,7 +4556,7 @@ describe("fx mcp call", () => {
       await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The rows a direct call of the tool gets, in the command's group.
-      expect(scrollback).toContain("● 4 tool calls · 3 MCP calls · 1 command");
+      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
       expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
       expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
       expect(scrollback).not.toContain("Running MCP");

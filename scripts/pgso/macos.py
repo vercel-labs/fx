@@ -32,7 +32,7 @@ TARGET = "aarch64-macos"
 DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
-SIZE_CEILING_MIB = 6.500
+SIZE_CEILING_MIB = 6.750
 # The ordinary control build already records everything the links reuse.
 CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
 # Apple ld's dead-code stripping for `zig cc` links.
@@ -210,6 +210,9 @@ def instrumented_link_argv(
         "-isysroot",
         str(toolchain.tools.sdk),
         "-Wl,-dead_strip",
+        # The map names the function at each address of the stripped
+        # binary, for its crash reports.
+        f"-Wl,-map,{paths.logs / 'instrumented-link.map'}",
         *PROFILE_SECTION_ALIGNMENTS,
         str(paths.instrumented_object),
         str(toolchain.profile_runtime),

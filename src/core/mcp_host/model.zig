@@ -203,7 +203,7 @@ pub const Catalog = struct {
         if (options.expected_binding) |b| if (b.runtime_generation != c.currentGeneration()) return error.McpAdvertisedToolChanged;
         if (options.expected_runtime_generation) |g| if (g != c.currentGeneration()) return error.McpAuthorityChanged;
         try c.ensureCurrent(name, options.cancel_flag);
-        const server, const tool, const transport, const how = found: {
+        const server, const tool, const transport, const how, const input_schema = found: {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
             const found = c.findLocked(name) orelse return null;
@@ -212,12 +212,26 @@ pub const Catalog = struct {
                 if (!b.sameDefinition(c.bindingLocked(found.server, found.tool.*))) return error.McpAdvertisedToolChanged;
             }
             const s = c.servers[found.server];
-            break :found .{ s.name, try arena.dupe(u8, found.tool.original_name), @tagName(s.transport), signIn(c.runtime.options.slash_commands, s.source) };
+            break :found .{
+                s.name,
+                try arena.dupe(u8, found.tool.original_name),
+                @tagName(s.transport),
+                signIn(c.runtime.options.slash_commands, s.source),
+                try arena.dupe(u8, found.tool.input_schema_json),
+            };
         };
+        // A value the model wrote as text goes out as the type the tool's
+        // schema names, so a server that checks types takes the call.
+        const sent_arguments = if (try tools_feature.repairArgumentTypes(arena, input_schema, arguments_json)) |repaired| sent: {
+            for (repaired.fields) |field| {
+                debug_trace.logf("mcp", "MCP argument sent as its schema's type server={s} tool={s} field={s} type={t}", .{ server, tool, field.name, field.json_type });
+            }
+            break :sent repaired.arguments_json;
+        } else arguments_json;
         var asking: Asking = .{ .responder = options.input_responder orelse undefined, .tool = name, .cancel = options.cancel_flag, .io = c.io };
         const observed = if (options.observer) |observer| observer.beginMcp(.{ .call_id = options.call_id, .server = server, .tool = tool, .transport = transport }) else null;
         const asker: ?runtime_mod.Asker = if (options.input_responder != null) .{ .context = &asking, .ask = Asking.ask } else null;
-        const answer = c.runtime.callObserved(arena, server, tool, arguments_json, options.cancel_flag, asker, options.progress, observed) catch |err| {
+        const answer = c.runtime.callObserved(arena, server, tool, sent_arguments, options.cancel_flag, asker, options.progress, observed) catch |err| {
             if (observed) |call| call.end(if (err == error.Cancelled) .cancelled else .failure, @errorName(err));
             asking.finish(arena, .abandoned);
             return err;

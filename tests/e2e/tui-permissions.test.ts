@@ -1146,7 +1146,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const cases = [
         {
           name: "denied",
-          outcome: "1 denied",
+          // The group's only call is its header, which says it was denied.
+          outcome: "● Denied file",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1463,16 +1464,18 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
 
       await session.sendText("Edit the long path fixture twice.");
+      // The header says what the group did; each row keeps its file and
+      // counts.
       await session.waitForPane(
         (pane) =>
           pane.includes("long path edits complete") &&
-          pane.includes("● 2 tool calls · 2 edit"),
+          /^● Edited a file$/m.test(pane),
         TIMEOUT,
       );
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
 
       const grid = await session.capturePaneGrid();
-      const rows = grid.filter((line) => line.includes("Edited packages/"));
+      const rows = grid.filter((line) => /^[├└] Edited packages\//.test(line));
       expect(rows).toHaveLength(2);
       for (const row of rows) {
         expect([...row.trimEnd()].length).toBeLessThanOrEqual(width);
@@ -1480,6 +1483,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       }
 
       const escapes = await session.capturePaneEscapes();
+      // Each row keeps its counts and their colors after its clipped path.
       const styledRows = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
       expect(styledRows).toHaveLength(2);
       for (const row of styledRows) {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const input_presentation = @import("input_presentation.zig");
 const render_input = @import("render_input.zig");
+const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
@@ -37,7 +38,45 @@ const Lines = struct {
 };
 
 pub fn menuRowCount(projection: ForkMenuProjection, width: u16, row_budget: u16) u16 {
+    if (projection.question != null) return @intCast(@min(row_budget, questionRows(projection, width)));
     return @intCast(@min(row_budget, Lines.measure(projection, width).total));
+}
+
+/// The question's rows: the chosen prompt, then the question (D97).
+fn questionRows(projection: ForkMenuProjection, width: u16) usize {
+    return promptLayout(projection.points[projection.selected].prompt, width).row_count + 1;
+}
+
+/// The keys the question takes, widest first.
+pub const question_hint_variants = [_][]const u8{
+    "enter yes     n or esc no",
+    "enter yes  n or esc no",
+    "enter y  esc n",
+    "enter esc",
+};
+
+/// The question after a prompt is chosen where the session had subagents.
+fn questionText(buf: []u8, count: usize) []const u8 {
+    if (count == 1) return "Bring 1 subagent into the fork?";
+    return std.mem.print(buf, "Bring {d} subagents into the fork?", .{count}) catch "Bring the subagents into the fork?";
+}
+
+/// Row `row_index` of the question: the chosen prompt, dim, then the
+/// question. A short budget drops prompt lines first.
+fn composeQuestionRow(alloc: Allocator, row: *std.ArrayList(u8), projection: ForkMenuProjection, count: usize, row_index: u16, width: u16, row_budget: u16) !void {
+    const layout = promptLayout(projection.points[projection.selected].prompt, width);
+    const total = layout.row_count + 1;
+    const line = total - @min(row_budget, total) + row_index;
+    try row.appendNTimes(alloc, ' ', indentWidth(width));
+    if (line < layout.row_count) {
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try input_presentation.appendMessageLayoutRow(alloc, row, layout, line);
+    } else {
+        var buf: [64]u8 = undefined;
+        try row.appendSlice(alloc, ui_render.selected_completion_style);
+        try row_text.appendClipped(alloc, row, questionText(&buf, count), width - indentWidth(width));
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
 }
 
 /// The first line shown: `projection.window_start`, moved only as far as it
@@ -61,6 +100,10 @@ pub fn composeForkMenuRow(
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     if (width == 0 or row_index >= row_budget) return row;
+    if (projection.question) |count| {
+        try composeQuestionRow(alloc, &row, projection, count, row_index, width, row_budget);
+        return row;
+    }
     const line = windowStart(projection, width, row_budget) + row_index;
     var first: usize = 0;
     for (projection.points, 0..) |point, index| {
@@ -147,5 +190,55 @@ test "fork menu lists prompts oldest first and opens on the newest at the bottom
         defer std.testing.allocator.free(bottom.text);
         try std.testing.expectEqualStrings(step.top, top.text);
         try std.testing.expectEqualStrings(step.bottom, bottom.text);
+    }
+}
+
+test "fork menu asks once about the subagents under the chosen prompt" {
+    const points = [_]ForkPoint{
+        .{ .turn = 1, .prompt = @constCast("first") },
+        .{ .turn = 2, .prompt = @constCast("second") },
+    };
+    var projection: ForkMenuProjection = .{ .points = &points, .selected = 0, .window_start = 0, .question = 2 };
+    try std.testing.expectEqual(@as(u16, 2), menuRowCount(projection, 40, max_inline_rows));
+    const prompt = try testRow(projection, 0, 40, max_inline_rows);
+    defer std.testing.allocator.free(prompt.text);
+    try std.testing.expectEqualStrings("  first", prompt.text);
+    try std.testing.expect(!prompt.selected);
+    const question = try testRow(projection, 1, 40, max_inline_rows);
+    defer std.testing.allocator.free(question.text);
+    try std.testing.expectEqualStrings("  Bring 2 subagents into the fork?", question.text);
+    try std.testing.expect(question.selected);
+
+    // One row shows only the question; one subagent reads in the singular.
+    projection.question = 1;
+    try std.testing.expectEqual(@as(u16, 1), menuRowCount(projection, 40, 1));
+    const only = try testRow(projection, 0, 40, 1);
+    defer std.testing.allocator.free(only.text);
+    try std.testing.expectEqualStrings("  Bring 1 subagent into the fork?", only.text);
+}
+
+test "the fork question's hint keeps its keys at every width (D97)" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { width: u16, text: []const u8 }{
+        .{ .width = 80, .text = "enter yes     n or esc no" },
+        .{ .width = 24, .text = "enter yes  n or esc no" },
+        .{ .width = 16, .text = "enter y  esc n" },
+        .{ .width = 9, .text = "enter esc" },
+    };
+    for (cases) |case| {
+        var row = try input_presentation.composeVariantHintRow(alloc, case.width, false, &question_hint_variants);
+        defer row.deinit(alloc);
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(alloc);
+        var index: usize = 0;
+        while (index < row.items.len) {
+            if (row.items[index] == 0x1b) {
+                index = std.mem.findScalarPos(u8, row.items, index, 'm').? + 1;
+                continue;
+            }
+            try text.append(alloc, row.items[index]);
+            index += 1;
+        }
+        try std.testing.expectEqualStrings(case.text, text.items);
     }
 }

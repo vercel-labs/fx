@@ -1,7 +1,11 @@
 -------------------------- MODULE PR1092Steering ---------------------------
 EXTENDS Naturals, Sequences, FiniteSets
 CONSTANT MaxMessages, MaxSteps
-Kinds == {"steering", "restored", "feedback", "plain"}
+\* "recovery" is fx's own prompt to a stalled turn (src/core/shared/recovery_prompt.zig).
+\* "notice" is a tool's notice to the model, such as the Vision outage, and "hook" is a
+\* Stop hook's message to continue the turn. All three are messages fx sends on its own,
+\* which the saved turn keeps inside the same marker.
+Kinds == {"steering", "restored", "feedback", "recovery", "notice", "hook", "plain"}
 Entry == [kind : Kinds, after : 0..MaxSteps, valid : BOOLEAN]
 VARIABLES steps, messages, saved, cancelled
 vars == <<steps, messages, saved, cancelled>>
@@ -19,7 +23,7 @@ Cancel == /\ ~cancelled /\ cancelled' = TRUE
           /\ UNCHANGED <<steps, messages>>
 Next == ToolResult \/ (\E k \in Kinds, v \in BOOLEAN : TypeMessage(k,v)) \/ Cancel \/ UNCHANGED vars
 Spec == Init /\ [][Next]_vars
-Expected == SelectSeq(messages, LAMBDA e : e.valid /\ e.kind \in {"steering", "restored", "feedback"})
+Expected == SelectSeq(messages, LAMBDA e : e.valid /\ e.kind \in {"steering", "restored", "feedback", "recovery", "notice", "hook"})
 SavedExactlyMarkedTail == cancelled => saved = Expected
 PlainTailExcluded == \A i \in 1..Len(saved) : saved[i].kind # "plain"
 AnchorsPreserved == cancelled => \A i \in 1..Len(saved) : saved[i].after = Expected[i].after

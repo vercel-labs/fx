@@ -180,6 +180,19 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+/// A refreshed login for the request that asked for it. Every field is
+/// allocated with the allocator the hook was given, and the caller owns it;
+/// the caller zeroes `token` when it frees it.
+pub const RefreshedGatewayCredential = struct {
+    token: []u8,
+    /// The Vercel team the refreshed login sends. Null keeps the request's
+    /// team, which is what a host that refuses a team change during a request
+    /// returns.
+    gateway_team: ?[]u8 = null,
+    /// That team's slug, which fx shows the user.
+    gateway_team_label: ?[]u8 = null,
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
@@ -190,6 +203,13 @@ pub const AgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    /// True where a turn's images are files the user named by path, as in the
+    /// TUI and `fx ask`. The rules of each image's folder then reach the model
+    /// the way a tool call's do: a note on the turn's own message, so the
+    /// instructions stay as they were cached. Hosts whose images carry no
+    /// workspace path leave it false. Other attached files reach the model the
+    /// same way through the prompt's `attached_files`.
+    image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
@@ -204,6 +224,17 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
+    /// Whether turn `turn_id`, which ends interrupted, ends because the user
+    /// cancelled it rather than because steering ended it. Asked before the
+    /// turn is reported, since a prompt typed once it is reported can join
+    /// its ending as steering. Hosts without steering leave it unset.
+    turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
+    /// Stops the commands that steering moved to the background during turn
+    /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
+    /// Called once the turn is reported, so a command that ignores SIGTERM
+    /// and takes seconds to stop does not hold the turn's end. Hosts without
+    /// steering leave it unset.
+    stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
@@ -271,6 +302,11 @@ pub const AgentRuntimeDeps = struct {
     /// Source-limit notices use a session-scoped deduplicating path when the
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
+    /// A notice the person should see once in a live session, however many
+    /// turns repeat its cause. The host shows it where they read the
+    /// transcript and drops a text it has already shown. Null: the host has
+    /// no session to remember it in, and the notice is not shown.
+    push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
@@ -281,7 +317,9 @@ pub const AgentRuntimeDeps = struct {
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
+    /// `rejected_token` is the access token the provider just answered 401
+    /// for, with `.force`; see `auth_runtime.refreshCredentialForAccount`.
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,

@@ -1,0 +1,21 @@
+event: response.created
+data: {"response":{"background":false,"completed_at":null,"created_at":1794248523,"error":null,"frequency_penalty":0,"id":"resp_379332","incomplete_details":null,"instructions":null,"max_output_tokens":64,"max_tool_calls":null,"metadata":{},"model":"qwen2.5:1.5b","object":"response","output":[],"parallel_tool_calls":true,"presence_penalty":0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","status":"in_progress","store":false,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Read a file","name":"read_file","parameters":{"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":1,"truncation":"disabled","usage":null},"sequence_number":0,"type":"response.created"}
+
+event: response.in_progress
+data: {"response":{"background":false,"completed_at":null,"created_at":1794248523,"error":null,"frequency_penalty":0,"id":"resp_379332","incomplete_details":null,"instructions":null,"max_output_tokens":64,"max_tool_calls":null,"metadata":{},"model":"qwen2.5:1.5b","object":"response","output":[],"parallel_tool_calls":true,"presence_penalty":0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","status":"in_progress","store":false,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Read a file","name":"read_file","parameters":{"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":1,"truncation":"disabled","usage":null},"sequence_number":1,"type":"response.in_progress"}
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call_jwjijtgk","id":"fc_581233_0","name":"read_file","status":"in_progress","type":"function_call"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"path\":\"/path/to/your/note.txt\"}","item_id":"fc_581233_0","output_index":0,"sequence_number":3,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.done
+data: {"arguments":"{\"path\":\"/path/to/your/note.txt\"}","item_id":"fc_581233_0","output_index":0,"sequence_number":4,"type":"response.function_call_arguments.done"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"path\":\"/path/to/your/note.txt\"}","call_id":"call_jwjijtgk","id":"fc_581233_0","name":"read_file","status":"completed","type":"function_call"},"output_index":0,"sequence_number":5,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"background":false,"completed_at":1794248523,"created_at":1794248523,"error":null,"frequency_penalty":0,"id":"resp_379332","incomplete_details":null,"instructions":null,"max_output_tokens":64,"max_tool_calls":null,"metadata":{},"model":"qwen2.5:1.5b","object":"response","output":[{"arguments":"{\"path\":\"/path/to/your/note.txt\"}","call_id":"call_jwjijtgk","id":"fc_581233_0","name":"read_file","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","status":"completed","store":false,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Read a file","name":"read_file","parameters":{"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":1,"truncation":"disabled","usage":{"input_tokens":152,"input_tokens_details":{"cached_tokens":151},"output_tokens":26,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":178}},"sequence_number":6,"type":"response.completed"}
+

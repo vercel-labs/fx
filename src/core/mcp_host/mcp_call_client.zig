@@ -15,6 +15,7 @@
 //! learn its arguments the same way.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
 const mcp_call = @import("mcp_call.zig");
 const wire = @import("mcp_call_wire.zig");
@@ -124,7 +125,6 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
         .search => |query| .{ .search = query },
         .help => |tool| .{ .help = tool },
     };
-    const tool = operation.subject();
     const socket_path = io_mod.getenv(wire.socket_env) orelse return unavailable(err);
     const token = wire.parseToken(io_mod.getenv(wire.token_env) orelse "") orelse return unavailable(err);
 
@@ -140,6 +140,13 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
         },
         else => return unavailable(err),
     };
+    return printReply(arena, io, out, err, operation, reply);
+}
+
+/// Shows the bridge's reply: the data on `out`, anything else on `err`.
+/// Returns the exit code.
+fn printReply(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, operation: wire.Operation, reply: Reply) !u8 {
+    const tool = operation.subject();
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
@@ -150,23 +157,23 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
             return exit.ok;
         },
         .tool_error => {
-            try err.print("fx mcp call: {s} returned an error:\n", .{tool});
-            try writeLine(err, reply.bytes);
+            try err.print("fx mcp call: {f} returned an error:\n", .{text_utils.terminalSafe(tool)});
+            try writeTerminalSafeLine(arena, err, reply.bytes);
             return exit.tool_error;
         },
         .failed => {
             try err.writeAll("fx mcp call: ");
-            try writeLine(err, reply.bytes);
+            try writeTerminalSafeLine(arena, err, reply.bytes);
             return exit.failed;
         },
         .denied => {
-            try err.print("fx mcp call: {s} did not run. ", .{tool});
-            try writeLine(err, reply.bytes);
+            try err.print("fx mcp call: {f} did not run. ", .{text_utils.terminalSafe(tool)});
+            try writeTerminalSafeLine(arena, err, reply.bytes);
             return exit.denied;
         },
         .refused => {
             try err.writeAll("fx mcp call: ");
-            try writeLine(err, reply.bytes);
+            try writeTerminalSafeLine(arena, err, reply.bytes);
             return if (reply.header.reason == .busy) exit.busy else if (reply.header.reason == .malformed or reply.header.reason == .too_large) exit.usage else exit.unavailable;
         },
     }
@@ -296,6 +303,18 @@ fn writeLine(w: *Writer, text: []const u8) !void {
     if (!std.mem.endsWith(u8, text, "\n")) try w.writeByte('\n');
 }
 
+/// `writeLine` for the text of a reply. It can be an MCP server's own, such as
+/// a JSON-RPC error's message. A person may read it on a terminal, and fx's
+/// shell tool hands it to the model as it is, so a control byte in it must
+/// show as text instead of acting. Line breaks and tabs stay, so the server's
+/// own lines read as it wrote them (a CRLF becomes a line feed); every other
+/// control byte, C1 control, and invalid UTF-8 byte becomes a visible escape.
+fn writeTerminalSafeLine(arena: Allocator, w: *Writer, text: []const u8) !void {
+    var safe: std.ArrayList(u8) = .empty;
+    try text_utils.appendTerminalSafeText(arena, &safe, text);
+    try writeLine(w, safe.items);
+}
+
 fn isJsonObject(arena: Allocator, text: []const u8) bool {
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return false;
     return value == .object;
@@ -313,6 +332,189 @@ test "fx mcp call outside a shell call reports it is unavailable" {
     try std.testing.expectEqual(exit.usage, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .call = .{ .tool = "mcp_s_t", .arguments = "[1]" } }));
     // A lookup outside a shell call is unavailable too.
     try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .list = "linear" }));
+}
+
+test "a tool error and a denial name the tool as visible escapes, not raw bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The name is a word from the command line, so it can hold any byte.
+    const asked: wire.Operation = .{ .call = .{ .tool = "mcp_s_\x1b]0;x\x07\x00t", .arguments_json = "{}" } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+
+    try std.testing.expectEqual(exit.denied, try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = .denied, .bytes = 4 },
+        .bytes = "Nope",
+    }));
+    try std.testing.expectEqual(exit.tool_error, try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = .tool_error, .bytes = 4 },
+        .bytes = "Boom",
+    }));
+    try std.testing.expectEqualStrings(
+        "fx mcp call: mcp_s_\\x1b]0;x\\x07\\x00t did not run. Nope\n" ++
+            "fx mcp call: mcp_s_\\x1b]0;x\\x07\\x00t returned an error:\nBoom\n",
+        err.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+/// The replies whose text `printReply` writes to stderr.
+const text_statuses = [_]wire.Status{ .tool_error, .failed, .denied, .refused };
+
+/// What `printReply` writes to stderr for a reply of `status` whose text is
+/// `text`, after the words that status starts with. Allocates in `arena`.
+fn replyLines(arena: Allocator, status: wire.Status, text: []const u8) ![]const u8 {
+    const asked: wire.Operation = .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const code = try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = status, .bytes = text.len },
+        .bytes = text,
+    });
+    try std.testing.expectEqual(switch (status) {
+        .tool_error => exit.tool_error,
+        .failed => exit.failed,
+        .denied => exit.denied,
+        .refused => exit.unavailable,
+        .ok => unreachable,
+    }, code);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    const first_words = switch (status) {
+        .tool_error => "fx mcp call: mcp_s_t returned an error:\n",
+        .failed, .refused => "fx mcp call: ",
+        .denied => "fx mcp call: mcp_s_t did not run. ",
+        .ok => unreachable,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, err.written(), first_words));
+    return err.written()[first_words.len..];
+}
+
+test "a reply's text keeps its lines and shows every other control byte as a visible escape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The text can be the MCP server's own, so it can hold any byte. The
+    // same table holds for every reply that carries text.
+    const cases = [_]struct { name: []const u8, text: []const u8, shown: []const u8 }{
+        .{ .name = "a plain line", .text = "Boom", .shown = "Boom\n" },
+        .{
+            .name = "plain lines and a tab stay as they are",
+            .text = "Invalid input: labels require at least one item\n\tretry rejected\n",
+            .shown = "Invalid input: labels require at least one item\n\tretry rejected\n",
+        },
+        .{ .name = "a blank line stays", .text = "one\n\ntwo", .shown = "one\n\ntwo\n" },
+        .{ .name = "JSON stays", .text = "{\"issues\":[1,2]}\n", .shown = "{\"issues\":[1,2]}\n" },
+        .{
+            .name = "valid UTF-8 stays",
+            .text = "caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac \xf0\x9f\x91\x8d",
+            .shown = "caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac \xf0\x9f\x91\x8d\n",
+        },
+        .{ .name = "empty text", .text = "", .shown = "\n" },
+        .{ .name = "a window title", .text = "x\x1b]0;owned\x07y", .shown = "x\\x1b]0;owned\\x07y\n" },
+        .{ .name = "clear screen", .text = "\x1b[2J\x1b[H", .shown = "\\x1b[2J\\x1b[H\n" },
+        .{ .name = "bell", .text = "a\x07b", .shown = "a\\x07b\n" },
+        .{ .name = "NUL", .text = "a\x00b\x00", .shown = "a\\x00b\\x00\n" },
+        .{ .name = "delete", .text = "a\x7fb", .shown = "a\\x7fb\n" },
+        .{ .name = "a C1 control sequence introducer", .text = "a\xc2\x9b2Jb", .shown = "a\\u{009b}2Jb\n" },
+        .{ .name = "a C1 next line", .text = "a\xc2\x85b", .shown = "a\\u{0085}b\n" },
+        .{ .name = "CRLF line ends become line feeds", .text = "one\r\ntwo\r\n", .shown = "one\ntwo\n" },
+        .{ .name = "a lone carriage return would overwrite the line", .text = "good\rbad", .shown = "good\\x0dbad\n" },
+        .{ .name = "a trailing carriage return", .text = "a\r", .shown = "a\\x0d\n" },
+        .{ .name = "a carriage return before a CRLF", .text = "a\r\r\nb", .shown = "a\\x0d\nb\n" },
+        .{ .name = "a stray byte", .text = "a\xffb", .shown = "a\\xffb\n" },
+        .{ .name = "a cut sequence at the end", .text = "ok\xe2\x82", .shown = "ok\\xe2\\x82\n" },
+        .{ .name = "an overlong sequence", .text = "\xc0\xaf", .shown = "\\xc0\\xaf\n" },
+        .{ .name = "an encoded surrogate", .text = "\xed\xa0\x80", .shown = "\\xed\\xa0\\x80\n" },
+        // fx writes a name it escaped itself with a backslash, which stays.
+        .{
+            .name = "a name fx escaped stays",
+            .text = "No MCP tool named mcp_s_\\x1b]0;x\\x07t is available.",
+            .shown = "No MCP tool named mcp_s_\\x1b]0;x\\x07t is available.\n",
+        },
+    };
+    for (text_statuses) |status| for (cases) |case| {
+        const shown = try replyLines(arena, status, case.text);
+        std.testing.expectEqualStrings(case.shown, shown) catch |failure| {
+            std.debug.print("status: {s}, case: {s}\n", .{ @tagName(status), case.name });
+            return failure;
+        };
+        try std.testing.expect(text_utils.isTerminalSafeText(shown));
+    };
+}
+
+test "a JSON-RPC error's message in a failed reply shows as visible escapes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // What the bridge sends for a server that answers tools/call with an
+    // error whose message holds a window title, a bell, and a clear screen.
+    const shown = try replyLines(
+        arena_state.allocator(),
+        .failed,
+        "MCP protocol error -32000: bad\x1b]0;owned\x07\x1b[2Jafter\xc2\x9b31m\x7f\rend",
+    );
+    try std.testing.expectEqualStrings(
+        "MCP protocol error -32000: bad\\x1b]0;owned\\x07\\x1b[2Jafter\\u{009b}31m\\x7f\\x0dend\n",
+        shown,
+    );
+}
+
+test "a very long reply text prints whole, and a long run of escapes expands whole" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const plain = try arena.alloc(u8, 1024 * 1024);
+    @memset(plain, 'a');
+    const run_len = 100_000;
+    const escapes = try arena.alloc(u8, run_len);
+    @memset(escapes, 0x1b);
+    for (text_statuses) |status| {
+        const plain_shown = try replyLines(arena, status, plain);
+        try std.testing.expectEqual(plain.len + 1, plain_shown.len);
+        try std.testing.expectEqualStrings(plain, plain_shown[0..plain.len]);
+        try std.testing.expectEqual(@as(u8, '\n'), plain_shown[plain.len]);
+
+        const escapes_shown = try replyLines(arena, status, escapes);
+        try std.testing.expectEqual(run_len * 4 + 1, escapes_shown.len);
+        for (0..run_len) |index| {
+            try std.testing.expectEqualStrings("\\x1b", escapes_shown[index * 4 ..][0..4]);
+        }
+        try std.testing.expectEqual(@as(u8, '\n'), escapes_shown[run_len * 4]);
+    }
+}
+
+test "a reply's text reaches stderr terminal-safe whatever bytes the server sends" {
+    try std.testing.fuzz({}, fuzzReplyText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "Invalid input: labels require at least one item\n\tretry rejected\n",
+            "x\x1b]0;owned\x07y \xc2\x9b2J \xff \xe2\x82",
+            "a\r\r\nb\rc\x00d\x7fe",
+        }) ++ @import("fuzz_corpus").mcp_call_error_text.*),
+    });
+}
+
+/// Whatever the bytes, the reply's text on stderr holds no control but line
+/// breaks and tabs, is valid UTF-8 with no C1 control, ends with one line
+/// break, and costs at most four bytes for each byte of the text. Text that
+/// is already safe prints as it is. The text's length picks the reply.
+fn fuzzReplyText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const text = buffer[0..len];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const shown = try replyLines(arena_state.allocator(), text_statuses[len % text_statuses.len], text);
+    try std.testing.expect(std.mem.endsWith(u8, shown, "\n"));
+    try std.testing.expect(text_utils.isTerminalSafeText(shown));
+    try std.testing.expect(shown.len <= text.len * 4 + 1);
+    if (text_utils.isTerminalSafeText(text)) {
+        const ends_with_line = std.mem.endsWith(u8, text, "\n");
+        try std.testing.expectEqual(text.len + @intFromBool(!ends_with_line), shown.len);
+        try std.testing.expectEqualStrings(text, shown[0..text.len]);
+    }
 }
 
 test "a shape summary of one item names sizes, keys, and types, not values" {

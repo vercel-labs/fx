@@ -84,6 +84,9 @@ pub const RequestRecovery = struct {
     /// for example with Enter. Null on hosts that cannot ask the user, which
     /// end the turn instead (`canAskUser`).
     continue_flag: ?*std.atomic.Value(bool) = null,
+    /// Set by the same host when the sign-in it opened for this request
+    /// closes without a new login (`recovery.Event.sign_in_closed`).
+    sign_in_closed_flag: ?*std.atomic.Value(bool) = null,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
     /// Replies this request could not read. Touched only by the request's
@@ -239,11 +242,22 @@ pub const RequestRecovery = struct {
     }
 
     /// Reports a failed send. Returns the send the module asks for at once,
-    /// which only compaction does. Any other kind makes the module wait or
-    /// ask the user; the caller then calls `waitForSend`.
+    /// which only compaction and a sign-in failure the user already answered
+    /// do. Any other kind makes the module wait or ask the user; the caller
+    /// then calls `waitForSend`.
     pub fn failed(self: *RequestRecovery, failure: Failure) !?Send {
-        // An answer given before this failure answers nothing.
-        if (self.continue_flag) |flag| flag.store(false, .seq_cst);
+        // An answer given before this failure answers nothing, except a
+        // sign-in that finished while a resend for one was on the wire: the
+        // module keeps that one and resends at once with the new login. It
+        // ignores the continue in every other phase.
+        if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            _ = try self.deliverAnswer(.user_continue, "failed_send");
+        };
+        // The send that failed was the saved login's try, so a sign-in that
+        // closed while it was on the wire leaves nothing more to try.
+        if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=failed_send reason=the_failed_send_tried_the_saved_login", .{});
+        };
         return self.event(.{ .failed = failure });
     }
 
@@ -257,19 +271,23 @@ pub const RequestRecovery = struct {
     /// the continue flag, for example with a picker choice. Returns the
     /// module's send.
     pub fn userContinue(self: *RequestRecovery) !?Send {
-        return self.event(.user_continue);
+        return self.deliverAnswer(.user_continue, "host");
     }
 
     /// Waits for the module's next send, delivering `tick` every
-    /// `wait_tick_ms` and `user_continue` when the continue flag is set.
-    /// Returns null when the cancel flag is set; the caller then runs its
-    /// cancel path, which calls `cancel`.
+    /// `wait_tick_ms`, `user_continue` when the continue flag is set, and
+    /// `sign_in_closed` when the sign-in closed flag is. Returns null when
+    /// the cancel flag is set; the caller then runs its cancel path, which
+    /// calls `cancel`.
     pub fn waitForSend(self: *RequestRecovery) !?Send {
         var next_tick_ms = self.nowMs() +| wait_tick_ms;
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
             if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
-                if (try self.event(.user_continue)) |send| return send;
+                if (try self.deliverAnswer(.user_continue, "wait")) |send| return send;
+            };
+            if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+                if (try self.deliverAnswer(.sign_in_closed, "wait")) |send| return send;
             };
             const now_ms = self.nowMs();
             if (now_ms < next_tick_ms) {
@@ -476,6 +494,20 @@ pub const RequestRecovery = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        return self.stepLocked(value);
+    }
+
+    /// Steps the module with a user's answer, and traces the answer when
+    /// the module has no use for it, since that drops what the user did: an
+    /// Enter while nothing waits for them, or a closed sign-in while no wait
+    /// is for one. `origin` names where the answer was read.
+    fn deliverAnswer(self: *RequestRecovery, value: recovery.Event, origin: []const u8) !?Send {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (!recovery.usesAnswer(&self.state, value)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event={s} origin={s} reason=nothing_waits_for_it", .{ @tagName(value), origin });
+        }
         return self.stepLocked(value);
     }
 
@@ -717,6 +749,81 @@ test "a healthy request shows nothing and reports no recovery" {
     try request.succeeded();
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_statuses.items.len);
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_clear_count);
+}
+
+test "a sign-in that finishes while a sign-in resend is on the wire sends again when that resend fails" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    // The sign-in fx opened closes, so the request tries its saved login.
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 2), request.attempt());
+    try std.testing.expect(!closed_flag.load(.seq_cst));
+    // The user signs in while that resend is on the wire, and it fails.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.failed(.{ .kind = .sign_in })).?);
+    try std.testing.expectEqual(@as(u16, 3), request.attempt());
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+}
+
+test "a sign-in during a sign-in resend that then fails on the way waits briefly, then resends" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    try std.testing.expect(try request.failed(.{ .kind = .sign_in }) == null);
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    // The user signs in while that resend is on the wire, and the connection
+    // drops. The turn loop's transient sites take their send from
+    // `waitForSend`, so `failed` must not hand one back here.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expect(try request.failed(.{ .kind = .dropped }) == null);
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 3), request.attempt());
+}
+
+test "a continue or a closed sign-in before an ordinary failure answers nothing" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    continue_flag.store(true, .seq_cst);
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expect(try request.failed(.{ .kind = .dropped }) == null);
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expect(!closed_flag.load(.seq_cst));
+    // The request still waits, then resends.
+    _ = (try request.waitForSend()).?;
+    try std.testing.expectEqual(@as(u16, 2), request.attempt());
 }
 
 test "Esc during a wait stops waiting and cancel clears the status" {

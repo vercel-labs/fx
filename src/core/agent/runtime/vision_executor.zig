@@ -37,6 +37,8 @@ pub const Config = struct {
     cancel_flag: ?*std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
     output_limit: context_limits.Resolved,
+    /// The model that reads the images.
+    model: []const u8 = image_provider.default_model,
 };
 
 pub fn execute(
@@ -296,6 +298,7 @@ fn runBatchAttempt(
             .credential_source = config.credential_source,
             .gateway_team = config.gateway_team,
             .session_id = config.session_id,
+            .model = config.model,
             .retry_count = config.retry_count,
             .cancel_flag = cancel_flag,
             .trace_ctx = config.trace_ctx,

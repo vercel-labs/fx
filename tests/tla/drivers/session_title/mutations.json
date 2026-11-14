@@ -1,0 +1,58 @@
+[
+  {
+    "id": "no-reload",
+    "breaks": "the title sends the in-memory token without reading the store",
+    "file": "src/core/session/session_title_generation.zig",
+    "find": "        if (try auth_runtime.readStoredCredential(alloc, sign_in)) |stored| token.adopt(alloc, stored);",
+    "replace": "        if (try auth_runtime.readStoredCredential(alloc, sign_in)) |stored| {\n            var unused = stored;\n            unused.deinit(alloc);\n        }",
+    "only": "tui"
+  },
+  {
+    "id": "no-replay",
+    "breaks": "the title gives up after one 401",
+    "file": "src/core/session/session_title_generation.zig",
+    "find": "        .already_replayed = false,\n    }) == .refresh_and_replay;",
+    "replace": "        .already_replayed = true,\n    }) == .refresh_and_replay;",
+    "only": "ask"
+  },
+  {
+    "id": "double-replay",
+    "breaks": "the title is sent a third time",
+    "file": "src/core/session/session_title_generation.zig",
+    "find": "                sent = try send(alloc, request, token.bytes, deadline);\n            } else {",
+    "replace": "                sent = try send(alloc, request, token.bytes, deadline);\n                if (rejectedAsStale(sent, sign_in)) {\n                    if (try auth_runtime.storedReplacement(alloc, sign_in, token.bytes)) |again| {\n                        token.adopt(alloc, again);\n                        sent.deinit(alloc);\n                        sent = .{ .unavailable = .{ .reason = .cancelled } };\n                        sent = try send(alloc, request, token.bytes, deadline);\n                    }\n                }\n            } else {",
+    "only": "ask"
+  },
+  {
+    "id": "authority-unchecked",
+    "breaks": "another team's stored token carries the request",
+    "file": "src/core/auth/auth_runtime.zig",
+    "find": "    if (!sign_in.accepts(stored)) {",
+    "replace": "    if (false and !sign_in.accepts(stored)) {",
+    "only": "tui"
+  },
+  {
+    "id": "history-gate",
+    "breaks": "the gate reads only the history, so an interrupting prompt titles the session again",
+    "file": "src/core/app/app_session_runtime.zig",
+    "find": "                .title_started = agent.session_persistence.title_generation.startedFor(session_id),",
+    "replace": "                .title_started = false,",
+    "only": "tui"
+  },
+  {
+    "id": "catalog-no-reload",
+    "breaks": "the model list sends the in-memory token without reading the store",
+    "file": "src/core/app/model_cache_runtime.zig",
+    "find": "    fn storedToken(self: *CatalogSignIn, current: []const u8) ?[]const u8 {\n",
+    "replace": "    fn storedToken(self: *CatalogSignIn, current: []const u8) ?[]const u8 {\n        if (current.len > 0) return null;\n",
+    "only": "catalog"
+  },
+  {
+    "id": "catalog-no-replay",
+    "breaks": "the model list falls back to public models after one 401",
+    "file": "src/core/gateway/model_catalog.zig",
+    "find": "    if (failure.http_status != .unauthorized) return null;",
+    "replace": "    if (failure.http_status != .unauthorized or attempt.endpoint.len > 0) return null;",
+    "only": "catalog"
+  }
+]

@@ -103,7 +103,7 @@ To learn fx, read the manual as Markdown. [fx.sh/llms.txt](https://fx.sh/llms.tx
 
 To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`.
 
-To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for local health checks. Neither changes the setup.
+To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for health checks. Neither changes the setup.
 
 `fx ask` uses the user's saved permission mode, which is `auto` unless they changed it. Pass `--full-access` only when the user asks for it, because it turns off fx's permission checks.
 
@@ -111,7 +111,7 @@ To change fx itself, read [AGENTS.md](AGENTS.md) first, then build and verify th
 
 ## Feedback
 
-Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose). If something looks wrong in your terminal, `/trace` creates a private diagnostic report you can attach ([share feedback](https://fx.sh/docs/using-fx/share-feedback)).
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose). If something looks wrong in your terminal, `/trace` creates a private diagnostic trace that you can share as a link from [fx.sh/share](https://fx.sh/share) ([share feedback](https://fx.sh/docs/using-fx/share-feedback)).
 
 ## Contributing
 

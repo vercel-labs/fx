@@ -420,6 +420,10 @@ pub const Result = struct {
     result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
     delivery: ?types.SteeringDelivery = null,
+    /// The subagents a call that concerns them all was about: those a
+    /// `wait` waited for, or those a `status` that names none listed, so
+    /// its row can name them, live and after a resume.
+    subagents: ?[]const []const u8 = null,
 };
 
 pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
@@ -449,6 +453,14 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
     );
     if (result.pending) try out.writer.writeAll(",\"pending\":true");
     if (result.delivery) |delivery| try out.writer.print(",\"delivery\":\"{s}\"", .{@tagName(delivery)});
+    if (result.subagents) |names| if (names.len > 0) {
+        try out.writer.writeAll(",\"subagents\":[");
+        for (names, 0..) |name, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(name, .{}, &out.writer);
+        }
+        try out.writer.writeByte(']');
+    };
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -698,6 +710,16 @@ test "terminal result omits scheduler identities and phases" {
     try std.testing.expect(std.mem.find(u8, encoded, "operation_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "child_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "status") == null);
+}
+
+test "a result lists the subagents it concerns only when there are some" {
+    const alloc = std.testing.allocator;
+    const listed = try encodeResultAlloc(alloc, .{ .ok = true, .result = "done", .subagents = &.{ "reviewer", "a\"b" } });
+    defer alloc.free(listed);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"result\":\"done\",\"error_code\":null,\"subagents\":[\"reviewer\",\"a\\\"b\"]}", listed);
+    const empty = try encodeResultAlloc(alloc, .{ .ok = true, .result = "done", .subagents = &.{} });
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"result\":\"done\",\"error_code\":null}", empty);
 }
 
 test "a subagent request's profile is checked and changes its fingerprint only when present" {

@@ -13,6 +13,12 @@
 (* a broken gateway, sign-in or quota trouble, crashes, closed windows)    *)
 (* and then heals, which is what lets Heals be checked.                    *)
 (*                                                                         *)
+(* The world's trouble that only the user can fix is a sign-in here, as   *)
+(* the driver reports it. While the module waits for a sign-in it resends *)
+(* now and then without the user (SignInPoll), and that resend keeps the  *)
+(* sign-in status, so fx never opens a second sign-in for it. Quota       *)
+(* trouble asks without resending; recovery.zig's own tests pin that.     *)
+(*                                                                         *)
 (* The turn loop routes each request's network, gateway, and rate-limit    *)
 (* failures through the module, and fx saves the module's record with the  *)
 (* session, so a closed window or a crash resumes on the next launch       *)
@@ -33,8 +39,10 @@ CONSTANTS
 
 Bugs == {"none", "stall_stop", "no_wake", "stale_socket", "frozen_status",
          "no_closing", "never_ask", "hot_retry", "send_without_save",
+         "poll_reopens", "poll_drop_reasks",
          \* Planted in RecoveryTimed.tla.
-         "unbounded_wait", "frozen_countdown", "no_handoff"}
+         "unbounded_wait", "frozen_countdown", "no_handoff", "poll_hot",
+         "never_poll"}
 
 ASSUME /\ MaxFaults \in Nat /\ Ladder \in 1..4 /\ Bug \in Bugs
 
@@ -65,11 +73,13 @@ VARIABLES
     needUser,       \* world: sign-in or quota trouble only the user can fix
     faults,         \* disruptions injected so far
     alive,          \* the fx process is running
-    cancelled       \* the user pressed Esc or quit fx
+    cancelled,      \* the user pressed Esc or quit fx
+    askedSignIn,    \* the module waits for a sign-in, so it resends now and then
+    polling         \* the send on the wire is such a resend (SignInPoll)
 
 vars == <<phase, status, inflight, flowing, attempt, sameFail, lastSendWaited,
           savedInflight, savedClean, seenDeaths, deaths, cleanExit, net,
-          gateway, needUser, faults, alive, cancelled>>
+          gateway, needUser, faults, alive, cancelled, askedSignIn, polling>>
 
 TypeOK ==
     /\ phase \in Phases
@@ -90,6 +100,8 @@ TypeOK ==
     /\ faults \in 0..MaxFaults
     /\ alive \in BOOLEAN
     /\ cancelled \in BOOLEAN
+    /\ askedSignIn \in BOOLEAN
+    /\ polling \in BOOLEAN
 
 \* start(null): the plan is save, send .{}.
 Init ==
@@ -111,10 +123,13 @@ Init ==
     /\ faults = 0
     /\ alive = TRUE
     /\ cancelled = FALSE
+    /\ askedSignIn = FALSE
+    /\ polling = FALSE
 
 -----------------------------------------------------------------------------
 (* Plan fragments. Each sets phase, status, inflight, flowing, attempt,    *)
-(* lastSendWaited and savedInflight; callers fix every other variable.     *)
+(* lastSendWaited, savedInflight, askedSignIn and polling; callers fix     *)
+(* every other variable.                                                   *)
 
 \* save, send, status. `waited` records whether time passed (or fx was
 \* relaunched, or the user acted) since the previous failure.
@@ -128,16 +143,26 @@ SendNow(waited) ==
     /\ savedInflight' = IF Bug = "send_without_save" /\ attempt > 0
                            THEN savedInflight ELSE TRUE
     /\ status' = IF attempt + 1 > 1 THEN "retrying" ELSE "clear"
+    /\ askedSignIn' = FALSE
+    /\ polling' = FALSE
 
 \* A failure of the given kind. "offline" does not count toward sameFail.
+\* A sign-in wait's own resend that fails on the way, offline, dropped, or
+\* on a broken gateway, waits for the sign-in again with its start kept
+\* (recovery.zig onFailed), so fx opens no second sign-in. Planted defect
+\* poll_drop_reasks: it waits as an ordinary retry instead, and the next
+\* sign-in failure opens a second sign-in.
 OnFail(kind) ==
-    IF kind = "need_user"
+    /\ polling' = FALSE
+    /\ IF kind = "need_user" \/ (polling /\ Bug # "poll_drop_reasks")
        THEN /\ phase' = "need_user" /\ status' = "need_user"
             /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
+            /\ askedSignIn' = TRUE
             /\ UNCHANGED <<attempt, sameFail, lastSendWaited>>
        ELSE LET counted  == kind # "offline"
                 nextFail == IF counted THEN Min(sameFail + 1, Ladder) ELSE sameFail
             IN /\ sameFail' = nextFail
+               /\ askedSignIn' = FALSE
                /\ IF Bug = "hot_retry"
                      \* Planted defect: resend at once, without waiting.
                      THEN SendNow(FALSE)
@@ -156,16 +181,19 @@ OnFail(kind) ==
 OnSuccess ==
     /\ phase' = "done_ok" /\ status' = "clear"
     /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
+    /\ askedSignIn' = FALSE /\ polling' = FALSE
     /\ UNCHANGED <<attempt, sameFail, lastSendWaited>>
 
 -----------------------------------------------------------------------------
 (* The request on the wire.                                                *)
 
-\* `responding`: the first byte arrived, so any retry status clears.
+\* `responding`: the first byte arrived, so any retry status clears, and a
+\* sign-in resend that gets an answer no longer waits for a sign-in.
 Responding ==
     /\ alive /\ phase = "working" /\ inflight /\ ~flowing
     /\ flowing' = TRUE
     /\ status' = IF Bug = "frozen_status" THEN status ELSE "clear"
+    /\ askedSignIn' = FALSE /\ polling' = FALSE
     /\ UNCHANGED <<phase, inflight, attempt, sameFail, lastSendWaited,
                    savedInflight, savedClean, seenDeaths, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled>>
@@ -179,7 +207,8 @@ HandOff ==
     /\ status' = "clear"
     /\ UNCHANGED <<phase, inflight, flowing, attempt, sameFail, lastSendWaited,
                    savedInflight, savedClean, seenDeaths, deaths, cleanExit,
-                   net, gateway, needUser, faults, alive, cancelled>>
+                   net, gateway, needUser, faults, alive, cancelled,
+                   askedSignIn, polling>>
 
 \* The gateway answers according to the world. These failures follow from
 \* conditions already counted as faults. A complete answer needs `responding`.
@@ -218,6 +247,25 @@ TimerFires ==
     /\ UNCHANGED <<sameFail, savedClean, seenDeaths, deaths, cleanExit, net,
                    gateway, needUser, faults, alive, cancelled>>
 
+\* While the module waits for a sign-in, it resends after a long wait
+\* (recovery.zig sign_in_poll_ms), or at once when the sign-in fx opened
+\* closes without a new login (`sign_in_closed`): save, send, and keep the
+\* sign-in status, so fx does not open another sign-in for this resend.
+\* RecoveryTimed.tla says when. Planted defect poll_reopens: the resend
+\* shows the retry status, and its failure then opens a second sign-in.
+SignInPoll ==
+    /\ alive /\ phase = "need_user" /\ askedSignIn
+    /\ phase' = "working"
+    /\ inflight' = TRUE
+    /\ flowing' = FALSE
+    /\ attempt' = Min(attempt + 1, MaxAttempt)
+    /\ lastSendWaited' = TRUE
+    /\ savedInflight' = TRUE
+    /\ status' = IF Bug = "poll_reopens" THEN "retrying" ELSE "need_user"
+    /\ polling' = TRUE
+    /\ UNCHANGED <<askedSignIn, sameFail, savedClean, seenDeaths, deaths,
+                   cleanExit, net, gateway, needUser, faults, alive, cancelled>>
+
 -----------------------------------------------------------------------------
 (* The world.                                                              *)
 
@@ -226,7 +274,8 @@ NetDown ==
     /\ net' = "down" /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
-                   deaths, cleanExit, gateway, needUser, alive, cancelled>>
+                   deaths, cleanExit, gateway, needUser, alive, cancelled,
+                   askedSignIn, polling>>
 
 NetUp ==
     /\ net = "down"
@@ -234,28 +283,41 @@ NetUp ==
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
                    deaths, cleanExit, gateway, needUser, faults, alive,
-                   cancelled>>
+                   cancelled, askedSignIn, polling>>
 
 GatewayBreak ==
     /\ gateway = "ok" /\ faults < MaxFaults
     /\ gateway' = "broken" /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
-                   deaths, cleanExit, net, needUser, alive, cancelled>>
+                   deaths, cleanExit, net, needUser, alive, cancelled,
+                   askedSignIn, polling>>
 
 GatewayHeal ==
     /\ gateway = "broken"
     /\ gateway' = "ok"
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
-                   deaths, cleanExit, net, needUser, faults, alive, cancelled>>
+                   deaths, cleanExit, net, needUser, faults, alive, cancelled,
+                   askedSignIn, polling>>
 
 NeedUserFault ==
     /\ ~needUser /\ faults < MaxFaults
     /\ needUser' = TRUE /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
                    lastSendWaited, savedInflight, savedClean, seenDeaths,
-                   deaths, cleanExit, net, gateway, alive, cancelled>>
+                   deaths, cleanExit, net, gateway, alive, cancelled,
+                   askedSignIn, polling>>
+
+\* The trouble goes away without the user: the gateway stops refusing the
+\* login, or another fx process signs in. Only a resend finds out.
+TroubleClears ==
+    /\ needUser
+    /\ needUser' = FALSE
+    /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
+                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   deaths, cleanExit, net, gateway, faults, alive, cancelled,
+                   askedSignIn, polling>>
 
 -----------------------------------------------------------------------------
 (* Process death and relaunch. The saved record survives; the in-flight    *)
@@ -269,8 +331,10 @@ Crash ==
     /\ cleanExit' = FALSE
     /\ deaths' = IF inflight THEN Min(deaths + 1, MaxFaults) ELSE deaths
     /\ inflight' = FALSE /\ flowing' = FALSE /\ status' = "none"
+    /\ polling' = FALSE
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
-                   savedClean, seenDeaths, net, gateway, needUser, cancelled>>
+                   savedClean, seenDeaths, net, gateway, needUser, cancelled,
+                   askedSignIn>>
 
 \* SIGHUP or SIGTERM: fx sends `closing` and saves the plan before exiting.
 Close ==
@@ -281,8 +345,10 @@ Close ==
     \* Planted defect no_closing: the exit is not marked, so it looks like a crash.
     /\ savedClean' = IF Bug = "no_closing" THEN savedClean ELSE TRUE
     /\ inflight' = FALSE /\ flowing' = FALSE /\ status' = "none"
+    /\ polling' = FALSE
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
-                   seenDeaths, deaths, net, gateway, needUser, cancelled>>
+                   seenDeaths, deaths, net, gateway, needUser, cancelled,
+                   askedSignIn>>
 
 \* start(record). An abrupt death with a send in flight counts toward the
 \* crash-loop guard; the second one asks the user once. Otherwise: save, send.
@@ -298,6 +364,11 @@ Relaunch ==
                 THEN /\ phase' = "need_user" /\ status' = "need_user"
                      /\ inflight' = FALSE /\ flowing' = FALSE
                      /\ savedInflight' = FALSE
+                     \* A saved sign-in wait stays one; the crash-loop
+                     \* question is not a sign-in.
+                     /\ askedSignIn' = (askedSignIn /\ phase = "need_user"
+                                        /\ ~(seen >= 2 /\ Bug # "never_ask"))
+                     /\ polling' = FALSE
                      /\ UNCHANGED <<attempt, lastSendWaited>>
                 ELSE SendNow(TRUE)
     /\ UNCHANGED <<sameFail, deaths, cleanExit, net, gateway, needUser,
@@ -311,6 +382,7 @@ UserCancels ==
     /\ alive /\ phase \in Active
     /\ phase' = "done_cancel" /\ status' = "clear" /\ cancelled' = TRUE
     /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
+    /\ askedSignIn' = FALSE /\ polling' = FALSE
     /\ UNCHANGED <<attempt, sameFail, lastSendWaited, savedClean, seenDeaths,
                    deaths, cleanExit, net, gateway, needUser, faults, alive>>
 
@@ -335,16 +407,21 @@ Finished ==
 
 Next ==
     \/ Responding \/ HandOff \/ Respond \/ Drop \/ StaleSocket \/ TimerFires
+    \/ SignInPoll
     \/ NetDown \/ NetUp \/ GatewayBreak \/ GatewayHeal \/ NeedUserFault
+    \/ TroubleClears
     \/ Crash \/ Close \/ Relaunch
     \/ UserCancels \/ UserActs
     \/ Finished
 
 \* Time passes, answers arrive, the world heals, fx gets relaunched, and the
 \* user eventually does what was asked. Faults, deaths and Esc are never forced.
+\* A sign-in wait's own resends take the request out of need_user now and
+\* then, so the user's answer is strongly fair: a user who keeps being asked
+\* answers at last.
 Fairness ==
     /\ WF_vars(Responding) /\ WF_vars(Respond) /\ WF_vars(TimerFires)
-    /\ WF_vars(Relaunch) /\ WF_vars(UserActs)
+    /\ WF_vars(Relaunch) /\ SF_vars(UserActs)
     /\ WF_vars(NetUp) /\ WF_vars(GatewayHeal)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -371,7 +448,9 @@ StatusHonest ==
         /\ (phase = "waiting" => status = "waiting")
         /\ (phase = "need_user" => status = "need_user")
         /\ (phase = "working" /\ inflight /\ ~flowing =>
-                status \in IF attempt > 1 THEN {"retrying", "clear"} ELSE {"clear"})
+                status \in IF polling THEN {"need_user"}
+                           ELSE IF attempt > 1 THEN {"retrying", "clear"}
+                           ELSE {"clear"})
         /\ (phase = "working" /\ flowing => status = "clear")
 
 \* After SIGHUP or SIGTERM, the request resumes without asking.
@@ -385,6 +464,13 @@ CrashLoopAsks ==
 
 \* A retry after a transient failure always waits first.
 NoHotRetry == lastSendWaited
+
+\* A sign-in wait's own resend that fails, for any reason, waits for the
+\* sign-in again: one request opens one sign-in. A crash, an answer, or Esc
+\* ends the resend another way.
+PollKeepsSignIn ==
+    [][(polling /\ inflight /\ alive' /\ ~inflight' /\ phase' \notin Terminal)
+         => (phase' = "need_user" /\ askedSignIn')]_vars
 
 \* Every send comes with a save, so the record always knows
 \* whether a send is outstanding.
