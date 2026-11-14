@@ -8139,6 +8139,14 @@ test.skipIf(!tmuxAvailable())(
       expect(await active.waitForSessionEnd()).toBe(true);
       await active.kill();
       active = null;
+
+      // The saved transcript is longer than the screen. One frame writes all
+      // of it, so the screen opens at the end of the conversation instead of
+      // scrolling there.
+      const savedTranscriptFrames = readTapeFrames(tapePath)
+        .filter((frame) => frame.kind === 1 && frame.payload.includes("SESSION_PICKER_SCROLLBACK_"));
+      expect(savedTranscriptFrames[0]?.payload.includes(earlyMarker)).toBe(true);
+      expect(savedTranscriptFrames[0]?.payload.includes(lateMarker)).toBe(true);
     } finally {
       if (active) await active.kill();
       for (const gateway of gateways) gateway.stop();
