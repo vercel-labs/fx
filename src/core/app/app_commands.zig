@@ -2429,6 +2429,102 @@ test "credits command renders through the composed provider" {
     try std.testing.expectEqualStrings("balance=10", app.notice_body.items);
 }
 
+/// An app whose `/credits` lookup answers that the team has Token Pass, for
+/// the credential epoch in `collectCreditsFacts`.
+const TokenPassReplyFakeApp = struct {
+    const FakeModelCache = struct {
+        token_pass_epoch: u32 = 0,
+        status: token_pass.Status = .unknown,
+
+        fn tokenPassStatus(self: *const FakeModelCache) token_pass.Status {
+            return self.status;
+        }
+
+        pub fn observeTokenPassAnswer(self: *FakeModelCache, answer: token_pass.Answer, _: []const u8) void {
+            self.status = if (answer == .has_pass) .active else .unknown;
+        }
+    };
+
+    alloc: std.mem.Allocator,
+    credits_lookup: credits_lookup.Lookup = .{},
+    model_cache: FakeModelCache = .{},
+    fetches: std.atomic.Value(usize) = .init(0),
+    notices: usize = 0,
+
+    fn deinit(self: *TokenPassReplyFakeApp) void {
+        self.credits_lookup.deinit();
+    }
+
+    fn creditsProvider(self: *TokenPassReplyFakeApp) gateway_provider.CreditsProvider {
+        return .{ .context = self, .fetch_fn = fetchCredits };
+    }
+
+    fn fetchCredits(
+        raw: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        _: gateway_provider.CreditsLookupInput,
+    ) output_contracts.CreditsSnapshot {
+        const self: *TokenPassReplyFakeApp = @ptrCast(@alignCast(raw.?));
+        _ = self.fetches.fetchAdd(1, .seq_cst);
+        return .{
+            .balance = alloc.dupe(u8, "10") catch null,
+            .token_pass = .{ .remaining = alloc.dupe(u8, "79.9") catch "" },
+        };
+    }
+
+    fn adoptRenewedCredential(_: *TokenPassReplyFakeApp, _: *const credentials.Credential) !void {}
+
+    fn writeDomainNotice(self: *TokenPassReplyFakeApp, _: types.SemanticNotice, _: bool) !void {
+        self.notices += 1;
+    }
+
+    /// Starts a `/credits` lookup for the current credential.
+    fn startLookup(self: *TokenPassReplyFakeApp) !void {
+        try std.testing.expectEqual(credits_lookup.Start.started, try self.credits_lookup.start(
+            self.creditsProvider(),
+            .{ .credential = null, .tenant = null },
+            null,
+            self.model_cache.token_pass_epoch,
+        ));
+    }
+
+    /// Runs the event loop's credits step until the lookup's reply is taken.
+    fn collectReply(self: *TokenPassReplyFakeApp) !void {
+        while (self.credits_lookup.task != null) {
+            try Handlers(TokenPassReplyFakeApp).collectCreditsFacts(self);
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+test "a Token Pass reply for an earlier credential does not speak for the current one" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var app = TokenPassReplyFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try app.startLookup();
+    // A login or team change while the lookup runs moves to a new epoch.
+    app.model_cache.token_pass_epoch += 1;
+    try app.collectReply();
+
+    // The reply still shows, but it records nothing for the new team.
+    try std.testing.expectEqual(token_pass.Status.unknown, app.model_cache.tokenPassStatus());
+    try std.testing.expect(app.notices >= 1);
+    try std.testing.expectEqual(@as(usize, 1), app.fetches.load(.seq_cst));
+}
+
+test "a Token Pass reply for the current credential records that the team has Token Pass" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var app = TokenPassReplyFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try app.startLookup();
+    try app.collectReply();
+
+    try std.testing.expectEqual(token_pass.Status.active, app.model_cache.tokenPassStatus());
+    try std.testing.expectEqual(@as(usize, 1), app.fetches.load(.seq_cst));
+}
+
 test "app_commands routes clear through carry-forward session reset" {
     var app = ClearCommandFakeApp{};
 

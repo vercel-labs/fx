@@ -94,6 +94,7 @@ var grok_context = host_xai_grok.Context{ .transport = js_host_stream_provider.t
 
 const js_host_provider_set = set: {
     var providers = provider_set.gateway_only(.{
+        .capabilities = .{ .gateway_prompt_caching = true },
         .presentation = provider_catalog.find(.gateway),
         .auth_strategy = .vercel,
         .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,

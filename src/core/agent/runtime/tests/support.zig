@@ -152,7 +152,7 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-const test_tools = [_]tool_dispatch.Tool{
+pub const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.glob_files,
     builtin_tools.grep_files,
     builtin_tools.read_file,
@@ -205,6 +205,8 @@ pub const FakeCompletion = struct {
     provider_failure_cause: ?types.ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     finish_reason: ?types.ProviderFinishReason = null,
+    /// The provider's own stop reason, such as Gemini's MALFORMED_FUNCTION_CALL.
+    finish_reason_raw: []const u8 = "",
     omit_finish: bool = false,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
@@ -376,6 +378,7 @@ pub const FakeGateway = struct {
                     null
                 else
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
+                .finish_reason_raw = types.ProviderFinishRaw.init(completion.finish_reason_raw),
                 .usage = completion.usage,
                 .generation_id = completion.generation_id,
             },
