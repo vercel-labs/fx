@@ -32,6 +32,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
+const secret = @import("../core/auth/secret.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
@@ -241,6 +242,74 @@ const AgentMessageKind = enum {
     operational,
 };
 
+/// What a turn reads of the session's model route.
+const RouteView = struct {
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+    credential_source: ?types.CredentialSource,
+    api_key: []const u8,
+    account_id: ?[]const u8,
+    gateway_team: ?[]const u8,
+};
+
+/// What a subagent's turn reads of the session's model route, copied under
+/// `subagent_authority_mutex` when the turn starts, with its model catalog.
+/// `session/set_config_option` sets the route under the same lock and frees
+/// what it held: the model, the key, the account, the team and the catalog.
+/// A turn that kept pointers into the session would read freed memory, so it
+/// reads this copy, which a later switch leaves as it was. The switch reaches
+/// the subagent's next turn.
+const ModelRoute = struct {
+    provider: model_provider.ProviderId,
+    model: []u8,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+    credential_source: ?types.CredentialSource,
+    api_key: []u8,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+    resolver: gateway_provider.CapabilityResolver,
+
+    /// Copies the active session's route. Call with `subagent_authority_mutex` held.
+    fn take(alloc: Allocator, state: *const server.ServerState, active: *const server.ActiveSessionState) Allocator.Error!ModelRoute {
+        const model = try alloc.dupe(u8, active.model);
+        errdefer alloc.free(model);
+        const api_key = try alloc.dupe(u8, active.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id: ?[]u8 = if (active.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team: ?[]u8 = if (state.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (gateway_team) |value| alloc.free(value);
+        var resolver = try state.capability_resolver.snapshot(alloc);
+        errdefer resolver.deinit(alloc);
+        return .{
+            .provider = active.provider,
+            .model = model,
+            .effort = active.effort,
+            .fast_mode = active.fast_mode,
+            .ultrafast_mode = active.ultrafast_mode,
+            .credential_source = active.credential_source,
+            .api_key = api_key,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+            .resolver = resolver,
+        };
+    }
+
+    fn deinit(self: *ModelRoute, alloc: Allocator) void {
+        self.resolver.deinit(alloc);
+        if (self.gateway_team) |value| alloc.free(value);
+        if (self.account_id) |value| alloc.free(value);
+        secret.zeroAndFree(alloc, self.api_key);
+        alloc.free(self.model);
+        self.* = undefined;
+    }
+};
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
@@ -271,6 +340,42 @@ const AcpContext = struct {
     /// the session's host. Null for a prompt's own context: a reload joins
     /// the prompt first, so it reads the session's.
     captured_mcp_host: ?struct { host: ?*mcp_host.Host } = null,
+    /// The model route a subagent's turn reads, copied under the authority
+    /// lock when it starts. Null for a prompt's own context, which reads the
+    /// session's: a prompt and a switch of the provider never overlap.
+    route: ?*ModelRoute = null,
+
+    /// What this turn reads of the session's model route.
+    fn routeView(self: *const AcpContext, session: *const server.ActiveSessionState) RouteView {
+        if (self.route) |route| return .{
+            .provider = route.provider,
+            .model = route.model,
+            .effort = route.effort,
+            .fast_mode = route.fast_mode,
+            .ultrafast_mode = route.ultrafast_mode,
+            .credential_source = route.credential_source,
+            .api_key = route.api_key,
+            .account_id = route.account_id,
+            .gateway_team = route.gateway_team,
+        };
+        return .{
+            .provider = session.provider,
+            .model = session.model,
+            .effort = session.effort,
+            .fast_mode = session.fast_mode,
+            .ultrafast_mode = session.ultrafast_mode,
+            .credential_source = session.credential_source,
+            .api_key = session.api_key,
+            .account_id = session.account_id,
+            .gateway_team = self.state.gateway_team,
+        };
+    }
+
+    /// The capability resolver this turn reads: a subagent's own copy, or the server's.
+    fn capabilityResolver(self: *AcpContext) *gateway_provider.CapabilityResolver {
+        if (self.route) |route| return &route.resolver;
+        return &self.state.capability_resolver;
+    }
 
     /// The MCP host this turn's tools and approvals use.
     fn mcpHost(self: *const AcpContext) ?*mcp_host.Host {
@@ -506,13 +611,16 @@ const AcpContext = struct {
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
-        const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
-        if (provider_capabilities.fx_search) {
+        const route = self.routeView(session);
+        const provider_capabilities = self.state.cfg.provider_set.select(route.provider).capabilities;
+        // A subagent's copy of the route is its own: the shared runtime would keep a pointer into it
+        // past the turn. A switch of the model or the credential points the runtime at the new ones.
+        if (provider_capabilities.fx_search and self.route == null) {
             self.state.web_search_runtime.configure(.{
-                .api_key = session.api_key,
-                .credential_source = session.credential_source,
-                .gateway_team = self.state.gateway_team,
-                .worker_model = session.model,
+                .api_key = route.api_key,
+                .credential_source = route.credential_source,
+                .gateway_team = route.gateway_team,
+                .worker_model = route.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
             });
@@ -529,30 +637,30 @@ const AcpContext = struct {
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
             .auto_compact_percent = self.state.auto_compact_percent,
-            .api_key = session.api_key,
-            .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
-            .credential_source = session.credential_source,
-            .account_id = session.account_id,
-            .provider = session.provider,
+            .api_key = route.api_key,
+            .agent_stream_provider = server.streamProviderFor(self.state, route.provider),
+            .credential_source = route.credential_source,
+            .account_id = route.account_id,
+            .provider = route.provider,
             .provider_capabilities = provider_capabilities,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
             .secret_store = self.state.cfg.secret_store,
-            .gateway_team = self.state.gateway_team,
-            .model = session.model,
+            .gateway_team = route.gateway_team,
+            .model = route.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
             .gateway_models_path = self.state.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
-            .fast_mode = session.fast_mode,
-            .ultrafast_mode = session.ultrafast_mode,
-            .effort = session.effort,
+            .fast_mode = route.fast_mode,
+            .ultrafast_mode = route.ultrafast_mode,
+            .effort = route.effort,
             .first_call_tool_choice = session.first_call_tool_choice,
             .permission_mode = self.captured_permission_mode orelse session.permission_mode,
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
             .host_tool_provider = hostToolProvider(self.state),
-            .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
+            .permission_reviewer_provider = self.state.cfg.provider_set.select(route.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
@@ -1336,7 +1444,22 @@ pub fn runSubagentChild(
     // the turn reads each here once.
     const captured_hooks = active.observer_hooks;
     const captured_host = active.mcp_host;
+    // A switch of the provider or the model, which a client may send while this subagent works,
+    // sets the route under this lock and frees what it held, so the turn reads a copy.
+    var route = ModelRoute.take(alloc, state, active) catch |err| {
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return err;
+    };
+    // The next prompt gathers the project context again and frees the snapshot this turn would
+    // otherwise borrow its bytes from, so the turn holds a copy of its own.
+    var project_context = state.context_snapshot.dupe(alloc) catch |err| {
+        route.deinit(alloc);
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return err;
+    };
     state.subagent_authority_mutex.unlock(io_mod.getIo());
+    defer route.deinit(alloc);
+    defer project_context.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
         .state = state,
@@ -1344,6 +1467,7 @@ pub fn runSubagentChild(
         .captured_mode = captured_mode,
         .captured_permission_mode = admission.permission_mode,
         .captured_mcp_host = .{ .host = captured_host },
+        .route = &route,
     };
     defer ctx.deinitPublishedToolCalls();
     var child_bridge: libfx_hooks.Bridge = undefined;
@@ -1382,7 +1506,7 @@ pub fn runSubagentChild(
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
-        .project_context = state.context_snapshot.modelVisibleBytes(),
+        .project_context = project_context.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
 }
@@ -1394,10 +1518,16 @@ fn refreshProjectContext(
     omissions: []const context_contract.ContextOmissionInput,
     omission_summary: ?context_contract.ContextOmissionSummary,
 ) context_contract.ProviderError!void {
-    state.context_snapshot.deinit(alloc);
+    {
+        // A subagent's turn copies the snapshot under this lock when it starts, so what this frees
+        // is nobody's but the server's.
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        state.context_snapshot.deinit(alloc);
+    }
     if (!state.context_enabled) return;
 
-    state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
+    const gathered = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .targets = targets,
@@ -1408,6 +1538,9 @@ fn refreshProjectContext(
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
         return err;
     };
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    state.context_snapshot = gathered;
 }
 
 /// Host tools plus every tool of the session's always-loaded MCP servers, so
@@ -2225,7 +2358,7 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn modelCatalogFailure(raw_ctx: *anyopaque) ?gateway_model_catalog.FailureCategory {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.state.capability_resolver.downFailure();
+    return ctx.capabilityResolver().downFailure();
 }
 
 fn resolveModelCapabilities(
@@ -2235,16 +2368,17 @@ fn resolveModelCapabilities(
 ) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
-    const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    return ctx.state.capability_resolver.resolveWithin(
+    const route = ctx.routeView(session);
+    const bundle = ctx.state.cfg.provider_set.select(route.provider);
+    return ctx.capabilityResolver().resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
-                session.credential_source,
-                session.api_key,
-                ctx.state.gateway_team,
-                session.account_id,
+                route.credential_source,
+                route.api_key,
+                route.gateway_team,
+                route.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
@@ -2265,17 +2399,18 @@ fn resolveModelOverride(
 ) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
-    const bundle = ctx.state.cfg.provider_set.select(session.provider);
+    const route = ctx.routeView(session);
+    const bundle = ctx.state.cfg.provider_set.select(route.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.state.capability_resolver.resolveWithin(
+    _ = ctx.capabilityResolver().resolveWithin(
         ctx.state.alloc,
         catalog_provider,
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
-                session.credential_source,
-                session.api_key,
-                ctx.state.gateway_team,
-                session.account_id,
+                route.credential_source,
+                route.api_key,
+                route.gateway_team,
+                route.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
@@ -2284,7 +2419,7 @@ fn resolveModelOverride(
         bundle.fallbackModelCapabilities(raw_model),
         gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
-    const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
+    const entries = ctx.capabilityResolver().catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
     defer {
         for (ids.items) |id| alloc.free(id);
@@ -2299,9 +2434,9 @@ fn availableModelCapabilities(
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
-    return ctx.state.capability_resolver.available(
+    return ctx.capabilityResolver().available(
         model,
-        ctx.state.cfg.provider_set.select(session.provider).fallbackModelCapabilities(model),
+        ctx.state.cfg.provider_set.select(ctx.routeView(session).provider).fallbackModelCapabilities(model),
     );
 }
 
@@ -5188,6 +5323,52 @@ test "ACP propagateGrant stores deduped runtime session grants" {
     try std.testing.expect(tool_ctx.permission_grants.ptr == session.session_grants.ptr);
 }
 
+test "a subagent's model route is its own copy, which a switch of the session leaves as it was" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const session = &state.active_session.?;
+    const first_key = "first-key";
+    const first_account = "first-account";
+    session.provider = .codex;
+    session.credential_source = .chatgpt_subscription;
+    session.api_key = first_key;
+    session.account_id = first_account;
+    session.fast_mode = true;
+    session.effort = .auto;
+
+    var route = try ModelRoute.take(alloc, &state, session);
+    defer route.deinit(alloc);
+    // The copy is in memory of its own, so a switch that frees the session's strings leaves it whole.
+    try std.testing.expect(route.api_key.ptr != first_key.ptr);
+    try std.testing.expect(route.model.ptr != session.model.ptr);
+    try std.testing.expect(route.account_id.?.ptr != first_account.ptr);
+
+    // A switch of the provider, as `session/set_config_option` makes it.
+    session.provider = .gateway;
+    session.credential_source = .ai_gateway_api_key;
+    session.api_key = "second-key";
+    session.account_id = null;
+    session.fast_mode = false;
+
+    var child = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1", .route = &route };
+    const kept = child.routeView(session);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, kept.provider);
+    try std.testing.expectEqual(@as(?types.CredentialSource, .chatgpt_subscription), kept.credential_source);
+    try std.testing.expectEqualStrings(first_key, kept.api_key);
+    try std.testing.expectEqualStrings(first_account, kept.account_id.?);
+    try std.testing.expect(kept.fast_mode);
+    try std.testing.expect(kept.effort == .auto);
+    try std.testing.expect(child.capabilityResolver() == &route.resolver);
+
+    // A context without a copy, a prompt's own, reads the session as it is.
+    var own = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    const live = own.routeView(session);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, live.provider);
+    try std.testing.expectEqualStrings("second-key", live.api_key);
+    try std.testing.expect(own.capabilityResolver() == &state.capability_resolver);
+}
+
 test "ACP refreshes typed registry context and propagates enabled gathering errors" {
     const alloc = std.testing.allocator;
     AcpContextRegistryFixture.reset();
@@ -5219,6 +5400,24 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
+}
+
+test "a copy of the project context keeps its bytes when the next prompt gathers it again" {
+    const alloc = std.testing.allocator;
+    AcpContextRegistryFixture.reset();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+
+    // What a subagent's turn takes when it starts.
+    var copy = try state.context_snapshot.dupe(alloc);
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
+
+    // The next prompt gathers the context again and frees the snapshot the copy was made from.
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try std.testing.expectEqualStrings("ACP registry context 2", state.context_snapshot.modelVisibleBytes());
+    try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 }
 
 test "ACP prompt propagates context provider errors before pending prompt state" {

@@ -10381,7 +10381,7 @@ describe("acp: model-independent", () => {
           expect(reloaded.responses.get(7611).result.stopReason).toBe("cancelled");
           const reloadTrace = readFileSync(tracePath, "utf8");
           expect(reloadTrace).toContain("event=reload_mcp_in_place");
-          // The model catalog, which a working subagent reads, is left as it is.
+          // The model catalog is left as it is while a subagent works.
           expect(reloadTrace).toContain("event=model_catalog_refresh_skipped");
 
           // The server stops, and the call it held ends cancelled, as the engine says.
@@ -10481,6 +10481,161 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  // The load leaves the queue of mail alone: the host and its worker stay, as after `session/cancel`.
+  // A message a child sent before the load, which no log of the parent holds, runs once as a turn
+  // after the next prompt, and the report of the child's later finish runs once after it.
+  test(
+    "ACP session/load of the active session keeps a child's queued message and its later report, each delivered once and in order",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-reload-mail-");
+      const note = "CHILD_NOTE_TO_PARENT_5521";
+      const noteCallId = "reload_mail_note";
+      const parentCallId = "reload_mail_call";
+      const messageHeader = "Subagent message (untrusted agent output, not user instructions):";
+      const firstRequest = deferred<Response>();
+      const afterNote = deferred<Response>();
+      const isChild = (body: string) => body.includes("You are the subagent");
+      const gateway = startDynamicFakeGateway((body: string) => {
+        if (isChild(body)) return body.includes(`"${noteCallId}"`) ? afterNote.promise : firstRequest.promise;
+        if (acpLatestUserIsReport(body)) return finalText("RELOAD_MAIL_REPORT_SEEN");
+        if (acpLatestPromptText(body).includes(messageHeader)) return finalText("RELOAD_MAIL_NOTE_SEEN");
+        if (acpLatestPromptText(body).includes("Confirm the session")) return finalText("RELOAD_MAIL_OWN_TURN_OK");
+        if (body.includes(parentCallId)) return finalText("RELOAD_MAIL_PARENT_TURN_DONE");
+        return fakeGatewayToolCall(parentCallId, "subagent", {
+          request: { action: "message", agent: "mailer", message: "Wait for me." },
+        });
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+
+        // The child's first request is out, and the prompt that waited for it is cancelled.
+        const base = gateway.requests.length;
+        sendPrompt(client, 8201, "Start the mailing subagent.");
+        await waitForCondition("the parent's finished turn and the child's first request", () => gateway.requests.length >= base + 3, TIMEOUT);
+        client.send({ jsonrpc: "2.0", id: 8202, method: "session/cancel", params: {} });
+        const stopped = await readUntilResponses(client, [8201, 8202], TIMEOUT);
+        expect(stopped.responses.get(8201).result.stopReason).toBe("cancelled");
+        // No prompt waits now, so the message the child sends is queued. Its next request is the proof that it was sent.
+        firstRequest.resolve(fakeGatewayToolCall(noteCallId, "subagent", { request: { action: "message", agent: "parent", message: note } }));
+        await waitForCondition("the child's request after its message", () => gateway.requests.length >= base + 4, TIMEOUT);
+
+        const loadBase = gateway.requests.length;
+        const loaded = await client.request("session/load", { sessionId, mcpServers: [] }, 4) as any;
+        expect(loaded.error).toBeUndefined();
+        // The load stopped nothing: the child works on, and finishes when its held request is answered.
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual([]);
+        afterNote.resolve(finalText("MAILER_DONE_5521"));
+        await waitForCondition("the child's finish", () => reloadChildOutcomes(root.home, sessionId).length > 0, TIMEOUT);
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["ok"]);
+
+        // The prompt after the load runs its own turn, then the child's message, then its report: each once, in that order.
+        const run = await runPrompt(client, "Confirm the session is usable.", TIMEOUT);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+        const bodies = gateway.requests.slice(loadBase).map((request) => request.body).filter((body) => !isChild(body));
+        expect(bodies).toHaveLength(3);
+        expect(acpLatestPromptText(bodies[0]!)).toContain("Confirm the session is usable.");
+        expect(acpLatestPromptText(bodies[1]!)).toContain(messageHeader);
+        expect(acpLatestPromptText(bodies[1]!)).toContain(note);
+        expect(acpLatestUserIsReport(bodies[2]!)).toBe(true);
+        expect(bodies[2]).toContain("MAILER_DONE_5521");
+        expect(bodies.filter((body) => acpLatestPromptText(body).includes(note))).toHaveLength(1);
+        expect(bodies.filter((body) => acpLatestUserIsReport(body))).toHaveLength(1);
+
+        expect(client.stderr).toBe("");
+      } finally {
+        firstRequest.resolve(finalText("held child cleanup"));
+        afterNote.resolve(finalText("held child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  // `session/set_config_option` sets the session's provider, model and credential and frees what
+  // they held, which a subagent's model steps read. A prompt is not what holds the switch back from
+  // a working subagent: `session/cancel` ends the prompt and the subagent works on. The subagent
+  // reads the route it began with from a copy it took under the lock the switch sets it under.
+  // Run under ThreadSanitizer, a read of the session's own route here is a data race.
+  test(
+    "ACP session/set_config_option switches the provider while a subagent waits at a model step, and the subagent finishes on the route it began with",
+    async () => {
+      const held = deferred<Response>();
+      const isChild = (body: any) => JSON.stringify(body.messages).includes("You are the subagent");
+      let childSteps = 0;
+      const fixture = createConfiguredProviderFixture((body) => {
+        if (isChild(body)) {
+          childSteps += 1;
+          return childSteps === 1 ? held.promise : configuredCompletion(body.model, "ROUTE_CHILD_DONE");
+        }
+        if (JSON.stringify(body.messages).includes("route_child_call")) return configuredCompletion(body.model, "ROUTE_PARENT_DONE");
+        return configuredToolCompletion(body.model, "subagent", {
+          request: { action: "message", agent: "router", message: "Read the note." },
+        }, "route_child_call");
+      });
+      writeFileSync(join(fixture.workspace, "note.txt"), "route note\n");
+      const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+      try {
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+        if (created.error) throw new Error(JSON.stringify(created));
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const optionValue = (response: any, id: string) => response.result.configOptions.find((option: any) => option.id === id).currentValue;
+        expect(optionValue(created, "provider")).toBe("local");
+
+        sendPrompt(client, 8101, "Start the router subagent.");
+        await waitForCondition("the subagent's first model request", () => childSteps === 1, TIMEOUT);
+        // The prompt waits for the subagent's report. The cancel ends it, and the subagent works on.
+        client.send({ jsonrpc: "2.0", id: 8102, method: "session/cancel", params: {} });
+        const ended = await readUntilResponses(client, [8101], TIMEOUT);
+        expect(ended.responses.get(8101).result.stopReason).toBe("cancelled");
+
+        // The provider switch frees the model, the key, the account and the catalog the session held.
+        const switched = await client.request("session/set_config_option", { configId: "provider", value: "remote" }, 8103) as any;
+        if (switched.error) throw new Error(JSON.stringify(switched));
+        expect(optionValue(switched, "provider")).toBe("remote");
+        expect(optionValue(switched, "model")).toBe("remote-model");
+        // The model option frees the string the session held for its model.
+        const remodeled = await client.request("session/set_config_option", { configId: "model", value: "unlisted-model" }, 8104) as any;
+        if (remodeled.error) throw new Error(JSON.stringify(remodeled));
+        expect(optionValue(remodeled, "model")).toBe("unlisted-model");
+
+        // The held model step answers with a tool call, so the subagent takes a second step after the switch.
+        held.resolve(configuredToolCompletion("local-model", "read_file", { path: join(fixture.workspace, "note.txt") }, "router_read"));
+        await waitForCondition("the subagent's second model request", () => childSteps === 2, TIMEOUT);
+        await waitForCondition("the subagent's finish", () => fixture.requests.filter((request) => isChild(request.body)).length === 2 && childSteps === 2, TIMEOUT);
+
+        // The subagent's two steps went to the route it began on, with no credential, on its own model.
+        const childRequests = fixture.requests.filter((request) => isChild(request.body));
+        expect(childRequests).toHaveLength(2);
+        for (const request of childRequests) {
+          expect(request.authorization).toBeNull();
+          expect(request.body.model).toBe("local-model");
+        }
+        expect(JSON.stringify(childRequests[1]!.body.messages)).toContain("route note");
+
+        // The session's own next turn takes the new provider, and the subagent's report reaches it.
+        const followUp = await runPrompt(client, "Which route is this?", TIMEOUT);
+        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+        const parentRequests = fixture.requests.filter((request) => !isChild(request.body));
+        const last = parentRequests.at(-1)!;
+        expect(last.authorization).toBe("Bearer own-provider-token");
+        expect(last.body.model).toBe("unlisted-model");
+        expect(parentRequests.filter((request) => JSON.stringify(request.body.messages).includes("ROUTE_CHILD_DONE")).length).toBeGreaterThan(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        held.resolve(configuredCompletion("local-model", "held cleanup"));
+        await client.close();
+        fixture.close();
       }
     },
     TIMEOUT * 2,

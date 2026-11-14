@@ -407,6 +407,15 @@ pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry)
     if (entry.web_search_price) |price| alloc.free(price);
 }
 
+/// An owned copy of `entries`, which shares nothing with them. Free it with `freeModelCatalog`.
+pub fn cloneModelCatalog(alloc: std.mem.Allocator, entries: []const ModelCatalogEntry) !std.ArrayList(ModelCatalogEntry) {
+    var copy: std.ArrayList(ModelCatalogEntry) = .empty;
+    errdefer freeModelCatalog(alloc, &copy);
+    try copy.ensureTotalCapacity(alloc, entries.len);
+    for (entries) |entry| try appendClonedModelCatalogEntry(alloc, &copy, entry);
+    return copy;
+}
+
 /// Returns owned model id strings in catalog order; caller frees with `collections.freeStringList`.
 pub fn projectModelIds(alloc: std.mem.Allocator, candidates: []const ModelCatalogEntry) !std.ArrayList([]u8) {
     var ids: std.ArrayList([]u8) = .empty;

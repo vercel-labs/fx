@@ -459,11 +459,14 @@ fn credentialReadyAt(
 }
 
 /// Transfers credential storage after the caller has stopped its prior borrowers.
+/// Makes `credential` the server's and the active session's. It frees the
+/// credential it replaces, which a subagent's turn reads from its own copy
+/// (`ModelRoute`); call it with `subagent_authority_mutex` held.
 pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+    const previous_key = state.api_key;
+    const previous_team = state.gateway_team;
+    const previous_account = state.account_id;
     if (state.active_session) |*active| active.api_key = &.{};
-    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
-    if (state.gateway_team) |team| state.alloc.free(team);
-    if (state.account_id) |account_id| state.alloc.free(account_id);
 
     state.api_key = credential.token;
     credential.token = &.{};
@@ -485,6 +488,27 @@ pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Crede
         active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
     }
+    // The web search runtime borrows the key and the team, so it points at the new ones first.
+    pointWebSearchAtSession(state);
+    if (previous_key.len > 0) secret.zeroAndFree(state.alloc, previous_key);
+    if (previous_team) |team| state.alloc.free(team);
+    if (previous_account) |account_id| state.alloc.free(account_id);
+}
+
+/// Points the web search runtime at the active session's credential and
+/// worker model again. The runtime borrows them, and a switch of the model or
+/// of the credential frees what it borrowed. Call with
+/// `subagent_authority_mutex` held.
+fn pointWebSearchAtSession(state: *ServerState) void {
+    const session = if (state.active_session) |*active| active else return;
+    state.web_search_runtime.configure(.{
+        .api_key = session.api_key,
+        .credential_source = session.credential_source,
+        .gateway_team = state.gateway_team,
+        .worker_model = session.model,
+        .gateway_retry_count = state.cfg.gateway_retry_count,
+        .gateway_chat_url = state.cfg.gateway_chat_url,
+    });
 }
 
 /// Ensures the process and active ACP session use a credential authorized for
@@ -494,6 +518,8 @@ pub fn selectCredentialForProvider(
     provider: model_provider.ProviderId,
 ) !bool {
     if (state.cfg.auth_mode == .host_managed) {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         state.credential_source = .host_managed;
         state.credential_refresh_after_ms = null;
         state.account_id = null;
@@ -511,7 +537,11 @@ pub fn selectCredentialForProvider(
         return err;
     };
     defer if (prepared) |*credential| credential.deinit(state.alloc);
-    if (prepared) |*credential| adoptServerCredential(state, credential);
+    if (prepared) |*credential| {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        adoptServerCredential(state, credential);
+    }
     return true;
 }
 
@@ -532,22 +562,27 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
     if (state.cfg.auth_mode == .host_managed) return null;
     if (hostManagesRoute(state.cfg, provider)) return hostManagedCredential();
     const now_ms = io_mod.milliTimestamp();
-    if (state.active_session) |active| {
-        if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
+    {
+        // The credential in use is read under the lock a subagent's refresh publishes under.
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        if (state.active_session) |active| {
+            if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
+                credentialReadyAt(
+                    active.credential_source,
+                    active.api_key,
+                    active.credential_refresh_after_ms,
+                    now_ms,
+                )) return null;
+        }
+        if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
             credentialReadyAt(
-                active.credential_source,
-                active.api_key,
-                active.credential_refresh_after_ms,
+                state.credential_source,
+                state.api_key,
+                state.credential_refresh_after_ms,
                 now_ms,
             )) return null;
     }
-    if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
-        credentialReadyAt(
-            state.credential_source,
-            state.api_key,
-            state.credential_refresh_after_ms,
-            now_ms,
-        )) return null;
 
     return if (provider == .gateway and state.cfg.credential_override != null)
         credentials.Credential{
@@ -569,6 +604,7 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
     state.cfg.auth_mode = .local;
     state.cfg.credential_override = "next-token";
     state.active_session = null;
@@ -588,6 +624,7 @@ test "ACP provider routes are host-managed only when configured and never leak i
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
     state.cfg.auth_mode = .local;
     state.cfg.provider_auth_mode = .host_managed;
     state.cfg.credential_override = "gateway-key";
@@ -675,7 +712,7 @@ pub fn refreshModelCredential(
         state,
         &refreshed,
         expected_account_id,
-        if (source == .fx_login) state.gateway_team else null,
+        source == .fx_login,
     );
     return worker_token;
 }
@@ -684,8 +721,13 @@ fn publishRefreshedCredential(
     state: *ServerState,
     refreshed: *credentials.Credential,
     expected_account_id: ?[]const u8,
-    expected_team: ?[]const u8,
+    check_team: bool,
 ) !void {
+    // A subagent's turn refreshes from its own thread, and the server's credential, team and
+    // account are what a switch of the provider replaces, so the checks, the reads of the team
+    // included, and the adoption are one step under the lock.
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
     if (state.credential_source != refreshed.source) {
         debug_trace.logf("auth", "ACP credential publication rejected stage=state_source", .{});
         return error.CredentialAuthorityChanged;
@@ -708,11 +750,10 @@ fn publishRefreshedCredential(
             return error.ChatGptAccountChanged;
         }
     }
-    if (expected_team) |expected| {
+    if (check_team) {
         const refreshed_team = refreshed.gatewayTeam() orelse return error.CredentialAuthorityChanged;
         const state_team = state.gateway_team orelse return error.CredentialAuthorityChanged;
-        if (!std.mem.eql(u8, expected, refreshed_team) or
-            !std.mem.eql(u8, expected, state_team)) return error.CredentialAuthorityChanged;
+        if (!std.mem.eql(u8, state_team, refreshed_team)) return error.CredentialAuthorityChanged;
     }
     if (state.active_session) |active| {
         if (active.credential_source != refreshed.source) {
@@ -3630,6 +3671,9 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }
             }
         }
+        // A subagent's turn reads the session's model route under this lock, from its own copy.
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         if (host_target.is_wasm) {
             const next_model = alloc.dupe(u8, value) catch
                 return state.writer.writeError(alloc, msg.id, .{
@@ -3663,6 +3707,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     "Failed to persist session model",
             });
         };
+        pointWebSearchAtSession(state);
         if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
     } else if (std.mem.eql(u8, config_id, "provider")) {
         const parsed_provider = model_provider.parse(value) orelse
@@ -3771,6 +3816,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     }
                 }
             };
+            // A subagent's turn copies the session's model route under this lock when it starts,
+            // so what the switch frees here is nobody's but the server's.
+            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+            defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             commitActiveSessionProvider(
                 alloc,
                 session,
@@ -3791,6 +3840,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 session.api_key = &.{};
                 session.account_id = null;
             }
+            pointWebSearchAtSession(state);
             if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
@@ -3809,6 +3859,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Ultrafast mode must be true or false",
             });
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         if (!try applyActiveSessionUltrafast(state, alloc, msg, session, ultrafast)) return;
     } else if (std.mem.eql(u8, config_id, "fast")) {
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
@@ -3820,6 +3872,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Fast mode must be true or false",
             });
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         if (!try applyActiveSessionFast(state, alloc, msg, session, fast)) return;
     } else if (std.mem.eql(u8, config_id, "effort")) {
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
@@ -3842,6 +3896,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Reasoning effort is not available for the active model",
             });
         }
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         commitActiveSessionEffort(alloc, session, effort) catch {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.internal_error,
@@ -3905,9 +3961,12 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     const provider = catalogProviderFor(state, active.provider) orelse return;
     std.debug.assert(state.active_prompt == null);
-    // A refresh replaces the catalog's entries, and a subagent that works
-    // reads them as it goes (`CapabilityResolver.refreshWithin`: the owner
-    // keeps readers out). So the catalog stays as it is until none works.
+    // A refresh replaces the catalog's entries. A working subagent reads its
+    // own copy of the catalog (`ModelRoute` in prompt.zig), so a refresh frees
+    // nothing it reads; the refresh still waits until none works, so that a
+    // reload and a model option leave working subagents alone. A switch of the
+    // provider, which must replace the catalog, does it under
+    // `subagent_authority_mutex` in `handleSetConfigOption`.
     if (state.subagent_host) |subagents| if (!subagents.quiet()) {
         debug_trace.logf("acp", "event=model_catalog_refresh_skipped session={s} reason=subagents_working", .{active.session_id});
         return;
@@ -4909,6 +4968,10 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
+    state.web_search_runtime = web_search_runtime.Runtime.init(.{});
+    state.cfg.gateway_retry_count = 0;
+    state.cfg.gateway_chat_url = "";
     state.api_key = try alloc.dupe(u8, "stale-token");
     state.account_id = try alloc.dupe(u8, "acct-1");
     state.credential_source = .chatgpt_subscription;
@@ -4920,6 +4983,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     active.account_id = state.account_id;
     active.credential_source = .chatgpt_subscription;
     active.credential_refresh_after_ms = 1;
+    active.model = &.{};
     active.session_rt = .{ .max_history_turns = 8 };
     state.active_session = active;
     defer {
@@ -4935,7 +4999,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
         .refresh_after_ms = 100,
     };
     defer refreshed.deinit(alloc);
-    try publishRefreshedCredential(&state, &refreshed, "acct-1", null);
+    try publishRefreshedCredential(&state, &refreshed, "acct-1", false);
 
     try std.testing.expectEqualStrings("fresh-token", state.api_key);
     try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
@@ -4953,10 +5017,53 @@ test "ACP credential readiness rejects refresh-due access tokens" {
     try std.testing.expect(!credentialReadyAt(.ai_gateway_api_key, "", null, 10));
 }
 
+test "ACP rejects a refreshed Gateway login for another team and takes one for the same team" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
+    state.web_search_runtime = web_search_runtime.Runtime.init(.{});
+    state.cfg.gateway_retry_count = 0;
+    state.cfg.gateway_chat_url = "";
+    state.api_key = try alloc.dupe(u8, "stale-token");
+    state.account_id = null;
+    state.credential_source = .fx_login;
+    state.credential_refresh_after_ms = 1;
+    state.gateway_team = try alloc.dupe(u8, "team-a");
+    state.active_session = null;
+    defer {
+        secret.zeroAndFree(alloc, state.api_key);
+        if (state.gateway_team) |team| alloc.free(team);
+    }
+
+    var other_team = credentials.Credential{
+        .token = try alloc.dupe(u8, "other-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team-b"),
+        .refresh_after_ms = 100,
+    };
+    defer other_team.deinit(alloc);
+    try std.testing.expectError(error.CredentialAuthorityChanged, publishRefreshedCredential(&state, &other_team, null, true));
+    try std.testing.expectEqualStrings("stale-token", state.api_key);
+    try std.testing.expectEqualStrings("team-a", state.gateway_team.?);
+
+    var same_team = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team-a"),
+        .refresh_after_ms = 100,
+    };
+    defer same_team.deinit(alloc);
+    try publishRefreshedCredential(&state, &same_team, null, true);
+    try std.testing.expectEqualStrings("fresh-token", state.api_key);
+    try std.testing.expectEqualStrings("team-a", state.gateway_team.?);
+}
+
 test "ACP rejects refreshed Codex tokens for another account" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
     state.api_key = try alloc.dupe(u8, "stale-token");
     state.account_id = try alloc.dupe(u8, "acct-1");
     state.credential_source = .chatgpt_subscription;
@@ -4979,7 +5086,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
         &state,
         &refreshed,
         "acct-2",
-        null,
+        false,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
 }
