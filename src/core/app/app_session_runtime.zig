@@ -905,10 +905,24 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             agent.session_persistence.pending_live_session_policy = null;
             agent.session_persistence.pending_live_session_wait = null;
-            app.shell.cancelSessionScrollbackHandoff(reason);
+            try giveUpScrollbackHandoff(app, reason);
             releaseLiveSessionTransitionHold(app, agent);
             debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
+        }
+
+        /// Gives up a scrollback handoff that still has rows to write. When
+        /// its frame already pushed some rows into scrollback, the terminal
+        /// is cleared and the transcript printed again, as after a resize, so
+        /// the switch's next handoff does not push those rows a second time.
+        fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
+            if (comptime !@hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff") or !@hasField(App, "metrics")) return;
+            const pending = app.shell.pending_session_scrollback_handoff orelse return;
+            app.shell.cancelSessionScrollbackHandoff(reason);
+            if (pending.remaining_rows < pending.total_rows) {
+                try app.shell.requestTerminalReset(&app.metrics);
+                debug_trace.logf("session", "event=scrollback_handoff_reset reason={s} pushed_rows={d}", .{ reason, pending.total_rows - pending.remaining_rows });
+            }
         }
 
         pub fn settlePendingLiveSessionTransition(app: *App, agent: *AppAgent) !void {
@@ -920,11 +934,7 @@ pub fn Runtime(comptime App: type) type {
             // the handoff, and every hidden agent, until it ends, and that
             // turn may wait on a hidden agent. So the handoff yields; the
             // change hands the rows off again once the agent is idle.
-            if (processing) {
-                if (comptime @hasDecl(@TypeOf(app.shell), "cancelSessionScrollbackHandoff")) {
-                    app.shell.cancelSessionScrollbackHandoff("agent_busy");
-                }
-            }
+            if (processing) try giveUpScrollbackHandoff(app, "agent_busy");
             const now = operation_control.monotonicMillis(io_mod.getIo());
             var wait = agent.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
             if (wait == .worker and !processing) wait = .{ .geometry = now };

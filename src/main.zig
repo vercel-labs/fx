@@ -6176,6 +6176,42 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
     }
 }
 
+test "a handoff that gives way before it pushed any row only redraws" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
+    app.shell.has_committed_frame = true;
+
+    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
+    defer app.main_agent.session_persistence.pending_live_session_policy = null;
+    defer app.main_agent.session_persistence.pending_live_session_wait = null;
+    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 2, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
+    defer app.shell.pending_session_scrollback_handoff = null;
+    app.screenAgent().worker.worker_processing = true;
+    defer app.screenAgent().worker.worker_processing = false;
+
+    try std.testing.expect(!app.shell.terminal_reset_pending);
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
+    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(!app.shell.terminal_reset_pending);
+}
+
 test "a subagent its parent closes during a pending handoff is dropped once the handoff ends" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
@@ -6277,10 +6313,14 @@ test "a turn that starts on screen during a pending handoff lets the hidden agen
     app.screenAgent().worker.worker_processing = true;
     defer app.screenAgent().worker.worker_processing = false;
 
+    try std.testing.expect(!app.shell.terminal_reset_pending);
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
     // The session change still waits for the turn.
     try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
     try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
+    // Its frame had pushed a row into scrollback, so the terminal is cleared
+    // and printed again, and the next handoff does not push that row twice.
+    try std.testing.expect(app.shell.terminal_reset_pending);
 
     var visits: HiddenWorkVisits = .{};
     defer visits.deinit(alloc);
