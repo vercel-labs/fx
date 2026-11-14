@@ -463,7 +463,9 @@ fn lockOpened(alloc: Allocator, store: *session_store.Store, id: []const u8, ope
     var dir = opened;
     errdefer dir.close();
     const spent: u64 = @intCast(@max(io_mod.milliTimestamp() - started, 0));
-    var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
+    // An old release left v1's lock files readable by others, as it left
+    // their folders (D61).
+    var lock = io_mod.acquireTimedAdvisoryLockOnOlderFile(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
         error.LockBusy => return error.SessionBusy,
         // Gone since it was opened here, so its lock file is gone too.
         error.FileNotFound => {

@@ -900,6 +900,7 @@ pub const SessionChildCapability = struct {
             route.setPermissions(io_mod.getIo(), private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
+        try verifyPrivateDirectory(route);
         return initOpenedLegacyRoute(alloc, route, route_path, kind, mode);
     }
 
@@ -919,11 +920,17 @@ pub const SessionChildCapability = struct {
             else => return err,
         };
         errdefer route.close(io_mod.getIo());
+        // An old release left v1's folders readable by others (D61 in
+        // `tests/tla/session_manager/system-design.md`); one others can
+        // write is still refused.
+        try verifyOwnerWritableDirectory(route);
         const display = try std.Io.Dir.path.join(alloc, &.{ display_session_path, "subagent" });
         defer alloc.free(display);
         return try initOpenedLegacyRoute(alloc, route, display, .subagent_control, .read_only);
     }
 
+    /// `route` must already be checked: private, or for a read-only route
+    /// an older release made, writable by its owner only.
     fn initOpenedLegacyRoute(
         alloc: Allocator,
         route: std.Io.Dir,
@@ -931,8 +938,6 @@ pub const SessionChildCapability = struct {
         kind: ManagedChildKind,
         mode: Mode,
     ) !SessionChildCapability {
-        try verifyPrivateDirectory(route);
-
         var retained = try route.openDir(io_mod.getIo(), ".", .{
             .iterate = true,
             .follow_symlinks = false,
@@ -997,6 +1002,36 @@ pub const SessionChildCapability = struct {
         });
         errdefer retained.close(io_mod.getIo());
         try verifyPrivateDirectory(retained);
+        return initRetained(alloc, retained, display_session_path, mode, options);
+    }
+
+    /// `init` read-only on a v1 session folder, which an old release may
+    /// have left readable by others (D61 in
+    /// `tests/tla/session_manager/system-design.md`); one others can write
+    /// is still refused.
+    pub fn initOlderReadOnly(
+        alloc: Allocator,
+        session_dir: std.Io.Dir,
+        display_session_path: []const u8,
+    ) !SessionChildCapability {
+        var retained = try session_dir.openDir(io_mod.getIo(), ".", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        errdefer retained.close(io_mod.getIo());
+        try verifyOwnerWritableDirectory(retained);
+        return initRetained(alloc, retained, display_session_path, .read_only, .{});
+    }
+
+    /// The capability over `retained`, the checked session folder, which
+    /// it takes; the caller closes it on an error.
+    fn initRetained(
+        alloc: Allocator,
+        retained: std.Io.Dir,
+        display_session_path: []const u8,
+        mode: Mode,
+        options: Options,
+    ) !SessionChildCapability {
         const display = try alloc.dupe(u8, display_session_path);
         errdefer alloc.free(display);
         const impl = try alloc.create(CapabilityImpl);
@@ -1464,6 +1499,15 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
     if (stat.permissions.toMode() & 0o777 != 0o700) {
+        return error.PrivateStatePermissionsUnsupported;
+    }
+}
+
+/// A directory only its owner can write, though others may read it.
+fn verifyOwnerWritableDirectory(dir: std.Io.Dir) !void {
+    const stat = try dir.stat(io_mod.getIo());
+    if (stat.kind != .directory) return error.SessionPathUnsafe;
+    if (stat.permissions.toMode() & 0o022 != 0) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
