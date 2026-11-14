@@ -393,10 +393,6 @@ pub const ServerState = struct {
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
-        // A subagent that works runs its commands through `managed_executions`, which frees what
-        // such a command uses and asserts that no operation is in flight, so the subagents stop
-        // first. After a reload or `session/cancel` one can be at work here.
-        disableSubagentHost(self);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {

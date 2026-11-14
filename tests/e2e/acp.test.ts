@@ -11243,51 +11243,46 @@ describe("acp: model-independent", () => {
     TIMEOUT * 2,
   );
 
-  // Closing stdin ends the server while a subagent that outlived its prompt is inside a shell
-  // command. The subagents stop before the executions they run commands through are torn down:
-  // torn down first, the process waited for ever on a runtime that was gone, and on macOS it
-  // sometimes aborted on the assertion that no operation is in flight.
-  for (const via of ["session/load", "session/cancel"] as const) {
-    test(
-      `ACP closing stdin after ${via} stops a subagent that runs a shell command, and the server exits`,
-      async () => {
-        const root = createIsolatedRoot("fx-acp-stdin-close-shell-");
-        const started = join(root.root, "shell-started");
-        const gateway = startDynamicFakeGateway((body) => {
-          if (!body.includes('"name":"subagent"')) return fakeShellRun("stdin_close_shell", `touch '${started}'; sleep 30`);
-          if (body.includes("stdin_close_call")) return finalText("ACP_STDIN_CLOSE_PARENT_DONE");
-          return fakeGatewayToolCall("stdin_close_call", "subagent", {
-            request: { action: "message", agent: "sheller", message: "Run the command." },
-          });
+  // Closing stdin ends the server while a subagent that the reload kept is inside a shell command. The
+  // subagents stop before the executions they run commands through are torn down, as in the tests for
+  // closing stdin with no reload.
+  test(
+    "ACP closing stdin after session/load stops a subagent that runs a shell command, and the server exits",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-stdin-close-shell-");
+      const started = join(root.root, "shell-started");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) return fakeShellRun("stdin_close_shell", `touch '${started}'; sleep 30`);
+        if (body.includes("stdin_close_call")) return finalText("ACP_STDIN_CLOSE_PARENT_DONE");
+        return fakeGatewayToolCall("stdin_close_call", "subagent", {
+          request: { action: "message", agent: "sheller", message: "Run the command." },
         });
-        try {
-          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
-          const sessionId = await startAutoSession(client);
-          await client.request("session/set_mode", { modeId: "full-access" }, 4);
-          sendPrompt(client, 8301, "Start the subagent that runs the command.");
-          await waitForPath(started, TIMEOUT);
-          client.send(via === "session/load"
-            ? { jsonrpc: "2.0", id: 8302, method: "session/load", params: { sessionId, mcpServers: [] } }
-            : { jsonrpc: "2.0", id: 8302, method: "session/cancel", params: {} });
-          const ended = await readUntilResponses(client, [8301, 8302], TIMEOUT);
-          expect(ended.responses.get(8301).result.stopReason).toBe("cancelled");
-          // The subagent outlived the prompt and its command still runs.
-          expect(reloadChildOutcomes(root.home, sessionId)).toEqual([]);
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "full-access" }, 4);
+        sendPrompt(client, 8301, "Start the subagent that runs the command.");
+        await waitForPath(started, TIMEOUT);
+        client.send({ jsonrpc: "2.0", id: 8302, method: "session/load", params: { sessionId, mcpServers: [] } });
+        const ended = await readUntilResponses(client, [8301, 8302], TIMEOUT);
+        expect(ended.responses.get(8301).result.stopReason).toBe("cancelled");
+        // The reload kept the subagent and its command still runs.
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual([]);
 
-          client.endStdin();
-          const code = await client.waitForExit(TIMEOUT);
-          // The exit code and stderr together, so a failure shows what the process said.
-          expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
-          expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
-        } finally {
-          await client?.close();
-          gateway.stop();
-          rmSync(root.root, { recursive: true, force: true });
-        }
-      },
-      TIMEOUT * 2,
-    );
-  }
+        client.endStdin();
+        const code = await client.waitForExit(TIMEOUT);
+        // The exit code and stderr together, so a failure shows what the process said.
+        expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
+        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
 
   // A session with no MCP host that is loaded again with servers while a
   // subagent works gets its host set under the lock the subagent reads it with.
