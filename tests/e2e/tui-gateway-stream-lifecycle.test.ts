@@ -242,6 +242,103 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
     }
   } finally { writeFileSync(release, "go"); }
 }, 60000);
+
+// A parent's message to a working subagent is steering too: it moves the
+// subagent's running command to the background, and the parent's stop of
+// that turn stops the command, as Escape does for main's.
+test.skipIf(!tmuxAvailable())("a parent's stop of a subagent turn stops the command its steering moved to the background", async () => {
+  root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-steered-stop-")));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
+  const pidPath = join(workspace, "child-command.pid");
+  mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
+  writeFileSync(join(home, ".fx/settings.json"), "{}");
+  const answers: Record<string, string> = {
+    "child-stop-start": "CHILD_TASK_SENT",
+    "child-stop-steer": "CHILD_STEER_SENT",
+    "child-stop-stop": "CHILD_STOPPED",
+  };
+  const receipts: Record<string, any> = {};
+  const hold: HoldState = { started: false, cancelled: false };
+  let childCalls = 0, steeredChildBody = "";
+  const routeErrors: string[] = [];
+  const currentResult = (request: any) => {
+    const last = request.prompt.at(-1);
+    if (last?.role !== "tool") return null;
+    const part = (Array.isArray(last.content) ? last.content : []).find((p: any) => p.type === "tool-result");
+    return part ? { id: part.toolCallId as string, output: JSON.parse(part.output.value) } : null;
+  };
+  const host = startDynamicFakeGateway(raw => {
+    try {
+      const request = JSON.parse(raw), child = !raw.includes("Start the child task.");
+      const latest = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
+      if (child) {
+        childCalls++;
+        if (childCalls === 1) return fakeGatewayToolCall("child-stop-shell", "shell",
+          { request: { action: "run", command: `printf %s $$ > ${JSON.stringify(pidPath)}; exec sleep 90`, yield_time_ms: 30_000, timeout_ms: 600_000 } });
+        // The parent's message returned the command running; the turn's
+        // next step waits until the parent stops it.
+        steeredChildBody = raw;
+        return heldGatewayResponse(hold);
+      }
+      const current = currentResult(request);
+      if (current && answers[current.id]) {
+        receipts[current.id] = current.output;
+        return fakeGatewayFinalText(answers[current.id]!);
+      }
+      if (latest.includes("Start the child task.")) return fakeGatewayToolCall("child-stop-start", "subagent",
+        { request: { action: "message", agent: "reviewer", message: "CHILD_STOP_TASK: run the prepared command." } });
+      if (latest.includes("Steer the child.")) return fakeGatewayToolCall("child-stop-steer", "subagent",
+        { request: { action: "message", agent: "reviewer", message: "CHILD_STEER_TOKEN: check the config while it runs." } });
+      if (latest.includes("Stop the child.")) return fakeGatewayToolCall("child-stop-stop", "subagent",
+        { request: { action: "stop", agent: "reviewer" } });
+      throw new Error(`unexpected parent request: ${latest}`);
+    } catch (error) { routeErrors.push(String(error)); return new Response("fixture route error", { status: 422 }); }
+  }, { classifierDecision: "clear" });
+  gateway = host;
+  session = await TmuxSession.create({ cwd: workspace, width: 120, height: 40, stderrPath: stderr, isolated: true, remainOnExit: true,
+    env: { HOME: home, AI_GATEWAY_API_KEY: "fake-child-steered-stop", FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_TEST_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,interrupt,shell" } });
+  let commandPid = 0;
+  try {
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Start the child task.");
+    await waitForCondition(() => existsSync(pidPath) && readTrimmed(pidPath) !== "", "child command pid");
+    commandPid = Number(readTrimmed(pidPath));
+    await session.waitForText("CHILD_TASK_SENT", TIMEOUT);
+    expect(childWork(home, rootSessionIds(home)[0]!)?.outcome).toBeNull();
+
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Steer the child.");
+    await session.waitForText("CHILD_STEER_SENT", TIMEOUT);
+    expect(receipts["child-stop-steer"]).toMatchObject({ ok: true, delivery: "queued" });
+    // The child's next step carries the command's running result with the
+    // steering notice, and the parent's message.
+    await waitForCondition(() => hold.started, "child step after the parent's steering");
+    expect(steeredChildBody).toContain("steering_notice");
+    expect(steeredChildBody).toContain("CHILD_STEER_TOKEN");
+    expect(isProcessAlive(commandPid)).toBe(true);
+
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Stop the child.");
+    await session.waitForText("CHILD_STOPPED", TIMEOUT);
+    expect(receipts["child-stop-stop"].result).toContain("Stopped reviewer");
+    await waitForCondition(() => hold.cancelled, "child step cancellation");
+    await waitForCondition(() => !isProcessAlive(commandPid), "child command exit after the stop");
+    await waitForCondition(() => /steering-detached command stops done turn_id=\d+ count=1/.test(readFileSync(trace, "utf8")),
+      "child steering-detached stops done");
+    const traceText = readFileSync(trace, "utf8");
+    expect(traceText.match(/stopping steering-detached command session_id=\S+ turn_id=\d+ reason=turn_cancelled/g) ?? []).toHaveLength(1);
+    expect(childCalls).toBe(2);
+    expect(routeErrors).toEqual([]);
+
+    await session.waitForStableComposer(TIMEOUT); await session.sendText("/quit");
+    await waitForCondition(() => session!.paneStatus().dead, "fx exit");
+    expect(session.paneStatus().status).toBe(0); expect(readFileSync(stderr, "utf8")).toBe("");
+  } finally { if (commandPid > 0 && isProcessAlive(commandPid)) process.kill(commandPid, "SIGKILL"); }
+}, 60000);
 const GLM_MODEL = "zai/glm-5.2";
 const TURN_SUMMARY_WITH_TOKENS =
   /^ {2}(?:\d+s|\d+m \d+s|\d+h \d{2}m) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)$/m;
@@ -5359,6 +5456,128 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "Escape stops steered commands that ignore SIGTERM together, after the turn ends",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-stubborn-escape-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const pidPaths = [join(workspace, "stubborn-1.pid"), join(workspace, "stubborn-2.pid")];
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // The shell and its `sleep` ignore SIGTERM, SIGHUP and SIGINT, so the
+      // tty stop of each waits out its whole grace, about 3 s.
+      const stubborn = (path: string) =>
+        `trap '' TERM HUP INT; printf %s $$ > ${JSON.stringify(path)}; while :; do sleep 1; done`;
+      const run = (id: string, path: string) => ({
+        type: "tool-call",
+        toolCallId: id,
+        toolName: "shell",
+        input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, tty: true, command: stubborn(path) } },
+      });
+      const hold: HoldState = { started: false, cancelled: false };
+      const steeringGateway = startFakeGateway([
+        fakeGatewaySse([
+          run("stubborn_tool_1", pidPaths[0]!),
+          run("stubborn_tool_2", pidPaths[1]!),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
+        () => heldGatewayResponse(hold),
+        fakeGatewayFinalText("NEXT_PROMPT_DONE"),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-stubborn-escape-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,shell",
+        },
+      });
+
+      const pids: number[] = [];
+      const pidWritten = (path: string) => existsSync(path) && readTrimmed(path) !== "";
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Run the stubborn escape fixture.");
+        // The calls run in turn: steering moves the first to the background,
+        // and the second returns running at once for the same steering.
+        await waitForCondition(() => pidWritten(pidPaths[0]!), "first stubborn command pid");
+        await session.sendText("Check the config while those commands run.");
+        await waitForCondition(
+          () => pidPaths.every(pidWritten) && steeringGateway.requests.length === 2 && hold.started,
+          "steering request while both commands run",
+        );
+        pids.push(...pidPaths.map((path) => Number(readTrimmed(path))));
+        expect(pids.every(isProcessAlive)).toBe(true);
+        const continued = steeringGateway.requests[1]!.body;
+        expect(continued.match(/steering_notice/g) ?? []).toHaveLength(2);
+
+        await session.sendInterruptEscapePair(TIMEOUT);
+        const escaped = Date.now();
+        await session.waitForText("Cancelled · What can fx do differently?", TIMEOUT);
+        // The next prompt starts once the stops are done.
+        await session.sendText("Send the next request.");
+        await waitForCondition(() => steeringGateway.requests.length === 3, "next request after Escape", TIMEOUT);
+        const nextRequestMs = Date.now() - escaped;
+        await session.waitForText("NEXT_PROMPT_DONE", TIMEOUT);
+
+        // Both are stopped, by force in the end.
+        await waitForCondition(() => !pids.some(isProcessAlive), "stubborn command exits after Escape", TIMEOUT);
+        const finishedStops = () => new Set([...readFileSync(tracePath, "utf8").matchAll(
+          /\[shell\] (?:stopped steering-detached command session_id=(\S+) force=\S+ ended=true|steering-detached command stop failed session_id=(\S+))/g,
+        )].map((match) => match[1] ?? match[2])).size;
+        await waitForCondition(() => finishedStops() === 2, "both stops finished");
+        // Each stop waited out its graceful time, and they waited together:
+        // the next request came well before the stops' total, which it used
+        // to wait for.
+        const stops = new Map<string, { start: number; end: number }>();
+        for (const [, at, verb, id] of readFileSync(tracePath, "utf8").matchAll(
+          /^(\d+) \[shell\] (stopping|stopped) steering-detached command session_id=(\S+)/gm,
+        )) {
+          const stop = stops.get(id!) ?? { start: Number(at), end: Number(at) };
+          if (verb === "stopped") stop.end = Number(at);
+          stops.set(id!, stop);
+        }
+        const [first, second] = [...stops.values()].sort((a, b) => a.start - b.start);
+        expect(stops.size).toBe(2);
+        const totalStopMs = first!.end - first!.start + second!.end - second!.start;
+        expect(totalStopMs).toBeGreaterThan(2_000);
+        expect(nextRequestMs).toBeLessThan(totalStopMs * 0.8);
+        expect(second!.start).toBeLessThan(first!.end);
+        await waitForCondition(
+          () => /steering-detached command stops done turn_id=\d+ count=2/.test(readFileSync(tracePath, "utf8")),
+          "steering-detached stops done",
+        );
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace.match(/stopping steering-detached command /g) ?? []).toHaveLength(2);
+        expect(steeringGateway.requests).toHaveLength(3);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(session.isAlive()).toBe(true);
+        expect(session.isPaneAlive()).toBe(true);
+      } finally {
+        for (const pid of pids) if (isProcessAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "Escape keeps a command the model started in the background",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-background-escape-")));
@@ -5539,10 +5758,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
         await session.sendInterruptEscapePair(TIMEOUT);
         await waitForCondition(() => hold.cancelled, "held steering request cancellation");
-        // The stop of steering-detached commands runs before this event.
+        // The stops of steering-detached commands, which run after the turn
+        // is reported, found nothing to stop.
         await waitForCondition(
-          () => readFileSync(tracePath, "utf8").includes("finish_event_emitted"),
-          "interrupted turn finish",
+          () => /steering-detached command stops done turn_id=\d+ count=0/.test(readFileSync(tracePath, "utf8")),
+          "steering-detached stops done",
         );
         await waitForCondition(
           () => isProcessAlive(backgroundPid) &&

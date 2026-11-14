@@ -393,6 +393,7 @@ pub fn Bindings(comptime App: type) type {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
             if (comptime @hasDecl(App, "stopSteeringDetachedCommands")) {
+                deps.turn_ends_by_explicit_cancel = agentTurnEndsByExplicitCancel;
                 deps.stop_steering_detached_commands = agentStopSteeringDetachedCommands;
             }
             return deps;
@@ -407,9 +408,13 @@ pub fn Bindings(comptime App: type) type {
         /// Main's and each subagent's turns end here. Only an explicit
         /// cancel stops what steering detached; a turn steering ended keeps
         /// its commands.
+        fn agentTurnEndsByExplicitCancel(ctx: *anyopaque, turn_id: u64) bool {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return agent.worker.turnEndsByExplicitCancel(turn_id);
+        }
+
         fn agentStopSteeringDetachedCommands(ctx: *anyopaque, turn_id: u64) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            if (!agent.worker.turnEndsByExplicitCancel(turn_id)) return;
             return appOf(agent).stopSteeringDetachedCommands(agent, turn_id);
         }
 

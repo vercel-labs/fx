@@ -568,6 +568,10 @@ pub const FakeAgentRuntimeDeps = struct {
     finalized_outcome: ?types.TurnPresentationOutcome = null,
     finalized_disposition: ?types.ProviderCompletionDisposition = null,
     finalization_error: ?anyerror = null,
+    /// When set, the host stops steering-detached commands, and this is
+    /// its answer to whether an interrupted turn was cancelled by the user.
+    /// Both hooks write to `log`.
+    steering_detached_explicit_cancel: ?bool = null,
     terminal_lease_cleanup_ids: std.ArrayList([]u8) = .empty,
     terminal_lease_cleanup_errors: []const ?anyerror = &.{},
     terminal_lease_cleanup_index: usize = 0,
@@ -786,6 +790,8 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .finalize_turn = finalizeTurn,
             .release_agent_terminal_lease = releaseAgentTerminalLease,
+            .turn_ends_by_explicit_cancel = if (self.steering_detached_explicit_cancel != null) turnEndsByExplicitCancel else null,
+            .stop_steering_detached_commands = if (self.steering_detached_explicit_cancel != null) stopSteeringDetachedCommands else null,
             .append_runtime_context = appendRuntimeContext,
             .append_static_context = appendStaticContext,
             .validate_tool_call = validateToolCall,
@@ -1038,6 +1044,18 @@ pub const FakeAgentRuntimeDeps = struct {
         self.finalized_disposition = disposition;
         try self.record("event:turn_finished", .{});
         if (self.finalization_error) |err| return err;
+    }
+
+    fn turnEndsByExplicitCancel(raw: *anyopaque, _: u64) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.record("hook:explicit_cancel", .{}) catch {};
+        return self.steering_detached_explicit_cancel.?;
+    }
+
+    fn stopSteeringDetachedCommands(raw: *anyopaque, turn_id: u64) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(self.finalized_turn_id, turn_id);
+        try self.record("hook:stop_steering_detached", .{});
     }
 
     fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
