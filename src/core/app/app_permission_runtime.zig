@@ -177,6 +177,26 @@ pub fn Runtime(comptime App: type) type {
             return types.dupePermissionGrantSlice(alloc, grantsLocked(app, agent));
         }
 
+        /// `own`, a turn's list of approvals, followed by a copy of `agent`'s
+        /// instance's taken under the authority lock now. A turn that has no
+        /// run authority of its own checks and executes against this, so it
+        /// reads what the instance holds at that moment and not only what the
+        /// turn was given when it began or answered. `own`'s entries stay the
+        /// caller's. The copy is in `arena`, which frees all of it: one slice
+        /// and two strings for each of the instance's approvals.
+        pub fn copyGrantsAfter(app: anytype, agent: anytype, arena: std.mem.Allocator, own: []const types.PermissionGrant) ![]types.PermissionGrant {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            const live = grantsLocked(app, agent);
+            const merged = try arena.alloc(types.PermissionGrant, own.len + live.len);
+            @memcpy(merged[0..own.len], own);
+            for (live, merged[own.len..]) |grant, *slot| slot.* = .{
+                .tool_name = try arena.dupe(u8, grant.tool_name),
+                .target_path = try arena.dupe(u8, grant.target_path),
+            };
+            return merged;
+        }
+
         /// How many of `agent`'s session approvals still apply, counted under
         /// the authority lock.
         pub fn liveGrantCount(app: anytype, agent: anytype) usize {
@@ -210,14 +230,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Records, at once, an "always" approval a subagent's turn just gave. A
-        /// subagent resolves its authority from its instance's approvals at
-        /// every tool call, so its next call may run before the main loop
-        /// handles the event that carries the same approval. A main agent
-        /// keeps its own list for the rest of its turn and needs no early write.
-        pub fn allowSubagentForSession(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        /// Records, at once, an "always" approval `agent`'s turn just gave, on
+        /// its worker's thread. Every agent of the instance reads the instance's
+        /// list at its next check, and a subagent's next call may run before
+        /// the main loop handles the event that carries the same approval. The
+        /// main loop records it again then, and the list keeps one row, since
+        /// `allowToolForSession` skips an approval the list already allows.
+        pub fn allowAtOnce(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
             if (comptime !per_instance) return;
-            if (!isSubagent(app, agent)) return;
             try allowForSession(app, agent, tool_name, target_path);
         }
 

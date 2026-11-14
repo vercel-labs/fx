@@ -24,6 +24,7 @@ const change_tracker = @import("../workspace/change_tracker.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -187,19 +188,21 @@ pub fn Runtime(comptime App: type) type {
             return if (agent.child_run) |*run| run else null;
         }
 
-        /// `ctx` with a copy of the session approvals `agent`'s tool calls use,
-        /// taken under the authority lock into `arena`. A subagent's worker adds
-        /// approvals to its instance's list while this thread works, and the
-        /// list moves when it grows, so a call that reads the approvals holds a
-        /// copy and never the list. A subagent's own tools carry its run's
-        /// approvals already. When the copy cannot be made the call sees none
-        /// and asks.
-        pub fn withLiveGrants(app: *App, agent: *AppAgent, arena: Allocator, ctx: tool_runtime.Context) tool_runtime.Context {
-            if (childToolAuthority(agent) != null) return ctx;
-            var with_grants = ctx;
-            const copy: []const PermissionGrant = app_permission_runtime.Runtime(App).copyGrants(app, agent, arena) catch &.{};
-            with_grants.permission_grants = copy;
-            return with_grants;
+        /// The approvals a check or an execution by `agent`'s turn reads: the
+        /// turn's own list, `own`, followed by a copy of its instance's taken
+        /// under the authority lock at that moment, in `arena`. The turn's list
+        /// holds what it was given when it began and what it answered itself;
+        /// an agent's worker adds to the instance's list while the turn runs,
+        /// and the list moves when it grows, so a call that reads the
+        /// instance's approvals holds a copy and never the list. The caller
+        /// gives an arena that ends with the check or the execution, so a
+        /// turn keeps no copy of it. A subagent's own tools read the run's
+        /// approvals, which its authority resolves from the instance at every
+        /// call. When the copy cannot be made the call sees `own` alone and
+        /// asks for the rest.
+        pub fn mergeLiveGrants(app: *App, agent: *AppAgent, arena: Allocator, own: []const PermissionGrant) []const PermissionGrant {
+            if (childToolAuthority(agent) != null) return own;
+            return app_permission_runtime.Runtime(App).copyGrantsAfter(app, agent, arena, own) catch own;
         }
 
         /// A subagent's tools work under its run's admission, never main's
@@ -360,8 +363,8 @@ pub fn Runtime(comptime App: type) type {
             else
                 app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent);
             // An agent without a run of its own has no approvals here: they sit in
-            // a list that a subagent's worker adds to, so a call that reads them
-            // takes a copy with `withLiveGrants`.
+            // a list that every agent's worker adds to, so a call that reads them
+            // takes a copy with `mergeLiveGrants`.
             const permission_grants: []const PermissionGrant = if (authority) |snapshot|
                 snapshot.grants
             else
@@ -843,15 +846,18 @@ pub fn Runtime(comptime App: type) type {
             applyCredentialLease(app, agent, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             ctx.mcp_review_schema_json = mcp_review_schema_json;
-            ctx = withLiveGrants(app, agent, arena, ctx);
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
+            // The outcome holds nothing of the list, so the copy ends with the check.
+            var copy = std.heap.ArenaAllocator.init(app.alloc);
+            defer copy.deinit();
+            const grants = mergeLiveGrants(app, agent, copy.allocator(), local_grants);
             return if (revalidation) |request| switch (request) {
                 .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
                     admission,
                     arena,
                     call,
                     permission_mode,
-                    local_grants,
+                    grants,
                     action.authority,
                     action.human_approval,
                 ),
@@ -860,7 +866,7 @@ pub fn Runtime(comptime App: type) type {
                 arena,
                 call,
                 permission_mode,
-                local_grants,
+                grants,
             );
         }
 
@@ -901,15 +907,16 @@ pub fn Runtime(comptime App: type) type {
             );
             applyCredentialLease(app, agent, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
-            ctx = withLiveGrants(app, agent, arena, ctx);
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
+            var copy = std.heap.ArenaAllocator.init(app.alloc);
+            defer copy.deinit();
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
                 admission,
                 arena,
                 call,
                 prepared,
                 permission_mode,
-                local_grants,
+                mergeLiveGrants(app, agent, copy.allocator(), local_grants),
             );
         }
 
@@ -1003,10 +1010,12 @@ pub fn Runtime(comptime App: type) type {
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
             ctx.root_user_evidence_complete = request.root_user_evidence_complete;
-            ctx.session_grants = request.session_grants;
+            // The execution reads the list only while it runs, so the copy ends with it.
+            var copy = std.heap.ArenaAllocator.init(app.alloc);
+            defer copy.deinit();
+            ctx.session_grants = mergeLiveGrants(app, agent, copy.allocator(), request.session_grants);
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
-            ctx = withLiveGrants(app, agent, request.call_allocator, ctx);
             return tool_runtime.executeToolCallAuthorized(ctx, request);
         }
 
@@ -2343,6 +2352,90 @@ test "app model id loading uses the injected catalog provider" {
     try std.testing.expectEqualStrings("provider/second", ids.items[1]);
 }
 
+test "a merge of approvals makes one copy of the instance's list: a slice and two strings for each" {
+    var app = try FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const own = [_]PermissionGrant{
+        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") },
+        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/b") },
+    };
+    var held: usize = 0;
+    for ([_]usize{ 1, 20, 200 }) |count| {
+        while (held < count) : (held += 1) {
+            var buf: [24]u8 = undefined;
+            try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{held}));
+        }
+        var counting = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
+        const alloc = counting.allocator();
+        const merged = try app_permission_runtime.Runtime(FakeApp).copyGrantsAfter(&app, app.agent(), alloc, &own);
+        // The turn's own entries are not copied: the merge allocates for the instance's alone.
+        try std.testing.expectEqual(@as(usize, 1 + 2 * count), counting.alloc_index);
+        try std.testing.expectEqual(own.len + count, merged.len);
+        for (merged[own.len..]) |grant| {
+            alloc.free(grant.tool_name);
+            alloc.free(grant.target_path);
+        }
+        alloc.free(merged);
+    }
+}
+
+/// How big the turn's arena is after 50 checks and 50 executions of a call, with
+/// `count` approvals in the instance's list. Everything the checks and the
+/// executions copy must be freed when they return: the testing allocator, which
+/// backs them, reports what is not.
+fn turnArenaAfterCalls(count: usize) !usize {
+    var app = try FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    for (0..count) |i| {
+        var buf: [24]u8 = undefined;
+        try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{i}));
+    }
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const read = ToolCall{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
+    const reads = [_]ToolCall{read};
+    const review_turn: permission_auto_classifier.ReviewTurnContext = .{
+        .model = "openai/gpt-5",
+        .pending_assistant = .{ .role = .assistant, .tool_calls = &reads },
+        .target_call_id = read.id,
+        .origin = .root,
+    };
+    for (0..50) |_| {
+        _ = try app.requestToolPermissionSyncWithAdvertised({}, arena, read, review_turn, .ask, &.{}, null, null, &.{}, null);
+        _ = try app.executeToolCall(app.agent(), .{
+            .call_allocator = arena,
+            .result_allocator = arena,
+            .call = read,
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = 2048,
+        });
+    }
+    return arena_state.queryCapacity();
+}
+
+test "a check and an execution free their copy of the approvals when they return, so the turn's arena does not grow with them" {
+    try std.testing.expectEqual(try turnArenaAfterCalls(0), try turnArenaAfterCalls(200));
+}
+
+test "an approval in the instance's list never makes a tool that main's turn does not offer available" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call = ToolCall{ .id = "unoffered", .name = "mcp_unoffered", .arguments_json = "{}" };
+
+    // What the turn offers decides, and the list of approvals does not enter
+    // into it: a merged approval skips a prompt, and grants no tool.
+    try std.testing.expect((try app.validateToolCall({}, arena, call)) == .not_registered);
+    try app.permission_engine.allow(alloc, "mcp_unoffered", "anything");
+    try std.testing.expect((try app.validateToolCall({}, arena, call)) == .not_registered);
+}
+
 test "app agent runtime builds tool context from app state and MCP callbacks" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
@@ -2368,10 +2461,20 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expectEqual(@as(usize, 0), ctx.permission_grants.len);
     var copy_arena = std.heap.ArenaAllocator.init(alloc);
     defer copy_arena.deinit();
-    const with_grants = Runtime(FakeApp).withLiveGrants(&app, app.agent(), copy_arena.allocator(), ctx);
-    try std.testing.expectEqual(@as(usize, 1), with_grants.permission_grants.len);
-    try std.testing.expectEqualStrings("run_command", with_grants.permission_grants[0].tool_name);
-    try std.testing.expect(with_grants.permission_grants.ptr != app.permission_engine.grants.items.ptr);
+    // A check reads the turn's own approvals, then a copy of the instance's.
+    var own = [_]PermissionGrant{.{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/own") }};
+    const merged = Runtime(FakeApp).mergeLiveGrants(&app, app.agent(), copy_arena.allocator(), &own);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    try std.testing.expectEqualStrings("read_file", merged[0].tool_name);
+    try std.testing.expect(merged[0].tool_name.ptr == own[0].tool_name.ptr);
+    try std.testing.expectEqualStrings("run_command", merged[1].tool_name);
+    try std.testing.expect(merged[1].tool_name.ptr != app.permission_engine.grants.items[0].tool_name.ptr);
+    // A copy that cannot be made leaves the turn's own list alone, so a call
+    // the turn was not given asks.
+    var no_memory = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const alone = Runtime(FakeApp).mergeLiveGrants(&app, app.agent(), no_memory.allocator(), &own);
+    try std.testing.expectEqual(@as(usize, 1), alone.len);
+    try std.testing.expect(alone.ptr == &own);
     try std.testing.expect(ctx.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), ctx.effort);
     try std.testing.expect(!ctx.web_search_runtime_ready);

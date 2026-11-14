@@ -6908,22 +6908,34 @@ test "each instance keeps its own permission mode and session approvals" {
     try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
 }
 
+/// An `App` for a test of session approvals. `deinit` stops the subagents the
+/// test added, frees the approvals, and tears the `App` down in the order it
+/// needs.
+const ApprovalsFixture = struct {
+    app: App,
+
+    fn deinit(self: *ApprovalsFixture) void {
+        App.AgentsAppRuntime.shutdownChildren(&self.app);
+        app_permission_runtime.Runtime(App).deinitSessionGrants(&self.app, &self.app.main_agent);
+        App.AgentsAppRuntime.deinitChildren(&self.app);
+        self.app.pacer.deinit(self.app.alloc);
+        self.app.shell.deinit(self.app.alloc);
+    }
+};
+
 test "a subagent's always approval reaches its instance's list at once, for main and its siblings only" {
     const alloc = std.testing.allocator;
     const Permission = app_permission_runtime.Runtime(App);
     const Worker = app_worker_runtime.Runtime(App);
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer Permission.deinitSessionGrants(&app, &app.main_agent);
-    const second = try addTestChildAgent(&app, "instance-2");
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const second = try addTestChildAgent(app, "instance-2");
     second.agent.role = .instance;
-    const child = try addTestChildAgent(&app, "child-1");
-    const sibling = try addTestChildAgent(&app, "child-2");
-    const other = try addTestChildAgent(&app, "child-of-instance-2");
+    const child = try addTestChildAgent(app, "child-1");
+    const sibling = try addTestChildAgent(app, "child-2");
+    const other = try addTestChildAgent(app, "child-of-instance-2");
     other.agent.root_instance = &second.agent;
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6934,51 +6946,86 @@ test "a subagent's always approval reaches its instance's list at once, for main
 
     // They are in the list when the call returns, before the event that
     // carries them reaches the main loop.
-    for (file_grants) |grant| try Worker.propagateGrant(&app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
     for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
-        try std.testing.expect(grantAllowed(&app, agent, "write_file", "/tmp/workspace/other/file.txt"));
+        try std.testing.expect(grantAllowed(app, agent, "write_file", "/tmp/workspace/other/file.txt"));
     }
-    try std.testing.expect(Permission.grantsLocked(&app, &child.agent).ptr == Permission.grantsLocked(&app, &app.main_agent).ptr);
-    const stored = grantCount(&app, &app.main_agent);
+    try std.testing.expect(Permission.grantsLocked(app, &child.agent).ptr == Permission.grantsLocked(app, &app.main_agent).ptr);
+    const stored = grantCount(app, &app.main_agent);
 
     // The same approval again leaves the list as it was.
-    for (file_grants) |grant| try Worker.propagateGrant(&app, &child.agent, grant.tool_name, grant.target_path);
-    try std.testing.expectEqual(stored, grantCount(&app, &app.main_agent));
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
 
     // A second instance is another session: it keeps its own list, and its
     // subagent's approval stays there.
-    try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &second.agent));
-    try std.testing.expect(!grantAllowed(&app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
-    try Worker.propagateGrant(&app, &other.agent, "skill", "demo");
-    try std.testing.expect(grantAllowed(&app, &second.agent, "skill", "demo"));
-    try std.testing.expect(!grantAllowed(&app, &app.main_agent, "skill", "demo"));
-    try std.testing.expectEqual(stored, grantCount(&app, &app.main_agent));
+    try std.testing.expectEqual(@as(usize, 0), grantCount(app, &second.agent));
+    try std.testing.expect(!grantAllowed(app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
+    try Worker.propagateGrant(app, &other.agent, "skill", "demo");
+    try std.testing.expect(grantAllowed(app, &second.agent, "skill", "demo"));
+    try std.testing.expect(!grantAllowed(app, &app.main_agent, "skill", "demo"));
+    try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
 
-    // A main agent's own turn writes nothing early: its list and its event
-    // carry the approval.
-    try Worker.propagateGrant(&app, &app.main_agent, "skill", "main-only");
-    try std.testing.expectEqual(stored, grantCount(&app, &app.main_agent));
+    // Main's own answer is written at once too, so a subagent that is running
+    // reads it at its next call. The main loop's event for the same answer
+    // then adds no second row.
+    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only");
+    try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
+    try std.testing.expect(grantAllowed(app, &child.agent, "skill", "main-only"));
+    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only");
+    try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
 }
 
-test "a subagent's worker adds approvals while main's worker and main's thread read them" {
+test "main's check reads the approvals its instance holds when it checks, and no other instance's" {
+    const alloc = std.testing.allocator;
+    const Worker = app_worker_runtime.Runtime(App);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const second = try addTestChildAgent(app, "instance-2");
+    second.agent.role = .instance;
+    const child = try addTestChildAgent(app, "child-1");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Merge = App.AgentAppRuntime;
+
+    // The turn began, or the prompt was queued, before the approval, so its own
+    // list has none of it.
+    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
+    try Worker.propagateGrant(app, &child.agent, "skill", "granted");
+
+    // Main's check now reads it, and still reads the turn's own approval.
+    const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, &own);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "skill", "granted"));
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "skill", "own"));
+    // The approval covers what it names, and nothing else.
+    try std.testing.expect(!permissions.sessionGrantAllowed(main_grants, "skill", "other"));
+
+    // Another instance is another session, whether its turn is running or its
+    // prompt is queued: its check does not read this instance's list.
+    const second_grants = Merge.mergeLiveGrants(app, &second.agent, arena, &own);
+    try std.testing.expectEqual(own.len, second_grants.len);
+    try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "skill", "granted"));
+}
+
+test "subagents' workers and main's worker add approvals while main's worker and main's thread read them" {
     const alloc = std.testing.allocator;
     const Permission = app_permission_runtime.Runtime(App);
     const Worker = app_worker_runtime.Runtime(App);
     // The process Io installs its wrapped vtable on first use, before threads
     // start; touch it here so the threads below meet it ready.
     _ = io_mod.getIo();
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer Permission.deinitSessionGrants(&app, &app.main_agent);
-    const first = try addTestChildAgent(&app, "child-1");
-    const second = try addTestChildAgent(&app, "child-2");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const first = try addTestChildAgent(app, "child-1");
+    const second = try addTestChildAgent(app, "child-2");
 
     const Race = struct {
         app: *App,
-        writers_left: std.atomic.Value(u32) = .init(2),
+        writers_left: std.atomic.Value(u32) = .init(3),
         torn: std.atomic.Value(u32) = .init(0),
         const approvals = 200;
 
@@ -7003,6 +7050,24 @@ test "a subagent's worker adds approvals while main's worker and main's thread r
             }
         }
 
+        /// Main's worker: its own answers, each written at once. Main's thread
+        /// writes the same answers below, as it does when it handles the events
+        /// that carry them.
+        fn writeAsMainWorker(self: *@This()) void {
+            defer _ = self.writers_left.fetchSub(1, .release);
+            for (0..approvals) |i| {
+                var buf: [24]u8 = undefined;
+                const target = std.mem.print(&buf, "m-{d}", .{i}) catch {
+                    _ = self.torn.fetchAdd(1, .monotonic);
+                    return;
+                };
+                Worker.propagateGrant(self.app, &self.app.main_agent, "skill", target) catch {
+                    _ = self.torn.fetchAdd(1, .monotonic);
+                    return;
+                };
+            }
+        }
+
         /// Every approval read has a whole name and target.
         fn check(self: *@This(), grants: []const types.PermissionGrant) void {
             for (grants) |grant| {
@@ -7015,15 +7080,17 @@ test "a subagent's worker adds approvals while main's worker and main's thread r
         }
 
         /// Main's worker: a tool context at every call, and the approvals a
-        /// permission check reads, copied into the call's arena.
+        /// check or an execution reads, the turn's own and a copy of the
+        /// instance's, in an arena that ends with the call.
         fn readAsWorker(self: *@This()) void {
             var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer arena.deinit();
             while (self.writing()) {
                 _ = arena.reset(.retain_capacity);
                 const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
-                const with_grants = App.AgentAppRuntime.withLiveGrants(self.app, &self.app.main_agent, arena.allocator(), ctx);
-                self.check(with_grants.permission_grants);
+                _ = ctx;
+                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
+                self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));
             }
         }
 
@@ -7046,26 +7113,29 @@ test "a subagent's worker adds approvals while main's worker and main's thread r
             }
         }
     };
-    var race = Race{ .app = &app };
+    var race = Race{ .app = app };
     const first_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &first.agent, "a" });
     const second_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &second.agent, "b" });
+    const main_writer = try std.Thread.spawn(.{}, Race.writeAsMainWorker, .{&race});
     const worker_reader = try std.Thread.spawn(.{}, Race.readAsWorker, .{&race});
     const main_reader = try std.Thread.spawn(.{}, Race.readAsMainThread, .{&race});
     const display_reader = try std.Thread.spawn(.{}, Race.readForDisplay, .{&race});
-    // Main's own event handler adds approvals to the same list meanwhile.
+    // Main's thread handles the events for main's own answers meanwhile: the
+    // same approvals its worker has written, which add no second row.
     for (0..Race.approvals) |i| {
         var buf: [16]u8 = undefined;
         const target = try std.mem.print(&buf, "m-{d}", .{i});
-        try Permission.allowForSession(&app, &app.main_agent, "skill", target);
+        try Permission.allowForSession(app, &app.main_agent, "skill", target);
     }
     first_writer.join();
     second_writer.join();
+    main_writer.join();
     worker_reader.join();
     main_reader.join();
     display_reader.join();
 
     try std.testing.expectEqual(@as(u32, 0), race.torn.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 3 * Race.approvals), grantCount(&app, &app.main_agent));
+    try std.testing.expectEqual(@as(usize, 3 * Race.approvals), grantCount(app, &app.main_agent));
 }
 
 test "a subagent's turn is stamped with its run's model, permissions, credential, and root request" {

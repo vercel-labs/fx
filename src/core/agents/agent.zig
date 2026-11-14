@@ -49,7 +49,7 @@ pub const Agent = struct {
     /// session. A subagent records none; its go to the instance at the
     /// top of its tree (`root_instance`). Each entry owns its strings,
     /// allocated with the app's allocator. Guarded by the app's permission
-    /// authority lock: a subagent's worker adds to it, so every write and every
+    /// authority lock: every agent's worker adds to it, so every write and every
     /// read holds the lock, and a reader that keeps what it reads takes a copy
     /// (`copyGrants`). Only freeing it, after the instance's tree has stopped,
     /// takes no lock.
