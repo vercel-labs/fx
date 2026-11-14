@@ -1948,15 +1948,18 @@ fn collectStoryRetries(
 }
 
 /// The tool and target a call acts on, which a retry of it repeats: the
-/// tool's name and the base name of the first argument that names a target,
-/// so a skill opened by its path repeats one opened by its name. Null for a
-/// shell command, which repeats as "passed on the 3rd run" instead.
+/// tool's name and the first argument that names a target. A skill or tool
+/// to open or run counts by its base name, so one opened by its path repeats
+/// one opened by its name; a path counts whole, so another file with the
+/// same name is not a retry. Null for a shell command, which repeats as
+/// "passed on the 3rd run" instead.
 fn retryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
     if (isShellCommandCall(scratch, record)) return null;
     const fields = [_][]const u8{ "path", "open", "run", "search", "agent", "pattern", "url", "query" };
     var target: []const u8 = "";
     for (fields) |field| if (storyArgString(scratch, record, field)) |value| {
-        target = std.Io.Dir.path.basename(value);
+        const by_name = std.mem.eql(u8, field, "open") or std.mem.eql(u8, field, "run");
+        target = if (by_name) std.Io.Dir.path.basename(value) else value;
         break;
     };
     return try std.mem.concat(scratch, u8, &.{ record.tool_name, "\x00", target });
@@ -4818,6 +4821,19 @@ test "a failure the model fixed at once shows as the try that worked" {
         const text = try groupTextForTest(alloc, &.{ failed_open, failed_again, opened }, &.{ failed_detail, failed_again_detail, opened_detail });
         defer alloc.free(text);
         try std.testing.expectEqualStrings("● Used /a/fx-commit · 3rd try", std.mem.trim(u8, text, "\n"));
+    }
+    // An edit of another file with the same name did not fix it either.
+    {
+        const failed_edit = TranscriptEntry{ .raw_bytes = .{ .id = 5, .bytes = "● Failed /Users/example/fx/tests/main.zig: old_string not found\n", .class = .tool_status } };
+        const other_edit = TranscriptEntry{ .raw_bytes = .{ .id = 6, .bytes = "● Edited /Users/example/fx/src/main.zig +1 / -1\n", .class = .tool_status } };
+        const failed_edit_detail = ToolDetailRecord{ .entry_id = 5, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"/Users/example/fx/tests/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .outcome = .failed };
+        const other_edit_detail = ToolDetailRecord{ .entry_id = 6, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"/Users/example/fx/src/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .outcome = .completed };
+        const text = try groupTextForTest(alloc, &.{ failed_edit, other_edit }, &.{ failed_edit_detail, other_edit_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Couldn't edit main.zig · old_string not found") != null);
+        try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
     // A next call with another target did not fix it, so the failure stays.
     {
