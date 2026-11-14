@@ -47,6 +47,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const MODEL = "openai/gpt-5.5";
 /** The frame every subagent report arrives in (`src/core/subagent/reports.zig`). */
@@ -10145,23 +10146,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     restore: (blobs: string) => void;
   };
 
-  // Whether a read-only folder refuses a write from the user running the
-  // tests. Root, and any user that holds CAP_DAC_OVERRIDE, writes into it.
-  const permissionsEnforced = (() => {
-    const folder = mkdtempSync(join(tmpdir(), "fx-permission-probe-"));
-    try {
-      chmodSync(folder, 0o500);
-      writeFileSync(join(folder, "probe"), "");
-      return false;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      return code === "EACCES" || code === "EPERM";
-    } finally {
-      chmodSync(folder, 0o700);
-      rmSync(folder, { recursive: true, force: true });
-    }
-  })();
-  if (!permissionsEnforced) {
+  // A user that file modes do not hold back, such as root or one that holds
+  // CAP_DAC_OVERRIDE, writes into a read-only folder, so the restored test
+  // cannot force its failure for them and skips.
+  const fileModesIgnored = ignoresFileModes();
+  if (fileModesIgnored) {
     console.warn(
       'skipping "subagent failure retains its cause after effects and worker cleanup": a write into a read-only folder was not refused for this user (root, or a user that holds CAP_DAC_OVERRIDE), so the folder cannot force the write failure that test needs',
     );
@@ -10268,7 +10257,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }
 
-  test.skipIf(!permissionsEnforced)("subagent failure retains its cause after effects and worker cleanup", () => runFailedChildAfterEffects(readOnlyBlobs), 20_000);
+  test.skipIf(fileModesIgnored)("subagent failure retains its cause after effects and worker cleanup", () => runFailedChildAfterEffects(readOnlyBlobs), 20_000);
 
   test("subagent failure keeps its cause when the child's commit fails after effects, whatever the user's permissions", () => runFailedChildAfterEffects(fileInPlaceOfBlobs), 20_000);
 
