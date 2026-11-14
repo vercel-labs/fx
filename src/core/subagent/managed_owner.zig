@@ -556,9 +556,13 @@ pub const Owner = struct {
     /// work whose own call fails with the cause owes none, while a message
     /// the parent was told was queued owes one under the child's rule.
     /// `expected_work_id`, when given, must be the active work. Null when
-    /// the registry could not be read or written: the child stays marked
-    /// running until it is closed or fx restarts, and the trace names the
-    /// work.
+    /// the work could not be ended, and the trace names the stage and the
+    /// work. At `state_load`, `work_id`, `state_finish` and `state_save` the
+    /// registry could not be read or nothing was written, so the child may
+    /// stay marked running until it is closed or fx restarts. At
+    /// `child_missing`, `no_active_work` and `other_active_work` there is no
+    /// such work to end: the child is gone, has no active work, or runs
+    /// another one.
     pub fn endUnstarted(
         self: *Owner,
         child_id: []const u8,
@@ -1652,12 +1656,13 @@ fn failedOutcome(work_id: []u8, stage: []const u8, err: anyerror) OneOutcome {
     };
 }
 
-/// A work whose start failed could not be ended in the registry, which keeps
-/// it running with no slot behind it.
+/// A work whose start failed could not be ended in the registry. At some
+/// stages that leaves it marked running with no slot behind it
+/// (`endUnstarted`).
 fn unstartedFailure(child_id: []const u8, work_id: ?[]const u8, stage: []const u8, err: anyerror) void {
     debug_trace.logf(
         "subagent",
-        "failed start could not be ended child_id={s} work_id={s} stage={s} err={s}: the registry keeps the work running and the child takes no message until it is closed or fx restarts",
+        "failed start could not be ended child_id={s} work_id={s} stage={s} err={s}: the work may still be marked running in the registry, and the child may take no message until it is closed or fx restarts",
         .{ child_id, work_id orelse "unknown", stage, @errorName(err) },
     );
 }
