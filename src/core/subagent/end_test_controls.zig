@@ -52,6 +52,10 @@ var run_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_RUN_HELD", .release
 var next_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_NEXT_HELD", .release_env = "FX_TEST_SUBAGENT_NEXT_RELEASE" };
 var settle_hold = file_hold.Hold{ .held_env = "FX_TEST_SUBAGENT_SETTLE_HELD", .release_env = "FX_TEST_SUBAGENT_SETTLE_RELEASE" };
 
+/// False in the libfx artifacts, which leave every test control out. A host
+/// sets its user-stop hook only where this is true.
+pub const controls_built = !build_options.libfx;
+
 /// The host the user-stop control acts through: `stop_fn` stops a child of
 /// `context` as the app's `noteUserStop` does. A host's owner keeps its own
 /// (`Owner.user_stop_hook`) and passes it to the holds of its slots, so hosts

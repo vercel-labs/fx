@@ -293,7 +293,9 @@ pub const Runtime = struct {
         errdefer runtime.approvals.deinit();
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
-        runtime.managed.user_stop_hook = .{ .context = runtime, .stop_fn = userStopForTest };
+        if (comptime end_test_controls.controls_built) {
+            runtime.managed.user_stop_hook = .{ .context = runtime, .stop_fn = userStopForTest };
+        }
         return runtime;
     }
 
