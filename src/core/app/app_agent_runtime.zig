@@ -2409,18 +2409,23 @@ test "a merge of approvals makes one copy of the instance's list: a slice and tw
     }
 }
 
-/// How big the turn's arena is after 50 checks and 50 executions of a call, with
-/// `count` approvals in the instance's list. Everything the checks and the
-/// executions copy must be freed when they return: the testing allocator, which
-/// backs them, reports what is not.
-fn turnArenaAfterCalls(count: usize) !usize {
+/// Runs 50 checks and 50 executions of a call, with `count` approvals in the
+/// instance's list, against a turn's arena that cannot grow past `limit` bytes.
+/// What the checks and the executions copy goes into an arena of their own,
+/// backed by the testing allocator, which reports what is not freed when they
+/// return. A copy that went into the turn's arena would not fit under the
+/// limit.
+fn callsAgainstTurnArena(count: usize, limit: usize) !void {
     var app = try FakeApp.init(std.testing.allocator);
     defer app.deinit();
     for (0..count) |i| {
         var buf: [24]u8 = undefined;
         try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{i}));
     }
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const buffer = try std.testing.allocator.alloc(u8, limit);
+    defer std.testing.allocator.free(buffer);
+    var fixed = std.heap.FixedBufferAllocator.init(buffer);
+    var arena_state = std.heap.ArenaAllocator.init(fixed.allocator());
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const read = ToolCall{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
@@ -2443,11 +2448,14 @@ fn turnArenaAfterCalls(count: usize) !usize {
             .max_tool_result_bytes = 2048,
         });
     }
-    return arena_state.queryCapacity();
 }
 
 test "a check and an execution free their copy of the approvals when they return, so the turn's arena does not grow with them" {
-    try std.testing.expectEqual(try turnArenaAfterCalls(0), try turnArenaAfterCalls(200));
+    // The 100 calls' own results fit in 256 KB with no approvals. A copy of 200
+    // approvals is over 10 KB, so 100 of them in the turn's arena would need over 1 MB.
+    const limit = 256 * 1024;
+    try callsAgainstTurnArena(0, limit);
+    try callsAgainstTurnArena(200, limit);
 }
 
 test "an approval in the instance's list never makes a tool that main's turn does not offer available" {
