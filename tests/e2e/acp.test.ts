@@ -10803,6 +10803,53 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  // Closing stdin ends the server while a subagent is inside a shell command. The subagents stop before the
+  // executions they run commands through are torn down: torn down first, the process waited for ever on a
+  // runtime that was gone, and on macOS it sometimes aborted on the assertion that no operation is in flight.
+  for (const after of ["while the prompt runs", "after session/cancel"] as const) {
+    test(
+      `ACP closing stdin ${after} stops a subagent that runs a shell command, and the server exits`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-stdin-close-shell-");
+        const started = join(root.root, "shell-started");
+        const gateway = startDynamicFakeGateway((body) => {
+          if (!body.includes('"name":"subagent"')) return fakeShellRun("stdin_close_shell", `touch '${started}'; sleep 30`);
+          if (body.includes("stdin_close_call")) return finalText("ACP_STDIN_CLOSE_PARENT_DONE");
+          return fakeGatewayToolCall("stdin_close_call", "subagent", {
+            request: { action: "message", agent: "sheller", message: "Run the command." },
+          });
+        });
+        const childOutcomes = (sessionId: string): string[] =>
+          (logLines(root.home, sessionId) as any[]).filter((line) => line.kind === "child_finished").map((line) => line.outcome);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          const sessionId = await startAutoSession(client);
+          await client.request("session/set_mode", { modeId: "full-access" }, 4);
+          sendPrompt(client, 8301, "Start the subagent that runs the command.");
+          await waitForPath(started, TIMEOUT);
+          if (after === "after session/cancel") {
+            client.send({ jsonrpc: "2.0", id: 8302, method: "session/cancel", params: {} });
+            const ended = await readUntilResponses(client, [8301, 8302], TIMEOUT);
+            expect(ended.responses.get(8301).result.stopReason).toBe("cancelled");
+            // The subagent outlived the prompt and its command still runs.
+            expect(childOutcomes(sessionId)).toEqual([]);
+          }
+
+          client.endStdin();
+          const code = await client.waitForExit(TIMEOUT);
+          // The exit code and stderr together, so a failure shows what the process said.
+          expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
+          expect(childOutcomes(sessionId)).toEqual(["interrupted"]);
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT * 2,
+    );
+  }
+
   test(
     "ACP cancellation ends the wait for subagent reports, and a late report follows the next prompt",
     async () => {
@@ -10887,53 +10934,6 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
-
-  // Closing stdin ends the server while a subagent is inside a shell command. The subagents stop before the
-  // executions they run commands through are torn down: torn down first, the process waited for ever on a
-  // runtime that was gone, and on macOS it sometimes aborted on the assertion that no operation is in flight.
-  for (const after of ["while the prompt runs", "after session/cancel"] as const) {
-    test(
-      `ACP closing stdin ${after} stops a subagent that runs a shell command, and the server exits`,
-      async () => {
-        const root = createIsolatedRoot("fx-acp-stdin-close-shell-");
-        const started = join(root.root, "shell-started");
-        const gateway = startDynamicFakeGateway((body) => {
-          if (!body.includes('"name":"subagent"')) return fakeShellRun("stdin_close_shell", `touch '${started}'; sleep 30`);
-          if (body.includes("stdin_close_call")) return finalText("ACP_STDIN_CLOSE_PARENT_DONE");
-          return fakeGatewayToolCall("stdin_close_call", "subagent", {
-            request: { action: "message", agent: "sheller", message: "Run the command." },
-          });
-        });
-        const childOutcomes = (sessionId: string): string[] =>
-          (logLines(root.home, sessionId) as any[]).filter((line) => line.kind === "child_finished").map((line) => line.outcome);
-        try {
-          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
-          const sessionId = await startAutoSession(client);
-          await client.request("session/set_mode", { modeId: "full-access" }, 4);
-          sendPrompt(client, 8301, "Start the subagent that runs the command.");
-          await waitForPath(started, TIMEOUT);
-          if (after === "after session/cancel") {
-            client.send({ jsonrpc: "2.0", id: 8302, method: "session/cancel", params: {} });
-            const ended = await readUntilResponses(client, [8301, 8302], TIMEOUT);
-            expect(ended.responses.get(8301).result.stopReason).toBe("cancelled");
-            // The subagent outlived the prompt and its command still runs.
-            expect(childOutcomes(sessionId)).toEqual([]);
-          }
-
-          client.endStdin();
-          const code = await client.waitForExit(TIMEOUT);
-          // The exit code and stderr together, so a failure shows what the process said.
-          expect({ code, stderr: client.stderr }).toEqual({ code: 0, stderr: "" });
-          expect(childOutcomes(sessionId)).toEqual(["interrupted"]);
-        } finally {
-          await client?.close();
-          gateway.stop();
-          rmSync(root.root, { recursive: true, force: true });
-        }
-      },
-      TIMEOUT * 2,
-    );
-  }
 
   test(
     "ACP allow-once command approval executes with shared authority",
