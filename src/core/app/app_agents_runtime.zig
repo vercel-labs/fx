@@ -95,6 +95,11 @@ pub const ChildAgent = struct {
     /// The profile it runs in, from its host's list. Empty until the list is
     /// read. Owned.
     profile: []u8 = &.{},
+    /// What it is for, from its host's saved list: one line, set when its
+    /// parent started it, which the agent list shows while it has no title
+    /// and searches. Empty until the list syncs or its first run starts, and
+    /// for a one-off. Owned.
+    purpose: []u8 = &.{},
     /// Where its current approval and question come in the order its tree's
     /// prompts were asked (`App.prompt_order`), so the instance's screen
     /// shows the oldest first. Meaningful only while that prompt is active.
@@ -768,6 +773,22 @@ fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *us
     }
 }
 
+/// What subagent `target` is for. It is empty for the first instance (null),
+/// for any other instance, and for a subagent that has none.
+fn purposeOf(target: ?*const ChildAgent) []const u8 {
+    const child = target orelse return "";
+    return if (child.agent.role == .subagent) child.purpose else "";
+}
+
+/// Whether an agent's `name`, `title`, or `purpose` has `search` in it, case
+/// aside. The list shows the purpose only where a title is missing, so a
+/// match on it can come from text the row does not show.
+fn matchesSearchText(name: []const u8, title: []const u8, purpose: []const u8, search: []const u8) bool {
+    return ascii_case.containsIgnoreCase(name, search) or
+        ascii_case.containsIgnoreCase(title, search) or
+        ascii_case.containsIgnoreCase(purpose, search);
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -1163,6 +1184,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
                     if (child.profile.len == 0) child.profile = try app.alloc.dupe(u8, entry.profile);
+                    if (child.purpose.len == 0 and entry.purpose.len > 0) child.purpose = try app.alloc.dupe(u8, entry.purpose);
                     if (child.parent_host == null) setParentHost(app, child, host);
                     try order.append(app.alloc, .{ .id = entry.id });
                 }
@@ -1267,11 +1289,11 @@ pub fn Runtime(comptime App: type) type {
             return .{ .agent = order.items[at - 1] };
         }
 
-        /// Whether agent `target`'s name or title has `search` in it, case aside.
+        /// Whether agent `target`'s name, title, or purpose has `search` in
+        /// it, case aside.
         fn matchesSearch(app: *App, target: ?*ChildAgent, search: []const u8) bool {
             var buf: [instance_name_bytes]u8 = undefined;
-            return ascii_case.containsIgnoreCase(noteName(app, target, &buf), search) or
-                ascii_case.containsIgnoreCase(targetAgent(app, target).session_title.items, search);
+            return matchesSearchText(noteName(app, target, &buf), targetAgent(app, target).session_title.items, purposeOf(target), search);
         }
 
         /// How the waiting note names agent `child`, null for the first
@@ -1742,6 +1764,7 @@ pub fn Runtime(comptime App: type) type {
                     // A search lists its matches flat, since their parents may not match.
                     .nested = if (subagent) |child| searchText(app).len == 0 and parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
+                    .purpose = purposeOf(target),
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = listedProfile(if (subagent) |child| child.profile else agent.profile.profile.name),
@@ -2653,6 +2676,9 @@ pub fn Runtime(comptime App: type) type {
             if (child.name.len == 0) if (post.turn.child_name) |name| {
                 child.name = try app.alloc.dupe(u8, name);
             };
+            if (child.purpose.len == 0) if (post.turn.child_purpose) |purpose| {
+                child.purpose = try app.alloc.dupe(u8, purpose);
+            };
             installChildRun(app, child, post.run.?);
             post.run = null;
             const start: Start = .{ .post = post, .child = child };
@@ -2929,6 +2955,7 @@ pub fn Runtime(comptime App: type) type {
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);
             if (child.profile.len > 0) app.alloc.free(child.profile);
+            if (child.purpose.len > 0) app.alloc.free(child.purpose);
             app.alloc.free(child.id);
             app.alloc.destroy(child);
         }
@@ -3261,6 +3288,7 @@ pub fn Runtime(comptime App: type) type {
                 child.screen.deinit(app.alloc);
                 if (child.name.len > 0) app.alloc.free(child.name);
                 if (child.profile.len > 0) app.alloc.free(child.profile);
+                if (child.purpose.len > 0) app.alloc.free(child.purpose);
                 app.alloc.free(child.id);
                 app.alloc.destroy(child);
             }
@@ -3610,4 +3638,28 @@ test "the newest turn's end time never falls back to an older turn" {
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, untimed }));
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{compacted}));
     try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{}));
+}
+
+test "only a subagent has a purpose to show, and the list's search reads it with the name and the title" {
+    var id = "sub".*;
+    var purpose = "You audit the zebra crossing logic.".*;
+    var subagent: ChildAgent = .{ .id = &id, .agent = .{ .role = .subagent }, .purpose = &purpose };
+    var instance: ChildAgent = .{ .id = &id, .agent = .{ .role = .instance }, .purpose = &purpose };
+    try std.testing.expectEqualStrings(&purpose, purposeOf(&subagent));
+    // The first instance, an instance, and a subagent with none have no purpose.
+    try std.testing.expectEqualStrings("", purposeOf(null));
+    try std.testing.expectEqualStrings("", purposeOf(&instance));
+    subagent.purpose = &.{};
+    try std.testing.expectEqualStrings("", purposeOf(&subagent));
+
+    const text = "You audit the zebra crossing logic.";
+    // Only the purpose holds the word, in any case, whether or not there is a title.
+    try std.testing.expect(matchesSearchText("auditor", "", text, "zebra"));
+    try std.testing.expect(matchesSearchText("auditor", "", text, "ZEBRA"));
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "zebra"));
+    // The name and the title still match, and a word none holds does not.
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "AUDITOR"));
+    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "parser"));
+    try std.testing.expect(!matchesSearchText("auditor", "Review the parser", text, "giraffe"));
+    try std.testing.expect(!matchesSearchText("auditor", "", "", "zebra"));
 }

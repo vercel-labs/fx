@@ -193,6 +193,10 @@ pub const AgentsMenuRow = struct {
     nested: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
+    /// What a subagent is for, the one line its parent started it with, which
+    /// the row shows while it has no title; empty for an instance and for a
+    /// subagent with none.
+    purpose: []const u8 = "",
     /// The agent profile it runs in, or empty for the main one, which the
     /// list leaves unnamed.
     profile: []const u8 = "",
