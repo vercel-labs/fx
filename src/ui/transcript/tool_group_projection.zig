@@ -1630,8 +1630,11 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     const record = row.detail orelse return null;
     if (!std.mem.eql(u8, record.tool_name, "read_file")) return null;
     const path = storyArgString(scratch, record, "path") orelse return try pendingPathPhrase(scratch, phrase, record);
-    if (phrase.len <= path.len or !std.mem.endsWith(u8, phrase, path)) return null;
-    const label = phrase[0 .. phrase.len - path.len];
+    // Core writes the path terminal-safe, so a control byte in it shows
+    // escaped.
+    const shown = try terminalSafeText(scratch, path);
+    if (phrase.len <= shown.len or !std.mem.endsWith(u8, phrase, shown)) return null;
+    const label = phrase[0 .. phrase.len - shown.len];
     if (label[label.len - 1] != ' ') return null;
     if (std.Io.Dir.path.basename(path).len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(scratch);
@@ -4779,6 +4782,24 @@ test "a call joins its row at once, without a row of its own first" {
         defer alloc.free(text);
         try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
     }
+}
+
+test "a read row names a file whose path core wrote escaped" {
+    const alloc = std.testing.allocator;
+    const odd = "/Users/example/fx/odd\tname.zig";
+    const status = try alloc.print("● Read {f}\n", .{text_utils.terminalSafe(odd)});
+    defer alloc.free(status);
+    const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = status, .class = .tool_status } }};
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("read_file"),
+        .activity_kind = .read,
+        .arguments_json = @constCast("{\"path\":\"/Users/example/fx/odd\\tname.zig\",\"start_line\":3,\"line_count\":4}"),
+        .outcome = .completed,
+    }};
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Read odd\\x09name.zig L3-6", std.mem.trim(u8, text, "\n"));
 }
 
 test "a group of one row that lists names is that one line" {
