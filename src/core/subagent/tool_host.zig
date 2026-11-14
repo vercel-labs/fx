@@ -1588,7 +1588,7 @@ pub const Runtime = struct {
         // lock released, and the next one waiting is tried.
         while (self.startPendingAfterTurn(child_id)) |failed| {
             defer failed.deinit(self.alloc);
-            self.deliverEnd(.{
+            _ = self.deliverEnd(.{
                 .child_id = child_id,
                 .work_id = failed.work_id,
                 .outcome = .failed,
