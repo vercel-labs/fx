@@ -1621,16 +1621,26 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
 /// An edit or write row by the file's name and its counts, such as
 /// "Edited main.zig +10/-3", in place of the whole path. The name links to
 /// the file like a read row's. A row for several changes to one file adds up
-/// their counts. Null when the phrase does not end with the path the call
-/// changed and its counts.
+/// their counts, even when core names the file another way, such as a long
+/// path cut short. Null for a row of one call whose phrase does not end with
+/// the path it changed and its counts.
 fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
     if (!entryShowsDiffStats(row.detail)) return null;
     const path = storyArgString(scratch, row.detail.?, "path") orelse return null;
+    // Core writes the path terminal-safe, so a control byte in it shows
+    // escaped.
+    const shown = try terminalSafeText(scratch, path);
     const named = if (diffStatsSuffixStart(phrase)) |at| phrase[0..at] else phrase;
-    if (named.len <= path.len or !std.mem.endsWith(u8, named, path)) return null;
-    const label = named[0 .. named.len - path.len];
-    if (label[label.len - 1] != ' ') return null;
-    const totals = if (row.identity.kind == .edit and row.count > 1) row.diff else diffTotalsOfPhrase(phrase);
+    const merged = row.identity.kind == .edit and row.count > 1;
+    const label = if (named.len > shown.len and std.mem.endsWith(u8, named, shown) and named[named.len - shown.len - 1] == ' ')
+        named[0 .. named.len - shown.len]
+    else if (merged)
+        // The row's calls are completed or running changes, whose verb is
+        // one word, such as "Edited".
+        if (findByte(named, ' ')) |space| named[0 .. space + 1] else return null
+    else
+        return null;
+    const totals = if (merged) row.diff else diffTotalsOfPhrase(phrase);
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(label);
     try writeFileName(&out.writer, path);
@@ -4330,6 +4340,46 @@ test "edit rows name the file, and changes to one file share a row" {
     const same_text = try visibleLinesForTest(alloc, same_line, 120);
     defer alloc.free(same_text);
     try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, same_text, "\n"));
+}
+
+test "an edit row adds up its counts when core names the file another way" {
+    const alloc = std.testing.allocator;
+    // A tab in the path shows escaped in core's status.
+    const odd = "/Users/example/fx/odd\tname.zig";
+    const odd_args = "{\"path\":\"/Users/example/fx/odd\\tname.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const first = try std.fmt.allocPrint(alloc, "● Edited {f} +4 / -2\n", .{text_utils.terminalSafe(odd)});
+    defer alloc.free(first);
+    const second = try std.fmt.allocPrint(alloc, "● Edited {f} +1 / -1\n", .{text_utils.terminalSafe(odd)});
+    defer alloc.free(second);
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = first, .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = second, .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(odd_args), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(odd_args), .outcome = .completed },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Edited odd\\x09name.zig +5/-3 · 2 edits", std.mem.trim(u8, text, "\n"));
+    }
+    // A status that names the file in another form still gets the row's
+    // added-up counts.
+    {
+        const args = "{\"path\":\"/Users/example/fx/src/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited …/src/main.zig +4 / -2\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited …/src/main.zig +1 / -1\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(args), .outcome = .completed },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, text, "\n"));
+    }
 }
 
 test "a denied or cancelled change keeps its own row beside the file's edits" {
