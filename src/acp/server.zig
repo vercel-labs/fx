@@ -21,6 +21,8 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
+const token_pass_check = @import("../core/app/token_pass_check.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
@@ -335,6 +337,11 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    /// Whether the credential's team has Token Pass: the check that asks.
+    token_pass_run: ?token_pass_check.Check = null,
+    /// The profile's speeds, kept while nothing chose the model, so new
+    /// sessions follow the team's start model (`token_pass.startModel`).
+    token_pass_start: ?struct { fast_mode: bool, ultrafast_mode: bool } = null,
     process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -389,6 +396,7 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
+        if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
@@ -750,6 +758,96 @@ fn closeActiveSession(state: *ServerState) !void {
     if (state.active_session == null) return;
     disableSubagentHost(state);
     destroyActiveSession(state);
+}
+
+/// The client leaves the active session for another, or closes it: its
+/// subagents stop as cancelled and owe no report, and nothing they posted for
+/// it stays for the session that follows (D41, D97; the app does the same in
+/// `stopSet`). The tree closes first, so no work the stop ends owes a report,
+/// and the host is joined before the queue is dropped, so nothing posts after
+/// it. A quit leaves reports owed and loses no queue it could keep, so it calls
+/// neither this nor `stopSubagentsForReopen`. A reload of the same session
+/// under the same `cwd` keeps what the session holds and opens nothing again,
+/// so it calls neither either. Call this before `releaseActiveSession` or
+/// `closeActiveSession`.
+pub fn stopSubagentsForSwitch(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (state.subagent_host) |host| host.closeTree();
+    disableSubagentHost(state);
+    dropQueuedMail(state, active.session_id, .all, "session_switch");
+}
+
+/// The client loads the active session again under another `cwd`: the session
+/// is released and opened again from its log. It is the same session, so its
+/// subagents stop as a quit stops them, and what they owe stays owed. The
+/// open log hands each owed report out once, as a restart's does, so the
+/// reports the host queued, before the load or while it stopped, are dropped
+/// once the host is joined, and each runs once. A message or notice a child
+/// sent is in no log, so it stays queued, in its order, and runs as a turn of
+/// the reopened session. Call this before `releaseActiveSession`.
+pub fn stopSubagentsForReopen(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    disableSubagentHost(state);
+    dropQueuedMail(state, active.session_id, .owed_reports, "session_reload");
+}
+
+/// What a drop takes of the mail `postAcpReport` queued.
+const DropScope = enum {
+    /// Every item: the session goes, and its mail with it.
+    all,
+    /// The reports the session's log still owes, those with a work id. A
+    /// message or notice, and a report with no work id, is in no log.
+    owed_reports,
+
+    fn takes(scope: DropScope, call: ?*const ReportCall) bool {
+        return switch (scope) {
+            .all => true,
+            .owed_reports => if (call) |value| value.outcome != null and value.work_id.len > 0 else false,
+        };
+    }
+};
+
+/// Drops the mail `postAcpReport` queued for `session_id` that no prompt took
+/// and `scope` names, and names each item in the trace with `reason`. A
+/// report that was owed stays owed in the session's log, which posts it again
+/// when the session opens. A message a child sent is in no log of the parent,
+/// so a drop of it leaves only the child's own log and the trace line.
+fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope, reason: []const u8) void {
+    const alloc = std.heap.c_allocator;
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    const Drop = struct {
+        state: *ServerState,
+        session_id: []const u8,
+        scope: DropScope,
+        reason: []const u8,
+
+        fn decide(self: *@This(), place: usize, queued: *const worker_runtime.QueuedPrompt) bool {
+            const call: ?*const ReportCall = if (place < self.state.report_calls.items.len) &self.state.report_calls.items[place] else null;
+            if (!self.scope.takes(call)) return false;
+            debug_trace.logf("acp", "event=subagent_mail_dropped session={s} kind={s} child={s} work={s} reason={s}", .{
+                self.session_id,
+                @tagName(queued.mail),
+                if (call) |value| value.child_id else "",
+                if (call) |value| value.work_id else "",
+                self.reason,
+            });
+            return true;
+        }
+    };
+    var drop: Drop = .{ .state = state, .session_id = session_id, .scope = scope, .reason = reason };
+    _ = state.worker.discardQueuedWhere(alloc, &drop, Drop.decide);
+    // The calls of the mail that stays keep their places, one for one.
+    var kept: usize = 0;
+    for (state.report_calls.items) |*call| {
+        if (scope.takes(call)) {
+            call.deinit(alloc);
+        } else {
+            state.report_calls.items[kept] = call.*;
+            kept += 1;
+        }
+    }
+    state.report_calls.shrinkRetainingCapacity(kept);
 }
 
 fn destroyActiveSession(state: *ServerState) void {
@@ -1484,6 +1582,7 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
 
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
+    pollTokenPass(state);
     const method = AcpMethod.parse(msg.method);
 
     if (method == .initialize) {
@@ -2815,6 +2914,58 @@ test "ordinary ACP ignores private libfx capabilities" {
     try std.testing.expectEqual(@as(usize, 0), request.host_instructions.len);
 }
 
+/// Asks whether the credential's team has Token Pass. A team with Token Pass
+/// starts new sessions on the Token Pass default when nothing chose the
+/// model. The check waits here only when fx has no saved answer, and
+/// `pollTokenPass` takes a later answer.
+fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
+    if (state.provider != .gateway) return;
+    const source = state.credential_source orelse return;
+    const api_key: ?[]const u8 = if (state.api_key.len > 0) state.api_key else null;
+    // A client that sends `initialize` again replaces the earlier check.
+    if (state.token_pass_run) |*earlier| earlier.finish(alloc, "initialize_retried");
+    state.token_pass_run = null;
+    state.token_pass_start = null;
+    const named = token_pass_check.name(alloc, source, api_key, state.account_id, state.gateway_team) orelse return;
+    state.token_pass_run = .{ .named = named, .home = state.cfg.home_override orelse io_mod.homeDir() };
+    state.token_pass_run.?.begin(
+        alloc,
+        state.cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+        .{ .credential = api_key, .credential_source = source, .tenant = state.gateway_team },
+        token_pass_check.first_prompt_wait_ms,
+    );
+    if (model_source != .compiled_default or state.process_model_override) return;
+    state.token_pass_start = .{ .fast_mode = state.fast_mode, .ultrafast_mode = state.ultrafast_mode };
+    applyTokenPassStartModel(state);
+}
+
+fn pollTokenPass(state: *ServerState) void {
+    const check = if (state.token_pass_run) |*value| value else return;
+    const before = check.has_pass;
+    if (check.lookup.task != null) check.poll(state.alloc);
+    _ = check.observeCatalog(state.alloc);
+    if (check.has_pass != before) applyTokenPassStartModel(state);
+}
+
+/// Puts new sessions on the team's start model, unless a client chose
+/// another model since. Token Pass credit pays only for standard speed.
+fn applyTokenPassStartModel(state: *ServerState) void {
+    const profile = state.token_pass_start orelse return;
+    const has_pass = if (state.token_pass_run) |check| check.has_pass else false;
+    const target = token_pass.startModelFor(state.selected_model, state.configured_model, has_pass) orelse return;
+    if (!std.mem.eql(u8, state.selected_model, target)) {
+        const owned = state.alloc.dupe(u8, target) catch |err| {
+            debug_trace.logf("token_pass", "start model not applied err={s}", .{@errorName(err)});
+            return;
+        };
+        if (state.selected_model.len > 0) state.alloc.free(state.selected_model);
+        state.selected_model = owned;
+        debug_trace.logf("token_pass", "start model={s}", .{target});
+    }
+    state.fast_mode = if (has_pass) false else profile.fast_mode;
+    state.ultrafast_mode = if (has_pass) false else profile.ultrafast_mode;
+}
+
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
         var startup = try app_lifecycle.loadLibfxStartupState(
@@ -3016,6 +3167,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
+    if (comptime !host_target.is_wasm) {
+        if (!state.cfg.minimal_kernel) startTokenPassCheck(state, alloc, startup.model_source);
+    }
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
@@ -3039,6 +3193,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .message = "Selected provider is unavailable in this host",
             });
         _ = try resolveSelectedModelCapabilities(state, startup_catalog);
+        // The catalog just loaded; its Token Pass marks can answer for the
+        // team when the credits check could not.
+        if (comptime !host_target.is_wasm) pollTokenPass(state);
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -3542,6 +3699,7 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
     }
 
     cancelAndReapActivePrompt(state);
+    stopSubagentsForSwitch(state);
     closeActiveSession(state) catch |err| {
         debug_trace.logf(
             "session",

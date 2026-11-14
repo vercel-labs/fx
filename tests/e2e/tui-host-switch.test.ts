@@ -751,6 +751,53 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // Main starts subagent `worker` under the never rule, so its completed work
+  // owes no report, and calls wait. The settle hold
+  // (src/core/subagent/end_test_controls.zig) stops fx after it has told main
+  // of the work's end and before it clears the subagent's busy flag. Main's
+  // wait starts in that gap, and fx lets the end go once its trace shows the
+  // wait began. The wait has to come back and main has to finish its turn.
+  test(
+    "a wait that starts as a subagent's work ends with nothing to report still returns",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-wait-gap-")));
+      const settleHeld = join(dir, "settle-held");
+      const settleRelease = join(dir, "settle-release");
+      const tracePath = join(dir, "fx-trace.log");
+      let waitResult = "";
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) return text("child_answer", "WAITGAP_CHILD_DONE");
+          if (body.includes('"main_wait"')) {
+            waitResult ||= toolResultText(body, "main_wait");
+            return text("main_done", "WAITGAP_MAIN_DONE");
+          }
+          if (body.includes('"main_sub"')) {
+            // The subagent's work has ended, and fx is held before it settles it.
+            await until("the held end", () => existsSync(`${settleHeld}.1`), 30_000);
+            void until("the wait to begin", () => traceHas(tracePath, "event=wait_begin"), 30_000).then(() => writeFileSync(settleRelease, ""));
+            return toolCall("main_wait", "subagent", { request: { action: "wait" } });
+          }
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "WAITGAP_TASK", report: "never" },
+          });
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("WAITGAP_MAIN_DONE", 30_000);
+          expect(waitResult).toContain("ended without a report");
+        }, () => {}, false, {
+          FX_TRACE_LOG: tracePath,
+          FX_TEST_SUBAGENT_SETTLE_HELD: settleHeld,
+          FX_TEST_SUBAGENT_SETTLE_RELEASE: settleRelease,
+        });
+      } finally {
+        writeFileSync(settleRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   // Main starts subagent `worker`, whose first turn the start hold
   // (src/core/subagent/start_test_controls.zig) stops before its worker
   // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
@@ -1611,6 +1658,57 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "asker");
         await session.waitForPane((pane) => pane.includes("SWITCH_ASKER_DONE"), 15_000);
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's stop ends a subagent's open question and the turn that asked it",
+    async () => {
+      let stopResult = "";
+      let statusAfter = "";
+      let childCalls = 0;
+      let stage = 0;
+      const promptShows = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) {
+            return toolCall("child_ask", "ask_user_question", {
+              questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
+            });
+          }
+          return text("child_after", "SWITCH_ASKER_STOPPED");
+        }
+        stage += 1;
+        if (stage === 1) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "asker", message: "SWITCH_ASK_TASK" } });
+        }
+        if (stage === 2) {
+          // Main's next step waits for the question on its screen.
+          await promptShows.promise;
+          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "asker" } });
+        }
+        if (stage === 3) stopResult = toolResultText(body, "main_stop");
+        else statusAfter = toolResultText(body, `main_status_${stage - 1}`);
+        // The subagent's turn ends a moment after the stop, so main asks
+        // again until `status` stops saying it works.
+        if (stage < 63 && (stage === 3 || statusAfter.includes("working"))) {
+          await Bun.sleep(100);
+          return toolCall(`main_status_${stage}`, "subagent", { request: { action: "status" } });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+        promptShows.release();
+        // The question leaves main's screen with the subagent's turn.
+        const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && !pane.includes("SWITCH_QUESTION pick one"), 30_000);
+        expect(main).not.toContain("asker asks");
+      });
+      expect(stopResult).toContain("Stopped asker: its turn ended");
+      expect(statusAfter).toContain("asker: idle");
+      expect(statusAfter).not.toContain("working");
     },
     TIMEOUT,
   );

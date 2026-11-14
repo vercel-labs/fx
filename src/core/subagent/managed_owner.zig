@@ -175,15 +175,20 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
-    /// `/close` closed this owner's tree: works that end from now on owe no
-    /// report, since nobody is left to take one. A quit leaves it false, so
-    /// its reports stay owed.
+    /// `/close`, or a switch to another session, closed this owner's tree:
+    /// works that end from now on owe no report, since nobody is left to take
+    /// one, and a teardown ends them cancelled. A quit leaves it false, so its
+    /// reports stay owed.
     tree_closed: bool = false,
     /// Set when fx starts to quit, so a work its quit cancels says so in
     /// its report.
     quitting: std.atomic.Value(bool) = .init(false),
     /// Told each time a work ends, set by the host.
     on_end: ?EndHook = null,
+    /// How a test stands in for the user's Esc on a child of this host, set
+    /// by the host and handed to the holds of its slots
+    /// (`end_test_controls.zig`).
+    user_stop_hook: ?end_test_controls.UserStopHook = null,
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
         for (self.feedback.items) |item| {
@@ -494,8 +499,9 @@ pub const Owner = struct {
         }
     }
 
-    /// Marks this owner's tree closed by `/close`: every work that ends
-    /// after this owes no report. Call before the tree's turns are cancelled.
+    /// Marks this owner's tree closed by `/close` or by a switch to another
+    /// session: every work that ends after this owes no report. Call before
+    /// the tree's turns are cancelled or the owner is torn down.
     pub fn closeTree(self: *Owner) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1068,24 +1074,7 @@ fn slotMain(slot: *Slot) void {
     while (true) {
         const outcome = runOne(slot);
         defer outcome.deinit(owner.alloc);
-        // A test can hold the slot here, with the turn's unread messages kept
-        // and the work not finished (src/core/subagent/end_test_controls.zig).
-        if (end_test_controls.runArmed()) {
-            const unread = blk: {
-                owner.mutex.lockUncancelable(io_mod.getIo());
-                defer owner.mutex.unlock(io_mod.getIo());
-                break :blk slot.leftovers.items.len;
-            };
-            if (unread > 0) end_test_controls.holdAfterRun(slot.child_id, unread);
-        }
-        if (end_test_controls.armed()) {
-            const stopped_by: ?[]const u8 = blk: {
-                owner.mutex.lockUncancelable(io_mod.getIo());
-                defer owner.mutex.unlock(io_mod.getIo());
-                break :blk if (slot.stopped_by_parent) "parent" else if (slot.stopped_by_user) "user" else null;
-            };
-            if (stopped_by) |by| end_test_controls.holdStoppedEnd(slot.child_id, by);
-        }
+        holdBeforeFinish(slot);
         // Startup must not inspect the old slot between saved and in-memory completion.
         // Take owner before registry, matching cancellation and approval lock ordering.
         owner.mutex.lockUncancelable(io_mod.getIo());
@@ -1112,7 +1101,7 @@ fn slotMain(slot: *Slot) void {
         }) else false;
         // A test can hold the slot here, with the next work installed and not
         // begun (src/core/subagent/end_test_controls.zig).
-        if (end_test_controls.nextArmed()) end_test_controls.holdAfterEndHook(slot.child_id, next);
+        if (end_test_controls.nextArmed()) end_test_controls.holdAfterEndHook(slot.child_id, next, owner.user_stop_hook);
         owner.mutex.lockUncancelable(io_mod.getIo());
         freeLeftovers(owner.alloc, slot);
         if (next and !closing and !owner.closed and !slot.shutdown.load(.seq_cst)) {
@@ -1130,6 +1119,31 @@ fn slotMain(slot: *Slot) void {
         owner.waiters_changed.broadcast(io_mod.getIo());
         owner.mutex.unlock(io_mod.getIo());
         return;
+    }
+}
+
+/// A test can hold the slot after its work's turn ended and before the work
+/// is finished: with the turn's unread messages kept, and then with a stop's
+/// answer given and the work still running
+/// (src/core/subagent/end_test_controls.zig). Both holds are off in a normal
+/// run.
+fn holdBeforeFinish(slot: *Slot) void {
+    const owner = slot.owner;
+    if (end_test_controls.runArmed()) {
+        const unread = blk: {
+            owner.mutex.lockUncancelable(io_mod.getIo());
+            defer owner.mutex.unlock(io_mod.getIo());
+            break :blk slot.leftovers.items.len;
+        };
+        if (unread > 0) end_test_controls.holdAfterRun(slot.child_id, unread, owner.user_stop_hook);
+    }
+    if (end_test_controls.armed()) {
+        const stopped_by: ?[]const u8 = blk: {
+            owner.mutex.lockUncancelable(io_mod.getIo());
+            defer owner.mutex.unlock(io_mod.getIo());
+            break :blk if (slot.stopped_by_parent) "parent" else if (slot.stopped_by_user) "user" else null;
+        };
+        if (stopped_by) |by| end_test_controls.holdStoppedEnd(slot.child_id, by);
     }
 }
 
@@ -1241,7 +1255,7 @@ fn runOne(slot: *Slot) OneOutcome {
         admission,
         &slot.cancel,
     ) catch |err| {
-        const outcome: child_state.Outcome = if (slot.shutdown.load(.seq_cst))
+        const outcome: child_state.Outcome = if (interruptedByTeardown(slot))
             .interrupted
         else if (slot.cancel.load(.seq_cst) or err == error.Cancelled)
             .cancelled
@@ -1256,7 +1270,7 @@ fn runOne(slot: *Slot) OneOutcome {
                 null,
         };
     };
-    if (slot.shutdown.load(.seq_cst)) return .{
+    if (interruptedByTeardown(slot)) return .{
         .work_id = work_id,
         .outcome = .interrupted,
     };
@@ -1271,6 +1285,20 @@ fn runOne(slot: *Slot) OneOutcome {
             .awaiting_approval, .paused => .interrupted,
         },
     };
+}
+
+/// Whether the owner's teardown ended `slot`'s work as a quit does:
+/// interrupted, with its report left owed. After `closeTree` the teardown
+/// ends the work cancelled instead, which owes nothing. A finish that owes
+/// nothing is saved without data, and a reopen reads an interrupted finish
+/// without data as crash repair, which owes a report
+/// (`reports.PendingFold.step`), so only a cancelled one stays quiet.
+fn interruptedByTeardown(slot: *Slot) bool {
+    if (!slot.shutdown.load(.seq_cst)) return false;
+    const owner = slot.owner;
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    defer owner.mutex.unlock(io_mod.getIo());
+    return !owner.tree_closed;
 }
 
 /// A child's saved preferences, read without opening its session. Caller
