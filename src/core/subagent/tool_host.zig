@@ -747,7 +747,7 @@ pub const Runtime = struct {
                     keep_call = true;
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
-                    const sent = sentResult(&buf, agent);
+                    const sent = sentResult(&buf, agent, self.owner_has_parent);
                     if (!ready.created) return self.encodeManaged(alloc, .{ .ok = true, .result = sent });
                     var scratch = std.heap.ArenaAllocator.init(alloc);
                     defer scratch.deinit();
@@ -4040,9 +4040,27 @@ const StartWait = struct {
 };
 const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 
-/// `message`'s answer when the child takes it now.
-fn sentResult(buf: []u8, agent: []const u8) []const u8 {
-    return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+/// `message`'s answer when the child takes it now. Main is told not to wait,
+/// since each report starts its next turn and a wait keeps the user out. A
+/// subagent's turn end sends its own report, so it may still wait for its
+/// children.
+fn sentResult(buf: []u8, agent: []const u8, owner_has_parent: bool) []const u8 {
+    if (owner_has_parent) return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+    return std.mem.print(buf, "Sent to {s}, which works on it now. Do not call wait. Do any other work you have, then end your turn with a short status. Its report starts your next turn when the work ends.", .{agent}) catch "Sent.";
+}
+
+test "a message's answer tells main not to wait and leaves a subagent free to" {
+    var buf: [sent_result_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Sent to tester, which works on it now. Do not call wait. Do any other work you have, then end your turn with a short status. Its report starts your next turn when the work ends.",
+        sentResult(&buf, "tester", false),
+    );
+    try std.testing.expectEqualStrings(
+        "Sent to tester, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.",
+        sentResult(&buf, "tester", true),
+    );
+    const longest: [domain.max_agent_name_bytes]u8 = @splat('a');
+    try std.testing.expect(std.mem.endsWith(u8, sentResult(&buf, &longest, false), "when the work ends."));
 }
 
 /// What decides whether a child is idle once its work's report goes
