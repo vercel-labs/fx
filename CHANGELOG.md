@@ -10,6 +10,7 @@
 
 - Subagents work alongside the main agent and report back when they finish.
 - Switch to any subagent to watch it, message it, or answer its prompts.
+- A parent agent hears when its subagent's command has printed nothing for 2 minutes.
 - Open the agent list with Down or Ctrl+X to see, search, switch, and close agents.
 - Each subagent has its own model, effort, Fast mode, and permission mode, and subagents can nest two levels deep.
 - The main agent sees its subagents each turn and reuses idle ones for related work.
@@ -21,6 +22,7 @@
 - Vercel Token Pass models come first in the model picker.
 - `/credits` and `fx credits` show your Token Pass credit and its reset date.
 - Token Pass sessions use Token Pass models for titles, images, and auto mode review.
+- Login offers Token Pass to teams that don't have it yet.
 - The `toolbox` tool replaces `skill`, `capability_search`, and `mcp_select_tool`, so every request sends the same tools.
 - `fx mcp call TOOL` runs an MCP tool from a shell command.
 - Custom connections can set effort levels, request fields, headers, timeouts, and a title model.
@@ -32,23 +34,32 @@
 - `fx completion bash`, `zsh`, and `fish` print a shell completion script.
 - `fx "<prompt>"` starts a session with that prompt, and `-r` is short for `--resume`.
 - `FX_HOME` moves the profile folder from `~/.fx`.
+- Ctrl+T cycles the reasoning effort.
 
 ### Improvements
 
 - Toolbox raised prompt cache reads from 61.3% to 82.0% of later input in live tests across 9 model families.
 - Built-in tool definitions are 48.0% smaller than in 0.0.16, and a new session's first request is 32.4% smaller.
 - libfx's native addons are 10.1% to 12.9% smaller than in 0.0.16.
+- The Linux arm64 and x86_64 binaries are 37.6% and 32.2% smaller than in 0.0.16.
+- libfx requests now use AI Gateway's prompt cache.
 - A shell result for a command with no output is about 70 characters instead of about 340.
 - Skill descriptions in the toolbox menu stop at 200 characters, down from 1,024.
 - Earlier turns go back to the model unchanged, so the prompt cache keeps covering them.
+- An attached file's folder rules arrive as a note, so the prompt cache keeps matching.
 - Conversations with many images drop the oldest in blocks, so the prompt cache stays valid longer.
 - Amazon Nova models now use the prompt cache.
 - Long sessions stay responsive, with the last turn of a 2,400-tool-call session taking 3 s instead of 11 s.
 - Full detail in Ctrl+O shows each model call with its model, time, tokens, and call ID.
 - `/trace` writes JSON Lines instead of a Markdown report.
+- `/trace` includes subagents and keeps failed calls whole.
 - Questions from the model render as Markdown.
 - `fx doctor` now tests your credential and connects to each approved MCP server.
 - Requests keep retrying through network drops, gateway errors, and rate limits until they succeed or you press Esc.
+- Steering moves a running shell command to the background, so your message reaches the model within about a second.
+- Cancelling a turn also stops the commands that steering moved to the background.
+- A command still running in the background shows `Still running` instead of `Ran`.
+- A waiting shell command uses under 1% of a core instead of about 3%.
 - More gateway errors are retried, including 520, 524, and 529.
 - The status line shows why a request is retrying and when it tries again.
 - fx resends a request within about a second when the Mac changes networks, instead of after 45 seconds.
@@ -62,10 +73,14 @@
 - A restarted answer replaces the broken one instead of following it.
 - A reply cut off before any text is sent again once instead of ending the turn.
 - fx asks the model to continue once when it stops without a reply.
+- After a tool call it can't read, fx tells the model and asks it again at once, with tools available.
+- A compaction the provider refuses as too long is sent again as a smaller request.
 - A command that fails again after an edit goes back to the model instead of ending the turn.
 - Shell results tell the model when a command has printed nothing for 2 minutes.
 - `edit_file` errors show the lines the model most likely meant.
 - MCP arguments sent as text go to the server as the type its schema names.
+- Tool arguments a model writes as JSON text, such as question options and toolbox runs, are read like objects.
+- libfx sends host tools the argument types their schemas name.
 - Menus and pickers match letters in order, so `/mdl` finds `/model`.
 - The model picker labels Fast models and Fast mode apart and lists newer GPT versions first.
 - Ordered lists in replies align their numbers.
@@ -77,6 +92,8 @@
 - `fx pr`, `fx issue`, and `fx acp` take the same run flags as `fx ask`.
 - fx turns off color when `NO_COLOR` is set or `TERM=dumb`.
 - The resume command prints on its own line at exit.
+- `fx sessions` and `fx sessions --live` print aligned tables.
+- fx retries a sign-out that the provider did not confirm.
 - A new libfx session skips 3 empty storage reads on its first prompt.
 - libfx starts preparing a prompt's run while the queue confirms the prompt.
 
@@ -85,7 +102,12 @@
 - Closing the window during a request no longer cancels it, so `fx -c` sends it again.
 - `fx ask` and ACP no longer wait 15 seconds for a stuck session title.
 - Esc and Ctrl-C stop a request at once during a stuck DNS lookup.
+- Cancelling a turn ends a running tty command.
+- A cancelled provider switch ends at once.
 - fx uses a login another fx just refreshed instead of asking you to sign in again.
+- Several fx processes that get a 401 together refresh a shared fx, Codex, or Grok login once.
+- A cancel no longer cuts off a sign-in refresh, so other fx processes stay signed in.
+- A new Vercel sign-in starts on the team you used before.
 - A request waiting for a sign-in resends with the team you picked.
 - Claude Fable 5.1 and later no longer reject a continued session with "Invalid signature in thinking block".
 - Starting many HTTP MCP servers no longer crashes fx.
@@ -101,9 +123,13 @@
 - Ctrl+Backspace deletes a word, and repeated Cmd+Backspace deletes across lines.
 - `/rename`, `/image`, and `/shell` picked from the slash menu wait for their argument.
 - Wide edit rows keep their `+N / -M` counts.
+- Resizing or resuming a session no longer drops turns from the screen, and long tool-heavy turns leave no blank rows in scrollback.
 - Theme switches and bracketed paste keep working after a terminal reset or Ctrl+Z.
 - Ctrl+G updates fx without moving or repeating the conversation.
 - A damaged session says it is unreadable and points to `fx doctor`.
+- New session IDs never start with a dash.
+- fx says why a terminal recording could not start.
+- libfx no longer sends the same Codex request twice.
 - `/credits` shows the AI Gateway amount used.
 - Skills load from a linked `FX_HOME`, with multi-line descriptions and nested keys.
 - fx keeps running when herdr doesn't answer.
@@ -117,7 +143,7 @@
 
 ### Security
 
-- Control codes in model replies and prompts show as text instead of acting on the terminal.
+- Control codes in model replies, prompts, and MCP tool errors show as text instead of acting on the terminal.
 - `fx logout codex` revokes the login at OpenAI.
 - Shell commands no longer inherit `web_fetch` connections.
 - `fx doctor` fix lines can't run commands from a project's `.mcp.json`.

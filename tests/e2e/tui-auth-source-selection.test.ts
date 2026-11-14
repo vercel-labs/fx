@@ -448,6 +448,13 @@ function startRequestCatcher() {
   };
 }
 
+/// Waits until the credits fake has seen `count` requests.
+async function waitForCreditsRequests(creditsGateway: { requests: unknown[] }, count: number) {
+  const deadline = Date.now() + TIMEOUT;
+  while (creditsGateway.requests.length < count && Date.now() < deadline) await Bun.sleep(25);
+  expect(creditsGateway.requests).toHaveLength(count);
+}
+
 function startFakeCreditsGateway() {
   const requests: Array<{
     method: string;
@@ -9574,11 +9581,11 @@ tmuxTest(
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
     ]);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // /credits, and the Token Pass check the renewed login starts: both
+    // with the renewed token.
+    await waitForCreditsRequests(creditsGateway, 2);
+    const renewed = { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` };
+    expect(creditsGateway.requests).toEqual([renewed, renewed]);
     await waitForModelRequestCount(gateway, 2);
     expect(gateway.modelRequests).toHaveLength(2);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
@@ -9622,11 +9629,13 @@ tmuxTest(
 
     await session.waitForText("* credits: balance=42", TIMEOUT);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(1);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // The Token Pass check at launch, with the login that was current
+    // then, and /credits with the renewed one.
+    await waitForCreditsRequests(creditsGateway, 2);
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -9739,11 +9748,16 @@ tmuxTest(
       FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
     });
     await session.waitForComposer(TIMEOUT);
+    // The Token Pass check at launch uses the login while it is current.
+    await waitForCreditsRequests(creditsGateway, 1);
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
     await session.sendText("/credits");
     await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
-    expect(creditsGateway.requests).toEqual([]);
+    // /credits sends nothing with the expired login.
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
