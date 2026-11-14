@@ -203,7 +203,8 @@ test.skipIf(!tmuxAvailable())(
     expect(fixRows[0]).toStartWith("├ Searched");
     // A read shows the file by name.
     expect(fixRows[1]).toBe("├ Read window.ts");
-    expect(fixRows[2]).toBe("├ Edited desktop/src/main.ts +1 / -1");
+    // An edit shows the file by name, with its counts.
+    expect(fixRows[2]).toBe("├ Edited main.ts +1/-1");
     expect(fixRows[3]).toBe("└ Ran sh build.sh");
     expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands · /.test(line))).toBe(true);
     expect(lines.some((line) => / tool calls? · /.test(line))).toBe(false);
