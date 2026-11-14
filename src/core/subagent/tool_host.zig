@@ -3245,6 +3245,62 @@ test "a work that ends after its tree closed owes no report and posts none" {
     try std.testing.expect(!registry.children[0].last_report_owed);
 }
 
+test "a closed tree's teardown ends a running work cancelled, so a reopen has no report to post" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    runtime.closeTree();
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    // The finish owes nothing, so it is saved without data. Only a cancelled
+    // one reads that way on reopen: an interrupted one reads as crash repair,
+    // which owes a report.
+    const lines = try parent.parent.reportLines(arena);
+    var finishes: usize = 0;
+    for (lines) |line| switch (line) {
+        .finished => |finished| {
+            finishes += 1;
+            try std.testing.expectEqual(session_adapter.ChildOutcome.cancelled, finished.outcome);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), finishes);
+    try std.testing.expectEqual(@as(usize, 0), (try reports.pendingReports(arena, lines)).len);
+}
+
+test "a quit's teardown ends a running work interrupted, and a reopen posts its report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], " interrupted fx stopped before it finished.") != null);
+    const lines = try parent.parent.reportLines(arena);
+    const pending = try reports.pendingReports(arena, lines);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(child_state.Outcome.interrupted, pending[0].outcome);
+}
+
 test "stop ends a subagent's turn without a report and drops what waits for it" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
