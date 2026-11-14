@@ -470,6 +470,35 @@ pub fn Runtime(comptime App: type) type {
             return record.phase == .terminal and record.activity_kind == .command;
         }
 
+        pub const FinishSettle = enum {
+            /// Settle the turn the pacer holds only when queued work waits behind it.
+            when_start_waits,
+            /// Settle it now, because mail is about to start a turn.
+            now,
+        };
+
+        /// Releases `agent`'s worker once the host has applied its finished
+        /// turn, run in the agent's own context. The worker holds queued work
+        /// from the turn's finish event until then, so the next turn reads the
+        /// history, and streams into the session, that the finish updates. An
+        /// open prompt pauses the pacer, which keeps the turn, so the turn is
+        /// settled here when work waits behind it, as the next turn's own
+        /// start settles it.
+        pub fn settleHeldFinish(app: *App, agent: *AppAgent, mode: FinishSettle) void {
+            if (!agent.worker.finishUnapplied()) return;
+            // The finish event waits in the queue: a later pass applies it.
+            if (agent.worker.hasPendingFinishEvent()) return;
+            if (app.pacer.holdsFinish()) {
+                if (mode == .when_start_waits and !agent.worker.startWaitsForFinish()) return;
+                app.pacer.flushPresentationAtBoundary(app.alloc, io_mod.nanoTimestamp(), app.pacerCallbacks()) catch |err| {
+                    // The turn stays with the pacer, and the worker goes on, as
+                    // it did before it waited.
+                    debug_trace.logf("session", "held finish not settled, the worker starts without it err={s}", .{@errorName(err)});
+                };
+            }
+            agent.worker.finishApplied();
+        }
+
         /// After the worker joins, persist finished turns without presenting output
         /// or admitting work. The pacer owns the finish preceding queued events.
         pub fn settleFinishedPromptsForShutdown(app: *App, agent: *AppAgent) !void {

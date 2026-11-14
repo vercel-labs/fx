@@ -657,6 +657,15 @@ pub const WorkerRuntime = struct {
     handed_off_turn_id: u64 = 0,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
+    /// Set by a host whose main loop applies each turn's finish event and
+    /// holds its presentation, before it starts the worker thread. A turn's
+    /// finish event then keeps queued work from starting until the host calls
+    /// `finishApplied`: the next turn reads the history and writes into the
+    /// session that the host updates when it applies the finish.
+    holds_start_for_finish: bool = false,
+    /// From the push of a finish event until `finishApplied`. Guarded by
+    /// `worker_mutex`; set only when `holds_start_for_finish` is.
+    finish_unapplied: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
     /// work until a fresh-session scrollback handoff succeeds or is cancelled.
     session_transition_held: bool = false,
@@ -983,6 +992,10 @@ pub const WorkerRuntime = struct {
         var tool_transition = try self.prepareActiveToolTransitionLocked(alloc, event);
         errdefer tool_transition.deinit(alloc);
         self.worker_events.appendAssumeCapacity(event);
+        if (event == .finish_prompt and self.holds_start_for_finish) {
+            self.finish_unapplied = true;
+            debug_trace.logf("worker", "start held until the host applies the finished turn", .{});
+        }
         // Logged under the lock the main loop drains with, so this line
         // always comes before the line that applies the event.
         if (self.trace_agent) |agent| {
@@ -1113,6 +1126,41 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         return self.worker_events.items.len > 0;
+    }
+
+    /// Whether a turn's finish event waits in the queue for the host.
+    pub fn hasPendingFinishEvent(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        for (self.worker_events.items) |event| {
+            if (event == .finish_prompt) return true;
+        }
+        return false;
+    }
+
+    /// Whether queued work is held back until `finishApplied`.
+    pub fn finishUnapplied(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.finish_unapplied;
+    }
+
+    /// Whether a prompt or a compaction waits to start behind the hold.
+    pub fn startWaitsForFinish(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.finish_unapplied and self.queuedWorkCountLocked() > 0;
+    }
+
+    /// The host applied every finish event and holds none of them back: queued
+    /// work may start.
+    pub fn finishApplied(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.finish_unapplied) return;
+        self.finish_unapplied = false;
+        debug_trace.logf("worker", "start released, the host applied the finished turn queued={d}", .{self.queuedWorkCountLocked()});
+        self.worker_cond.broadcast(io_mod.getIo());
     }
 
     pub fn takeEvents(self: *WorkerRuntime) std.ArrayList(WorkerEvent) {
@@ -1981,7 +2029,7 @@ pub const WorkerRuntime = struct {
         while (true) {
             // Leftover steering is not work: with only that queued, wait on.
             if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
-            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held) and
+            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held or self.finish_unapplied) and
                 !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
@@ -2000,7 +2048,7 @@ pub const WorkerRuntime = struct {
             if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
             if (!(((self.queued_prompts.items.len == 0 and
                 self.queued_context_compaction == null) or self.turn_start_held or
-                self.session_transition_held) and !self.worker_stop_requested)) break;
+                self.session_transition_held or self.finish_unapplied) and !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
             self.tool_phase_step_id = null;
@@ -2050,7 +2098,7 @@ pub const WorkerRuntime = struct {
         if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
         if (self.queued_prompts.items.len == 0 or
             self.turn_start_held or self.session_transition_held or
-            self.worker_stop_requested)
+            self.finish_unapplied or self.worker_stop_requested)
         {
             return null;
         }
@@ -2063,7 +2111,8 @@ pub const WorkerRuntime = struct {
         if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
-            self.session_transition_held or self.worker_stop_requested)
+            self.session_transition_held or self.finish_unapplied or
+            self.worker_stop_requested)
         {
             return null;
         }
@@ -7309,6 +7358,115 @@ test "turn start hold rejects busy worker and blocks take while held" {
     const job = state.job.?;
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("held blocked prompt", job.prompt);
+}
+
+fn pushFinishedTurn(runtime: *WorkerRuntime, alloc: std.mem.Allocator, prompt: []const u8) !void {
+    try runtime.pushEvent(alloc, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast(prompt), .images = &.{} },
+        .assistant = @constCast("done"),
+    } } } });
+}
+
+test "a finished turn holds queued work until the host applies it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{ .holds_start_for_finish = true };
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, first);
+    // Queued while the first turn runs, it starts the moment that turn ends.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    try pushFinishedTurn(&runtime, alloc, "first");
+    runtime.finishProcessing();
+
+    try std.testing.expect(runtime.finishUnapplied());
+    try std.testing.expect(runtime.hasPendingFinishEvent());
+    try std.testing.expect(runtime.startWaitsForFinish());
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+
+    // The host takes the finish event, and the turn is still not settled.
+    var events = runtime.takeEvents();
+    freeEventList(alloc, &events);
+    try std.testing.expect(!runtime.hasPendingFinishEvent());
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+
+    runtime.finishApplied();
+    try std.testing.expect(!runtime.finishUnapplied());
+    try std.testing.expect(!runtime.startWaitsForFinish());
+    const second = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, second);
+    try std.testing.expectEqualStrings("second", second.prompt);
+}
+
+test "a finished turn holds a queued compaction until the host applies it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{ .holds_start_for_finish = true };
+    defer runtime.deinit(alloc);
+
+    try pushFinishedTurn(&runtime, alloc, "first");
+    runtime.queued_context_compaction = .{
+        .turn_id = 77,
+        .model = try alloc.dupe(u8, "model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+    };
+    try std.testing.expect(runtime.startWaitsForFinish());
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+
+    runtime.finishApplied();
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expect(work == .compact_context);
+}
+
+test "a worker that does not hold its start for a finish starts queued work at once" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, first);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    try pushFinishedTurn(&runtime, alloc, "first");
+    runtime.finishProcessing();
+
+    try std.testing.expect(!runtime.finishUnapplied());
+    const second = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, second);
+    try std.testing.expectEqualStrings("second", second.prompt);
+    var events = runtime.takeEvents();
+    freeEventList(alloc, &events);
+}
+
+test "finishApplied wakes a worker that waits for queued work held behind a finish" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{ .holds_start_for_finish = true };
+    defer runtime.deinit(alloc);
+
+    try pushFinishedTurn(&runtime, alloc, "first");
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "waits for the host", "model"));
+    var state = PromptTakeThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPromptTake, .{ &state, &runtime });
+    var joined = false;
+    defer if (!joined) {
+        runtime.finishApplied();
+        runtime.requestStop();
+        thread.join();
+        if (state.job) |job| freeQueuedPrompt(alloc, job);
+    };
+
+    runtime.finishApplied();
+    thread.join();
+    joined = true;
+    try std.testing.expect(state.err == null);
+    const job = state.job.?;
+    defer freeQueuedPrompt(alloc, job);
+    try std.testing.expectEqualStrings("waits for the host", job.prompt);
+    var events = runtime.takeEvents();
+    freeEventList(alloc, &events);
 }
 
 test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next prompt" {

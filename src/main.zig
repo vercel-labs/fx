@@ -2149,6 +2149,7 @@ const App = struct {
     /// `reserveMessagePlace` held for it.
     pub fn postAgentMessage(self: *App, agent: *agents.Agent, text: []const u8, author: types.MessageAuthor, mail: agent_frame.MailKind) !void {
         std.debug.assert(author != .user);
+        AgentsAppRuntime.settleBeforeMail(self, agent, tickAgentInContext);
         // Until the worker takes it, a message still holds its place.
         var place_held = mail == .message;
         defer if (place_held) agent.worker.releaseAgentMessage();
@@ -3633,6 +3634,7 @@ const App = struct {
         } else {
             self.pacer.pause(now_ns);
         }
+        WorkerAppRuntime.settleHeldFinish(self, agent, .when_start_waits);
     }
 
     pub fn loopCommitFrame(ctx: *anyopaque) !void {
@@ -6991,6 +6993,83 @@ test "a report reaches the agent that owns its host as its subagent's message" {
     // A subagent's turn keeps its run's root request.
     try std.testing.expectEqualStrings("ROOT_REQUEST", queued.root_user_intent_context);
     try std.testing.expect(queued.delivery == .continuation);
+}
+
+fn testFinishedTurn(prompt: []const u8, answer: []const u8) worker_runtime.WorkerEvent {
+    return .{ .finish_prompt = .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast(prompt), .images = &.{} },
+            .assistant = @constCast(answer),
+        } },
+        .summary = .{ .thinking_duration_ms = 1, .turn_duration_ms = 2, .token_progress = .{ .output_tokens = 3 } },
+        .terminal_outcome = .completed,
+    } };
+}
+
+test "mail posted to an agent whose finished turn is not applied yet is queued with that turn in its history" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
+
+    // The worker finished the turn and queued its event, which the loop has
+    // not taken yet.
+    try child.agent.worker.pushEvent(std.heap.c_allocator, testFinishedTurn("earlier prompt", "earlier answer"));
+    try std.testing.expectEqual(@as(usize, 0), child.agent.session.agent.history.items.len);
+
+    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
+
+    // The report's turn starts from the history that holds the finished turn.
+    try std.testing.expectEqual(@as(usize, 1), child.agent.session.agent.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queued_history.len);
+    try std.testing.expectEqualStrings("earlier answer", child.agent.worker.queued_history[0].assistant.assistant);
+}
+
+test "mail posted to an agent whose pacer holds its finished turn settles that turn first" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
+    child.agent.worker.holds_start_for_finish = true;
+
+    // The finished turn's last line is still pending in the agent's pacer, and
+    // an open prompt would keep the pacer from ticking.
+    try child.screen.pacer.enqueue(alloc, "last line, no newline");
+    try child.agent.worker.pushEvent(std.heap.c_allocator, testFinishedTurn("earlier prompt", "earlier answer"));
+    const Apply = struct {
+        fn run(_: void, a: *App, agent: *agents.Agent) anyerror!void {
+            try App.WorkerAppRuntime.tick(a, agent, app_callbacks.Bindings(App).workerEventHandlers(agent));
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, {}, Apply.run);
+    try std.testing.expect(child.screen.pacer.holdsFinish());
+    try std.testing.expect(child.agent.worker.finishUnapplied());
+    try std.testing.expectEqual(@as(usize, 0), child.agent.session.agent.history.items.len);
+
+    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
+
+    try std.testing.expect(!child.screen.pacer.holdsFinish());
+    try std.testing.expect(!child.agent.worker.finishUnapplied());
+    try std.testing.expectEqual(@as(usize, 1), child.agent.session.agent.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queued_history.len);
 }
 
 test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {

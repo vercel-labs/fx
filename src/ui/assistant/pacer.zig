@@ -182,6 +182,12 @@ pub const AssistantPacer = struct {
         self.deferred_started_ns = null;
     }
 
+    /// Whether a finished turn waits here for its presentation: its history
+    /// and session commit wait with it.
+    pub fn holdsFinish(self: *const AssistantPacer) bool {
+        return self.deferred_turn != null;
+    }
+
     pub fn hasPending(self: *const AssistantPacer) bool {
         return self.pending.items.len > 0 or self.deferred_turn != null or self.held_calls.items.len > 0;
     }
@@ -638,6 +644,28 @@ test "deferFinish returns false when buffer empty" {
     const deferred = try pacer.deferFinish(alloc, .{ .turn = turn });
     try std.testing.expect(!deferred);
     try std.testing.expect(pacer.deferred_turn == null);
+}
+
+test "a finish is held only while text is pending, and a boundary flush settles it" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    const turn = try makeAssistantTurn(alloc);
+    defer types.freeHistoryTurn(alloc, turn);
+
+    try std.testing.expect(!try pacer.deferFinish(alloc, .{ .turn = turn }));
+    try std.testing.expect(!pacer.holdsFinish());
+
+    try pacer.enqueue(alloc, "last line, no newline");
+    try std.testing.expect(try pacer.deferFinish(alloc, .{ .turn = turn }));
+    try std.testing.expect(pacer.holdsFinish());
+
+    try pacer.flushPresentationAtBoundary(alloc, 0, cap.callbacks());
+    try std.testing.expect(!pacer.holdsFinish());
+    try std.testing.expect(!pacer.hasPending());
 }
 
 test "presentation boundary neutralizes only the incomplete ANSI or UTF-8 tail" {

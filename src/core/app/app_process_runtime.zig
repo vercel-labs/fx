@@ -37,6 +37,7 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         pub fn startWorkerThread(app: *App, agent: *AppAgent) !void {
+            agent.worker.holds_start_for_finish = true;
             agent.worker_thread = try std.Thread.spawn(.{}, workerThreadMain, .{app});
         }
 
@@ -45,6 +46,7 @@ pub fn Runtime(comptime App: type) type {
         /// threads, so it hosts only its first agent.
         pub fn startAgentWorkerThread(app: *App, agent: *agents.Agent) !void {
             if (comptime cooperativeHost(App)) return error.AgentThreadsUnavailable;
+            agent.worker.holds_start_for_finish = true;
             agent.worker_thread = try std.Thread.spawn(.{}, agentWorkerThreadMain, .{ app, agent });
         }
 

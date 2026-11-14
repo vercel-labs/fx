@@ -130,7 +130,7 @@ pub const ChildAgent = struct {
     /// pace out in `pacer`, the pacer that holds its text: its own slot's
     /// while it is hidden, the app's while it is on screen (`pacerOf`).
     fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
-        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending() or self.agent.worker.finishUnapplied();
     }
 };
 
@@ -795,6 +795,31 @@ pub fn Runtime(comptime App: type) type {
             try body(context, app, agent);
         }
 
+        /// Brings `agent` up to date before mail is posted to it, in the
+        /// agent's own context: its worker's events are applied and the
+        /// finished turn its pacer holds is settled. The mail's prompt takes
+        /// the history the agent has when the mail is posted, so mail posted
+        /// earlier starts a turn that lacks the finished turn.
+        pub fn settleBeforeMail(
+            app: *App,
+            agent: *AppAgent,
+            comptime tick: fn (void, *App, *agents.Agent) anyerror!void,
+        ) void {
+            const Settle = struct {
+                fn run(_: void, a: *App, target: *agents.Agent) anyerror!void {
+                    try tick({}, a, target);
+                    app_worker_runtime.Runtime(App).settleHeldFinish(a, target, .now);
+                }
+            };
+            const outcome = if (agent == app.screenAgent())
+                Settle.run({}, app, agent)
+            else if (hostedOf(app, agent)) |child|
+                visit(app, child, {}, Settle.run)
+            else
+                visitScreen(app, agent, &app.main_screen, {}, Settle.run);
+            outcome catch |err| debug_trace.logf("session", "agent not settled before mail err={s}", .{@errorName(err)});
+        }
+
         /// True when the hidden `child` has events for the loop to handle or
         /// assistant text left to pace out.
         pub fn hasPendingWork(child: *ChildAgent) bool {
@@ -812,7 +837,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             if (app.agent_on_screen != null and
                 (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
-                    approvalOutOfDate(&app.main_agent, false)))
+                    app.main_agent.worker.finishUnapplied() or approvalOutOfDate(&app.main_agent, false)))
             {
                 try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }
