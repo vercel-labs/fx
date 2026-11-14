@@ -8622,6 +8622,19 @@ fn runMcpElicitationRequest(state: *QuestionThreadState, runtime: *WorkerRuntime
     };
 }
 
+/// Who asks the user a question: the agent's own question tool, an MCP
+/// server's elicitation, or the picker a failed request opens.
+const QuestionAsker = enum { agent, mcp_server, failed_request };
+
+/// Starts the thread that puts `entries` to the user the way `asker` does.
+fn startQuestionAsker(asker: QuestionAsker, state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) !std.Thread {
+    return switch (asker) {
+        .agent => std.Thread.spawn(.{}, runQuestionRequest, .{ state, runtime, entries }),
+        .mcp_server => std.Thread.spawn(.{}, runMcpElicitationRequest, .{ state, runtime, entries }),
+        .failed_request => std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ state, runtime, entries }),
+    };
+}
+
 test "a turn that waits for a permission answer says so until the wait ends, however it ends" {
     const alloc = std.testing.allocator;
     const Ends = enum { allowed, denied, approval_cancelled, turn_cancelled, stopped };
@@ -8675,15 +8688,11 @@ test "an MCP server's question and the out-of-credits picker are waits for the u
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
-    const Asker = enum { mcp_server, out_of_credits };
-    for (std.enums.values(Asker)) |asker| {
+    for ([_]QuestionAsker{ .mcp_server, .failed_request }) |asker| {
         var runtime = WorkerRuntime{};
         defer runtime.deinit(alloc);
         var state = QuestionThreadState{};
-        const thread = switch (asker) {
-            .mcp_server => try std.Thread.spawn(.{}, runMcpElicitationRequest, .{ &state, &runtime, &entries }),
-            .out_of_credits => try std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ &state, &runtime, &entries }),
-        };
+        const thread = try startQuestionAsker(asker, &state, &runtime, &entries);
         var snapshot = try waitForQuestionSnapshot(&runtime);
         snapshot.deinit(alloc);
         try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .question), runtime.userWait());
@@ -8721,16 +8730,11 @@ test "cancelling a turn ends the question it waits on, whoever asked it" {
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
-    const Asker = enum { agent, mcp_server, failed_request };
-    for (std.enums.values(Asker)) |asker| {
+    for (std.enums.values(QuestionAsker)) |asker| {
         var runtime = WorkerRuntime{};
         defer runtime.deinit(alloc);
         var state = QuestionThreadState{};
-        const thread = switch (asker) {
-            .agent => try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries }),
-            .mcp_server => try std.Thread.spawn(.{}, runMcpElicitationRequest, .{ &state, &runtime, &entries }),
-            .failed_request => try std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ &state, &runtime, &entries }),
-        };
+        const thread = try startQuestionAsker(asker, &state, &runtime, &entries);
         var snapshot = try waitForQuestionSnapshot(&runtime);
         snapshot.deinit(alloc);
         runtime.requestTurnCancel();

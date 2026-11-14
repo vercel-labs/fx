@@ -1612,12 +1612,12 @@ pub const Runtime = struct {
         return names.items;
     }
 
-    /// What a subagent is doing, as `status` says it.
     /// How long a team note is good for. A `kept` note is built for one turn of
     /// the owner and returned for the rest of it; a `fresh` one is built for
     /// each request.
     const NoteKind = enum { kept, fresh };
 
+    /// What a subagent is doing, as `status` says it.
     const ChildState = enum {
         awaiting_approval,
         awaiting_answer,
@@ -1637,16 +1637,18 @@ pub const Runtime = struct {
             };
         }
 
-        /// The state as a row of the team note says it. The owner hears of
-        /// every other change of a row's state by itself: a work's end as a
-        /// report, a start as its own call's result. The end of a wait tells it
-        /// nothing, so a row of a kept note says when the wait was true.
+        /// The state as a row of the team note says it. Neither the start nor
+        /// the end of an approval or question wait reaches the owner during
+        /// its turn, so a kept note shows each row as it was when the turn
+        /// started. Only a waiting row says so: it is the row the owner could
+        /// act on wrongly, by asking the user to answer a prompt already
+        /// answered. A row that reads working after a wait began is as on
+        /// main, and `status` shows the wait.
         fn noteLabel(self: ChildState, kind: NoteKind) []const u8 {
             return switch (kind) {
                 .fresh => self.label(),
                 .kept => switch (self) {
-                    .awaiting_approval => "waiting for an approval when this turn started",
-                    .awaiting_answer => "waiting for the user's answer when this turn started",
+                    inline .awaiting_approval, .awaiting_answer => |state| comptime state.label() ++ " when this turn started",
                     .working, .interrupted, .finished, .idle => self.label(),
                 },
             };
@@ -1733,10 +1735,10 @@ pub const Runtime = struct {
     /// (`src/core/agent/runtime/runtime_context.zig`); a report or a new
     /// start tells the owner of a change within the turn. A row of the kept
     /// note that waits for the user says so "when this turn started", since
-    /// the end of a wait tells the owner nothing (`ChildState.noteLabel`). A
-    /// `turn_id` of 0, as in ACP, whose turns have no id here, builds it
-    /// afresh each time, and its rows say no more than `status` does. The
-    /// note is in `alloc`.
+    /// neither the start nor the end of a wait tells the owner
+    /// (`ChildState.noteLabel`). A `turn_id` of 0, as in ACP, whose turns
+    /// have no id here, builds it afresh each time, and its rows say no more
+    /// than `status` does. The note is in `alloc`.
     pub fn teamNote(self: *Runtime, alloc: Allocator, turn_id: u64) Allocator.Error!?[]u8 {
         if (turn_id != 0) {
             self.team_mutex.lockUncancelable(io_mod.getIo());
