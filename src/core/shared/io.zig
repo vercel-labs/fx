@@ -922,7 +922,24 @@ pub fn durableReplaceVerifiedWithOps(
     ops.sync_dir(ops.ctx, dir.dir) catch return error.DurableReplacePostRenameFailed;
 }
 
-fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File {
+/// What an existing lock file's mode must be. A missing one is always
+/// created private.
+const LockFileMode = enum {
+    /// 0600, as fx makes every lock file.
+    private,
+    /// Writable by its owner only, readable by anyone: a lock an older fx
+    /// release left readable by others.
+    owner_writable,
+};
+
+/// A regular file only its owner can write, though others may read it.
+fn verifyOwnerWritableRegularFile(file: std.Io.File) !void {
+    const stat = try file.stat(getIo());
+    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (stat.permissions.toMode() & 0o022 != 0) return error.PrivateStatePermissionsUnsupported;
+}
+
+fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8, existing: LockFileMode) !std.Io.File {
     try validateRelativeLeaf(name);
     const zio = getIo();
 
@@ -962,7 +979,10 @@ fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File
         else => return err,
     };
     errdefer file.close(zio);
-    try verifyPrivateRegularFile(file);
+    switch (existing) {
+        .private => try verifyPrivateRegularFile(file),
+        .owner_writable => try verifyOwnerWritableRegularFile(file),
+    }
     return file;
 }
 
@@ -972,6 +992,18 @@ pub fn acquireTimedAdvisoryLock(
     deadline_ms: u64,
 ) !TimedAdvisoryLock {
     return acquireTimedAdvisoryLockControlled(dir, name, deadline_ms, null, .{});
+}
+
+/// `acquireTimedAdvisoryLock` on a lock file an older fx release made,
+/// which may be readable by others, as such a release left its session
+/// folders (D61 in `tests/tla/session_manager/system-design.md`). The file
+/// keeps its mode; one others can write is refused.
+pub fn acquireTimedAdvisoryLockOnOlderFile(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+) !TimedAdvisoryLock {
+    return acquireTimedAdvisoryLockFile(dir, name, deadline_ms, null, .{}, .owner_writable);
 }
 
 pub fn acquireTimedAdvisoryLockWithOps(
@@ -1021,7 +1053,18 @@ fn acquireTimedAdvisoryLockControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
     ops: LockOps,
 ) !TimedAdvisoryLock {
-    const file = try openOrCreatePrivateLockFile(dir, name);
+    return acquireTimedAdvisoryLockFile(dir, name, deadline_ms, cancel_flag, ops, .private);
+}
+
+fn acquireTimedAdvisoryLockFile(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    ops: LockOps,
+    existing: LockFileMode,
+) !TimedAdvisoryLock {
+    const file = try openOrCreatePrivateLockFile(dir, name, existing);
     errdefer file.close(getIo());
 
     const started = ops.now_ms(ops.ctx);
@@ -1887,6 +1930,36 @@ test "a folder that need not be private opens whatever its mode, but never throu
         return err;
     };
     try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "link"));
+}
+
+test "a lock on an older release's file takes one others can read, keeps its mode, and refuses one others can write" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "readable.lock", .data = "" });
+    var readable = try tmp.dir.openFile(getIo(), "readable.lock", .{});
+    try readable.setPermissions(getIo(), .fromMode(0o644));
+    readable.close(getIo());
+    // The private lock refuses it, as before.
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, acquireTimedAdvisoryLock(&dir, "readable.lock", 0));
+    var lock = try acquireTimedAdvisoryLockOnOlderFile(&dir, "readable.lock", 0);
+    lock.release();
+    const kept = try tmp.dir.statFile(getIo(), "readable.lock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(kept.permissions.toMode() & 0o777)));
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "shared.lock", .data = "" });
+    var shared = try tmp.dir.openFile(getIo(), "shared.lock", .{});
+    try shared.setPermissions(getIo(), .fromMode(0o666));
+    shared.close(getIo());
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, acquireTimedAdvisoryLockOnOlderFile(&dir, "shared.lock", 0));
+
+    // A missing one is made private.
+    var made = try acquireTimedAdvisoryLockOnOlderFile(&dir, "new.lock", 0);
+    made.release();
+    const created = try tmp.dir.statFile(getIo(), "new.lock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(created.permissions.toMode() & 0o777)));
 }
 
 test "timed advisory lock returns busy after deadline" {

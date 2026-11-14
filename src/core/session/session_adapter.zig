@@ -445,7 +445,8 @@ pub fn commandError(err: anyerror) CommandError {
         error.SessionRecoveryNotNeeded => error.SessionRecoveryNotNeeded,
         error.SessionRecoveryBoundaryInvalid, error.SessionRecoveryRequiresCurrentSchema => error.SessionRecoveryBoundaryInvalid,
         error.SessionRecoveryUnsupportedSchema => error.UnsupportedSessionSchema,
-        error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
+        // A v1 file others can write, say: unsafe, not damaged.
+        error.DurablePathUnsafe, error.SessionPathUnsafe, error.PrivateStatePermissionsUnsupported => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig => blk: {
@@ -9343,6 +9344,25 @@ const V1Home = struct {
         try (if (target) |value| value.dir else dir.dir).writeFile(io_mod.getIo(), .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
     }
 
+    /// Makes `ids`' v1 folders readable by others, as an old release left
+    /// them (D61): every folder 0755 and every file 0644, lock files too.
+    fn readableByOthers(v1: *V1Home, ids: []const []const u8) !void {
+        const io = io_mod.getIo();
+        const a = v1.arena.allocator();
+        for (ids) |id| {
+            var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
+            defer dir.close(io);
+            dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+            var walker = try dir.walk(a);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| switch (entry.kind) {
+                .directory => try dir.setFilePermissions(io, entry.path, .fromMode(0o755), .{}),
+                .file => try dir.setFilePermissions(io, entry.path, .fromMode(0o644), .{}),
+                else => {},
+            };
+        }
+    }
+
     /// v1's `session.json` of `id`. The arena's.
     fn metadata(v1: *V1Home, id: []const u8) !std.json.ObjectMap {
         const a = v1.arena.allocator();
@@ -9871,6 +9891,61 @@ test "recover salvages a damaged v1 session into a fresh v2 root and leaves its 
     const whole = (try v1.fixture("plain", 1))[0];
     try testing.expectError(error.SessionRecoveryNotNeeded, recover(&t.store, alloc, whole));
     try testing.expectError(error.SessionNotFound, recover(&t.store, alloc, "v1-none"));
+}
+
+test "recover on a v1 session an old fx left readable by others answers that none is needed, salvages a damaged one, and both convert (D61, D64)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // A family: its root's `subagent` folder and every member's lock file
+    // are readable by others too.
+    const family = try v1.fixture("family", 3);
+    try v1.readableByOthers(family);
+    try testing.expectError(error.SessionRecoveryNotNeeded, recover(&t.store, alloc, family[0]));
+
+    // Two turns, then a torn line.
+    const torn = (try v1.fixture("cancelled", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put(torn, null, "events.jsonl", damaged);
+    try v1.readableByOthers(&.{torn});
+    var recovered = try recover(&t.store, alloc, torn);
+    defer recovered.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), recovered.history_len);
+    const after = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(after);
+    try testing.expectEqualStrings(damaged, after);
+    // The lock file keeps the mode it had.
+    const lock = try t.tmp.dir.statFile(io_mod.getIo(), try v1.sessionPath(torn, "session.lock"), .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(lock.permissions.toMode() & 0o777)));
+
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    var copy = try t.store.manager.peek(alloc, family[0]);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(sm.Role.root, copy.role);
+}
+
+test "recover on a v1 session whose lock file others can write says its storage is unsafe, not that it is corrupt" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("plain", 1))[0];
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "session.lock"), .fromMode(0o666), .{});
+    const err = if (recover(&t.store, alloc, id)) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
 }
 
 test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
