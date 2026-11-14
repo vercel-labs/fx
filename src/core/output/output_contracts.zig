@@ -2135,33 +2135,27 @@ pub const DoctorSnapshot = struct {
         try w.writeAll("\n\n");
 
         try writeDoctorField(w, alloc, "Workspace", self.workspace_root, style.columns);
-        try writeDoctorFieldLabel(w, "Model");
-        try writeTerminalSafe(w, alloc, self.model);
-        if (self.provider != .gateway) {
-            try w.writeAll(" via ");
-            try writeTerminalSafe(w, alloc, providerDisplayName(&self.provider));
-        }
-        try w.writeByte('\n');
-        try writeDoctorFieldLabel(w, "Auth");
-        try writeTerminalSafe(w, alloc, self.auth.activeSourceLabel());
-        if (self.auth.team) |team| {
-            try w.writeAll(" \u{00b7} team ");
-            try writeTerminalSafe(w, alloc, team);
-        }
-        if (self.auth.expired) try w.writeAll(" \u{00b7} expired");
-        try w.writeByte('\n');
+        // Each value is built whole first, so it wraps as one.
+        var value: std.Io.Writer.Allocating = .init(alloc);
+        defer value.deinit();
+        const v = &value.writer;
+        try v.writeAll(self.model);
+        if (self.provider != .gateway) try v.print(" via {s}", .{providerDisplayName(&self.provider)});
+        try writeDoctorField(w, alloc, "Model", value.written(), style.columns);
+        value.clearRetainingCapacity();
+        try v.writeAll(self.auth.activeSourceLabel());
+        if (self.auth.team) |team| try v.print(" \u{00b7} team {s}", .{team});
+        if (self.auth.expired) try v.writeAll(" \u{00b7} expired");
+        try writeDoctorField(w, alloc, "Auth", value.written(), style.columns);
         try writeDoctorField(w, alloc, "Permissions", permissions.permissionModeDisplayLabel(self.permission_mode), style.columns);
         try writeDoctorFieldLabel(w, "Step limit");
         if (self.agent_step_limit == 0) try w.writeAll("none\n") else try w.print("{d}\n", .{self.agent_step_limit});
         if (self.mcp) |mcp| {
-            try writeDoctorFieldLabel(w, "MCP");
-            try w.print("{d} server{s}", .{ mcp.servers.len, if (mcp.servers.len == 1) "" else "s" });
-            if (mcp.configuration_issues.len > 0) try w.print(" \u{00b7} {d} config issue{s}", .{ mcp.configuration_issues.len, if (mcp.configuration_issues.len == 1) "" else "s" });
-            if (mcp.inspection_error) |error_name| {
-                try w.writeAll(" \u{00b7} could not be read: ");
-                try writeTerminalSafe(w, alloc, error_name);
-            }
-            try w.writeByte('\n');
+            value.clearRetainingCapacity();
+            try v.print("{d} server{s}", .{ mcp.servers.len, if (mcp.servers.len == 1) "" else "s" });
+            if (mcp.configuration_issues.len > 0) try v.print(" \u{00b7} {d} config issue{s}", .{ mcp.configuration_issues.len, if (mcp.configuration_issues.len == 1) "" else "s" });
+            if (mcp.inspection_error) |error_name| try v.print(" \u{00b7} could not be read: {s}", .{error_name});
+            try writeDoctorField(w, alloc, "MCP", value.written(), style.columns);
         }
 
         for (std.enums.values(DoctorGroup)) |group| {
@@ -2682,51 +2676,27 @@ const doctor_fix_column = doctor_detail_column + "fix: ".len;
 const doctor_min_wrap_width = 20;
 
 /// Writes `raw` made terminal-safe, starting at column `indent`. With a
-/// known `columns`, it breaks at spaces before the edge and starts each next
-/// line at `indent`; a word wider than a whole line is broken where the edge
-/// falls.
+/// known `columns`, it breaks at the last space that fits before the edge
+/// and starts each next line at `indent`; a word wider than a whole line
+/// breaks at the edge, between whole characters, emoji sequences included.
 fn writeDoctorWrapped(w: *std.Io.Writer, alloc: Allocator, raw: []const u8, indent: usize, columns: ?usize) !void {
     const width = columns orelse return writeTerminalSafe(w, alloc, raw);
     if (width < indent + doctor_min_wrap_width) return writeTerminalSafe(w, alloc, raw);
     var encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
     defer encoded.deinit(alloc);
-    var col = indent;
+    var rest = display_width.trimBreakWhitespace(encoded.bytes);
     var first = true;
-    var words = std.mem.splitScalar(u8, encoded.bytes, ' ');
-    while (words.next()) |word| {
-        if (word.len == 0) continue;
-        const word_width = display_width.visibleWidth(word);
+    while (rest.len > 0) {
+        var line = display_width.wrapCutIgnoringAnsi(rest, width - indent);
+        // A single character wider than the line still takes one line.
+        if (line.len == 0) line = rest[0..display_width.displayUnitAt(rest, 0).byte_len];
         if (!first) {
-            if (col + 1 + word_width > width) {
-                try w.writeByte('\n');
-                try w.splatByteAll(' ', indent);
-                col = indent;
-            } else {
-                try w.writeByte(' ');
-                col += 1;
-            }
+            try w.writeByte('\n');
+            try w.splatByteAll(' ', indent);
         }
+        try w.writeAll(std.mem.trimEnd(u8, line, " \t"));
+        rest = display_width.trimBreakWhitespace(rest[line.len..]);
         first = false;
-        if (col + word_width <= width) {
-            try w.writeAll(word);
-            col += word_width;
-            continue;
-        }
-        // Wider than what is left of a whole line: break it at the edge.
-        var rest = word;
-        while (rest.len > 0) {
-            const len = std.unicode.utf8ByteSequenceLength(rest[0]) catch 1;
-            const unit = rest[0..@min(len, rest.len)];
-            const unit_width = display_width.visibleWidth(unit);
-            if (col + unit_width > width and col > indent) {
-                try w.writeByte('\n');
-                try w.splatByteAll(' ', indent);
-                col = indent;
-            }
-            try w.writeAll(unit);
-            col += unit_width;
-            rest = rest[unit.len..];
-        }
     }
 }
 
@@ -4013,6 +3983,37 @@ test "doctor text wraps long values, details, and fixes under their own columns 
     const piped = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(piped);
     try std.testing.expect(std.mem.find(u8, piped, "  ! install    another fx at /usr/local/bin/fx is on PATH; a shell may run it instead\n") != null);
+
+    // Too narrow to leave 20 columns for the text: written whole.
+    const narrow = try snapshot.renderTextStyled(std.testing.allocator, .{ .columns = 30 });
+    defer std.testing.allocator.free(narrow);
+    try std.testing.expectEqualStrings(piped, narrow);
+}
+
+test "doctor text wraps every header value, and breaks a long word between whole emoji" {
+    const smile = "\u{1F600}";
+    // 18 two-column emoji in one word: 36 columns, more than the 35 left
+    // after the 15-column indent at a width of 50.
+    const emoji_word = text_utils.repeat(smile, 18);
+    const checks = [_]doctor_runtime.Check{.{ .name = "skills", .status = .warn, .detail = emoji_word, .fix = "rename it" }};
+    const snapshot = DoctorSnapshot{
+        .workspace_root = "/tmp/fx",
+        .model = "example/a-model-with-a-long-name and-more-words-after-it",
+        .auth = .{ .active_source = .ai_gateway_api_key, .team = "a-team-with-a-long-name-too" },
+        .permission_mode = .ask,
+        .agent_step_limit = 0,
+        .checks = &checks,
+    };
+    const text = try snapshot.renderTextStyled(std.testing.allocator, .{ .columns = 50 });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "  Model        example/a-model-with-a-long-name\n" ++
+        "               and-more-words-after-it\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "  Auth         AI_GATEWAY_API_KEY \u{00b7} team\n" ++
+        "               a-team-with-a-long-name-too\n") != null);
+    // 17 emoji fill 34 columns; the 18th would cross the edge.
+    try std.testing.expect(std.mem.find(u8, text, "  ! skills     " ++ text_utils.repeat(smile, 17) ++ "\n               " ++ smile ++ "\n") != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try std.testing.expect(display_width.visibleWidth(line) <= 50);
 }
 
 test "doctor text escapes hostile check details while json preserves data" {
