@@ -2879,6 +2879,90 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a search that matches a subagent only by what it is for, cleared by a held Backspace and then some, closes nothing: the agent stays open and working",
+    async () => {
+      const auditor = held();
+      const auditorTitle = held();
+      let childCalls = 0;
+      let tracePath = "";
+      const env: Record<string, string> = {};
+      const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await auditor.promise;
+            return text("child_answer", "PURPOSE_CHILD_DONE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: {
+                action: "message",
+                agent: "auditor",
+                message: "Review src/parser.zig for bugs",
+                instructions: "You audit the zebra crossing logic.\nKeep each note short.",
+              },
+            });
+          }
+          return text("main_wait", "PURPOSE_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER plan it");
+          await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+          await until("the auditor's turn", () => childCalls >= 1);
+          await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendKeys("Down");
+
+          // The title model has not answered, so the row says what the
+          // auditor is for, and only that text holds "zebra".
+          const untitled = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+            && /^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\. {2,}working/m.test(pane), 15_000);
+          expect(untitled).toContain("Agents 2");
+          await session.sendLiteral("zebra");
+          const found = await session.waitForPane((pane) => composerContains(pane, "zebra") && pane.includes("Agents 1"), 10_000);
+          expect(found).toMatch(/^ {2}\u2514 auditor {2,}You audit the zebra crossing logic\./m);
+
+          // Five presses empty the search and four more follow, as a held key
+          // repeats, with no other key between.
+          await session.sendKeys(held_key("BSpace", 9));
+          await until("the held Backspace to be handled", () =>
+            eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+          const after = await paneAtRest(session);
+          expect(composerContains(after, "zebra")).toBe(false);
+          expect(after).toContain("Agents 2");
+          expectRowOrder(after, mainRow(), subagentRow("auditor", "working"));
+          await waitForSelectedRow(session, "auditor");
+          // Nothing is armed: the hint offers the close again, not its warning.
+          expect(after).not.toContain("press delete again");
+          expect(after).toContain("delete close");
+          const log = trace();
+          expect(log).not.toContain("agents_menu_close_armed");
+          expect(log).not.toContain("subagent_closed");
+          expect(eventCount(log, "agents_menu_close_ignored")).toBe(4);
+
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+          auditor.release();
+          await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
+        }, (home) => {
+          tracePath = join(home, "fx-trace.log");
+          env.FX_TRACE_LOG = tracePath;
+        }, false, env, {
+          titleResponses: Array.from({ length: 8 }, () => async (body: string) => {
+            if (!body.includes("src/parser.zig")) return fakeGatewayFinalText("Plan the parser work");
+            await auditorTitle.promise;
+            return fakeGatewayFinalText("Review the parser");
+          }),
+        });
+      } finally {
+        auditor.release();
+        auditorTitle.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "after the user closes an idle subagent, main's next message to its name says the new one starts with no history",
     async () => {
       let noted = false;
