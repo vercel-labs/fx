@@ -5,7 +5,7 @@ import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import * as messagesFake from "./fixtures/anthropic-messages";
 import * as responsesFake from "./fixtures/responses";
-import { logLines, rootSessionIds } from "./saved-sessions";
+import { committedRootTurns, logLines, rootSessionIds, waitForRootTurnCommitted } from "./saved-sessions";
 import { reviewedActionEvidence } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
@@ -374,8 +374,13 @@ describe("configured providers", () => {
 
   test.each(["inherited", "override", "unknown"])("subagent requests preserve connection and %s model capabilities", async mode => {
     const childModel = mode === "inherited" ? "local-model" : mode === "override" ? "child-model" : "unknown-model";
-    const f = fixture(body => {
-      if (isChildRequest(body)) return completion(body.model, "child reply");
+    const f = fixture(async body => {
+      if (isChildRequest(body)) {
+        // A report that arrives while the parent's first turn runs joins that
+        // turn, so the child answers only once that turn is saved.
+        await waitForRootTurnCommitted(f.home);
+        return completion(body.model, "child reply");
+      }
       if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "helper", message: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
@@ -401,8 +406,15 @@ describe("configured providers", () => {
 
   test("persistent child capabilities stay bound when the parent changes providers", async () => {
     let callId = 0;
-    const f = fixture(body => {
-      if (isChildRequest(body)) return completion(body.model, "child reply");
+    // Turns saved before the current run. A report that arrives while the
+    // parent's first turn of a run is still going joins that turn, so the
+    // child answers only once that turn is saved.
+    let committedBefore = 0;
+    const f = fixture(async body => {
+      if (isChildRequest(body)) {
+        await waitForRootTurnCommitted(f.home, committedBefore);
+        return completion(body.model, "child reply");
+      }
       if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
@@ -418,6 +430,7 @@ describe("configured providers", () => {
       const id = JSON.parse(first.stdout).session_id;
       // Parent call, the child and the parent after its receipt, then the report turn.
       expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 1024]);
+      committedBefore = committedRootTurns(f.home);
       const resumed = await runFx(["ask", "--json", "--resume", id, "Continue the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
       const resumedRequests = f.requests.slice(4);

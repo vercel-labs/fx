@@ -3,12 +3,17 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const compactor = @import("../compactor/compactor.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// Longest search text a row repeats, after terminal-safe encoding.
 const max_query_label_bytes = 60;
+
+/// Room for a `request` the model wrote as JSON text while `presentation`
+/// reads it. Text that needs more keeps the tool's default label.
+const presentation_request_bytes = 4096;
 
 /// A handle as `validate` resolves it: without surrounding whitespace, plus
 /// the `.txt` a stored result or image handle may omit.
@@ -38,11 +43,8 @@ const RequestView = struct {
     const Kind = enum { range, query, images, record, history_search };
 };
 
-fn requestView(args: std.json.ObjectMap) ?RequestView {
-    const object = if (args.get("request")) |request| switch (request) {
-        .object => |value| value,
-        else => return null,
-    } else args;
+fn requestView(alloc: Allocator, args: std.json.ObjectMap) Allocator.Error!?RequestView {
+    const object = (try tool_args.unwrapRequest(alloc, args)) orelse return null;
     if (object.get("search") != null) return .{ .kind = .history_search };
     const handle = switch (object.get("handle") orelse return null) {
         .string => |value| std.mem.trim(u8, value, " \t\r\n"),
@@ -101,7 +103,11 @@ fn readPresentation(
 /// Labels a call by what it reads instead of one shared "tool result" label.
 /// The resolved row text from `displayTarget` replaces the default object.
 pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
-    const view = requestView(args) orelse return null;
+    // The hook passes no allocator, and every label below is static text, so
+    // a request written as JSON text is read into a buffer on the stack.
+    var buffer: [presentation_request_bytes]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const view = (requestView(fixed.allocator(), args) catch return null) orelse return null;
     return switch (view.kind) {
         .range => readPresentation("Reading", "Read", outputNoun(view.handle, "more command output", "more output")),
         .query => readPresentation("Searching", "Searched", outputNoun(view.handle, "command output", "saved output")),
@@ -117,7 +123,7 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
 pub fn requestedHandle(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?[]u8 {
     var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
     defer parsed.deinit();
-    const view = requestView(parsed.value.object) orelse return null;
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
     switch (view.kind) {
         .record, .history_search => return null,
         .range, .query, .images => {},
@@ -137,7 +143,7 @@ pub fn displayTarget(
 ) Allocator.Error!?[]u8 {
     var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
     defer parsed.deinit();
-    const view = requestView(parsed.value.object) orelse return null;
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
     switch (view.kind) {
         .range => {
             const name = source orelse return null;
@@ -217,6 +223,53 @@ test "read_tool_result display targets name the source, query, and record" {
     try expectDisplayTarget("{\"request\":{\"handle\":\"image-result-abc\"}}", "vision", null);
     try expectDisplayTarget("{\"request\":{\"search\":\"retry\"}}", null, null);
     try expectDisplayTarget("not json", "zig build test", null);
+}
+
+test "read_tool_result rows read a request sent as JSON text as they read an object" {
+    const alloc = std.testing.allocator;
+    const replay = "fx-command-replay-0123.bin";
+    const query_text = "{\"request\":\"{\\\"handle\\\":\\\"" ++ replay ++ "\\\",\\\"query\\\":\\\"error:\\\"}\"}";
+    try expectPresentation(query_text, "Searching", "Searched", "command output");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\"result-x\\\"}\"}", "Reading", "Read", "more output");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\" t5 \\\"}\"}", "Opening", "Opened", "earlier conversation");
+    try expectPresentation("{\"request\":\"{\\\"search\\\":[\\\"retry budget\\\"]}\"}", "Searching", "Searched", "earlier conversation");
+    try expectDisplayTarget(query_text, "zig build test", "zig build test output for \"error:\"");
+    try expectDisplayTarget("{\"request\":\"{\\\"handle\\\":\\\"t5\\\"}\"}", null, "earlier tool call T5");
+    const restored = (try requestedHandle(alloc, "{\"request\":\"{\\\"handle\\\":\\\" result-shell-abc \\\"}\"}")).?;
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("result-shell-abc.txt", restored);
+
+    // Text that is not one object names nothing, as decode refuses it.
+    for ([_][]const u8{
+        "{\"request\":\"[1]\"}",
+        "{\"request\":\"null\"}",
+        "{\"request\":\"\"}",
+        "{\"request\":\"\\\"{\\\\\\\"handle\\\\\\\":\\\\\\\"h\\\\\\\"}\\\"\"}",
+    }) |arguments_json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(presentation(parsed.value.object) == null);
+        try std.testing.expect(try requestedHandle(alloc, arguments_json) == null);
+        try expectDisplayTarget(arguments_json, "zig build test", null);
+    }
+}
+
+test "read_tool_result rows keep the default label for request text too large to read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request_text = try std.json.Stringify.valueAlloc(arena, .{
+        .handle = "result-x",
+        .query = text_utils.repeat("q", presentation_request_bytes),
+    }, .{});
+    const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .request = request_text }, .{});
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{});
+    try std.testing.expect(presentation(parsed.object) == null);
+    // The row text and the source link still read it.
+    const restored = (try requestedHandle(alloc, arguments_json)).?;
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("result-x.txt", restored);
 }
 
 test "read_tool_result display targets keep search text terminal-safe and short" {

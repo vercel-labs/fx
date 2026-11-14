@@ -378,7 +378,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
         .options = &sessions_options,
         .details = &.{
-            "--live shows each session's state (working or idle), the model saved with it, and its subagents with the <id>/<agent> address fx session reads them by.",
+            "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",
         },
     },
     .{

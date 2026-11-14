@@ -2395,8 +2395,10 @@ test "auto permission notice is retained without changing compact transcript geo
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Auto agent approved") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
+    // The group's only row is its header.
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "●") != null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Ran printf done") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "└") == null);
 
     var projection = try runtime.buildFullTranscriptProjection(alloc, null);
     defer projection.deinit(alloc);
@@ -2971,7 +2973,8 @@ test "compact run command group stays width safe after resize" {
                 else => {},
             }
         }
-        try std.testing.expectEqual(@as(usize, 2), status_line_count);
+        // The group's only row is its header, one line long.
+        try std.testing.expectEqual(@as(usize, 1), status_line_count);
         try std.testing.expect(output_line == null);
 
         try std.testing.expect(status_line != null);
@@ -3743,7 +3746,9 @@ test "command output consolidation preserves current compact ownership" {
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "STREAM 001") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
+    // The running command is still its compact group's header.
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "●") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "run_command") != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
@@ -4687,6 +4692,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
+    "resume_handoff_repaint_pending",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
     "last_visible_transcript_partial_skip_rows",
@@ -4930,6 +4936,12 @@ pub const TranscriptRuntime = struct {
     /// shell rows before the renderer has had a chance to respect
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
+    /// The last stable frame handed a resumed transcript's flow to the commit
+    /// anchor and invalidated it, so the rows it painted are on screen with
+    /// no anchor until the next stable frame. The transcript window holds
+    /// every drop until then, or until the transcript leaves the screen
+    /// (`slotLeftScreen`).
+    resume_handoff_repaint_pending: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -5014,6 +5026,16 @@ pub const TranscriptRuntime = struct {
         inline for (transcript_slot_fields) |name| {
             std.mem.swap(@FieldType(TranscriptRuntime, name), &@field(self, name), &@field(slot, name));
         }
+    }
+
+    /// Marks `slot`'s transcript as off the screen after another agent's
+    /// took its place. None of its rows are on screen any more, so a resume
+    /// handoff it was waiting to repaint no longer holds its transcript
+    /// window's drops; showing it again resets the terminal and repaints it
+    /// from its entries. A resume flow it has not painted yet still holds
+    /// them, because showing it again paints that flow.
+    pub fn slotLeftScreen(slot: *TranscriptSlot) void {
+        slot.resume_handoff_repaint_pending = false;
     }
 
     /// Frees a transcript that is not on screen.
@@ -5479,13 +5501,15 @@ pub const TranscriptRuntime = struct {
         return self.pending_session_scrollback_handoff != null;
     }
 
-    pub fn cancelSessionScrollbackHandoff(self: *TranscriptRuntime) void {
+    /// Gives up a handoff that still has rows to write, keeping the
+    /// transcript, and redraws it. `reason` names why, for the trace.
+    pub fn cancelSessionScrollbackHandoff(self: *TranscriptRuntime, reason: []const u8) void {
         const pending = self.pending_session_scrollback_handoff orelse return;
         self.pending_session_scrollback_handoff = null;
-        self.resetTranscriptAnchor("session_scrollback_handoff_geometry_changed");
+        self.resetTranscriptAnchor("session_scrollback_handoff_cancelled");
         self.markTranscriptDirty();
         self.render_requests.request(.footer);
-        debug_trace.logf("scroll", "session_scrollback_handoff_cancel remaining_rows={d} reason=geometry_changed", .{pending.remaining_rows});
+        debug_trace.logf("scroll", "session_scrollback_handoff_cancel remaining_rows={d} reason={s}", .{ pending.remaining_rows, reason });
     }
 
     pub fn commitVisibleTranscriptBeforeFreshSession(
@@ -7093,7 +7117,8 @@ pub const TranscriptRuntime = struct {
     /// `holds_previous_cycle` when they are the cycle before the newest
     /// compaction, which had no turn since (`Session.visitHistorySinceCompaction`).
     /// Then the window applies that compaction as it applies a live one: the
-    /// entries stay on screen and leave memory as they scroll off.
+    /// entries stay on screen, a resize before the next turn end reprints
+    /// them, and after it they leave memory as they scroll off.
     pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator, holds_previous_cycle: bool) !void {
         // Which cycle is "one back" changed with the session.
         self.discardTranscriptArchive();
@@ -7149,10 +7174,16 @@ pub const TranscriptRuntime = struct {
 
     /// The screen is about to be cleared and replayed from the entries: the
     /// drops held for rows on screen can go, so the replay starts at the
-    /// held cycle.
+    /// held cycle. A resumed transcript not painted yet is the exception: the
+    /// clear replays its prepared flow, which still shows the cycle before
+    /// the newest compaction, so those entries stay until they scroll off.
     pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
         if (window.pending_drops.items.len == 0) return;
+        if (self.notebook.pending_resume_source != null) {
+            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
+            return;
+        }
         var ready = window.pending_drops;
         window.pending_drops = .empty;
         defer ready.deinit(alloc);
@@ -7184,9 +7215,10 @@ pub const TranscriptRuntime = struct {
     /// rows released into terminal history.
     fn transcriptWindowDropHold(self: *TranscriptRuntime, alloc: Allocator) !TranscriptWindowDropHold {
         if (self.fullTranscriptActive()) return .all;
-        // A resumed transcript not painted yet: everything it holds is about
-        // to be on screen.
-        if (self.notebook.pending_resume_source != null) return .all;
+        // A resumed transcript not painted yet, or painted and handed off
+        // with no anchor yet: everything it holds is on screen or about to
+        // be.
+        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
             .stable => |anchor| anchor.history_visual_offset,
@@ -7754,7 +7786,8 @@ pub const TranscriptRuntime = struct {
     }
 
     /// Whether the transcript window still holds the cycle before the newest
-    /// compaction, which it does until the first turn end the log holds.
+    /// compaction, which it does until the first turn end after it, once the
+    /// log holds that cycle.
     pub fn transcriptWindowHoldsPreviousCycle(self: *const TranscriptRuntime) bool {
         const window = if (self.transcript_window) |*value| value else return false;
         return window.state.prev_first != null;
@@ -10830,6 +10863,7 @@ pub const TranscriptRuntime = struct {
             transition.retention_identity = .{};
 
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
+            self.resume_handoff_repaint_pending = pending_resume_bytes > 0;
             if (pending_resume_bytes > 0) {
                 self.invalidateTranscriptAnchor("resume publication retained source handoff");
                 if (transition.target_flow_owned) {

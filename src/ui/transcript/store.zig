@@ -190,7 +190,7 @@ pub fn retainedStructuredBytes(self: anytype) usize {
 fn entryRetainedBytes(entry: TranscriptEntry) usize {
     return switch (entry) {
         .raw_bytes => |e| e.bytes.len,
-        .semantic_notice => |e| e.topic.len + e.body.len,
+        .semantic_notice => |e| e.topic.len + e.body.len + e.detail.len,
         .user_turn => |e| blk: {
             var total = e.turn.text.len;
             for (e.turn.images) |img| {
@@ -947,6 +947,7 @@ fn appendSemanticNoticeEntry(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .detail = owned.detail,
         .pending_replacement = pending_replacement,
     } });
     self.notebook.next_entry_id +%= 1;
@@ -1048,6 +1049,7 @@ pub fn replaceSemanticNoticeAtomic(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .detail = owned.detail,
     } };
     handed_off = true;
     previous.deinit(alloc);
@@ -1862,6 +1864,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .tone = notice.tone,
                 .body = notice.body,
                 .visibility = notice.visibility,
+                .detail = notice.detail,
             });
             break :blk .{ .semantic_notice = .{
                 .id = notice.id,
@@ -1871,6 +1874,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .tone = owned.tone,
                 .body = owned.body,
                 .visibility = owned.visibility,
+                .detail = owned.detail,
                 .pending_replacement = notice.pending_replacement,
             } };
         },

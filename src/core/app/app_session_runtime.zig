@@ -23,6 +23,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -871,7 +872,7 @@ pub fn Runtime(comptime App: type) type {
                 error.SessionScrollbackHandoffGeometryChanged => {
                     agent.session_persistence.pending_live_session_policy = null;
                     agent.session_persistence.pending_live_session_wait = null;
-                    app.shell.cancelSessionScrollbackHandoff();
+                    app.shell.cancelSessionScrollbackHandoff("geometry_changed");
                     releaseLiveSessionTransitionHold(app, agent);
                     debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
@@ -905,15 +906,36 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             agent.session_persistence.pending_live_session_policy = null;
             agent.session_persistence.pending_live_session_wait = null;
-            app.shell.cancelSessionScrollbackHandoff();
+            try giveUpScrollbackHandoff(app, reason);
             releaseLiveSessionTransitionHold(app, agent);
             debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
         }
 
+        /// Gives up a scrollback handoff that still has rows to write. When
+        /// its frame already pushed some rows into scrollback, the terminal
+        /// is cleared and the transcript printed again, as after a resize, so
+        /// the switch's next handoff does not push those rows a second time.
+        fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
+            if (comptime !@hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff") or !@hasField(App, "metrics")) return;
+            const pending = app.shell.pending_session_scrollback_handoff orelse return;
+            app.shell.cancelSessionScrollbackHandoff(reason);
+            if (pending.remaining_rows < pending.total_rows) {
+                try app.shell.requestTerminalReset(&app.metrics);
+                debug_trace.logf("session", "event=scrollback_handoff_reset reason={s} pushed_rows={d}", .{ reason, pending.total_rows - pending.remaining_rows });
+            }
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App, agent: *AppAgent) !void {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             const processing = agent.worker.isProcessing();
+            // The handoff goes on only while the agent is idle, and no agent's
+            // transcript can be swapped in until it ends. A turn that starts
+            // meanwhile, such as one a subagent's report starts, would hold
+            // the handoff, and every hidden agent, until it ends, and that
+            // turn may wait on a hidden agent. So the handoff yields; the
+            // change hands the rows off again once the agent is idle.
+            if (processing) try giveUpScrollbackHandoff(app, "agent_busy");
             const now = operation_control.monotonicMillis(io_mod.getIo());
             var wait = agent.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
             if (wait == .worker and !processing) wait = .{ .geometry = now };
@@ -2638,13 +2660,14 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
-        /// The provider's title model, or a Token Pass model when the
-        /// agent's AI Gateway model is a Token Pass model.
+        /// The provider's title model, or a Token Pass model when the team
+        /// has Token Pass and the agent's AI Gateway model is a Token Pass
+        /// model.
         fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
             const default_model = provider_title_model orelse return null;
             if (comptime !provider_runtime.supported(App)) return default_model;
             if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
-            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+            return token_pass_team.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
         }
 
         /// Applies a finished background title generation on the main loop.
@@ -4094,7 +4117,10 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
-            const outcome_decision = command_decision orelse terminal_action_decision;
+            // A shell run that returned its command running, captured or tty,
+            // has no exit status and reads "Still running", as it did live.
+            const outcome_decision = command_decision orelse terminal_action_decision orelse
+                try tool_presentation.runningCommandDecision(action_arena.allocator(), call, result.output);
             const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     agent,

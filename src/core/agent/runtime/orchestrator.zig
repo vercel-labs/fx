@@ -23,6 +23,7 @@ const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
@@ -50,6 +51,7 @@ const runtime_config = @import("config.zig");
 const cache_warming = @import("cache_warming.zig");
 const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
+const credential_renewal = @import("credential_renewal.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const runtime_context_state = @import("runtime_context.zig");
@@ -124,6 +126,75 @@ test "empty reply notice names the provider's reason and the next step" {
     try std.testing.expectEqualStrings(
         "The model stopped without a reply (finish reason: other). Continue with a follow-up prompt if needed.",
         try emptyReplyNotice(arena, "", empty_reply_follow_up),
+    );
+}
+
+// Gemini ends a reply with MALFORMED_FUNCTION_CALL when it cannot write a
+// valid function call. The provider answered, so this is the model's output,
+// not a server failure: fx tells the model at once, with tools on, that the
+// call could not be read and did not run. A second malformed reply in the same
+// step asks for smaller calls, and a third ends the turn
+// (`tests/tla/agent_runtime/MalformedToolCall.tla` EveryStallGetsFeedback,
+// FeedbackRightAway, EndsAfterThird).
+const malformed_tool_call_max_feedbacks = 2;
+const malformed_tool_call_asking = "Asking it to try again.";
+
+/// What fx tells the model after its `attempt`-th malformed tool call in a
+/// step. `tool_name` is a registered tool the call named, or null.
+fn malformedToolCallFeedback(arena: Allocator, attempt: usize, tool_name: ?[]const u8) ![]const u8 {
+    const call = if (tool_name) |name| try arena.print(" to {s}", .{name}) else "";
+    if (attempt <= 1) return try arena.print(
+        "Your last tool call{s} could not be read: the provider reported {s}, and fx did not run it. Call the tool again with arguments that are valid JSON and match its schema, or answer in text.",
+        .{ call, types.malformed_function_call_reason },
+    );
+    return try arena.print(
+        "Your tool call{s} could not be read again ({s}), and fx did not run it. Long or deeply nested arguments often cause this: make smaller calls with short arguments, such as writing a large file in several steps, or answer in text.",
+        .{ call, types.malformed_function_call_reason },
+    );
+}
+
+/// What fx shows for a malformed tool call: that it asks the model again, or,
+/// once the feedback is spent, that the turn failed and the next step is the
+/// user's.
+fn malformedToolCallNotice(arena: Allocator, failed: bool) ![]const u8 {
+    if (!failed) return try arena.print(
+        "The model's tool call could not be read (provider reason: {s}). {s}",
+        .{ types.malformed_function_call_reason, malformed_tool_call_asking },
+    );
+    return try arena.print(
+        "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
+        .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
+    );
+}
+
+/// The tool a malformed reply's call named, when it is one fx knows; a name
+/// the provider made up stays out of the feedback.
+fn malformedCallToolName(registry: tool_dispatch.Registry, completion: types.ModelCompletion) ?[]const u8 {
+    for (completion.tool_calls) |call| {
+        if (registry.lookup(call.name) != null) return call.name;
+    }
+    return null;
+}
+
+test "malformed tool call feedback names the tool, then asks for smaller calls" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "Your last tool call to read_file could not be read: the provider reported MALFORMED_FUNCTION_CALL, and fx did not run it. Call the tool again with arguments that are valid JSON and match its schema, or answer in text.",
+        try malformedToolCallFeedback(arena, 1, "read_file"),
+    );
+    try std.testing.expectEqualStrings(
+        "Your tool call could not be read again (MALFORMED_FUNCTION_CALL), and fx did not run it. Long or deeply nested arguments often cause this: make smaller calls with short arguments, such as writing a large file in several steps, or answer in text.",
+        try malformedToolCallFeedback(arena, 2, null),
+    );
+    try std.testing.expectEqualStrings(
+        "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
+        try malformedToolCallNotice(arena, false),
+    );
+    try std.testing.expectEqualStrings(
+        "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL). Continue with a follow-up prompt if needed.",
+        try malformedToolCallNotice(arena, true),
     );
 }
 
@@ -455,7 +526,8 @@ fn normalize_terminal_model_input(
 }
 
 /// Returns the top-level arguments of an exact {"request":{...}}
-/// read_tool_result call, or null to replay the call as it was sent.
+/// read_tool_result call, its wrapper an object or JSON text of one, or null
+/// to replay the call as it was sent.
 fn projected_read_tool_result_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -471,12 +543,12 @@ fn projected_read_tool_result_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.get("request") orelse return null;
-    if (request != .object) return null;
+    if (parsed.value.object.get("request") == null) return null;
+    const request = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request, .{}, &out.writer) catch
+    std.json.Stringify.value(std.json.Value{ .object = request }, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -1000,6 +1072,7 @@ fn project_subagent_request_messages(
             if (try normalized_subagent_request_arguments(
                 alloc,
                 call.arguments_json,
+                false,
             )) |arguments| {
                 alloc.free(arguments);
                 needs_projection = true;
@@ -1081,6 +1154,7 @@ fn project_subagent_request_messages(
                     const arguments = (try normalized_subagent_request_arguments(
                         alloc,
                         call.arguments_json,
+                        false,
                     )) orelse try alloc.dupe(u8, call.arguments_json);
                     var copied = call;
                     copied.arguments_json = arguments;
@@ -1328,7 +1402,8 @@ fn project_read_tool_result_request_messages(
 }
 
 /// Returns the arguments a shell call is stored and admitted with: an exact
-/// {"request":{...}} unwrapped, and a missing action filled in when
+/// {"request":{...}} unwrapped, its wrapper an object or JSON text of one,
+/// and a missing action filled in when
 /// `infer_action` names exactly one. Null keeps the call as it was sent.
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
@@ -1344,13 +1419,10 @@ fn normalized_terminal_request_arguments(
     const arena = parsed.arena.allocator();
     var args = parsed.value;
     var changed = false;
-    if (args.object.count() == 1) {
-        if (args.object.get("request")) |request| {
-            if (request != .object) return null;
-            args = request;
-            _ = try normalize_terminal_model_input(arena, &args.object);
-            changed = true;
-        }
+    if (args.object.count() == 1 and args.object.get("request") != null) {
+        args = .{ .object = (try tool_args.unwrapRequest(arena, args.object)) orelse return null };
+        _ = try normalize_terminal_model_input(arena, &args.object);
+        changed = true;
     }
     if (infer_action) |infer| {
         if (infer(args.object)) |action| {
@@ -1379,11 +1451,16 @@ fn managed_subagent_action(action: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Returns the top-level arguments of an exact {"request":{...}} subagent call
+/// Returns the top-level arguments of an exact {"request":...} subagent call
 /// whose action is run or message, or null to keep the call as it was sent.
+/// The wrapper is read as `tool_args.unwrapRequest` reads it: an object, or
+/// JSON text of one within the depth limit. Decode reads an object wrapper
+/// of any action but never a text one, so with `any_text_action` a text
+/// wrapper is unwrapped whatever it asks for, and decode judges the fields.
 fn normalized_subagent_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
+    any_text_action: bool,
 ) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1391,14 +1468,16 @@ fn normalized_subagent_request_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.get("request") orelse return null;
-    if (request != .object) return null;
-    const action = request.object.get("action") orelse return null;
-    if (action != .string or managed_subagent_action(action.string) == null) return null;
+    const wrapper = parsed.value.object.get("request") orelse return null;
+    const request = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse return null;
+    if (!(any_text_action and wrapper == .string)) {
+        const action = request.get("action") orelse return null;
+        if (action != .string or managed_subagent_action(action.string) == null) return null;
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(std.json.Value{ .object = request }, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -1526,6 +1605,7 @@ fn normalize_subagent_request_tool_calls(
         const arguments_json = try normalized_subagent_request_arguments(
             alloc,
             call.arguments_json,
+            true,
         ) orelse continue;
         if (normalized == null) {
             normalized = alloc.dupe(ToolCall, source) catch |err| {
@@ -1557,9 +1637,18 @@ test "subagent intake unwraps an exact request wrapper" {
         .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
         .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
         .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"wrapped\"}}" },
+        // A wrapper the model wrote as JSON text is read like an object.
+        .{ .id = "text-message", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"review\\\"}\"}" },
+        .{ .id = "text-run", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":\\\"wrapped\\\"}\"}" },
+        // Decode never reads a text wrapper, so intake unwraps one whatever
+        // it asks for.
+        .{ .id = "text-wait", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}" },
+        .{ .id = "text-no-action", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"agent\\\":\\\"reviewer\\\"}\"}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
         .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
         .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"a\"},\"task\":\"b\"}" },
+        .{ .id = "text-array", .name = "subagent", .arguments_json = "{\"request\":\"[1]\"}" },
+        .{ .id = "text-deep", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":" ++ text_utils.repeat("[", 70) ++ text_utils.repeat("]", 70) ++ "}\"}" },
     };
 
     const normalized = try normalize_subagent_request_tool_calls(
@@ -1575,9 +1664,14 @@ test "subagent intake unwraps an exact request wrapper" {
         normalized[1].arguments_json,
     );
     try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[2].arguments_json);
-    // Anything but an exact wrapper around a known action reaches the decoder
-    // as sent, which names what is wrong with it.
-    for (calls[3..], normalized[3..]) |call, result| {
+    try std.testing.expectEqualStrings(normalized[1].arguments_json, normalized[3].arguments_json);
+    try std.testing.expectEqualStrings(normalized[2].arguments_json, normalized[4].arguments_json);
+    try std.testing.expectEqualStrings("{\"action\":\"wait\"}", normalized[5].arguments_json);
+    try std.testing.expectEqualStrings("{\"agent\":\"reviewer\"}", normalized[6].arguments_json);
+    // Anything else, an object wrapper of another action, a wrapper beside
+    // another field, and text that is no object or nests past the depth
+    // limit, reaches the decoder as sent, which names what is wrong with it.
+    for (calls[7..], normalized[7..]) |call, result| {
         try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
     }
     const ineligible = try normalize_subagent_request_tool_calls(
@@ -1681,7 +1775,8 @@ test "wrapped read_tool_result history replays with top-level arguments" {
         .{ .id = "flat", .name = "read_tool_result", .arguments_json = "{\"handle\":\"flat.bin\",\"start_byte\":1,\"byte_count\":160}" },
         .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
         .{ .id = "beside", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"a.bin\"},\"query\":\"b\"}" },
-        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"{}\"}" },
+        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"[1]\"}" },
+        .{ .id = "text", .name = "read_tool_result", .arguments_json = "{\"request\":\"{\\\"handle\\\":\\\"text.bin\\\",\\\"query\\\":\\\"needle\\\"}\"}" },
     };
     const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
 
@@ -1696,9 +1791,13 @@ test "wrapped read_tool_result history replays with top-level arguments" {
         "{\"handle\":\"new.bin\",\"query\":\"needle\"}",
         projected[0].tool_calls[1].arguments_json,
     );
-    // Only an exact wrapper around an object is unwrapped.
+    // Only an exact wrapper around an object, or JSON text of one, is unwrapped.
     try std.testing.expectEqual(calls[2].arguments_json.ptr, projected[0].tool_calls[2].arguments_json.ptr);
     try std.testing.expectEqual(calls[3].arguments_json.ptr, projected[0].tool_calls[3].arguments_json.ptr);
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"text.bin\",\"query\":\"needle\"}",
+        projected[0].tool_calls[4].arguments_json,
+    );
     try std.testing.expectEqualStrings(
         "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}",
         messages[0].tool_calls[1].arguments_json,
@@ -2168,6 +2267,110 @@ test "terminal request projection cleans every partial allocation failure" {
         check_terminal_request_projection_allocation_failures,
         .{},
     );
+}
+
+const max_fuzz_request_text_bytes: usize = 16 * 1024;
+
+fn fuzzRequestWrapperText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_request_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before request is read.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+    const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
+    const wrapped = try tool_args.unwrapRequest(arena, args);
+    const expected = if (wrapped) |object|
+        try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = object }, .{})
+    else
+        null;
+
+    // History replays read_tool_result with the arguments the wrapper holds,
+    // exactly when tool_args reads some.
+    const replayed = try projected_read_tool_result_arguments(alloc, args_json);
+    defer if (replayed) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, replayed == null);
+    if (expected) |json| try std.testing.expectEqualStrings(json, replayed.?);
+
+    // Shell intake unwraps the same wrappers.
+    const shell = try normalized_terminal_request_arguments(alloc, args_json, null);
+    defer if (shell) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, shell == null);
+
+    // Subagent replay unwraps the same wrappers of a run or a message, and
+    // subagent intake every one, to the same arguments.
+    const replayed_subagent = try normalized_subagent_request_arguments(alloc, args_json, false);
+    defer if (replayed_subagent) |json| alloc.free(json);
+    const managed = if (wrapped) |object| blk: {
+        const action = object.get("action") orelse break :blk false;
+        break :blk action == .string and managed_subagent_action(action.string) != null;
+    } else false;
+    try std.testing.expectEqual(managed, replayed_subagent != null);
+    if (replayed_subagent) |json| try std.testing.expectEqualStrings(expected.?, json);
+    const subagent_intake = try normalized_subagent_request_arguments(alloc, args_json, true);
+    defer if (subagent_intake) |json| alloc.free(json);
+    try std.testing.expectEqual(expected == null, subagent_intake == null);
+    if (subagent_intake) |json| try std.testing.expectEqualStrings(expected.?, json);
+}
+
+test "request wrappers sent as JSON text unwrap as tool_args reads them" {
+    try std.testing.fuzz({}, fuzzRequestWrapperText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"action\":\"run\",\"command\":\"printf ok\"}",
+            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}",
+            "{\"handle\":\"h.txt\",\"query\":\"needle\"}",
+            "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"hi\"}",
+            "{\"action\":\"run\",\"task\":\"review\"}",
+            "{}",
+            "[1]",
+            "\"{\\\"action\\\":\\\"run\\\"}\"",
+            "{",
+        }) ++ @import("fuzz_corpus").request_wrapper_text.*),
+    });
+}
+
+test "terminal request normalization reads a wrapper written as JSON text" {
+    const alloc = std.testing.allocator;
+    const run = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"printf ok\\\"}\"}",
+        null,
+    )).?;
+    defer alloc.free(run);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", run);
+    // The write input is read from a text wrapper as from an object.
+    const write = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":\"{\\\"action\\\":\\\"write\\\",\\\"session_id\\\":\\\"terminal-a\\\",\\\"input\\\":{\\\"keys\\\":[\\\"enter\\\"]}}\"}",
+        null,
+    )).?;
+    defer alloc.free(write);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
+        write,
+    );
+
+    // Anything else is kept as it was sent: text of another kind, an object
+    // encoded twice, text nested deeper than tool input may be, and a wrapper
+    // beside other fields.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "{\"action\":\"run\",\"command\":\"true\"}", .{});
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |text| {
+        const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+        try std.testing.expect(try normalized_terminal_request_arguments(alloc, args_json, null) == null);
+    }
+    const beside = try std.json.Stringify.valueAlloc(arena, .{
+        .request = "{\"action\":\"run\",\"command\":\"true\"}",
+        .yield_time_ms = 1000,
+    }, .{});
+    try std.testing.expect(try normalized_terminal_request_arguments(alloc, beside, null) == null);
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {
@@ -2697,11 +2900,39 @@ fn preparedTerminalModelOutput(
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
         .unsupported => try alloc.print(
-            "Unsupported tool: {s}",
-            .{call.name},
+            "Unsupported tool: {f}",
+            .{model_context_encoding.scalar(call.name)},
         ),
         else => unreachable,
     };
+}
+
+test "a prepared call of a tool fx does not know names it as visible text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { name: []const u8, shown: []const u8 }{
+        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
+        .{ .name = "", .shown = "Unsupported tool: " },
+        .{ .name = "x\x1b]0;owned\x07y", .shown = "Unsupported tool: x&#x1b;]0;owned&#x07;y" },
+        .{ .name = "a\x00b\r\nc", .shown = "Unsupported tool: a&#x00;b&#x0d;&#x0a;c" },
+    };
+    for (cases) |case| {
+        const shown = try preparedTerminalModelOutput(
+            arena,
+            .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" },
+            .{ .kind = .unsupported },
+        );
+        try std.testing.expectEqualStrings(case.shown, shown);
+    }
+    // A terminal that already carries the model's text is passed on as it is.
+    const kept = try arena.dupe(u8, "Tool arguments are invalid.");
+    try std.testing.expectEqualStrings("Tool arguments are invalid.", try preparedTerminalModelOutput(
+        arena,
+        .{ .id = "x", .name = "read_file", .arguments_json = "{}" },
+        .{ .kind = .validation_failure, .model_output = kept },
+    ));
 }
 
 noinline fn preparedCandidateClassificationComplete(
@@ -2867,25 +3098,31 @@ fn commitRulesNote(
     selected.content = null;
 }
 
-/// Queues the rules of the folders the turn's images come from as a note on
-/// the turn's own message, after the user's text, the way a tool call that
-/// reaches a folder delivers its rules (D93). The instructions never change
-/// when an image brings a folder the session has not seen, so the provider's
-/// cached prefix still matches. Rules an earlier note delivered are not sent
-/// again: a reminder line stands in for them, as for a tool call.
-fn queueImageFolderRules(
+/// Queues the rules of the folders the turn's attachments come from as a note
+/// on the turn's own message, after the user's text, the way a tool call that
+/// reaches a folder delivers its rules (D93). `images` are the images the host
+/// names by workspace path and `attached` the other files, with the sources
+/// that were no files. The instructions never change when an attachment brings
+/// a folder the session has not seen, so the provider's cached prefix still
+/// matches. Rules an earlier note delivered are not sent again: a reminder line
+/// stands in for them, as for a tool call.
+fn queueAttachedFolderRules(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     registry: context_contract.Registry,
     config: Config,
     images: []const types.ImageAttachment,
+    attached: context_contract.AttachedFiles,
     context_delivery_state: *context_contract.DeliveryState,
     replaced_sources: []const []const u8,
     remind_sources: *std.ArrayList([]const u8),
     pending_notes: *std.ArrayList(ChatMessage),
 ) !void {
-    if (images.len == 0) return;
-    const targets = try context_contract.applicableTargetsForImages(arena, images);
+    if (images.len == 0 and attached.isEmpty()) return;
+    const targets = try std.mem.concat(arena, context_contract.ApplicableTarget, &.{
+        try context_contract.applicableTargetsForImages(arena, images),
+        attached.targets,
+    });
     var selected = try registry.selectDefaultApplicableContext(arena, .{
         .workspace_root = config.workspace_root,
         .access_scope = config.access_scope,
@@ -2893,13 +3130,20 @@ fn queueImageFolderRules(
         .delivered_sources = context_delivery_state.delivered_sources.items,
         .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
         .remind_sources = remind_sources.items,
+        .omissions = attached.omissions,
+        .omission_summary = attached.omission_summary,
         .context_limits = config.context_limits,
     });
     defer selected.deinit(arena);
     for (selected.notices) |notice| try deps.pushContextNotice(notice);
     const queued_before = pending_notes.items.len;
     try commitContextNote(arena, pending_notes, context_delivery_state, registry.instruction_files, &selected, replaced_sources, remind_sources);
-    debug_trace.logf("context", "image folder rules images={d} notes_queued={d}", .{ images.len, pending_notes.items.len - queued_before });
+    debug_trace.logf("context", "attached folder rules images={d} files={d} omitted={d} notes_queued={d}", .{
+        images.len,
+        attached.targets.len,
+        attached.omissions.len,
+        pending_notes.items.len - queued_before,
+    });
 }
 
 /// Counts each instruction file a saved note delivered as delivered when the
@@ -3744,20 +3988,37 @@ noinline fn effectiveRecoveryToolEvidence(
 /// ended in a provider error never ran them. A completed attempt keeps
 /// `effectiveRecoveryToolEvidence`: its calls run next, and one may start
 /// before fx saves its intent. A call the provider runs itself may have run
-/// either way.
+/// either way, but when each one only reads, as a search does, running it
+/// again is safe (`tests/tla/agent_runtime/MalformedToolCall.tla`
+/// SearchKeepsTools). A stream that threw has no completion.
 fn settledAttemptToolEvidence(
+    registry: tool_dispatch.Registry,
     preserved: resend_strategy.ToolEvidence,
-    completion: types.ModelCompletion,
+    completion: ?types.ModelCompletion,
     disposition: types.ProviderCompletionDisposition,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) resend_strategy.ToolEvidence {
     const evidence = effectiveRecoveryToolEvidence(preserved, completion, stream_ctx);
     if (disposition != .interrupted and disposition != .provider_failure) return evidence;
-    if (evidence != .uncertain or completion.tool_calls.len == 0) return evidence;
-    if (stream_ctx.saw_provider_tool_start or hasProviderExecutedCall(completion.tool_calls)) {
-        return .uncertain;
+    if (evidence != .uncertain) return evidence;
+    const calls: []const types.ToolCall = if (completion) |value| value.tool_calls else &.{};
+    if (!stream_ctx.saw_provider_tool_start and !hasProviderExecutedCall(calls)) {
+        return if (calls.len == 0) evidence else .proven_unexecuted;
     }
-    return .proven_unexecuted;
+    if (stream_ctx.saw_unrepeatable_provider_tool_start) return .uncertain;
+    for (calls) |call| {
+        if (call.provenance != .provider_executed) continue;
+        if (!runtime_tool_presentation.providerToolOnlyReads(registry, call.name)) return .uncertain;
+    }
+    return .repeatable;
+}
+
+/// Whether a resend follows an attempt whose local calls never ran, so their
+/// streamed rows settle as unexecuted once the resend's own reply settles.
+/// A provider-run call's row is left alone either way.
+fn resendFollowsUnexecutedCalls(strategy: ?resend_strategy.Strategy) bool {
+    const selected = strategy orelse return false;
+    return selected == .regenerate_tool or selected == .repeat_read_only_tool;
 }
 
 fn restoredRecoveryToolEvidence(
@@ -3912,6 +4173,7 @@ fn checkpointAction(
         .retry_request => .retrying_request,
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
+        .repeat_read_only_tool => .regenerating_tool,
         .reconcile_tool => .reconciling_tool,
     };
 }
@@ -3923,7 +4185,9 @@ fn checkpointToolState(
         .none => .none,
         .proven_unexecuted => .proven_unexecuted,
         .confirmed => .confirmed,
-        .uncertain => .uncertain,
+        // Saved as uncertain, a value every version reads: a resumed turn
+        // reconciles instead of searching again.
+        .repeatable, .uncertain => .uncertain,
     };
 }
 
@@ -4639,7 +4903,7 @@ fn needsUserFailureKind(
     {
         return .quota;
     }
-    if (isContextOverflowFailure(failure)) return .too_long;
+    if (agent_stream_provider.isContextOverflow(failure)) return .too_long;
     return switch (failure.kind) {
         .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
         // fx tried to refresh the credential once, and the refresh failed:
@@ -4758,25 +5022,6 @@ fn waitForUser(
     return if (try request_recovery.waitForSend() != null) .resend else .cancelled;
 }
 
-fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
-    if (failure.kind == .request_too_large) return true;
-    if (failure.kind != .invalid_request) return false;
-    const detail = failure.detail orelse return false;
-    inline for (.{
-        "context_length_exceeded",
-        "exceeds the context window",
-        "exceeded the context window",
-        "maximum context length",
-        "maximum prompt length",
-        "input is too long",
-        "prompt is too long",
-        "too many input tokens",
-    }) |needle| {
-        if (text_utils.containsIgnoreCase(detail, needle)) return true;
-    }
-    return false;
-}
-
 const ContextOverflowRecoveryState = enum {
     ready,
     pending,
@@ -4794,7 +5039,7 @@ fn shouldRecoverContextOverflow(
         recovery_available and
         has_compactable_context and
         replay_safe and
-        isContextOverflowFailure(failure);
+        agent_stream_provider.isContextOverflow(failure);
 }
 
 test "context overflow recovery is typed safe and bounded" {
@@ -5380,9 +5625,6 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
-/// The job's credential from the host in `mode`, owned by the caller. Null
-/// when its source is not refreshable, the host holds none, or the host
-/// refused it, such as a stored sign-in for another account or team.
 fn loadJobCredential(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
@@ -5391,20 +5633,11 @@ fn loadJobCredential(
     rejected_token: ?[]const u8,
     trace_ctx: TraceContext,
 ) !?RefreshedGatewayCredential {
-    const source = job.credential_source orelse return null;
-    if (!credentials.sourceRefreshable(source)) return null;
-    const refresh = deps.refresh_gateway_credential orelse return null;
-    return refresh(deps.ctx, alloc, source, mode, job.account_id, rejected_token) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        debug_trace.eventf(
-            "gateway",
-            "credential_refresh_failed",
-            trace_ctx,
-            "source={s} mode={s} err={s}",
-            .{ @tagName(source), @tagName(mode), @errorName(err) },
-        );
-        return null;
-    };
+    return credential_renewal.load(deps, alloc, jobSignIn(job), mode, rejected_token, trace_ctx);
+}
+
+fn jobSignIn(job: QueuedPrompt) credential_renewal.SignIn {
+    return .{ .source = job.credential_source, .account_id = job.account_id };
 }
 
 /// Takes `credential` for the job, which owns it from here on. When the host
@@ -5451,15 +5684,8 @@ fn adoptJobCredential(
     );
 }
 
-/// Renews the credential the provider rejected with 401 for one replay: the
-/// stored credential when another fx process already replaced the rejected
-/// token, and a forced refresh only when the store still holds it, because
-/// every forced refresh rotates the sign-in all fx processes share
-/// (`tests/e2e/auth-refresh.test.ts` "fx ask replays a rejected request with
-/// the login another fx already renewed, without refreshing"). When the store
-/// holds nothing this job can send, such as another team's sign-in, nothing is
-/// refreshed (`tests/e2e/auth-refresh.test.ts` "fx ask does not refresh the
-/// login another fx signed in to another team when its request is rejected").
+/// Renews the credential the provider rejected with 401 for one replay
+/// (`credential_renewal.renewRejected`).
 fn renewRejectedCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
@@ -5474,16 +5700,15 @@ fn renewRejectedCredentialForJob(
     // comparison.
     const rejected = try alloc.dupe(u8, active_api_key.*);
     defer secret.zeroAndFree(alloc, rejected);
-    const stored = (try loadJobCredential(deps, alloc, job.*, .reload, null, trace_ctx)) orelse {
-        debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
-        return false;
+    const renewal = try credential_renewal.renewRejected(deps, alloc, jobSignIn(job.*), rejected, trace_ctx);
+    // Adopt the stored one even when it is the rejected token: the job then
+    // owns the bytes it holds if the forced refresh gives nothing.
+    if (renewal.stored) |stored| adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx) catch |err| {
+        if (renewal.forced) |forced| credential_renewal.free(alloc, forced);
+        return err;
     };
-    const renewed = !std.mem.eql(u8, stored.token, rejected);
-    // Adopt it even when it is the rejected token: the job then owns the bytes
-    // it holds if the forced refresh gives nothing.
-    try adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx);
-    if (renewed) return true;
-    return refreshGatewayCredentialForJob(deps, alloc, job, job_arena, .force, rejected, active_api_key, owned_api_key, trace_ctx);
+    if (renewal.forced) |forced| try adoptJobCredential(alloc, job, job_arena, .force, forced, active_api_key, owned_api_key, trace_ctx);
+    return renewal.resend;
 }
 
 const ProviderAdmission = struct {
@@ -5715,6 +5940,24 @@ fn traceRouteFailure(
     );
 }
 
+/// How a turn ended: from the error it returned, else from what its
+/// finalization recorded.
+fn observedTurnOutcome(observed_error: ?anyerror, finalized: ?types.TurnPresentationOutcome) observation.TurnOutcome {
+    if (observed_error) |err| return switch (err) {
+        error.TurnYielded => .yielded,
+        error.Cancelled => .cancelled,
+        error.SessionWriterChanged, error.SessionWriterParked => .fenced,
+        else => .failed,
+    };
+    const outcome = finalized orelse return .failed;
+    return switch (outcome) {
+        .completed => .completed,
+        .interrupted => .interrupted,
+        .failed => .failed,
+        .paused => .paused,
+    };
+}
+
 pub fn processAgentPrompt(
     agent: *runtime_agent.Agent,
     deps: *const AgentRuntimeDeps,
@@ -5749,20 +5992,22 @@ pub fn processAgentPrompt(
 
     var observed_error: ?anyerror = null;
     if (deps.observer) |observer| observer.beginTurn(job.prompt, job.recovery_checkpoint != null);
-    defer if (deps.observer) |observer| {
-        const outcome: observation.TurnOutcome = if (observed_error) |err| switch (err) {
-            error.TurnYielded => .yielded,
-            error.Cancelled => .cancelled,
-            error.SessionWriterChanged, error.SessionWriterParked => .fenced,
-            else => .failed,
-        } else if (finalization.outcome) |outcome| switch (outcome) {
-            .completed => .completed,
-            .interrupted => .interrupted,
-            .failed => .failed,
-            .paused => .paused,
-        } else .failed;
-        observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
-    };
+    // A subagent's turn is recorded for `/trace`, which says which subagent
+    // each `subagent_id` in its tool and network records belongs to.
+    const traced_subagent_id: u64 = if (effective_config.origin == .subagent) effective_config.subagent_id else 0;
+    if (traced_subagent_id != 0) diagnostics.recordSubagentTurnStart(.{
+        .subagent_id = traced_subagent_id,
+        .session_id = effective_lifecycle.scope.session_id orelse "",
+        .model = effective_job.model,
+        .effort = effective_config.effort.label(),
+        .prompt = effective_job.prompt,
+        .started_at_ms = io_mod.milliTimestamp(),
+    });
+    defer {
+        const outcome = observedTurnOutcome(observed_error, finalization.outcome);
+        if (deps.observer) |observer| observer.endTurn(outcome, if (observed_error) |err| @errorName(err) else null);
+        if (traced_subagent_id != 0) diagnostics.recordSubagentTurnEnd(traced_subagent_id, @tagName(outcome));
+    }
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         observed_error = err;
@@ -7622,14 +7867,15 @@ fn processQueuedPromptLoop(
     // Notes the gate queued during a step; they join the turn at the next
     // step boundary.
     var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
-    // The rules of the folders the turn's images come from join the turn's
-    // own message at its first boundary.
-    if (deps.context_enabled and deps.image_folder_rules) if (deps.context_registry) |registry| try queueImageFolderRules(
+    // The rules of the folders the turn's attachments come from join the
+    // turn's own message at its first boundary.
+    if (deps.context_enabled) if (deps.context_registry) |registry| try queueAttachedFolderRules(
         arena,
         deps,
         registry,
         config,
-        job.images,
+        if (deps.image_folder_rules) job.images else &.{},
+        job.attached_files,
         &context_delivery_state,
         replaced_note_sources.items,
         &remind_sources,
@@ -7955,6 +8201,8 @@ fn processQueuedPromptLoop(
         // screen; its resends do not repeat it.
         var auth_reason_shown = false;
         var assistant_prefill_recovery_used = false;
+        // Malformed tool calls this step has answered with feedback.
+        var malformed_tool_call_feedbacks: usize = 0;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var request_size_retries: usize = 0;
@@ -8456,9 +8704,11 @@ fn processQueuedPromptLoop(
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
+                        .renewal_deps = deps,
                     };
+                    defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
-                    const compacted = compactContext(arena, deps, .{
+                    const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
                         .before_summary = source.hook(),
@@ -8472,7 +8722,22 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
-                    }) catch |err| {
+                    });
+                    // A summary request the provider rejected with 401 renewed
+                    // the sign-in; the rest of the turn sends the renewed one.
+                    // Taken first: renewing can free the credential the turn
+                    // borrowed, such as ACP's.
+                    if (summary_model.takeRenewed()) |renewed| try adoptJobCredential(
+                        std.heap.c_allocator,
+                        &job,
+                        arena,
+                        renewed.mode,
+                        renewed.credential,
+                        &active_api_key,
+                        &owned_refreshed_api_key,
+                        step_ctx,
+                    );
+                    const compacted = compaction_result catch |err| {
                         if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(
@@ -8664,9 +8929,11 @@ fn processQueuedPromptLoop(
                 else
                     recovery_cause;
                 const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
-                const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                const failure_tool_evidence = settledAttemptToolEvidence(
+                    deps.tool_registry,
                     preserved_tool_evidence,
                     null,
+                    .interrupted,
                     &stream_ctx,
                 );
                 const next_strategy: ?resend_strategy.Strategy = if (network_failure) |evidence|
@@ -8778,7 +9045,7 @@ fn processQueuedPromptLoop(
                     preserved_tool_evidence = failure_tool_evidence;
                     recovery_strategy = next_strategy;
                     recovery_cause = failure_cause;
-                    if (recovery_strategy == .regenerate_tool) {
+                    if (resendFollowsUnexecutedCalls(recovery_strategy)) {
                         recovery_has_unexecuted_tool_start = true;
                     }
                     reset_stream_for_next_attempt = true;
@@ -9083,6 +9350,7 @@ fn processQueuedPromptLoop(
                     recovery_cause,
                     recovery_strategy,
                     settledAttemptToolEvidence(
+                        deps.tool_registry,
                         preserved_tool_evidence,
                         response_completion,
                         settled_disposition,
@@ -9421,8 +9689,98 @@ fn processQueuedPromptLoop(
                         retries,
                     );
                 }
+                if (attempt_disposition == .provider_failure and
+                    types.isMalformedToolCallFinish(attempt_completion.finish_reason, attempt_completion.finish_reason_raw) and
+                    !config.cancel_flag.load(.seq_cst))
+                {
+                    if (recovery_strategy == .reconcile_tool) {
+                        // The model wanted a tool while tools were off, so the
+                        // same request would fail the same way
+                        // (`tests/tla/agent_runtime/MalformedToolCall.tla`
+                        // ReconcileMalformedStops).
+                        debug_trace.eventf("agent", "malformed_tool_call_rejected", step_ctx, "tool_choice=none", .{});
+                        try persistRecoveryCheckpoint(
+                            deps,
+                            finalization,
+                            job,
+                            within_turn_suffix.items,
+                            stream_ctx.interruption_source_or(""),
+                            gateway_model,
+                            selected_fast_mode,
+                            attempt_fast_mode,
+                            request_recovery.attempt(),
+                            false,
+                            recovery_cause,
+                            .reconcile_tool,
+                            .uncertain,
+                            step_ctx,
+                            .keep,
+                        );
+                        try finishUncertainToolReview(
+                            deps,
+                            &request_recovery,
+                            finalization,
+                            &stream_ctx,
+                            arena,
+                            &finish_trace,
+                            types.ModelFailureDiagnostic.init("MalformedToolCallDuringReconciliation"),
+                        );
+                        return;
+                    }
+                    const malformed_evidence = settledAttemptToolEvidence(
+                        deps.tool_registry,
+                        preserved_tool_evidence,
+                        attempt_completion,
+                        attempt_disposition,
+                        &stream_ctx,
+                    );
+                    // A provider tool that does more than read may have run:
+                    // the resend below reconciles it with tools off.
+                    if (malformed_evidence != .uncertain) {
+                        malformed_tool_call_feedbacks += 1;
+                        const feedback = malformed_tool_call_feedbacks <= malformed_tool_call_max_feedbacks;
+                        const tool_name = malformedCallToolName(deps.tool_registry, attempt_completion);
+                        debug_trace.eventf("agent", if (feedback) "malformed_tool_call_feedback" else "malformed_tool_call_failed", step_ctx, "count={d} tool={s} tool_call_count={d}", .{
+                            malformed_tool_call_feedbacks,
+                            tool_name orelse "",
+                            attempt_completion.tool_calls.len,
+                        });
+                        // The streamed rows settle as calls that never ran.
+                        if (stream_ctx.saw_tool_start) recovery_has_unexecuted_tool_start = true;
+                        if (!feedback) {
+                            try finishFailedTurnWithNotice(
+                                deps,
+                                finalization,
+                                arena,
+                                job,
+                                within_turn_suffix.items,
+                                &summary_accumulator,
+                                stop_state,
+                                &finish_trace,
+                                try malformedToolCallNotice(arena, true),
+                                "malformed_tool_call",
+                            );
+                            return;
+                        }
+                        try deps.push_text(deps.ctx, .{ .operational = try malformedToolCallNotice(arena, false) });
+                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                        // The feedback stays in the turn, so a later request
+                        // in it still explains the earlier stall.
+                        try within_turn_suffix.append(arena, .{
+                            .role = .user,
+                            .content = try malformedToolCallFeedback(arena, malformed_tool_call_feedbacks, tool_name),
+                            .recovery_prompt = true,
+                        });
+                        preserved_tool_evidence = malformed_evidence;
+                        recovery_strategy = null;
+                        recovery_cause = cause;
+                        reset_stream_for_next_attempt = true;
+                        continue;
+                    }
+                }
                 if (retries) {
                     const failure_tool_evidence = settledAttemptToolEvidence(
+                        deps.tool_registry,
                         preserved_tool_evidence,
                         attempt_completion,
                         attempt_disposition,
@@ -9433,7 +9791,7 @@ fn processQueuedPromptLoop(
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
-                        if (recovery_strategy == .regenerate_tool) {
+                        if (resendFollowsUnexecutedCalls(recovery_strategy)) {
                             recovery_has_unexecuted_tool_start = true;
                         }
                         reset_stream_for_next_attempt = true;
@@ -10175,9 +10533,13 @@ fn processQueuedPromptLoop(
                         arena,
                         context,
                     );
+                    // The reply stays in the turn, and the hook's message
+                    // follows it as fx's own: the saved turn keeps it
+                    // (`recovery_prompt`) where the request carried it.
                     try within_turn_suffix.append(arena, .{
                         .role = .user,
                         .content = synthetic,
+                        .recovery_prompt = true,
                     });
                     continue;
                 },
@@ -12621,11 +12983,12 @@ fn processQueuedPromptLoop(
                 result_commit_pending = false;
             }
             replay_handed_off = true;
+            // The notice joins the turn when the step's results are in, as
+            // steering the saved turn restores there, and the step's notes
+            // join before it at the next step (`insertBoundaryNotes`), so the
+            // saved turn matches the request.
             if (execution.system_notice) |notice| {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = notice,
-                });
+                try runtime_tool_batch.appendToolNotice(arena, &step_batch, notice);
             }
             if (execution.interactive_notice) |notice| {
                 if (deps.push_interactive_notice) |push_notice| {
@@ -12884,9 +13247,13 @@ fn processQueuedPromptLoop(
                         arena,
                         context,
                     );
+                    // The reply stays in the turn, and the hook's message
+                    // follows it as fx's own: the saved turn keeps it
+                    // (`recovery_prompt`) where the request carried it.
                     try within_turn_suffix.append(arena, .{
                         .role = .user,
                         .content = synthetic,
+                        .recovery_prompt = true,
                     });
                     continue;
                 },
