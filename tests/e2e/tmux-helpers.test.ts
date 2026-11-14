@@ -25,6 +25,7 @@ import {
   buildObservedCommand,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
+  localCreditsEnv,
   paneExitMatches,
   parseSingleChildPid,
   TmuxSession,
@@ -283,10 +284,13 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     expect(existsSync(resultPath)).toBe(true);
     const observed = JSON.parse(readFileSync(resultPath, "utf8"));
     expect(observed.AI_GATEWAY_API_KEY).toBe(explicitCredential);
-    // A key the test sets itself is kept; every other stale one is gone.
+    // A key the test sets itself is kept; every other stale one is gone. The
+    // Token Pass check's credits URL is the harness's closed loopback port,
+    // never a stale one.
     expect(observed.FX_RECORD_INPUT).toBe(explicitRecordInput);
+    expect(observed.FX_TEST_GATEWAY_CREDITS_URL).toBe(localCreditsEnv({}).FX_TEST_GATEWAY_CREDITS_URL);
     for (const key of ISOLATED_KEYS) {
-      if (key === "AI_GATEWAY_API_KEY" || key === "FX_RECORD_INPUT") continue;
+      if (key === "AI_GATEWAY_API_KEY" || key === "FX_RECORD_INPUT" || key === "FX_TEST_GATEWAY_CREDITS_URL") continue;
       expect(observed[key], `${key} reached the pane`).toBeNull();
     }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const jwt_claims = @import("jwt_claims.zig");
 const credentials = @import("credentials.zig");
 const browser_callback = @import("browser_callback.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -667,21 +668,8 @@ fn chatGptRefreshRequiresSignIn(body: []const u8) bool {
 }
 
 fn accessTokenExpiresAtMs(alloc: Allocator, token: []const u8) !i64 {
-    var parts = std.mem.splitScalar(u8, token, '.');
-    _ = parts.next() orelse return error.InvalidChatGptAccessToken;
-    const payload = parts.next() orelse return error.InvalidChatGptAccessToken;
-    _ = parts.next() orelse return error.InvalidChatGptAccessToken;
-    if (parts.next() != null) return error.InvalidChatGptAccessToken;
-    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch
-        return error.InvalidChatGptAccessToken;
-    const decoded = try alloc.alloc(u8, decoded_len);
-    defer alloc.free(decoded);
-    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch
-        return error.InvalidChatGptAccessToken;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, decoded, .{}) catch
-        return error.InvalidChatGptAccessToken;
+    var parsed = try accessTokenClaims(alloc, token);
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidChatGptAccessToken;
     const exp = parsed.value.object.get("exp") orelse return error.InvalidChatGptOAuthResponse;
     if (exp != .integer or exp.integer <= 0) return error.InvalidChatGptOAuthResponse;
     return std.math.mul(i64, exp.integer, std.time.ms_per_s) catch
@@ -766,27 +754,19 @@ fn requestAcceptedWithBounds(
 }
 
 pub fn extractAccountId(alloc: Allocator, token: []const u8) ![]u8 {
-    var parts = std.mem.splitScalar(u8, token, '.');
-    _ = parts.next() orelse return error.InvalidChatGptAccessToken;
-    const payload = parts.next() orelse return error.InvalidChatGptAccessToken;
-    _ = parts.next() orelse return error.InvalidChatGptAccessToken;
-    if (parts.next() != null) return error.InvalidChatGptAccessToken;
-
-    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch
-        return error.InvalidChatGptAccessToken;
-    const decoded = try alloc.alloc(u8, decoded_len);
-    defer alloc.free(decoded);
-    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch
-        return error.InvalidChatGptAccessToken;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, decoded, .{}) catch
-        return error.InvalidChatGptAccessToken;
+    var parsed = try accessTokenClaims(alloc, token);
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidChatGptAccessToken;
     const claim = parsed.value.object.get(jwt_auth_claim) orelse return error.InvalidChatGptAccessToken;
     if (claim != .object) return error.InvalidChatGptAccessToken;
     return dupeRequiredString(alloc, claim.object, "chatgpt_account_id") catch
         return error.InvalidChatGptAccessToken;
+}
+
+fn accessTokenClaims(alloc: Allocator, token: []const u8) !std.json.Parsed(std.json.Value) {
+    return jwt_claims.parse(alloc, token) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidJwt => error.InvalidChatGptAccessToken,
+    };
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {

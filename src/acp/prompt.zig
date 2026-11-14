@@ -11,6 +11,7 @@ const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const token_pass = @import("../core/gateway/token_pass.zig");
+const token_pass_team = @import("../core/gateway/token_pass_team.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -1439,9 +1440,10 @@ fn maybeStartAcpTitleTask(
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
     const provider_title_model = bundle.title_model orelse return;
-    // A Token Pass session titles itself with a Token Pass model.
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model.
     const title_model = if (session.provider == .gateway)
-        token_pass.modelForSideCall(.title, session.model, provider_title_model)
+        token_pass_team.modelForSideCall(.title, session.model, provider_title_model)
     else
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
