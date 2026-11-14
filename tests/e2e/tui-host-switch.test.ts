@@ -3353,9 +3353,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   // test decides: `again` holds main's, `typed` fails the user's. `run` starts
   // once `broken` and `fine` have ended and `cut` still works.
   async function withEndedSubagents(
-    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held> }, reports: () => ReportSeen[]) => Promise<void>,
+    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held> }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
+    options: { trace?: boolean } = {},
   ) {
     const gates = { cut: held(), again: held() };
+    // With `trace`, fx writes its trace log, which `run` reads as its last argument.
+    let tracePath = "";
+    const env: Record<string, string> = {};
+    const trace = () => (tracePath && existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
     // The reports main has been told of, by the work they end.
     const reported = new Map<string, ReportSeen>();
     const steps = { broken: 0, typed: 0 };
@@ -3417,8 +3422,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           throw new Error(`${(error as Error).message}: main was told of ${JSON.stringify([...reported.values()])}`);
         }
         await session.waitForComposer(30_000);
-        await run(session, context, gates, () => [...reported.values()]);
-      });
+        await run(session, context, gates, () => [...reported.values()], trace);
+      }, (home) => {
+        if (!options.trace) return;
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
     } finally {
       gates.cut.release();
       gates.again.release();
@@ -3479,6 +3488,62 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(outcomeOf("cut")).toBe("cancelled");
         expect(outcomeOf("fine")).toBe("completed");
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a failed or stopped row that a search finds keeps its label when a held Backspace clears the search and goes on, and nothing closes",
+    async () => {
+      await withEndedSubagents(async (session, _context, _gates, _reports, trace) => {
+        // `broken` failed, `fine` completed, and `cut` works. A search that
+        // only `broken` matches leaves it as the one row, still `failed`.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendLiteral("bro");
+        const found = await session.waitForPane((pane) => composerContains(pane, "bro") && pane.includes("Agents 1")
+          && subagentRow("broken", "failed").test(pane), 10_000);
+        expect(found).not.toContain("delete close");
+        // Three presses empty the search and four more follow, as a held key
+        // repeats, with no other key between.
+        await session.sendKeys(held_key("BSpace", 7));
+        await until("the held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 4 || trace().includes("agents_menu_close_armed"));
+        const failed = await paneAtRest(session);
+        expect(composerContains(failed, "bro")).toBe(false);
+        expect(failed).toContain("Agents 4");
+        // `cut` still works, so it sorts above the two that ended.
+        expectRowOrder(failed, mainRow(), subagentRow("cut", "working"), subagentRow("broken", "failed"), subagentRow("fine", "idle"));
+        expect(failed).not.toContain("press delete again");
+        expect(failed).toContain("delete close");
+        expect(eventCount(trace(), "agents_menu_close_ignored")).toBe(4);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+
+        // The same for a row the user stopped: `cut` is the one row its
+        // search leaves, still `stopped`, and the presses past the end of
+        // the search leave it alone.
+        await stopCut(session);
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendLiteral("cut");
+        const stopped = await session.waitForPane((pane) => composerContains(pane, "cut") && pane.includes("Agents 1")
+          && subagentRow("cut", "stopped").test(pane), 10_000);
+        expect(stopped).not.toContain("delete close");
+        await session.sendKeys(held_key("BSpace", 7));
+        await until("the second held Backspace to be handled", () =>
+          eventCount(trace(), "agents_menu_close_ignored") >= 8 || trace().includes("agents_menu_close_armed"));
+        const after = await paneAtRest(session);
+        expect(composerContains(after, "cut")).toBe(false);
+        expect(after).toContain("Agents 4");
+        expectRowOrder(after, mainRow(), subagentRow("broken", "failed"), subagentRow("fine", "idle"), subagentRow("cut", "stopped"));
+        expect(after).not.toContain("press delete again");
+        expect(after).toContain("delete close");
+        const log = trace();
+        expect(log).not.toContain("agents_menu_close_armed");
+        expect(log).not.toContain("subagent_closed");
+        expect(eventCount(log, "agents_menu_close_ignored")).toBe(8);
+      }, { trace: true });
     },
     TIMEOUT,
   );
