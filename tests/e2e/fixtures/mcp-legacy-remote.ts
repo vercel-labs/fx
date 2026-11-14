@@ -32,6 +32,9 @@ type StreamableMode =
   | "hold_initialize"
   | "hold_initialized"
   | "stall_call"
+  | "refused_json_body"
+  | "refused_sse_no_id"
+  | "refused_sse_readable_id"
   | "expire_session"
   | "elicitation_form"
   | "elicitation_url"
@@ -101,6 +104,10 @@ export function startLegacyStreamableHttpFixture(
 
   const server = Bun.serve({
     port: 0,
+    // Bun closes a connection that is quiet for 10 s. fx would then see "the server went away" at
+    // about 12 s, which hides the grace: the call ends there, long before the 30 s it is meant to
+    // wait. The refused modes hold their stream open for the grace, as a working server would.
+    idleTimeout: mode.startsWith("refused_") ? 0 : undefined,
     async fetch(request) {
       const url = new URL(request.url);
       const headers = Object.fromEntries(request.headers.entries());
@@ -626,6 +633,35 @@ export function startLegacyStreamableHttpFixture(
                     }\n\n`,
                   ),
                 );
+              },
+              cancel() {
+                cancelledCalls += 1;
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        // A reply fx refuses: a JSON body with bytes that are not UTF-8, or an SSE event with such
+        // bytes and its id last (it names no request fx can read) or with a readable id and a
+        // jsonrpc that is not "2.0". The stream stays open, as a server that is still working would.
+        if (mode === "refused_json_body" || mode === "refused_sse_no_id" || mode === "refused_sse_readable_id") {
+          const id = message!.id;
+          const encoder = new TextEncoder();
+          const bad = mode === "refused_sse_readable_id"
+            ? encoder.encode(JSON.stringify({ jsonrpc: "1.0", id, result: {} }))
+            : new Uint8Array([
+              ...encoder.encode('{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x'),
+              0xff,
+              0xfe,
+              ...encoder.encode(`"}]},"id":${id}}`),
+            ]);
+          if (mode === "refused_json_body") {
+            return new Response(bad, { headers: { "content-type": "application/json" } });
+          }
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new Uint8Array([...encoder.encode("data: "), ...bad, ...encoder.encode("\n\n")]));
               },
               cancel() {
                 cancelledCalls += 1;

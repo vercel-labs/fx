@@ -110,7 +110,8 @@ type RootOptions = {
     | "startup_exit_after_delay"
     | "startup_garbage"
     | "exit_after_result"
-    | "typed_arguments";
+    | "typed_arguments"
+    | "refused_reply";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
   /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
@@ -134,6 +135,16 @@ type RootOptions = {
   resourceTtlMs?: number;
   captureEnvironment?: boolean;
   image?: Buffer;
+  /** For mode "refused_reply": what the server does with each tools/call, in order. */
+  refused?: { calls: RefusedCall[] };
+};
+
+/** A line fx refuses and cannot attach to a call, then what the server does (mcp-legacy-stdio.mjs says). */
+type RefusedCall = {
+  bad?: "utf8_last" | "deep_last" | "garbage" | "cut";
+  then?: "silent" | "exit";
+  slowMs?: number;
+  progressEveryMs?: number;
 };
 
 function createRoot(
@@ -214,6 +225,7 @@ function createRoot(
               options.legacyRejectNewerInitialize ? "1" : undefined,
             FX_MCP_DRAFT7_PATTERN: options.draft7Pattern,
             FX_MCP_URL_REQUIRED_OPERATION: options.urlRequiredOperation,
+            FX_MCP_REFUSED: options.refused ? JSON.stringify(options.refused) : undefined,
             FX_MCP_ENV_CAPTURE: options.captureEnvironment
               ? environmentCapturePath
               : undefined,
@@ -289,6 +301,39 @@ function startToolGateway(finalText: string) {
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
   });
+}
+
+/**
+ * One `fx ask` against the legacy fixture in refused_reply mode, with its own root, gateway and
+ * clean-up so that several can run at once. The model calls the tool once per entry in `calls`.
+ */
+async function askRefused(label: string, calls: RefusedCall[], timeoutMs = 75_000) {
+  const root = createRoot(label, LEGACY_FIXTURE, { mode: "refused_reply", refused: { calls } });
+  const ids = calls.map((_, index) => `call_mcp${index === 0 ? "" : index + 1}`);
+  const activeGateway = startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    ...ids.map((id) => fakeGatewayToolCall(id, "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } })),
+    fakeGatewayFinalText("Refused reply complete."),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const started = Date.now();
+  try {
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the refused-reply fixture."],
+      { cwd: root.workspace, env: fixtureEnv(root, activeGateway), timeoutMs },
+    );
+    const body = activeGateway.requests.at(-1)?.body ?? "";
+    return {
+      code: result.code,
+      seconds: (Date.now() - started) / 1000,
+      requests: activeGateway.requests.length,
+      results: activeGateway.requests.length === ids.length + 2 ? ids.map((id) => toolResultText(body, id)) : [],
+      wire: existsSync(root.wireLogPath) ? readWire(root.wireLogPath) : [],
+      trace: existsSync(root.traceLogPath) ? readFileSync(root.traceLogPath, "utf8") : "",
+    };
+  } finally {
+    activeGateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
 }
 
 function writeFakeUrlOpeners(directory: string, script: string): void {
@@ -2370,6 +2415,75 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
     await expectFixtureProcessesExited(wire);
   }, 30_000);
+
+  test("fx ask ends a call that a refused line leaves silent 30 seconds later, as malformed, and cancels it; one that shows progress, or starts after the line, goes on", async () => {
+    // Each server writes a line fx refuses and cannot attach to the call (its id comes after the
+    // bad part, or it has none), then says nothing. Until now fx waited out the operation timeout,
+    // 5 minutes by default, and then said that the server did not answer.
+    const variants: Array<[string, RefusedCall]> = [
+      ["bytes that are not UTF-8, the id after them", { bad: "utf8_last", then: "silent" }],
+      ["JSON nested past the engine's limit, the id last", { bad: "deep_last", then: "silent" }],
+      ["a line with no JSON in it", { bad: "garbage", then: "silent" }],
+    ];
+    // All of them at once, so the test takes as long as its slowest wait, not their sum.
+    const [runs, progress, later] = await Promise.all([
+      Promise.all(variants.map(([, spec], index) => askRefused(`refused-grace-${index}`, [spec]))),
+      // The line, then 36 s of work with progress for the call's own token: the grace is cleared.
+      askRefused("refused-progress", [{ bad: "garbage", slowMs: 36_000, progressEveryMs: 4_000 }]),
+      // The first call ends at once; the second starts after the line and is slow with no
+      // progress at all: it gets no grace, so it returns its result after 36 s.
+      askRefused("refused-later", [{ bad: "garbage" }, { slowMs: 36_000 }]),
+    ]);
+    for (const [index, run] of runs.entries()) {
+      const what = variants[index]![0];
+      expect({ what, code: run.code, requests: run.requests }).toEqual({ what, code: 0, requests: 3 });
+      expect({ what, text: run.results[0] }).toEqual({
+        what,
+        text: expect.stringContaining("the server's answer was malformed"),
+      });
+      expect(run.results[0]).not.toContain("operation timeout");
+      // About 30 s after the line: not at once, and nowhere near the 300 s default.
+      expect({ what, late: run.seconds > 28, early: run.seconds < 55 }).toEqual({ what, late: true, early: true });
+      const call = run.wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+      const cancelled = run.wire.find((entry) => entry.message.method === "notifications/cancelled");
+      expect({ what, cancelled: cancelled?.message.params?.requestId }).toEqual({ what, cancelled: call?.message.id });
+      // The debug trace says what ended the call and how long the line was. Nothing of the line.
+      expect({ what, line: run.trace.match(/MCP call ended server=fixture transport=stdio code=malformed reason=unreadable_line bytes=\d+/)?.[0] }).toEqual({
+        what,
+        line: expect.stringContaining("code=malformed"),
+      });
+      for (const text of ["xxxxxxxxxxxxxxxxxxxx", '"jsonrpc"', "structuredContent", '{"a":{"a":']) {
+        expect({ what, text, traced: run.trace.includes(text) }).toEqual({ what, text, traced: false });
+      }
+    }
+    // A call that showed progress, or started after the line, was not ended: no such line.
+    expect(progress.trace).not.toContain("code=malformed");
+    expect(later.trace).not.toContain("code=malformed");
+    expect({ code: progress.code, requests: progress.requests }).toEqual({ code: 0, requests: 3 });
+    expect(progress.results[0]).toContain(LEGACY_RESULT);
+    expect(progress.seconds).toBeGreaterThan(33);
+    expect({ code: later.code, requests: later.requests }).toEqual({ code: 0, requests: 4 });
+    expect(later.results[0]).toContain(LEGACY_RESULT);
+    expect(later.results[1]).toContain(LEGACY_RESULT);
+    expect(later.results[1]).not.toContain("malformed");
+    expect(later.seconds).toBeGreaterThan(33);
+  }, 90_000);
+
+  test("fx ask still returns a valid reply that follows a refused line inside the grace, and ends at once when the server exits", async () => {
+    const [late, notified, cut] = await Promise.all([
+      askRefused("refused-valid-late", [{ bad: "utf8_last", slowMs: 3_000 }], 30_000),
+      askRefused("refused-notification", [{ bad: "garbage" }], 30_000),
+      askRefused("refused-cut", [{ bad: "cut", then: "exit" }], 30_000),
+    ]);
+    for (const run of [late, notified]) {
+      expect({ code: run.code, requests: run.requests }).toEqual({ code: 0, requests: 3 });
+      expect(run.results[0]).toContain(LEGACY_RESULT);
+      expect(run.seconds).toBeLessThan(20);
+    }
+    expect({ code: cut.code, requests: cut.requests }).toEqual({ code: 0, requests: 3 });
+    expect(cut.results[0]).toContain("the server went away");
+    expect(cut.seconds).toBeLessThan(20);
+  }, 60_000);
 
   test.skipIf(!tmuxAvailable())(
     "the TUI calls the modern stdio fixture through the shared runtime",

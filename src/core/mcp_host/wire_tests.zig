@@ -258,3 +258,108 @@ fn expectFuzzMethod(line: []const u8, method: []const u8) !void {
     try testing.expect(@intFromPtr(method.ptr) > @intFromPtr(line.ptr));
     try testing.expectEqual(@as(u8, '"'), (method.ptr - 1)[0]);
 }
+
+// ---- the grace for a refused line that names no request ----
+//
+// `src/mcp/core/request.zig` holds the rules, and `tests/tla/mcp/Request.tla` states them.
+
+test "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed" {
+    try testing.fuzz({}, fuzzGrace, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_request_grace.*),
+    });
+}
+
+/// Each byte is one step: its last decimal digit picks the step and the rest picks a request, so a
+/// saved input reads as a short script. 0 to 2 send a normal request, initialize or a listen; 3 is a
+/// refused line that names no request; 4 fires a grace timer; 5 answers a request; 6 is progress;
+/// 7 fires a request's idle timer; 8 cancels; 9 loses the transport.
+fn fuzzGrace(_: void, smith: *testing.Smith) !void {
+    const request = mcp.core.request;
+    var slots: [4]request.Slot = undefined;
+    var table: request.Table = .init(&slots, .{ .refused_ms = 30_000 });
+    var out: request.Output = .{};
+    var raw: [160]u8 = undefined;
+    const len = smith.slice(&raw);
+    // What the rules say each request holds, by id: a grace, or an ending already delivered.
+    var armed: [256]bool = @splat(false);
+    var ended: [256]bool = @splat(false);
+    var kinds: [256]request.Kind = @splat(.normal);
+    var timers: [16]request.Timer = undefined;
+    var timer_count: usize = 0;
+
+    for (raw[0..len]) |byte| {
+        const pick = byte % 10;
+        const arg: request.Id = byte / 10 % 8;
+        var fresh: usize = 0;
+        var was_progress: u32 = 0;
+        const index = @min(arg + 1, 255);
+        switch (pick) {
+            0, 1, 2 => {
+                const kind: request.Kind = switch (pick) {
+                    0 => .normal,
+                    1 => .initialize,
+                    else => .listen,
+                };
+                table.step(.{ .send = kind }, &out) catch |err| switch (err) {
+                    error.TooManyInFlight => continue,
+                    else => return err,
+                };
+                const id = out.effects()[0].write_request.id;
+                kinds[@intCast(id)] = kind;
+            },
+            3 => {
+                for (table.slots) |slot| fresh += @intFromBool(slot.used and slot.kind == .normal and !armed[@intCast(slot.id)]);
+                try table.step(.refused_line, &out);
+                // One timer covers every request the line finds without a grace, and none when it finds none.
+                var arms: usize = 0;
+                for (out.effects()) |effect| switch (effect) {
+                    .arm_timer => |arm| arms += @intFromBool(arm.timer.kind == .refused),
+                    else => {},
+                };
+                try testing.expectEqual(@as(usize, @intFromBool(fresh > 0)), arms);
+                for (table.slots) |slot| if (slot.used and slot.kind == .normal) {
+                    armed[@intCast(slot.id)] = true;
+                };
+            },
+            4 => {
+                if (timer_count == 0) continue;
+                try table.step(.{ .timer_fired = timers[@intCast(arg % timer_count)] }, &out);
+            },
+            5 => try table.step(.{ .response_received = .{ .id = index, .response = .result } }, &out),
+            6 => {
+                was_progress = table.progressCount(index);
+                try table.step(.{ .progress_received = .{ .token = index, .value = @floatFromInt(arg) } }, &out);
+                // Progress that the table accepts clears the request's grace.
+                if (table.progressCount(index) != was_progress) armed[@intCast(index)] = false;
+            },
+            7 => {
+                const generation: u32 = for (table.slots) |slot| {
+                    if (slot.used and slot.id == index) break slot.idle_generation;
+                } else 1;
+                try table.step(.{ .timer_fired = .{ .id = index, .kind = .idle, .generation = generation } }, &out);
+            },
+            8 => table.step(.{ .cancel_requested = index }, &out) catch |err| switch (err) {
+                error.InitializeNotCancellable => continue,
+                else => return err,
+            },
+            else => try table.step(.{ .transport_lost = index }, &out),
+        }
+        for (out.effects()) |effect| switch (effect) {
+            .deliver => |d| {
+                const at: usize = @intCast(d.id);
+                try testing.expect(!ended[at]);
+                ended[at] = true;
+                if (d.outcome == .malformed) {
+                    try testing.expect(armed[at]);
+                    try testing.expect(kinds[at] == .normal);
+                }
+                armed[at] = false;
+            },
+            .arm_timer => |arm| if (arm.timer.kind == .refused and timer_count < timers.len) {
+                timers[timer_count] = arm.timer;
+                timer_count += 1;
+            },
+            else => {},
+        };
+    }
+}

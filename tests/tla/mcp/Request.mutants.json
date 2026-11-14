@@ -52,5 +52,65 @@
   "old": "IF id \\in ListenIds /\\ req[id] = \"inflight\"",
   "new": "IF req[id] = \"inflight\"",
   "invariant": "EndedOnlyListen"
+ },
+ {
+  "description": "The wrong request ends: another request's grace runs out and ends a listen, which never had one",
+  "old": "    /\\ Armed(id)\n    /\\ (~Timed \\/ graceDue[id] <= now)\n",
+  "new": "    /\\ \\E j \\in Ids : Armed(j) /\\ (~Timed \\/ graceDue[j] <= now)\n    /\\ id \\notin InitIds\n",
+  "invariant": "MalformedOnlyIfGraced"
+ },
+ {
+  "description": "No request ends: the grace runs out and nothing happens",
+  "old": "    /\\ Finish(id, \"malformed\")\n",
+  "new": "    /\\ FALSE\n    /\\ Finish(id, \"malformed\")\n",
+  "property": "EveryRequestEnds"
+ },
+ {
+  "description": "A request sent after a refused line gets a grace from it",
+  "old": "SendGrace(id) ==\n    /\\ graceDue' = [graceDue EXCEPT ![id] = NoTime]\n    /\\ armedEpoch' = armedEpoch\n    /\\ graceTimers' = graceTimers\n",
+  "new": "SendGrace(id) ==\n    LET late == GraceOn /\\ refusals > 0 /\\ id \\notin InitIds \\cup ListenIds\n    IN /\\ graceDue' = [graceDue EXCEPT ![id] = IF late THEN now + GraceTicks ELSE NoTime]\n       /\\ armedEpoch' = [armedEpoch EXCEPT ![id] = IF late THEN refusals ELSE NoEpoch]\n       /\\ graceTimers' = graceTimers + (IF late THEN 1 ELSE 0)\n",
+  "invariant": "NoGraceForLaterCalls"
+ },
+ {
+  "description": "A request that finishes keeps its grace (a valid reply does not clear it)",
+  "old": "    /\\ everDone' = [everDone EXCEPT ![id] = TRUE]\n    /\\ Disarm(id)\n",
+  "new": "    /\\ everDone' = [everDone EXCEPT ![id] = TRUE]\n    /\\ UNCHANGED <<graceDue, graceTimers>>\n",
+  "invariant": "GraceOnlyInFlight"
+ },
+ {
+  "description": "Progress for another request clears this request's grace",
+  "old": "refusedAt[id] # NoTime]\n    /\\ Disarm(id)\n",
+  "new": "refusedAt[id] # NoTime]\n    /\\ graceDue' = [j \\in Ids |-> NoTime]\n    /\\ graceTimers' = 0\n",
+  "invariant": "GraceClearedOnlyByOwnProgress"
+ },
+ {
+  "description": "Progress for the request's own token does not clear its grace",
+  "old": "refusedAt[id] # NoTime]\n    /\\ Disarm(id)\n",
+  "new": "refusedAt[id] # NoTime]\n    /\\ UNCHANGED <<graceDue, graceTimers>>\n",
+  "invariant": "ProgressProtects"
+ },
+ {
+  "description": "The error words carry what the server wrote",
+  "old": "    /\\ words' = [words EXCEPT ![id] = \"malformed\"]\n",
+  "new": "    /\\ words' = [words EXCEPT ![id] = \"server_text\"]\n",
+  "invariant": "WordsFixed"
+ },
+ {
+  "description": "One timer per refused line, even when every request already has a grace",
+  "old": "graceTimers' = graceTimers + Cardinality(Fresh)",
+  "new": "graceTimers' = graceTimers + 1",
+  "invariant": "TimersAreGraces"
+ },
+ {
+  "description": "A second refused line extends the grace it finds",
+  "old": "IF id \\in Fresh THEN now + GraceTicks ELSE graceDue[id]",
+  "new": "IF id \\in Pending THEN now + GraceTicks ELSE graceDue[id]",
+  "invariant": "SoonAfterRefusal"
+ },
+ {
+  "description": "initialize and listen get a grace too",
+  "old": "Pending == {id \\in Ids \\ (InitIds \\cup ListenIds) : req[id] = \"inflight\"}",
+  "new": "Pending == {id \\in Ids : req[id] = \"inflight\"}",
+  "invariant": "NoGraceForInitOrListen"
  }
 ]

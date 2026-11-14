@@ -1266,6 +1266,12 @@ pub const Runtime = struct {
                     const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
                     if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
                 }
+                // The grace of a refused line ran out: the server wrote something fx could not read
+                // and no request named it. Nothing of the line is logged, only its length.
+                if (result == .ended and result.ended.outcome == .malformed and c.refused_bytes > 0) {
+                    const s = r.resolved.servers[i];
+                    debug_trace.logf("mcp", "MCP call ended server={s} transport={s} code=malformed reason=unreadable_line bytes={d}", .{ s.name, @tagName(s.transport), c.refused_bytes });
+                }
                 if (r.holdForUrls(i, req, result)) return;
                 r.finish(req, .{ .call = result });
             },
