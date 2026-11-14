@@ -1422,8 +1422,11 @@ test "stopping a check that keeps starting processes in groups of their own leav
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
     // Each process it starts moves to a group of its own and writes its pid,
-    // like a stdio server an `fx mcp show` child starts.
-    const script = "while :; do /usr/bin/perl -e 'setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & done";
+    // like a stdio server an `fx mcp show` child starts. It starts one every
+    // 5 ms. Started as fast as the machine allows, a stop that is slow to land
+    // lets thousands start, and the load they add slows the stop and the exit
+    // of what it killed further, until the processes fill the machine's memory.
+    const script = "while :; do /usr/bin/perl -e 'setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & sleep 0.005; done";
     for (0..5) |round| {
         var waiters: std.Io.Group = .init;
         const before = try entryCount(tmp.dir);
@@ -1435,13 +1438,15 @@ test "stopping a check that keeps starting processes in groups of their own leav
             if (try entryCount(tmp.dir) > before) break true;
             io_mod.sleep(5 * std.time.ns_per_ms);
         } else false;
-        try std.testing.expect(started_one);
         io_mod.sleep((5 * round) * std.time.ns_per_ms);
         probe.stopped.store(true, .release);
         // Under load the stop can take longer than `stop_land_ms` to land,
         // which `stopTrees` allows; what it started must be gone either way.
         stopTrees(&.{probe});
         waiters.cancel(io_mod.getIo());
+        // Only after the stop, so a test that fails here does not leave the
+        // forker starting processes.
+        try std.testing.expect(started_one);
         try std.testing.expect(probe.done.load(.acquire));
     }
     // Every process any round started is gone, once the system reaps it.
