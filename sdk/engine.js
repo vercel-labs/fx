@@ -2178,13 +2178,15 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     };
   }
 
+  // The core's prompt response carries ACP's unstable `usage` names; the
+  // SDK's own result keeps its names.
   function normalizeTurnUsage(usage) {
     const result = {};
     if (Number.isSafeInteger(usage?.inputTokens)) result.inputTokens = usage.inputTokens;
     if (Number.isSafeInteger(usage?.outputTokens)) result.outputTokens = usage.outputTokens;
-    if (Number.isSafeInteger(usage?.cacheReadTokens)) result.cacheReadTokens = usage.cacheReadTokens;
-    if (Number.isSafeInteger(usage?.cacheWriteTokens)) result.cacheWriteTokens = usage.cacheWriteTokens;
-    if (Number.isSafeInteger(usage?.reasoningTokens)) result.reasoningTokens = usage.reasoningTokens;
+    if (Number.isSafeInteger(usage?.cachedReadTokens)) result.cacheReadTokens = usage.cachedReadTokens;
+    if (Number.isSafeInteger(usage?.cachedWriteTokens)) result.cacheWriteTokens = usage.cachedWriteTokens;
+    if (Number.isSafeInteger(usage?.thoughtTokens)) result.reasoningTokens = usage.thoughtTokens;
     return result;
   }
 

@@ -29,6 +29,13 @@ pub const Extension = enum {
     permission_mode,
     /// `sh.fx/modelResponseRecovery` on `session_info_update`.
     model_response_recovery,
+    /// `_sh.fx/session/turn_progress`: a running turn's phase, tokens, and
+    /// provider.
+    turn_progress,
+    /// `_sh.fx/session/model_call` for each model call that ends.
+    model_calls,
+    /// `sh.fx/usage` in the `_meta` of a `session/prompt` response.
+    usage,
 
     pub fn capabilityName(self: Extension) []const u8 {
         return switch (self) {
@@ -40,6 +47,9 @@ pub const Extension = enum {
             .tool_call => "sh.fx/toolCall",
             .permission_mode => "sh.fx/permissionMode",
             .model_response_recovery => "sh.fx/modelResponseRecovery",
+            .turn_progress => "sh.fx/turnProgress",
+            .model_calls => "sh.fx/modelCalls",
+            .usage => "sh.fx/usage",
         };
     }
 };
@@ -84,6 +94,8 @@ pub const method = struct {
     pub const journal_append = "_sh.fx/journal/append";
     pub const journal_flush = "_sh.fx/journal/flush";
     pub const hooks_event = "_sh.fx/hooks/event";
+    pub const session_turn_progress = "_sh.fx/session/turn_progress";
+    pub const session_model_call = "_sh.fx/session/model_call";
     pub const tools_call = "_sh.fx/tools/call";
 };
 

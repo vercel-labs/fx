@@ -291,6 +291,11 @@ pub const ActiveSessionState = struct {
     /// context `usage_update` reports; 0 until a completion reports both.
     /// `usize` keeps it atomic on wasm32.
     context_used: std.atomic.Value(usize) = .init(0),
+    /// The summary of the session's latest finished turn, its times and the
+    /// tokens fx counted, for that turn's response. The turn's worker writes
+    /// it and then answers the prompt (`promptWorkerMain`), so both happen on
+    /// one thread.
+    turn_summary: ?types.TurnSummary = null,
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     mode: []const u8,
@@ -394,6 +399,8 @@ pub const ServerState = struct {
     client_terminal: bool = false,
     /// The client shows ACP v1 Session Notices (`session.notices`).
     client_notices: bool = false,
+    /// The client takes ACP v1's compaction updates (`session.compaction`).
+    client_compaction: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     /// The directory `fx acp` was launched in, or `--workspace`'s: the
     /// workspace of the libfx kernel's and the web core's one session, and
@@ -3112,6 +3119,8 @@ fn publishPromptOutcome(active: *ActivePrompt, id: ?jsonrpc.RequestId, outcome: 
                 &response.writer,
                 stop_reason,
                 usage,
+                active.session.turn_summary,
+                active.state.extensions.contains(.usage),
             );
             try active.state.writer.writeResponse(active.alloc, id, response.writer.buffered());
         },
@@ -3181,6 +3190,8 @@ const InitializeRequest = struct {
     client_terminal: bool = false,
     /// The client shows ACP v1 Session Notices (`session.notices`).
     client_notices: bool = false,
+    /// The client takes ACP v1's compaction updates (`session.compaction`).
+    client_compaction: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     /// The extensions the client lists in `clientCapabilities._meta`.
@@ -3230,6 +3241,9 @@ fn parseInitializeRequest(
         // and any value v1 doesn't define, such as `false`, all mean no.
         if (session == .object) if (session.object.get("notices")) |notices| {
             request.client_notices = notices == .object;
+        };
+        if (session == .object) if (session.object.get("compaction")) |compaction| {
+            request.client_compaction = compaction == .object;
         };
     }
     if (capabilities.object.get("terminal")) |value| {
@@ -3594,6 +3608,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
     state.client_notices = request.client_notices;
+    state.client_compaction = request.client_compaction;
     state.client_elicitation = request.client_elicitation;
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
@@ -3625,9 +3640,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 /// The extensions fx lists at `initialize`. `fx acp` steers through
 /// `session/prompt`; libfx's kernel serves its host's steering, journal, and
 /// tools. Every build sends hooks, tool call identities, permission modes,
-/// and model recovery to a client that lists them.
+/// model recovery, and turn events to a client that lists them.
 fn agentExtensions(minimal_kernel: bool) sh_fx.Set {
-    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery });
+    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage });
     if (minimal_kernel) {
         set.setUnion(.initMany(&.{ .host_steering, .journal, .host_tools }));
     } else if (!host_target.is_wasm) {

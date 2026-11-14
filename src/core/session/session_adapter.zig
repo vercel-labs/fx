@@ -2939,12 +2939,15 @@ pub const Session = struct {
     };
 
     /// The replay sink behind the `visitHistory` readers: hands each turn to
-    /// the visitor, frees it, and counts it.
+    /// the visitor, frees it, and counts it. A visitor with a `compaction`
+    /// method, such as ACP's replay, hears where each compaction happened,
+    /// numbered in order from 1.
     fn VisitorSink(comptime Visitor: type, comptime at_summary: AtSummary) type {
         return struct {
             alloc: Allocator,
             visitor: Visitor,
             turns: usize = 0,
+            compactions: usize = 0,
 
             fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
                 defer types.freeHistoryTurn(sink.alloc, value);
@@ -2952,9 +2955,12 @@ pub const Session = struct {
                 try sink.visitor.append(value);
             }
 
-            fn summary(_: *@This(), _: []const u8) !void {
+            fn summary(sink: *@This(), _: []const u8) !void {
                 switch (at_summary) {
-                    .skip => {},
+                    .skip => {
+                        sink.compactions += 1;
+                        if (@hasDecl(@typeInfo(Visitor).pointer.child, "compaction")) try sink.visitor.compaction(sink.compactions);
+                    },
                     .end_cycle => return error.CycleEnd,
                 }
             }
