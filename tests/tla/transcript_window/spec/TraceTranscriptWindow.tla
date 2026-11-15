@@ -20,7 +20,7 @@ CONSTANTS MaxSeq, Ids, MaxCycles, Window, Step, Slice, MaxTokens, Saved, OnlyOld
 
 VARIABLES
     cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen,
-    paintedThrough, reprinting,
+    prevWaits, paintedThrough, reprinting,
     coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken,
     out, act,
     alive, cycleStarts, painted,
@@ -29,13 +29,13 @@ VARIABLES
 TW == INSTANCE TranscriptWindow
 
 vars == <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen,
-          paintedThrough, reprinting, coOpen, coLo, coHi, coAtStart, pending,
+          prevWaits, paintedThrough, reprinting, coOpen, coLo, coHi, coAtStart, pending,
           pendingDir, nextToken, out, act, alive, cycleStarts, painted>>
 
 Load(s) ==
     /\ cycle = s.cycle /\ cycleFirst = s.cycleFirst /\ prevFirst = s.prevFirst
     /\ nextSeq = s.nextSeq /\ savedThrough = s.savedThrough /\ live = s.live
-    /\ turnOpen = s.turnOpen /\ paintedThrough = s.paintedThrough
+    /\ turnOpen = s.turnOpen /\ prevWaits = s.prevWaits /\ paintedThrough = s.paintedThrough
     /\ reprinting = s.reprinting /\ coOpen = s.coOpen /\ coLo = s.coLo
     /\ coHi = s.coHi /\ coAtStart = s.coAtStart /\ pending = s.pending
     /\ pendingDir = s.pendingDir /\ nextToken = s.nextToken /\ out = s.out
@@ -45,7 +45,7 @@ Load(s) ==
 LoadNext(s) ==
     /\ cycle' = s.cycle /\ cycleFirst' = s.cycleFirst /\ prevFirst' = s.prevFirst
     /\ nextSeq' = s.nextSeq /\ savedThrough' = s.savedThrough /\ live' = s.live
-    /\ turnOpen' = s.turnOpen /\ paintedThrough' = s.paintedThrough
+    /\ turnOpen' = s.turnOpen /\ prevWaits' = s.prevWaits /\ paintedThrough' = s.paintedThrough
     /\ reprinting' = s.reprinting /\ coOpen' = s.coOpen /\ coLo' = s.coLo
     /\ coHi' = s.coHi /\ coAtStart' = s.coAtStart /\ pending' = s.pending
     /\ pendingDir' = s.pendingDir /\ nextToken' = s.nextToken /\ out' = s.out
@@ -81,6 +81,7 @@ NoReadWhenUnsaved == TW!NoReadWhenUnsaved
 RecoveredFromLog == TW!RecoveredFromLog
 DropBetweenTurns == TW!DropBetweenTurns
 ScreenHoldsHeld == TW!ScreenHoldsHeld
+PreviousWaitsForTurnEnd == TW!PreviousWaitsForTurnEnd
 PaintedOnce == TW!PaintedOnce
 ReadBounded == TW!ReadBounded
 UpdateIsLocal == TW!UpdateIsLocal

@@ -35,7 +35,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -2960,8 +2960,13 @@ const isReportTurn = (body: string) => {
 
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
-  const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      // A report that arrives while the parent's first turn runs joins that
+      // turn, so the child answers only once that turn is saved.
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayFinalText("CHILD_ANSWER_5521");
+    }
     if (isReportTurn(body)) {
       expect(body).toContain("CHILD_ANSWER_5521");
       return fakeGatewayFinalText("PARENT_DONE");
@@ -4240,6 +4245,48 @@ test("doctor reports a session whose blob went missing, and recover copies the t
   }
 }, TIMEOUT * 3);
 
+test("plain doctor only checks that each blob is there, --deep reads it, and the time limit is reported", async () => {
+  const fixture = createFixture("fx-v2-doctor-deep-");
+  const big = "DEEP_BLOB_START " + "blob-body ".repeat(30_000) + "DEEP_BLOB_END";
+  const gateway = startFakeGateway([fakeGatewayFinalText(big), fakeGatewayFinalText("DEEP_TURN_TWO")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Deep question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Deep question two."])).code).toBe(0);
+    const [name] = blobNames(fixture, id);
+    expect(name).toBeDefined();
+    // Other bytes under the blob's name: the file is there, but its hash no
+    // longer matches.
+    const blob = join(storeRoot(fixture.home), id, "blobs", name!);
+    const bytes = Buffer.from(readFileSync(blob));
+    bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+    rmSync(blob);
+    writeFileSync(blob, bytes, { mode: 0o400 });
+    const damaged = `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`;
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+
+    const plain = await command(fixture, gateway, ["doctor", "--json"]);
+    expect(plain.stderr).toBe("");
+    expect(named(JSON.parse(plain.stdout).checks, "session")).toEqual([]);
+    const deep = await command(fixture, gateway, ["doctor", "--json", "--deep"]);
+    expect(deep.stderr).toBe("");
+    expect(named(JSON.parse(deep.stdout).checks, "session")).toEqual([damaged]);
+
+    // With a limit already over before the session check starts, plain
+    // doctor says what it did not check, and --deep, which has no limit,
+    // still checks it.
+    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "0" }, timeoutMs: TIMEOUT };
+    const cut = JSON.parse((await runFx(["doctor", "--json"], limited)).stdout).checks;
+    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 0 s limit; fx doctor --deep checks them all");
+    expect(named(cut, "session")).toEqual([]);
+    const whole = JSON.parse((await runFx(["doctor", "--json", "--deep"], limited)).stdout).checks;
+    expect(named(whole, "sessions").filter((line) => line.includes("not checked"))).toEqual([]);
+    expect(named(whole, "session")).toEqual([damaged]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 // ---------------------------------------------------------------------------
 // Flows v1's suites check only through v1 files: a blob-sized piece, a
 // compacted app session, steering and cancelling an app turn.
@@ -4607,7 +4654,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     held.release("HELD_CHILD_RESULT");
     const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
-    expect(reported).toContain("worker completed");
+    expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
     // The report's turn: its tool call, then its reply.
     expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
@@ -5080,6 +5127,9 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
   const alive = (pid: number) => {
+    // Signal 0 to pid 0 or below reaches a whole process group, which is
+    // always alive, so only a real pid can be checked.
+    if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
     try {
       process.kill(pid, 0);
       return true;
@@ -5094,7 +5144,16 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const id = onlySessionId(fixture.home);
     await waitForLog(fixture, id, "turn_committed");
-    const shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid);
+    // The run returned at once, so the record may not hold the shell's pid
+    // until the shell has started.
+    let shellPid = 0;
+    const pidDeadline = Date.now() + TIMEOUT;
+    while (Date.now() < pidDeadline) {
+      shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid ?? 0);
+      if (shellPid > 0) break;
+      await Bun.sleep(10);
+    }
+    expect(shellPid).toBeGreaterThan(0);
     expect(alive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
@@ -5348,9 +5407,12 @@ const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost,
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  // The app's pattern leaves out the terminal recording's line, which names
+  // the same fault: a recording that started on the full disk is a leak from
+  // the environment, not the session's refusal this row checks.
   full: REAL_FULL_DISK
-    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
-    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|(?<!terminal recording: )the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|(?<!terminal recording: )a file-size limit was reached/, acp: /a file-size limit was reached/ },
 };
 
 /// A first reply over the blob limit, so every base session has a blob.

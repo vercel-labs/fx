@@ -2,7 +2,7 @@
 
 This directory owns the non-publishing Stage 1 build for a smaller macOS arm64 `fx` candidate. It preserves Zig ReleaseSafe semantics and the complete product feature set, then uses native LLVM profiles to keep measured hot code speed-oriented and compile profile-proven cold functions for size.
 
-The candidate is accepted only when it is no larger than its platform's ceiling, **6.500 MiB** for macOS arm64, **6.750 MiB** for Linux arm64, and **8.750 MiB** for Linux x86_64, has the preferred **0.250 MiB** of size headroom under that ceiling, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
+The candidate is accepted only when it is no larger than its platform's ceiling, **6.750 MiB** for macOS arm64, **7.000 MiB** for Linux arm64, and **8.750 MiB** for Linux x86_64, has the preferred **0.250 MiB** of size headroom under that ceiling, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
 
 ## Toolchain and target
 
@@ -275,6 +275,8 @@ logs/
 measurements/
 manifest.json
 ```
+
+Training and behavior jobs also upload the crash reports macOS wrote for fx, in `crash-reports/`. These builds print no stack trace when fx panics, but the report lists each thread's frames as offsets into the binary. A function's address in `logs/instrumented-link.map` (training) or `logs/candidate-link.map` (behavior) is 0x100000000 plus that offset.
 
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 

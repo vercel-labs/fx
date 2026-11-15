@@ -1121,10 +1121,11 @@ describe("modern MCP stdio compatibility", () => {
         { text: "later" },
       ]);
 
-      // Each turn's tool group counts its MCP call as one, never as a command.
+      // Each turn's tool group names its MCP call as MCP work, never as a
+      // command.
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain("1 MCP call");
-      expect(scrollback).not.toMatch(/\b\d+ commands?\b/);
+      expect(scrollback).toContain("● Used an MCP tool");
+      expect(scrollback).not.toMatch(/\b\d+ commands?\b|\b[Rr]an (a )?commands?\b/);
       expect(scrollback).not.toContain("not selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -1639,6 +1640,38 @@ describe("modern MCP stdio compatibility", () => {
     );
     await expectFixtureProcessesExited(wire);
   }, 30_000);
+
+  for (const retriedLimit of [40, "forty"]) {
+    test(`a 2026 server that refuses a call's arguments with -32602 still answers the next call (${JSON.stringify(retriedLimit)})`, async () => {
+      const root = createRoot("typed-arguments-refused", MODERN_FIXTURE, { mode: "typed_arguments" });
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+        // Text that is not a number stays text, so the server refuses it.
+        fakeGatewayToolCall("refused_call", "toolbox", { run: TOOL_NAME, arguments: { limit: "forty" } }),
+        fakeGatewayToolCall("retried_call", "toolbox", { run: TOOL_NAME, arguments: { limit: retriedLimit } }),
+        fakeGatewayFinalText("Refused MCP arguments complete."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+      );
+
+      const wire = readWire(root.wireLogPath);
+      expect(result.code).toBe(0);
+      expect(toolResultText(gateway.requests[2]!.body, "refused_call")).toContain("-32602");
+      const retried = toolResultText(gateway.requests[3]!.body, "retried_call");
+      expect(retried).toContain(retriedLimit === 40 ? "TYPED_ARGUMENTS_OK" : "-32602");
+      expect(retried).not.toContain("unavailable");
+      // The refusal is about the arguments, so fx keeps the 2026 session.
+      expect(wire.filter((entry) => entry.message.method === "initialize")).toHaveLength(0);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(2);
+      expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
 
   test("typed MCP arguments the model wrote as text reach the server as their schema's types", async () => {
     const root = createRoot("typed-arguments-repaired", MODERN_FIXTURE, { mode: "typed_arguments" });
@@ -2410,13 +2443,15 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the failing MCP fixture once.");
+      // The failed call's reason follows its row on the same line.
       await tui.waitForText(
-        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`,
+        " · Invalid input: labels require at least one item retry rejected",
         20_000,
       );
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`└ Couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -2437,8 +2472,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   test.skipIf(!tmuxAvailable())(
     "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
     async () => {
-      // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx
-      // negotiate the protocol again.
+      // A 2025 server, as Datadog's is. A 2026 server's -32602 on a call keeps its
+      // session ("a 2026 server that refuses a call's arguments with -32602 still
+      // answers the next call" in this file).
       const root = createRoot("tui-invalid-params", LEGACY_FIXTURE, {
         mode: "invalid_params",
         legacyVersion: "2025-06-18",
@@ -2459,8 +2495,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the MCP fixture with a typed argument.");
       const cause = "arguments rejected: limit is a string, the schema wants a number";
-      await tui.waitForText(`Failed ${TOOL_NAME}: ${cause}`, 20_000);
+      // The row names the failed call, and the cause follows it on its line.
+      await tui.waitForText(cause, 20_000);
       await tui.waitForText("Rejected arguments complete.", 20_000);
+      expect(await tui.captureFullScrollback()).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
 
@@ -4517,7 +4555,7 @@ describe("fx mcp call", () => {
       await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The rows a direct call of the tool gets, in the command's group.
-      expect(scrollback).toContain("● 4 tool calls · 3 MCP calls · 1 command");
+      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
       expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
       expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
       expect(scrollback).not.toContain("Running MCP");

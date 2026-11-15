@@ -2561,6 +2561,284 @@ fn expectReminderOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, ru
     try std.testing.expect(std.mem.endsWith(u8, output, line));
 }
 
+test "a tool's notice raised by the first of two results keeps the second result in the saved turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Done" } };
+    const notice = "notice from the first call";
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output", .system_notice = notice } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    hooks.permission_feedback = &.{ "", "typed feedback" };
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The request carries both results and the feedback before the notice.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "typed feedback", notice });
+
+    // The save keeps both results and the feedback, and the notice after them.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps[0].tool_results.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+
+    // The next turn's request opens with that whole request.
+    var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_job = fixture.job();
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+    try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+    try test_support.expectPromptExtends(gateway.request_bodies.items[1], next_gateway.request_bodies.items[0]);
+}
+
+test "a tool's notice follows the rules its step delivered, and the next turn extends the request (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/a.txt", .data = "a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/b.txt", .data = "b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/plain.txt", .data = "p" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+
+    // A step's notes come before its steering at the boundary, so the notice
+    // comes after the rules whichever call raises which.
+    const Case = struct {
+        name: []const u8,
+        first_path: []const u8,
+        second_path: []const u8,
+        notice_on_second: bool,
+        feedback: []const []const u8 = &.{},
+    };
+    const cases = [_]Case{
+        .{ .name = "rules from the first call, notice from the second", .first_path = "nested/a.txt", .second_path = "plain.txt", .notice_on_second = true },
+        .{ .name = "notice from the first call, rules from the second", .first_path = "plain.txt", .second_path = "nested/b.txt", .notice_on_second = false },
+        .{ .name = "rules and notice from one call", .first_path = "nested/a.txt", .second_path = "plain.txt", .notice_on_second = false },
+        .{ .name = "with permission feedback on the second call", .first_path = "nested/a.txt", .second_path = "plain.txt", .notice_on_second = true, .feedback = &.{ "", "typed feedback" } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const calls = [_]ToolCall{
+            toolCall("call_first", "read_file", try arena.print("{{\"path\":\"{s}\"}}", .{case.first_path})),
+            toolCall("call_second", "read_file", try arena.print("{{\"path\":\"{s}\"}}", .{case.second_path})),
+        };
+        const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Done" } };
+        const notice = "notice from a tool";
+        const plans = [_]test_support.FakeExecPlan{
+            .{ .result = .{ .model_output = "first output", .system_notice = if (!case.notice_on_second) notice else null } },
+            .{ .result = .{ .model_output = "second output", .system_notice = if (case.notice_on_second) notice else null } },
+        };
+        var fixture = PromptFixture{ .workspace_root = workspace };
+        var job = fixture.job();
+        job.model = @constCast("anthropic/claude-sonnet-5.5");
+        job.permission_mode = .auto;
+
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = registry;
+        hooks.exec_plans = &plans;
+        hooks.permission_feedback = case.feedback;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        // The request sends the results, the rules the step delivered, then
+        // the notice.
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "NOTE_SCOPE_RULE", notice });
+        const saved = hooks.history_turns.items[0].assistant.execution;
+        try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+        try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+
+        // The next turn's request opens with that whole request.
+        var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+        defer next_gateway.deinit();
+        var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer next_hooks.deinit();
+        next_hooks.context_enabled = true;
+        next_hooks.context_registry = registry;
+        var next_job = fixture.job();
+        next_job.model = job.model;
+        next_job.permission_mode = .auto;
+        next_job.prompt = @constCast("second prompt");
+        next_job.history = hooks.history_turns.items;
+        try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+        try test_support.expectPromptExtends(gateway.request_bodies.items[1], next_gateway.request_bodies.items[0]);
+    }
+}
+
+test "a step that ends on a repeated failure joins its notes and notice before the steering it takes, and the next turn extends the request (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/a.txt", .data = "a" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const notice = "notice from a tool";
+
+    // The last step of each case reads a file in a folder with its own rules,
+    // which raises a notice, and ends the turn on a repeated failure unless
+    // the user steers it on. The steering is taken at the step's end, after
+    // the boundaries at the top of each step. Repeated malformed arguments
+    // is the third such end, but a step of only malformed calls reaches no
+    // folder and runs no tool, so it holds neither a note nor a notice.
+    const failing = [_]ToolCall{toolCall("shell_failing", "shell", "{\"command\":\"false\"}")};
+    const failing_and_read = [_]ToolCall{
+        toolCall("shell_failing_last", "shell", "{\"command\":\"false\"}"),
+        toolCall("read_nested", "read_file", "{\"path\":\"nested/a.txt\"}"),
+    };
+    const shell_completions = [_]FakeCompletion{
+        .{ .tool_calls = &failing },
+        .{ .tool_calls = &failing },
+        .{ .tool_calls = &failing_and_read },
+        .{ .content = "Done" },
+    };
+    const shell_plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "shell failed", .status = .failure } },
+        .{ .result = .{ .model_output = "read output", .system_notice = notice } },
+    };
+    const invalid_output = "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"missing field\"]}}";
+    const invalid = [_]ToolCall{toolCall("shell_invalid", "shell", "{\"command\":\"\"}")};
+    const invalid_and_read = [_]ToolCall{
+        // Other arguments, so the result does not carry the note for a call
+        // that failed before, and the two results are the same text.
+        toolCall("shell_invalid_last", "shell", "{\"command\":\" \"}"),
+        toolCall("read_nested", "read_file", "{\"path\":\"nested/a.txt\"}"),
+    };
+    const validation_completions = [_]FakeCompletion{
+        .{ .tool_calls = &invalid },
+        .{ .tool_calls = &invalid_and_read },
+        .{ .content = "Done" },
+    };
+    // The shell calls fail the registered tool's own validation and never
+    // run, so only the read has a plan.
+    const validation_plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "read output", .system_notice = notice } },
+    };
+    const validation_results = [_]?[]const u8{ invalid_output, invalid_output };
+    const Case = struct {
+        name: []const u8,
+        completions: []const FakeCompletion,
+        plans: []const test_support.FakeExecPlan,
+        validation_results: []const ?[]const u8 = &.{},
+        steering_take_at: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "the same shell call fails in three steps", .completions = &shell_completions, .plans = &shell_plans, .steering_take_at = 4 },
+        .{ .name = "the same shell validation error comes twice", .completions = &validation_completions, .plans = &validation_plans, .validation_results = &validation_results, .steering_take_at = 3 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var fixture = PromptFixture{ .workspace_root = workspace };
+        var job = fixture.job();
+        job.model = @constCast("anthropic/claude-sonnet-5.5");
+        job.permission_mode = .auto;
+
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = registry;
+        hooks.exec_plans = case.plans;
+        hooks.validation_results = case.validation_results;
+        hooks.steering_messages = &.{"typed steering text"};
+        hooks.steering_take_at = case.steering_take_at;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        // The request after the last step sends its results, the rules its
+        // read reached, the notice, then the steering.
+        try std.testing.expectEqual(case.completions.len, gateway.request_bodies.items.len);
+        const last = gateway.request_bodies.items.len - 1;
+        try expectBodyContainsInOrder(&gateway, last, &.{ "read output", "NOTE_SCOPE_RULE", notice, "typed steering text" });
+
+        // The next turn's request opens with that whole request.
+        var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+        defer next_gateway.deinit();
+        var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer next_hooks.deinit();
+        next_hooks.context_enabled = true;
+        next_hooks.context_registry = registry;
+        var next_job = fixture.job();
+        next_job.model = job.model;
+        next_job.permission_mode = .auto;
+        next_job.prompt = @constCast("second prompt");
+        next_job.history = hooks.history_turns.items;
+        try runFakePrompt(&next_gateway, &next_hooks, fixture.config(), next_job);
+        try test_support.expectPromptExtends(gateway.request_bodies.items[last], next_gateway.request_bodies.items[0]);
+    }
+}
+
+test "a tool's notice stays in a turn cancelled once the step's last result is in" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    // The last call answers normally and raises the cancel as it runs, so the
+    // cancel is seen with the step's notice still waiting for the next boundary.
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output" } },
+        .{ .result = .{ .model_output = "second output", .system_notice = "notice from the last call" } },
+    };
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+    hooks.cancel_on_execute_index = 1;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    const follow_completions = [_]FakeCompletion{.{ .content = "Carrying on." }};
+    var follow_gateway = FakeGateway.init(alloc, &follow_completions);
+    defer follow_gateway.deinit();
+    var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_hooks.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.prompt = @constCast("go on");
+    follow_job.history = hooks.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_hooks, follow_fixture.config(), follow_job);
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{
+        "first output",
+        "second output",
+        "notice from the last call",
+        "<turn_aborted>",
+        "go on",
+    });
+}
+
 test "rules a tool call reaches ride on the step's tool result and stay out of the instructions, for every model (D93)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

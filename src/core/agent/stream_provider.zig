@@ -4,6 +4,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
@@ -532,6 +533,44 @@ pub const Failure = struct {
     http_status: ?std.http.Status = null,
     ownership: ResultOwnership = .borrowed,
 };
+
+/// Whether the provider refused the request as longer than the model's
+/// context window, in any family's wording.
+pub fn isContextOverflow(failure: Failure) bool {
+    if (failure.kind == .request_too_large) return true;
+    if (failure.kind != .invalid_request) return false;
+    const detail = failure.detail orelse return false;
+    inline for (.{
+        "context_length_exceeded",
+        "exceeds the context window",
+        "exceeded the context window",
+        "maximum context length",
+        "maximum prompt length",
+        "input is too long",
+        "prompt is too long",
+        "too many input tokens",
+    }) |needle| {
+        if (text_utils.containsIgnoreCase(detail, needle)) return true;
+    }
+    return false;
+}
+
+test "a context overflow is recognized in each family's words, and nothing else is" {
+    const overflows = [_][]const u8{
+        "{\"error\":{\"code\":\"context_length_exceeded\"}}",
+        "AI_APICallError: input exceeds the context window",
+        "This model's maximum prompt length is 1000000 but the request contains 1003383 tokens.",
+        "AI_APICallError: prompt is too long: 1077372 tokens > 1000000 maximum",
+        "This model's maximum context length is 128000 tokens.",
+    };
+    for (overflows) |detail| {
+        try std.testing.expect(isContextOverflow(.{ .kind = .invalid_request, .detail = @constCast(detail) }));
+    }
+    try std.testing.expect(isContextOverflow(.{ .kind = .request_too_large }));
+    try std.testing.expect(!isContextOverflow(.{ .kind = .invalid_request, .detail = @constCast("invalid tool schema") }));
+    try std.testing.expect(!isContextOverflow(.{ .kind = .invalid_request }));
+    try std.testing.expect(!isContextOverflow(.{ .kind = .rate_limited, .detail = @constCast("context_length_exceeded") }));
+}
 
 pub const Result = union(enum) {
     completed: Completed,
