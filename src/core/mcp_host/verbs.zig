@@ -391,7 +391,7 @@ pub const Context = struct {
     kept_sign_outs: ?KeptSignOutRetry = null,
 };
 
-pub const KeptSignOutRetry = struct {
+const KeptSignOutRetry = struct {
     transport: oauth_transport.Provider,
     /// Runs before the first revocation goes out.
     notice: ?auth_oauth.BeforeRevocation = null,

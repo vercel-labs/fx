@@ -679,9 +679,10 @@ pub const RetryOutcome = struct {
 
 /// Revokes every sign-out kept for `source`, oldest first, and forgets each
 /// one that its provider confirms. It leaves alone the ones another live fx
-/// is sending, and leases the rest while it sends them. It stops at the first
-/// failure, since the provider is likely down, and the rest wait for the next
-/// retry. Runs `before` once, before the first request.
+/// is sending, and leases the rest while it sends them. A failure leaves the
+/// rest of that provider's sign-outs for the next retry, since it is likely
+/// down: for an MCP login, the rest of that server's, so the other servers'
+/// still go. Runs `before` once, before the first request.
 pub fn retry(alloc: Allocator, source: Source, revoker: Revoker, before: ?oauth.BeforeRevocation) RetryOutcome {
     return retryIn(alloc, .of(source), revoker, before);
 }
@@ -719,7 +720,17 @@ fn retryAt(alloc: Allocator, place: Place, now_ms: i64, revoker: Revoker, before
     var outcome: RetryOutcome = .{};
     if (kept.entries.items.len == 0) return outcome;
     if (before) |notice| notice.run(notice.context);
+    // The servers that failed this retry, by `server_url`: each one is likely
+    // down, so its later sign-outs wait for the next retry. Codex, Grok, and
+    // the fx login keep no server URL, so their first failure stops the
+    // retry; one MCP server that fails leaves the others to go on.
+    var failed_servers: std.ArrayList([]const u8) = .empty;
+    defer failed_servers.deinit(alloc);
     for (kept.entries.items) |entry| {
+        const skipped = for (failed_servers.items) |url| {
+            if (std.mem.eql(u8, url, entry.server_url)) break true;
+        } else false;
+        if (skipped) continue;
         revoker.run(revoker.context, alloc, entry.asTokens()) catch |err| switch (retryable(err)) {
             false => {
                 debug_trace.logf("auth", "kept sign-out dropped reason=unusable source={t} err={s}", .{ place.source, @errorName(err) });
@@ -729,9 +740,10 @@ fn retryAt(alloc: Allocator, place: Place, now_ms: i64, revoker: Revoker, before
                 continue;
             },
             true => {
-                debug_trace.logf("auth", "kept sign-out retry failed source={t} err={s}; it stays kept", .{ place.source, @errorName(err) });
+                debug_trace.logf("auth", "kept sign-out retry failed source={t} err={s}; it and its server's later ones stay kept", .{ place.source, @errorName(err) });
                 outcome.failed = true;
-                break;
+                try failed_servers.append(alloc, entry.server_url);
+                continue;
             },
         };
         outcome.revoked += 1;
@@ -879,6 +891,30 @@ test "a refused retry keeps the sign-out and the ones after it" {
     // It stopped at the refusal: "c" was never sent.
     try testing.expectEqual(@as(usize, 2), fake.sent.items.len);
     try expectKept(place, &.{ "b", "c" });
+}
+
+test "an MCP server that refuses keeps only its own sign-outs back, and the other servers' still go" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const place = testPlace(&tmp, .mcp);
+    const refusing = "https://refusing.example.com/mcp";
+    const working = "https://working.example.com/mcp";
+    try keepAt(testing.allocator, place, .{ .refresh_token = "refused-1", .server_url = refusing }, 1, null);
+    try keepAt(testing.allocator, place, .{ .refresh_token = "works-1", .server_url = working }, 2, null);
+    try keepAt(testing.allocator, place, .{ .refresh_token = "refused-2", .server_url = refusing }, 3, null);
+    try keepAt(testing.allocator, place, .{ .refresh_token = "works-2", .server_url = working }, 4, null);
+
+    var fake: FakeRevoker = .{ .refuse = &.{"refused-1"} };
+    defer fake.deinit();
+    const outcome = try retryAt(testing.allocator, place, 5, fake.revoker(), null);
+    try testing.expectEqual(@as(usize, 2), outcome.revoked);
+    try testing.expect(outcome.failed);
+    // The refusing server got one request; its second sign-out waits.
+    try testing.expectEqual(@as(usize, 3), fake.sent.items.len);
+    try testing.expectEqualStrings("refused-1", fake.sent.items[0]);
+    try testing.expectEqualStrings("works-1", fake.sent.items[1]);
+    try testing.expectEqualStrings("works-2", fake.sent.items[2]);
+    try expectKept(place, &.{ "refused-1", "refused-2" });
 }
 
 test "a sign-out kept exactly 30 days is retried and one kept longer is dropped unsent" {
