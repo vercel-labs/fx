@@ -8,7 +8,9 @@
 \*   - A step on an id that is not in flight is one of the model's ignore
 \*     branches, which leave every variable unchanged. So are a stale idle
 \*     timer and progress that doesn't increase.
-\*   - A refused_line step has id 0 and is the model's RefusedLine. A grace_expired step
+\*   - A refused_line step is the model's RefusedLine. Its id is 0 for a line on a connection that
+\*     carries every request (stdio) and the request's id for an SSE event on that request's
+\*     stream, which is the line's scope. A grace_expired step
 \*     is GraceExpired: the request ends as malformed with a cancel signal.
 \*   - Fields the core no longer knows (outcome and counters of a finished
 \*     request) are absent from the record and not compared.
@@ -19,7 +21,8 @@ VARIABLE i
 Recs == {ObsTrace[k] : k \in 1..Len(ObsTrace)}
 Has(r, f) == f \in DOMAIN r.data
 
-\* A refused line names no request: the core writes it with id 0.
+\* A refused line names no request: the core writes it with id 0, or the id of the request whose
+\* stream carried it.
 ObsIds == {r.data.id : r \in Recs} \ {0}
 ObsInitIds == {r.data.id : r \in {x \in Recs : Has(x, "kind") /\ x.data.kind = "initialize"}}
 ObsListenIds == {r.data.id : r \in {x \in Recs : Has(x, "kind") /\ x.data.kind = "listen"}}
@@ -56,7 +59,7 @@ TraceNext ==
     /\ LET r == ObsTrace[i + 1]
            id == r.data.id
        IN \/ /\ r.event = "refused_line"
-             /\ RefusedLine
+             /\ RefusedLine(id)
           \/ /\ r.event # "refused_line"
              /\ id \in Ids
              /\ req[id] = r.from

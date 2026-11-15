@@ -716,6 +716,19 @@ export const scenarios: Scenario[] = [
       ),
   }),
   engineScenario({
+    name: "u12-refused-grace-every-waiting-call",
+    description: "A stdio line fx cannot read and that names no request is about every call waiting on that one connection: both calls end as malformed when the grace runs out, and the server is told it cancelled each",
+    servers: { a: { rules: modern({ method: "tools/call", tool: "silent", delayMs: 400, rawBytes: 40, noReply: true }) } },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a silent", "call a silent", "expect a.called.1.malformed 5000", "expect a.called.2.malformed 5000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        same(received(logs.a, "notifications/cancelled").length, 2, "cancel notices the server got"),
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 2, "grace_expired steps in the request trace"),
+      ),
+  }),
+  engineScenario({
     name: "u12-refused-grace-progress",
     description: "Progress for the call's own token after the refused line clears its grace: a call that works for longer than the grace returns its result, and no grace ends it",
     servers: {
@@ -827,6 +840,32 @@ export const scenarios: Scenario[] = [
     labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
     script: ["call h slow", "call h liar", "expect h.called.2.failure 3000", "expect h.called.1.result 6000"],
     machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-no-id-other-stream",
+    description:
+      "An SSE event that fx cannot read and that has no readable id is about the call whose stream carried it alone: that call ends as malformed when the grace runs out, and its stream is closed; the other call, on its own stream, is not touched and returns its result",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("slow"), tool("noisy")] } },
+        { method: "tools/call", name: "slow", delayMs: 3000, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+        { method: "tools/call", name: "noisy", sse: true, before: ["not an object"], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h slow", "call h noisy", "expect h.called.2.malformed 5000", "expect h.called.1.result 8000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (_lines, logs, trace) => {
+      const raw = logs.h as unknown as { dir: string; id?: number }[];
+      return first(
+        // Only the call on the noisy stream ends by its grace, and its stream is closed.
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 1, "grace_expired steps in the request trace"),
+        expectThat(raw.some((l) => l.dir === "closed"), "the noisy call's stream was not closed"),
+      );
+    },
   }),
   engineScenario({
     name: "u12-refused-http-sse-no-id",

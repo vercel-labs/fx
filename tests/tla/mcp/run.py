@@ -4,7 +4,7 @@
 Modes:
   list      show the models in spec/catalog.json
   check     exhaustive TLC run of each model (smoke or stress preset)
-  mutate    run every planted bug in <Module>.mutants.json
+  mutate    run every planted bug in <Module>.mutants.json (an entry may name its own "config")
   simulate  seeded random simulation (SAMPLED, never counted as PASS)
   gate      for a unit: smoke, stress if present, and every planted bug
 
@@ -127,6 +127,8 @@ def load_mutants(spec_dir, module):
         for field in ('description', 'old', 'new'):
             if not mutant.get(field):
                 raise ToolingError(f'{path.name} entry {number}: missing {field}')
+        if mutant.get('config') and not (spec_dir / mutant['config']).is_file():
+            raise ToolingError(f"{path.name} entry {number}: missing config {mutant['config']}")
         if bool(mutant.get('invariant')) == bool(mutant.get('property')):
             raise ToolingError(f'{path.name} entry {number}: name exactly one of invariant or property')
         if mutant.get('property'):
@@ -171,7 +173,10 @@ def keep_property(cfg_text, name):
     return '\n'.join(kept + [f'PROPERTY {name}']) + '\n'
 
 
-def config_for(spec_dir, module, preset):
+def config_for(spec_dir, module, preset, mutant=None):
+    # A planted bug may name the config that can show it, when the smoke config cannot afford the ids it needs.
+    if mutant and mutant.get('config'):
+        return mutant['config']
     if preset == 'stress':
         stress = module + '.stress.cfg'
         return stress if (spec_dir / stress).is_file() else None
@@ -181,7 +186,7 @@ def config_for(spec_dir, module, preset):
 def run_one(ctx, entry, mode, preset, mutant=None):
     spec_dir, args = ctx['spec_dir'], ctx['args']
     module = entry['module']
-    config = config_for(spec_dir, module, preset)
+    config = config_for(spec_dir, module, preset, mutant)
     label = module + ('' if preset == 'smoke' else '-' + preset) + ('' if mutant is None else f"-mutant-{mutant['number']}")
     work = ctx['reports'][entry['unit']] / label
     (work / 'tmp').mkdir(parents=True)

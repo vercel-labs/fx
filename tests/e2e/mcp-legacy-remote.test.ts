@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   LEGACY_REMOTE_TOOL_RESULT,
   startLegacyStreamableHttpFixture,
@@ -670,6 +670,52 @@ describe("version-scoped legacy MCP remote transports", () => {
     while (streamable.cancellationNotifications === 0 && Date.now() < deadline) await Bun.sleep(25);
     expect(streamable.cancellationNotifications).toBe(1);
   }, 90_000);
+
+  // An event fx can't read, with no readable id, is about the call whose stream carried it. A call on
+  // another stream keeps its own timers, though it has been waiting longer than the grace. Two
+  // `fx mcp call` commands in one shell command put both calls in flight in the one host.
+  test("Streamable HTTP gives the grace of an unreadable event with no id to the call on its stream alone", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "refused_sse_other_stream" });
+    const root = createRoot("refused-sse-two-streams", "http", streamable.url, 300_000);
+    const call = (text: string) => `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${text}.out 2> ${text}.err`;
+    const command = [
+      `${call("slow")} & slow=$!`,
+      `${call("noisy")}; echo "noisy exit=$?"; cat noisy.err`,
+      `wait $slow; echo "slow exit=$?"; cat slow.out slow.err`,
+    ].join("\n");
+    let seen = "";
+    gateway = startFakeGateway([
+      // The shell tool hands control back after 30 seconds, and the calls end after 30 and 36.
+      fakeGatewayToolCall("run_calls", "shell", { action: "run", command, yield_time_ms: 30_000, timeout_ms: 100_000 }),
+      fakeGatewayToolCall("collect_calls", "shell", { action: "interact", session_id: "shell-1", yield_time_ms: 60_000 }),
+      (body: string) => {
+        seen = `${toolResultText(body, "run_calls")}\n${toolResultText(body, "collect_calls")}`;
+        return fakeGatewayFinalText("Two streams complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const started = Date.now();
+
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Call both."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 120_000,
+    });
+    const seconds = (Date.now() - started) / 1000;
+
+    expect(result.code).toBe(0);
+    // The call on the noisy stream ends when its grace does, as malformed.
+    expect(seen).toContain("the server's answer was malformed");
+    // The other call is not touched: it waits for its answer, which comes after 36 seconds.
+    expect(seen).toContain("slow exit=0");
+    expect(seen).toContain(`${LEGACY_REMOTE_TOOL_RESULT}:slow`);
+    expect(seconds).toBeGreaterThan(34);
+    // One cancel, for the noisy call.
+    const deadline = Date.now() + 5_000;
+    while (streamable.cancellationNotifications === 0 && Date.now() < deadline) await Bun.sleep(25);
+    expect(streamable.cancellationNotifications).toBe(1);
+  }, 150_000);
 
   test("Streamable HTTP reinitializes an expired session and retries the call it refused", async () => {
     const version = "2025-06-18";

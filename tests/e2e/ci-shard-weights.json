@@ -19,7 +19,7 @@
   { "file": "host-managed-auth.test.ts", "weight": 2 },
   { "file": "mcp-auth.test.ts", "weight": 86 },
   { "file": "mcp-http.test.ts", "weight": 8 },
-  { "file": "mcp-legacy-remote.test.ts", "weight": 122 },
+  { "file": "mcp-legacy-remote.test.ts", "weight": 158 },
   { "file": "mcp-stdio.test.ts", "weight": 171 },
   { "file": "toolbox.test.ts", "weight": 12 },
   { "file": "mcp-verbs.test.ts", "weight": 23 },

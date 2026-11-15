@@ -35,6 +35,7 @@ type StreamableMode =
   | "refused_json_body"
   | "refused_sse_no_id"
   | "refused_sse_readable_id"
+  | "refused_sse_other_stream"
   | "expire_session"
   | "elicitation_form"
   | "elicitation_url"
@@ -644,8 +645,14 @@ export function startLegacyStreamableHttpFixture(
         // A reply fx refuses: a JSON body with bytes that are not UTF-8, or an SSE event with such
         // bytes and its id last (it names no request fx can read) or with a readable id and a
         // jsonrpc that is not "2.0". The stream stays open, as a server that is still working would.
-        if (mode === "refused_json_body" || mode === "refused_sse_no_id" || mode === "refused_sse_readable_id") {
+        if (mode === "refused_json_body" || mode === "refused_sse_no_id" || mode === "refused_sse_readable_id" || mode === "refused_sse_other_stream") {
           const id = message!.id;
+          // Two calls at once: "slow" answers well after the grace that "noisy"'s unreadable event
+          // starts for its own stream; "noisy" writes that event and keeps its stream open.
+          if (mode === "refused_sse_other_stream" && message!.params?.arguments?.text === "slow") {
+            await Bun.sleep(36_000);
+            return Response.json(toolCallResponse(id!, "slow"));
+          }
           const encoder = new TextEncoder();
           const bad = mode === "refused_sse_readable_id"
             ? encoder.encode(JSON.stringify({ jsonrpc: "1.0", id, result: {} }))

@@ -796,15 +796,15 @@ pub const Server = struct {
     /// wrong and the start of the line. One that names a request not in
     /// flight is ignored, and so is one on an HTTP request's stream that names
     /// another request (`stream` is that request's key). One that names none
-    /// gives each normal request in flight a short deadline
-    /// (`request.Timeouts.refused_ms`).
+    /// gives a short deadline (`request.Timeouts.refused_ms`) to each normal
+    /// request in flight, or, on an HTTP request's stream, to that request alone.
     fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8, stream: ?u64) Error!void {
         // Empty for a process that has gone since.
         if (line.len == 0) return;
         const id = wire.responseId(line) orelse {
             r.keepStray(line);
             r.refused_bytes = @intCast(@min(line.len, std.math.maxInt(u32)));
-            return r.stepRequest(.refused_line);
+            return r.stepRequest(.{ .refused_line = stream });
         };
         if (r.logicalFor(id) == null) return r.keepStray(line);
         // An event on a request's stream answers that request only, as a valid reply does
@@ -2287,14 +2287,43 @@ test "a bad line and progress in turns, a thousand times, leave the server one r
     defer r.deinit();
     try r.stepRequest(.{ .send = .normal });
     for (1..1001) |round| {
-        try r.stepRequest(.refused_line);
+        try r.stepRequest(.{ .refused_line = null });
         try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
         try r.stepRequest(.{ .progress_received = .{ .token = 1, .value = @floatFromInt(round) } });
         try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
     }
     // The line then still gives the request its full deadline, and the request's end drops it.
-    try r.stepRequest(.refused_line);
+    try r.stepRequest(.{ .refused_line = null });
     try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
     try r.stepRequest(.{ .response_received = .{ .id = 1, .response = .result } });
     try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
+}
+
+fn holdsGrace(r: *const Server, id: request.Id) bool {
+    for (r.table_slots) |slot| if (slot.used and slot.id == id) return slot.refused_epoch != 0;
+    return false;
+}
+
+test "a line with no readable id gives a grace to the request whose stream carried it, and to every request when it came on stdio" {
+    var r: Server = undefined;
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+    defer r.deinit();
+    try r.stepRequest(.{ .send = .normal });
+    try r.stepRequest(.{ .send = .normal });
+    try r.stepRequest(.{ .send = .normal });
+
+    // An SSE event on request 2's stream: request 2 has a grace, and 1 and 3 have none.
+    try r.onRefusedLine(error.InvalidJson, "not json", 2);
+    try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
+    try std.testing.expect(!holdsGrace(&r, 1));
+    try std.testing.expect(holdsGrace(&r, 2));
+    try std.testing.expect(!holdsGrace(&r, 3));
+    // Stdio has one stream, so its line is about every request that has no grace.
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expectEqual(@as(usize, 2), refusedTimers(&r));
+    try std.testing.expect(holdsGrace(&r, 1));
+    try std.testing.expect(holdsGrace(&r, 3));
 }

@@ -97,14 +97,14 @@
  },
  {
   "description": "A refused line arms a timer even when every request already has a grace",
-  "old": "timerEpochs' = IF Fresh = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}",
+  "old": "timerEpochs' = IF Fresh(s) = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}",
   "new": "timerEpochs' = timerEpochs \\cup {refusals + 1}",
   "invariant": "TimersBounded"
  },
  {
   "description": "A second refused line extends the grace it finds",
-  "old": "IF id \\in Fresh THEN now + GraceTicks ELSE graceDue[id]",
-  "new": "IF id \\in Pending THEN now + GraceTicks ELSE graceDue[id]",
+  "old": "IF id \\in Fresh(s) THEN now + GraceTicks ELSE graceDue[id]",
+  "new": "IF id \\in Scoped(s) THEN now + GraceTicks ELSE graceDue[id]",
   "invariant": "SoonAfterRefusal"
  },
  {
@@ -121,8 +121,15 @@
  },
  {
   "description": "A refused line gives a request a grace but arms no timer for it, so nothing ends it at its deadline",
-  "old": "timerEpochs' = IF Fresh = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}",
+  "old": "timerEpochs' = IF Fresh(s) = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}",
   "new": "timerEpochs' = timerEpochs",
   "invariant": "GraceHasTimer"
+ },
+ {
+  "description": "An SSE refusal grants a grace to every call, not only the one on its stream",
+  "old": "Scoped(s) == IF s = NoScope THEN Pending ELSE Pending \\cap {s}",
+  "new": "Scoped(s) == Pending",
+  "invariant": "ScopedGrantsOnlyItsCall",
+  "config": "Request.scoped.cfg"
  }
 ]

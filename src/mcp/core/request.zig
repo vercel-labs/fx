@@ -12,8 +12,10 @@
 //!
 //! A line the client refused that names no request has no request to end, so the requests in
 //! flight when it came wait for their own timers, which can be minutes. `refused_line` gives each
-//! normal one a short deadline instead, its grace (`Timeouts.refused_ms`). One timer covers the
-//! requests a line finds without a grace: it ends them one at a time as `malformed`, with a cancel
+//! normal one a short deadline instead, its grace (`Timeouts.refused_ms`). A line on a connection
+//! that carries every request (stdio) is about all of them. A line on one request's stream (an HTTP
+//! SSE event) is about that request alone, and another request keeps its own timers. One timer
+//! covers the requests a line finds without a grace: it ends them one at a time as `malformed`, with a cancel
 //! signal, unless an answer or progress for the request's own token came first. When the last
 //! request that holds a line lets go of it, by ending or by progress, the table says
 //! `disarm_refused` for that line, so the timers armed for refused lines never outnumber the
@@ -119,8 +121,11 @@ pub const Event = union(enum) {
     /// The questions are answered; a full idle period starts.
     idle_resumed: Id,
     /// The client refused a line that names no request: bytes that are not UTF-8, JSON nested too
-    /// deep, a line whose id comes after what could not be read, or no JSON at all.
-    refused_line,
+    /// deep, a line whose id comes after what could not be read, or no JSON at all. The payload is
+    /// the request whose stream carried the line, when it came on one request's stream, as an HTTP
+    /// SSE event does: the line is about that request alone. It is null for a connection that
+    /// carries every request, as stdio does: the line is about all of them.
+    refused_line: ?Id,
 };
 
 pub const Effect = union(enum) {
@@ -242,7 +247,7 @@ pub const Table = struct {
             .server_cancel_received => |id| table.serverCancel(id, out),
             .idle_paused => |id| table.pauseIdle(id, true, out),
             .idle_resumed => |id| table.pauseIdle(id, false, out),
-            .refused_line => table.refusedLine(out),
+            .refused_line => |scope| table.refusedLine(scope, out),
         }
     }
 
@@ -360,16 +365,20 @@ pub const Table = struct {
         table.finish(index, "timer_fired", .timed_out, slot.kind != .initialize, out);
     }
 
-    /// A line that names no request gives every normal request in flight that has no grace one:
-    /// the same deadline for all of them, behind one timer. A request that has a grace keeps it:
-    /// a later line neither extends it nor arms another timer. initialize and a listen get none,
-    /// and a request sent later is not in flight yet.
-    fn refusedLine(table: *Table, out: *Output) void {
-        out.transition = .{ .event = "refused_line", .id = 0, .from = .unused, .to = .unused };
+    /// A line that names no request gives every normal request it is about that is in flight and
+    /// has no grace one: the same deadline for all of them, behind one timer. It is about every
+    /// request when `scope` is null, and about `scope` alone when it came on that request's stream:
+    /// another request keeps its own timers. A request that has a grace keeps it: a later line
+    /// neither extends it nor arms another timer. initialize and a listen get none, and a request
+    /// sent later is not in flight yet.
+    fn refusedLine(table: *Table, scope: ?Id, out: *Output) void {
+        const shown = if (scope) |id| table.status(id) else Status.unused;
+        out.transition = .{ .event = "refused_line", .id = scope orelse 0, .from = shown, .to = shown };
         const epoch = table.refused_epoch +| 1;
         var fresh = false;
         for (table.slots) |*slot| {
             if (!slot.used or slot.kind != .normal or slot.refused_epoch != 0) continue;
+            if (scope) |id| if (slot.id != id) continue;
             slot.refused_epoch = epoch;
             fresh = true;
         }
@@ -763,6 +772,13 @@ const Observed = struct {
             // TimersAreGraces: a timer is dropped only for a line that no request holds.
             .disarm_refused => |epoch| try testing.expect(!table.holdsRefusal(epoch)),
         };
+        // ScopedGrantsOnlyItsCall: a line on one request's stream gives a grace to that request alone.
+        if (event == .refused_line) if (event.refused_line) |scope| for (out.effects()) |effect| switch (effect) {
+            .arm_timer => |a| if (a.timer.kind == .refused) for (table.slots) |slot| {
+                if (slot.used and slot.refused_epoch == a.timer.generation) try testing.expectEqual(scope, slot.id);
+            },
+            else => {},
+        };
         // Where the model has no choice, the core must act: a request in
         // flight ends on its response, a transport loss, a cancel (unless it
         // is initialize), or its hard timeout.
@@ -792,7 +808,8 @@ const Observed = struct {
 
 fn eventId(event: Event) ?Id {
     return switch (event) {
-        .send, .refused_line => null,
+        .send => null,
+        .refused_line => |scope| scope,
         .response_received => |r| r.id,
         .cancel_requested, .transport_lost, .server_cancel_received, .idle_paused, .idle_resumed => |id| id,
         .timer_fired => |t| t.id,
@@ -818,15 +835,17 @@ const alphabet = [_]Event{
     .{ .progress_received = .{ .token = 2, .value = 2 } },
     .{ .server_cancel_received = 1 },
     .{ .server_cancel_received = 2 },
-    .refused_line,
+    .{ .refused_line = null },
+    .{ .refused_line = 1 },
+    .{ .refused_line = 2 },
     .{ .timer_fired = .{ .id = 0, .kind = .refused, .generation = 1 } },
 };
 
-fn explore(slots: [2]Slot, next_id: Id, observed: Observed, depth: usize, steps: *usize) !void {
+fn explore(slots: [2]Slot, next_id: Id, refused_epoch: u32, observed: Observed, depth: usize, steps: *usize) !void {
     if (depth == 0) return;
     for (alphabet) |event| {
         var child_slots = slots;
-        var table: Table = .{ .slots = &child_slots, .timeouts = .{}, .next_id = next_id };
+        var table: Table = .{ .slots = &child_slots, .timeouts = .{}, .next_id = next_id, .refused_epoch = refused_epoch };
         var child = observed;
         const before = if (eventId(event)) |id| table.status(id) else Status.unused;
         var out: Output = .{};
@@ -840,7 +859,7 @@ fn explore(slots: [2]Slot, next_id: Id, observed: Observed, depth: usize, steps:
         };
         steps.* += 1;
         try child.check(&table, event, before, &out);
-        try explore(child_slots, table.next_id, child, depth - 1, steps);
+        try explore(child_slots, table.next_id, table.refused_epoch, child, depth - 1, steps);
     }
 }
 
@@ -848,7 +867,7 @@ test "every event sequence up to depth 5 keeps the model's invariants" {
     var slots: [2]Slot = undefined;
     @memset(&slots, .{});
     var steps: usize = 0;
-    try explore(slots, 1, .{}, 5, &steps);
+    try explore(slots, 1, 0, .{}, 5, &steps);
     try testing.expect(steps > 100_000);
 }
 
@@ -874,7 +893,7 @@ test "random long sequences keep the model's invariants" {
                 5 => .{ .transport_lost = id },
                 6 => .{ .progress_received = .{ .token = id, .value = @floatFromInt(random.uintLessThan(u8, 4)) } },
                 7 => .{ .server_cancel_received = id },
-                8 => .refused_line,
+                8 => .{ .refused_line = if (random.boolean()) null else id },
                 else => .{ .timer_fired = .{ .id = 0, .kind = .refused, .generation = random.intRangeAtMost(u32, 1, 3) } },
             };
             if (event == .send and table.next_id >= Observed.max_ids) continue;
@@ -911,8 +930,8 @@ test "writes a model transition as one trace line" {
 
 // ---- a line the client refused that names no request: the grace ----
 //
-// A refused line gives every normal request in flight that has no grace one, with one timer for
-// them all (`refused_line` step, id 0); the timer's firing ends the first request that holds its
+// A refused line gives every normal request it is about that is in flight and has no grace one, with
+// one timer for them all (`refused_line` step, id 0, or the stream's request for an SSE event); the timer's firing ends the first request that holds its
 // number as `malformed` with a cancel signal (`grace_expired` step) and, while others hold it,
 // arms the same timer again at once. tests/tla/mcp/Request.tla states the rules: RefusedLine,
 // GraceExpired, ProgressClears and the invariants that go with them.
@@ -1006,7 +1025,7 @@ test "grace: a line that names no request arms one timer for the request in flig
     var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try testing.expectEqual(@as(usize, 1), out.effect_count);
     const arm = try refusedOrFail(&out);
     try testing.expectEqual(@as(u32, 30_000), arm.after_ms);
@@ -1017,7 +1036,7 @@ test "grace: a line that names no request arms one timer for the request in flig
     try testing.expectEqual(Status.unused, out.transition.?.to);
 
     // The second line finds a request that has its grace already: no timer, no extension.
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try testing.expectEqual(@as(usize, 0), out.effect_count);
     try testing.expectEqual(Status.inflight, table.status(1));
 }
@@ -1027,7 +1046,7 @@ test "grace: a request that stays silent ends malformed, and the server is told 
     var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     const arm = try refusedOrFail(&out);
 
     try table.step(.{ .timer_fired = arm.timer }, &out);
@@ -1044,12 +1063,70 @@ test "grace: a request that stays silent ends malformed, and the server is told 
     try testing.expectEqual(@as(usize, 0), out.effect_count);
 }
 
+test "grace: a line on one request's stream gives a grace to that request alone, and a line on the connection gives one to all" {
+    var slots: [4]Slot = undefined;
+    var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
+    var out: Output = .{};
+    for (0..3) |_| try table.step(.{ .send = .normal }, &out);
+
+    // An SSE event on request 2's stream: request 2 has a grace and the others have none.
+    try table.step(.{ .refused_line = 2 }, &out);
+    try testing.expectEqual(@as(usize, 1), refusedArms(&out));
+    try testing.expectEqual(@as(u32, 30_000), (try refusedOrFail(&out)).after_ms);
+    try testing.expectEqual(@as(u32, 0), table.slots[0].refused_epoch);
+    try testing.expect(table.slots[1].refused_epoch != 0);
+    try testing.expectEqual(@as(u32, 0), table.slots[2].refused_epoch);
+    try testing.expectEqual(@as(Id, 2), out.transition.?.id);
+    const first = (try refusedOrFail(&out)).timer;
+
+    // Its grace ends request 2 as malformed, with a cancel, and the others go on.
+    try table.step(.{ .timer_fired = first }, &out);
+    try testing.expectEqual(Outcome.malformed, try deliveredOrFail(&out));
+    try testing.expectEqual(@as(usize, 1), countEffects(&out, .send_cancel));
+    try testing.expectEqual(@as(usize, 0), refusedArms(&out));
+    try testing.expectEqual(Status.done, table.status(2));
+    try testing.expectEqual(Status.inflight, table.status(1));
+    try testing.expectEqual(Status.inflight, table.status(3));
+
+    // A line on the connection, as stdio has one, is about every request still in flight.
+    try table.step(.{ .refused_line = null }, &out);
+    try testing.expectEqual(@as(usize, 1), refusedArms(&out));
+    try testing.expect(table.slots[0].refused_epoch != 0);
+    try testing.expect(table.slots[2].refused_epoch != 0);
+    try testing.expectEqual(@as(Id, 0), out.transition.?.id);
+}
+
+test "grace: a line on a stream that carries no normal request in flight arms no timer, and a second one adds nothing" {
+    var slots: [4]Slot = undefined;
+    var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
+    var out: Output = .{};
+    try table.step(.{ .send = .initialize }, &out);
+    try table.step(.{ .send = .listen }, &out);
+    try table.step(.{ .send = .normal }, &out);
+    try table.step(.{ .send = .normal }, &out);
+    // initialize, a listen, an id never sent, and a request that ended: nothing to grace.
+    for ([_]Id{ 1, 2, 9 }) |scope| {
+        try table.step(.{ .refused_line = scope }, &out);
+        try testing.expectEqual(@as(usize, 0), out.effect_count);
+    }
+    try table.step(.{ .response_received = .{ .id = 3, .response = .result } }, &out);
+    try table.step(.{ .refused_line = 3 }, &out);
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    // Request 4 gets its grace from the first line on its stream, and a second line adds none.
+    try table.step(.{ .refused_line = 4 }, &out);
+    try testing.expectEqual(@as(usize, 1), refusedArms(&out));
+    try table.step(.{ .refused_line = 4 }, &out);
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    // A line that grants nothing takes no number.
+    try testing.expectEqual(@as(u32, 1), table.refused_epoch);
+}
+
 test "grace: a response inside the grace still matches its request, and the timer then does nothing" {
     var slots: [4]Slot = undefined;
     var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     const arm = try refusedOrFail(&out);
 
     try table.step(.{ .response_received = .{ .id = 1, .response = .result } }, &out);
@@ -1063,7 +1140,7 @@ test "grace: a response inside the grace still matches its request, and the time
     var later: [1]Slot = undefined;
     var one: Table = .init(&later, .{ .refused_ms = 30_000 });
     try one.step(.{ .send = .normal }, &out);
-    try one.step(.refused_line, &out);
+    try one.step(.{ .refused_line = null }, &out);
     const held = try refusedOrFail(&out);
     try one.step(.{ .response_received = .{ .id = 1, .response = .result } }, &out);
     try one.step(.{ .send = .normal }, &out);
@@ -1077,7 +1154,7 @@ test "grace: progress for the request's own token clears its grace, and its othe
     var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     const arm = try refusedOrFail(&out);
     try table.step(.{ .progress_received = .{ .token = 1, .value = 1 } }, &out);
     try testing.expectEqual(@as(u32, 1), table.progressCount(1));
@@ -1098,7 +1175,7 @@ test "grace: progress for another request's token does not clear it" {
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try testing.expectEqual(@as(usize, 1), refusedArms(&out));
     const arm = try refusedOrFail(&out);
     // Request 1 shows its server is alive; request 2 stays silent.
@@ -1117,7 +1194,7 @@ test "grace: progress that does not increase is not progress, so it does not cle
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
     try table.step(.{ .progress_received = .{ .token = 1, .value = 5 } }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     const arm = try refusedOrFail(&out);
     try table.step(.{ .progress_received = .{ .token = 1, .value = 5 } }, &out);
     try testing.expectEqual(@as(u32, 1), table.progressCount(1));
@@ -1132,7 +1209,7 @@ test "grace: progress before the line does not protect, and a request sent after
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
     try table.step(.{ .progress_received = .{ .token = 1, .value = 1 } }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     const arm = try refusedOrFail(&out);
     try table.step(.{ .send = .normal }, &out);
 
@@ -1151,11 +1228,11 @@ test "grace: initialize and listen get none, and a line with nothing else in fli
     var out: Output = .{};
     try table.step(.{ .send = .initialize }, &out);
     try table.step(.{ .send = .listen }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try testing.expectEqual(@as(usize, 0), out.effect_count);
 
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try testing.expectEqual(@as(usize, 1), refusedArms(&out));
     const arm = try refusedOrFail(&out);
     try table.step(.{ .timer_fired = arm.timer }, &out);
@@ -1170,7 +1247,7 @@ test "grace: a request whose own deadline comes first ends at it, and the grace 
     var table: Table = .init(&slots, .{ .refused_ms = 30_000, .idle_ms = 10_000 });
     var out: Output = .{};
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     const arm = try refusedOrFail(&out);
     try table.step(.{ .timer_fired = .{ .id = 1, .kind = .idle, .generation = 1 } }, &out);
     try testing.expectEqual(Outcome.timed_out, try deliveredOrFail(&out));
@@ -1183,7 +1260,7 @@ test "grace: one line over three requests arms one timer, and it ends them one a
     var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
     var out: Output = .{};
     for (0..3) |_| try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try testing.expectEqual(@as(usize, 1), refusedArms(&out));
     const arm = try refusedOrFail(&out);
 
@@ -1211,7 +1288,7 @@ test "grace: a flood of lines holds one timer for the requests, and a call that 
     var timers: RefusedTimers = .{};
     for (0..3) |_| try table.step(.{ .send = .normal }, &out);
     for (0..10_000) |_| {
-        try table.step(.refused_line, &out);
+        try table.step(.{ .refused_line = null }, &out);
         try timers.apply(&out);
         try timers.expectHeld(&table);
     }
@@ -1220,7 +1297,7 @@ test "grace: a flood of lines holds one timer for the requests, and a call that 
     // A call that starts between lines is covered by the next line, once.
     try table.step(.{ .send = .normal }, &out);
     for (0..10_000) |_| {
-        try table.step(.refused_line, &out);
+        try table.step(.{ .refused_line = null }, &out);
         try timers.apply(&out);
         try timers.expectHeld(&table);
     }
@@ -1235,7 +1312,7 @@ test "grace: progress and a bad line in turns, a thousand times, leave one refus
     try table.step(.{ .send = .normal }, &out);
     for (1..1001) |round| {
         // The line gives the request a grace, with the full deadline each time.
-        try table.step(.refused_line, &out);
+        try table.step(.{ .refused_line = null }, &out);
         try testing.expectEqual(@as(u32, 30_000), (try refusedOrFail(&out)).after_ms);
         try timers.apply(&out);
         try testing.expectEqual(@as(usize, 1), timers.count);
@@ -1249,6 +1326,41 @@ test "grace: progress and a bad line in turns, a thousand times, leave one refus
     try testing.expectEqual(Status.inflight, table.status(1));
 }
 
+test "grace: progress and a bad line in turns, a thousand times, keep the timers within the requests, on a stream and on a connection" {
+    var slots: [4]Slot = undefined;
+    var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
+    var out: Output = .{};
+    var timers: RefusedTimers = .{};
+    try table.step(.{ .send = .normal }, &out);
+    try table.step(.{ .send = .normal }, &out);
+    for (1..1001) |round| {
+        const value: f64 = @floatFromInt(round);
+        // An SSE event on request 1's stream: one timer, held by request 1 alone.
+        try table.step(.{ .refused_line = 1 }, &out);
+        try timers.apply(&out);
+        try testing.expectEqual(@as(usize, 1), timers.count);
+        try testing.expectEqual(@as(u32, 0), table.slots[1].refused_epoch);
+        try timers.expectHeld(&table);
+        try table.step(.{ .progress_received = .{ .token = 1, .value = value } }, &out);
+        try timers.apply(&out);
+        try testing.expectEqual(@as(usize, 0), timers.count);
+        // A line on the connection: one timer, held by both requests, which each lets go in turn.
+        try table.step(.{ .refused_line = null }, &out);
+        try timers.apply(&out);
+        try testing.expectEqual(@as(usize, 1), timers.count);
+        try timers.expectHeld(&table);
+        try table.step(.{ .progress_received = .{ .token = 1, .value = value + 0.5 } }, &out);
+        try timers.apply(&out);
+        try testing.expectEqual(@as(usize, 1), timers.count);
+        try table.step(.{ .progress_received = .{ .token = 2, .value = value } }, &out);
+        try timers.apply(&out);
+        try testing.expectEqual(@as(usize, 0), timers.count);
+        try timers.expectHeld(&table);
+    }
+    try testing.expectEqual(Status.inflight, table.status(1));
+    try testing.expectEqual(Status.inflight, table.status(2));
+}
+
 test "grace: a request that ends or shows progress takes its line's timer away only when it was the last to hold it" {
     var slots: [4]Slot = undefined;
     var table: Table = .init(&slots, .{ .refused_ms = 30_000 });
@@ -1256,10 +1368,10 @@ test "grace: a request that ends or shows progress takes its line's timer away o
     var timers: RefusedTimers = .{};
     try table.step(.{ .send = .normal }, &out);
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try timers.apply(&out);
     try table.step(.{ .send = .normal }, &out);
-    try table.step(.refused_line, &out);
+    try table.step(.{ .refused_line = null }, &out);
     try timers.apply(&out);
     // Request 1 and 2 hold the first line, request 3 the second.
     try testing.expectEqual(@as(usize, 2), timers.count);
@@ -1309,7 +1421,8 @@ test "grace stress: a flood of lines with requests coming and going keeps the ti
                 else => return err,
             }
         } else if (pick < 55) {
-            try table.step(.refused_line, &out);
+            const scope: ?Id = if (random.boolean()) null else random.intRangeAtMost(Id, 1, @max(1, table.next_id -| 1));
+            try table.step(.{ .refused_line = scope }, &out);
             arms += refusedArms(&out);
         } else if (pick < 72) {
             if (timers.count == 0) continue;

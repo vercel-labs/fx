@@ -271,7 +271,8 @@ test "a fuzzed run of requests, lines that name no request, replies, progress an
 
 /// Each byte is one step: its last decimal digit picks the step and the rest picks a request, so a
 /// saved input reads as a short script. 0 to 2 send a normal request, initialize or a listen; 3 is a
-/// refused line that names no request; 4 fires a grace timer; 5 answers a request; 6 is progress;
+/// refused line that names no request, on the connection (an even request number) or on one request's
+/// stream (an odd one); 4 fires a grace timer; 5 answers a request; 6 is progress;
 /// 7 fires a request's idle timer; 8 cancels; 9 loses the transport.
 fn fuzzGrace(_: void, smith: *testing.Smith) !void {
     const request = mcp.core.request;
@@ -308,8 +309,9 @@ fn fuzzGrace(_: void, smith: *testing.Smith) !void {
                 kinds[@intCast(id)] = kind;
             },
             3 => {
-                for (table.slots) |slot| fresh += @intFromBool(slot.used and slot.kind == .normal and !armed[@intCast(slot.id)]);
-                try table.step(.refused_line, &out);
+                const scope: ?request.Id = if (arg % 2 == 0) null else index;
+                for (table.slots) |slot| fresh += @intFromBool(slot.used and slot.kind == .normal and !armed[@intCast(slot.id)] and (scope == null or slot.id == scope.?));
+                try table.step(.{ .refused_line = scope }, &out);
                 // One timer covers every request the line finds without a grace, and none when it finds none.
                 var arms: usize = 0;
                 for (out.effects()) |effect| switch (effect) {
@@ -317,7 +319,7 @@ fn fuzzGrace(_: void, smith: *testing.Smith) !void {
                     else => {},
                 };
                 try testing.expectEqual(@as(usize, @intFromBool(fresh > 0)), arms);
-                for (table.slots) |slot| if (slot.used and slot.kind == .normal) {
+                for (table.slots) |slot| if (slot.used and slot.kind == .normal and (scope == null or slot.id == scope.?)) {
                     armed[@intCast(slot.id)] = true;
                 };
             },

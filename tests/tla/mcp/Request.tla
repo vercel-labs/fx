@@ -25,7 +25,9 @@
 \* request's own token clears its grace, and its other timers go on. A request
 \* still silent at the deadline ends as `malformed`, with a cancel signal.
 \* initialize and listen get no grace, and neither does a request sent after the
-\* line. A request has at most one grace. One timer covers the requests a line finds without a
+\* line. A line on a stream that carries one request, an HTTP SSE event, is about that request
+\* alone: it gives a grace to it and to no other (scope s = its id); a stdio line has one stream
+\* for all requests, so it is about every one (scope 0). A request has at most one grace. One timer covers the requests a line finds without a
 \* grace, and it goes when the last of them lets go of it, by ending or by progress for its own
 \* token (`disarm_refused` in src/mcp/core/request.zig), so the timers armed for refused lines
 \* never outnumber the requests that hold a grace, however many lines and progress
@@ -66,13 +68,14 @@ VARIABLES
     timerEpochs,   \* the refused lines whose timer is armed: a set of refusal numbers, one timer each
     refusedAt,     \* ghost [Ids -> ticks, or NoTime]: when a refused line first found it in flight
     ownProgress,   \* ghost [Ids -> BOOLEAN]: progress accepted for it after such a line
-    words          \* ghost [Ids -> Words]: how a request that the grace ended was worded
+    words,         \* ghost [Ids -> Words]: how a request that the grace ended was worded
+    foreignGrant   \* ghost: a refused line gave a grace to a request other than the one its stream carried
 
 vars == <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen,
-          now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words>>
+          now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant>>
 
 \* Everything the grace adds but its deadlines and timers.
-Rest == <<now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, words>>
+Rest == <<now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, words, foreignGrant>>
 
 Init ==
     /\ req = [id \in Ids |-> "unused"]
@@ -92,6 +95,7 @@ Init ==
     /\ refusedAt = [id \in Ids |-> NoTime]
     /\ ownProgress = [id \in Ids |-> FALSE]
     /\ words = [id \in Ids |-> "none"]
+    /\ foreignGrant = FALSE
 
 Armed(id) == graceDue[id] # NoTime
 
@@ -121,7 +125,7 @@ Send(id) ==
     /\ req' = [req EXCEPT ![id] = "inflight"]
     /\ sentEpoch' = [sentEpoch EXCEPT ![id] = refusals]
     /\ SendGrace(id)
-    /\ UNCHANGED <<outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, refusals, refusedAt, ownProgress, words>>
+    /\ UNCHANGED <<outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, refusals, refusedAt, ownProgress, words, foreignGrant>>
 
 Accept(id, kind) ==
     /\ Finish(id, kind)
@@ -175,7 +179,7 @@ ProgressReceived(id, p) ==
     THEN /\ progress' = [progress EXCEPT ![id] = p]
          /\ progressSeen' = progressSeen \cup {<<id, req[id]>>}
          /\ ProgressClears(id)
-         /\ UNCHANGED <<req, outcome, delivered, cancelSent, everDone, peerAnswered, now, refusals, sentEpoch, armedEpoch, refusedAt, words>>
+         /\ UNCHANGED <<req, outcome, delivered, cancelSent, everDone, peerAnswered, now, refusals, sentEpoch, armedEpoch, refusedAt, words, foreignGrant>>
     ELSE UNCHANGED vars
 
 \* The server sends notifications/cancelled naming a client request. That
@@ -188,23 +192,33 @@ ServerCancelReceived(id) ==
          /\ UNCHANGED <<cancelSent, progress, progressSeen, Rest>>
     ELSE UNCHANGED vars
 
-\* The normal requests in flight, and those among them with no grace yet.
+\* The normal requests in flight.
 Pending == {id \in Ids \ (InitIds \cup ListenIds) : req[id] = "inflight"}
-Fresh == {id \in Pending : graceDue[id] = NoTime}
 
-\* A line the client refused that names no request. Each request that has no grace
-\* gets one; a request that has one keeps its deadline, and one timer covers the
+\* No stream: the line is about every request in flight.
+NoScope == 0
+\* The requests a refused line is about: all of them for scope 0, or the one whose stream
+\* carried it. Another request's own timers go on.
+Scoped(s) == IF s = NoScope THEN Pending ELSE Pending \cap {s}
+\* Those among them with no grace yet.
+Fresh(s) == {id \in Scoped(s) : graceDue[id] = NoTime}
+\* The scopes a line can have: none, or a normal request's stream.
+Scopes == {NoScope} \cup (Ids \ (InitIds \cup ListenIds))
+
+\* A line the client refused that names no request, with scope s. Each request it is about that
+\* has no grace gets one; a request that has one keeps its deadline, and one timer covers the
 \* requests a line finds without.
-RefusedLine ==
+RefusedLine(s) ==
     /\ refusals < MaxRefusals
     /\ refusals' = refusals + 1
     \* A grace that starts now is a new window: the ghosts start over for the requests that get one.
-    /\ refusedAt' = [id \in Ids |-> IF (GraceOn /\ id \in Fresh) \/ (id \in Pending /\ refusedAt[id] = NoTime) THEN now ELSE refusedAt[id]]
-    /\ ownProgress' = [id \in Ids |-> IF GraceOn /\ id \in Fresh THEN FALSE ELSE ownProgress[id]]
+    /\ refusedAt' = [id \in Ids |-> IF (GraceOn /\ id \in Fresh(s)) \/ (id \in Scoped(s) /\ refusedAt[id] = NoTime) THEN now ELSE refusedAt[id]]
+    /\ ownProgress' = [id \in Ids |-> IF GraceOn /\ id \in Fresh(s) THEN FALSE ELSE ownProgress[id]]
+    /\ foreignGrant' = (foreignGrant \/ (GraceOn /\ s # NoScope /\ Fresh(s) \ {s} # {}))
     /\ IF GraceOn
-       THEN /\ graceDue' = [id \in Ids |-> IF id \in Fresh THEN now + GraceTicks ELSE graceDue[id]]
-            /\ armedEpoch' = [id \in Ids |-> IF id \in Fresh THEN refusals + 1 ELSE armedEpoch[id]]
-            /\ timerEpochs' = IF Fresh = {} THEN timerEpochs ELSE timerEpochs \cup {refusals + 1}
+       THEN /\ graceDue' = [id \in Ids |-> IF id \in Fresh(s) THEN now + GraceTicks ELSE graceDue[id]]
+            /\ armedEpoch' = [id \in Ids |-> IF id \in Fresh(s) THEN refusals + 1 ELSE armedEpoch[id]]
+            /\ timerEpochs' = IF Fresh(s) = {} THEN timerEpochs ELSE timerEpochs \cup {refusals + 1}
        ELSE UNCHANGED <<graceDue, armedEpoch, timerEpochs>>
     /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, sentEpoch, words>>
 
@@ -217,7 +231,7 @@ GraceExpired(id) ==
     /\ Finish(id, "malformed")
     /\ cancelSent' = [cancelSent EXCEPT ![id] = TRUE]
     /\ words' = [words EXCEPT ![id] = "malformed"]
-    /\ UNCHANGED <<progress, peerAnswered, progressSeen, now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress>>
+    /\ UNCHANGED <<progress, peerAnswered, progressSeen, now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, foreignGrant>>
 
 \* Time passes, but never past a grace that is due.
 Tick ==
@@ -225,10 +239,10 @@ Tick ==
     /\ now < MaxTime
     /\ \A id \in Ids : (~Armed(id) \/ graceDue[id] > now)
     /\ now' = now + 1
-    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words>>
+    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant>>
 
 Next ==
-    \/ RefusedLine
+    \/ \E s \in Scopes: RefusedLine(s)
     \/ Tick
     \/ \E id \in Ids:
         \/ Send(id)
@@ -260,6 +274,7 @@ TypeOK ==
     /\ refusedAt \in [Ids -> 0..NoTime]
     /\ ownProgress \in [Ids -> BOOLEAN]
     /\ words \in [Ids -> Words]
+    /\ foreignGrant \in BOOLEAN
 
 \* WIRE-01: a finished id never goes back in flight.
 IdsNeverReused == \A id \in Ids: everDone[id] => req[id] = "done"
@@ -323,6 +338,10 @@ GraceClearedOnlyByOwnProgress ==
 
 \* A request whose server sent progress after the line is not ended by the grace.
 ProgressProtects == \A id \in Ids: ownProgress[id] => outcome[id] # "malformed"
+
+\* A refused line scoped to one request's stream never gives a grace to another request: an
+\* SSE event on one call's stream says nothing about a call on another stream.
+ScopedGrantsOnlyItsCall == ~foreignGrant
 
 \* The words of an ended request never carry what the server wrote.
 WordsFixed == \A id \in Ids: words[id] # "server_text"
