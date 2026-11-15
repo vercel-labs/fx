@@ -23,7 +23,8 @@
 \*     server's answer: `.tools` ok (accept), `.auth_required` that isn't a
 \*     step-up (refuse: discardLogin, nothing saved, `.sign_in_failed`),
 \*     `.tools` not ok, `.failed`, or `.phase` backoff or failed (fail: saved,
-\*     `.signed_in_unchecked`), or expireLogins after 45 s (fail). A 401 to the check
+\*     `.signed_in_unchecked`), or expireLogins after 45 s (`checkFailed`: refused when the
+\*     engine holds a 401 for the token, else fail; ExpireCheck). A 401 to the check
 \*     request starts a refresh. When that refresh gets no usable answer (a 5xx, a 429,
 \*     no answer in time) the engine ends the request as `.failed` (`auth_unavailable`),
 \*     which also moves the server to `.phase` backoff, or as a `.tools` that is not ok,
@@ -106,6 +107,12 @@ Refusals == {"refuse", "refuse_unrenewed"}
 \* couldn't be made, as fx did before: a findings config sets it to TRUE.
 RefreshFailAsUnchecked == FALSE
 RefreshFailAsUncheckedYes == TRUE
+\* The host's reading of the 45 second wait for the check request when the engine holds a 401 for
+\* the token (a refresh or a retry that 401 started is still pending). fx has it as a refusal
+\* (`checkFailed`, as for every other failed check). With DeadlineKeepsRefused the deadline would
+\* keep the login with a note, as fx did before: a planted bug sets it to TRUE.
+DeadlineKeepsRefused == FALSE
+DeadlineKeepsRefusedYes == TRUE
 
 VARIABLES
     cur, alive, retired, leases,
@@ -284,6 +291,22 @@ Confirm(k) ==
           /\ ck' = [ck EXCEPT ![k].asked = TRUE, ![k].notified = (a \notin Refusals)]
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, flow, shownUrl, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
+\* expireLogins, 45 seconds after the check request went out, for a login that still waits for its
+\* check: the owner doesn't wait longer. The engine's own timeouts end the request first unless a
+\* refresh or a retry that a 401 started is still pending. A token the server refuses has had its 401
+\* heard by then, so the login is refused and never saved, whatever the pending request would answer
+\* (`checkFailed`). With no 401 held, the check failed: the login is kept, with a note.
+ExpireCheck(k) ==
+    /\ phase[k] = "confirming" /\ alive[hostOf[k]] /\ live[hostOf[k]] = k
+    /\ LET h == hostOf[k]
+           refused == ck[k].srv \in Refusals /\ ~DeadlineKeepsRefused
+       IN /\ phase' = Ended(k)
+          /\ live' = [live EXCEPT ![h] = 0]
+          /\ indicator' = FALSE
+          /\ saved' = IF ~refused THEN saved \cup {k} ELSE saved
+          /\ ck' = [ck EXCEPT ![k].asked = TRUE, ![k].notified = ~refused]
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, flow, shownUrl, next, badRedeem, foreignTaken, unread, swapped, gone>>
+
 \* Another fx process takes a login that is saved (pickUpLogin).
 PickUp(k) ==
     /\ k \in saved /\ ~ck[k].taken
@@ -389,7 +412,7 @@ Replace ==
 Next ==
     \/ StartLogin
     \/ AgainLogin
-    \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE) \/ Confirm(k) \/ PickUp(k)
+    \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE) \/ Confirm(k) \/ ExpireCheck(k) \/ PickUp(k)
     \/ StoreUnreadable
     \/ Reread
     \/ Logout

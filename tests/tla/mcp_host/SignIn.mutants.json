@@ -137,5 +137,17 @@
     "old": "          /\\ saved' = IF a \\notin Refusals THEN saved \\cup {k} ELSE saved\n",
     "new": "          /\\ saved' = IF a \\notin Refusals \\/ ck[k].srv = \"refuse_unrenewed\" THEN saved \\cup {k} ELSE saved\n",
     "invariant": "RefusedNeverSaved"
+  },
+  {
+    "description": "The 45 second deadline keeps a login the engine holds a 401 for, and reports it as signed in with a note (`expireLogins` taking the check for one that couldn't be made)",
+    "old": "DeadlineKeepsRefused == FALSE\n",
+    "new": "DeadlineKeepsRefused == TRUE\n",
+    "invariant": "NoticeMatchesAnswer"
+  },
+  {
+    "description": "The deadline saves a refused login",
+    "old": "          /\\ saved' = IF ~refused THEN saved \\cup {k} ELSE saved\n",
+    "new": "          /\\ saved' = saved \\cup {k}\n",
+    "invariant": "RefusedNeverSaved"
   }
 ]

@@ -34,6 +34,10 @@ const login_timeout_ms: i64 = 5 * 60 * 1000;
 /// A new login waits this long for the server to answer a request with it,
 /// past the engine's own start timeout: the owner ends the sign-in then.
 const confirm_wait_ms: i64 = 45 * 1000;
+/// How long after a refused new login the saved login that the host takes back is the one from
+/// before it. The next request, status or verb takes it back within moments; a login saved by
+/// another fx after this long is a new login, and fx says so.
+const refusal_pickup_ms: i64 = 30 * 1000;
 /// The longest the owner sleeps; a `wake` ends it sooner.
 const idle_wait_ms: u32 = 1000;
 /// How long a logout waits for its revocation, as the engine's `close` does.
@@ -491,9 +495,10 @@ pub const Runtime = struct {
         relisting: bool = false,
         /// Why the server needs a login, while `needs_login`.
         login: login_words.Held = .{},
-        /// A new login of this server was just refused, so the saved login the host takes back
-        /// next is the one it had before, not a sign-in.
-        refused_new: bool = false,
+        /// When a new login of this server was refused, so the saved login the host takes back
+        /// next is the one it had before, not a sign-in. Only the moments after the refusal count:
+        /// see `refusalRecent`.
+        refused_new_ms: ?i64 = null,
     };
 
     /// A refresh the engine said was due: waiting for its login's refresh lock,
@@ -1254,7 +1259,7 @@ pub const Runtime = struct {
                 const text = std.mem.print(&buffer, "{s}", .{words}) catch words[0..@min(words.len, buffer.len)];
                 r.engine.discardLogin(name) catch |err| debug_trace.logf("mcp", "MCP new login not forgotten server={s} err={s}", .{ name, @errorName(err) });
                 // Nothing was saved, so there is nothing to say beyond the sign-in's failure.
-                r.flags[i] = .{ .needs_login = true, .refused_new = true };
+                r.flags[i] = .{ .needs_login = true, .refused_new_ms = r.nowMs() };
                 r.endLogin(i);
                 r.notify(.{ .sign_in_failed = .{ .server = name, .reason = text } });
                 r.endToolWaiters(i, .needs_login);
@@ -1336,9 +1341,11 @@ pub const Runtime = struct {
             }
             const name = r.resolved.servers[l.server].name;
             if (l.confirming) {
-                // The engine's own timeouts should have ended it; the sign-in doesn't wait longer.
+                // The engine's own timeouts should have ended it; the sign-in doesn't wait longer. It
+                // ends as any failed check does: refused when the engine holds a 401 for the token (a
+                // refresh or a retry that 401 started is still pending), else kept with a note.
                 debug_trace.logf("mcp", "MCP login check ended server={s} reason=no answer in time", .{name});
-                r.concludeSignIn(l.server, .unchecked) catch |err| {
+                r.checkFailed(l.server) catch |err| {
                     debug_trace.logf("mcp", "MCP login not concluded server={s} err={s}", .{ name, @errorName(err) });
                     r.endLogin(l.server);
                 };
@@ -2346,12 +2353,13 @@ pub const Runtime = struct {
         if (!try r.takeSaved(i)) return false;
         // A new login was just refused: the saved login back in use is the one from before it.
         // That is no sign-in, and "Signed in to NAME." after "Couldn't sign in to NAME" would be
-        // false. A login another fx saved in that window is taken the same way, without the notice.
-        const after_refusal = r.flags[i].refused_new;
+        // false. A login another fx saved within `refusal_pickup_ms` of it is taken the same way,
+        // without the notice; one saved later is a new login, and is announced.
+        const after_refusal = refusalRecent(r.flags[i].refused_new_ms, r.nowMs());
         r.flags[i].needs_login = false;
         r.flags[i].login.clear();
         r.flags[i].signed_in = true;
-        r.flags[i].refused_new = false;
+        r.flags[i].refused_new_ms = null;
         if (after_refusal) {
             debug_trace.logf("mcp", "MCP saved login taken again after a refused new login server={s}", .{s.name});
             return true;
@@ -2549,6 +2557,15 @@ fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u
     return std.mem.print(buffer, "{s} ({s})", .{ what, said }) catch what;
 }
 
+test "a saved login taken back counts as the one from before a refusal only for a moment after it" {
+    try std.testing.expect(!refusalRecent(null, 1_000_000));
+    try std.testing.expect(refusalRecent(5_000, 5_000));
+    try std.testing.expect(refusalRecent(5_000, 5_000 + refusal_pickup_ms));
+    try std.testing.expect(!refusalRecent(5_000, 5_000 + refusal_pickup_ms + 1));
+    // Hours later, a login another fx saved is a new login.
+    try std.testing.expect(!refusalRecent(5_000, 5_000 + 3 * 60 * 60 * 1000));
+}
+
 test "a failed sign-in says why in words, with the server's own" {
     var buffer: [512]u8 = undefined;
     try std.testing.expectEqualStrings("it didn't accept the sign-in (invalid_grant: The code expired)", signInFailure(&buffer, .redemption, "invalid_grant: The code expired."));
@@ -2572,6 +2589,13 @@ fn writeFailure(w: *std.Io.Writer, why: []const u8, exit: ?mcp.stdio.Exit, stray
     };
     if (stray) |line| try w.print("; it wrote \"{s}\" instead of MCP", .{line});
     if (tail) |t| try w.print("; its last stderr lines: \"{s}\"", .{t});
+}
+
+/// Whether a new login that was refused at `refused_ms` was refused a moment ago, so that the saved
+/// login taken back now is the one from before it (`refusal_pickup_ms`). Never, for no refusal.
+fn refusalRecent(refused_ms: ?i64, now_ms: i64) bool {
+    const at = refused_ms orelse return false;
+    return now_ms - at <= refusal_pickup_ms;
 }
 
 /// The engine names why a server is down; fx says it in words. Anything else,

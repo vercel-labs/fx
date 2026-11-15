@@ -260,9 +260,10 @@ pub const Auth = struct {
             .forgotten => try a.stepGate(.{ .forget = key }),
             .rejected => |r| {
                 const c = try a.takeChallenge(r.challenge);
-                // A refused token is named only when the request carried one:
-                // a request that went out with none is the lack of a login.
-                if (r.status == 401) if (a.gate.find(key)) |sent| if (sent.g > 0) a.keepRejection(r.status, c);
+                // A refused token is named only when the request carried the newest one: a request
+                // that went out with none is the lack of a login, and one that went out with a token
+                // since replaced says nothing of the new login (the gate sends it again with that).
+                if (r.status == 401) if (a.gate.find(key)) |sent| if (sent.g > 0 and sent.g == a.gate.token()) a.keepRejection(r.status, c);
                 if (r.status == 403) {
                     if (!c.insufficient_scope) {
                         try a.stepGate(.{ .accepted = key });
@@ -1236,6 +1237,29 @@ test "a 401 to a token fx sent is kept with the server's words; one to a request
     none.actions.clearRetainingCapacity();
     _ = try none.ended(1, .{ .rejected = .{ .status = 401, .challenge = "Bearer error=\"invalid_token\", error_description=\"No authorization provided\"" } });
     try testing.expectEqual(@as(?Rejected, null), neededSignIn(&none).?.rejected);
+}
+
+test "a late 401 for a token a new login replaced is not a refusal of the new login" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer a.deinit();
+    const refused = "Bearer error=\"invalid_token\", error_description=\"No authorization provided\"";
+    try testing.expect(try a.restore(unrefreshable_login));
+    try a.beforeSend(1);
+    // A new login comes while request 1 is out with the old token.
+    try testing.expect(try a.restore(unrefreshable_login));
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(1, .{ .rejected = .{ .status = 401, .challenge = refused } });
+    try testing.expectEqual(@as(?Rejected, null), a.rejection());
+
+    // A 401 to a request sent with the new token is the server's answer to it.
+    try a.beforeSend(2);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(2, .{ .rejected = .{ .status = 401, .challenge = refused } });
+    try testing.expectEqual(@as(u16, 401), a.rejection().?.status);
 }
 
 test "a refused refresh keeps its own reason, a server's acceptance clears the refusal, and discarding a login saves nothing" {
