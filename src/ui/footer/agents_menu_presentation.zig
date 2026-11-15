@@ -97,9 +97,8 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
-/// A working subagent's current call, else its session's title.
+/// Its session's title, else a placeholder.
 fn titleOf(row: AgentsMenuRow) []const u8 {
-    if (row.activity.len > 0) return row.activity;
     return if (row.title.len > 0) row.title else untitled;
 }
 
@@ -362,16 +361,16 @@ test "the agent list counts the agents, then shows each one's name, title, state
     }
 }
 
-test "a working subagent's row shows its current call in place of its title, and the call's time with its state" {
+test "a working subagent's row keeps its title, and shows its call's time with its state" {
     const rows = [_]AgentsMenuRow{
         .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active, .model = "anthropic/claude-opus-4-7", .effort = "high" },
-        .{ .name = "worker", .subagent = true, .title = "Run the auth tests", .activity = "Waiting for npm test", .state = "working 4m12s", .state_tone = .active, .model = "openai/gpt-5.4-mini" },
+        .{ .name = "worker", .subagent = true, .title = "Run the auth tests", .state = "working 4m12s", .state_tone = .active, .model = "openai/gpt-5.4-mini" },
     };
     try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
         "  Agents 2",
         "",
-        "  main      Fix the login bug     working        opus 4-7 high",
-        "  \u{2514} worker  Waiting for npm test  working 4m12s  gpt-5.4-mini",
+        "  main      Fix the login bug   working        opus 4-7 high",
+        "  \u{2514} worker  Run the auth tests  working 4m12s  gpt-5.4-mini",
     });
 }
 
