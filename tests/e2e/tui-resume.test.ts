@@ -1617,9 +1617,9 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared watcher and stop it.");
       const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
       // The launch returned while its command ran on, and the session's input
-      // and its stop share one row with its latest state.
-      expect(live).toContain("├ Still running cat, sleep");
-      expect(live).toContain("└ Stopped cat, sleep · 2 calls");
+      // and its stop join its row, which shows the latest state.
+      expect(live).toContain("● Stopped cat, sleep · 3 calls");
+      expect(live).not.toContain("Still running cat, sleep");
       expect(live).not.toContain("Observed shell-1");
 
       await active.sendText("/quit");
@@ -1637,8 +1637,8 @@ test.skipIf(!tmuxAvailable())(
         height: 30,
       });
       const resumed = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(resumed).toContain("├ Still running cat, sleep");
-      expect(resumed).toContain("└ Stopped cat, sleep · 2 calls");
+      expect(resumed).toContain("● Stopped cat, sleep · 3 calls");
+      expect(resumed).not.toContain("Still running cat, sleep");
       expect(resumed).not.toContain("Observed shell-1");
       expect(resumed).not.toContain("Stopped shell-1");
       expect(resumedGateway.requests).toHaveLength(0);
