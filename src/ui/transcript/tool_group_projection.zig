@@ -935,6 +935,9 @@ const StoryTally = struct {
     /// Calls other than commands that failed, such as an edit that did not
     /// apply.
     other_failures: usize = 0,
+    /// Those failed calls that their turn ended on, which a collapsed group's
+    /// header counts, since no row shows them.
+    turn_ending_failures: usize = 0,
     /// Calls held until fx reads the project instructions they reach.
     deferred: usize = 0,
     /// Rows whose latest command failed, other than the group's last
@@ -1263,11 +1266,12 @@ fn workPhrase(tally: StoryTally, kind: WorkKind) []const u8 {
 /// they are the change the group made, then the kind of work with the most
 /// calls, and a tie goes to the kind earlier in WorkKind. Up to three kinds
 /// show, then ", and more". The result mark says how the commands ended.
-/// With `with_diff`, for a group whose rows are collapsed, the edits keep the
-/// lines they added and removed, since no row shows them. Returns null when
+/// With `collapsed`, for a group whose rows are collapsed, the edits keep the
+/// lines they added and removed, and a failure the turn ended on counts,
+/// since no row shows them. Returns null when
 /// the group has nothing the story can name, so the caller keeps the count
 /// summary. The parts live in `scratch`.
-fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Summary, style: SummaryStyle, with_diff: bool) !?StoryHeader {
+fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Summary, style: SummaryStyle, collapsed: bool) !?StoryHeader {
     var kinds: std.ArrayList(WorkKind) = .empty;
     for (std.enums.values(WorkKind)) |kind| {
         const amount = workAmount(tally, kind);
@@ -1293,7 +1297,7 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
         const first = workPhrase(tally, kinds.items[0]);
         try lead.writer.writeByte(std.ascii.toUpper(first[0]));
         try lead.writer.writeAll(first[1..]);
-        if (with_diff and kinds.items[0] == .edits) try writeDiffTotals(&lead.writer, tally.diff, style);
+        if (collapsed and kinds.items[0] == .edits) try writeDiffTotals(&lead.writer, tally.diff, style);
         const named = @min(kinds.items.len, header_max_parts);
         for (kinds.items[1..named]) |kind| {
             if (kind == .commands) mark_part = parts.items.len;
@@ -1316,8 +1320,10 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     if (mark_shown) try writeResultMark(&mark.writer, tally, style);
     // A failed call that is not a command was most often the model's own
     // mistake, which it works past, so the header does not count it; its
-    // row still says it failed.
-    const failed = if (lead_says_failed) 0 else tally.earlier_command_failures;
+    // row still says it failed. A collapsed group shows no rows, so its
+    // header counts the failures its turn ended on.
+    const turn_ending: usize = if (collapsed) tally.turn_ending_failures else 0;
+    const failed = if (lead_says_failed) 0 else tally.earlier_command_failures + turn_ending;
     const last_failed: usize = if (tally.last_command_failed orelse false) 1 else 0;
     const states = try formatHeaderStates(scratch, failed, summary);
     const states_without_mark = try formatHeaderStates(scratch, failed + last_failed, summary);
@@ -2513,7 +2519,9 @@ fn writeGroupBlock(
     }
     const rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, focused_entry_id, &retries);
     for (rows.items) |*row| {
-        if (storyCallFailed(row.detail)) row.ends_turn = callEndsTurn(entries, row.status_index);
+        if (!storyCallFailed(row.detail)) continue;
+        row.ends_turn = callEndsTurn(entries, row.status_index);
+        if (row.ends_turn and !isShellCommandCall(scratch, row.detail.?)) tally.turn_ending_failures += 1;
     }
     var last_command_row: ?usize = null;
     for (rows.items, 0..) |*row, index| {
@@ -4198,6 +4206,46 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     _ = rows.next();
     while (rows.next()) |row| {
         try std.testing.expectEqual(@as(usize, cols), try widthWithoutTestMarkersForTest(alloc, row));
+    }
+}
+
+test "a collapsed group's header counts a failure its turn ended on" {
+    const alloc = std.testing.allocator;
+    const read_args = "{\"path\":\"/w/README.md\"}";
+    const edit_args = "{\"path\":\"/w/README.md\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /w/README.md\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed /w/README.md: old_string not found in file\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "  2s", .class = .turn_summary } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .failed },
+    };
+    // Collapsed, the header is the group's only line, so it counts the
+    // failure the turn ended on.
+    {
+        var collapsed = try buildWithStyleAndStats(alloc, &entries, &details, 120, null, true, .{}, .{}, .compact, null, null);
+        defer collapsed.deinit(alloc);
+        const header = collapsed.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("collapsed:\n{s}\n", .{header});
+        try std.testing.expectEqualStrings("● Read a file · 1 failed", header);
+    }
+    // Expanded, the failed row says why, so the header does not count it.
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("expanded:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings("● Read a file", firstLineForTest(text));
+        try std.testing.expect(std.mem.find(u8, text, "└ Couldn't edit README.md · old_string not found in file") != null);
+    }
+    // A failure the turn went on after stays out of a collapsed header.
+    {
+        var mid_turn = try buildWithStyleAndStats(alloc, entries[0..2], &details, 120, null, true, .{}, .{}, .compact, null, null);
+        defer mid_turn.deinit(alloc);
+        const header = mid_turn.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("mid turn:\n{s}\n", .{header});
+        try std.testing.expectEqualStrings("● Read a file", header);
     }
 }
 
