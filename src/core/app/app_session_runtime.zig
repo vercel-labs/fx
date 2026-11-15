@@ -3631,12 +3631,8 @@ pub fn Runtime(comptime App: type) type {
         pub fn pollTranscriptArchive(app: *App, agent: *AppAgent) !bool {
             if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return false;
             const read = &agent.session_persistence.transcript_archive_read;
+            if (read.dropIfStale(app.shell.transcript_archive_generation)) return false;
             const task = read.completed() orelse return false;
-            if (task.request.generation != app.shell.transcript_archive_generation) {
-                debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=stale turns={d}", .{ task.request.back, task.turns.items.len });
-                read.finish();
-                return false;
-            }
             const back = task.request.back;
             const outcome = advanceTranscriptArchiveReplay(app, agent, task) catch |err| {
                 read.finish();
