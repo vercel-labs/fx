@@ -1855,6 +1855,10 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
     const kind = record.activity_kind orelse return .{};
     switch (kind) {
         .command => {
+            // A denied or cancelled command did not run, so it keeps its own
+            // row instead of counting as a run of the same command. A failed
+            // run still joins, so a row can say "passed on the 3rd run".
+            if (record.outcome) |outcome| if (outcome == .denied or outcome == .cancelled) return .{};
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
             if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
                 .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
@@ -1865,8 +1869,11 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             return .{};
         },
         .read, .list => {
-            // A failed read or search keeps its own row, so its reason shows.
+            // A read or search that failed, was denied, or was cancelled
+            // keeps its own row, so what happened to it shows. One still
+            // running joins the row it shares.
             if (storyCallFailed(detail)) return .{};
+            if (record.outcome) |outcome| if (outcome != .completed) return .{};
             if (try storySearchKey(scratch, record)) |key| return .{ .kind = .search, .key = key };
             if (kind != .read or !std.mem.eql(u8, record.tool_name, "read_file")) return .{};
             const path = storyArgString(scratch, record, "path") orelse return .{};
@@ -1955,17 +1962,18 @@ fn collectStoryRetries(
 /// to open or run counts by its base name, so one opened by its path repeats
 /// one opened by its name; a path counts whole, so another file with the
 /// same name is not a retry. Null for a shell command, which repeats as
-/// "passed on the 3rd run" instead.
+/// "passed on the 3rd run" instead, and for a call that names no target,
+/// such as an MCP tool's: its next call may do other work, so its failure
+/// stays.
 fn retryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
     if (isShellCommandCall(scratch, record)) return null;
     const fields = [_][]const u8{ "path", "open", "run", "search", "agent", "pattern", "url", "query" };
-    var target: []const u8 = "";
     for (fields) |field| if (storyArgString(scratch, record, field)) |value| {
         const by_name = std.mem.eql(u8, field, "open") or std.mem.eql(u8, field, "run");
-        target = if (by_name) std.Io.Dir.path.basename(value) else value;
-        break;
+        const target = if (by_name) std.Io.Dir.path.basename(value) else value;
+        return try std.mem.concat(scratch, u8, &.{ record.tool_name, "\x00", target });
     };
-    return try std.mem.concat(scratch, u8, &.{ record.tool_name, "\x00", target });
+    return null;
 }
 
 /// The rows of a group after calls for the same task share one row. Rows
@@ -4802,6 +4810,61 @@ test "a read row names a file whose path core wrote escaped" {
     try std.testing.expectEqualStrings("● Read odd\\x09name.zig L3-6", std.mem.trim(u8, text, "\n"));
 }
 
+test "a denied or cancelled read, search, or command keeps its own row" {
+    const alloc = std.testing.allocator;
+    const read_a = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/a.zig\n", .class = .tool_status } };
+    const denied_b = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Denied read /Users/example/b.zig\n", .class = .tool_status } };
+    const cancelled_c = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Cancelled read /Users/example/c.zig\n", .class = .tool_status } };
+    const read_a_detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/Users/example/a.zig\"}"), .outcome = .completed };
+    const denied_b_detail = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/Users/example/b.zig\"}"), .outcome = .denied };
+    const cancelled_c_detail = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/Users/example/c.zig\"}"), .outcome = .cancelled };
+
+    // The denied read is not named as read; it has its own row.
+    {
+        const text = try groupTextForTest(alloc, &.{ read_a, denied_b }, &.{ read_a_detail, denied_b_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "1 denied") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Read a.zig\n") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Denied read b.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "a.zig, b.zig") == null);
+    }
+    // A cancelled read does not join the read row either.
+    {
+        const text = try groupTextForTest(alloc, &.{ read_a, cancelled_c }, &.{ read_a_detail, cancelled_c_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "a.zig, c.zig") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Read a.zig") != null);
+    }
+    // A denied command keeps its own row and is not counted as a run of the
+    // same command.
+    {
+        const denied_run = TranscriptEntry{ .raw_bytes = .{ .id = 6, .bytes = "● Denied zig build\n", .class = .tool_status } };
+        const ran = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● Ran zig build\n", .class = .tool_status } };
+        const denied_run_detail = ToolDetailRecord{ .entry_id = 6, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("Ran"), .outcome = .denied };
+        const ran_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("shell"), .captured_command = true, .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"zig build\"}"), .command_display = @constCast("zig build"), .command_action_label = @constCast("Ran"), .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } };
+        const text = try groupTextForTest(alloc, &.{ denied_run, ran }, &.{ denied_run_detail, ran_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "×2") == null);
+        try std.testing.expect(std.mem.find(u8, text, "1 denied") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Denied") != null);
+    }
+    // A denied search keeps its own row beside the searches that ran.
+    {
+        const searched = TranscriptEntry{ .raw_bytes = .{ .id = 4, .bytes = "● Searched foo\n", .class = .tool_status } };
+        const denied_search = TranscriptEntry{ .raw_bytes = .{ .id = 5, .bytes = "● Denied search bar\n", .class = .tool_status } };
+        const searched_detail = ToolDetailRecord{ .entry_id = 4, .tool_name = @constCast("grep_files"), .activity_kind = .read, .arguments_json = @constCast("{\"pattern\":\"foo\"}"), .outcome = .completed };
+        const denied_search_detail = ToolDetailRecord{ .entry_id = 5, .tool_name = @constCast("grep_files"), .activity_kind = .read, .arguments_json = @constCast("{\"pattern\":\"bar\"}"), .outcome = .denied };
+        const text = try groupTextForTest(alloc, &.{ searched, denied_search }, &.{ searched_detail, denied_search_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "foo, bar") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Denied search bar") != null);
+    }
+}
+
 test "a group of one row that lists names is that one line" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
@@ -4854,6 +4917,20 @@ test "a failure the model fixed at once shows as the try that worked" {
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
         try std.testing.expect(std.mem.find(u8, text, "Couldn't edit main.zig · old_string not found") != null);
+        try std.testing.expect(std.mem.find(u8, text, "try") == null);
+    }
+    // A tool whose calls name no target, such as an MCP tool, may do other
+    // work on its next call, so its failure stays.
+    {
+        const failed_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● Failed mcp_issues_create: Invalid input\n", .class = .tool_status } };
+        const done_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 8, .bytes = "● Ran mcp_issues_create\n", .class = .tool_status } };
+        const failed_mcp_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("mcp_issues_create"), .activity_kind = .read, .arguments_json = @constCast("{\"title\":\"a\"}"), .outcome = .failed };
+        const done_mcp_detail = ToolDetailRecord{ .entry_id = 8, .tool_name = @constCast("mcp_issues_create"), .activity_kind = .read, .arguments_json = @constCast("{\"title\":\"b\"}"), .outcome = .completed };
+        const text = try groupTextForTest(alloc, &.{ failed_mcp, done_mcp }, &.{ failed_mcp_detail, done_mcp_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_issues_create · Invalid input") != null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
     // A next call with another target did not fix it, so the failure stays.
