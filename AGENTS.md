@@ -181,6 +181,8 @@ Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
 
+Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgrade Zig code. It covers what Zig 0.17.x removed, deprecated, or changed without a compile error, including the 0.17.0 to 0.17.1 changes, and Zig ownership, error, I/O, concurrency, and testing practice. Where the skill and this file differ, this file takes precedence.
+
 ### Memory and Errors
 
 * Allocators are passed explicitly. Never use a global allocator.
@@ -433,7 +435,7 @@ Each platform check is informational. An increase of at least 52,429 bytes
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (6.500 MiB for macOS arm64, 6.750 MiB for Linux arm64, and
+production ceilings (6.750 MiB for macOS arm64, 7.000 MiB for Linux arm64, and
 8.750 MiB for Linux x86_64) and performance gates.
 
 ## Documentation

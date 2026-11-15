@@ -47,6 +47,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const MODEL = "openai/gpt-5.5";
 /** The frame every subagent report arrives in (`src/core/subagent/reports.zig`). */
@@ -8613,7 +8614,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(3);
           await tui.waitForPane((pane) => /^[• ] Running \(/m.test(pane), 15000);
           await tui.sendKeys("C-c");
-          await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
+          // The cancelled call is its group's header, and the cancellation
+          // block below it says "Cancelled".
+          await tui.waitForPane((pane) => /cancelled/i.test(pane) && hasEmptyComposer(pane), 15000);
           const roots = rootSessionIds(root.home);
           expect(roots).toHaveLength(1);
           const sessionId = roots[0]!;
@@ -10134,7 +10137,49 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 45_000);
 
-  test("subagent failure retains its cause after effects and worker cleanup", async () => {
+  // How a test breaks the child's blobs folder, and the cause the child then
+  // reports.
+  type BlobsFault = {
+    cause: string;
+    inject: (blobs: string) => void;
+    // Puts the folder back, so the next message to the same child works.
+    restore: (blobs: string) => void;
+  };
+
+  // A user that file modes do not hold back, such as root or one that holds
+  // CAP_DAC_OVERRIDE, writes into a read-only folder, so the restored test
+  // cannot force its failure for them and skips.
+  const fileModesIgnored = ignoresFileModes();
+  if (fileModesIgnored) {
+    console.warn(
+      'skipping "subagent failure retains its cause after effects and worker cleanup": a write into a read-only folder was not refused for this user (root, or a user that holds CAP_DAC_OVERRIDE), so the folder cannot force the write failure that test needs',
+    );
+  }
+
+  // The child's next tool result needs a new blob, which a read-only blobs
+  // folder refuses, so the write fails while the child streams the step and
+  // the cause is the refused write.
+  const readOnlyBlobs: BlobsFault = {
+    cause: "AccessDenied",
+    inject: (blobs) => chmodSync(blobs, 0o500),
+    restore: (blobs) => chmodSync(blobs, 0o700),
+  };
+
+  // A file where the blobs folder must be fails the child's commit for every
+  // user. The step still streams, and the cause is the failed commit.
+  const fileInPlaceOfBlobs: BlobsFault = {
+    cause: "SessionCommitFailed",
+    inject: (blobs) => {
+      renameSync(blobs, `${blobs}.aside`);
+      writeFileSync(blobs, "");
+    },
+    restore: (blobs) => {
+      rmSync(blobs);
+      renameSync(`${blobs}.aside`, blobs);
+    },
+  };
+
+  async function runFailedChildAfterEffects(fault: BlobsFault) {
     const root = createFixtureRoot("subagent-failure-detail");
     const marker = join(root.workspace, "effect.txt");
     const childTask = "Write the effect once, then read it.";
@@ -10154,15 +10199,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (latestUserIsReport(body)) {
         const report = latestUserText(body);
         expect(report).toContain("failed");
-        expect(report).toContain("agent_turn_failed: AccessDenied");
+        expect(report).toContain(`agent_turn_failed: ${fault.cause}`);
         expect(report).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
         // The parent's log records the child's work failed, with its cause.
         expect(childWork(root.home, parentId).outcome).toBe("failed");
-        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain("AccessDenied");
+        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain(fault.cause);
         failureObserved = true;
-        chmodSync(childBlobs, 0o700);
+        fault.restore(childBlobs);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -10177,12 +10222,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-          // The child's next tool result needs a new blob, which a read-only
-          // blobs folder refuses, so the child's turn fails after its effect
-          // and reports that cause.
+          // Breaking the child's blobs folder makes its turn fail after its
+          // effect and report that cause.
           parentId = rootSessionIds(root.home)[0]!;
           childBlobs = join(sessionDir(root.home, childWork(root.home, parentId).child), "blobs");
-          chmodSync(childBlobs, 0o500);
+          fault.inject(childBlobs);
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -10202,7 +10246,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The message was sent; its failure is saved as the report's turn.
       const persisted = savedToolResults(history).find((entry) => entry.tool_call_id === "delegate");
       expect(persisted?.status).toBe("success");
-      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes("agent_turn_failed: AccessDenied"))).toBe(true);
+      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes(`agent_turn_failed: ${fault.cause}`))).toBe(true);
       // Parent call, two child requests, the receipt, the failure's report
       // turn, the follow-up's receipt, the child, and its report's turn.
       expect(scripted.requestCount()).toBe(8);
@@ -10211,7 +10255,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       scripted.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }
+
+  test.skipIf(fileModesIgnored)("subagent failure retains its cause after effects and worker cleanup", () => runFailedChildAfterEffects(readOnlyBlobs), 20_000);
+
+  test("subagent failure keeps its cause when the child's commit fails after effects, whatever the user's permissions", () => runFailedChildAfterEffects(fileInPlaceOfBlobs), 20_000);
 
   test.each([
     ["before output", 401, false],
@@ -12132,8 +12180,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await tui.waitForPane(() => childRequests === 1 && parentBodies.length === 2 && parentHold.started, 10000);
       // The child finishes while the parent's reply is still open, so its
       // report waits for the step to end instead of interrupting the model.
+      // The report reaches the worker through the main loop, a moment after
+      // `report_queued`, so the reply stays held until the open turn has it
+      // (`mail_posted` as joined). Released sooner, the step can end first,
+      // the empty reply is asked to continue, and the report comes a request
+      // later.
       child.release("CHILD_REPORT_TEXT");
-      await tui.waitForPane(() => trace().includes("event=report_queued "), 10000);
+      await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
       await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
 

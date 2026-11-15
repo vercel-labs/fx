@@ -97,12 +97,10 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
-/// A working subagent's current call, else its session's title, else what a
-/// subagent is for, else `untitled`. The purpose is model-written text like
-/// the title, and `appendCell` draws all of them through the same escaping and
-/// display-width cut.
+/// Its session's title, else what a subagent is for, else `untitled`. The
+/// purpose is model-written text like the title, and `appendCell` draws both
+/// through the same escaping and display-width cut.
 fn titleOf(row: AgentsMenuRow) []const u8 {
-    if (row.activity.len > 0) return row.activity;
     if (row.title.len > 0) return row.title;
     return if (row.purpose.len > 0) row.purpose else untitled;
 }
@@ -366,16 +364,16 @@ test "the agent list counts the agents, then shows each one's name, title, state
     }
 }
 
-test "a working subagent's row shows its current call in place of its title, and the call's time with its state" {
+test "a working subagent's row keeps its title, and shows its call's time with its state" {
     const rows = [_]AgentsMenuRow{
         .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active, .model = "anthropic/claude-opus-4-7", .effort = "high" },
-        .{ .name = "worker", .subagent = true, .title = "Run the auth tests", .activity = "Waiting for npm test", .state = "working 4m12s", .state_tone = .active, .model = "openai/gpt-5.4-mini" },
+        .{ .name = "worker", .subagent = true, .title = "Run the auth tests", .state = "working 4m12s", .state_tone = .active, .model = "openai/gpt-5.4-mini" },
     };
     try expectRows(.{ .rows = &rows }, 80, max_inline_rows, &.{
         "  Agents 2",
         "",
-        "  main      Fix the login bug     working        opus 4-7 high",
-        "  \u{2514} worker  Waiting for npm test  working 4m12s  gpt-5.4-mini",
+        "  main      Fix the login bug   working        opus 4-7 high",
+        "  \u{2514} worker  Run the auth tests  working 4m12s  gpt-5.4-mini",
     });
 }
 
@@ -537,9 +535,9 @@ test "a narrow agent list leaves out the profile, then the model, and cuts a lon
     });
 }
 
-test "a row's title comes before what the subagent is for, which comes before new session, and a working call comes first" {
-    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
-    try std.testing.expectEqualStrings("Waiting for npm test", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .activity = "Waiting for npm test", .state = "working" }));
+test "a row's title comes before what the subagent is for, which comes before new session, whether the subagent works or not" {
+    try std.testing.expectEqualStrings("Review the parser", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .state = "working" }));
+    try std.testing.expectEqualStrings("You review the parser.", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .state = "working" }));
     try std.testing.expectEqualStrings("Review the parser", titleOf(.{ .name = "a", .title = "Review the parser", .purpose = "You review the parser.", .state = "idle" }));
     try std.testing.expectEqualStrings("You review the parser.", titleOf(.{ .name = "a", .title = "", .purpose = "You review the parser.", .state = "idle" }));
     try std.testing.expectEqualStrings(untitled, titleOf(.{ .name = "a", .title = "", .purpose = "", .state = "idle" }));

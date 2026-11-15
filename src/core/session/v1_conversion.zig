@@ -129,6 +129,24 @@ const Root = struct {
 /// root. Fails only when v1's sessions folder itself cannot be listed.
 /// Caller owns the ids and the slice.
 pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
+    var complete = true;
+    return rootIdsUntil(alloc, home, null, &complete);
+}
+
+/// Whether `stop`, null or an optional value with `context` and
+/// `requested` such as the session manager's `Stop`, says to end a scan.
+/// Only the session adapter imports the session manager, so the type is
+/// left to the caller.
+fn stopNow(stop: anytype) bool {
+    if (@TypeOf(stop) == @TypeOf(null)) return false;
+    const s = stop orelse return false;
+    return s.requested(s.context);
+}
+
+/// `rootIds`, ended early when `stop`, asked before each folder, says so; `complete` is then false and
+/// the roots are those read before it.
+pub fn rootIdsUntil(alloc: Allocator, home: []const u8, stop: anytype, complete: *bool) ![]Root {
+    complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     var roots: std.ArrayList(Root) = .empty;
@@ -140,6 +158,13 @@ pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
     while (true) {
         try roots.ensureUnusedCapacity(alloc, 1);
         const id = (try candidates.nextId(alloc, null)) orelse break;
+        // Asked only when a folder is left, so a scan with nothing to read
+        // is complete however late it starts.
+        if (stopNow(stop)) {
+            alloc.free(id);
+            complete.* = false;
+            break;
+        }
         errdefer alloc.free(id);
         const kind = kindOf(&store, alloc, id) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -182,7 +207,10 @@ pub const Stray = struct {
 /// gone or already converted. A folder whose kind or parent cannot be read
 /// is left out; `rootIds` reports the first. Fails only when v1's sessions
 /// folder cannot be listed. Caller owns the result.
-pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
+/// Ended early when `stop`, asked before each folder, says so; `complete` is
+/// then false and the children are those found before it.
+pub fn strayChildren(alloc: Allocator, home: []const u8, stop: anytype, complete: *bool) ![]Stray {
+    complete.* = true;
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     var strays: std.ArrayList(Stray) = .empty;
@@ -191,8 +219,13 @@ pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
         strays.deinit(alloc);
     }
     var candidates = store.readOnlyCandidates();
-    while (try candidates.nextId(alloc, null)) |id| {
+    while (true) {
+        const id = (try candidates.nextId(alloc, null)) orelse break;
         defer alloc.free(id);
+        if (stopNow(stop)) {
+            complete.* = false;
+            break;
+        }
         if ((kindOf(&store, alloc, id) catch continue) != .child) continue;
         const parent = parentOf(&store, alloc, id) catch |err| switch (err) {
             error.OutOfMemory => return err,

@@ -1228,8 +1228,8 @@ printf '${trailingMarker}   '
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, doneMarker);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).toContain("└ Ran ./command-output-controls.sh");
+      // The group's only call is its header, marked with the result.
+      expect(compact).toContain("● Ran ./command-output-controls.sh ✓");
       expect(compact).not.toContain(`│ ${ansiMarker}`);
       expect(compact).not.toContain(`│ ${crMarker}`);
       expect(compact).not.toContain("│ TAB");
@@ -1616,8 +1616,10 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared watcher and stop it.");
       const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(live).toContain("Still running cat <<'EOF' launch marker line EOF sleep 300");
-      expect(live).toContain("Observed cat <<'EOF'");
+      // The launch returned while its command ran on, and the session's input
+      // and its stop share one row with its latest state.
+      expect(live).toContain("├ Still running cat, sleep");
+      expect(live).toContain("└ Stopped cat, sleep · 2 calls");
       expect(live).not.toContain("Observed shell-1");
 
       await active.sendText("/quit");
@@ -1635,9 +1637,8 @@ test.skipIf(!tmuxAvailable())(
         height: 30,
       });
       const resumed = await waitForScrollback(active, "SESSION_LABEL_DONE");
-      expect(resumed).toContain("Still running cat <<'EOF' launch marker line EOF sleep 300");
-      expect(resumed).toContain("Observed cat <<'EOF'");
-      expect(resumed).toContain("Stopped cat <<'EOF'");
+      expect(resumed).toContain("├ Still running cat, sleep");
+      expect(resumed).toContain("└ Stopped cat, sleep · 2 calls");
       expect(resumed).not.toContain("Observed shell-1");
       expect(resumed).not.toContain("Stopped shell-1");
       expect(resumedGateway.requests).toHaveLength(0);
@@ -1857,7 +1858,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toMatch(/^● Ran awk .*✓$/m);
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
@@ -1937,7 +1938,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(tailMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
+      // Only the compact view recaps the turn.
+      await active.waitForText("Ran 1 command · ", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
       expect(restored).not.toContain("lines more (ctrl+o to view)");
@@ -2015,7 +2017,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toContain("● Ran awk, printf, sleep +1 more ✓");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
@@ -2673,7 +2675,8 @@ test.skipIf(!tmuxAvailable())(
     const finalMarker = "ORDER_REPRO_DONE";
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
-    const statusLine = "└ Ran pwd";
+    // The group's only call is its header, marked with the result.
+    const statusLine = "● Ran pwd ✓";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -3118,7 +3121,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared Ctrl-O cancellation check.");
-      await active.waitForText(streamMarker, TIMEOUT);
+      // The running row shows the inline script's steps in short form.
+      await active.waitForText("Running printf, sleep", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
@@ -3185,7 +3189,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await active.waitForText("Running sh -c", TIMEOUT);
+      // The inline script shows its steps in short form.
+      await active.waitForText("Running printf, sleep, printf", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, TIMEOUT);
@@ -3259,7 +3264,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${lineMarker} 001`),
         TIMEOUT,
       );
@@ -3424,7 +3429,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${commandMarker} 00005`),
         TIMEOUT,
       );
@@ -3512,7 +3517,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command and ask the prepared question.");
-      await active.waitForText(commandMarker, TIMEOUT);
+      // The command's row shows its inline script's steps in short form.
+      await active.waitForText("printf, sleep", TIMEOUT);
       await active.sendKeys("C-o");
       await active.waitForText(questionMarker, TIMEOUT);
 
@@ -4276,7 +4282,9 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", actionTimeout);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForText("CTRL_O_HANDOFF_FIRST_RUNNING", actionTimeout);
+      // The first command's row appears when it starts, with the steps of its
+      // inline script in short form.
+      await active.waitForText("Running touch, printf, sleep +1 more", actionTimeout);
       const beforeHandoff = await active.captureFullScrollback();
       expect(countOccurrences(beforeHandoff, bulletMarker)).toBe(1);
       expect(countOccurrences(beforeHandoff, codeMarker)).toBe(1);
@@ -4472,7 +4480,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running sh -c") &&
+          pane.includes("Running printf, sleep, printf") &&
           !pane.includes(`${streamPrefix}004`),
         TIMEOUT,
       );
@@ -4574,7 +4582,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const afterFileRejection = await active.waitForPane(
         (pane) =>
-          pane.includes("Ran sh -c") &&
+          pane.includes("Ran printf, sleep, printf") &&
           !pane.includes("Apply this change?"),
         TIMEOUT,
       );
@@ -5056,10 +5064,12 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("1 failed");
+      // The failure control ran last, and the deferred call does not count.
+      expect(scrollback).toContain("● Ran commands, read a file ✗");
       expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
-      expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
+      // The hold for project instructions gets no row in the compact view.
+      expect(scrollback).not.toContain("Reading project instructions before continuing");
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("├ terminal");
       expect(scrollback).not.toContain("└ terminal");
@@ -5067,9 +5077,10 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain("└ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
-      expect(scrollback).toContain("Read nested/input.txt");
+      expect(scrollback).toContain("Read input.txt");
       expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Exited 7 ${failureCommand}`);
+      // The failure control's steps show in short form; `exit` drops out.
+      expect(scrollback).toContain("Exited 7 printf");
       expect(scrollback).not.toContain("│ exit code 7");
     }
 
@@ -7428,8 +7439,7 @@ printf '${stdoutTail2}\\n'
     let active: TmuxSession | null = null;
 
     function expectCompactCommandOutput(pane: string): void {
-      expect(pane).toContain("● 1 tool call · 1 command");
-      expect(pane).toContain("Ran ./resume-command-output.sh");
+      expect(pane).toContain("● Ran ./resume-command-output.sh ✓");
       expect(pane).not.toContain("lines more (ctrl+o to view)");
       expect(pane).not.toContain(firstMarker);
       expect(pane).not.toContain("RESUME_COMMAND_TAIL");
@@ -9065,13 +9075,15 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     const scrollback = await waitForScrollback(active, "RECLIP_MOVED_REPLY");
     // The replayed row abbreviates against the live workspace and reclips to
     // the live width instead of keeping the frozen compact-bound marker.
-    const row = scrollback.split("\n").find((line) => line.includes("Still running cd ./alpha"));
+    // The launch and its observe share one session row, which is the group's
+    // header and shows the launch command's steps in short form.
+    const row = scrollback.split("\n").find((line) => line.includes("Observed printf"));
     expect(row).toBeDefined();
-    expect(row!).toContain(tail);
+    expect(row!).toContain(" · 2 calls");
     expect(row!).not.toContain("...");
     // Session-action rows resolve the launch command through the live root
     // instead of falling back to the raw session id.
-    expect(scrollback).toContain("Observed cd ./alpha");
+    expect(scrollback).toContain("Observed printf");
     expect(scrollback).not.toContain("Observed shell-1");
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
