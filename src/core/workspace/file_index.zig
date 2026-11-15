@@ -14,6 +14,7 @@ const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const unicode_simple_fold = @import("unicode_simple_fold.zig");
 const pathing = @import("pathing.zig");
@@ -863,9 +864,10 @@ fn loadGeneration(
     return .ready;
 }
 
-/// `<home>/.fx/file-index/<sha256>.idx`, or null without an absolute home
-/// directory. The digest covers the roots and every variable that locates git
-/// config, so a listing built under one config is never reused under another.
+/// `$FX_HOME/file-index/<sha256>.idx` (default `~/.fx/file-index/`),
+/// or null without an absolute home directory. The digest covers the roots
+/// and every variable that locates git config, so a listing built under one
+/// config is never reused under another.
 pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
     const home = io_mod.homeDir() orelse return null;
     var config_environment: [indexer.config_environment_names.len]?[]const u8 = undefined;
@@ -891,7 +893,9 @@ fn snapshotPathIn(
     var sum: [sha256_digest_len]u8 = undefined;
     digest.final(&sum);
     const hex = std.fmt.bytesToHex(sum, .lower);
-    return alloc.print("{s}/.fx/file-index/{s}.idx", .{ home, &hex });
+    const root = try profile_paths.rootDir(alloc, home);
+    defer alloc.free(root);
+    return alloc.print("{s}/file-index/{s}.idx", .{ root, &hex });
 }
 
 /// The trees for the available roots of a scope, in root order. Trees reused
