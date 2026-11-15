@@ -447,6 +447,24 @@ test "a challenge keeps the error and description a server names, cut at their b
     try testing.expect(std.unicode.utf8ValidateSlice((try parseChallenge(a, odd)).?.description.?));
 }
 
+test "an error written with escapes is read as the word it spells" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A quoted-pair escape in the name: the same word, so the same step-up (a fuzzer found this, after
+    // a first challenge that was not one).
+    const spelled = (try parseChallenge(a, "Bearer error=\"insuffic\\ient_scope\", scope=\"a\"")).?;
+    try testing.expect(spelled.insufficient_scope);
+    try testing.expectEqualStrings("insufficient_scope", spelled.error_code.?);
+    const after_broken = (try parseChallenge(a, "\"alm=\"a\", Bearer error=\"insuffic\\ient_scope\",Q=")).?;
+    try testing.expect(after_broken.insufficient_scope);
+    // An escaped quote stays part of the value: it is kept as written, no step-up, and the words fx
+    // shows leave a code like it out (`login_words.isLogSafeCode`).
+    const quoted = (try parseChallenge(a, "Bearer error=\"inv\\\"alid\"")).?;
+    try testing.expect(!quoted.insufficient_scope);
+    try testing.expectEqualStrings("inv\"alid", quoted.error_code.?);
+}
+
 test "canonical URIs and the resource check" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

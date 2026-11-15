@@ -300,7 +300,18 @@ fn fuzzChallenge(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual(@as(usize, 240), discovery.max_description_bytes);
     // Cut at a character, never inside one, when the bytes were UTF-8.
     if (c.description) |text| if (std.unicode.utf8ValidateSlice(value)) try testing.expect(std.unicode.utf8ValidateSlice(text));
-    if (c.insufficient_scope) try testing.expect(std.mem.find(u8, value, "insufficient_scope") != null);
+    // The name may be written with escapes (`insuffic\\ient_scope` is the same word in a quoted string),
+    // so it is looked for with the backslashes taken out. The name has none, so what a quoted string
+    // spells out is the header's bytes without the backslashes that start an escape.
+    if (c.insufficient_scope) {
+        var plain: [2048]u8 = undefined;
+        var n: usize = 0;
+        for (value) |byte| if (byte != '\\') {
+            plain[n] = byte;
+            n += 1;
+        };
+        try testing.expect(std.mem.find(u8, plain[0..n], "insufficient_scope") != null);
+    }
 }
 
 fn expectSameText(x: ?[]const u8, y: ?[]const u8, bound: usize) !void {

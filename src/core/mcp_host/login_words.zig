@@ -244,5 +244,8 @@ test "only a plain token is named in a log" {
     try testing.expect(!isLogSafeCode(""));
     try testing.expect(!isLogSafeCode("bad code"));
     try testing.expect(!isLogSafeCode("a\x1b"));
+    // What a quoted string with escapes can spell out: a quote or a backslash is no plain token.
+    try testing.expect(!isLogSafeCode("inv\"alid"));
+    try testing.expect(!isLogSafeCode("a\\b"));
     try testing.expect(!isLogSafeCode(text_utils.repeat("x", 65)));
 }
