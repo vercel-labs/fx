@@ -68,7 +68,7 @@ pub fn truecolorIsEnabled() bool {
 
 /// The failure style under `theme`: its own red when it is a named theme
 /// that sets one, and its dim otherwise, since fx's themes have no red.
-pub fn failureStyle(theme: shared_theme.Theme, named: bool) []const u8 {
+fn failureStyle(theme: shared_theme.Theme, named: bool) []const u8 {
     const base = shared_theme.builtin(theme.light);
     if (named and !std.mem.eql(u8, theme.red_style, base.red_style)) return theme.red_style;
     return theme.dim_style;
