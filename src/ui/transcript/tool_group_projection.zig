@@ -1959,17 +1959,18 @@ fn collectStoryRetries(
 /// to open or run counts by its base name, so one opened by its path repeats
 /// one opened by its name; a path counts whole, so another file with the
 /// same name is not a retry. Null for a shell command, which repeats as
-/// "passed on the 3rd run" instead.
+/// "passed on the 3rd run" instead, and for a call that names no target,
+/// such as an MCP tool's: its next call may do other work, so its failure
+/// stays.
 fn retryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
     if (isShellCommandCall(scratch, record)) return null;
     const fields = [_][]const u8{ "path", "open", "run", "search", "agent", "pattern", "url", "query" };
-    var target: []const u8 = "";
     for (fields) |field| if (storyArgString(scratch, record, field)) |value| {
         const by_name = std.mem.eql(u8, field, "open") or std.mem.eql(u8, field, "run");
-        target = if (by_name) std.Io.Dir.path.basename(value) else value;
-        break;
+        const target = if (by_name) std.Io.Dir.path.basename(value) else value;
+        return try std.mem.concat(scratch, u8, &.{ record.tool_name, "\x00", target });
     };
-    return try std.mem.concat(scratch, u8, &.{ record.tool_name, "\x00", target });
+    return null;
 }
 
 /// The rows of a group after calls for the same task share one row. Rows
@@ -4895,6 +4896,20 @@ test "a failure the model fixed at once shows as the try that worked" {
         errdefer std.debug.print("group:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
         try std.testing.expect(std.mem.find(u8, text, "Couldn't edit main.zig · old_string not found") != null);
+        try std.testing.expect(std.mem.find(u8, text, "try") == null);
+    }
+    // A tool whose calls name no target, such as an MCP tool, may do other
+    // work on its next call, so its failure stays.
+    {
+        const failed_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 7, .bytes = "● Failed mcp_issues_create: Invalid input\n", .class = .tool_status } };
+        const done_mcp = TranscriptEntry{ .raw_bytes = .{ .id = 8, .bytes = "● Ran mcp_issues_create\n", .class = .tool_status } };
+        const failed_mcp_detail = ToolDetailRecord{ .entry_id = 7, .tool_name = @constCast("mcp_issues_create"), .activity_kind = .read, .arguments_json = @constCast("{\"title\":\"a\"}"), .outcome = .failed };
+        const done_mcp_detail = ToolDetailRecord{ .entry_id = 8, .tool_name = @constCast("mcp_issues_create"), .activity_kind = .read, .arguments_json = @constCast("{\"title\":\"b\"}"), .outcome = .completed };
+        const text = try groupTextForTest(alloc, &.{ failed_mcp, done_mcp }, &.{ failed_mcp_detail, done_mcp_detail });
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_issues_create · Invalid input") != null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
     // A next call with another target did not fix it, so the failure stays.
