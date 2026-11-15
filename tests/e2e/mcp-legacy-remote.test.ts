@@ -617,6 +617,22 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(text).toContain("the server's answer was malformed");
     expect(text).not.toContain("the connection failed");
     expect(Date.now() - started).toBeLessThan(15_000);
+
+    // The debug trace says that the body could not be read and how long it was, to the byte, and
+    // nothing of what it held.
+    const call = streamable.requests.find((entry) => entry.message?.method === "tools/call");
+    const encoder = new TextEncoder();
+    const bodyBytes =
+      encoder.encode('{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x').length +
+      2 +
+      encoder.encode(`"}]},"id":${call?.message?.id}}`).length;
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    const ended = trace.split("\n").filter((line) => line.includes("MCP call ended"));
+    expect(ended).toHaveLength(1);
+    expect(ended[0]).toContain(`transport=http code=malformed reason=unreadable_body bytes=${bodyBytes}`);
+    for (const held of ["jsonrpc", "content", '"text"', '"id"']) {
+      expect({ held, traced: trace.includes(held) }).toEqual({ held, traced: false });
+    }
   }, 30_000);
 
   test("Streamable HTTP ends at once a call whose SSE event has its id and a jsonrpc that is not 2.0, as stdio does", async () => {

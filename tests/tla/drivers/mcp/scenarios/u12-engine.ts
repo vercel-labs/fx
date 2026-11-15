@@ -810,6 +810,25 @@ export const scenarios: Scenario[] = [
     machines: { h: ["engine", "request", "era", "catalog"] },
   }),
   engineScenario({
+    name: "u12-refused-http-sse-other-id",
+    description:
+      "An SSE event on one call's stream that names another call is a stray, as a valid reply would be: it ends the call whose stream it came on, by its own id, and never the other call in flight, which returns its result",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("slow"), tool("liar")] } },
+        { method: "tools/call", name: "slow", delayMs: 1500, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+        // Every id the client could have used, each with a jsonrpc that is not 2.0.
+        { method: "tools/call", name: "liar", sse: true, before: Array.from({ length: 12 }, (_, n) => ({ jsonrpc: "1.0", id: n + 1, result: {} })), hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h slow", "call h liar", "expect h.called.2.failure 3000", "expect h.called.1.result 6000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
     name: "u12-refused-http-sse-no-id",
     description: "An SSE event that names no request, on a stream that stays open: the call ends as malformed when the grace runs out, as a stdio call does",
     http: {

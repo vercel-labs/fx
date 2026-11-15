@@ -25,8 +25,11 @@
 \* request's own token clears its grace, and its other timers go on. A request
 \* still silent at the deadline ends as `malformed`, with a cancel signal.
 \* initialize and listen get no grace, and neither does a request sent after the
-\* line. A request has at most one grace, so the grace timers never outnumber
-\* the requests in flight. Time is abstract unless Timed: then `now` counts
+\* line. A request has at most one grace. One timer covers the requests a line finds without a
+\* grace, and it goes when the last of them lets go of it, by ending or by progress for its own
+\* token (`disarm_refused` in src/mcp/core/request.zig), so the timers armed for refused lines
+\* never outnumber the requests that hold a grace, however many lines and progress
+\* notifications come. Time is abstract unless Timed: then `now` counts
 \* ticks, a request's own deadline is the end of the modelled time (one sooner than the
 \* grace is for the Table's tests and the drivers), and time cannot pass a grace that is due. GraceOn = FALSE is the code before the grace:
 \* a refused line changes nothing (Request.findings.cfg).
@@ -60,13 +63,13 @@ VARIABLES
     sentEpoch,     \* ghost [Ids -> 0..MaxRefusals]: refusals seen when it was sent
     graceDue,      \* [Ids -> ticks, or NoTime]: the request's grace deadline
     armedEpoch,    \* ghost [Ids -> refusal number, or NoEpoch]: the refusal that gave it a grace
-    graceTimers,   \* grace timers armed
+    timerEpochs,   \* the refused lines whose timer is armed: a set of refusal numbers, one timer each
     refusedAt,     \* ghost [Ids -> ticks, or NoTime]: when a refused line first found it in flight
     ownProgress,   \* ghost [Ids -> BOOLEAN]: progress accepted for it after such a line
     words          \* ghost [Ids -> Words]: how a request that the grace ended was worded
 
 vars == <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen,
-          now, refusals, sentEpoch, graceDue, armedEpoch, graceTimers, refusedAt, ownProgress, words>>
+          now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words>>
 
 \* Everything the grace adds but its deadlines and timers.
 Rest == <<now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, words>>
@@ -85,17 +88,18 @@ Init ==
     /\ sentEpoch = [id \in Ids |-> 0]
     /\ graceDue = [id \in Ids |-> NoTime]
     /\ armedEpoch = [id \in Ids |-> NoEpoch]
-    /\ graceTimers = 0
+    /\ timerEpochs = {}
     /\ refusedAt = [id \in Ids |-> NoTime]
     /\ ownProgress = [id \in Ids |-> FALSE]
     /\ words = [id \in Ids |-> "none"]
 
 Armed(id) == graceDue[id] # NoTime
 
-\* A request that ends takes its grace with it.
+\* A request that ends, or whose own progress clears its grace, takes its grace with it. The timer
+\* of its refused line goes too, unless another request still holds that line.
 Disarm(id) ==
     /\ graceDue' = [graceDue EXCEPT ![id] = NoTime]
-    /\ graceTimers' = graceTimers - (IF Armed(id) THEN 1 ELSE 0)
+    /\ timerEpochs' = {e \in timerEpochs : \E o \in Ids \ {id} : Armed(o) /\ armedEpoch[o] = e}
 
 \* Ends a request with outcome o and hands o to the caller.
 Finish(id, o) ==
@@ -109,7 +113,7 @@ Finish(id, o) ==
 SendGrace(id) ==
     /\ graceDue' = [graceDue EXCEPT ![id] = NoTime]
     /\ armedEpoch' = armedEpoch
-    /\ graceTimers' = graceTimers
+    /\ timerEpochs' = timerEpochs
 
 \* The client sends a request with a fresh id (WIRE-01).
 Send(id) ==
@@ -200,8 +204,8 @@ RefusedLine ==
     /\ IF GraceOn
        THEN /\ graceDue' = [id \in Ids |-> IF id \in Fresh THEN now + GraceTicks ELSE graceDue[id]]
             /\ armedEpoch' = [id \in Ids |-> IF id \in Fresh THEN refusals + 1 ELSE armedEpoch[id]]
-            /\ graceTimers' = graceTimers + Cardinality(Fresh)
-       ELSE UNCHANGED <<graceDue, armedEpoch, graceTimers>>
+            /\ timerEpochs' = IF Fresh = {} THEN timerEpochs ELSE timerEpochs \cup {refusals + 1}
+       ELSE UNCHANGED <<graceDue, armedEpoch, timerEpochs>>
     /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, sentEpoch, words>>
 
 \* The grace of a request that stayed silent runs out: it ends as malformed, and
@@ -221,7 +225,7 @@ Tick ==
     /\ now < MaxTime
     /\ \A id \in Ids : (~Armed(id) \/ graceDue[id] > now)
     /\ now' = now + 1
-    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, refusals, sentEpoch, graceDue, armedEpoch, graceTimers, refusedAt, ownProgress, words>>
+    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words>>
 
 Next ==
     \/ RefusedLine
@@ -252,7 +256,7 @@ TypeOK ==
     /\ sentEpoch \in [Ids -> 0..MaxRefusals]
     /\ graceDue \in [Ids -> 0..NoTime]
     /\ armedEpoch \in [Ids -> 1..NoEpoch]
-    /\ graceTimers \in 0..(Cardinality(Ids) + MaxRefusals)
+    /\ timerEpochs \subseteq 1..MaxRefusals
     /\ refusedAt \in [Ids -> 0..NoTime]
     /\ ownProgress \in [Ids -> BOOLEAN]
     /\ words \in [Ids -> Words]
@@ -293,10 +297,16 @@ EveryRequestEnds == \A id \in Ids \ ListenIds: req[id] = "inflight" ~> req[id] =
 \* A grace belongs to a request in flight, and a finished one leaves none behind.
 GraceOnlyInFlight == \A id \in Ids: Armed(id) => req[id] = "inflight"
 
-\* The grace timers are exactly the graces, which are at most one per request, so a
-\* flood of refused lines cannot make them grow.
-TimersAreGraces == graceTimers = Cardinality({id \in Ids: Armed(id)})
-TimersBounded == graceTimers <= Cardinality(Ids)
+\* Each refused timer is for a line that some request in flight still holds: a timer never
+\* outlives its holders, so progress and refused lines in turns leave none behind.
+TimersAreGraces == \A e \in timerEpochs: \E id \in Ids: Armed(id) /\ armedEpoch[id] = e
+
+\* Each grace has its timer, so its deadline is kept however many lines come.
+GraceHasTimer == \A id \in Ids: Armed(id) => armedEpoch[id] \in timerEpochs
+
+\* The timers never outnumber the requests that hold a grace. One timer is for a line and a
+\* request holds one line, so a flood of lines cannot make them grow.
+TimersBounded == Cardinality(timerEpochs) <= Cardinality({id \in Ids: Armed(id)})
 
 \* initialize and listen are never given a grace or ended by one.
 NoGraceForInitOrListen == \A id \in InitIds \cup ListenIds: ~Armed(id) /\ outcome[id] # "malformed"

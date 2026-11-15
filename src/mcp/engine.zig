@@ -62,8 +62,9 @@ pub const Event = struct {
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
         /// `oversized`: a lost call's answer was over the message limit.
-        /// `refused_bytes`: the length of the refused line that gave a `malformed` call its grace.
-        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0 },
+        /// `refused_bytes`, `refused_body`: the length of what fx could not read, for a `malformed`
+        /// call, and whether it was an HTTP body (else a line); see `server.Event.called`.
+        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false },
         /// A call's server reported progress; `message` is terminal-safe and
         /// valid until the next `next`.
         progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
@@ -481,6 +482,7 @@ pub const Engine = struct {
                     .answer = c.answer,
                     .oversized = c.oversized,
                     .refused_bytes = c.refused_bytes,
+                    .refused_body = c.refused_body,
                 } });
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {

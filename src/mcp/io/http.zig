@@ -74,7 +74,8 @@ pub const Incoming = union(enum) {
     opened: u64,
     /// Request `key` ended. Nothing more comes for it. A rejected one carries
     /// its `WWW-Authenticate` values, joined.
-    ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]const u8 },
+    /// `bytes` is the length of the body an `unreadable` ending could not read, 0 for any other.
+    ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]const u8, bytes: u32 = 0 },
     /// The answer to `fetch` request `key`: status 0 when none came. `media`
     /// is its Content-Type, "" for none; `challenge` its `WWW-Authenticate`
     /// values, joined.
@@ -88,7 +89,7 @@ const Posted = union(enum) {
     event: struct { key: u64, status: u16, data: ?[]u8, event_id: ?[]u8, retry_ms: ?u32 },
     session: struct { key: u64, id: []u8 },
     opened: u64,
-    ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]u8 = null },
+    ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]u8 = null, bytes: u32 = 0 },
     fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null, media: ?[]u8 = null, challenge: ?[]u8 = null },
 
     fn free(p: Posted, gpa: std.mem.Allocator) void {
@@ -341,7 +342,7 @@ pub const Client = struct {
                 }
                 c.settle(e.key);
                 c.held = posted;
-                return .{ .ended = .{ .key = e.key, .status = e.status, .how = e.how, .challenge = e.challenge } };
+                return .{ .ended = .{ .key = e.key, .status = e.status, .how = e.how, .challenge = e.challenge, .bytes = e.bytes } };
             },
             .fetched => |f| {
                 if (!c.inFlight(f.key)) {
@@ -412,10 +413,10 @@ pub const Client = struct {
         const ending = c.run(key, method, body, headers) catch |err| switch (err) {
             error.Canceled => return,
         };
-        c.put(.{ .ended = .{ .key = key, .status = ending.status, .how = ending.how, .challenge = ending.challenge } }) catch {};
+        c.put(.{ .ended = .{ .key = key, .status = ending.status, .how = ending.how, .challenge = ending.challenge, .bytes = ending.bytes } }) catch {};
     }
 
-    const Result = struct { status: u16 = 0, how: Ending, challenge: ?[]u8 = null };
+    const Result = struct { status: u16 = 0, how: Ending, challenge: ?[]u8 = null, bytes: u32 = 0 };
 
     /// Bodies are read as sent, so only uncompressed ones are asked for
     /// (`std.http` asks for gzip and deflate by default) and accepted: a
@@ -494,7 +495,8 @@ pub const Client = struct {
             try c.put(.{ .event = .{ .key = key, .status = status, .data = bytes, .event_id = null, .retry_ms = null } });
             return .{ .status = status, .how = .complete };
         } else |_| {
-            return .{ .status = status, .how = if (status / 100 == 2) .unreadable else .http_failure };
+            if (status / 100 != 2) return .{ .status = status, .how = .http_failure };
+            return .{ .status = status, .how = .unreadable, .bytes = @intCast(@min(answer.items.len, std.math.maxInt(u32))) };
         }
     }
 

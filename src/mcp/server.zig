@@ -127,9 +127,11 @@ pub const Event = union(enum) {
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
     /// `oversized` says a lost call's answer was over the message limit: a
     /// stdio line over `max_line`, or an HTTP answer over `max_message`.
-    /// `refused_bytes` is the length of the line that gave a `malformed` call its grace, 0 for any
-    /// other (see `request.Timeouts.refused_ms`).
-    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0 },
+    /// `refused_bytes` is the length of what fx could not read, for a `malformed` call, and
+    /// `refused_body` says which it was: a 2xx HTTP body that is no JSON-RPC message, or, when
+    /// it is false, the last line with no readable id that the server wrote before the call's
+    /// grace ran out (see `request.Timeouts.refused_ms`). Both are 0 and false for any other call.
+    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false },
     /// A call's server reported progress that the request core accepted.
     /// `message` is terminal-safe and cut to 160 bytes, valid until the
     /// next `next`.
@@ -199,6 +201,10 @@ const Logical = struct {
     /// The server's answer could not be read: an HTTP body fx refused, or the grace of a refused
     /// line ran out. The call ends as `malformed` where it would end `cancelled` or `http_failure`.
     malformed: bool = false,
+    /// The length of what could not be read, for a `malformed` call, and whether it was a body
+    /// (see `Event.called`).
+    refused_bytes: u32 = 0,
+    refused_body: bool = false,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -287,7 +293,9 @@ pub const Server = struct {
     /// The message of an invalid reply's answer, kept as long as the line it
     /// came from: until the process is read again.
     refused_reply: [512]u8 = undefined,
-    /// The length of the last refused line that named no request.
+    /// The length of the last refused line that named no request. A call whose grace runs out
+    /// takes it into `Logical.refused_bytes`; it is the last such line the server wrote, not
+    /// necessarily the one that gave that call its grace.
     refused_bytes: u32 = 0,
     /// An excerpt of the last stdout line that answered nothing, since the
     /// server was last ready: what a failed start wrote instead.
@@ -755,12 +763,12 @@ pub const Server = struct {
             },
             .refused => |m| {
                 try r.onEventId(m.key, m.event_id, m.retry_ms);
-                try r.onRefusedLine(m.err, m.bytes);
+                try r.onRefusedLine(m.err, m.bytes, m.key);
             },
             .mark => |m| try r.onEventId(m.key, m.event_id, m.retry_ms),
             .session => |s| try r.onSession(s.key, s.id),
             .opened => |key| if (r.legacy != null and key == r.listen_key) try r.listenSettled(),
-            .ended => |e| try r.onEnded(e.key, e.status, e.how, e.challenge),
+            .ended => |e| try r.onEnded(e.key, e.status, e.how, e.challenge, e.bytes),
             .fetched => |f| {
                 _ = try r.auth.fetched(f.key, f.status, f.media, f.challenge, f.body);
                 try r.runAuth(null);
@@ -777,7 +785,7 @@ pub const Server = struct {
             .message => |m| try r.onMessage(if (m.message == .response) m.message.response.id orelse 0 else 0, 200, m.message),
             // With no sink for stderr.
             .stderr => {},
-            .dropped => |d| try r.onRefusedLine(d.err, d.line),
+            .dropped => |d| try r.onRefusedLine(d.err, d.line, null),
             .changed => |c| try r.onProcessChanged(c.state, c.lost, c.oversized),
             .timeout => unreachable,
         }
@@ -786,9 +794,11 @@ pub const Server = struct {
     /// A line `decode` refused that names a request in flight is that
     /// request's answer, an invalid one: the request fails with what was
     /// wrong and the start of the line. One that names a request not in
-    /// flight is ignored. One that names none gives each normal request in
-    /// flight a short deadline (`request.Timeouts.refused_ms`).
-    fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8) Error!void {
+    /// flight is ignored, and so is one on an HTTP request's stream that names
+    /// another request (`stream` is that request's key). One that names none
+    /// gives each normal request in flight a short deadline
+    /// (`request.Timeouts.refused_ms`).
+    fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8, stream: ?u64) Error!void {
         // Empty for a process that has gone since.
         if (line.len == 0) return;
         const id = wire.responseId(line) orelse {
@@ -797,6 +807,9 @@ pub const Server = struct {
             return r.stepRequest(.refused_line);
         };
         if (r.logicalFor(id) == null) return r.keepStray(line);
+        // An event on a request's stream answers that request only, as a valid reply does
+        // (`onMessage`): one that names another request is a stray. Stdio has no stream.
+        if (stream) |key| if (id != key) return r.keepStray(line);
         const why = switch (err) {
             error.NotJsonRpc2 => "its jsonrpc isn't \"2.0\"",
             error.Ambiguous => "it has both a result and an error, or neither",
@@ -1232,7 +1245,7 @@ pub const Server = struct {
 
     /// A request ended: the gate hears first, then the machines that
     /// wait on it.
-    fn onEnded(r: *Server, key: u64, status: u16, how: http.Ending, challenge: ?[]const u8) Error!void {
+    fn onEnded(r: *Server, key: u64, status: u16, how: http.Ending, challenge: ?[]const u8, bytes: u32) Error!void {
         if (r.kept(key) != null) {
             if (how == .rejected) {
                 if (try r.auth.ended(key, .{ .rejected = .{ .status = status, .challenge = challenge orelse "" } })) return r.runAuth(null);
@@ -1249,6 +1262,8 @@ pub const Server = struct {
         // An answer fx could not read ends the call like any other HTTP failure, but as malformed.
         if (how == .unreadable) if (r.logicalFor(key)) |l| {
             l.malformed = true;
+            l.refused_bytes = bytes;
+            l.refused_body = true;
         };
         try r.onEndedDomain(key, status, if (how == .rejected or how == .unreadable) .http_failure else how);
     }
@@ -1373,7 +1388,8 @@ pub const Server = struct {
                         .timed_out = l.timed_out,
                         .answer = if (o == .result or o == .failure) r.held_answer else null,
                         .oversized = o == .lost and r.losing_oversized,
-                        .refused_bytes = if (l.malformed and o == .cancelled) r.refused_bytes else 0,
+                        .refused_bytes = l.refused_bytes,
+                        .refused_body = l.refused_body,
                     },
                 });
                 l.used = false;
@@ -1739,7 +1755,8 @@ pub const Server = struct {
                 .timed_out = l.timed_out,
                 .answer = if (outcome == .result) r.held_answer else null,
                 .oversized = outcome == .lost and r.losing_oversized,
-                .refused_bytes = if (l.malformed and outcome == .cancelled) r.refused_bytes else 0,
+                .refused_bytes = l.refused_bytes,
+                .refused_body = l.refused_body,
             },
         });
         if (l.what == .list and outcome != .result) {
@@ -1903,7 +1920,7 @@ pub const Server = struct {
                 .post => |p| if (now_key != null and p.key == now_key.?) {
                     try r.dispatch(p.key, p.token);
                 } else r.dispatch(p.key, p.token) catch |err| switch (err) {
-                    error.TooManyInFlight, error.ConcurrencyUnavailable => try r.onEnded(p.key, 0, .broken, null),
+                    error.TooManyInFlight, error.ConcurrencyUnavailable => try r.onEnded(p.key, 0, .broken, null, 0),
                     else => return err,
                 },
                 .give_up => |g| try r.authGaveUp(g.key, g.why),
@@ -2014,6 +2031,7 @@ pub const Server = struct {
             },
             .malformed => if (r.logicalFor(effect.deliver.id)) |l| {
                 l.malformed = true;
+                l.refused_bytes = r.refused_bytes;
             },
             else => {},
         };
@@ -2050,6 +2068,15 @@ pub const Server = struct {
                 while (i < r.timers.items.len) {
                     const t = r.timers.items[i];
                     if (t.kind == .request and t.kind.request.id == id) _ = r.timers.swapRemove(i) else i += 1;
+                }
+            },
+            // The timer of a refused line that no request holds any more: only refused timers
+            // have this generation, and each line has one timer, so this removes at most one.
+            .disarm_refused => |epoch| {
+                var i: usize = 0;
+                while (i < r.timers.items.len) {
+                    const t = r.timers.items[i];
+                    if (t.kind == .request and t.kind.request.kind == .refused and t.kind.request.generation == epoch) _ = r.timers.swapRemove(i) else i += 1;
                 }
             },
         };
@@ -2242,4 +2269,32 @@ test "a send that fails after the outbox took its copy frees the copy once" {
     // The one that failed keeps nothing; the others stay kept.
     try std.testing.expect(r.kept(key) == null);
     try std.testing.expect(r.kept(key - 1) != null);
+}
+
+fn refusedTimers(r: *const Server) usize {
+    var count: usize = 0;
+    for (r.timers.items) |t| count += @intFromBool(t.kind == .request and t.kind.request.kind == .refused);
+    return count;
+}
+
+test "a bad line and progress in turns, a thousand times, leave the server one refused timer for its one request" {
+    var r: Server = undefined;
+    // Nothing is sent: the requests are only counted, so the timers are the server's own.
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+    defer r.deinit();
+    try r.stepRequest(.{ .send = .normal });
+    for (1..1001) |round| {
+        try r.stepRequest(.refused_line);
+        try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
+        try r.stepRequest(.{ .progress_received = .{ .token = 1, .value = @floatFromInt(round) } });
+        try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
+    }
+    // The line then still gives the request its full deadline, and the request's end drops it.
+    try r.stepRequest(.refused_line);
+    try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
+    try r.stepRequest(.{ .response_received = .{ .id = 1, .response = .result } });
+    try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
 }

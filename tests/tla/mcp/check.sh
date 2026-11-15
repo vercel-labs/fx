@@ -19,11 +19,11 @@ cd "$(dirname "$0")"
 python3 run.py check "$@"
 python3 run.py mutate "$@"
 
-# A property the model of today's code is known to break must stay broken until the code is
-# repaired: Request.findings.cfg states that a request in flight at a refused line that names
-# no request, and silent, ends within the grace, which fails while there is no grace and the
-# request waits for its own deadline (5 minutes by default). Each verdict is required
-# (../lib/tlc.sh). Other pull requests add findings blocks to this file too: when two land,
+# A property that the model of the code before the grace breaks must stay broken: Request.findings.cfg
+# models that code (GraceOn = FALSE) and states that a request in flight at a refused line that
+# names no request, and silent, ends within the grace. It fails there, because the request waits
+# for its own deadline (5 minutes by default); Request.cfg models the code with the grace, where
+# it holds. Each verdict is required (../lib/tlc.sh). Other pull requests add findings blocks to this file too: when two land,
 # merge them into one tlc_verdicts block.
 . ../lib/tlc.sh
 tlc_verdicts <<'EOF_FINDINGS'

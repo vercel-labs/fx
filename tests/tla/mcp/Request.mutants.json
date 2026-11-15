@@ -67,26 +67,26 @@
  },
  {
   "description": "A request sent after a refused line gets a grace from it",
-  "old": "SendGrace(id) ==\n    /\\ graceDue' = [graceDue EXCEPT ![id] = NoTime]\n    /\\ armedEpoch' = armedEpoch\n    /\\ graceTimers' = graceTimers\n",
-  "new": "SendGrace(id) ==\n    LET late == GraceOn /\\ refusals > 0 /\\ id \\notin InitIds \\cup ListenIds\n    IN /\\ graceDue' = [graceDue EXCEPT ![id] = IF late THEN now + GraceTicks ELSE NoTime]\n       /\\ armedEpoch' = [armedEpoch EXCEPT ![id] = IF late THEN refusals ELSE NoEpoch]\n       /\\ graceTimers' = graceTimers + (IF late THEN 1 ELSE 0)\n",
+  "old": "SendGrace(id) ==\n    /\\ graceDue' = [graceDue EXCEPT ![id] = NoTime]\n    /\\ armedEpoch' = armedEpoch\n    /\\ timerEpochs' = timerEpochs\n",
+  "new": "SendGrace(id) ==\n    LET late == GraceOn /\\ refusals > 0 /\\ id \\notin InitIds \\cup ListenIds\n    IN /\\ graceDue' = [graceDue EXCEPT ![id] = IF late THEN now + GraceTicks ELSE NoTime]\n       /\\ armedEpoch' = [armedEpoch EXCEPT ![id] = IF late THEN refusals ELSE NoEpoch]\n       /\\ timerEpochs' = IF late THEN timerEpochs \\cup {refusals} ELSE timerEpochs\n",
   "invariant": "NoGraceForLaterCalls"
  },
  {
   "description": "A request that finishes keeps its grace (a valid reply does not clear it)",
   "old": "    /\\ everDone' = [everDone EXCEPT ![id] = TRUE]\n    /\\ Disarm(id)\n",
-  "new": "    /\\ everDone' = [everDone EXCEPT ![id] = TRUE]\n    /\\ UNCHANGED <<graceDue, graceTimers>>\n",
+  "new": "    /\\ everDone' = [everDone EXCEPT ![id] = TRUE]\n    /\\ UNCHANGED <<graceDue, timerEpochs>>\n",
   "invariant": "GraceOnlyInFlight"
  },
  {
   "description": "Progress for another request clears this request's grace",
   "old": "refusedAt[id] # NoTime]\n    /\\ Disarm(id)\n",
-  "new": "refusedAt[id] # NoTime]\n    /\\ graceDue' = [j \\in Ids |-> NoTime]\n    /\\ graceTimers' = 0\n",
+  "new": "refusedAt[id] # NoTime]\n    /\\ graceDue' = [j \\in Ids |-> NoTime]\n    /\\ timerEpochs' = {}\n",
   "invariant": "GraceClearedOnlyByOwnProgress"
  },
  {
   "description": "Progress for the request's own token does not clear its grace",
   "old": "refusedAt[id] # NoTime]\n    /\\ Disarm(id)\n",
-  "new": "refusedAt[id] # NoTime]\n    /\\ UNCHANGED <<graceDue, graceTimers>>\n",
+  "new": "refusedAt[id] # NoTime]\n    /\\ UNCHANGED <<graceDue, timerEpochs>>\n",
   "invariant": "ProgressProtects"
  },
  {
@@ -96,10 +96,10 @@
   "invariant": "WordsFixed"
  },
  {
-  "description": "One timer per refused line, even when every request already has a grace",
-  "old": "graceTimers' = graceTimers + Cardinality(Fresh)",
-  "new": "graceTimers' = graceTimers + 1",
-  "invariant": "TimersAreGraces"
+  "description": "A refused line arms a timer even when every request already has a grace",
+  "old": "timerEpochs' = IF Fresh = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}",
+  "new": "timerEpochs' = timerEpochs \\cup {refusals + 1}",
+  "invariant": "TimersBounded"
  },
  {
   "description": "A second refused line extends the grace it finds",
@@ -112,5 +112,17 @@
   "old": "Pending == {id \\in Ids \\ (InitIds \\cup ListenIds) : req[id] = \"inflight\"}",
   "new": "Pending == {id \\in Ids : req[id] = \"inflight\"}",
   "invariant": "NoGraceForInitOrListen"
+ },
+ {
+  "description": "A new grace appends a timer without dropping the stale one: a request that ends or shows progress leaves its line's timer armed",
+  "old": "    /\\ timerEpochs' = {e \\in timerEpochs : \\E o \\in Ids \\ {id} : Armed(o) /\\ armedEpoch[o] = e}\n",
+  "new": "    /\\ timerEpochs' = timerEpochs\n",
+  "invariant": "TimersBounded"
+ },
+ {
+  "description": "A refused line gives a request a grace but arms no timer for it, so nothing ends it at its deadline",
+  "old": "timerEpochs' = IF Fresh = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}",
+  "new": "timerEpochs' = timerEpochs",
+  "invariant": "GraceHasTimer"
  }
 ]
