@@ -1459,6 +1459,9 @@ const StoryRow = struct {
     /// The shell session a `.commands` row's run started, once a later call
     /// to the session joined the row; "" otherwise.
     session: []const u8 = "",
+    /// The row's latest call that returned while its command ran on, which
+    /// the first later call to its session joins; null when none did.
+    background: ?*const ToolDetailRecord = null,
 };
 
 /// The name a call adds to a `.read` or `.search` row: the file's path, or
@@ -1507,15 +1510,21 @@ fn joinsCommandRow(scratch: std.mem.Allocator, last: *const StoryRow, entry: Tra
     }
     const label = try commandRowLabel(scratch, entry, detail) orelse return false;
     const last_label = try commandRowLabel(scratch, last.entry, last.detail) orelse return false;
-    // A command still running joins a row that ran, so it does not show on
-    // a row of its own first and then fold into this one when it ends.
-    return std.mem.eql(u8, label, last_label) or (ranFamily(label) and ranFamily(last_label));
+    // Commands that ran or still run share a row, so a call still running
+    // does not show on a row of its own first and then fold into this one
+    // when it ends. One that ran does not join a row whose latest command
+    // returned while it ran on: the row's label and mark come from its latest
+    // call, so the row would say that command ran.
+    if (std.mem.eql(u8, label, last_label)) return true;
+    if (!ranFamily(label) or !ranFamily(last_label)) return false;
+    return !(std.mem.eql(u8, label, "Ran ") and std.mem.eql(u8, last_label, still_running_label ++ " "));
 }
 
 /// Whether `label` is what a command's row says while it runs, after its
-/// call returned while it ran on, or once it ran. A row of such commands
-/// stays one row through all three, so none of its calls shows on a row of
-/// its own and then folds back into it.
+/// call returned while it ran on, or once it ran. Under joinsCommandRow, two
+/// calls with such labels that do not share a row never come to share one
+/// as their labels change, so no call shows on a row of its own and then
+/// folds into another.
 fn ranFamily(label: []const u8) bool {
     return std.mem.eql(u8, label, "Ran ") or std.mem.eql(u8, label, "Running ") or
         std.mem.eql(u8, label, still_running_label ++ " ");
@@ -2113,7 +2122,7 @@ fn collectStoryRows(
             // A run's record keeps its output but not the session it started,
             // so a session's first input or stop joins the run in the group
             // that still goes on, which is the one that started it.
-            if (identity.kind == .session) if (try sessionRunRow(scratch, rows.items, detail.?)) |run_row| {
+            if (identity.kind == .session) if (sessionRunRow(rows.items, detail.?)) |run_row| {
                 // A row of several commands keeps naming their steps.
                 if (run_row.identity.kind == .commands) run_row.session = identity.key else run_row.identity = identity;
                 break :new run_row;
@@ -2132,6 +2141,7 @@ fn collectStoryRows(
                     last.entry_id = entry_id;
                     last.detail = detail;
                     last.status_index = status_index;
+                    if (try commandStillRunning(scratch, entry)) last.background = detail;
                     continue :calls;
                 }
             }
@@ -2144,6 +2154,7 @@ fn collectStoryRows(
         target.entry_id = entry_id;
         target.detail = detail;
         target.status_index = status_index;
+        if (try commandStillRunning(scratch, entry)) target.background = detail;
         target.tries = retries.tries.get(entry_id) orelse 0;
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addDistinct(&target.names, scratch, name);
@@ -2157,17 +2168,18 @@ fn collectStoryRows(
     return rows;
 }
 
-/// The latest row of a run that returned while its command went on, for a
-/// session's first follow-up to join. When both calls show the command, it
-/// must be the same one, so input to one session never joins another's run.
-fn sessionRunRow(scratch: std.mem.Allocator, rows: []StoryRow, follow_up: *const ToolDetailRecord) !?*StoryRow {
+/// The latest row with a run that returned while its command went on, for a
+/// session's first follow-up to join, though later calls may have joined
+/// that row too. When both calls show the command, it must be the same one,
+/// so input to one session never joins another's run.
+fn sessionRunRow(rows: []StoryRow, follow_up: *const ToolDetailRecord) ?*StoryRow {
     var index = rows.len;
     while (index > 0) {
         index -= 1;
         const row = &rows[index];
         if (row.identity.kind != .command and row.identity.kind != .commands) continue;
-        if (row.session.len > 0 or !try commandStillRunning(scratch, row.entry)) continue;
-        const run = row.detail orelse continue;
+        if (row.session.len > 0) continue;
+        const run = row.background orelse continue;
         if (follow_up.command_display) |shown| if (run.command_display) |run_shown| {
             if (!std.mem.eql(u8, shown, run_shown)) continue;
         };
@@ -7981,4 +7993,54 @@ test "a running search or edit without the argument its row needs waits in its t
         try std.testing.expect(std.mem.find(u8, same_text, "├ Editing") == null);
         try std.testing.expect(std.mem.find(u8, same_text, "└ Editing") == null);
     }
+}
+
+test "a command that ran after one still running keeps its own row and no check mark" {
+    const alloc = std.testing.allocator;
+    var background = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sleep 25\"}", 0, "");
+    background.command_process_presentation = null;
+    background.command_display = @constCast("sleep 25");
+    var quick = storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"printf QUICK_OK\"}", 0, "QUICK_OK");
+    quick.command_display = @constCast("printf QUICK_OK");
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Still running sleep 25\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran printf QUICK_OK\n", .class = .tool_status } },
+    };
+    const text = try groupTextForTest(alloc, &entries, &.{ background, quick });
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    // One row with both would take the quick command's label and mark, and
+    // say the one still running ran.
+    try std.testing.expect(std.mem.find(u8, text, "├ Still running sleep") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Ran printf") != null);
+    try std.testing.expect(std.mem.find(u8, text, "✓") == null);
+}
+
+test "a session's input finds its run after a quick command joined the run's row" {
+    const alloc = std.testing.allocator;
+    var first = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"printf a\"}", 0, null);
+    first.command_display = @constCast("printf a");
+    var run = storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"sh loop.sh\"}", 0, "1 108\n");
+    run.command_process_presentation = null;
+    run.command_display = @constCast("sh loop.sh");
+    var quick = storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"printf b\"}", 0, null);
+    quick.command_display = @constCast("printf b");
+    quick.outcome = null;
+    quick.command_process_presentation = null;
+    var observe = storyCommandDetail(4, "{\"action\":\"interact\",\"session_id\":\"shell-9\"}", 0, null);
+    observe.command_display = @constCast("sh loop.sh");
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf a\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running sh loop.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running printf b\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Observed sh loop.sh\n", .class = .tool_status } },
+    };
+    const text = try groupTextForTest(alloc, &entries, &.{ first, run, quick, observe });
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    // The quick command, still running, joins the row; the input to the
+    // session still finds the run in it, so it gets no row of its own.
+    const trimmed = std.mem.trim(u8, text, "\n");
+    try std.testing.expect(std.mem.findScalar(u8, trimmed, '\n') == null);
+    try std.testing.expect(std.mem.startsWith(u8, trimmed, "● Observed printf, sh"));
 }
