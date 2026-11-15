@@ -296,6 +296,14 @@ Confirm(k) ==
 \* refresh or a retry that a 401 started is still pending. A token the server refuses has had its 401
 \* heard by then, so the login is refused and never saved, whatever the pending request would answer
 \* (`checkFailed`). With no 401 held, the check failed: the login is kept, with a note.
+\*
+\* The model takes `srv` as already heard: a server that will refuse has sent its 401 before the
+\* deadline. A server with a `startup_timeout_ms` over 45 seconds can send it later. fx then holds
+\* no 401 at the deadline, so it keeps the login with the note, as in the case above. The late 401
+\* reaches the host after the sign-in has ended, so it refuses a saved login (the server shows as
+\* needing a login, with "refused the saved login"), not a new one. The login was saved before
+\* that 401, so RefusedNeverSaved does not hold for it. The model leaves this case out: it has no
+\* event for a 401 that comes after the sign-in ended.
 ExpireCheck(k) ==
     /\ phase[k] = "confirming" /\ alive[hostOf[k]] /\ live[hostOf[k]] = k
     /\ LET h == hostOf[k]
@@ -476,7 +484,8 @@ SignedInOnlyAfterCheck == \A k \in Logins : ck[k].notified => ck[k].asked
 \* The server never hears "Signed in" for a login it refuses.
 NoticeMatchesAnswer == \A k \in Logins : ck[k].notified => ck[k].srv \notin Refusals
 
-\* A token the server refuses is never kept in the store.
+\* A token the server refuses is never kept in the store, when its 401 reaches fx before the save
+\* (see ExpireCheck for a 401 that comes after it).
 RefusedNeverSaved == \A k \in Logins : ck[k].srv \in Refusals => k \notin saved
 
 \* So no other fx process can take a login the server refuses
