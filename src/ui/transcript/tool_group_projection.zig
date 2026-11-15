@@ -139,6 +139,8 @@ pub const SummaryStyle = struct {
     marker_style: []const u8 = "",
     text_style: []const u8 = "",
     reset_style: []const u8 = "",
+    /// A failed call's ✗ and the words that say it failed.
+    failure_style: []const u8 = "",
 };
 
 const BuildStats = struct {
@@ -1117,13 +1119,35 @@ fn writeDiffCount(writer: *std.Io.Writer, sign: []const u8, count: usize, accent
 /// failed, and ✓ when it passed and every command finished, so a command that
 /// passed on a retry still ends its group with ✓. Other calls that failed show
 /// as " · N failed" instead, so the mark never blames a command for them.
-fn writeResultMark(writer: *std.Io.Writer, tally: StoryTally) !void {
+fn writeResultMark(writer: *std.Io.Writer, tally: StoryTally, style: SummaryStyle) !void {
     const latest_failed = tally.last_command_failed orelse return;
     if (latest_failed) {
-        try writer.writeAll(" ✗");
+        try writeFailureMark(writer, style);
     } else if (tally.commands_running == 0 and tally.commands_still_running == 0) {
         try writer.writeAll(" ✓");
     }
+}
+
+/// " ✗" in the failure style, then the text style again.
+fn writeFailureMark(writer: *std.Io.Writer, style: SummaryStyle) !void {
+    try writer.writeByte(' ');
+    try writeInFailureStyle(writer, "✗", style);
+}
+
+/// `text` in the failure style, then the text style again.
+fn writeInFailureStyle(writer: *std.Io.Writer, text: []const u8, style: SummaryStyle) !void {
+    if (style.failure_style.len == 0) return writer.writeAll(text);
+    try writer.writeAll(style.failure_style);
+    try writer.writeAll(text);
+    try writer.writeAll(style.reset_style);
+    try writer.writeAll(style.text_style);
+}
+
+/// `text` in the failure style, in `scratch`.
+fn inFailureStyle(scratch: std.mem.Allocator, text: []const u8, style: SummaryStyle) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    writeInFailureStyle(&out.writer, text, style) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 /// A story header in parts: what the group did, as verbs with no counts,
@@ -1289,8 +1313,11 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
     }
 
     var mark: std.Io.Writer.Allocating = .init(scratch);
-    if (mark_shown) try writeResultMark(&mark.writer, tally);
-    const failed = if (lead_says_failed) 0 else tally.other_failures + tally.earlier_command_failures;
+    if (mark_shown) try writeResultMark(&mark.writer, tally, style);
+    // A failed call that is not a command was most often the model's own
+    // mistake, which it works past, so the header does not count it; its
+    // row still says it failed.
+    const failed = if (lead_says_failed) 0 else tally.earlier_command_failures;
     const last_failed: usize = if (tally.last_command_failed orelse false) 1 else 0;
     const states = try formatHeaderStates(scratch, failed, summary);
     const states_without_mark = try formatHeaderStates(scratch, failed + last_failed, summary);
@@ -1415,6 +1442,11 @@ const StoryRow = struct {
     /// Which try the row's latest call was, when the model repeated a call
     /// that failed and this one completed; 0 otherwise.
     tries: usize = 0,
+    /// Where the row's latest call is in the transcript's entries.
+    status_index: usize = 0,
+    /// Whether the row's latest call failed as the last call of a turn that
+    /// has ended, so the turn ended on it.
+    ends_turn: bool = false,
 };
 
 /// The name a call adds to a `.read` or `.search` row: the file's path, or
@@ -2029,10 +2061,11 @@ fn collectStoryRows(
                     last.entry = entry;
                     last.entry_id = entry_id;
                     last.detail = detail;
+                    last.status_index = status_index;
                     continue :calls;
                 }
             }
-            try rows.append(scratch, .{ .entry = entry, .entry_id = entry_id, .detail = detail, .identity = identity, .count = 0 });
+            try rows.append(scratch, .{ .entry = entry, .entry_id = entry_id, .detail = detail, .identity = identity, .count = 0, .status_index = status_index });
             break :new &rows.items[rows.items.len - 1];
         };
         target.count += 1;
@@ -2040,6 +2073,7 @@ fn collectStoryRows(
         target.entry = entry;
         target.entry_id = entry_id;
         target.detail = detail;
+        target.status_index = status_index;
         target.tries = retries.tries.get(entry_id) orelse 0;
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addDistinct(&target.names, scratch, name);
@@ -2113,10 +2147,20 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     // status or in its result. A command keeps core's label, such as
     // "Exited 1", which says how it ended.
     const phrase = if (row.detail) |record| if (storyCallFailed(row.detail) and !isShellCommandCall(scratch, record))
-        try couldNotPhrase(scratch, named_phrase, record)
+        try inFailureStyle(scratch, try couldNotPhrase(scratch, named_phrase, record), style)
     else
         named_phrase else named_phrase;
-    const reason = if (split_failure) |split|
+    // Why a call failed is for the model, which most often fixes it in its
+    // next call, so the row says only that it failed; Ctrl+O shows the
+    // error. A command or a subagent says why, since how it ended is part of
+    // the story, and so does a failure the turn ended on.
+    const says_why = if (row.detail) |record|
+        isShellCommandCall(scratch, record) or record.activity_kind == .subagent or row.ends_turn
+    else
+        false;
+    const reason = if (!says_why)
+        ""
+    else if (split_failure) |split|
         try storySafeLine(scratch, firstSentence(split.reason), story_reason_max_bytes)
     else
         try storyFailureReason(scratch, row.detail) orelse "";
@@ -2468,6 +2512,9 @@ fn writeGroupBlock(
         try tally.observe(scratch, entry, detail);
     }
     const rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, focused_entry_id, &retries);
+    for (rows.items) |*row| {
+        if (storyCallFailed(row.detail)) row.ends_turn = callEndsTurn(entries, row.status_index);
+    }
     var last_command_row: ?usize = null;
     for (rows.items, 0..) |*row, index| {
         if (row.detail) |record| if (isShellCommandCall(scratch, record)) {
@@ -2501,7 +2548,7 @@ fn writeGroupBlock(
         // A failure the phrase does not name, such as a status line `fx ask`
         // never rewrites, still shows on the header.
         const unnamed_failure = storyCallFailed(row.detail) and !phraseNamesFailure(text.display);
-        const mark = if (succeeded_command) " ✓" else if (unnamed_failure) " ✗" else "";
+        const mark = if (succeeded_command) " ✓" else if (unnamed_failure) try std.mem.concat(scratch, u8, &.{ " ", try inFailureStyle(scratch, "✗", style) }) else "";
         break :blk try applySummaryStyle(scratch, try clipStoryRow(scratch, "● ", row, &text, mark, cols, style), style);
     } else if (try formatStoryHeader(scratch, tally, summary, style, collapse_tool_calls)) |story|
         try applySummaryStyle(scratch, try clipStoryHeader(scratch, story, cols), style)
@@ -2546,7 +2593,8 @@ fn writeGroupBlock(
 /// the mark stay when the phrase is clipped, like the diff counts.
 fn clipStoryRow(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryRow, text: *const StoryRowText, mark: []const u8, cols: u16, style: SummaryStyle) ![]const u8 {
     if (text.reason.len == 0) return clipStoryPhrase(scratch, lead, row, text, mark, cols, style);
-    // A failed row says why after its phrase, in red, and before its mark.
+    // A failed row says why after its phrase, in the failure style, and
+    // before its mark.
     // The reason clips first, and a row with no room for it drops it;
     // Ctrl+O still shows the call's whole error.
     const mark_width = display_width.visibleWidthIgnoringAnsi(mark);
@@ -2556,7 +2604,7 @@ fn clipStoryRow(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryR
     const separator = " · ";
     if (used + separator.len + story_reason_min_cols > cols) return std.mem.concat(scratch, u8, &.{ phrase, mark });
     const reason = try clipSummary(scratch, text.reason, @intCast(cols - used - display_width.visibleWidthIgnoringAnsi(separator)));
-    return std.mem.concat(scratch, u8, &.{ phrase, style.text_style, separator, ui_render.red_style, reason, ui_render.reset_style, style.text_style, mark });
+    return std.mem.concat(scratch, u8, &.{ phrase, style.text_style, separator, try inFailureStyle(scratch, reason, style), mark });
 }
 
 /// The fewest cells a failed row gives its reason; with less room the row
@@ -2575,6 +2623,19 @@ fn clipStoryPhrase(scratch: std.mem.Allocator, lead: []const u8, row: *const Sto
     const accented = try accentTrailingDiffStats(scratch, clipped_phrase, style.text_style);
     // The counts end their color, so the tail takes the row's style again.
     return if (phrase_cols == cols or tail.len == 0) accented else try std.mem.concat(scratch, u8, &.{ accented, style.text_style, tail });
+}
+
+/// Whether the call at `status_index` was the last call of a turn that has
+/// ended: no other call follows it before the turn's summary.
+fn callEndsTurn(entries: []const TranscriptEntry, status_index: usize) bool {
+    for (entries[status_index + 1 ..]) |entry| {
+        if (toolStatusEntryId(entry) != null) return false;
+        switch (entry) {
+            .raw_bytes => |raw| if (raw.class == .turn_summary or raw.class == .turn_cancellation) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// The lines under a row: a subagent's model line and the reason its latest
@@ -3913,7 +3974,7 @@ test "tool relationship grouping retries cleanly after cancellation" {
     try std.testing.expect(retry.entry_actions.items[entries.len - 1] == .keep);
 }
 
-test "group header says what the group did and marks a failed call" {
+test "group header says what the group did, and a failed call's row says it failed" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Read runtime.zig\n", .class = .tool_status } },
@@ -3931,7 +3992,7 @@ test "group header says what the group did and marks a failed call" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● Ran a command, read a file ✓ · 1 failed\n" ++
+        "● Ran a command, read a file ✓\n" ++
             "├ Read runtime.zig\n" ++
             "├ Edited main.zig\n" ++
             "└ Ran \x1b[38;5;252mzig\x1b[39m build",
@@ -4525,11 +4586,12 @@ test "edit rows name the file, and changes to one file share a row" {
     errdefer std.debug.print("group:\n{s}\n", .{group_text});
     const trimmed = std.mem.trim(u8, group_text, "\n");
     // Each file shows by its name. The two edits of main.zig share one row
-    // with their counts added up; the failed edit keeps its own row and its
-    // reason.
+    // with their counts added up; the failed edit keeps its own row, which
+    // says only that it failed.
     try std.testing.expect(std.mem.find(u8, trimmed, "├ Edited main.zig +5/-3 · 2 edits\n") != null);
     try std.testing.expect(std.mem.find(u8, trimmed, "├ Wrote notes.md +7\n") != null);
-    try std.testing.expect(std.mem.find(u8, trimmed, "└ Couldn't edit app.zig · old_string not found") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "└ Couldn't edit app.zig") != null);
+    try std.testing.expect(std.mem.find(u8, trimmed, "old_string") == null);
     try std.testing.expect(std.mem.find(u8, trimmed, "/Users/example") == null);
     // The name links to the file, as a read row's does.
     try std.testing.expect(std.mem.find(u8, painted.items, "\x1b]8;;file://" ++ main_path ++ "\x1b\\main.zig" ++ link_close) != null);
@@ -4646,7 +4708,7 @@ test "a denied or cancelled change keeps its own row beside the file's edits" {
     }
 }
 
-test "a failed call says what it tried and why on one line" {
+test "a failed call says what it tried, and why only when its turn ended on it" {
     const alloc = std.testing.allocator;
     const skill_args = "{\"open\":\"fx-commit\"}";
     const failed_skill = TranscriptEntry{ .raw_bytes = .{
@@ -4655,34 +4717,68 @@ test "a failed call says what it tried and why on one line" {
         .class = .tool_status,
     } };
     const failed_skill_detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast(skill_args), .outcome = .failed };
+    const turn_ended = TranscriptEntry{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
 
-    // Alone, the call is one line: what it tried, then the first sentence of
-    // its error, without the instructions meant for the model.
+    // While the turn goes on, the row says only what the call tried: the
+    // error is for the model, which most often works past it.
     {
         const text = try groupTextForTest(alloc, &.{failed_skill}, &.{failed_skill_detail});
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Couldn't open fx-commit · Skill \"fx-commit\" is ambiguous", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● Couldn't open fx-commit", std.mem.trim(u8, text, "\n"));
+    }
+    // When the turn ended on the call, the row says why on its one line: the
+    // first sentence of its error, without the instructions for the model.
+    {
+        const text = try groupTextForTest(alloc, &.{ failed_skill, turn_ended }, &.{failed_skill_detail});
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Couldn't open fx-commit · Skill \"fx-commit\" is ambiguous", firstLineForTest(text));
     }
 
-    // In a group, the failed row keeps its reason on its own line and the
-    // header still counts the failure.
+    // In a group, the failed row says only that it failed, the header does
+    // not count it, and no mark blames a command for it.
     const path = "/Users/example/fx/src/main.zig";
     const read_args = "{\"path\":\"/Users/example/fx/src/app.zig\"}";
     const edit_args = "{\"path\":\"" ++ path ++ "\",\"old_string\":\"a\",\"new_string\":\"b\"}";
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /Users/example/fx/src/app.zig\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed " ++ path ++ ": old_string not found in file\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read /Users/example/fx/src/app.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .failed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
     };
-    const text = try groupTextForTest(alloc, &entries, &details);
-    defer alloc.free(text);
-    errdefer std.debug.print("group:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
-    try std.testing.expect(std.mem.find(u8, text, "└ Couldn't edit main.zig · old_string not found in file") != null);
-    try std.testing.expect(std.mem.find(u8, text, "✗") == null);
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "failed") == null);
+        try std.testing.expect(std.mem.find(u8, text, "└ Couldn't edit main.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "old_string") == null);
+        try std.testing.expect(std.mem.find(u8, text, "✗") == null);
+    }
+    // Ctrl+O still shows the whole error.
+    {
+        var expanded = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+        defer expanded.deinit(alloc);
+        var shown: std.ArrayList(u8) = .empty;
+        defer shown.deinit(alloc);
+        for (expanded.entry_actions.items, entries) |action, entry| switch (action) {
+            .override => |override| try shown.appendSlice(alloc, override.bytes),
+            .keep => try shown.appendSlice(alloc, entry.raw_bytes.bytes),
+            else => {},
+        };
+        try std.testing.expect(std.mem.find(u8, shown.items, "old_string not found in file") != null);
+    }
+    // A call after it means the turn did not end on it, even once the turn
+    // ends.
+    {
+        const text = try groupTextForTest(alloc, &(entries ++ [_]TranscriptEntry{turn_ended}), &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "old_string") == null);
+    }
 
     // A status that names only the target takes its reason from the result.
     {
@@ -4695,29 +4791,62 @@ test "a failed call says what it tried and why on one line" {
             .result = @constCast("{\"error\":\"read_tool_result failed for handle h1: ResultHandleNotFound. Copy handles exactly.\"}"),
             .outcome = .failed,
         };
-        const result_text = try groupTextForTest(alloc, &.{entry}, &.{detail});
+        const result_text = try groupTextForTest(alloc, &.{ entry, turn_ended }, &.{detail});
         defer alloc.free(result_text);
-        try std.testing.expectEqualStrings("● Couldn't read more output · read_tool_result failed for handle h1: ResultHandleNotFound", std.mem.trim(u8, result_text, "\n"));
+        try std.testing.expectEqualStrings("● Couldn't read more output · read_tool_result failed for handle h1: ResultHandleNotFound", firstLineForTest(result_text));
     }
 
     // A call that names no target says the tool it ran.
     const mcp = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Failed mcp_plain_getThreads: Invalid input. Labels need one item.\n", .class = .tool_status } };
     const mcp_detail = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("mcp_plain_getThreads"), .activity_kind = .read, .arguments_json = @constCast("{}"), .outcome = .failed };
-    const mcp_text = try groupTextForTest(alloc, &.{mcp}, &.{mcp_detail});
+    const mcp_text = try groupTextForTest(alloc, &.{ mcp, turn_ended }, &.{mcp_detail});
     defer alloc.free(mcp_text);
-    try std.testing.expectEqualStrings("● Couldn't run mcp_plain_getThreads · Invalid input", std.mem.trim(u8, mcp_text, "\n"));
+    try std.testing.expectEqualStrings("● Couldn't run mcp_plain_getThreads · Invalid input", firstLineForTest(mcp_text));
 
     // In a narrow row the reason clips first, and with no room it goes.
-    var narrow = try build(alloc, &.{failed_skill}, &.{failed_skill_detail}, 40);
+    var narrow = try build(alloc, &.{ failed_skill, turn_ended }, &.{failed_skill_detail}, 40);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_row) <= 40);
     try std.testing.expect(std.mem.find(u8, narrow_row, "Couldn't open fx-commit · ") != null);
-    var tiny = try build(alloc, &.{failed_skill}, &.{failed_skill_detail}, 30);
+    var tiny = try build(alloc, &.{ failed_skill, turn_ended }, &.{failed_skill_detail}, 30);
     defer tiny.deinit(alloc);
     const tiny_row = tiny.entry_actions.items[0].override.bytes;
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(tiny_row) <= 30);
     try std.testing.expect(std.mem.find(u8, tiny_row, " · ") == null);
+}
+
+test "a failed call's mark and words take the failure style" {
+    const alloc = std.testing.allocator;
+    const style: SummaryStyle = .{ .text_style = "<text>", .reset_style = "<reset>", .failure_style = "<failure>" };
+    // A failed edit's row says it failed in the failure style.
+    const edit_args = "{\"path\":\"/w/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const read_args = "{\"path\":\"/w/app.zig\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read /w/app.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Failed /w/main.zig: old_string not found\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .failed },
+    };
+    var projection = try buildStyled(alloc, &entries, &details, 120, style, .{});
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    errdefer std.debug.print("group:\n{s}\n", .{bytes});
+    try std.testing.expect(std.mem.find(u8, bytes, "<failure>Couldn't edit ") != null);
+
+    // A failed command's ✗ and its line of output take it too.
+    const command_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Exited 1 zig build\n", .class = .tool_status } },
+    };
+    var command_detail = storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"zig build\"}", 1, "error: expected ';'\n");
+    command_detail.outcome = .failed;
+    var command = try buildStyled(alloc, &command_entries, &.{command_detail}, 120, style, .{});
+    defer command.deinit(alloc);
+    const command_bytes = command.entry_actions.items[0].override.bytes;
+    errdefer std.debug.print("command:\n{s}\n", .{command_bytes});
+    try std.testing.expect(std.mem.find(u8, command_bytes, "<failure>error: expected ';'<reset><text>") != null);
 }
 
 test "a running read or edit names its file before its arguments arrive" {
@@ -4915,8 +5044,9 @@ test "a failure the model fixed at once shows as the try that worked" {
         const text = try groupTextForTest(alloc, &.{ failed_edit, other_edit }, &.{ failed_edit_detail, other_edit_detail });
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
-        try std.testing.expect(std.mem.find(u8, text, "Couldn't edit main.zig · old_string not found") != null);
+        try std.testing.expect(std.mem.find(u8, text, "1 failed") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Couldn't edit main.zig") != null);
+        try std.testing.expect(std.mem.find(u8, text, "old_string") == null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
     // A tool whose calls name no target, such as an MCP tool, may do other
@@ -4929,8 +5059,9 @@ test "a failure the model fixed at once shows as the try that worked" {
         const text = try groupTextForTest(alloc, &.{ failed_mcp, done_mcp }, &.{ failed_mcp_detail, done_mcp_detail });
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
-        try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_issues_create · Invalid input") != null);
+        try std.testing.expect(std.mem.find(u8, text, "1 failed") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_issues_create") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Invalid input") == null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
     // A next call with another target did not fix it, so the failure stays.
@@ -4938,8 +5069,9 @@ test "a failure the model fixed at once shows as the try that worked" {
         const text = try groupTextForTest(alloc, &.{ failed_open, other }, &.{ failed_detail, other_detail });
         defer alloc.free(text);
         errdefer std.debug.print("group:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "1 failed") != null);
-        try std.testing.expect(std.mem.find(u8, text, "Couldn't open fx-commit · Skill \"fx-commit\" is ambiguous") != null);
+        try std.testing.expect(std.mem.find(u8, text, "1 failed") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Couldn't open fx-commit") != null);
+        try std.testing.expect(std.mem.find(u8, text, "ambiguous") == null);
         try std.testing.expect(std.mem.find(u8, text, "try") == null);
     }
 }
@@ -5208,6 +5340,12 @@ fn groupTextForTest(alloc: std.mem.Allocator, entries: []const TranscriptEntry, 
         else => {},
     };
     return visibleLinesForTest(alloc, painted.items, 120);
+}
+
+/// The first line of `text`, after its leading newlines.
+fn firstLineForTest(text: []const u8) []const u8 {
+    const trimmed = std.mem.trimStart(u8, text, "\n");
+    return if (std.mem.findScalar(u8, trimmed, '\n')) |at| trimmed[0..at] else trimmed;
 }
 
 /// The visible text of `bytes` as the terminal paints it, one line per row,
@@ -6570,9 +6708,7 @@ test "repeated runs of one command share a row that keeps the earlier failures" 
     // reason is the run's first line that names a failure.
     try std.testing.expect(std.mem.findScalar(u8, failed_bytes, '\n') == null);
     try std.testing.expect(std.mem.startsWith(u8, failed_bytes, "● Ran \x1b[38;5;252msh\x1b[39m test.sh ×3"));
-    const red_reason = try std.mem.concat(alloc, u8, &.{ " · ", ui_render.red_style, "FAIL quits on click" });
-    defer alloc.free(red_reason);
-    try std.testing.expect(std.mem.find(u8, failed_bytes, red_reason) != null);
+    try std.testing.expect(std.mem.find(u8, failed_bytes, " · FAIL quits on click") != null);
     try std.testing.expect(std.mem.endsWith(u8, failed_bytes, " ✗"));
     try std.testing.expect(std.mem.find(u8, failed_bytes, "exit 1") == null);
 }
@@ -6696,7 +6832,7 @@ test "toolbox lookups and wrapped arguments name what the group did" {
     };
     var opened_projection = try build(alloc, &opened, &opened_details, 100);
     defer opened_projection.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, opened_projection.entry_actions.items[0].override.bytes, "● Opened a tool · 1 failed\n"));
+    try std.testing.expect(std.mem.startsWith(u8, opened_projection.entry_actions.items[0].override.bytes, "● Opened a tool\n"));
 
     // Fields inside {"request": {...}} count like top-level ones.
     const run = "{\"request\":{\"action\":\"run\",\"command\":\"npm run dev\",\"tty\":true}}";
@@ -6940,7 +7076,7 @@ test "every read in a group shares one row, and so does each search tool" {
     defer projection.deinit(alloc);
     var rows = std.mem.splitScalar(u8, projection.entry_actions.items[0].override.bytes, '\n');
     // The header says what the group did, with no counts.
-    try std.testing.expectEqualStrings("● Read files, searched, ran a command ✓ · 1 failed", rows.next().?);
+    try std.testing.expectEqualStrings("● Read files, searched, ran a command ✓", rows.next().?);
     // Each file shows once, though the model read a.zig twice with other
     // calls between, and each search tool keeps one row of its patterns.
     try std.testing.expectEqualStrings("├ Read a.zig, b.zig, c.zig", rows.next().?);
@@ -6965,7 +7101,7 @@ test "every read in a group shares one row, and so does each search tool" {
     var short = try build(alloc, &entries, &details, 28);
     defer short.deinit(alloc);
     const short_bytes = short.entry_actions.items[0].override.bytes;
-    try std.testing.expectEqualStrings("● Read files … · 1 failed", short_bytes[0..std.mem.findScalar(u8, short_bytes, '\n').?]);
+    try std.testing.expectEqualStrings("● Read files, searched …", short_bytes[0..std.mem.findScalar(u8, short_bytes, '\n').?]);
 }
 
 test "a list row links each file it names" {
@@ -7249,9 +7385,7 @@ test "a failure reason is one line of plain text within the width" {
         // already says how the command ended.
         const reason = projection.entry_actions.items[0].override.bytes;
         try std.testing.expect(std.mem.findScalar(u8, reason, '\n') == null);
-        const red_reason = try std.mem.concat(alloc, u8, &.{ " · ", ui_render.red_style, "error: " });
-        defer alloc.free(red_reason);
-        try std.testing.expect(std.mem.find(u8, reason, red_reason) != null);
+        try std.testing.expect(std.mem.find(u8, reason, " · error: ") != null);
         try std.testing.expect(std.mem.find(u8, reason, "exit 3 ·") == null);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(reason) <= cols);
         try std.testing.expect(std.mem.find(u8, reason, "starting") == null);
