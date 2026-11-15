@@ -33,7 +33,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -201,14 +201,14 @@ function compactionRaceFixture(label: string) {
 const RACE_PROMPT = "Read notes.txt until told to stop. RACE_MAIN_PROMPT";
 
 /// The records the `compaction_records` lines of session `id` list, besides
-/// each line's own map, which every such line lists too (D50). The log is
-/// read raw: the mid-turn compaction makes fx write the turn afresh as
-/// superseded, which logLines refuses.
+/// each line's own map, which every such line lists too (D50). The mid-turn
+/// compaction makes fx write the turn afresh as superseded, which logLines
+/// refuses. logLinesAfterCompaction accepts that supersede only when a
+/// compaction in the same turn explains it, so this read also checks it is the
+/// designed one.
 function listedRecords(home: string, id: string): string[] {
-  const lines = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8")
-    .split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const listed: string[] = [];
-  for (const line of lines) {
+  for (const line of logLinesAfterCompaction(home, id) as any[]) {
     if (line.kind !== "set" || line.key !== "compaction_records") continue;
     expect(line.blobs).toContain(line.value.map);
     listed.push(...(line.blobs as string[]).filter((hash) => hash !== line.value.map));
