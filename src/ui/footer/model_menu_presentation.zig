@@ -626,6 +626,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
             .host_managed => "Provider catalog: authentication is managed by the host.",
             .configured => "Provider catalog: models from profile settings.",
+            .claude_code => "Claude Code models.",
         };
     }
     return null;

@@ -64,6 +64,8 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    /// The `claude` binary is signed in; its model list needs no token.
+    claude_code,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -73,6 +75,7 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .claude_code => .claude_code,
         };
     }
 };
@@ -234,6 +237,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .host_managed => unreachable,
+        .claude_code => .claude_code,
         .configured => return .{ .public_only = .no_credential },
         .fx_login => blk: {
             const team = team_context orelse
@@ -558,6 +562,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .claude_code => .{ .token = try alloc.dupe(u8, ""), .source = .claude_code },
         .host_managed, .configured => null,
     };
 }
@@ -612,6 +617,7 @@ pub fn sourceExists(
                 },
             };
         },
+        .claude_code => true,
         .host_managed, .configured => false,
     };
 }
@@ -636,6 +642,7 @@ pub fn sourcePresence(
             secret_store.presence(),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
+        .claude_code => .present,
         .host_managed, .configured => .missing,
     };
 }
@@ -767,7 +774,7 @@ pub fn loadStoredSource(alloc: std.mem.Allocator, source: Source) !?Credential {
         .fx_login => loadStoredFxLoginCredential(alloc),
         .chatgpt_subscription => loadStoredChatGptCredential(alloc),
         .grok_subscription => loadStoredGrokCredential(alloc),
-        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => null,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured, .claude_code => null,
     };
 }
 
@@ -1006,6 +1013,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .grok_subscription => "Grok subscription",
         .host_managed => "host managed",
         .configured => "configured provider",
+        .claude_code => "Claude Code",
     };
 }
 

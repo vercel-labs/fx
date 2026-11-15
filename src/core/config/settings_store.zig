@@ -1943,7 +1943,7 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
-        .configured => return changed,
+        .claude_code, .configured => return changed,
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);

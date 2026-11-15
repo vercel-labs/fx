@@ -1423,6 +1423,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .claude_code => provider_catalog.label(.claude_code),
             .configured => "configured provider",
         };
     }

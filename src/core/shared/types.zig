@@ -121,6 +121,8 @@ pub const CredentialSource = enum {
     grok_subscription,
     host_managed,
     configured,
+    /// The `claude` binary keeps its own sign-in; fx holds no secret.
+    claude_code,
 };
 
 pub const DirectCredentialLease = struct {
@@ -181,7 +183,7 @@ test "empty direct credential lease preserves absent authority" {
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     const source = parseRuntimeCredentialSource(text) orelse return null;
-    return if (source == .host_managed or source == .configured) null else source;
+    return if (source == .host_managed or source == .configured or source == .claude_code) null else source;
 }
 
 pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
@@ -190,7 +192,7 @@ pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
-        if (source == .host_managed or source == .configured) continue;
+        if (source == .host_managed or source == .configured or source == .claude_code) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);

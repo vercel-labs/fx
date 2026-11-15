@@ -186,6 +186,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        .claude_code => "Claude Code is unavailable. Install `claude` and sign in with /login there.",
                         .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
                     },
                 }, true),
@@ -1425,7 +1426,7 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
-                        .gateway, .configured => {},
+                        .gateway, .claude_code, .configured => {},
                     }
                 }
                 if (target == .gateway or !request.allow_login) {
@@ -2168,6 +2169,7 @@ pub fn Runtime(comptime App: type) type {
                 .stored_key,
                 .host_managed,
                 .configured,
+                .claude_code,
                 => {},
             }
         }
@@ -2223,7 +2225,7 @@ pub fn Runtime(comptime App: type) type {
                 .fx_login => try beginSignIn(app, agent, false),
                 .chatgpt_subscription => try beginChatGptSignIn(app, agent),
                 .grok_subscription => try beginGrokSignIn(app, agent),
-                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => {},
+                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured, .claude_code => {},
             }
         }
 

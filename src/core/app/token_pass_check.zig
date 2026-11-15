@@ -62,7 +62,7 @@ pub fn name(alloc: Allocator, source: credentials.Source, api_key: ?[]const u8, 
                 _ = token_pass.identity(&named.asked, .session_token, "", team);
             }
         },
-        .chatgpt_subscription, .grok_subscription, .host_managed, .configured => return null,
+        .chatgpt_subscription, .grok_subscription, .host_managed, .configured, .claude_code => return null,
     }
     return named;
 }

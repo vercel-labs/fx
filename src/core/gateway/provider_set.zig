@@ -59,6 +59,7 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    claude_code: Bundle = .{},
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
     /// Builds a configured provider's bundle; `configured_context` is passed through.
     configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
@@ -69,6 +70,7 @@ pub const Set = struct {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .claude_code => self.claude_code,
             .configured => blk: {
                 const factory = self.configured_fn orelse break :blk .{};
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };

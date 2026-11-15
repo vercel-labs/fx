@@ -4956,7 +4956,7 @@ fn signInRepairs(credential_source: ?types.CredentialSource) bool {
     const source = credential_source orelse return false;
     return switch (source) {
         .fx_login, .chatgpt_subscription, .grok_subscription => true,
-        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => false,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured, .claude_code => false,
     };
 }
 

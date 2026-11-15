@@ -67,6 +67,7 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
+const claude_code = @import("gateway/claude_code.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
@@ -2274,6 +2275,7 @@ const App = struct {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;
+            providers.claude_code.permission_reviewer = null;
         }
         return providers;
     }
@@ -3878,6 +3880,7 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
     io_mod.reserveClosedStandardStreams();
+    defer claude_code.stopAll();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
 }
@@ -3907,6 +3910,16 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             try terminal_native_session.runLauncher(processAllocator());
             return;
         }
+    }
+
+    if (claude_code.isBridgeModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        try claude_code.runBridge(raw_args);
+        return;
     }
 
     if (shouldRunBenchmarkNoArgRaw(raw_args, raw_env)) {
@@ -4213,6 +4226,7 @@ fn writeStderrFast(text: []const u8) !void {
 }
 
 fn exitFast(code: u8) noreturn {
+    claude_code.stopAll();
     if (comptime builtin.link_libc and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         std.c._exit(@intCast(code));
     }
@@ -5518,6 +5532,9 @@ test {
     _ = @import("gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
+    _ = @import("gateway/claude_code.zig");
+    _ = @import("gateway/claude_code_session.zig");
+    _ = @import("gateway/claude_code_wire.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");

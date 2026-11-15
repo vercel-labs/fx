@@ -326,6 +326,7 @@ pub fn loginCommand(provider: model_provider.ProviderId) []const u8 {
         .gateway => "fx login",
         .codex => "fx login codex",
         .grok => "fx login grok",
+        .claude_code => "run claude and sign in with /login",
         .configured => profile_paths.displayText("check the connection's auth in ~/.fx/settings.json"),
     };
 }
