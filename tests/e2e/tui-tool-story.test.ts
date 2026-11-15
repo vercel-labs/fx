@@ -189,12 +189,12 @@ test.skipIf(!tmuxAvailable())(
 
     const checks = group(lines, "● Ran commands ✗");
     // The two passing checks share a row by their step; the failure keeps
-    // its own.
+    // its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
       "├ Ran sh check.sh",
-      expect.stringMatching(/^└ .*sh build\.sh$/),
+      expect.stringMatching(/^└ .*sh build\.sh · src\/main\.ts:14:15 - error TS2554: Expected 1 arguments, but got 3\.$/),
     ]);
-    expect(checks).toContain("  ✗ exit 2 · src/main.ts:14:15 - error TS2554: Expected 1 arguments, but got 3.");
+    expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
 
     // Edits come first; the other kinds tie, and the fourth is "more".
     const fix = group(lines, "● Edited a file, ran a command, read a file, and more ✓");
@@ -203,7 +203,8 @@ test.skipIf(!tmuxAvailable())(
     expect(fixRows[0]).toStartWith("├ Searched");
     // A read shows the file by name.
     expect(fixRows[1]).toBe("├ Read window.ts");
-    expect(fixRows[2]).toBe("├ Edited desktop/src/main.ts +1 / -1");
+    // An edit shows the file by name, with its counts.
+    expect(fixRows[2]).toBe("├ Edited main.ts +1/-1");
     expect(fixRows[3]).toBe("└ Ran sh build.sh");
     expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands · /.test(line))).toBe(true);
     expect(lines.some((line) => / tool calls? · /.test(line))).toBe(false);
@@ -343,12 +344,14 @@ test.skipIf(!tmuxAvailable())(
       width,
     });
     const lines = paneLines(pane);
-    const block = group(lines, /^● .*sh hostile\.sh$/);
-    const reason = block.find((line) => line.startsWith("  ✗ "));
-    expect(reason).toBeDefined();
-    expect(reason!).toStartWith("  ✗ exit 3 · error: xxxx");
-    expect(reason!).toEndWith("…");
-    expect([...reason!].length).toBeLessThanOrEqual(width);
+    // The failed call is its group's line, and the error's line follows it
+    // there, clipped to the width.
+    const row = lines.find((line) => /^● .*sh hostile\.sh · /.test(line));
+    expect(row).toBeDefined();
+    expect(row!).toContain(" · error: xxxx");
+    expect(row!).toEndWith("…");
+    expect([...row!].length).toBeLessThanOrEqual(width);
+    expect(lines.some((line) => line.startsWith("  ✗ "))).toBe(false);
     expect(lines.some((line) => line.includes("starting"))).toBe(false);
   },
   TIMEOUT * 2,

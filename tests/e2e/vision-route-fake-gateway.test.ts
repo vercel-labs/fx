@@ -3721,8 +3721,8 @@ describe("Vision route fake Gateway", () => {
 
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).toContain("Inspected images");
-        // The failed call is its group's header, with its reason on the line below.
-        expect(scrollback).toContain("● Failed images\n  ✗ Vision is unavailable right now");
+        // The failed call is its group's line, with its reason after it.
+        expect(scrollback).toContain("● Couldn't inspect images · Vision is unavailable right now");
         expect(scrollback).toContain(
           "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
         );
