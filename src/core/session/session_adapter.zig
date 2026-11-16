@@ -3105,15 +3105,6 @@ pub const Session = struct {
         }
     }
 
-    /// `visitHistory` over one compaction cycle: the turns after the
-    /// compaction line at `start`, or from the log's start when null, up to
-    /// the next compaction line. A turn the next compaction splits is not
-    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
-    /// when reading stopped at a damaged line, so turns are missing.
-    pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        return visitCycle(self.source(), alloc, start, visitor);
-    }
-
     /// A reader of this session's log that another thread can keep after
     /// this call returns, such as the one that reads a cycle for Ctrl+O.
     /// Caller owns it; free it with `CycleReader.deinit` on any thread.
@@ -3773,14 +3764,18 @@ pub const CycleReader = struct {
         return .{ .store = self.store, .id = self.host.id, .host = self.host, .files_path = self.files_path };
     }
 
-    /// `Session.visitHistoryCycle`, read on the reader's thread.
+    /// `visitHistory` over one compaction cycle: the turns after the
+    /// compaction line at `start`, or from the log's start when null, up to
+    /// the next compaction line. A turn the next compaction splits is not
+    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
+    /// when reading stopped at a damaged line, so turns are missing.
     pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
         return visitCycle(self.source(), alloc, start, visitor);
     }
 };
 
 /// The turns of one compaction cycle from `src`, each handed to
-/// `visitor.append` and freed after it returns (`Session.visitHistoryCycle`).
+/// `visitor.append` and freed after it returns (`CycleReader.visitHistoryCycle`).
 fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
     var sink: Session.VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
     const from: sm.From = if (start) |cursor| .{ .at = try src.cycleStart(alloc, cursor) } else .start;
@@ -7119,12 +7114,14 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
     const older = (try s.previousCompactionCursor(testing.allocator, newest)).cursor.?;
     try testing.expect(older.offset < newest.offset);
     try testing.expectEqual(Session.PreviousCompaction{ .cursor = null }, try s.previousCompactionCursor(testing.allocator, older));
+    var cycles = try s.cycleReader(testing.allocator);
+    defer cycles.deinit();
     var visitor: Visitor = .{};
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{ "one", "two" });
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, older, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, older, &visitor));
     try visitor.expectPrompts(&.{"three"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, newest, &visitor));
     try visitor.expectPrompts(&.{"four"});
     try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{"four"});
@@ -7244,14 +7241,16 @@ test "a damaged line in a compaction cycle shows that cycle's turns before it an
             for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
         }
     };
+    var cycles = try s.cycleReader(testing.allocator);
+    defer cycles.deinit();
     var visitor: Visitor = .{};
     // Forward, cycle 1 shows its turn before the damage and says the read
     // stopped there; the other cycles read whole.
-    try testing.expect(try s.visitHistoryCycle(testing.allocator, opens_one, &visitor));
+    try testing.expect(try cycles.visitHistoryCycle(testing.allocator, opens_one, &visitor));
     try visitor.expectPrompts(&.{"one-a"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, opens_two, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, opens_two, &visitor));
     try visitor.expectPrompts(&.{"two"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{"zero"});
     // Backward, the search across cycle 2 still finds the line opening it,
     // and the search across cycle 1 stops at the damage and says so instead
@@ -7371,9 +7370,11 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     // Ctrl+O: the cycle before leaves the split turn out, and the one the
     // compaction opens shows it whole.
     const compaction = (try r.previousCompactionCursor(testing.allocator, null)).cursor.?;
-    try testing.expect(!try r.visitHistoryCycle(testing.allocator, null, &visitor));
+    var cycles = try r.cycleReader(testing.allocator);
+    defer cycles.deinit();
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{"first"});
-    try testing.expect(!try r.visitHistoryCycle(testing.allocator, compaction, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, compaction, &visitor));
     try visitor.expectPrompts(&.{ "split", "after" });
 }
 
