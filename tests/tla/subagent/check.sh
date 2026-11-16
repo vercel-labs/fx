@@ -98,6 +98,8 @@
 #
 #   no-gate              the next turn starts before the commit              CommitBeforeNextTurn
 #   stuck-gate           a commit leaves the gate's count as it was          GateNeverStuck
+#   drop-unacknowledged  a finish the loop drops unsaved (a cancel, a            GateNeverStuck
+#                        session switch) leaves the count as it was
 #
 # tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
 # against it (MainMailTrace.tla) where turns commit as they finish, as in
@@ -148,6 +150,7 @@ MainMail main-mail-mutation-close-with-mail JoinsOpenTurn
 MainMail main-mail-commit -
 MainMail main-mail-mutation-no-gate CommitBeforeNextTurn
 MainMail main-mail-mutation-stuck-gate GateNeverStuck
+MainMail main-mail-mutation-drop-unacknowledged GateNeverStuck
 QuietRelay quiet-relay -
 QuietRelay quiet-relay-deep -
 QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell

@@ -38,8 +38,11 @@
 (* not start the next one first. A turn that starts first writes its first *)
 (* piece into the log while the finished turn is still open, which         *)
 (* supersedes both. The worker counts the finishes it pushed and the loop  *)
-(* has not acknowledged (`owed`; `commit_gate` and                         *)
-(* `acknowledgeFinishCommitted` in worker_runtime.zig), holds that mail    *)
+(* has not acknowledged (`owed`; `commit_gate`,                            *)
+(* `acknowledgeFinishCommitted` and `acknowledgeFinishDropped` in          *)
+(* worker_runtime.zig; the loop acknowledges a finish it drops unsaved, as *)
+(* a cancel or a session switch does, as it does one it commits), holds    *)
+(* that mail                                                               *)
 (* while the count is above zero, and gives up after a limit               *)
 (* (`commit_gate_limit_ms`). A stop of the worker also ends the hold; the  *)
 (* model has no stop, as it has no close of the agent.                     *)
@@ -63,7 +66,8 @@ Bugs == {"none",
          "lost_at_finish",      \* a finished turn drops the mail left for it
          "close_with_mail",     \* a final boundary closes the turn with joined mail unread
          "no_gate",            \* the next turn starts without waiting for the commit
-         "stuck_gate"}         \* a commit leaves the gate's count as it was
+         "stuck_gate",         \* a commit leaves the gate's count as it was
+         "drop_unacknowledged"}\* a finish the loop drops unsaved leaves the gate's count as it was
 
 ASSUME /\ Bug \in Bugs
        /\ Joins \in BOOLEAN
@@ -215,6 +219,16 @@ Commit ==
   /\ owed' = IF Bug = "stuck_gate" \/ owed = 0 THEN owed ELSE owed - 1
   /\ UNCHANGED <<turn, turns, open, marked, queue, posted, readIn, order, due, aborted, waits, twice, early>>
 
+\* The main loop drops a finished turn without committing it, as a cancel or a
+\* session switch drops the one the pacer held, or a drain that cannot save
+\* drops what is left (`acknowledgeFinishDropped`). Nothing will commit it, so
+\* the drop is acknowledged as a commit is.
+Drop ==
+  /\ uncommitted > 0
+  /\ uncommitted' = uncommitted - 1
+  /\ owed' = IF Bug = "drop_unacknowledged" \/ owed = 0 THEN owed ELSE owed - 1
+  /\ UNCHANGED <<turn, turns, open, marked, queue, posted, readIn, order, due, aborted, waits, twice, early>>
+
 \* The limit passes with the commit still owed: the gate forgets it and lets
 \* the mail start the next turn, as before the gate (`commit_gate_expired`).
 Expire ==
@@ -232,6 +246,7 @@ Next ==
   \/ NextTurn
   \/ Wait
   \/ Commit
+  \/ Drop
   \/ Expire
 
 Spec == Init /\ [][Next]_vars

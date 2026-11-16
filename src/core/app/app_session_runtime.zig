@@ -28,6 +28,7 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
@@ -1090,7 +1091,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
-            app.pacer.clear(app.alloc);
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "session_switch");
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app, agent);
             } else {
@@ -11359,4 +11360,62 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     var restored = try reopenSaved(&app);
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "a live session switch drops the finishes it holds, so a later report is not held" {
+    const App = struct {
+        alloc: Allocator = std.heap.c_allocator,
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var app: App = .{};
+    defer app.pacer.deinit(app.alloc);
+    defer app.agent().worker.deinit(alloc);
+    const worker = &app.agent().worker;
+    worker.enableCommitGate();
+
+    // Turn A's finish is in the pacer, and turn B's finish is still queued.
+    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try app.pacer.enqueue(app.alloc, "still showing");
+    try std.testing.expect(try app.pacer.deferFinish(app.alloc, .{ .turn = turn }));
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try std.testing.expectEqual(@as(u32, 2), worker.unacknowledged_finishes);
+
+    // The switch cancels (and clears the pacer), then drops the queued events.
+    Runtime(App).beginLiveSessionCancellation(&app, (&app).agent());
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
+    worker.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+
+    // The new session's first turn finishes and is committed, and a report missed it.
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    worker.acknowledgeFinishCommitted();
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }

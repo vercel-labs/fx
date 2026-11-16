@@ -1790,8 +1790,9 @@ pub const WorkerRuntime = struct {
 
     /// Opts this worker into the commit gate. Only a host that applies the
     /// finish events it takes from this worker, and then calls
-    /// `acknowledgeFinishCommitted` for each, may call it: the gate waits for
-    /// that call, and a host that never makes it only loses
+    /// `acknowledgeFinishCommitted` for each it commits and
+    /// `acknowledgeFinishDropped` for each it drops unsaved, may call it: the
+    /// gate waits for those calls, and a host that never makes them only loses
     /// `commit_gate_limit_ms` per spell. A host that does not call this, as
     /// libfx and ACP do not, never counts a finish and never holds mail.
     pub fn enableCommitGate(self: *WorkerRuntime) void {
@@ -1806,11 +1807,28 @@ pub const WorkerRuntime = struct {
     pub fn acknowledgeFinishCommitted(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        self.releaseFinishesLocked(1, "committed");
+    }
+
+    /// The main loop's note that it dropped a finished turn without
+    /// committing it, as a cancel or a session switch drops the one the pacer
+    /// held. Nothing of that turn is open and no commit is coming, so the
+    /// gate must not wait for it: it lowers the count as a commit does, and
+    /// logs the drop with `reason`.
+    pub fn acknowledgeFinishDropped(self: *WorkerRuntime, reason: []const u8) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.commit_gate) return;
+        debug_trace.eventf("worker", "commit_gate_finish_dropped", .{ .turn_id = self.active_turn_id }, "worker={x} count=1 unacknowledged={d} reason={s}", .{ @intFromPtr(self), self.unacknowledged_finishes, reason });
+        self.releaseFinishesLocked(1, reason);
+    }
+
+    fn releaseFinishesLocked(self: *WorkerRuntime, count: u32, reason: []const u8) void {
         if (!self.commit_gate or self.unacknowledged_finishes == 0) return;
-        self.unacknowledged_finishes -= 1;
+        self.unacknowledged_finishes -|= count;
         if (self.unacknowledged_finishes > 0) return;
         if (self.commit_gate_logged) {
-            debug_trace.eventf("worker", "commit_gate_released", .{ .turn_id = self.active_turn_id }, "worker={x} waited_ms={d} reason=committed", .{ @intFromPtr(self), self.commitGateWaitedMsLocked() });
+            debug_trace.eventf("worker", "commit_gate_released", .{ .turn_id = self.active_turn_id }, "worker={x} waited_ms={d} reason={s}", .{ @intFromPtr(self), self.commitGateWaitedMsLocked(), reason });
         }
         self.commit_gate_logged = false;
         self.worker_cond.broadcast(io_mod.getIo());
@@ -1840,7 +1858,8 @@ pub const WorkerRuntime = struct {
     /// typed, and compaction, are not held.
     ///
     /// What ends the hold: the main loop's acknowledgement (a cancelled turn
-    /// still finishes, and a failed commit still acknowledges); a stop of this
+    /// still finishes, a failed commit still acknowledges, and a finish the
+    /// loop drops unsaved is acknowledged as dropped); a stop of this
     /// worker, which the wait loops check on their own; and
     /// `commit_gate_limit_ms` after the finish was pushed, when it logs
     /// `commit_gate_expired`, forgets the unacknowledged count, and lets the
@@ -2610,10 +2629,22 @@ pub const WorkerRuntime = struct {
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
+    /// Drops every queued event, as a live session switch does. A finish among
+    /// them will never be committed, so the commit gate stops waiting for it.
     pub fn discardEvents(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         var events = self.takeEvents();
         defer events.deinit(alloc);
-        for (events.items) |event| freeWorkerEvent(alloc, event);
+        var finishes: u32 = 0;
+        for (events.items) |event| {
+            if (event == .finish_prompt) finishes += 1;
+            freeWorkerEvent(alloc, event);
+        }
+        if (finishes == 0) return;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.commit_gate) return;
+        debug_trace.eventf("worker", "commit_gate_finish_dropped", .{ .turn_id = self.active_turn_id }, "worker={x} count={d} unacknowledged={d} reason=events_discarded", .{ @intFromPtr(self), finishes, self.unacknowledged_finishes });
+        self.releaseFinishesLocked(finishes, "events_discarded");
     }
 
     pub fn syncQueuedPromptModel(self: *WorkerRuntime, alloc: std.mem.Allocator, model: []const u8) !void {
@@ -9234,4 +9265,99 @@ test "a worker held by the commit gate goes on at its limit when the commit neve
     try std.testing.expect(waiter.got_prompt);
     try std.testing.expect(io_mod.milliTimestamp() - started >= 100);
     try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+}
+
+test "a finish the app dropped without committing does not hold mail behind a later commit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+
+    // Turn A finished and the app dropped its finish: a cancel cleared what
+    // the pacer held, so nothing will commit it.
+    try pushTestFinish(alloc, &runtime);
+    var taken = runtime.takeEvents();
+    for (taken.items) |event| freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    runtime.acknowledgeFinishDropped("cancel");
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    // Turn B finishes and is committed, and a report missed it.
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expect(runtime.commitGateRemainingMsLocked() == null);
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+}
+
+test "an acknowledged drop lowers the count by one, and does nothing for a host that did not opt in" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try pushTestFinish(alloc, &runtime);
+    try pushTestFinish(alloc, &runtime);
+    runtime.acknowledgeFinishDropped("session_switch");
+    try std.testing.expectEqual(@as(u32, 1), runtime.unacknowledged_finishes);
+    runtime.acknowledgeFinishDropped("session_switch");
+    runtime.acknowledgeFinishDropped("session_switch");
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    var plain = WorkerRuntime{};
+    defer plain.deinit(alloc);
+    try pushTestFinish(alloc, &plain);
+    plain.acknowledgeFinishDropped("cancel");
+    try std.testing.expectEqual(@as(u32, 0), plain.unacknowledged_finishes);
+}
+
+test "discarded events release the finishes among them, so a later report is not held" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+
+    // A live session switch drops the events the loop had not applied.
+    try pushTestFinish(alloc, &runtime);
+    try pushTestFinish(alloc, &runtime);
+    try runtime.pushEvent(alloc, .{ .error_text = .{ .topic = "t", .tone = .@"error", .body = @constCast("b") } });
+    try std.testing.expectEqual(@as(u32, 2), runtime.unacknowledged_finishes);
+    runtime.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    // The next session's first turn finishes, is committed, and a report missed it.
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    runtime.acknowledgeFinishCommitted();
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    freeWorkItem(alloc, work);
+}
+
+test "the commit gate logs a finish the app dropped, with its reason" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "dropped.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try pushTestFinish(alloc, &runtime);
+    runtime.acknowledgeFinishDropped("cancel");
+    try pushTestFinish(alloc, &runtime);
+    runtime.discardEvents(alloc);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=commit_gate_finish_dropped") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=cancel") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=events_discarded") != null);
 }

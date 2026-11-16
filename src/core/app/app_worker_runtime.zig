@@ -510,6 +510,53 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Tells `agent`'s worker that a finished turn it pushed is gone
+        /// without a commit, so its commit gate stops waiting for it
+        /// (`WorkerRuntime.acknowledgeFinishDropped`). Every place that frees
+        /// a finished turn unsaved calls this or goes through `clearPacer` or
+        /// `deferFinish`; a turn that is saved is acknowledged by
+        /// `appendFinishedPrompt`.
+        pub fn acknowledgeDroppedFinish(agent: *AppAgent, reason: []const u8) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishDropped"))
+            {
+                agent.worker.acknowledgeFinishDropped(reason);
+            }
+        }
+
+        fn pacerHoldsFinish(app: *App) bool {
+            if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return false;
+            return app.pacer.deferred_turn != null;
+        }
+
+        /// Clears the pacer of `agent`, the agent in context: the text it had
+        /// not shown, and a finished turn it deferred, which is never saved
+        /// then. A cancel and a session switch clear it. `reason` names which.
+        pub fn clearPacer(app: *App, agent: *AppAgent, reason: []const u8) void {
+            const held_finish = pacerHoldsFinish(app);
+            app.pacer.clear(app.alloc);
+            if (held_finish) {
+                debug_trace.logf("worker", "pacer cleared a deferred finished turn unsaved reason={s}", .{reason});
+                acknowledgeDroppedFinish(agent, reason);
+            }
+        }
+
+        /// Defers `finished` in the pacer of `agent` while text is still being
+        /// shown. A finished turn the pacer already held is replaced and never
+        /// saved, so that one is acknowledged as dropped.
+        pub fn deferFinish(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !bool {
+            const replaced = pacerHoldsFinish(app);
+            const retained = app.pacer.deferFinish(app.alloc, finished) catch |err| {
+                if (replaced and !pacerHoldsFinish(app)) acknowledgeDroppedFinish(agent, "pacer_replaced");
+                return err;
+            };
+            if (retained and replaced) {
+                debug_trace.logf("worker", "pacer replaced a deferred finished turn unsaved", .{});
+                acknowledgeDroppedFinish(agent, "pacer_replaced");
+            }
+            return retained;
+        }
+
         fn preserveFinishedAfterDrainFailure(app: *App, agent: *AppAgent, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
             var can_persist = may_persist;
             if (can_persist) settleDeferredFinish(app, agent) catch {
@@ -525,6 +572,7 @@ pub fn Runtime(comptime App: type) type {
                             };
                         } else {
                             debug_trace.logf("worker", "finished turn not persisted after earlier save failure", .{});
+                            acknowledgeDroppedFinish(agent, "not_persisted");
                         }
                     },
                     else => debug_trace.logf("worker", "presentation failure discarded worker event kind={s}", .{@tagName(event)}),
@@ -1448,9 +1496,14 @@ pub fn Runtime(comptime App: type) type {
                             settleDeferredFinish(app, agent) catch {
                                 can_persist_finished = false;
                             };
-                            if (can_persist_finished) persistFinishedPrompt(app, agent, finished) catch {
-                                can_persist_finished = false;
-                            };
+                            if (can_persist_finished) {
+                                persistFinishedPrompt(app, agent, finished) catch {
+                                    can_persist_finished = false;
+                                };
+                            } else {
+                                debug_trace.logf("worker", "finished turn not persisted after earlier save failure", .{});
+                                acknowledgeDroppedFinish(agent, "not_persisted");
+                            }
                         };
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
                         resetStream(app, agent, false);
@@ -5856,4 +5909,88 @@ test "a time-bounded drain applies a cancelled take whole" {
     try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.events.items.len);
     try std.testing.expectEqual(@as(usize, 0), capture.texts.items.len);
     try std.testing.expect(!app.main_agent.worker.takeDrainContinuationDue());
+}
+
+const GateApp = struct {
+    alloc: std.mem.Allocator,
+    pacer: assistant_pacer.AssistantPacer = .{},
+    main_agent: struct {
+        total_input_tokens: u64 = 0,
+        total_output_tokens: u64 = 0,
+        session: @import("../session/session.zig").SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+    } = .{},
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    fn pushFinish(self: *GateApp, answer: []const u8) !void {
+        const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast(answer) } };
+        try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = turn } });
+    }
+
+    /// What the loop does with the events it took: applies them, here by dropping them.
+    fn takeAndDrop(self: *GateApp) void {
+        var events = self.agent().worker.takeEvents();
+        for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+        events.deinit(std.heap.c_allocator);
+    }
+};
+
+test "a finished turn the pacer replaces or clears is acknowledged as dropped, and the one it holds is not" {
+    const alloc = std.testing.allocator;
+    var app: GateApp = .{ .alloc = alloc };
+    defer app.agent().session_persistence.deinit(alloc);
+    defer app.agent().session.deinit(alloc);
+    defer app.agent().worker.deinit(std.heap.c_allocator);
+    defer app.pacer.deinit(alloc);
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    try app.pushFinish("first");
+    try app.pushFinish("second");
+    app.takeAndDrop();
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
+
+    try app.pacer.enqueue(alloc, "text still showing");
+    const first: types.FinishedPrompt = .{ .turn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("first") } } };
+    const second: types.FinishedPrompt = .{ .turn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("second") } } };
+    try std.testing.expect(try Runtime(GateApp).deferFinish(&app, agent, first));
+    // The pacer holds the first turn, which a commit will still acknowledge.
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
+    // A second turn replaces it unsaved: that one is acknowledged as dropped.
+    try std.testing.expect(try Runtime(GateApp).deferFinish(&app, agent, second));
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+    // Clearing the pacer drops the second.
+    Runtime(GateApp).clearPacer(&app, agent, "cancel");
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    // Clearing a pacer that holds no turn acknowledges nothing.
+    try app.pushFinish("third");
+    app.takeAndDrop();
+    Runtime(GateApp).clearPacer(&app, agent, "cancel");
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+}
+
+test "a finished turn the loop does not save after an earlier save failure is acknowledged as dropped" {
+    const alloc = std.testing.allocator;
+    var app: GateApp = .{ .alloc = alloc };
+    defer app.agent().session_persistence.deinit(alloc);
+    defer app.agent().session.deinit(alloc);
+    defer app.agent().worker.deinit(std.heap.c_allocator);
+    defer app.pacer.deinit(alloc);
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    try app.pushFinish("one");
+    try app.pushFinish("two");
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
+    const taken = agent.worker.takeEventBatch();
+    var batch = DetachedWorkerEventBatch.init(std.heap.c_allocator, taken.events);
+    defer batch.deinit();
+    // The drain failed after a save failure, so it may not save what is left.
+    Runtime(GateApp).preserveFinishedAfterDrainFailure(&app, agent, &batch, false);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
 }
