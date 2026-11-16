@@ -1403,7 +1403,7 @@ pub fn Runtime(comptime App: type) type {
                         const waited_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
                         try handlers.credential_refreshed(handlers.ctx, credential);
                         if (waited_for_sign_in) if (comptime @hasDecl(App, "closeRecoverySignInForStoredLogin")) {
-                            if (agent == app.screenAgent()) try app.closeRecoverySignInForStoredLogin();
+                            if (agent == app.screenAgent()) try app.closeRecoverySignInForStoredLogin(credential.source);
                         };
                     },
                     .command_output => |chunk| {

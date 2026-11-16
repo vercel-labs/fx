@@ -2230,8 +2230,12 @@ pub fn Runtime(comptime App: type) type {
         /// The request that waits for a sign-in took a login another fx
         /// process saved: the sign-in fx opened for it here, still waiting
         /// for its code, is no longer needed.
-        pub fn closeRecoverySignInForStoredLogin(app: *App) !void {
+        pub fn closeRecoverySignInForStoredLogin(app: *App, source: credentials.Source) !void {
             if (!app.auth.signInEntryActive()) return;
+            // A sign-in for another provider, which the user opened, stays.
+            if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) {
+                if (app.auth.pickerView().sign_in_source != source) return;
+            }
             debug_trace.logf("auth", "sign-in closed: the waiting request took the login another fx saved, and this sign-in's device code is dropped", .{});
             _ = app.auth.popPickerStage(app.alloc);
             try writeAuthNotice(app, .{

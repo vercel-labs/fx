@@ -3310,14 +3310,19 @@ tmuxTest(
     await session.sendText("Answer on the team I pick.");
     await session.waitForText("Choose a team to finish setup", TIMEOUT);
     await session.waitForText("› Vercel Labs", TIMEOUT);
+    // The sign-in saved its login before the team choice. While the choice
+    // takes its time, the request waits for it and is not sent on the old
+    // team with that login.
+    const waitingRequests = gateway.requests.length;
+    await Bun.sleep(2_500);
+    expect(gateway.requests).toHaveLength(waitingRequests);
     await session.sendLiteral("other");
     await session.waitForText("› Other Team", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Other Team (other-team).", TIMEOUT);
     await session.waitForText("TEAM_CHANGE_RESPONSE", TIMEOUT);
-    // The waiting request was sent again with the team just picked.
-    const last = gateway.requests[gateway.requests.length - 1]!;
-    expect(last.headers.get("x-vercel-ai-gateway-team")).toBe("team_456");
+    // The waiting request was sent again only with the team just picked.
+    expect(gateway.requests.map((request) => request.headers.get("x-vercel-ai-gateway-team"))).toEqual(["team_123", "team_456"]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   90_000,
