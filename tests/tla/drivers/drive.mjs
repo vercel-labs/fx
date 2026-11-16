@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue|crash] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
@@ -13,6 +13,11 @@
 // with effects; both wait for their intent. Each model response names a new
 // call id, as a model's does, and the driver counts the execution ids the
 // tool ran under.
+//
+// The crash graph is the write graph with one more claim and one freeze: a
+// worker frozen partway through its call is taken over, which cuts that
+// step off as the deadline does, so a call that keeps stopping its worker
+// is cut off until the bound stops it from running again.
 //
 // The leased graph is the send graph with Heartbeat: its agents keep the
 // session in a World that cannot tell whether a holder runs, so each renews
@@ -59,8 +64,8 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
-const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
+const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue", "crash"].includes(arg)) ?? "send";
+const tool = graphName === "cutoff" ? "lookup" : graphName === "crash" ? "write" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
 // The tool as the host declares it, and whether its calls run ahead.
 const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
 const runsAhead = tool === "lookup";

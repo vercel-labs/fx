@@ -15,6 +15,7 @@
 #   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
 #   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun ../drivers/drive.mjs crash    # a write whose worker stops partway, then is cut off
 #   bun ../drivers/drive-intake.mjs   # prompts with images
 #   bun ../drivers/drive-images.mjs   # images stored once, across crashes and reopens
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
@@ -37,7 +38,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir -p graphs
 status=0
-for tool in send lookup write cutoff leased queue; do
+for tool in send lookup write cutoff leased queue crash; do
     echo "== DurableSession ($tool)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/$tool" -dump dot,actionlabels "graphs/$tool" \
@@ -61,10 +62,13 @@ done
 # that intent lands has the model ask again, under a new execution id.
 # WriteRunsAhead breaks OneExecutionId: a write that ran ahead the same way
 # would run under two ids, which is why a write waits for its intent.
+# NoCrashBound breaks RunsBounded: when a takeover from a worker that
+# stopped partway does not count as a cut-off, a call that crashes its
+# worker runs again after every crash.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
-    WriteRunsAhead:OneExecutionId; do
+    WriteRunsAhead:OneExecutionId NoCrashBound:RunsBounded; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
