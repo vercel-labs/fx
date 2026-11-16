@@ -1023,6 +1023,12 @@ const StoryTally = struct {
                     if (record.outcome == .failed) self.other_failures += 1 else self.other_calls += 1;
                     return;
                 }
+                // A request the shell refused ran no command, so it counts
+                // as another call that failed, not as a command.
+                if (shellCallNeverRan(scratch, record)) {
+                    self.other_failures += 1;
+                    return;
+                }
                 const follow_up = isSessionFollowUp(scratch, record);
                 if (!follow_up) {
                     self.commands += 1;
@@ -2701,7 +2707,7 @@ fn writeGroupBlock(
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
-        if (row.ends_turn and !isShellCommandCall(scratch, row.detail.?)) tally.turn_ending_failures += 1;
+        if (row.ends_turn and (!isShellCommandCall(scratch, row.detail.?) or shellCallNeverRan(scratch, row.detail.?))) tally.turn_ending_failures += 1;
     }
     var last_command_row: ?usize = null;
     for (rows.items, 0..) |*row, index| {
@@ -6953,6 +6959,38 @@ test "shell calls that never ran because their request was wrong read as the mod
     defer alloc.free(alone);
     errdefer std.debug.print("alone group:\n{s}\n", .{alone});
     try std.testing.expectEqualStrings("● Couldn't run ls, fx help", std.mem.trim(u8, alone, "\n"));
+
+    // Before another command, the header counts neither a command nor a
+    // failure for it, as for any call the model got wrong.
+    const other = [_]TranscriptEntry{
+        entries[0],
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran printf done\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var other_details = [_]ToolDetailRecord{ details[0], storyCommandDetail(4, "{\"action\":\"run\",\"command\":\"printf done\"}", 0, null) };
+    other_details[1].command_display = @constCast("printf done");
+    const before_other = try groupTextForTest(alloc, &other, &other_details);
+    defer alloc.free(before_other);
+    errdefer std.debug.print("before another command:\n{s}\n", .{before_other});
+    try std.testing.expectEqualStrings("● Ran a command ✓", firstLineForTest(before_other));
+    try std.testing.expect(std.mem.find(u8, before_other, "├ Couldn't run ls, fx help") != null);
+    try std.testing.expect(std.mem.find(u8, before_other, "failed") == null);
+
+    // A refused request the turn ended on still shows under collapse, like
+    // any failure a turn ends on; expanded, its row says it.
+    const last = [_]TranscriptEntry{ other[1], entries[0], other[2] };
+    const last_details = [_]ToolDetailRecord{ other_details[1], details[0] };
+    {
+        var collapsed = try buildWithStyleAndStats(alloc, &last, &last_details, 120, null, true, .{}, .{}, .compact, null, null);
+        defer collapsed.deinit(alloc);
+        const header = collapsed.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("collapsed:\n{s}\n", .{header});
+        try std.testing.expect(std.mem.find(u8, header, "· 1 failed") != null);
+    }
+    const expanded = try groupTextForTest(alloc, &last, &last_details);
+    defer alloc.free(expanded);
+    errdefer std.debug.print("expanded:\n{s}\n", .{expanded});
+    try std.testing.expect(std.mem.find(u8, firstLineForTest(expanded), "failed") == null);
 }
 
 test "repeated runs of one command share a row that keeps the earlier failures" {
