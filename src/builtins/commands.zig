@@ -43,6 +43,11 @@ pub const sessions_options = [_]command_specs.OptionDoc{
 
 pub const sessions_convert_options = [_]command_specs.OptionDoc{json_option};
 
+const sessions_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List saved sessions (default)", .options = &sessions_options },
+    .{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options },
+};
+
 pub const usage_options = [_]command_specs.OptionDoc{
     .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
     json_option,
@@ -374,9 +379,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions --live [--all] [--json] | sessions convert [--json]",
+        .usage = "sessions [ls] [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions [ls] --live [--all] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
-        .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
+        .subcommands = &sessions_subcommands,
         .options = &sessions_options,
         .details = &.{
             "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",
