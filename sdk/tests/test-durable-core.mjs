@@ -405,6 +405,63 @@ if (durabilityKind === "local") {
     await support.close();
     await coding.close();
   });
+
+  // `durability`, with each World's start run through `wrap(start, world)`.
+  const wrappingWorldStart = (durability, wrap) => ({
+    ...durability,
+    async world() {
+      const instance = await durability.world();
+      const start = instance.start.bind(instance);
+      instance.start = () => wrap(start, instance);
+      return instance;
+    },
+  });
+
+  // world-local fails a start that reads its data folder's version file
+  // while another start is writing it.
+  test("agents that start their Worlds on one store at once start them one at a time", async () => {
+    const starts = { count: 0, running: 0, most: 0 };
+    const durability = wrappingWorldStart(await durabilityFor(), async (start) => {
+      starts.count += 1;
+      starts.running += 1;
+      starts.most = Math.max(starts.most, starts.running);
+      try {
+        // A start that takes a while, so starts that overlap show.
+        await sleep(20);
+        return await start();
+      } finally {
+        starts.running -= 1;
+      }
+    });
+    const names = ["support", "coding", "billing", "ops"];
+    const agents = names.map((name) => createTaggedAgent({ durability, name, tag: name }));
+    const results = await Promise.all(agents.map((agent, index) => textOf(agent.session().prompt(`w${index}`))));
+    results.forEach(({ text }, index) => assert.equal(text, `w${index}-0 w${index}-1 w${index}-2`));
+    assert.deepEqual([starts.count, starts.most], [names.length, 1], "each agent started its World, one at a time");
+    for (const agent of agents) await agent.close();
+  });
+
+  test("a World that fails to start leaves the next World on its store free to start", async () => {
+    const failed = [];
+    const durability = wrappingWorldStart(await durabilityFor(), async (start, instance) => {
+      if (failed.length === 0) {
+        failed.push(instance);
+        throw new Error("the data folder is full");
+      }
+      return start();
+    });
+    const agents = ["support", "coding"].map((name) => createTaggedAgent({ durability, name, tag: name }));
+    const results = await Promise.allSettled(agents.map((agent) => agent.newSessionId()));
+    assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+    assert.match(results.find((result) => result.status === "rejected").reason.message, /the data folder is full/);
+    const started = agents[results.findIndex((result) => result.status === "fulfilled")];
+    const { text } = await textOf(started.session().prompt("after"));
+    assert.equal(text, "after-0 after-1 after-2");
+    for (const agent of agents) await agent.close();
+    // No agent holds the World that failed to start. Closing it is best
+    // effort, as libfx's is: under Bun its HTTP agent cannot close.
+    for (const instance of failed) await instance.close().catch(() => {});
+  });
 }
 
 test("an agent's name defaults to default, and a malformed one is refused", async () => {

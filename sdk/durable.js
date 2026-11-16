@@ -945,6 +945,23 @@ function claimName(name, member) {
   }
 }
 
+// The start of the World libfx created last for each store in this process,
+// settled either way. libfx creates a World for each agent, and a World's
+// start may set up its store, which two starts at once can break:
+// world-local creates its data folder's version file and then writes it, so
+// a start that reads it between the two finds it empty and fails. Each start
+// waits for the one before it on its store.
+const worldStarts = new Map();
+function startInTurn(store, start) {
+  const started = (worldStarts.get(store) ?? Promise.resolve()).then(start);
+  const settled = started.then(() => {}, () => {});
+  worldStarts.set(store, settled);
+  void settled.then(() => {
+    if (worldStarts.get(store) === settled) worldStarts.delete(store);
+  });
+  return started;
+}
+
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
@@ -1054,7 +1071,7 @@ function createWorldBackend(world, durability) {
       else liveHolders.delete(holder);
     },
     async start() {
-      if (owned) await world.start?.();
+      if (owned && typeof world.start === "function") await startInTurn(store, () => world.start());
       if (typeof world.getRuntimeDeadline === "function") {
         backend.deadline = () => backend.runtimeDeadline ?? null;
       }
