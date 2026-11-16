@@ -6,8 +6,9 @@
 //! The lab plays `Runtime.wait`'s part and knows nothing about the model: it
 //! keeps one command's start, last output, and exit, opens and polls one wait
 //! at the times the driver names, and reports what the module decided. Like
-//! `Runtime.wait`, it ends a wait on a finished command before it asks the
-//! module.
+//! `Runtime.waitOrYield`, it ends a wait on a finished command before it asks
+//! the module, and while a request holds the wait (`yield_hold`) it keeps the
+//! module's new arm but not its end.
 const std = @import("std");
 const quiet_notice = @import("quiet_notice");
 
@@ -34,6 +35,7 @@ const Lab = struct {
     started_ms: i64 = 0,
     last_output_ms: i64 = 0,
     running: bool = true,
+    held: bool = false,
     wait: ?quiet_notice.Wait = null,
 };
 
@@ -49,6 +51,12 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         lab.last_output_ms = op.now;
     } else if (is(op.op, "finish")) {
         lab.running = false;
+    } else if (is(op.op, "hold")) {
+        if (lab.held) result.@"error" = "already held";
+        lab.held = true;
+    } else if (is(op.op, "release")) {
+        if (!lab.held) result.@"error" = "not held";
+        lab.held = false;
     } else if (is(op.op, "begin")) {
         if (lab.wait != null) result.@"error" = "a wait is already open";
         lab.wait = quiet_notice.beginWait(op.now, lab.last_output_ms, op.ceiling, lab.limit_ms);
@@ -65,7 +73,9 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
             const step = quiet_notice.poll(wait, op.now, lab.last_output_ms, lab.limit_ms);
             armed = step.wait.armed;
             lab.wait = step.wait;
-            if (step.end) |reason| end = @tagName(reason);
+            if (step.end) |reason| {
+                if (!lab.held) end = @tagName(reason);
+            }
         }
         if (end) |reason| {
             lab.wait = null;

@@ -4144,11 +4144,13 @@ describe("fx mcp call", () => {
     let started = "";
     let paused = "";
     let followed = "";
+    // The run serves the first call, then returns at its 1 s yield while the
+    // command still runs.
+    const first = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"first"}' > first.txt`;
     gateway = startFakeGateway([
-      // The call returns at once, while the command still runs.
-      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `sleep 1; ${command}`, yield_time_ms: 0 }),
-      // The command's call arrives while another command runs, so no shell
-      // call follows its own command: it waits.
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `${first}; sleep 2; ${command}`, yield_time_ms: 1_000 }),
+      // The second call arrives while another command runs, so no shell call
+      // follows its own command: it waits.
       (body: string) => {
         started = toolResultText(body, "run_call");
         return fakeGatewayToolCall("pause_call", "shell", { action: "run", command: "sleep 3; echo paused" });
@@ -4172,12 +4174,17 @@ describe("fx mcp call", () => {
     });
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).output).toContain("BRIDGE_FOLLOWED");
-    expect((JSON.parse(started) as { state: string }).state).toBe("running");
+    const run = JSON.parse(started) as { state: string; mcp_call_notice?: string };
+    expect(run.state).toBe("running");
+    // The command has used fx mcp call, so the result says to follow it.
+    expect(run.mcp_call_notice).toContain("use interact with this session_id");
+    expect(readFileSync(join(root.workspace, "first.txt"), "utf8").trimEnd().endsWith("BRIDGE_TAIL:first")).toBe(true);
     expect(paused).toContain("paused");
     expect(followed).toContain("exit=0");
     expect(followed).toContain("BRIDGE_TAIL:hello");
+    expect(followed).not.toContain("mcp_call_notice");
     expect(readFileSync(join(root.workspace, "out.txt"), "utf8").length).toBeGreaterThan(1536 * 1024);
-    expect(toolCalls(root)).toHaveLength(1);
+    expect(toolCalls(root)).toHaveLength(2);
   }, 60_000);
 
   test("fx exits while a command's call waits for a shell call to follow it, and the call never runs", async () => {

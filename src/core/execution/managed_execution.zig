@@ -1001,7 +1001,8 @@ pub const Runtime = struct {
     /// `wait`, which also returns the command running once `tool_yield_flag`
     /// is set and `steerYieldDue` passes, so steering need not wait for it.
     /// While `yield_hold` is above zero, it neither yields nor ends at its
-    /// ceiling or the quiet limit (`StartCapturedInput.yield_hold`).
+    /// ceiling or the quiet limit (`StartCapturedInput.yield_hold`;
+    /// `tests/tla/managed_execution/QuietWait.tla` HeldWaitStaysOpen).
     pub fn waitOrYield(
         self: *Runtime,
         alloc: Allocator,
@@ -2173,6 +2174,110 @@ test "steering yield returns a captured command running and keeps it running" {
     }
     try std.testing.expect(std.mem.find(u8, completed.snapshot.output_delta, "done") != null);
     try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "a held wait yields neither for steering nor at its ceiling, and returns once the hold drops" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var hold = std.atomic.Value(u32).init(1);
+    var input = StartCapturedInput{
+        .execution_id = "managed-held-wait",
+        .command = "sleep 5; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    // A request of the command is in progress past the wait's 100 ms ceiling
+    // and the steering grace, as when an `interact` serves its `fx mcp call`.
+    const Release = struct {
+        const after_ms = 600;
+
+        fn run(value: *std.atomic.Value(u32)) void {
+            io_mod.sleep(after_ms * std.time.ns_per_ms);
+            value.store(0, .release);
+        }
+    };
+    const hold_ms = Release.after_ms;
+    const began_ms = io_mod.milliTimestamp();
+    const releaser = try std.Thread.spawn(.{}, Release.run, .{&hold});
+    var held = runtime.waitOrYield(alloc, input.execution_id, 100, null, &yield_flag, &hold) catch |err| {
+        releaser.join();
+        return err;
+    };
+    releaser.join();
+    defer held.deinit(alloc);
+    const waited_ms = io_mod.milliTimestamp() - began_ms;
+    try std.testing.expect(waited_ms >= hold_ms);
+    try std.testing.expect(waited_ms < 4_000);
+    try std.testing.expectEqual(SnapshotState.running, held.snapshot.state);
+    try runtime.commitDelivery(held.snapshot.execution_id, held.reservation_id);
+}
+
+test "a command sends its end notice once it ends, and an input that starts none sends it at once" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    const Notices = struct {
+        var count: std.atomic.Value(u32) = .init(0);
+        var last: std.atomic.Value(u64) = .init(0);
+
+        fn notify(id: u64) void {
+            last.store(id, .release);
+            _ = count.fetchAdd(1, .acq_rel);
+        }
+    };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var input = StartCapturedInput{
+        .execution_id = "managed-end-notice",
+        .command = "printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .end_notice = .{ .id = 7, .notify = Notices.notify },
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    switch (started.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    // The worker sends it after the state is terminal, so it can trail the
+    // result by a moment.
+    var waited: u32 = 0;
+    while (Notices.count.load(.acquire) == 0) : (waited += 1) {
+        if (waited > 400) return error.TestTimedOut;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(u64, 7), Notices.last.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), Notices.count.load(.acquire));
+
+    // An input refused before it starts a command sends its notice at once.
+    var refused = input;
+    refused.execution_id = "managed-end-notice-refused";
+    refused.yield_time_ms = contract.max_yield_time_ms + 1;
+    refused.end_notice = .{ .id = 8, .notify = Notices.notify };
+    try std.testing.expectError(error.InvalidYieldTime, runtime.startCaptured(alloc, refused));
+    try std.testing.expectEqual(@as(u64, 8), Notices.last.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), Notices.count.load(.acquire));
 }
 
 test "a command that ends inside the steering grace returns its result" {
