@@ -784,19 +784,19 @@ test "provider picker loading preserves query and selection instead of exposing 
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
     app.auth.inventory_refresh_active = true;
-    try app.input_runtime.textReplacementState().replace(alloc, "/provider co");
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider dex");
     app.input_runtime.picker.provider_column_index = 2;
 
-    const pending = columnFor(&app, .provider, "co");
+    const pending = columnFor(&app, .provider, "dex");
     try std.testing.expectEqual(@as(usize, 1), pending.count);
     try std.testing.expectEqualStrings("checking credentials...", pending.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);
     Runtime(ColumnTestApp).navigate(&app, 1);
-    try std.testing.expectEqualStrings("/provider co", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/provider dex", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.provider_column_index);
 
     app.auth.inventory_refresh_active = false;
-    const ready = columnFor(&app, .provider, "co");
+    const ready = columnFor(&app, .provider, "dex");
     try std.testing.expectEqual(@as(usize, 1), ready.count);
     try std.testing.expectEqualStrings("codex", ready.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);

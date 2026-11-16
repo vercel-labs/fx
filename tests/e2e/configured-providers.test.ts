@@ -258,13 +258,13 @@ describe("configured providers", () => {
       expect(selection.code).toBe(2);
       expect(selection.stdout).toBe("");
       expect(selection.stderr).toBe(
-        'fx provider: unknown provider remte; expected gateway, codex, grok, or a name under "providers" in ~/.fx/settings.json\n',
+        'fx provider: unknown provider remte; expected gateway, codex, grok, claude-code, or a name under "providers" in ~/.fx/settings.json\n',
       );
       // fx ask --provider names it the same way.
       const ask = await runFx(["ask", "--provider", "remte", "hi"], { cwd: f.workspace, env: f.env });
       expect(ask.code).toBe(2);
       expect(ask.stderr).toBe(
-        'fx ask: unknown provider remte; expected gateway, codex, grok, or a name under "providers" in ~/.fx/settings.json\n',
+        'fx ask: unknown provider remte; expected gateway, codex, grok, claude-code, or a name under "providers" in ~/.fx/settings.json\n',
       );
       expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
       expect(f.requests).toHaveLength(0);

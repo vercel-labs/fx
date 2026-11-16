@@ -364,7 +364,7 @@ pub fn selectProviderModel(
 /// under "providers". `fx provider` and `fx ask --provider` both print it.
 pub fn unknownProviderMessage(alloc: Allocator, name: []const u8) ![]u8 {
     return alloc.print(
-        "unknown provider {s}; expected gateway, codex, grok, or a name under \"providers\" in {s}",
+        "unknown provider {s}; expected gateway, codex, grok, claude-code, or a name under \"providers\" in {s}",
         .{ name, profile_paths.displayText("~/.fx/settings.json") },
     );
 }

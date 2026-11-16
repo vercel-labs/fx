@@ -190,7 +190,7 @@ pub const mcp_approve_options = [_]command_specs.OptionDoc{
 
 const permission_modes = [_][]const u8{ "ask", "auto", "full-access" };
 /// The built-in providers. A configured connection's name is also accepted.
-const builtin_providers = [_][]const u8{ "gateway", "codex", "grok" };
+const builtin_providers = [_][]const u8{ "gateway", "codex", "grok", "claude-code" };
 
 /// Whether a command takes the gateway provider-order flags.
 const ProviderOrder = enum { with_provider_order, without_provider_order };
@@ -207,7 +207,7 @@ fn agentRunOptions(comptime scope: []const u8, comptime provider_order: Provider
         .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
         .{ .flag = "--full-access", .description = "Disable fx permission checks" },
         .{ .flag = "--yolo", .description = "Alias for --full-access" },
-        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " (gateway, codex, grok, or a configured name)", .values = &builtin_providers },
+        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " (gateway, codex, grok, claude-code, or a configured name)", .values = &builtin_providers },
         .{ .flag = "--model <id>", .description = "Override the model for " ++ scope },
         .{ .flag = "--effort <level>", .description = "Override the reasoning effort for " ++ scope },
         .{ .flag = "--fast", .description = "Enable Fast mode for " ++ scope ++ " when the model supports it" },
@@ -356,6 +356,9 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "provider",
         .usage = "provider <name>",
         .summary = "Choose the model provider used by fx",
+        .details = &.{
+            "claude-code runs the conversation on your Claude subscription through your installed Claude Code (`claude`). fx keeps its own tools, permissions, and sessions; Claude Code supplies the model and its own sign-in. Install Claude Code and sign in with `claude` and /login first: fx never signs in to Claude.",
+        },
     },
     .{
         .kind = .doctor,
@@ -606,7 +609,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--provider <name>",
-        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+        .description = "Override the model provider for an interactive session (gateway, codex, grok, claude-code, or a configured name)",
     },
     .{
         .usage = "--provider-order <a,b,...>",

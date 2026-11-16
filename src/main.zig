@@ -3880,6 +3880,7 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
     io_mod.reserveClosedStandardStreams();
+    app_lifecycle.close_hook = claude_code.stopAll;
     defer claude_code.stopAll();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;

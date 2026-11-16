@@ -420,7 +420,7 @@ Options:
   --auto                      Automatically review unresolved permission requests
   --full-access               Disable fx permission checks
   --yolo                      Alias for --full-access
-  --provider <name>           Override the model provider for this request (gateway, codex, grok, or a configured name)
+  --provider <name>           Override the model provider for this request (gateway, codex, grok, claude-code, or a configured name)
   --model <id>                Override the model for this request
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it

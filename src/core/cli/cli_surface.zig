@@ -1854,7 +1854,7 @@ fn runNonInteractiveWithDeps(
                 return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, claude-code, or a configured name\n");
                 return usage_failure;
             };
             const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null) catch |err| switch (err) {
@@ -1917,6 +1917,18 @@ fn runNonInteractiveWithDeps(
             const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
             defer if (fx_home) |path| alloc.free(path);
             snapshot.fx_home = fx_home;
+            var claude_status: claude_code.Status = .{};
+            defer claude_status.deinit(alloc);
+            if (startup.provider == .claude_code) {
+                claude_status = try claude_code.probeStatus(alloc);
+                snapshot.claude_code = .{
+                    .installed = claude_status.installed,
+                    .version = claude_status.version,
+                    .signed_in = claude_status.signed_in,
+                    .auth_method = claude_status.auth_method,
+                    .subscription = claude_status.subscription,
+                };
+            }
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -4132,7 +4144,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.InvalidProfileName => "--profile names use lowercase letters, digits, '-', or '_'",
         error.InvalidInstancesValue => "--instances takes a whole number of at least 1",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
-        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
+        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, claude-code, or a configured provider name",
         error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",
         error.InvalidPermissionModeValue => "--permission-mode accepts ask, auto, or full-access",
         error.InvalidToolPlacementOverride => "--tool-placement takes <tool>=toolbox or <tool>=direct",
@@ -4471,6 +4483,9 @@ const DoctorProbes = struct {
             debug_trace.logf("doctor", "provider check skipped: startup state failed err={s}", .{@errorName(err)});
             return;
         };
+        // Claude Code's model list is built in, so fetching it confirms
+        // nothing; the local auth check asks `claude` itself instead.
+        if (startup.provider == .claude_code) return;
         var available = cfg.provider_set;
         available.definitions = startup.configured_providers.definitions;
         const catalog = available.select(startup.provider).cli_model_catalog orelse return;

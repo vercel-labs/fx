@@ -902,6 +902,18 @@ pub const StatusSnapshot = struct {
     agent_step_limit: usize,
     /// Requested Ultrafast mode. The serving provider may still fall back.
     ultrafast_requested: bool = false,
+    /// What the `claude` binary reports, when Claude Code is the provider.
+    claude_code: ?ClaudeCodeStatus = null,
+
+    /// Claude Code's own state, as `claude --version` and `claude auth
+    /// status` print it. Borrowed.
+    pub const ClaudeCodeStatus = struct {
+        installed: bool,
+        version: ?[]const u8 = null,
+        signed_in: ?bool = null,
+        auth_method: ?[]const u8 = null,
+        subscription: ?[]const u8 = null,
+    };
 
     pub const SessionModes = struct {
         current: []const u8,
@@ -1035,6 +1047,25 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
         try out.writer.print("[status] ultrafast_requested={}\n", .{self.ultrafast_requested});
+        if (self.claude_code) |claude| {
+            try out.writer.print("[status] claude_code_installed={}\n", .{claude.installed});
+            if (claude.version) |version| {
+                try out.writer.writeAll("[status] claude_code_version=");
+                try writeTerminalSafe(&out.writer, alloc, version);
+                try out.writer.writeByte('\n');
+            }
+            if (claude.signed_in) |signed_in| try out.writer.print("[status] claude_code_signed_in={}\n", .{signed_in});
+            if (claude.auth_method) |method| {
+                try out.writer.writeAll("[status] claude_code_auth=");
+                try writeTerminalSafe(&out.writer, alloc, method);
+                try out.writer.writeByte('\n');
+            }
+            if (claude.subscription) |plan| {
+                try out.writer.writeAll("[status] claude_code_plan=");
+                try writeTerminalSafe(&out.writer, alloc, plan);
+                try out.writer.writeByte('\n');
+            }
+        }
         if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "status");
         return try out.toOwnedSlice();
     }
@@ -1162,6 +1193,10 @@ pub const StatusSnapshot = struct {
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
         try writer.print(",\"ultrafast_requested\":{}", .{self.ultrafast_requested});
+        if (self.claude_code) |claude| {
+            try writer.writeAll(",\"claude_code\":");
+            try std.json.Stringify.value(claude, .{ .emit_null_optional_fields = false }, writer);
+        }
         if (self.mcp) |mcp| {
             try writer.writeAll(",\"mcp\":");
             try mcp.writeJson(writer);

@@ -92,6 +92,12 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 /// thread, the handler restores and re-raises itself. A terminal that hangs
 /// up closes fx the same way (`closeOnHangup`).
 var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+
+/// Runs when a signal or a hang-up closes fx, interactive or `fx ask`,
+/// outside signal context, just before fx ends: for cleanup that the usual exit path would have done,
+/// such as stopping the processes a provider started. The composition root
+/// sets it at startup.
+pub var close_hook: ?*const fn () void = null;
 var close_signal: std.atomic.Value(i32) = .init(0);
 var closer_tmux = false;
 var closer_started = false;
@@ -114,6 +120,7 @@ fn closerMain() void {
     const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
     const saved = request_recovery.RequestRecovery.closeActive();
     debug_trace.logf("app", "event=closing signal={d} records_saved={d}", .{ close_signal.load(.seq_cst), saved });
+    if (close_hook) |hook| hook();
     if (closer_tmux) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
     } else {
@@ -132,6 +139,7 @@ pub fn closeOnHangup(turn_running: bool) void {
     if (!turn_running) return;
     const saved = request_recovery.RequestRecovery.closeActive();
     debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turn=left_open", .{saved});
+    if (close_hook) |hook| hook();
     if (io_mod.getenv("TMUX") != null) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);
     } else {

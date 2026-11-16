@@ -84,18 +84,20 @@ fn effortFor(options: anytype) ?[]const u8 {
 fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     if (!acceptsCredential(request.credential)) return stream_provider.failResult(error.ClaudeCodeCredentialRequired);
-    if (request.response_format != null or request.vision_mode == .required) {
-        return unsupported(alloc, "Claude Code can't read images through fx yet.");
-    }
+    if (request.vision_mode == .required) return unsupported(alloc, request, "Claude Code can't read images through fx yet.");
+    if (request.response_format != null) return unsupported(alloc, request, "Claude Code can't answer in a set format through fx yet.");
     return switch (request.purpose) {
         .agent => session_runtime.agentStep(alloc, .{ .request = request, .effort = effortFor(request.provider_options) }),
         .title, .compaction => oneShotStep(alloc, request),
-        .vision => unsupported(alloc, "Claude Code can't read images through fx yet."),
-        .permission_review, .auxiliary => unsupported(alloc, "This request isn't sent through Claude Code."),
+        .vision => unsupported(alloc, request, "Claude Code can't read images through fx yet."),
+        .permission_review, .auxiliary => unsupported(alloc, request, "This request isn't sent through Claude Code."),
     };
 }
 
-fn unsupported(alloc: Allocator, text: []const u8) !stream_provider.Result {
+/// A request this provider refuses. fx accepts a failed result only from an
+/// admitted request; nothing is sent, so delivery stays unsent.
+fn unsupported(alloc: Allocator, request: stream_provider.ModelRequest, text: []const u8) !stream_provider.Result {
+    try request.admission.admit();
     return .{ .failed = .{ .kind = .invalid_request, .detail = try alloc.dupe(u8, text), .ownership = .owned } };
 }
 
@@ -407,7 +409,7 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) bool {
 
 pub const Status = struct {
     installed: bool = false,
-    /// `claude --version`, trimmed.
+    /// The version number from `claude --version`.
     version: ?[]u8 = null,
     signed_in: ?bool = null,
     /// How Claude Code signs in, such as `claude.ai` for a subscription.
@@ -436,8 +438,10 @@ pub fn probeStatus(alloc: Allocator) !Status {
     };
     defer alloc.free(version.stdout);
     status.installed = true;
+    // `claude --version` prints "2.1.325 (Claude Code)"; keep the number.
     const trimmed = std.mem.trim(u8, version.stdout, " \t\r\n");
-    if (trimmed.len > 0) status.version = try alloc.dupe(u8, trimmed);
+    const number = trimmed[0 .. std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len];
+    if (number.len > 0) status.version = try alloc.dupe(u8, number);
 
     const auth = runClaude(alloc, &.{ "claude", "auth", "status", "--json" }) catch |err| switch (err) {
         error.OutOfMemory => return err,

@@ -68,26 +68,59 @@ const registry = struct {
     /// Processes started and not yet stopped, so a program that never
     /// started one exits without touching the registry.
     var live: std.atomic.Value(usize) = .init(0);
+    /// Every live process's private directory, so an exit that cannot wait
+    /// for a step to end still removes it. The processes own the paths.
+    var dirs: std.ArrayList([]const u8) = .empty;
 };
 
-/// Stops every `claude` process this fx started and removes their private
-/// directories. For a program about to exit; safe from any thread. A
-/// process whose session is mid-step gets SIGTERM and is left to exit.
-pub fn stopAll() void {
-    if (registry.live.load(.acquire) == 0) return;
+fn trackDir(path: []const u8) !void {
     const io = io_mod.getIo();
     registry.mutex.lockUncancelable(io);
-    registry.exiting = true;
-    const list = registry.sessions.items;
-    registry.mutex.unlock(io);
-    for (list) |session| {
-        if (session.proc) |proc| proc.signal(.TERM);
+    defer registry.mutex.unlock(io);
+    try registry.dirs.append(gpa, path);
+}
+
+fn untrackDir(path: []const u8) void {
+    const io = io_mod.getIo();
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    for (registry.dirs.items, 0..) |item, index| {
+        if (item.ptr == path.ptr) {
+            _ = registry.dirs.swapRemove(index);
+            return;
+        }
     }
-    for (list) |session| {
+}
+
+/// Stops every `claude` process this fx started and removes their private
+/// directories. For a program about to exit, outside signal context; safe
+/// from any thread. A process whose session is mid-step gets SIGTERM and is
+/// left to exit, and its directory is removed under it.
+pub fn stopAll() void {
+    const live = registry.live.load(.acquire);
+    if (live == 0) return;
+    debug_trace.logf("claude-code", "stop all live={d}", .{live});
+    const io = io_mod.getIo();
+    var sessions: []*Session = &.{};
+    {
+        registry.mutex.lockUncancelable(io);
+        defer registry.mutex.unlock(io);
+        // A step that starts a process after this sees `exiting` and stops it.
+        registry.exiting = true;
+        for (registry.sessions.items) |session| {
+            if (session.proc) |proc| proc.signal(.TERM);
+        }
+        sessions = gpa.dupe(*Session, registry.sessions.items) catch &.{};
+    }
+    defer gpa.free(sessions);
+    for (sessions) |session| {
         if (!session.step_lock.tryLock()) continue;
         defer session.step_lock.unlock(io);
         session.stopProcess();
     }
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    for (registry.dirs.items) |path| std.Io.Dir.cwd().deleteTree(io, path) catch {};
 }
 
 fn acquire(key: []const u8) !*Session {
@@ -97,21 +130,24 @@ fn acquire(key: []const u8) !*Session {
     for (registry.sessions.items) |session| {
         if (std.mem.eql(u8, session.key, key)) found = session;
     }
-    if (found == null) {
-        const session = try gpa.create(Session);
-        errdefer gpa.destroy(session);
-        session.* = .{ .key = try gpa.dupe(u8, key) };
-        registry.sessions.append(gpa, session) catch |err| {
-            gpa.free(session.key);
-            registry.mutex.unlock(io);
-            return err;
-        };
-        found = session;
-    }
+    if (found == null) found = addSession(key) catch |err| {
+        registry.mutex.unlock(io);
+        return err;
+    };
     registry.mutex.unlock(io);
     const session = found.?;
     session.step_lock.lockUncancelable(io);
     session.last_used_ms = io_mod.milliTimestamp();
+    return session;
+}
+
+/// A new session in the registry. The caller holds the registry lock.
+fn addSession(key: []const u8) !*Session {
+    const session = try gpa.create(Session);
+    errdefer gpa.destroy(session);
+    session.* = .{ .key = try gpa.dupe(u8, key) };
+    errdefer gpa.free(session.key);
+    try registry.sessions.append(gpa, session);
     return session;
 }
 
@@ -183,6 +219,8 @@ const Answer = struct {
 };
 
 pub const Launch = struct {
+    /// The Claude Code program; tests name a fake one.
+    program: []const u8 = "claude",
     model: []const u8,
     effort: ?[]const u8 = null,
     system_prompt: []const u8,
@@ -323,6 +361,7 @@ const Proc = struct {
     /// Stops the process and everything it started, and frees `self`.
     fn destroy(self: *Proc) void {
         const io = io_mod.getIo();
+        debug_trace.logf("claude-code", "stopping claude pid={d}", .{self.pid});
         self.stop.store(true, .release);
         if (self.stdin) |file| file.close(io);
         self.stdin = null;
@@ -353,9 +392,11 @@ const Proc = struct {
             gpa.free(path);
         }
         if (self.dir_path) |path| {
-            std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            untrackDir(path);
+            std.Io.Dir.cwd().deleteTree(io, path) catch |err| debug_trace.logf("claude-code", "private directory not removed err={s}", .{@errorName(err)});
             gpa.free(path);
         }
+        debug_trace.logf("claude-code", "stopped claude pid={d}", .{self.pid});
         for (self.queue.items) |item| item.deinit();
         self.queue.deinit(gpa);
         if (self.tools_json) |json| gpa.free(json);
@@ -518,6 +559,7 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
     errdefer if (!started) {
         if (proc.listener) |*listener| listener.deinit(io);
         if (proc.dir_path) |path| {
+            untrackDir(path);
             std.Io.Dir.cwd().deleteTree(io, path) catch {};
             gpa.free(path);
         }
@@ -534,13 +576,14 @@ fn startProcess(alloc: Allocator, launch: Launch) StartError!*Proc {
     const base = if (tmp.len + 40 < 100) tmp else "/tmp";
     proc.dir_path = try gpa.print("{s}/fx-cc-{s}", .{ base, &hex });
     try std.Io.Dir.cwd().createDir(io, proc.dir_path.?, .fromMode(0o700));
+    try trackDir(proc.dir_path.?);
 
     const prompt_path = try alloc.print("{s}/system-prompt.md", .{proc.dir_path.?});
     try writePrivateFile(prompt_path, launch.system_prompt);
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(alloc, &.{
-        "claude",               "-p",
+        launch.program,         "-p",
         "--input-format",       "stream-json",
         "--output-format",      "stream-json",
         "--verbose",            "--include-partial-messages",
@@ -731,6 +774,8 @@ const Session = struct {
 pub const StepInput = struct {
     request: stream_provider.ModelRequest,
     effort: ?[]const u8,
+    /// The Claude Code program; tests name a fake one.
+    program: []const u8 = "claude",
 };
 
 /// One model step for an fx session's conversation.
@@ -766,13 +811,14 @@ pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Re
         if (session.pending.items.len == 0) {
             session.stopProcess();
             session.proc = startProcess(arena, .{
+                .program = input.program,
                 .model = request.model,
                 .effort = input.effort,
                 .system_prompt = system_prompt,
                 .session_id = session.session_id,
                 .resume_session = true,
                 .tools_json = tools_out.written(),
-            }) catch |err| return startFailure(alloc, err);
+            }) catch |err| return startFailure(alloc, request.admission, err);
             session.config_hash = config_hash;
         }
     }
@@ -784,13 +830,14 @@ pub fn agentStep(alloc: Allocator, input: StepInput) anyerror!stream_provider.Re
         var start = startPlan(arena, request.messages, request_units, session.failed_resume);
         session.session_id = start.session_id;
         session.proc = startProcess(arena, .{
+            .program = input.program,
             .model = request.model,
             .effort = input.effort,
             .system_prompt = system_prompt,
             .session_id = start.session_id,
             .resume_session = start.resumed,
             .tools_json = tools_out.written(),
-        }) catch |err| return startFailure(alloc, err);
+        }) catch |err| return startFailure(alloc, request.admission, err);
         session.config_hash = config_hash;
         session.resume_unconfirmed = start.resumed;
         try session.setSeen(request_units[0..start.seen]);
@@ -1100,8 +1147,11 @@ fn turnFailure(alloc: Allocator, session: *Session, class: wire.FailureClass, te
     // The process's transcript now ends in a failed turn; the next request
     // starts from fx's history.
     session.stopProcess();
+    // fx shows no detail for an unauthorized failure, and its sign-in
+    // repair is for fx's own logins, so signing out reports as forbidden,
+    // which keeps the message that says to sign in to Claude Code.
     const kind: stream_provider.FailureKind = switch (class) {
-        .not_signed_in => .unauthorized,
+        .not_signed_in => .forbidden,
         .usage_limit => .quota_exhausted,
         .billing => .forbidden,
         .invalid_request => .invalid_request,
@@ -1122,12 +1172,17 @@ fn processFailure(alloc: Allocator, session: *Session, text: []const u8) !stream
     return .{ .failed = .{ .kind = .provider_error, .detail = detail, .ownership = .owned } };
 }
 
-fn startFailure(alloc: Allocator, err: anyerror) !stream_provider.Result {
+/// A failed start as a failure result. The agent path admits the request
+/// first, since fx accepts a failed result only from an admitted request;
+/// nothing was sent, so delivery stays unsent.
+fn startFailure(alloc: Allocator, admission: ?stream_provider.Admission, err: anyerror) !stream_provider.Result {
     if (err == error.OutOfMemory or err == error.Canceled) return err;
-    const detail = if (err == error.ClaudeNotInstalled)
-        try alloc.dupe(u8, not_installed_message)
-    else
-        try alloc.print("Claude Code could not start: {s}", .{@errorName(err)});
+    if (admission) |value| try value.admit();
+    if (err == error.ClaudeNotInstalled) {
+        // Retrying can't install it, so the failure is final.
+        return .{ .failed = .{ .kind = .forbidden, .detail = try alloc.dupe(u8, not_installed_message), .ownership = .owned } };
+    }
+    const detail = try alloc.print("Claude Code could not start: {s}", .{@errorName(err)});
     return .{ .failed = .{ .kind = .unavailable, .detail = detail, .ownership = .owned } };
 }
 
@@ -1157,6 +1212,8 @@ fn configHash(model: []const u8, effort: ?[]const u8, system_prompt: []const u8)
 // One-shot calls
 
 pub const OneShot = struct {
+    /// The Claude Code program; tests name a fake one.
+    program: []const u8 = "claude",
     model: []const u8,
     system_prompt: []const u8,
     prompt: []const u8,
@@ -1181,6 +1238,7 @@ pub fn oneShot(alloc: Allocator, input: OneShot) anyerror!OneShotReply {
     var id_bytes: [16]u8 = undefined;
     io_mod.getIo().random(&id_bytes);
     const proc = startProcess(arena, .{
+        .program = input.program,
         .model = input.model,
         .system_prompt = input.system_prompt,
         .session_id = wire.formatSessionId(id_bytes),
@@ -1189,7 +1247,7 @@ pub fn oneShot(alloc: Allocator, input: OneShot) anyerror!OneShotReply {
         .one_shot = true,
         .json_schema = input.json_schema,
     }) catch |err| {
-        const failure = try startFailure(alloc, err);
+        const failure = try startFailure(alloc, null, err);
         return .{ .failed = failure.failed };
     };
     defer proc.destroy();
@@ -1287,4 +1345,220 @@ test "claude code: a start resumes the latest reply whose history still matches"
     const rewritten_units = try wire.units(arena, &rewritten);
     try std.testing.expect(!startPlan(arena, &rewritten, rewritten_units, null).resumed);
     try std.testing.expect(!startPlan(arena, &messages, request_units, id).resumed);
+}
+
+/// A fake `claude` for the tests below: it reads fx's first message, prints
+/// `events` as its stream-json output, then waits for its input to close
+/// like the real one.
+const FakeClaude = struct {
+    tmp: std.testing.TmpDir,
+    program: []u8,
+    cancel_flag: std.atomic.Value(bool) = .init(false),
+    delivery: stream_provider.DeliveryCertainty = .init(),
+    attempt: stream_provider.AttemptEvidence = .{},
+    admitted: usize = 0,
+    deltas: usize = 0,
+
+    fn init(fake: *FakeClaude, events: []const u8) !void {
+        const io = std.testing.io;
+        fake.* = .{ .tmp = std.testing.tmpDir(.{}), .program = undefined };
+        errdefer fake.tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(std.testing.allocator, fake.tmp.dir, ".");
+        defer std.testing.allocator.free(root);
+        {
+            var file = try fake.tmp.dir.createFile(io, "events.jsonl", .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, events);
+        }
+        const script = try std.testing.allocator.print("#!/bin/sh\nread -r line\ncat '{s}/events.jsonl'\ncat >/dev/null\n", .{root});
+        defer std.testing.allocator.free(script);
+        {
+            var file = try fake.tmp.dir.createFile(io, "claude", .{ .permissions = .fromMode(0o755) });
+            defer file.close(io);
+            try file.writeStreamingAll(io, script);
+        }
+        fake.program = try std.testing.allocator.print("{s}/claude", .{root});
+    }
+
+    fn deinit(fake: *FakeClaude) void {
+        std.testing.allocator.free(fake.program);
+        fake.tmp.cleanup();
+    }
+
+    fn request(fake: *FakeClaude, session_id: []const u8, messages: []const types.ChatMessage, tools: stream_provider.ToolSelection) stream_provider.ModelRequest {
+        return .{
+            .credential = .{ .direct = .{ .source = .claude_code } },
+            .session_id = session_id,
+            .model = "claude-haiku-5-5",
+            .retry_count = 0,
+            .messages = messages,
+            .tools = tools,
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &fake.delivery,
+            .attempt_evidence = &fake.attempt,
+            .events = .{ .context = fake, .emit_fn = emit },
+            .admission = .{ .context = fake, .admit_fn = admit },
+            .cancel_flag = &fake.cancel_flag,
+        };
+    }
+
+    fn emit(context: *anyopaque, event: stream_provider.Event) void {
+        const fake: *FakeClaude = @ptrCast(@alignCast(context));
+        if (event == .content_delta) fake.deltas += 1;
+    }
+
+    fn admit(context: *anyopaque) !void {
+        const fake: *FakeClaude = @ptrCast(@alignCast(context));
+        fake.admitted += 1;
+    }
+
+    /// Stops the session's process, as fx's exit would.
+    fn stop(session_id: []const u8) !void {
+        const session = try acquire(session_id);
+        defer release(session);
+        session.stopProcess();
+    }
+};
+
+const fake_session = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
+test "claude code: a step streams the reply and saves the Claude session for resume" {
+    const events =
+        \\{"type":"system","subtype":"init","session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"}
+        \\{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":3,"cache_read_input_tokens":10,"output_tokens":1}}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there."}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}
+        \\{"type":"result","subtype":"success","is_error":false,"result":"Hello there.","stop_reason":"end_turn","session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.init(events);
+    defer fake.deinit();
+    const key = "claude-code-test-text";
+    defer FakeClaude.stop(key) catch {};
+
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Say hello." }};
+    var result = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &messages, .{}), .effort = null, .program = fake.program });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.admitted);
+    try std.testing.expectEqual(@as(usize, 2), fake.deltas);
+    try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.possibly_sent, fake.delivery.load());
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings("Hello there.", completion.content.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason);
+    var replay_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer replay_arena.deinit();
+    const replay = wire.parseReplay(replay_arena.allocator(), completion.provider_state_json.?);
+    try std.testing.expectEqualStrings(fake_session, replay.?.session_id);
+    try std.testing.expectEqual(@as(usize, 1), replay.?.units);
+}
+
+test "claude code: a step returns every tool call the reply makes, with fx's tool names" {
+    const events =
+        \\{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":3}}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_a","name":"mcp__fx__read_file","input":{}}},"parent_tool_use_id":null}
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"mcp__fx__read_file","input":{"path":"a.txt"}}]},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_b","name":"mcp__fx__read_file","input":{}}},"parent_tool_use_id":null}
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b","name":"mcp__fx__read_file","input":{"path":"b.txt"}}]},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}},"parent_tool_use_id":null}
+        \\{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.init(events);
+    defer fake.deinit();
+    const key = "claude-code-test-tools";
+    defer FakeClaude.stop(key) catch {};
+
+    const functions = [_]@import("../core/tooling/model_tool_schema.zig").FunctionSchema{.{ .name = "read_file", .description = "Reads a file." }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Read a.txt and b.txt." }};
+    var result = try agentStep(std.testing.allocator, .{
+        .request = fake.request(key, &messages, .{ .additional_functions = &functions }),
+        .effort = null,
+        .program = fake.program,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const completion = result.completed.completion;
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason);
+    const calls = completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("toolu_a", calls[0].id);
+    try std.testing.expectEqualStrings("read_file", calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", calls[0].arguments_json);
+    try std.testing.expectEqualStrings("toolu_b", calls[1].id);
+}
+
+test "claude code: a signed-out claude fails the step with the sign-in instructions" {
+    const events =
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","parent_tool_use_id":null}
+        \\{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.init(events);
+    defer fake.deinit();
+    const key = "claude-code-test-signed-out";
+    defer FakeClaude.stop(key) catch {};
+
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hi" }};
+    var result = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &messages, .{}), .effort = null, .program = fake.program });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(stream_provider.FailureKind.forbidden, result.failed.kind);
+    try std.testing.expectEqualStrings(not_signed_in_message, result.failed.detail.?);
+}
+
+test "claude code: a missing claude fails the admitted step without sending anything" {
+    var fake: FakeClaude = undefined;
+    try fake.init("");
+    defer fake.deinit();
+    const key = "claude-code-test-missing";
+    defer FakeClaude.stop(key) catch {};
+
+    const missing = try std.testing.allocator.print("{s}-missing", .{fake.program});
+    defer std.testing.allocator.free(missing);
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hi" }};
+    var result = try agentStep(std.testing.allocator, .{ .request = fake.request(key, &messages, .{}), .effort = null, .program = missing });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.admitted);
+    try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, fake.delivery.load());
+    try std.testing.expectEqual(stream_provider.FailureKind.forbidden, result.failed.kind);
+    try std.testing.expectEqualStrings(not_installed_message, result.failed.detail.?);
+}
+
+test "claude code: a one-shot call returns the reply text" {
+    const events =
+        \\{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Read a file"}},"parent_tool_use_id":null}
+        \\{"type":"result","subtype":"success","is_error":false,"result":"Read a file","session_id":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"}
+        \\
+    ;
+    var fake: FakeClaude = undefined;
+    try fake.init(events);
+    defer fake.deinit();
+
+    const reply = try oneShot(std.testing.allocator, .{ .program = fake.program, .model = "claude-haiku-5-5", .system_prompt = "Title it.", .prompt = "Read a.txt" });
+    switch (reply) {
+        .text => |text| {
+            defer std.testing.allocator.free(text);
+            try std.testing.expectEqualStrings("Read a file", text);
+        },
+        .structured => |json| {
+            std.testing.allocator.free(json);
+            return error.TestUnexpectedResult;
+        },
+        .failed => |failure| {
+            if (failure.detail) |detail| std.testing.allocator.free(detail);
+            return error.TestUnexpectedResult;
+        },
+    }
 }

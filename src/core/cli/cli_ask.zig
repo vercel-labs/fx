@@ -206,6 +206,8 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             }
             if (redeliver and cancel_requested.load(.seq_cst)) {
                 const signal: std.posix.SIG = @fromBackingInt(@intCast(requested_signal.load(.seq_cst)));
+                // The signal ends fx, so the usual exit cleanup runs first.
+                if (!std_builtin.is_test) if (app_lifecycle.close_hook) |hook| hook();
                 _ = std.c.raise(signal);
             }
             coordinator_active = false;
