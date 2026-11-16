@@ -110,6 +110,65 @@ fn trim_segment(command: []const u8, raw_start: usize, raw_end: usize) PipeSegme
     return .{ .text = command[start..end], .start = start, .end = end };
 }
 
+/// Returns the commands a line runs in sequence or side by side: the parts
+/// between unquoted `;`, `&`, `&&`, `||`, `|`, and newlines, with grouping
+/// `(`, `)`, `{`, and `}` trimmed from each part's edges. Quoted and escaped
+/// operators stay inside their part, and redirections such as `2>&1` do not
+/// split. A line the scanner cannot read, such as one with an unbalanced
+/// quote, ends the walk after the parts already returned. Each part borrows
+/// the line.
+pub fn list_commands(command: []const u8) ListCommands {
+    return .{ .command = command };
+}
+
+const ListCommands = struct {
+    command: []const u8,
+    start: usize = 0,
+    index: usize = 0,
+    scan: ShellScan = .{},
+    done: bool = false,
+
+    pub fn next(self: *ListCommands) ?[]const u8 {
+        while (self.nextPart()) |part| {
+            const trimmed = std.mem.trim(u8, part, whitespace ++ "(){}");
+            if (trimmed.len != 0) return trimmed;
+        }
+        return null;
+    }
+
+    fn nextPart(self: *ListCommands) ?[]const u8 {
+        if (self.done) return null;
+        const command = self.command;
+        while (self.index < command.len) {
+            const i = self.index;
+            self.index += 1;
+            const ch = (self.scan.unquoted(command, i) catch {
+                self.done = true;
+                return null;
+            }) orelse continue;
+            switch (ch) {
+                ';', '\n' => {},
+                '&' => {
+                    if (i + 1 < command.len and command[i + 1] == '>') continue;
+                    if (i > 0 and command[i - 1] == '>') continue;
+                    if (i + 1 < command.len and command[i + 1] == '&') self.index += 1;
+                },
+                '|' => {
+                    if (i > 0 and command[i - 1] == '>') continue;
+                    if (i + 1 < command.len and command[i + 1] == '|') self.index += 1;
+                },
+                else => continue,
+            }
+            const part = command[self.start..i];
+            self.start = self.index;
+            return part;
+        }
+        self.done = true;
+        self.scan.finish() catch return null;
+        return command[self.start..];
+    }
+};
+
 /// Conservative shell-shape detector for syntax that needs a real shell parser.
 /// It recognizes common unquoted compound/subshell ASCII metacharacters only;
 /// it intentionally does not model every POSIX shell grammar production.
