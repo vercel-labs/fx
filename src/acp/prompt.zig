@@ -6,6 +6,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -942,6 +943,46 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
     try out.append(alloc, ')');
 }
 
+/// The sign-in one turn sends, copied when the turn starts: publishing a
+/// refreshed credential frees the server's copy (`server.adoptServerCredential`),
+/// so a turn, report turns included, never borrows it.
+const TurnSignIn = struct {
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+
+    /// The caller owns the result and frees it with `deinit`.
+    fn capture(alloc: Allocator, state: *const server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
+        const api_key = try alloc.dupe(u8, session.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team = if (state.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .api_key = api_key,
+            .credential_source = session.credential_source,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+        };
+    }
+
+    /// The job borrows these copies until `deinit`.
+    fn apply(self: TurnSignIn, job: *worker_runtime.QueuedPrompt) void {
+        job.api_key = self.api_key;
+        job.credential_source = self.credential_source;
+        job.account_id = self.account_id;
+        job.gateway_team = self.gateway_team;
+    }
+
+    fn deinit(self: *TurnSignIn, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.gateway_team) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
 pub fn handlePrompt(
@@ -1193,17 +1234,16 @@ pub fn handlePrompt(
         try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
-    const job: worker_runtime.QueuedPrompt = .{
+    var sign_in = try TurnSignIn.capture(alloc, state, session);
+    defer sign_in.deinit(alloc);
+    var job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
         .model = session.model,
-        .api_key = @constCast(session.api_key),
-        .credential_source = session.credential_source,
-        .account_id = if (session.account_id) |account_id| @constCast(account_id) else null,
+        .api_key = &.{},
         .provider = session.provider,
-        .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
         .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
@@ -1220,6 +1260,7 @@ pub fn handlePrompt(
         // in a new process says it holds none of it.
         .recovery_source_already_presented = recovery_checkpoint != null and !prompt_input.fresh_output,
     };
+    sign_in.apply(&job);
 
     // A turn whose completions report no tokens sends no `usage_update`.
     session.context_used.store(0, .release);
@@ -3081,7 +3122,12 @@ fn runReportTurns(
         }
         const history = try session.session_rt.snapshotHistory(alloc);
         defer types.freeHistoryTurnSlice(alloc, history);
+        // The first turn's sign-in may have been refreshed since; send the
+        // current one, as a turn the user starts does.
+        var sign_in = try TurnSignIn.capture(alloc, state, session);
+        defer sign_in.deinit(alloc);
         var job = base;
+        sign_in.apply(&job);
         job.turn_id = 0;
         job.prompt = next.prompt;
         job.author = next.author;
@@ -5866,6 +5912,52 @@ test "ACP full advertisement includes direct provider search with explicit permi
     defer projection.deinit(std.testing.allocator);
     try std.testing.expect(tool_projection_mod.containsName(projection.advertised_names, "web_search"));
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
+}
+
+test "ACP turn sign-in outlives a refreshed credential the server publishes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    state.gateway_team = try alloc.dupe(u8, "team_before");
+
+    var first = try TurnSignIn.capture(alloc, &state, &state.active_session.?);
+    defer first.deinit(alloc);
+    var job: worker_runtime.QueuedPrompt = .{
+        .prompt = &.{},
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    first.apply(&job);
+
+    // A step's refresh publishes a new credential and frees the old one.
+    var refreshed: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "refreshed-api-key"),
+        .source = .ai_gateway_api_key,
+        .team_id = try alloc.dupe(u8, "team_after"),
+    };
+    server.adoptServerCredential(&state, &refreshed);
+    refreshed.deinit(alloc);
+    try std.testing.expectEqualStrings("test-api-key", job.api_key);
+    try std.testing.expectEqualStrings("team_before", job.gateway_team.?);
+
+    // The report turn after it sends the published one.
+    var next = try TurnSignIn.capture(alloc, &state, &state.active_session.?);
+    defer next.deinit(alloc);
+    var report_job = job;
+    next.apply(&report_job);
+    try std.testing.expectEqualStrings("refreshed-api-key", report_job.api_key);
+    try std.testing.expectEqualStrings("team_after", report_job.gateway_team.?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, report_job.credential_source.?);
 }
 
 test "ACP prompt agent config carries request options from active session" {
