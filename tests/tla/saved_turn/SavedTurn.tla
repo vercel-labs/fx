@@ -27,15 +27,13 @@
 (*        prefill recovery prompt                                          *)
 (*   "H"  a Stop hook's message to continue                               *)
 (*   "V"  review mode's message                                           *)
-(*   "Q"  a tool's notice to the model, such as Vision's                  *)
-(*        (open PR 1829: the notice is steering and waits in               *)
-(*        `boundary_notices` until the next step's top)                    *)
-(*   "X"  a user message fx sent with no marker, which the save drops     *)
+(*   "Q"  a tool's notice to the model, such as Vision's                   *)
+(*   "X"  a user message fx sent with no marker, which the save drops      *)
 (* The steering kinds are T, K, H, V and Q: the save keeps each in the     *)
-(* turn's steering list, anchored at the number of steps before it, when   *)
-(* fx marks the message. fx marks T, K and V. It sends the Stop hook's     *)
-(* message (H) and a tool's notice (Q) with no marker, as X, so the save   *)
-(* drops them, until open PR 1829 marks them.                              *)
+(* turn's steering list, anchored at the number of steps before it. fx     *)
+(* marks every one but T, which is the user's own, as its own message      *)
+(* (`recovery_prompt`). X is a message fx does not send: only a planted    *)
+(* defect sends it.                                                        *)
 (*                                                                         *)
 (* Save keeps steps with their results and feedback, notes anchored the    *)
 (* same way, and steering with its assistant prefix. Restore puts back, at *)
@@ -44,10 +42,10 @@
 (* these checks hold (D93).                                                *)
 (*                                                                         *)
 (* Constants:                                                              *)
-(*   Notices      how a tool's notice joins the turn: "none"; "held", the *)
-(*                notice waits and joins at the next step's top (PR 1829);  *)
-(*                "inline", right after its own result; "plain", inline   *)
-(*                with no marker (fx on main)                              *)
+(*   Notices      how a tool's notice joins the turn: "none"; "end", once  *)
+(*                the step's results and feedback are in, which is how fx  *)
+(*                sends it; "inline", right after its own result, which    *)
+(*                ends the step there; "plain", with no marker             *)
 (*   Review       review mode's message after a step that wrote            *)
 (*   Hook         a Stop hook may continue the turn (no production code    *)
 (*                registers a Stop hook today)                             *)
@@ -59,7 +57,7 @@
 (*                catch it:                                                *)
 (*     append_notes     notes join after that steering, as fx did before   *)
 (*     review_plain     review mode's message has no marker                *)
-(*     hook_plain       a Stop hook's message has no marker, as on main    *)
+(*     hook_plain       a Stop hook's message has no marker                *)
 (*     steering_first   Restore puts a boundary's steering before its notes *)
 (*     prefix_dropped   Save forgets the assistant message before steering *)
 (***************************************************************************)
@@ -141,7 +139,6 @@ Restore(live) == RestoreFrom(Save(live), 0)
 VARIABLES
     live,      \* the turn's messages after the user's own, in the order sent
     sent,      \* the messages the last request carried
-    held,      \* tool notices waiting for the next step's top (Notices = "held")
     pend,      \* context notes the last step's gate queued
     ctx,       \* the runtime context changed and no note has carried it yet
     wrote,     \* the step that just ended wrote a file
@@ -149,46 +146,49 @@ VARIABLES
     requests,  \* requests sent
     how        \* how the turn ended
 
-vars == <<live, sent, held, pend, ctx, wrote, phase, requests, how>>
+vars == <<live, sent, pend, ctx, wrote, phase, requests, how>>
 
 Init ==
-    /\ live = <<>> /\ sent = <<>> /\ held = <<>> /\ pend = 0 /\ ctx = FALSE
+    /\ live = <<>> /\ sent = <<>> /\ pend = 0 /\ ctx = FALSE
     /\ wrote = FALSE /\ phase = "top" /\ requests = 0 /\ how = "none"
 
 \* Another process changes the git branch or the date.
 ContextChange ==
     /\ ~ctx /\ phase \in {"top", "reply", "end"}
     /\ ctx' = TRUE
-    /\ UNCHANGED <<live, sent, held, pend, wrote, phase, requests, how>>
+    /\ UNCHANGED <<live, sent, pend, wrote, phase, requests, how>>
 
-Flush(l, h) == IF Notices = "held" THEN l \o h ELSE l
-
-\* The top of a step: the gate's notes, the runtime context update, held
-\* notices, then steering the user typed, and the request.
+\* The top of a step: the gate's notes and the runtime context update, which
+\* join before the steering the last step ended with, then steering the user
+\* typed, and the request.
 Top ==
     /\ phase = "top" /\ requests < MaxRequests
     /\ \E typed \in BOOLEAN :
          LET notes == Repeat("N", pend) \o (IF ctx THEN <<"N">> ELSE <<>>)
-             next == Flush(Place(live, notes), held) \o (IF typed THEN <<"T">> ELSE <<>>)
+             next == Place(live, notes) \o (IF typed THEN <<"T">> ELSE <<>>)
          IN /\ live' = next /\ sent' = next
-    /\ held' = <<>> /\ pend' = 0 /\ ctx' = FALSE /\ wrote' = FALSE
+    /\ pend' = 0 /\ ctx' = FALSE /\ wrote' = FALSE
     /\ requests' = requests + 1 /\ phase' = "reply" /\ UNCHANGED how
 
 \* A fresh reply may not add steering to a tail the last request already
 \* carried, unless DoubleTrail allows it.
 MaySteer == DoubleTrail \/ ~(sent = live /\ Len(live) > 0 /\ live[Len(live)] \in Steer)
 
+\* A notice that joins right after its own result.
 NoticeAtoms ==
     CASE Notices = "inline" -> <<"Q">>
       [] Notices = "plain" -> <<"X">>
       [] OTHER -> <<>>
+
+\* A notice that joins once the step's results and feedback are in.
+EndNotice == IF Notices = "end" THEN <<"Q">> ELSE <<>>
 
 ToolStep ==
     /\ phase = "reply"
     /\ \E nr \in 1..2, fb \in BOOLEAN, notice \in BOOLEAN, gate \in 0..1, writes \in BOOLEAN :
          /\ live' = live \o <<"C", "R">> \o (IF notice THEN NoticeAtoms ELSE <<>>)
                          \o (IF nr = 2 THEN <<"R">> ELSE <<>>) \o (IF fb THEN <<"F">> ELSE <<>>)
-         /\ held' = IF notice /\ Notices = "held" THEN Append(held, "Q") ELSE held
+                         \o (IF notice THEN EndNotice ELSE <<>>)
          /\ pend' = pend + gate
          /\ wrote' = writes
     /\ phase' = "end"
@@ -200,24 +200,24 @@ EmptyReply ==
     /\ phase = "reply" /\ MaySteer
     /\ \E replay \in BOOLEAN : live' = live \o (IF replay THEN <<"A", "K">> ELSE <<"K">>)
     /\ phase' = "top"
-    /\ UNCHANGED <<sent, held, pend, ctx, wrote, requests, how>>
+    /\ UNCHANGED <<sent, pend, ctx, wrote, requests, how>>
 
 HookReply ==
     /\ phase = "reply" /\ Hook /\ MaySteer
     /\ live' = live \o <<"A", IF Bug = "hook_plain" THEN "X" ELSE "H">>
     /\ phase' = "top"
-    /\ UNCHANGED <<sent, held, pend, ctx, wrote, requests, how>>
+    /\ UNCHANGED <<sent, pend, ctx, wrote, requests, how>>
 
 \* Steering the user typed arrives while the reply finishes.
 SteerReply ==
     /\ phase = "reply" /\ MaySteer
     /\ \E replay \in BOOLEAN : live' = live \o (IF replay THEN <<"A", "T">> ELSE <<"P", "T">>)
     /\ phase' = "top"
-    /\ UNCHANGED <<sent, held, pend, ctx, wrote, requests, how>>
+    /\ UNCHANGED <<sent, pend, ctx, wrote, requests, how>>
 
 Finish(h) ==
     /\ phase' = "done" /\ how' = h
-    /\ UNCHANGED <<sent, held, pend, ctx, wrote, requests>>
+    /\ UNCHANGED <<sent, pend, ctx, wrote, requests>>
 
 FinalReply == phase = "reply" /\ Finish("final") /\ UNCHANGED live
 Cancel == phase = "reply" /\ Finish("cancel") /\ UNCHANGED live
@@ -227,25 +227,23 @@ ReviewStep ==
     /\ phase = "end" /\ Review /\ wrote
     /\ live' = live \o <<IF Bug = "review_plain" THEN "X" ELSE "V">>
     /\ wrote' = FALSE
-    /\ UNCHANGED <<sent, held, pend, ctx, phase, requests, how>>
+    /\ UNCHANGED <<sent, pend, ctx, phase, requests, how>>
 
 GoOn ==
     /\ phase = "end" /\ phase' = "top"
-    /\ UNCHANGED <<live, sent, held, pend, ctx, wrote, requests, how>>
+    /\ UNCHANGED <<live, sent, pend, ctx, wrote, requests, how>>
 
-\* A repeated-failure exit: held notices join, steering typed meanwhile
-\* follows, and the turn continues.
+\* A repeated-failure exit: steering typed meanwhile follows the step's
+\* messages, and the turn continues.
 FinalizingSteer ==
     /\ phase = "end" /\ phase' = "top"
-    /\ live' = Flush(live, held) \o <<"T">>
-    /\ held' = <<>>
+    /\ live' = live \o <<"T">>
     /\ UNCHANGED <<sent, pend, ctx, wrote, requests, how>>
 
-\* The step limit, or the end of the turn: held notices join the saved turn.
+\* The step limit ends the turn after a step.
 StepLimit ==
     /\ phase = "end" /\ phase' = "done" /\ how' = "limit"
-    /\ live' = Flush(live, held) /\ held' = <<>>
-    /\ UNCHANGED <<sent, pend, ctx, wrote, requests>>
+    /\ UNCHANGED <<live, sent, pend, ctx, wrote, requests>>
 
 \* The turn is over, or the model's bound on requests stops the search.
 Ended == (phase = "done" \/ (phase = "top" /\ requests >= MaxRequests)) /\ UNCHANGED vars
@@ -262,7 +260,7 @@ Bounded == Len(live) <= MaxAtoms /\ requests <= MaxRequests
 (* The rules                                                               *)
 (***************************************************************************)
 TypeOK ==
-    /\ live \in Seq(Atoms) /\ sent \in Seq(Atoms) /\ held \in Seq({"Q"})
+    /\ live \in Seq(Atoms) /\ sent \in Seq(Atoms)
     /\ pend \in Nat /\ ctx \in BOOLEAN /\ wrote \in BOOLEAN
     /\ phase \in {"top", "reply", "end", "done"} /\ requests \in Nat
 

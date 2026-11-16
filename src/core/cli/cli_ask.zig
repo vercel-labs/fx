@@ -47,6 +47,8 @@ const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -1795,6 +1797,43 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     }
 
+    // A team with Token Pass starts a new session on the Token Pass default
+    // when nothing chose the model. The check refreshes the saved answer
+    // while the turn runs, and waits for it only when fx has none.
+    var token_pass_run: ?token_pass_check.Check = null;
+    defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
+    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    if (token_pass_source) |source| {
+        if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
+            token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
+            token_pass_run.?.begin(
+                alloc,
+                cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+                .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
+                token_pass_check.first_prompt_wait_ms,
+            );
+            const nothing_chose_model = startup.model_source == .compiled_default and
+                options.model_override == null and
+                ctx.requested_resume == null and
+                ctx.session.agent.history.items.len == 0;
+            // Without an answer, the catalog's Token Pass marks can answer for
+            // the team; the turn reuses the catalog this loads.
+            if (nothing_chose_model and !token_pass_run.?.has_pass and !token_pass_run.?.answered) {
+                _ = resolveModelCapabilities(&ctx, alloc, ctx.model) catch |err| {
+                    debug_trace.logf("token_pass", "catalog not loaded for the start model err={s}", .{@errorName(err)});
+                };
+                _ = token_pass_run.?.observeCatalog(alloc);
+            }
+            if (token_pass_run.?.has_pass and nothing_chose_model) {
+                debug_trace.logf("token_pass", "start model={s}", .{token_pass.default_model});
+                ctx.model = token_pass.default_model;
+                // Token Pass credit pays only for standard speed.
+                if (options.fast_override == null) ctx.fast_mode = false;
+                if (options.ultrafast_override == null) ctx.ultrafast_mode = false;
+            }
+        }
+    }
+
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
@@ -2033,11 +2072,15 @@ fn maybeStartAskTitleTask(
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const provider_title_model = bundle.title_model orelse return null;
-    // A Token Pass session titles itself with a Token Pass model.
-    const title_model = if (ctx.provider == .gateway)
-        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
-    else
-        provider_title_model;
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model the catalog marks, so the title waits for the catalog
+    // the turn would load anyway.
+    const title_model = if (ctx.provider == .gateway) title: {
+        _ = resolveModelCapabilities(ctx, ctx.alloc, ctx.model) catch |err| {
+            debug_trace.logf("token_pass", "catalog not loaded for the title model err={s}", .{@errorName(err)});
+        };
+        break :title token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model);
+    } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     // A custom connection may need no key; its adapter checks the one it gets.
@@ -2960,10 +3003,7 @@ fn shell_action_for_call(arena: Allocator, call: ToolCall) ?ShellAction {
         .object => |object| object,
         else => return null,
     };
-    const request = if (root.get("request")) |value| switch (value) {
-        .object => |object| object,
-        else => return null,
-    } else root;
+    const request = (tool_args.unwrapRequest(arena, root) catch return null) orelse return null;
     const action = switch (request.get("action") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -3075,7 +3115,13 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const questions_value = parsed.value.object.get("questions") orelse return null;
+    var questions_value = parsed.value.object.get("questions") orelse return null;
+    // The tool reads the batch from JSON text too, so the record names the
+    // same question.
+    tool_args.normalizeCompositeArrayValue(parsed.arena.allocator(), &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (questions_value != .array or questions_value.array.items.len == 0) return null;
     const first = questions_value.array.items[0];
     if (first != .object) return null;
@@ -8159,6 +8205,7 @@ test "shell diagnostic action projection accepts only current actions" {
         .{ .arguments_json = "{\"action\":\"run\"}", .expected = .run },
         .{ .arguments_json = "{\"action\":\"interact\"}", .expected = .interact },
         .{ .arguments_json = "{\"request\":{\"action\":\"stop\"}}", .expected = .stop },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"interact\\\"}\"}", .expected = .interact },
     };
     for (cases) |case| {
         try std.testing.expectEqual(
@@ -8415,6 +8462,30 @@ test "fx ask JSON records ask_user_question text for matching assertions" {
     const tool_call = parsed.value.object.get("tool_calls").?.array.items[0].object;
     try std.testing.expectEqualStrings("ask_user_question", tool_call.get("name").?.string);
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
+}
+
+test "fx ask JSON names the question of a batch sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const call = struct {
+        fn of(arguments_json: []const u8) ToolCall {
+            return .{ .id = "question", .name = "ask_user_question", .arguments_json = arguments_json };
+        }
+    }.of;
+
+    const text = (try questionTextForAskCall(alloc, call("{\"questions\":\"[{\\\"question\\\":\\\" Which path? \\\"}]\"}"))).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Which path?", text);
+
+    // Text that does not hold a batch names no question, including a batch
+    // encoded twice.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "[{\"question\":\"Twice?\"}]", .{});
+    for ([_][]const u8{ "not json", "{}", "[]", "[1]", twice }) |questions_text| {
+        const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = questions_text }, .{});
+        try std.testing.expect((try questionTextForAskCall(alloc, call(arguments_json))) == null);
+    }
 }
 
 test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {

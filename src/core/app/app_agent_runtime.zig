@@ -739,6 +739,36 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        pub fn stopSteeringDetachedCommands(
+            app: *App,
+            agent: *AppAgent,
+            turn_id: u64,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !void {
+            return tool_runtime.stop_steering_detached_commands(
+                toolContext(
+                    app,
+                    agent,
+                    ignored_list_entries,
+                    max_list_entries,
+                    max_read_file_bytes,
+                    max_read_file_lines,
+                    max_read_file_line_len,
+                    max_command_output_bytes,
+                    gateway_retry_count,
+                    gateway_chat_url,
+                ),
+                turn_id,
+            );
+        }
+
         pub fn describeToolAction(
             app: *App,
             agent: *AppAgent,
@@ -1318,7 +1348,11 @@ pub fn Runtime(comptime App: type) type {
                 .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
+                // A sign-in another fx process renewed since `/compact`
+                // started gets one more send, as an agent turn does.
+                .renewal_deps = &deps,
             };
+            defer summary_model.deinit();
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
                 .activity_origin = .manual,

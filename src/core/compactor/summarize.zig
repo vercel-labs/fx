@@ -123,6 +123,9 @@ pub const ModelError = error{
     ModelFailed,
     /// The model stopped before finishing, for example at its output limit.
     SummaryIncomplete,
+    /// The provider refused the request as longer than the model's context
+    /// window. The summary step writes the turns out smaller and asks again.
+    SummaryTooLong,
     Cancelled,
     OutOfMemory,
 };
@@ -593,10 +596,34 @@ fn askFirstNotes(alloc: Allocator, out: Allocator, scratch: Allocator, plan: Pla
         };
         return .{ .asked = asked, .prompt = prompt, .request_start = request_start };
     }
-    const transcript = try fittingTranscript(alloc, scratch, plan, request.max_prompt_tokens);
-    const prompt: Prompt = .{ .model = request.model, .system = system_prompt, .user = transcript.text };
-    return .{ .asked = try askNotes(out, model, prompt, known, plan.earlier.entries, checkpoint.highestIds(plan.earlier)), .prompt = prompt, .request_start = transcript.request_start };
+    // A provider can count more tokens than `tokens` estimates, and refuse a
+    // request this thought fits. The turns are written out again within three
+    // quarters of the refused request, as the agent's own request recovers.
+    var max_tokens = request.max_prompt_tokens;
+    var smaller_requests: usize = 0;
+    while (true) {
+        const transcript = try fittingTranscript(alloc, scratch, plan, max_tokens);
+        const prompt: Prompt = .{ .model = request.model, .system = system_prompt, .user = transcript.text };
+        const asked = askNotes(out, model, prompt, known, plan.earlier.entries, checkpoint.highestIds(plan.earlier)) catch |err| switch (err) {
+            error.SummaryTooLong => {
+                const refused = tokens(&.{ system_prompt, transcript.text });
+                if (smaller_requests == max_smaller_requests) {
+                    trace.log(true, "compaction request refused as too long tokens={d} after {d} smaller requests", .{ refused, smaller_requests });
+                    return error.ModelFailed;
+                }
+                smaller_requests += 1;
+                max_tokens = refused / 4 * 3;
+                trace.log(true, "compaction request refused as too long tokens={d}; writing the turns out within tokens={d}", .{ refused, max_tokens });
+                continue;
+            },
+            else => |other| return other,
+        };
+        return .{ .asked = asked, .prompt = prompt, .request_start = transcript.request_start };
+    }
 }
+
+/// How many smaller requests follow one the provider refused as too long.
+const max_smaller_requests = 3;
 
 /// Sends `prompt` to the model and reads its notes. `earlier` are the
 /// entries so far and `highest` counts those a saved ledger holds too. `out`
@@ -1320,6 +1347,12 @@ const FakeModel = struct {
     fail: ?ModelError = null,
     /// Fails only the requests sent after the conversation.
     fail_after_conversation: bool = false,
+    /// Refuses as too long every request over this many estimated tokens.
+    too_long_over: ?usize = null,
+    /// Refuses as too long every request sent after the conversation.
+    too_long_after_conversation: bool = false,
+    /// Estimated tokens of each request, in order.
+    sizes: std.ArrayList(usize) = .empty,
     calls: usize = 0,
     after_conversation_calls: usize = 0,
     /// Estimated tokens of the largest request.
@@ -1330,6 +1363,7 @@ const FakeModel = struct {
 
     fn deinit(self: *FakeModel) void {
         self.seen_user.deinit(testing.allocator);
+        self.sizes.deinit(testing.allocator);
     }
 
     fn model(self: *FakeModel) Model {
@@ -1340,14 +1374,17 @@ const FakeModel = struct {
         const self: *FakeModel = @ptrCast(@alignCast(context));
         self.calls += 1;
         self.largest = @max(self.largest, tokens(&.{ prompt.system, prompt.user }));
+        try self.sizes.append(testing.allocator, tokens(&.{ prompt.system, prompt.user }));
         self.seen_model = prompt.model;
         self.seen_system = prompt.system;
         self.seen_user.clearRetainingCapacity();
         try self.seen_user.appendSlice(testing.allocator, prompt.user);
         if (self.fail) |err| return err;
+        if (self.too_long_over) |limit| if (tokens(&.{ prompt.system, prompt.user }) > limit) return error.SummaryTooLong;
         if (prompt.after_conversation) {
             self.after_conversation_calls += 1;
             if (self.fail_after_conversation) return error.ModelFailed;
+            if (self.too_long_after_conversation) return error.SummaryTooLong;
         }
         // One reply per call when given, the last one repeated.
         if (self.replies.len > 0) return alloc.dupe(u8, self.replies[@min(self.calls, self.replies.len) - 1]);
@@ -1554,6 +1591,48 @@ test "a follow-up after the conversation lists only the skipped turns, findable"
     try testing.expect(std.mem.find(u8, follow_up, "Turn 2") == null);
     try testing.expectEqualStrings("Ran make.", result.compacted.turns[0].work);
     try testing.expectEqualStrings("first build", result.compacted.turns[0].tools[0].why);
+}
+
+test "a request the provider refuses as too long is written out smaller until one fits" {
+    const output = text_utils.repeat("x", 40_000);
+    const turns = [_]Turn{workedTurn("build it", "call-1", output)};
+    var model = FakeModel{ .reply = "Turn 1\nIn between: Ran the build.", .too_long_over = 6000 };
+    defer model.deinit();
+    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = 100_000 }, model.model(), null);
+    defer result.deinit();
+    try testing.expectEqualStrings("Ran the build.", result.compacted.turns[0].work);
+    const sizes = model.sizes.items;
+    // The whole turn is refused, then each request is at most three quarters
+    // of the one refused before it, until one fits.
+    try testing.expect(sizes.len >= 2 and sizes.len <= 1 + max_smaller_requests);
+    try testing.expect(sizes[0] > 6000);
+    for (sizes[0 .. sizes.len - 1], sizes[1..]) |refused, next| try testing.expect(next <= refused / 4 * 3);
+    try testing.expect(sizes[sizes.len - 1] <= 6000);
+}
+
+test "a request refused as too long every time fails after the smaller ones, and other refusals are not retried" {
+    const output = text_utils.repeat("x", 40_000);
+    const turns = [_]Turn{workedTurn("build it", "call-1", output)};
+    var always = FakeModel{ .too_long_over = 0 };
+    defer always.deinit();
+    try testing.expectError(error.ModelFailed, compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = 100_000 }, always.model(), null));
+    try testing.expectEqual(@as(usize, 1 + max_smaller_requests), always.calls);
+    var down = FakeModel{ .fail = error.ModelFailed };
+    defer down.deinit();
+    try testing.expectError(error.ModelFailed, compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = 100_000 }, down.model(), null));
+    try testing.expectEqual(@as(usize, 1), down.calls);
+}
+
+test "a request after the conversation refused as too long falls back to the turns written out" {
+    const output = text_utils.repeat("x", 4000);
+    const turns = [_]Turn{workedTurn("build it", "call-1", output)};
+    var model = FakeModel{ .reply = "Turn 1\nIn between: Ran the build.", .too_long_after_conversation = true };
+    defer model.deinit();
+    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = 100_000, .conversation_room = 100_000 }, model.model(), null);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), model.calls);
+    try testing.expectEqual(@as(usize, 1), model.after_conversation_calls);
+    try testing.expectEqualStrings("Ran the build.", result.compacted.turns[0].work);
 }
 
 test "the conversation serves only a request for every turn" {
