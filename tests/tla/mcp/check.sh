@@ -23,11 +23,13 @@ python3 run.py mutate "$@"
 # models that code (GraceOn = FALSE) and states that a request in flight at a refused line that
 # names no request, and silent, ends within the grace. It fails there, because the request waits
 # for its own deadline (5 minutes by default); Request.cfg models the code with the grace, where
-# it holds. Request.scoped.cfg has two normal requests and no more, for the scope of a refused
-# line (ScopedGrantsOnlyItsCall), and must pass. Each verdict is required (../lib/tlc.sh). Other pull requests add findings blocks to this file too: when two land,
-# merge them into one tlc_verdicts block.
+# it holds. Each verdict is required (../lib/tlc.sh). Other pull requests add findings blocks to this
+# file too: when two land, merge them into one tlc_verdicts block.
+#
+# Request.scoped.cfg (two normal requests and no more, for the scope of a refused line,
+# ScopedGrantsOnlyItsCall) is not here: catalog.json lists it under "also", so `run.py check` runs it
+# next to the smoke config, in CI too.
 . ../lib/tlc.sh
 tlc_verdicts <<'EOF_FINDINGS'
-Request Request.scoped -
 Request Request.findings SoonAfterRefusal
 EOF_FINDINGS
