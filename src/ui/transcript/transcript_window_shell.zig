@@ -217,7 +217,7 @@ pub const Shell = struct {
         const count = range.to - range.from;
         drops.appendSliceAssumeCapacity(self.finished.items[0..count]);
         const rest = self.finished.items[count..];
-        std.mem.copyForwards(u32, self.finished.items[0..rest.len], rest);
+        @memmove(self.finished.items[0..rest.len], rest);
         self.finished.shrinkRetainingCapacity(rest.len);
         self.base = range.to;
     }
@@ -262,17 +262,17 @@ fn traceRejected(event: core.Event, why: core.Rejection) void {
 
 fn describeEvent(buf: []u8, event: core.Event) []const u8 {
     return switch (event) {
-        .block_opened, .block_changed, .block_finished => |id| std.fmt.bufPrint(buf, "{s}:{d}", .{ @tagName(event), id }) catch @tagName(event),
-        .saved_through => |seq| std.fmt.bufPrint(buf, "saved_through:{d}", .{seq}) catch "saved_through",
-        .resumed => |from| std.fmt.bufPrint(buf, "resumed:{d}:{d}:{d}", .{ from.cycle, from.cycle_first, from.next_seq }) catch "resumed",
+        .block_opened, .block_changed, .block_finished => |id| std.mem.print(buf, "{s}:{d}", .{ @tagName(event), id }) catch @tagName(event),
+        .saved_through => |seq| std.mem.print(buf, "saved_through:{d}", .{seq}) catch "saved_through",
+        .resumed => |from| std.mem.print(buf, "resumed:{d}:{d}:{d}", .{ from.cycle, from.cycle_first, from.next_seq }) catch "resumed",
         else => @tagName(event),
     };
 }
 
 fn describeEffect(buf: []u8, effect: core.Effect) []const u8 {
     return switch (effect) {
-        .drop, .reprint_slice, .ctrlo_show => |range| std.fmt.bufPrint(buf, "{s}:{d}:{d}", .{ @tagName(effect), range.from, range.to }) catch @tagName(effect),
-        .paint_final => |seq| std.fmt.bufPrint(buf, "paint_final:{d}", .{seq}) catch "paint_final",
+        .drop, .reprint_slice, .ctrlo_show => |range| std.mem.print(buf, "{s}:{d}:{d}", .{ @tagName(effect), range.from, range.to }) catch @tagName(effect),
+        .paint_final => |seq| std.mem.print(buf, "paint_final:{d}", .{seq}) catch "paint_final",
         else => @tagName(effect),
     };
 }
