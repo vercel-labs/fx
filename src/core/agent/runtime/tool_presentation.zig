@@ -1838,13 +1838,7 @@ const ProvisionalStatusTestCapture = struct {
             .publish_committed_file_handoff = noopPublishCommittedFileHandoff,
             .propagate_history_turn = noopPropagateHistoryTurn,
             .propagate_grant = noopPropagateGrant,
-            .push_event = noopPushEvent,
-            .push_text = noopPushText,
-            .push_tool_lifecycle = captureToolLifecycle,
-            .push_diff_block = noopPushDiffBlock,
-            .push_system_notice = noopPushSystemNotice,
-            .push_command_output_complete = noopPushCommandOutputComplete,
-            .push_http_error = noopPushHttpError,
+            .emit_event = captureTurnEvent,
             .format_tool_execution_error = noopFormatToolExecutionError,
         };
     }
@@ -1870,12 +1864,13 @@ const ProvisionalStatusTestCapture = struct {
     }
     fn noopPropagateHistoryTurn(_: *anyopaque, _: types.HistoryTurn) !void {}
     fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
-    fn noopPushEvent(_: *anyopaque, _: @import("../worker_runtime.zig").WorkerEvent) !void {}
-    fn noopPushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
-    fn noopPushDiffBlock(_: *anyopaque, _: DiffEntryPayload) !void {}
-    fn noopPushSystemNotice(_: *anyopaque, _: []const u8) !void {}
-    fn noopPushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopPushHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+    /// Keeps the tool lifecycle it is shown, and nothing else.
+    fn captureTurnEvent(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+        switch (event) {
+            .worker => |worker| if (worker == .tool_lifecycle) try captureToolLifecycle(raw, worker.tool_lifecycle),
+            else => {},
+        }
+    }
     fn noopFormatToolExecutionError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return arena.print("{s}", .{@errorName(err)});
     }

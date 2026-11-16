@@ -5504,6 +5504,13 @@ test "deferred tool cleanup contains publication failure and preserves tracking"
             self.failed_terminal = event == .terminal and event.terminal.outcome.kind == .failed;
             return error.TestCleanupSinkFailed;
         }
+
+        fn emit(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+            switch (event) {
+                .worker => |worker| if (worker == .tool_lifecycle) return push(raw, worker.tool_lifecycle),
+                else => {},
+            }
+        }
     };
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -5516,7 +5523,7 @@ test "deferred tool cleanup contains publication failure and preserves tracking"
     defer stream_ctx.deinit();
     try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "Reading", "fixture.txt", null);
     deps.ctx = &sink;
-    deps.push_tool_lifecycle = Sink.push;
+    deps.emit_event = Sink.emit;
     var cancelled = std.atomic.Value(bool).init(false);
     settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 73, &cancelled);
     try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -7682,7 +7689,7 @@ test "compaction activity transaction settles only after publication and preserv
         deps.agent_stream_provider.stream_fn = Host.stream;
         deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
         deps.commit_context_compaction = .{ .commit = Host.commit };
-        deps.push_interactive_notice = null;
+        host.fake.enable_interactive_notices = false;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");

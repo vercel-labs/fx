@@ -715,12 +715,7 @@ const NoticeCapture = struct {
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
             .propagate_grant = propagateGrant,
-            .push_event = pushEvent,
-            .push_text = pushText,
-            .push_diff_block = pushDiff,
-            .push_system_notice = systemNotice,
-            .push_command_output_complete = commandOutputComplete,
-            .push_http_error = httpError,
+            .emit_event = emitEvent,
             .format_tool_execution_error = formatError,
         };
     }
@@ -762,17 +757,17 @@ const NoticeCapture = struct {
 
     fn propagateHistory(_: *anyopaque, _: HistoryTurn) !void {}
     fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
-    fn pushEvent(_: *anyopaque, _: WorkerEvent) !void {}
-    fn pushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
-    fn pushDiff(_: *anyopaque, _: DiffEntryPayload) !void {}
-
-    fn systemNotice(raw: *anyopaque, text: []const u8) !void {
+    /// Keeps the plain notices it is shown, as a front end without
+    /// interactive or context notices shows them.
+    fn emitEvent(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+        const text = switch (event) {
+            .notice => |notice| notice.plain orelse return,
+            .context_notice => |text| text,
+            else => return,
+        };
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.notices.append(std.testing.allocator, try std.testing.allocator.dupe(u8, text));
     }
-
-    fn commandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn httpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
 
     fn formatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return arena.print("{s}", .{@errorName(err)});
@@ -830,13 +825,7 @@ const StreamCapture = struct {
             .publish_committed_file_handoff = noopPublishCommittedFileHandoff,
             .propagate_history_turn = noopPropagateHistory,
             .propagate_grant = noopPropagateGrant,
-            .push_event = captureEvent,
-            .push_text = captureText,
-            .push_tool_lifecycle = captureToolLifecycle,
-            .push_diff_block = noopPushDiff,
-            .push_system_notice = noopSystemNotice,
-            .push_command_output_complete = noopCommandOutputComplete,
-            .push_http_error = noopHttpError,
+            .emit_event = captureTurnEvent,
             .format_tool_execution_error = noopFormatError,
         };
     }
@@ -871,10 +860,19 @@ const StreamCapture = struct {
     }
     fn noopPropagateHistory(_: *anyopaque, _: HistoryTurn) !void {}
     fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
-    fn noopPushDiff(_: *anyopaque, _: DiffEntryPayload) !void {}
-    fn noopSystemNotice(_: *anyopaque, _: []const u8) !void {}
-    fn noopCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+    /// Keeps the stream's text, tool lifecycle, and worker events; the
+    /// stream emits no diff, notice, or HTTP error here.
+    fn captureTurnEvent(raw: *anyopaque, event: runtime_deps.TurnEvent) !void {
+        switch (event) {
+            .worker => |worker| switch (worker) {
+                .tool_lifecycle => |lifecycle| try captureToolLifecycle(raw, lifecycle),
+                .diff_block, .command_output_complete, .route_recovery_status => {},
+                else => try captureEvent(raw, worker),
+            },
+            .text => |emission| try captureText(raw, emission),
+            .reasoning_delta, .notice, .context_notice, .session_notice, .http_error => {},
+        }
+    }
     fn noopFormatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return arena.print("{s}", .{@errorName(err)});
     }

@@ -29,7 +29,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
-const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const profiles = @import("../profiles/profiles.zig");
@@ -511,14 +510,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .propagate_grant = discardGrant,
-        .push_event = pushLiveEvent,
-        .push_text = pushLiveText,
-        .push_tool_lifecycle = pushLiveToolLifecycle,
-        .push_diff_block = pushLiveDiff,
-        .push_system_notice = pushLiveNotice,
-        .push_route_recovery_status = pushLiveRouteRecoveryStatus,
-        .push_command_output_complete = pushLiveCommandOutputComplete,
-        .push_http_error = captureHttpError,
+        .emit_event = emitLiveEvent,
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
@@ -1060,33 +1052,6 @@ fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
     }
 }
 
-fn pushLiveDiff(
-    raw: *anyopaque,
-    payload: agent_runtime.DiffEntryPayload,
-) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
-    context.turn.appendLiveEvent(.{ .diff_block = payload });
-}
-
-fn pushLiveCommandOutputComplete(
-    raw: *anyopaque,
-    lifecycle_id: ?types.ToolLifecycleId,
-) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    context.turn.appendLiveEvent(.{
-        .command_output_complete = lifecycle_id,
-    });
-}
-
-fn pushLiveRouteRecoveryStatus(
-    raw: *anyopaque,
-    status: types.RouteRecoveryStatus,
-) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    context.turn.appendLiveEvent(.{ .route_recovery_status = status });
-}
-
 fn captureHttpError(
     raw: *anyopaque,
     status: std.http.Status,
@@ -1105,10 +1070,23 @@ fn captureHttpError(
     context.turn.setFailureDiagnostic("provider_http_error", masked);
 }
 
-fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
+/// A subagent turn's one sink for its loop's events, each lent for the call.
+/// The turn's live view copies what it keeps.
+fn emitLiveEvent(raw: *anyopaque, event: agent_runtime.TurnEvent) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    context.turn.appendLiveEvent(event);
-    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    switch (event) {
+        .worker => |worker| switch (worker) {
+            .tool_lifecycle => |lifecycle| try pushLiveToolLifecycle(raw, lifecycle),
+            else => context.turn.appendLiveEvent(worker),
+        },
+        .text => |emission| try pushLiveText(raw, emission),
+        // A subagent's live view shows neither reasoning nor notices meant
+        // once per session.
+        .reasoning_delta, .session_notice => {},
+        .notice => |notice| if (notice.plain) |text| try pushLiveNotice(raw, text),
+        .context_notice => |text| try pushLiveNotice(raw, text),
+        .http_error => |failure| try captureHttpError(raw, failure.status, failure.detail, failure.credential_source),
+    }
 }
 
 fn pushLiveOutputChunk(
