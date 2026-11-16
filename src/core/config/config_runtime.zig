@@ -4600,7 +4600,7 @@ test "detailed settings remove loose write access, load, and note it once" {
         const diagnostic = result.diagnostics[0];
         try std.testing.expectEqual(ConfigDiagnosticCause.private_state_permissions_tightened, diagnostic.cause);
         try std.testing.expect(!diagnostic.reportAtStartup());
-        try std.testing.expect(std.mem.indexOf(u8, diagnostic.note().?, "~/.fx/settings.json") != null);
+        try std.testing.expect(std.mem.find(u8, diagnostic.note().?, "~/.fx/settings.json") != null);
         try std.testing.expect(result.prompt_history_store_allowed);
     }
     const tightened = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});

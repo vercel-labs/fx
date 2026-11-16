@@ -477,7 +477,7 @@ test "transcript window: each command's output is bounded on its own" {
     };
     var line: [16]u8 = undefined;
     for (0..40) |index| {
-        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.fmt.bufPrint(&line, "line-{d:0>2}\n", .{index}), true);
+        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.mem.print(&line, "line-{d:0>2}\n", .{index}), true);
     }
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
     const first = runtime.notebook.command_output_blocks.items[0];
@@ -488,7 +488,7 @@ test "transcript window: each command's output is bounded on its own" {
     // The next command keeps all of its output though the transcript holds
     // more than the cap.
     for (0..3) |index| {
-        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.fmt.bufPrint(&line, "next-{d}\n", .{index}), true);
+        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.mem.print(&line, "next-{d}\n", .{index}), true);
     }
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
     try std.testing.expectEqual(@as(usize, 2), runtime.notebook.command_output_blocks.items.len);

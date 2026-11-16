@@ -4980,8 +4980,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // A saved login's slug is not checked when it loads, so only a valid team
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
-        try std.fmt.allocPrint(
-            arena,
+        try arena.print(
             "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )

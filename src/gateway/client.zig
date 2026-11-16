@@ -5582,7 +5582,7 @@ fn fuzzGatewayEventClass(_: void, smith: *std.testing.Smith) !void {
     const json_text = std.mem.trim(u8, data, " \t");
     // An empty data line is skipped and `[DONE]` ends the stream.
     if (json_text.len == 0 or std.mem.eql(u8, json_text, "[DONE]")) return;
-    const wire = try std.fmt.allocPrint(arena, "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"stop\"}}}}\n\n", .{data});
+    const wire = try arena.print("data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"stop\"}}}}\n\n", .{data});
 
     var whole: [4096]u8 = undefined;
     const outcome = gatewayEventOutcome(wire, &whole);
