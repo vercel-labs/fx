@@ -14,13 +14,10 @@
 (*  - The TUI (Queued) copies the event into its queue during the call.   *)
 (*    Its screen thread shows the copy later, in queue order, and frees   *)
 (*    it.                                                                  *)
-(*  - A front end that still sets the old push_* sinks (Shim) gets each    *)
-(*    event through emit's forwarding shim. push_event and push_diff_block *)
-(*    free what they get, so the shim hands them a copy of those kinds     *)
-(*    (Owning).                                                            *)
 (*                                                                         *)
-(* Today = TRUE is the rule before S8e: push_event and push_diff_block     *)
-(* took the loop's own payload and freed it, and the loop didn't.          *)
+(* Today = TRUE is the rule before emit: push_event and push_diff_block   *)
+(* took the loop's own payload for those kinds (Owning) and freed it, and  *)
+(* the loop didn't.                                                        *)
 (* turn-events-today.cfg shows LoopFrees failing.                          *)
 (*                                                                         *)
 (* Mutation plants one defect, and the rule each turn-events-mutation-*   *)
@@ -30,7 +27,6 @@
 (*   no-free           the loop never frees what it emitted               *)
 (*   drop-kind         a front end drops notices (a catch-all arm)         *)
 (*   bypass-queue      the TUI shows text at once, ahead of its queue      *)
-(*   shim-no-copy      the shim hands an owning sink the lent payload      *)
 (*                                                                         *)
 (* Script is the order the loop emits its kinds in. A run of the real fx  *)
 (* through tests/tla/drivers/agent_runtime/turn_events.ts sets it from    *)
@@ -41,8 +37,7 @@ EXTENDS Naturals, Sequences
 CONSTANTS
     Script,     \* the kinds the loop emits, in order
     Queued,     \* TRUE: the TUI; FALSE: fx acp or fx ask
-    Shim,       \* the front end still sets the push_* sinks
-    Today,      \* the ownership rule before S8e
+    Today,      \* the ownership rule before emit
     Mutation    \* "none" or one planted defect
 
 Kinds == {"text", "tool", "diff", "notice", "worker"}
@@ -50,8 +45,7 @@ Owning == {"worker", "diff"}    \* the kinds push_event and push_diff_block take
 Max == Len(Script)
 Mem == {"none", "live", "freed"}
 
-ASSUME /\ \A i \in 1..Max : Script[i] \in Kinds
-       /\ ~(Today /\ Shim)
+ASSUME \A i \in 1..Max : Script[i] \in Kinds
 
 VARIABLES
     n,          \* events the loop emitted
@@ -75,10 +69,8 @@ Init ==
     /\ queue = <<>> /\ shown = <<>> /\ bad = FALSE
 
 \* The front end gets the loop's own payload, which it then owns: before
-\* S8e for the owning kinds, or from a shim that forgets its copy.
-HandedOver(k) == k \in Owning /\ (Today \/ (Shim /\ Mutation = "shim-no-copy"))
-\* The shim hands an owning sink a copy, which the sink owns.
-ShimCopy(k) == Shim /\ k \in Owning /\ ~HandedOver(k)
+\* emit, for the owning kinds.
+HandedOver(k) == Today /\ k \in Owning
 Dropped(k) == Mutation = "drop-kind" /\ k = "notice"
 \* The TUI keeps the loop's payload itself, not a copy.
 Kept(k) == HandedOver(k) \/ Mutation = "keep-lent"
@@ -99,11 +91,10 @@ Emit ==
                /\ buf' = [buf EXCEPT ![i] = "live"]
                /\ freedBy' = freedBy
           ELSE \* Shown at once, or dropped. A front end frees what it owns:
-               \* a handed-over payload, a shim's copy, or, by mistake, the
-               \* lent payload.
+               \* a handed-over payload or, by mistake, the lent payload.
                /\ queue' = queue /\ aliased' = aliased
                /\ shown' = IF Dropped(k) THEN shown ELSE Append(shown, i)
-               /\ copy' = [copy EXCEPT ![i] = IF ShimCopy(k) THEN "freed" ELSE "none"]
+               /\ copy' = copy
                /\ IF HandedOver(k) \/ (Mutation = "free-in-front" /\ k \in Owning)
                   THEN /\ buf' = [buf EXCEPT ![i] = "freed"]
                        /\ freedBy' = [freedBy EXCEPT ![i] = "front"]
@@ -117,7 +108,7 @@ Return ==
     /\ inEmit # 0
     /\ LET i == inEmit IN
        /\ inEmit' = 0
-       /\ IF (Today /\ Script[i] \in Owning) \/ Mutation = "no-free"
+       /\ IF HandedOver(Script[i]) \/ Mutation = "no-free"
           THEN UNCHANGED <<buf, freedBy, bad>>
           ELSE IF buf[i] = "freed"
                THEN /\ bad' = TRUE

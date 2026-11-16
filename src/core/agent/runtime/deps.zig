@@ -26,7 +26,6 @@ const HistoryTurn = types.HistoryTurn;
 const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolCall = types.ToolCall;
-const WorkerEvent = worker_runtime.WorkerEvent;
 
 const DeferredToolCompletion = tool_contracts.DeferredToolCompletion;
 const DiffEntryPayload = tool_contracts.DiffEntryPayload;
@@ -287,27 +286,10 @@ pub const AgentRuntimeDeps = struct {
     /// Another process may have taken the session over.
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
-    /// The one sink for every `TurnEvent`, which the event is lent to. Null
-    /// while a front end still sets the `push_*` sinks below; `emit` then
-    /// forwards each event to the sink it replaces. A front end on `emit`
-    /// sets none of them.
-    emit_event: ?*const fn (ctx: *anyopaque, event: TurnEvent) anyerror!void = null,
-    push_event: ?*const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void = null,
-    push_text: ?*const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void = null,
-    push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
-    push_tool_lifecycle: ?*const fn (ctx: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void = null,
-    push_diff_block: ?*const fn (ctx: *anyopaque, payload: DiffEntryPayload) anyerror!void = null,
-    push_system_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
-    push_interactive_notice: ?*const fn (ctx: *anyopaque, notice: types.SemanticNotice) anyerror!void = null,
-    /// Source-limit notices use a session-scoped deduplicating path when the
-    /// host provides one; ordinary system notices remain unaffected.
-    push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
-    /// A notice the person should see once in a live session, however many
-    /// turns repeat its cause. The host shows it where they read the
-    /// transcript and drops a text it has already shown. Null: the host has
-    /// no session to remember it in, and the notice is not shown.
-    push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
-    push_route_recovery_status: ?*const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = null,
+    /// The front end's one sink for every `TurnEvent`. The event is lent to
+    /// it for the call, so it copies what it keeps
+    /// (`tests/tla/agent_runtime/TurnEvents.tla` MemorySafe).
+    emit_event: *const fn (ctx: *anyopaque, event: TurnEvent) anyerror!void,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
     /// here. Null: the host keeps no per-request report.
@@ -315,8 +297,6 @@ pub const AgentRuntimeDeps = struct {
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
-    push_command_output_complete: ?*const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void = null,
-    push_http_error: ?*const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void = null,
     /// `rejected_token` is the access token the provider just answered 401
     /// for, with `.force`; see `auth_runtime.refreshCredentialForAccount`.
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
@@ -349,67 +329,7 @@ pub const AgentRuntimeDeps = struct {
     /// payload is valid only during the call, and the caller frees what it
     /// allocated once `emit` returns.
     pub fn emit(self: *const AgentRuntimeDeps, event: TurnEvent) !void {
-        if (self.emit_event) |emit_fn| return emit_fn(self.ctx, event);
-        return self.forwardToSinks(event);
-    }
-
-    /// For a front end that still sets the `push_*` sinks: each event goes to
-    /// the sink it replaces, as the loop called it before. `push_event` and
-    /// `push_diff_block` free what they get, so they get a copy. A front end
-    /// without a tool lifecycle, recovery status, reasoning, interactive, or
-    /// session sink drops those, as the loop did.
-    fn forwardToSinks(self: *const AgentRuntimeDeps, event: TurnEvent) !void {
-        switch (event) {
-            .worker => |worker| switch (worker) {
-                .tool_lifecycle => |lifecycle| if (self.push_tool_lifecycle) |push| return push(self.ctx, lifecycle),
-                .diff_block => {
-                    const push = self.push_diff_block orelse return dropped(event);
-                    const copy = try worker_runtime.dupeWorkerEvent(std.heap.c_allocator, worker);
-                    return push(self.ctx, copy.diff_block);
-                },
-                .route_recovery_status => |status| if (self.push_route_recovery_status) |push| return push(self.ctx, status),
-                .command_output_complete => |id| {
-                    const push = self.push_command_output_complete orelse return dropped(event);
-                    return push(self.ctx, id);
-                },
-                else => {
-                    const push = self.push_event orelse return dropped(event);
-                    return push(self.ctx, try worker_runtime.dupeWorkerEvent(std.heap.c_allocator, worker));
-                },
-            },
-            .text => |emission| {
-                const push = self.push_text orelse return dropped(event);
-                return push(self.ctx, emission);
-            },
-            .reasoning_delta => |delta| if (self.push_reasoning_delta) |push| return push(self.ctx, delta),
-            .notice => |notice| {
-                if (notice.semantic) |semantic| if (self.push_interactive_notice) |push| return push(self.ctx, semantic);
-                if (notice.plain) |text| return self.pushSystemNotice(event, text);
-            },
-            .context_notice => |text| {
-                if (self.push_context_notice) |push| return push(self.ctx, text);
-                return self.pushSystemNotice(event, text);
-            },
-            .session_notice => |text| if (self.push_session_notice) |push| return push(self.ctx, text),
-            .http_error => |failure| {
-                const push = self.push_http_error orelse return dropped(event);
-                return push(self.ctx, failure.status, failure.detail, failure.credential_source);
-            },
-        }
-    }
-
-    fn pushSystemNotice(self: *const AgentRuntimeDeps, event: TurnEvent, text: []const u8) !void {
-        const push = self.push_system_notice orelse return dropped(event);
-        return push(self.ctx, text);
-    }
-
-    /// A front end that sets neither `emit_event` nor the sink an event needs.
-    fn dropped(event: TurnEvent) void {
-        const kind = switch (event) {
-            .worker => |worker| @tagName(worker),
-            else => @tagName(event),
-        };
-        debug_trace.logf("agent", "turn event dropped kind={s}: the front end sets neither emit_event nor its push sink", .{kind});
+        return self.emit_event(self.ctx, event);
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {

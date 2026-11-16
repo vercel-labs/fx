@@ -49,7 +49,6 @@
 #   no-free           the loop never frees what it emitted                NoLeak
 #   drop-kind         a front end drops notices                           Complete
 #   bypass-queue      the TUI shows text ahead of its queue               InOrder
-#   shim-no-copy      the shim hands an owning sink the lent payload      MemorySafe
 #
 # TurnEventsTrace.tla checks turns of the built fx binary against that model;
 # tests/tla/drivers/agent_runtime/turn_events.ts runs it.
@@ -89,13 +88,10 @@ MalformedToolCall malformed-tool-call-mutation-reconcile-loop ReconcileMalformed
 MalformedToolCall malformed-tool-call-mutation-search-reconcile SearchKeepsTools
 MCTurnEvents turn-events -
 MCTurnEvents turn-events-queued -
-MCTurnEvents turn-events-shim -
-MCTurnEvents turn-events-shim-queued -
 MCTurnEvents turn-events-today LoopFrees
 MCTurnEvents turn-events-mutation-keep-lent MemorySafe
 MCTurnEvents turn-events-mutation-free-in-front MemorySafe
 MCTurnEvents turn-events-mutation-no-free NoLeak
 MCTurnEvents turn-events-mutation-drop-kind Complete
 MCTurnEvents turn-events-mutation-bypass-queue InOrder
-MCTurnEvents turn-events-mutation-shim-no-copy MemorySafe
 VERDICTS

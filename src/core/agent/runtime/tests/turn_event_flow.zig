@@ -1,7 +1,6 @@
-//! `AgentRuntimeDeps.emit` for a front end that still sets the `push_*`
-//! sinks: each `TurnEvent` reaches the sink it replaces, in the order the
-//! loop emits it, and a sink that frees what it gets gets a copy of the lent
-//! event.
+//! `AgentRuntimeDeps.emit`: each `TurnEvent` reaches the front end's
+//! `emit_event` in the order the loop emits it, lent for the call. The fake
+//! front end in `support.zig` records each event by its kind.
 const std = @import("std");
 const support = @import("support.zig");
 
@@ -10,7 +9,7 @@ fn expectLog(fake: *const support.FakeAgentRuntimeDeps, expected: []const []cons
     for (expected, fake.log.items) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
-test "emit forwards each turn event to the sink it replaces, in order" {
+test "emit hands each turn event to the front end, in order" {
     var fake: support.FakeAgentRuntimeDeps = .{ .alloc = std.testing.allocator, .enable_interactive_notices = true };
     defer fake.deinit();
     const deps = fake.deps();
@@ -50,15 +49,14 @@ test "a front end without interactive notices gets a notice's plain text, and no
 
     try deps.emit(.{ .notice = .{ .semantic = .{ .topic = "system", .tone = .warning, .body = "rich" }, .plain = "fallback" } });
     try deps.emit(.{ .notice = .{ .semantic = .{ .topic = "skills", .tone = .warning, .body = "details" } } });
-    // No session sink and no reasoning sink: both are dropped, as the loop
-    // dropped them when the sink was null.
+    // The fake shows neither session notices nor reasoning.
     try deps.emit(.{ .session_notice = "once" });
     try deps.emit(.{ .reasoning_delta = "thinking" });
 
     try expectLog(&fake, &.{"system_notice:fallback"});
 }
 
-test "push_event and push_diff_block get a copy of the lent event, which they free" {
+test "a front end copies what it keeps of a lent event, and frees none of it" {
     var fake: support.FakeAgentRuntimeDeps = .{ .alloc = std.testing.allocator };
     defer fake.deinit();
     const deps = fake.deps();

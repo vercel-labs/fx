@@ -190,7 +190,6 @@ const TRACE_CFG = [
   "CONSTANTS",
   "    Script <- TScript",
   "    Queued = FALSE",
-  "    Shim = FALSE",
   "    Today = FALSE",
   '    Mutation = "none"',
   "INIT TraceInit",
