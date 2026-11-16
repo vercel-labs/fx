@@ -160,7 +160,13 @@ pub const ProvisionalToolStatuses = struct {
         var observed_kind = activity_kind;
         const argument_label: ?[]const u8 = if (is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
-            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
+            // While the arguments stream in they do not parse yet, but the
+            // action and the whole name after it already say what the call
+            // does, so its row does not read as a bare "Using" until they end.
+            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch streamed: {
+                const action = tooling_presentation.toolboxStreamedAction(scratch.allocator(), json) catch break :resource null;
+                break :streamed tool_args.parseToolArgsObject(scratch.allocator(), action orelse break :resource null) catch break :resource null;
+            };
             const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
             const presentation = tool_dispatch.presentationForArgs(spec.*, args);
             const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
@@ -2143,10 +2149,18 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
 test "provisional toolbox labels read as what the call opens, runs, or searches" {
     // The stream's hint is the first string in the arguments, which may name
     // what a run runs or what a search looks for, so it never labels the row.
+    // The action and its whole value label it as soon as they stream in.
     const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
         .{ .arguments_json = null, .label = "Using" },
         .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
         .{ .arguments_json = "{}", .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
+        .{ .arguments_json = "{\"search\":\"list files\"", .label = "Searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\",\"res", .label = "Opening", .value = "fixture" },
+        // A streamed skill location reads as the skill's name, never the
+        // opaque location.
+        .{ .arguments_json = "{\"open\":\"skill:0123456789abcdef:6/ste-english\",\"res", .label = "Opening", .value = "ste-english" },
         .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
         .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
