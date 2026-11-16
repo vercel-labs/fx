@@ -8385,7 +8385,7 @@ test "replay reads a cancelled command item a newer fx wrote and leaves out one 
     try testing.expect(decodeCancelledCommand(a, "{\"tool\":\"shell\"}") == null);
     const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
     @memset(long_id, 'c');
-    try testing.expect(decodeCancelledCommand(a, try std.fmt.allocPrint(a, "{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(decodeCancelledCommand(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
     try testing.expect(decodeCancelledCommand(a, "not json") == null);
 }
 
