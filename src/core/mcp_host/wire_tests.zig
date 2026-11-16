@@ -300,18 +300,52 @@ fn fuzzChallenge(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual(@as(usize, 240), discovery.max_description_bytes);
     // Cut at a character, never inside one, when the bytes were UTF-8.
     if (c.description) |text| if (std.unicode.utf8ValidateSlice(value)) try testing.expect(std.unicode.utf8ValidateSlice(text));
-    // The name may be written with escapes (`insuffic\\ient_scope` is the same word in a quoted string),
-    // so it is looked for with the backslashes taken out. The name has none, so what a quoted string
-    // spells out is the header's bytes without the backslashes that start an escape.
-    if (c.insufficient_scope) {
-        var plain: [2048]u8 = undefined;
-        var n: usize = 0;
-        for (value) |byte| if (byte != '\\') {
-            plain[n] = byte;
-            n += 1;
-        };
-        try testing.expect(std.mem.find(u8, plain[0..n], "insufficient_scope") != null);
+    // A step-up is named only when the header spells the name where a value can hold it.
+    if (c.insufficient_scope) try testing.expect(spellsStepUp(value));
+}
+
+/// Whether `value` spells `insufficient_scope` where the parser could read it as one value: as the plain
+/// bytes (an unquoted token, or a quoted string without escapes), or inside a quoted string whose
+/// escapes spell it, such as `"insuffic\ient_scope"` (RFC 9110 5.6.4: a backslash and the byte after
+/// it). A backslash outside a quoted string is part of the value, and an escaped backslash (`\\`) is a
+/// backslash in it, so neither spells the name. A quoted string may also run to the end of the header.
+fn spellsStepUp(value: []const u8) bool {
+    const name = "insufficient_scope";
+    if (std.mem.find(u8, value, name) != null) return true;
+    for (value, 0..) |byte, quote| {
+        if (byte != '"') continue;
+        var at = quote + 1;
+        var matched: usize = 0;
+        while (matched < name.len and at < value.len) : (matched += 1) {
+            if (value[at] == '\\' and at + 1 < value.len and value[at + 1] == name[matched]) {
+                at += 2;
+            } else if (value[at] == name[matched]) {
+                at += 1;
+            } else break;
+        }
+        if (matched == name.len and (at == value.len or value[at] == '"')) return true;
     }
+    return false;
+}
+
+test "the step-up law reads escapes only inside a quoted string" {
+    // The name, plain or quoted.
+    try testing.expect(spellsStepUp("Bearer error=insufficient_scope"));
+    try testing.expect(spellsStepUp("Bearer error=\"insufficient_scope\", scope=\"a\""));
+    // A quoted-pair spells it: the same word.
+    try testing.expect(spellsStepUp("Bearer error=\"insuffic\\ient_scope\""));
+    try testing.expect(spellsStepUp("Bearer error=\"\\insufficient_scope\""));
+    // The header the fuzzer found, after a first challenge that was not one, and a quoted string with no end.
+    try testing.expect(spellsStepUp("\"alm=\"a\", Bearer error=\"insuffic\\ient_scope\",Q="));
+    try testing.expect(spellsStepUp("Bearer error=\"insuffic\\ient_scope"));
+    // An escaped backslash is a backslash in the value, so it does not spell the name.
+    try testing.expect(!spellsStepUp("Bearer error=\"insuffic\\\\ient_scope\""));
+    // Outside a quoted string a backslash is part of the value.
+    try testing.expect(!spellsStepUp("Bearer error=insuffic\\ient_scope"));
+    try testing.expect(!spellsStepUp("Bearer error=x, scope=insuffic\\ient_scope"));
+    // A backslash before a byte the name does not have there, or none of the name at all.
+    try testing.expect(!spellsStepUp("Bearer error=\"insuffic\\xient_scope\""));
+    try testing.expect(!spellsStepUp("Bearer error=\"invalid_token\""));
 }
 
 fn expectSameText(x: ?[]const u8, y: ?[]const u8, bound: usize) !void {
