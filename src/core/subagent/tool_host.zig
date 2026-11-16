@@ -419,6 +419,61 @@ pub const Runtime = struct {
         alloc.free(entry.profile);
     }
 
+    /// What `/trace` says of one subagent from the registry.
+    pub const TraceChild = struct {
+        id: []u8,
+        phase: child_state.Phase,
+        /// How its last piece of work ended, or null before its first ends.
+        last_outcome: ?child_state.Outcome,
+        /// Why that work failed, or empty.
+        last_failure: []u8,
+        /// Whether `/close` is closing it.
+        closing: bool,
+    };
+
+    /// Every subagent of the root, with its work phase and last outcome,
+    /// one that is closing too. `alloc` owns the listing: `/trace` passes an
+    /// arena, and this file's tests free it with `freeTraceChildren`.
+    pub fn traceChildren(self: *Runtime, alloc: Allocator) ![]TraceChild {
+        // Admission before the registry, as everywhere in this host.
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        const listing = try alloc.alloc(TraceChild, registry.children.len);
+        var filled: usize = 0;
+        errdefer {
+            for (listing[0..filled]) |entry| freeTraced(alloc, entry);
+            alloc.free(listing);
+        }
+        for (registry.children) |child| {
+            const id = try alloc.dupe(u8, child.id);
+            errdefer alloc.free(id);
+            const failure = if (child.last_failure) |*diagnostic| diagnostic.view() else "";
+            listing[filled] = .{
+                .id = id,
+                .phase = child.phase,
+                .last_outcome = child.last_outcome,
+                .last_failure = try alloc.dupe(u8, failure),
+                .closing = self.closingIndexLocked(child.id) != null,
+            };
+            filled += 1;
+        }
+        return listing;
+    }
+
+    fn freeTraceChildren(alloc: Allocator, listing: []TraceChild) void {
+        for (listing) |entry| freeTraced(alloc, entry);
+        alloc.free(listing);
+    }
+
+    fn freeTraced(alloc: Allocator, entry: TraceChild) void {
+        alloc.free(entry.id);
+        alloc.free(entry.last_failure);
+    }
+
     /// A child's saved conversation, read without opening it. The caller
     /// owns the turns (`types.freeHistoryTurnSlice`).
     pub fn childHistory(self: *Runtime, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
@@ -1922,6 +1977,11 @@ pub const Runtime = struct {
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
     }
 
+    /// Whether a child was closed since the last `takeClosed`.
+    pub fn hasClosed(self: *const Runtime) bool {
+        return self.closed_waiting.load(.acquire);
+    }
+
     /// The children closed or closing since the last call, for the app to
     /// drop their agents. The caller owns the ids. Cheap when none is.
     pub fn takeClosed(self: *Runtime, alloc: Allocator) ![][]u8 {
@@ -3264,6 +3324,72 @@ test "stop ends a subagent's turn without a report and drops what waits for it" 
     try std.testing.expect(std.mem.find(u8, missing, "child_unavailable") != null);
 }
 
+test "trace children show each subagent's work phase, last outcome, and closing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 0), traced.len);
+    }
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 1), traced.len);
+        try std.testing.expectEqualStrings(child_id, traced[0].id);
+        try std.testing.expectEqual(child_state.Phase.running, traced[0].phase);
+        try std.testing.expect(traced[0].last_outcome == null);
+        try std.testing.expectEqualStrings("", traced[0].last_failure);
+        try std.testing.expect(!traced[0].closing);
+    }
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 1), traced.len);
+        try std.testing.expectEqual(child_state.Phase.idle, traced[0].phase);
+        try std.testing.expectEqual(child_state.Outcome.cancelled, traced[0].last_outcome.?);
+        try std.testing.expect(!traced[0].closing);
+    }
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-3", null);
+    try waitForRuns(&fixture, 2);
+    _ = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-4", null);
+    {
+        // The list drops a closing subagent at once; the trace keeps it,
+        // marked, until it is gone from the registry.
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expect(traced.len <= 1);
+        if (traced.len == 1) try std.testing.expect(traced[0].closing);
+    }
+    try waitUntilQuiet(runtime);
+    try waitUntilClosed(runtime, child_id);
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    {
+        const traced = try runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 0), traced.len);
+    }
+}
+
 test "the parent's close ends a working subagent's turn without a report and removes it for good" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3288,6 +3414,7 @@ test "the parent's close ends a working subagent's turn without a report and rem
     defer Runtime.freeChildListing(alloc, listing);
     try std.testing.expectEqual(@as(usize, 0), listing.len);
     try waitUntilQuiet(runtime);
+    try waitUntilClosed(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
     {
@@ -3329,6 +3456,7 @@ test "the user's close of a working subagent reports that the user closed it" {
     const closed = (try runtime.closeChild(child_id, .user)).?;
     try std.testing.expect(closed.stopped);
     try waitUntilQuiet(runtime);
+    try waitUntilClosed(runtime, child_id);
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
     try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, fixture.ends.items[0]);
     try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user closed it before it finished.") != null);
@@ -4121,7 +4249,6 @@ test "a subagent's message its parent can't take says so, and keeps nothing of w
     try std.testing.expectEqual(@as(usize, 1), worker.typed_this_turn.items.len);
 }
 
-/// Waits, in a test, until no child of `runtime` works.
 /// Waits until `child_id`'s work in the parent's log is `work_id`.
 fn waitForActiveWork(runtime: *Runtime, arena: Allocator, child_id: []const u8, work_id: []const u8) !void {
     for (0..5000) |_| {
@@ -4136,9 +4263,30 @@ fn waitForActiveWork(runtime: *Runtime, arena: Allocator, child_id: []const u8, 
     return error.Timeout;
 }
 
+/// Waits, in a test, until no child of `runtime` works and no message waits
+/// for one. A close of a working child is not written by then: its slot
+/// writes the close once the work has ended and stopped counting as working,
+/// so a test that reads the registry after such a close waits with
+/// `waitUntilClosed` too.
 fn waitUntilQuiet(runtime: *Runtime) !void {
     for (0..5000) |_| {
         if (runtime.quiet()) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Waits, in a test, until the registry no longer holds `child_id`, which is
+/// when the close of a working child has been written.
+fn waitUntilClosed(runtime: *Runtime, child_id: []const u8) !void {
+    for (0..5000) |_| {
+        {
+            var lock = runtime.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try runtime.managed.state_store.load(std.testing.allocator);
+            defer registry.deinit(std.testing.allocator);
+            if (registry.findById(child_id) == null) return;
+        }
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.Timeout;

@@ -3,6 +3,7 @@ const result_store = @import("../../core/session/result_store.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const json_depth = @import("../../core/shared/json_depth.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
@@ -43,7 +44,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var parsed = decoder.parse(args_json) catch |err| return .{ .failure = try decoder.takeFailure(err) };
     defer parsed.deinit();
     // The row reads the request the same way (read_tool_result_presentation.zig).
-    const args = (try read_result_presentation.requestObject(parsed.arena.allocator(), parsed.value.object)) orelse {
+    const args = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
     };
     if (args.get("search")) |value| {
@@ -412,7 +413,7 @@ fn fuzzRequestText(_: void, smith: *std.testing.Smith) !void {
 
     const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
     const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
-    const request = try read_result_presentation.requestObject(arena, args);
+    const request = try tool_args.unwrapRequest(arena, args);
 
     // decode refuses the request exactly when the row finds no object in it.
     switch (try decode(.{ .allocator = alloc }, args_json)) {
@@ -426,16 +427,45 @@ fn fuzzRequestText(_: void, smith: *std.testing.Smith) !void {
         },
     }
 
-    // The row's label for the text is the label of the object it holds, or
-    // the tool's default when the text does not fit the label's buffer.
-    const from_text = presentation(args) orelse return;
-    const object_json = try std.json.Stringify.valueAlloc(arena, .{ .request = std.json.Value{ .object = request.? } }, .{});
+    // The row reads the text in place, whatever its length, and gives it the
+    // label of the object a full parse finds in it. Its two differences are
+    // here. A parse refuses a text that repeats a field, at any depth, but the
+    // row sees only a repeat of a field it reads. And a handle written with
+    // escapes that decodes to more than the row has room for keeps the tool's
+    // default label.
+    const from_text = presentation(args);
+    const object = request orelse {
+        if (from_text != null) try expectRefusedOnlyForRepeatedField(arena, text);
+        return;
+    };
+    const object_json = try std.json.Stringify.valueAlloc(arena, .{ .request = std.json.Value{ .object = object } }, .{});
     const object_args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, object_json, .{})).object;
-    const from_object = presentation(object_args) orelse return error.TestExpectedPresentation;
-    try std.testing.expectEqual(from_object.activity_kind, from_text.activity_kind);
-    try std.testing.expectEqualStrings(from_object.action_label, from_text.action_label);
-    try std.testing.expectEqualStrings(from_object.completed_action_label, from_text.completed_action_label);
-    try std.testing.expectEqualStrings(from_object.label_arg_default, from_text.label_arg_default);
+    const from_object = presentation(object_args);
+    const label = from_text orelse {
+        if (from_object != null) {
+            try std.testing.expect(object.get("search") == null);
+            const handle = object.get("handle") orelse return error.TestExpectedHandle;
+            try std.testing.expect(handle == .string);
+            try std.testing.expect(handle.string.len > read_result_presentation.max_escaped_handle_bytes);
+            try std.testing.expect(std.mem.findScalar(u8, text, '\\') != null);
+        }
+        return;
+    };
+    const expected = from_object orelse return error.TestRowNamesWhatTheObjectDoesNot;
+    try std.testing.expectEqual(expected.activity_kind, label.activity_kind);
+    try std.testing.expectEqualStrings(expected.action_label, label.action_label);
+    try std.testing.expectEqualStrings(expected.completed_action_label, label.completed_action_label);
+    try std.testing.expectEqualStrings(expected.label_arg_default, label.label_arg_default);
+}
+
+/// The text a parse refuses and the row names anyway: a parse of it fails only
+/// on a field that repeats.
+fn expectRefusedOnlyForRepeatedField(arena: Allocator, text: []const u8) !void {
+    try std.testing.expect(!json_depth.exceeds(text));
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .allocate = .alloc_always });
+    if (parsed) |_| return error.TestParseAcceptedTheText else |err| {
+        if (err != error.DuplicateField) return error.TestParseFailedForAnotherReason;
+    }
 }
 
 test "read_tool_result requests sent as JSON text decode and label alike" {
@@ -449,6 +479,12 @@ test "read_tool_result requests sent as JSON text decode and label alike" {
             "[1]",
             "\"{\\\"handle\\\":\\\"h.txt\\\"}\"",
             "{",
+            // Text past what a parse in a small buffer once held, a repeated field the row reads and one it does not, and a handle with escapes past its room.
+            "{\"handle\":\"result-x\",\"query\":\"" ++ text_utils.repeat("q", 5000) ++ "\"}",
+            "{\"handle\":\"t5\",\"handle\":\"t6\"}",
+            "{\"handle\":\"t5\",\"x\":1,\"x\":2}",
+            "{\"h\\u0061ndle\":\"result-\\u0078\",\"query\":\"e\"}",
+            "{\"handle\":\"" ++ text_utils.repeat("\\u0078", 1030) ++ "\"}",
         }) ++ @import("fuzz_corpus").read_tool_result_request_text.*),
     });
 }

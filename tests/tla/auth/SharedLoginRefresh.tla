@@ -1,11 +1,15 @@
 ---- MODULE SharedLoginRefresh ----
-\* fx processes that share one saved fx login, after the gateway answers a
-\* request with 401 (src/core/auth/credentials.zig
-\* refreshFxLoginCredentialLocked, reached from the 401 replay in
-\* src/core/agent/runtime/orchestrator.zig).
+\* fx processes that share one saved login, after the provider answers a
+\* request with 401: the fx login (src/core/auth/credentials.zig
+\* refreshFxLoginCredentialLocked) or a Codex or Grok subscription login
+\* (src/core/auth/chatgpt_oauth.zig and grok_oauth.zig loadAccess), all
+\* deciding through src/core/auth/oauth.zig rejectedLoginRotates and reached
+\* from the 401 replay in src/core/agent/runtime/orchestrator.zig.
 \*
 \* Each process holds the access token it last loaded. The saved login sits
-\* behind one lock (src/core/auth/oauth_session.zig beginExistingMutation).
+\* behind one lock: src/core/auth/oauth_session.zig beginExistingMutation for
+\* the fx login, and src/core/auth/subscription_session.zig
+\* beginExistingMutation for a Codex or Grok login.
 \* The issuer rotates the refresh token on every refresh and the gateway then
 \* takes only the newest access token, so one process's refresh leaves every
 \* other process holding a token the gateway rejects. Tokens are numbered by

@@ -3,16 +3,14 @@
 # as restored from the saved turn (SavedTurn.tla), with TLC, and require each
 # config's expected verdict.
 #
-# saved-turn.cfg and saved-turn-kept.cfg must pass: the next turn's request
-# starts with the turn's last request, and so does each request of a turn with
-# the one before it. saved-turn.cfg is the design with open PR 1829, which marks
-# a tool's notice and a Stop hook's message so the save keeps them.
-# saved-turn-kept.cfg is what this change keeps without those two messages.
-# saved-turn-main.cfg is this head, which sends both with no marker, so the save
-# drops them (NothingDropped): a known limit that PR 1829 removes. When it
-# lands, saved-turn.cfg describes fx and this config goes. saved-turn-today.cfg
-# is fx before the change, where a changed runtime context joined a boundary
-# after the steering the last step ended with (NotesFirst).
+# saved-turn.cfg must pass: the next turn's request starts with the turn's last
+# request, and so does each request of a turn with the one before it. It is the
+# design fx implements: a tool's notice joins once its step's results and
+# feedback are in, the notice and a Stop hook's message are marked as fx's own
+# steering so the save keeps them, and a boundary's notes join before the
+# steering the last step ended with.
+# saved-turn-today.cfg is fx before a boundary's notes joined ahead of that
+# steering, where a changed runtime context joined after it (NotesFirst).
 # saved-turn-double-trail.cfg is a known limit, not a defect: when a reply adds
 # a second steering message to a tail the last request already carried, a note
 # joins ahead of the carried one, so that one request differs from the one
@@ -44,8 +42,6 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'VERDICTS'
 SavedTurn saved-turn -
-SavedTurn saved-turn-kept -
-SavedTurn saved-turn-main NothingDropped
 SavedTurn saved-turn-today NotesFirst
 SavedTurn saved-turn-double-trail RequestsExtend
 SavedTurn saved-turn-mutation-notice-inline ResultsTogether
