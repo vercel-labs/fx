@@ -604,6 +604,49 @@ test "processQueuedPrompt terminal outcomes finalize exactly once before optiona
     }
 }
 
+test "a cancelled turn is reported before the commands steering detached are stopped" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |explicit_cancel| {
+        const completions = [_]FakeCompletion{.{ .cancel_before_output = true }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.steering_detached_explicit_cancel = explicit_cancel;
+        var fixture = PromptFixture{};
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+        // Asked before the report: a prompt typed once the turn is reported
+        // can join its ending as steering.
+        const asked = logIndex(&hooks, "hook:explicit_cancel").?;
+        const reported = logIndex(&hooks, "event:turn_finished").?;
+        const finished = logIndex(&hooks, "event:finish_prompt").?;
+        try std.testing.expect(asked < reported);
+        // A stop that waits seconds on a stubborn command never holds the
+        // turn's end, and a turn steering ended stops nothing.
+        if (logIndex(&hooks, "hook:stop_steering_detached")) |stopped| {
+            try std.testing.expect(explicit_cancel);
+            try std.testing.expect(finished < stopped);
+        } else try std.testing.expect(!explicit_cancel);
+    }
+}
+
+test "a turn that completes never asks to stop steering-detached commands" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.steering_detached_explicit_cancel = true;
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expect(logIndex(&hooks, "hook:explicit_cancel") == null);
+    try std.testing.expect(logIndex(&hooks, "hook:stop_steering_detached") == null);
+}
+
 test "partial stream failure persists failed terminal reason" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{

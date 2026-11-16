@@ -23,7 +23,7 @@ import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
-import { rotateFxLogin } from "./fx-login-fakes";
+import { rotateFxLogin, startFakeIssuer, storedFxLoginToken, writeFxLogin } from "./fx-login-fakes";
 import { rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -446,6 +446,13 @@ function startRequestCatcher() {
       server.stop(true);
     },
   };
+}
+
+/// Waits until the credits fake has seen `count` requests.
+async function waitForCreditsRequests(creditsGateway: { requests: unknown[] }, count: number) {
+  const deadline = Date.now() + TIMEOUT;
+  while (creditsGateway.requests.length < count && Date.now() < deadline) await Bun.sleep(25);
+  expect(creditsGateway.requests).toHaveLength(count);
 }
 
 function startFakeCreditsGateway() {
@@ -3012,6 +3019,11 @@ tmuxTest(
     // The login was already on this team, so nothing changed.
     const signedIn = await session.captureFullScrollback();
     expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).not.toContain("auth: Using Vercel team");
+    expect(signedIn).toContain("Get $150 of tokens for $30 with Vercel Token Pass.");
+    // The link sits behind the name, so the address never shows.
+    expect(signedIn).not.toContain("vercel.com/get/token-pass");
+    expect(signedIn).not.toContain("Preparing Vercel AI Gateway");
     expect(signedIn).not.toContain("Changed Vercel team");
 
     expect(gateway.requests).toHaveLength(2);
@@ -3982,7 +3994,10 @@ tmuxTest(
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
         pane.includes("gpt-5.4-mini") &&
-        !pane.includes("openai/gpt-5.6-sol"),
+        !pane
+          .split("\n")
+          .filter((line) => /^\s+\S*gpt-/.test(line))
+          .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
     expect(codexCatalog).toContain("[All]");
@@ -9566,11 +9581,11 @@ tmuxTest(
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
     ]);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // /credits, and the Token Pass check the renewed login starts: both
+    // with the renewed token.
+    await waitForCreditsRequests(creditsGateway, 2);
+    const renewed = { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` };
+    expect(creditsGateway.requests).toEqual([renewed, renewed]);
     await waitForModelRequestCount(gateway, 2);
     expect(gateway.modelRequests).toHaveLength(2);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
@@ -9614,11 +9629,13 @@ tmuxTest(
 
     await session.waitForText("* credits: balance=42", TIMEOUT);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(1);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // The Token Pass check at launch, with the login that was current
+    // then, and /credits with the renewed one.
+    await waitForCreditsRequests(creditsGateway, 2);
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -9731,11 +9748,16 @@ tmuxTest(
       FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
     });
     await session.waitForComposer(TIMEOUT);
+    // The Token Pass check at launch uses the login while it is current.
+    await waitForCreditsRequests(creditsGateway, 1);
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
     await session.sendText("/credits");
     await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
-    expect(creditsGateway.requests).toEqual([]);
+    // /credits sends nothing with the expired login.
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -10422,6 +10444,51 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
     await session.waitForSessionEnd(3000);
     session = null;
   } finally { release(); grok.stop(); }
+}, TIMEOUT);
+
+tmuxTest("a cancelled provider switch ends at once while its sign-in refresh finishes and saves the login", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-cancel-refresh-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let refreshHeld = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  // The issuer holds the refresh, as a slow one does: a cancel must not wait
+  // for it, and must not cut it off.
+  const issuer = startFakeIssuer({ refresh: async () => {
+    refreshHeld = true;
+    await held;
+    return "renewed-login-token";
+  } });
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    // Expired, so preparing AI Gateway refreshes it first.
+    writeFxLogin(home, issuer.issuerUrl, "expired-login-token", { expiresAtMs: Date.now() - 60_000 });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    session = await startFx(home, stderrPath, gateway, issuer.issuerUrl, undefined, { ...chatgptOauth.env, AI_GATEWAY_API_KEY: undefined, FX_MODEL: undefined, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => refreshHeld, 5000);
+    await session.sendKeys("C-c");
+    await session.waitForText("Provider preparation cancelled.", 1500);
+    expect(storedFxLoginToken(home)).toBe("expired-login-token");
+    // A logout would wait for the login's lock, which the refresh holds: it
+    // is refused at once, and the terminal stays responsive.
+    await session.sendText("/logout vercel");
+    await session.waitForText("A sign-in refresh is still finishing. Try again in a moment.", 1500);
+
+    release();
+    const deadline = Date.now() + 5000;
+    while (storedFxLoginToken(home) !== "renewed-login-token" && Date.now() < deadline) await Bun.sleep(25);
+    expect(storedFxLoginToken(home)).toBe("renewed-login-token");
+    expect(issuer.refreshes).toHaveLength(1);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(3000);
+    session = null;
+  } finally { release(); issuer.stop(); }
 }, TIMEOUT);
 
 tmuxTest("provider recovery continues after a held prompt and failed catalog", async () => {

@@ -49,6 +49,8 @@ import {
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  localCreditsEnv,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -197,6 +199,13 @@ function partialEofResponse(text: string): Response {
     })}\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
+}
+
+/// A credits reply for a team with Token Pass, or for one without.
+function tokenPassCreditsReply(hasPass: boolean) {
+  return (url: URL) => url.pathname === "/coding-agent/v1/credits"
+    ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
+    : null;
 }
 
 function fakeGatewayEnv(
@@ -678,11 +687,11 @@ class AcpClient {
       }
     }
     const proc = nodeSpawn(FX_BIN, args, {
-      env: providerVersionTestEnv({
+      env: localCreditsEnv(providerVersionTestEnv({
         ...inheritedEnv,
         NO_COLOR: "1",
         PATH: inheritedEnv.PATH ?? "",
-      }),
+      })),
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -1211,14 +1220,15 @@ test("ACP finishes tool calls that a cancel stopped before they ran", async () =
 
 test("ACP finishes a provider search the turn ended before it finished", async () => {
   const root = createIsolatedRoot("fx-acp-open-search-");
-  // Every attempt starts a provider search, then the stream breaks off, so
-  // recovery gives up with the search announced and never finished.
-  const brokenSearch = () => new Response(
+  // The first attempt starts a provider search, then the stream breaks off.
+  // A search only reads, so fx resends with tools on, and the answer to that
+  // resend ends the turn with the search announced and never finished.
+  const brokenSearch = new Response(
     `data: ${JSON.stringify({ type: "tool-input-start", id: "search_open", toolName: "exa_search" })}\n\n`
       + `data: ${JSON.stringify({ type: "tool-input-delta", id: "search_open", delta: "{\"query\":" })}\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
-  const gateway = startFakeGateway(Array.from({ length: 12 }, brokenSearch));
+  const gateway = startFakeGateway([brokenSearch, finalText("Answered without the search.")]);
   let client: AcpClient | undefined;
   try {
     client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
@@ -1227,13 +1237,16 @@ test("ACP finishes a provider search the turn ended before it finished", async (
     if (created.error) throw new Error(JSON.stringify(created));
     sendPrompt(client, 3, "Search the web.");
     const { responses } = await readUntilResponses(client, [3]);
-    expect(responses.get(3)!.result.stopReason).toBe("refused");
+    expect(responses.get(3)!.result.stopReason).toBe("end_turn");
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]!.body).not.toContain('"toolChoice":{"type":"none"}');
+    expect(gateway.requests[1]!.body).toContain("search again if you still need one");
     const search = client.rawLines
       .map(line => JSON.parse(line))
       .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "search_open")
       .map((message: any) => message.params.update);
     expect(search.map((update: any) => update.status)).toEqual(["pending", "failed"]);
-    expect(acpContentText(search[1].content)).toBe("Tool state preserved for recovery");
+    expect(acpContentText(search[1].content)).toBe("Tool completion was not reported");
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();
@@ -1666,6 +1679,8 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-token-pass-title-");
       const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
         titleResponses: [finalText("ACP Token Pass Title")],
+        models: tokenPassCatalog(true),
+        usage: tokenPassCreditsReply(true),
       });
       try {
         client = await AcpClient.create({
@@ -1688,6 +1703,80 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP takes Token Pass from the model list's marks when the credits check fails",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-token-pass-catalog-");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_CATALOG_PASS_OK"), {
+        titleResponses: [finalText("ACP Catalog Pass Title")],
+        models: tokenPassCatalog(true),
+        usage: (url) => url.pathname === "/coding-agent/v1/credits" ? new Response("unavailable", { status: 503 }) : null,
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Which model answers?", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        // The catalog loaded at initialize answers for the team.
+        expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["deepseek/deepseek-v4.1-flash"]);
+        expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["zai/glm-5.3-flash"]);
+        const saved = JSON.parse(readFileSync(join(root.home, ".fx", "token-pass.json"), "utf8"));
+        expect(Object.values(saved.teams)).toEqual(["has_pass"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP starts new sessions on the Token Pass default for a team with Token Pass and on the built-in default otherwise",
+    async () => {
+      for (const hasPass of [true, false]) {
+        const root = createIsolatedRoot("fx-acp-token-pass-start-");
+        const gateway = startDynamicFakeGateway(_raw => finalText("ACP_START_MODEL_OK"), {
+          titleResponses: [finalText("ACP Start Model Title")],
+          models: tokenPassCatalog(hasPass),
+          usage: tokenPassCreditsReply(hasPass),
+        });
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          await client.request("session/new", { mcpServers: [] }, 2);
+          await client.readLine();
+          const result = await runPrompt(client, "Which model answers?", TIMEOUT);
+          expect(result.promptResult.result.stopReason).toBe("end_turn");
+          expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id")))
+            .toEqual([hasPass ? "deepseek/deepseek-v4.1-flash" : "spacexai/grok-4.7"]);
+          expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
+            .toEqual([hasPass ? "zai/glm-5.3-flash" : "openai/gpt-5.6-luna"]);
+          // The answer is saved for the next run, and the model is not.
+          const saved = JSON.parse(readFileSync(join(root.home, ".fx", "token-pass.json"), "utf8"));
+          expect(Object.values(saved.teams)).toEqual([hasPass ? "has_pass" : "no_pass"]);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          client = undefined;
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
       }
     },
     TIMEOUT,
@@ -1779,6 +1868,144 @@ describe("acp: model-independent", () => {
         expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token", "refreshed-token"]);
         expect(issuer.refreshes).toHaveLength(1);
         expect(storedFxLoginToken(root.home)).toBe("refreshed-token");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP renews a login the gateway rejects during a turn's compaction and the turn sends the renewed one after it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-compaction-401-");
+      writeFileSync(join(root.workspace, "notes.md"), "recorded notes ".repeat(400));
+      const issuer = startFakeIssuer({ refresh: () => "refreshed-token" });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      const kinds: string[] = [];
+      let turnRequests = 0;
+      // The token the gateway accepts. The launch token expires when the
+      // compaction asks for its summary, and the store still holds it.
+      let valid = "launch-token";
+      // The turn reads a file, then overflows the context, so it compacts.
+      const gateway = startDynamicFakeGateway((raw) => {
+        const sent = bearer(gateway.requests[gateway.requests.length - 1].headers);
+        const summary = JSON.parse(raw).toolChoice?.type === "none";
+        kinds.push(summary ? "summary" : "turn");
+        if (summary && valid === "launch-token") valid = "refreshed-token";
+        if (sent !== valid) return unauthorized();
+        if (summary) return finalText("Retain the notes the turn read.");
+        turnRequests += 1;
+        if (turnRequests === 1) return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.md" });
+        if (turnRequests === 2) {
+          return Response.json({ error: { message: "AI_APICallError: Your input exceeds the context window of this model." } }, { status: 400 });
+        }
+        return finalText("ACP_COMPACTED_ANSWER_OK");
+      }, {
+        titleResponses: [() => finalText("ACP Generated Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Read notes.md, then answer.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_COMPACTED_ANSWER_OK");
+        expect(kinds).toEqual(["turn", "turn", "summary", "summary", "turn"]);
+        // The summary is sent once more with the renewed login, and the rest
+        // of the turn sends it too.
+        expect(gateway.requests.map((request) => bearer(request.headers))).toEqual([
+          "launch-token",
+          "launch-token",
+          "launch-token",
+          "refreshed-token",
+          "refreshed-token",
+        ]);
+        expect(issuer.refreshes).toHaveLength(1);
+        expect(storedFxLoginToken(root.home)).toBe("refreshed-token");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        issuer.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP keeps sending its own copy of a rejected login when a turn's compaction cannot renew it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-compaction-401-down-");
+      writeFileSync(join(root.workspace, "notes.md"), "recorded notes ".repeat(400));
+      // The issuer is down, so the forced refresh gives nothing.
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+      const kinds: string[] = [];
+      let turnRequests = 0;
+      // The turn reads a file, then overflows the context, so it compacts.
+      // The gateway rejects every summary request, the compaction's own and
+      // the fallback the compactor sends after it.
+      const gateway = startDynamicFakeGateway((raw) => {
+        const summary = JSON.parse(raw).toolChoice?.type === "none";
+        kinds.push(summary ? "summary" : "turn");
+        if (summary) return unauthorized();
+        turnRequests += 1;
+        if (turnRequests === 1) return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.md" });
+        if (turnRequests === 2) {
+          return Response.json({ error: { message: "AI_APICallError: Your input exceeds the context window of this model." } }, { status: 400 });
+        }
+        return finalText("ACP_AFTER_FAILED_COMPACTION");
+      }, {
+        titleResponses: [() => finalText("ACP Generated Title")],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_OAUTH_CLIENT_ID: "test-client",
+            FX_SOUND: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        await runPrompt(client, "Read notes.md, then answer.", TIMEOUT);
+
+        // The host's reload freed the credential the turn borrowed. The
+        // fallback summary still goes out, with the stored login, never with
+        // freed bytes.
+        expect(kinds).toEqual(["turn", "turn", "summary", "summary"]);
+        expect(gateway.requests.map((request) => bearer(request.headers))).toEqual([
+          "launch-token",
+          "launch-token",
+          "launch-token",
+          "launch-token",
+        ]);
+        expect(issuer.refreshes).toHaveLength(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

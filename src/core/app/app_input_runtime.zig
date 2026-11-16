@@ -1126,6 +1126,19 @@ pub fn Runtime(comptime App: type) type {
                         try openModelPickerShortcut(app);
                     }
                 },
+                .cycle_effort => {
+                    // Ctrl+T sets the effort of the agent on screen, as
+                    // `/effort` does.
+                    const agent = agents.screenAgentOf(app);
+                    if (effortCycleShortcutBlocked(app, agent)) return .done;
+                    // The `/effort` menu marks the level that was in use
+                    // when it opened.
+                    if (cancelEffortMenu(app)) {
+                        debug_trace.logf("input", "effort menu closed without applying its highlight reason=ctrl_t_cycle", .{});
+                    }
+                    try session_commands.Commands(App).cycleEffort(app, agent);
+                    app.shell.render_requests.request(.footer);
+                },
                 .paste_start => dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app)),
                 .paste_end => {},
                 .remapped_byte => unreachable,
@@ -2205,6 +2218,22 @@ pub fn Runtime(comptime App: type) type {
                 if (app.terminal.fullTranscriptScreenActive()) return true;
             }
             return false;
+        }
+
+        /// Ctrl+T is a no-op while another surface owns the keyboard, and
+        /// while the model picker or an `/effort ` query previews a level in
+        /// the status line that is not the one in use.
+        fn effortCycleShortcutBlocked(app: *App, agent: *AppAgent) bool {
+            const reason: []const u8 = if (modelPickerShortcutBlocked(app, agent))
+                "surface_owns_input"
+            else if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null)
+                "model_picker_open"
+            else if (completion_rt.hasModelQuery(app))
+                "model_query"
+            else
+                return false;
+            debug_trace.logf("input", "ctrl+t effort cycle ignored reason={s}", .{reason});
+            return true;
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App, agent: *AppAgent) !bool {
@@ -9062,6 +9091,206 @@ test "app_input_runtime ctrl+p leaves the draft alone when a decision owns input
         try std.testing.expectEqualStrings("undisturbed", app.input_runtime.edit_state.input.items);
         try std.testing.expect(app.input_runtime.model_picker_draft == null);
     }
+}
+
+const routing_cycle_efforts = [_]types.ReasoningEffort{
+    types.ReasoningEffort.literal("low"),
+    types.ReasoningEffort.literal("medium"),
+    types.ReasoningEffort.literal("high"),
+};
+
+test "app_input_runtime ctrl+t steps from default through the model's effort levels and back to default" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    try app.input_runtime.textReplacementState().replace(alloc, "keep this draft");
+    app.input_runtime.edit_state.cursor = 4;
+
+    // From `default` the first press takes the first level the model lists,
+    // and the press after the last one goes back to `default`.
+    const expected = routing_cycle_efforts ++ [_]types.ReasoningEffort{ .auto, routing_cycle_efforts[0] };
+    for (expected, 1..) |effort, press| {
+        app.shell.render_requests.clearReason(.footer);
+        try feedRoutingBytes(&app, "\x14");
+
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(effort, app.last_preference_effort.?);
+        try std.testing.expectEqual(press, app.preference_commit_count);
+        try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    }
+
+    // The status line names the level; the draft and the transcript are
+    // left alone, and the model stays the one in use.
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    try std.testing.expectEqualStrings("", app.transcript.items);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.last_preference_model.items);
+}
+
+test "app_input_runtime ctrl+t reported as a key or after a bare escape still cycles the effort" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+
+    // The kitty keyboard protocol reports Ctrl+T as a key.
+    try feedRoutingBytes(&app, "\x1b[116;5u");
+    try std.testing.expectEqual(routing_cycle_efforts[0], app.agent().effort);
+
+    try feedRoutingBytes(&app, "\x1b\x14");
+    try std.testing.expectEqual(routing_cycle_efforts[1], app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 2), app.preference_commit_count);
+}
+
+test "app_input_runtime ctrl+t moves a level the model does not offer to default and toggles an only level" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    app.agent().effort = types.ReasoningEffort.literal("saved-for-another-model");
+
+    try feedRoutingBytes(&app, "\x14");
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.last_preference_effort.?);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+
+    // A model with one level switches between it and `default`.
+    app.setGatewayControls("test/model", routing_cycle_efforts[0..1], false);
+    for ([_]types.ReasoningEffort{ routing_cycle_efforts[0], .auto }, 2..) |effort, commits| {
+        try feedRoutingBytes(&app, "\x14");
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(commits, app.preference_commit_count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "app_input_runtime ctrl+t on a model without levels says why and changes nothing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try feedRoutingBytes(&app, "\x14");
+    try std.testing.expectEqualStrings("effort", app.notice_topic.items);
+    try std.testing.expectEqualStrings("test/model has no levels to choose from", app.notice_body.items);
+
+    app.model_cache_loading = true;
+    try feedRoutingBytes(&app, "\x14");
+    try std.testing.expectEqualStrings(
+        "levels for test/model are still loading; try ctrl+t again in a moment",
+        app.notice_body.items,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime ctrl+t leaves the effort alone when a decision owns input" {
+    const alloc = std.testing.allocator;
+    for ([_]RoutingDecisionKind{ .question, .approval }) |kind| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+        try activateRoutingDecision(&app, kind);
+
+        try feedRoutingBytes(&app, "\x14");
+
+        try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    }
+}
+
+test "app_input_runtime ctrl+t leaves the effort alone while the model picker previews one" {
+    const alloc = std.testing.allocator;
+    const Stage = enum { catalog, inline_effort };
+    for ([_]Stage{ .catalog, .inline_effort }) |stage| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+        switch (stage) {
+            .catalog => {
+                try app.input_runtime.textReplacementState().replace(alloc, "draft");
+                try feedRoutingBytes(&app, "\x10");
+                try std.testing.expect(app.model_cache.menu.active);
+            },
+            .inline_effort => {
+                try enterRoutingShortcutEffortStage(&app, "draft", 2);
+                try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
+            },
+        }
+        const borrowed_composer = try alloc.dupe(u8, app.input_runtime.edit_state.input.items);
+        defer alloc.free(borrowed_composer);
+
+        try feedRoutingBytes(&app, "\x14");
+
+        // The picker keeps the keyboard and its stashed draft.
+        try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+        try std.testing.expectEqualStrings(borrowed_composer, app.input_runtime.edit_state.input.items);
+        try std.testing.expect(app.input_runtime.model_picker_draft != null);
+        try std.testing.expectEqual(stage == .catalog, app.model_cache.menu.active);
+    }
+}
+
+test "app_input_runtime ctrl+t leaves the effort alone while another surface owns the keyboard" {
+    const alloc = std.testing.allocator;
+    const Surface = enum { effort_query, model_query, auth_picker, settings_menu, help_menu };
+    for ([_]Surface{ .effort_query, .model_query, .auth_picker, .settings_menu, .help_menu }) |surface| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+        switch (surface) {
+            // The `/effort ` and `/model ` columns under the composer preview
+            // a level in the status line.
+            .effort_query => try app.input_runtime.textReplacementState().replace(alloc, "/effort "),
+            .model_query => try app.input_runtime.textReplacementState().replace(alloc, "/model test"),
+            .auth_picker => try openRoutingAuthPicker(&app),
+            .settings_menu => app.input_runtime.settings_menu.open(),
+            .help_menu => app.input_runtime.help_menu.open(),
+        }
+        if (surface == .effort_query or surface == .model_query) {
+            try std.testing.expect(input_completion_runtime.CompletionRuntime(RoutingFakeApp).hasModelQuery(&app));
+        }
+        const composer = try alloc.dupe(u8, app.input_runtime.edit_state.input.items);
+        defer alloc.free(composer);
+
+        try feedRoutingBytes(&app, "\x14");
+
+        try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+        try std.testing.expectEqualStrings(composer, app.input_runtime.edit_state.input.items);
+    }
+}
+
+test "app_input_runtime ctrl+t closes the open effort menu and cycles from the level in use" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    app.agent().effort = routing_cycle_efforts[1];
+    try app.input_runtime.effort_menu.open(
+        alloc,
+        "test/model",
+        app.resolvedModelCapabilities("test/model"),
+        app.agent().effort,
+    );
+    // The highlight is not the level in use, and Ctrl+T does not apply it.
+    app.input_runtime.effort_menu.move(-1);
+
+    try feedRoutingBytes(&app, "\x14");
+
+    try std.testing.expect(!app.input_runtime.effort_menu.active);
+    try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
 }
 
 test "app_input_runtime ctrl+c while the picker borrows the composer keeps the stashed draft and its image" {

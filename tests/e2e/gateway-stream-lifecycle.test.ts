@@ -33,7 +33,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -47,6 +47,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const MODEL = "openai/gpt-5.5";
 /** The frame every subagent report arrives in (`src/core/subagent/reports.zig`). */
@@ -200,14 +201,14 @@ function compactionRaceFixture(label: string) {
 const RACE_PROMPT = "Read notes.txt until told to stop. RACE_MAIN_PROMPT";
 
 /// The records the `compaction_records` lines of session `id` list, besides
-/// each line's own map, which every such line lists too (D50). The log is
-/// read raw: the mid-turn compaction makes fx write the turn afresh as
-/// superseded, which logLines refuses.
+/// each line's own map, which every such line lists too (D50). The mid-turn
+/// compaction makes fx write the turn afresh as superseded, which logLines
+/// refuses. logLinesAfterCompaction accepts that supersede only when a
+/// compaction in the same turn explains it, so this read also checks it is the
+/// designed one.
 function listedRecords(home: string, id: string): string[] {
-  const lines = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8")
-    .split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const listed: string[] = [];
-  for (const line of lines) {
+  for (const line of logLinesAfterCompaction(home, id) as any[]) {
     if (line.kind !== "set" || line.key !== "compaction_records") continue;
     expect(line.blobs).toContain(line.value.map);
     listed.push(...(line.blobs as string[]).filter((hash) => hash !== line.value.map));
@@ -7942,6 +7943,56 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 40_000);
 
+  test("a subagent message whose request wrapper the model wrote as JSON text reaches the worker", async () => {
+    const root = createFixtureRoot("subagent-request-text");
+    const tracePath = join(root.root, "trace.log");
+    const childBodies: string[] = [];
+    let sentBody = "";
+    let statusBody = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childBodies.push(body);
+        return fakeGatewayFinalText("CHILD_TEXT_REQUEST_DONE");
+      }
+      // The worker answers at once, so its report may reach the parent before
+      // either call's result does; each result is taken from the first request
+      // that carries it, report or not.
+      if (body.includes("text-status") && !statusBody) {
+        statusBody = body;
+        return fakeGatewayFinalText("PARENT_TEXT_REQUEST_SENT");
+      }
+      if (body.includes("text-delegate") && !sentBody) {
+        sentBody = body;
+        // Every other action as JSON text is read too.
+        return fakeGatewayToolCall("text-status", "subagent", { request: JSON.stringify({ action: "status" }) });
+      }
+      if (latestUserIsReport(body) || sentBody) return fakeGatewayFinalText("PARENT_REPORT_SEEN");
+      return fakeGatewayToolCall("text-delegate", "subagent", {
+        request: JSON.stringify({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" }),
+      });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Start a worker with a wrapped request."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(toolResultOutput(sentBody, "text-delegate")).not.toContain("request must be an object");
+      expect(childBodies.some((body) => body.includes("TEXT_WRAPPED_TASK"))).toBe(true);
+      // Intake keeps the call with its top-level arguments, as it does for an
+      // object wrapper, so the history and the review see the real action.
+      const call = (gatewayRequest(sentBody).prompt.flatMap((message) =>
+        Array.isArray(message.content) ? message.content : []
+      ) as Array<Record<string, unknown>>).find((part) => part.type === "tool-call" && part.toolCallId === "text-delegate");
+      expect(call?.input).toEqual({ action: "message", agent: "worker", message: "TEXT_WRAPPED_TASK" });
+      const status = toolResultOutput(statusBody, "text-status");
+      expect(status).not.toContain("request must be an object");
+      expect(status).toContain("worker");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   test("a shell request wrapper as JSON text with extra fields or nested too deep gets the correction", async () => {
     const root = createFixtureRoot("shell-request-text-correction");
     const tracePath = join(root.root, "trace.log");
@@ -8044,6 +8095,64 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         // advertises, as it does for a wrapper that is an object.
         expect(replayedInput).toMatchObject({ query: marker });
         expect(replayedInput).not.toHaveProperty("request");
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(15000)).toBe(true);
+        tui = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        await tui?.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a read_tool_result request the model wrote as JSON text of over 4 KiB still names what it reads",
+    async () => {
+      const root = createFixtureRoot("read-request-long-text");
+      const tracePath = join(root.root, "trace.log");
+      const stderrPath = join(root.root, "stderr.log");
+      const marker = "READ_LONG_MATCH";
+      // A query as long as a model can make it. Text past about 2 KB once
+      // lost the row's verb, and no saved output holds this one.
+      const query = `${marker} ${"x".repeat(5000)}`;
+      let step = 0;
+      let readOutput = "";
+      const gateway = startDynamicFakeGateway((body) => {
+        switch (step++) {
+          case 0:
+            return fakeGatewayToolCall("read-long-source", "shell", {
+              request: { action: "run", command: `printf '${marker} found\\n'`, profile: "clean", yield_time_ms: 30000 },
+            });
+          case 1: {
+            const source = JSON.parse(toolResultOutput(body, "read-long-source"));
+            expect(source.full_output_handle).toBeString();
+            return fakeGatewayToolCall("read-long-page", "read_tool_result", {
+              request: JSON.stringify({ handle: source.full_output_handle, query }),
+            });
+          }
+          case 2:
+            readOutput = toolResultOutput(body, "read-long-page");
+            return fakeGatewayFinalText("READ_LONG_COMPLETE");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+      let tui: TmuxSession | null = null;
+      try {
+        const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0" };
+        tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
+        await tui.waitForComposer(15000);
+        await tui.sendText("Run the fixture command, then search its output for a long text.");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
+        expect(pane).not.toContain("request failed:");
+        expect(pane).toContain("READ_LONG_COMPLETE");
+        expect(readOutput).not.toContain("must be an object");
+        // The row says what the call does, as it does for a short query, and
+        // not the tool's default verb.
+        expect(pane).toMatch(new RegExp(`Searched[^\\n]*output for "${marker}`));
         await tui.sendText("/quit");
         expect(await tui.waitForSessionEnd(15000)).toBe(true);
         tui = null;
@@ -8563,7 +8672,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(3);
           await tui.waitForPane((pane) => /^[• ] Running \(/m.test(pane), 15000);
           await tui.sendKeys("C-c");
-          await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
+          // The cancelled call is its group's header, and the cancellation
+          // block below it says "Cancelled".
+          await tui.waitForPane((pane) => /cancelled/i.test(pane) && hasEmptyComposer(pane), 15000);
           const roots = rootSessionIds(root.home);
           expect(roots).toHaveLength(1);
           const sessionId = roots[0]!;
@@ -9397,20 +9508,23 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      // The summary and its fallback are both rejected, so the turn fails
+      // A 413 refuses the request as too large, so the summary is asked for
+      // again smaller three times, each time from the conversation's model
+      // and then the fallback. Every one is rejected, so the turn fails
       // without running the completed tool again.
       expect(serializedError).toContain("ModelFailed");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(4);
-      for (const index of [2, 3]) {
+      expect(gateway.requestCount()).toBe(10);
+      for (let index = 2; index < 10; index += 1) {
         const summaryRequest = JSON.parse(gateway.requests[index]!.body);
         expect(summaryRequest.tools).toEqual([]);
         expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+        const fallback = gateway.requests[index]!.headers.get("ai-language-model-id") === "anthropic/claude-sonnet-5";
+        expect(fallback).toBe(index % 2 === 1);
       }
-      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -9792,8 +9906,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
     let phase = 0;
-    const gateway = startDynamicFakeGateway((body) => {
-      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_SEED_DONE");
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        // A report that arrives while the parent's first turn runs joins that
+        // turn, so the worker answers only once that turn is saved.
+        await waitForRootTurnCommitted(root.home);
+        return fakeGatewayFinalText("CHILD_SEED_DONE");
+      }
       if (phase === 0) {
         // The worker's report starts the seed run's second turn.
         if (latestUserIsReport(body)) return fakeGatewayFinalText("PARENT_SEED_SENTINEL");
@@ -10076,7 +10195,49 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 45_000);
 
-  test("subagent failure retains its cause after effects and worker cleanup", async () => {
+  // How a test breaks the child's blobs folder, and the cause the child then
+  // reports.
+  type BlobsFault = {
+    cause: string;
+    inject: (blobs: string) => void;
+    // Puts the folder back, so the next message to the same child works.
+    restore: (blobs: string) => void;
+  };
+
+  // A user that file modes do not hold back, such as root or one that holds
+  // CAP_DAC_OVERRIDE, writes into a read-only folder, so the restored test
+  // cannot force its failure for them and skips.
+  const fileModesIgnored = ignoresFileModes();
+  if (fileModesIgnored) {
+    console.warn(
+      'skipping "subagent failure retains its cause after effects and worker cleanup": a write into a read-only folder was not refused for this user (root, or a user that holds CAP_DAC_OVERRIDE), so the folder cannot force the write failure that test needs',
+    );
+  }
+
+  // The child's next tool result needs a new blob, which a read-only blobs
+  // folder refuses, so the write fails while the child streams the step and
+  // the cause is the refused write.
+  const readOnlyBlobs: BlobsFault = {
+    cause: "AccessDenied",
+    inject: (blobs) => chmodSync(blobs, 0o500),
+    restore: (blobs) => chmodSync(blobs, 0o700),
+  };
+
+  // A file where the blobs folder must be fails the child's commit for every
+  // user. The step still streams, and the cause is the failed commit.
+  const fileInPlaceOfBlobs: BlobsFault = {
+    cause: "SessionCommitFailed",
+    inject: (blobs) => {
+      renameSync(blobs, `${blobs}.aside`);
+      writeFileSync(blobs, "");
+    },
+    restore: (blobs) => {
+      rmSync(blobs);
+      renameSync(`${blobs}.aside`, blobs);
+    },
+  };
+
+  async function runFailedChildAfterEffects(fault: BlobsFault) {
     const root = createFixtureRoot("subagent-failure-detail");
     const marker = join(root.workspace, "effect.txt");
     const childTask = "Write the effect once, then read it.";
@@ -10096,15 +10257,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (latestUserIsReport(body)) {
         const report = latestUserText(body);
         expect(report).toContain("failed");
-        expect(report).toContain("agent_turn_failed: AccessDenied");
+        expect(report).toContain(`agent_turn_failed: ${fault.cause}`);
         expect(report).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
         // The parent's log records the child's work failed, with its cause.
         expect(childWork(root.home, parentId).outcome).toBe("failed");
-        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain("AccessDenied");
+        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain(fault.cause);
         failureObserved = true;
-        chmodSync(childBlobs, 0o700);
+        fault.restore(childBlobs);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -10119,12 +10280,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-          // The child's next tool result needs a new blob, which a read-only
-          // blobs folder refuses, so the child's turn fails after its effect
-          // and reports that cause.
+          // Breaking the child's blobs folder makes its turn fail after its
+          // effect and report that cause.
           parentId = rootSessionIds(root.home)[0]!;
           childBlobs = join(sessionDir(root.home, childWork(root.home, parentId).child), "blobs");
-          chmodSync(childBlobs, 0o500);
+          fault.inject(childBlobs);
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -10144,7 +10304,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The message was sent; its failure is saved as the report's turn.
       const persisted = savedToolResults(history).find((entry) => entry.tool_call_id === "delegate");
       expect(persisted?.status).toBe("success");
-      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes("agent_turn_failed: AccessDenied"))).toBe(true);
+      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes(`agent_turn_failed: ${fault.cause}`))).toBe(true);
       // Parent call, two child requests, the receipt, the failure's report
       // turn, the follow-up's receipt, the child, and its report's turn.
       expect(scripted.requestCount()).toBe(8);
@@ -10153,7 +10313,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       scripted.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }
+
+  test.skipIf(fileModesIgnored)("subagent failure retains its cause after effects and worker cleanup", () => runFailedChildAfterEffects(readOnlyBlobs), 20_000);
+
+  test("subagent failure keeps its cause when the child's commit fails after effects, whatever the user's permissions", () => runFailedChildAfterEffects(fileInPlaceOfBlobs), 20_000);
 
   test.each([
     ["before output", 401, false],
@@ -12074,8 +12238,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await tui.waitForPane(() => childRequests === 1 && parentBodies.length === 2 && parentHold.started, 10000);
       // The child finishes while the parent's reply is still open, so its
       // report waits for the step to end instead of interrupting the model.
+      // The report reaches the worker through the main loop, a moment after
+      // `report_queued`, so the reply stays held until the open turn has it
+      // (`mail_posted` as joined). Released sooner, the step can end first,
+      // the empty reply is asked to continue, and the report comes a request
+      // later.
       child.release("CHILD_REPORT_TEXT");
-      await tui.waitForPane(() => trace().includes("event=report_queued "), 10000);
+      await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
       await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
 
@@ -13647,7 +13816,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const tracePath = join(root.root, "trace.log");
     writeFileSync(join(root.workspace, "notes.txt"), "malformed call fixture\n");
     // Gemini ends a reply with MALFORMED_FUNCTION_CALL after a local tool
-    // call, and its answer to the resend calls a tool again.
+    // call. fx tells it at once that the call could not be read, and its
+    // answer calls the tool again.
     const responses = [
       fakeGatewaySse([
         { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
@@ -13682,19 +13852,221 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(json.recovery?.message ?? "").not.toContain("Tool state needs review");
       expect(gateway.requestCount()).toBe(3);
-      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
+      expect(gateway.requests[1]!.body).toContain(
+        "Your last tool call to read_file could not be read: the provider reported MALFORMED_FUNCTION_CALL",
+      );
       expect(gateway.requests[1]!.body).not.toContain(
         '"toolChoice":{"type":"none"}',
       );
+      expect(result.stderr).not.toContain("next try in");
+      expect(`${result.stdout}\n${result.stderr}`).toContain("Asking it to try again.");
       expect(toolResultOutput(gateway.requests[2]!.body, "read_resent")).toContain(
         "malformed call fixture",
       );
+      expect(trace).toContain("event=malformed_tool_call_feedback");
       expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("a recorded Gemini MALFORMED_FUNCTION_CALL reply gets feedback and the turn continues", async () => {
+    const root = createFixtureRoot("malformed-function-call-recorded");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "a.txt"), "alpha\nbeta\n");
+    // gemini-4-carbon's own stream for a reply it could not finish: reasoning,
+    // a sentence, and the error finish, with no tool call event.
+    const recorded = readFileSync(
+      join(import.meta.dirname, "fixtures", "gemini-malformed-function-call.sse"),
+      "utf8",
+    );
+    const responses = [
+      sse(recorded),
+      fakeGatewaySse([
+        { type: "tool-call", toolCallId: "read_a", toolName: "read_file", input: { path: "a.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+      ]),
+      fakeGatewayFinalText("The second line of a.txt is beta."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the read_file tool to read a.txt, then tell me its second line."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("The second line of a.txt is beta.");
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain(
+        "Your last tool call could not be read: the provider reported MALFORMED_FUNCTION_CALL",
+      );
+      expect(gateway.requests[1]!.body).not.toContain('"toolChoice":{"type":"none"}');
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("three malformed function call finishes in a row end the turn with a notice", async () => {
+    const root = createFixtureRoot("malformed-function-call-three");
+    const tracePath = join(root.root, "trace.log");
+    const malformed = () =>
+      fakeGatewaySse([
+        { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+      ]);
+    const responses = [malformed(), malformed(), malformed(), fakeGatewayFinalText("must not be requested")];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Write the report."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const combined = `${result.stdout}\n${result.stderr}`;
+
+      expect(result.code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[1]!.body).toContain("Your last tool call could not be read");
+      expect(gateway.requests[2]!.body).toContain("could not be read again");
+      expect(gateway.requests[2]!.body).toContain("make smaller calls");
+      expect(combined).toContain(
+        "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL).",
+      );
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed reply that started a provider search resends with tools on", async () => {
+    const root = createFixtureRoot("failed-provider-search");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      fakeGatewaySse([
+        { type: "tool-input-start", id: "search_1", toolName: "exa_search" },
+        { type: "finish", finishReason: { unified: "error", raw: "provider_error" } },
+      ]),
+      fakeGatewayFinalText("Answered after the failed search."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Search for the release notes."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Answered after the failed search.");
+      expect(gateway.requestCount()).toBe(2);
+      // A search only reads, so a second one is safe: tools stay on.
+      expect(gateway.requests[1]!.body).not.toContain(
+        '"toolChoice":{"type":"none"}',
+      );
+      expect(gateway.requests[1]!.body).toContain("search again if you still need one");
+      expect(gateway.requests[1]!.body).not.toContain("Reconcile the available tool evidence");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a turn killed while its malformed-call feedback waits resumes with tools on and runs nothing twice", async () => {
+    const root = createFixtureRoot("malformed-call-crash");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "malformed crash fixture\n");
+    let releaseHeld: (() => void) | undefined;
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    let served = 0;
+    const gateway = startDynamicFakeGateway(async () => {
+      const request = served++;
+      if (request === 0) {
+        return fakeGatewaySse([
+          { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+          { type: "tool-call", toolCallId: "read_malformed", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+        ]);
+      }
+      if (request === 1) {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return fakeGatewayFinalText("Too late.");
+      }
+      if (request === 2) {
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "read_after_crash", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+        ]);
+      }
+      return fakeGatewayFinalText("Recovered after the malformed crash.");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "Read notes.txt."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      // fx dies while the feedback request waits on the gateway.
+      proc.kill("SIGKILL");
+      await proc.exited;
+      expect(gateway.requests[1]!.body).toContain("Your last tool call to read_file could not be read");
+      const sessionId = onlySessionId(root.home);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Continue after the crash."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      const json = parseAskJson(resumed.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(resumed.code).toBe(0);
+      expect(json.output).toContain("Recovered after the malformed crash.");
+      // The malformed call never ran, so the resume keeps tools on and the
+      // model's new call runs once.
+      for (const request of gateway.requests.slice(2)) {
+        expect(request.body).not.toContain('"toolChoice":{"type":"none"}');
+      }
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(trace).not.toContain("event=uncertain_provider_tool_rejected");
+      expect(trace).not.toContain("event=malformed_tool_call_rejected");
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 // Statuses and streams the request-recovery campaign found ending turns that a

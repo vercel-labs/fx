@@ -3936,6 +3936,80 @@ test "processQueuedPrompt compacts and retries one context overflow" {
     }
 }
 
+test "a turn's compaction renews a rejected login once and the turn sends the renewed one after it" {
+    const alloc = std.testing.allocator;
+    const model = "provider/compaction-login-renewal";
+    const overflow_body =
+        \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+    ;
+    const Case = struct {
+        // The tokens the host gives out: the turn's check before it sends,
+        // then the stored one after the 401, then a forced refresh.
+        tokens: []const []const u8,
+        modes: []const runtime_deps.CredentialRefreshMode,
+    };
+    const cases = [_]Case{
+        // Another fx process renewed the login: the stored one is sent.
+        .{ .tokens = &.{ "token-before", "token-after" }, .modes = &.{ .if_needed, .reload } },
+        // The store still holds the rejected token: one forced refresh.
+        .{ .tokens = &.{ "token-before", "token-before", "token-after" }, .modes = &.{ .if_needed, .reload, .force } },
+    };
+    for (cases) |case| {
+        const completions = [_]FakeCompletion{
+            .{ .status = .bad_request, .err_body = overflow_body },
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+            .{ .content = "Retain the completed prior turn and continue from it." },
+            .{ .content = "COMPACTION_LOGIN_RENEWED" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &.{.{
+            .model = model,
+            .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+        }};
+        hooks.credential_refresh_tokens = case.tokens;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.credential_source = .fx_login;
+        // A tool call leaves work to summarize, so the compaction asks the model.
+        var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+        var prior_results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("prior-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        }};
+        var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior user") },
+            .assistant = @constCast("prior assistant"),
+            .execution = .{ .tool_steps = &prior_steps },
+        } }};
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 2, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 3, "compacted_conversation");
+        try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+        try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[1]);
+        // The summary is sent once more with the renewed login, and the rest
+        // of the turn sends it too, with no second 401.
+        try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[2]);
+        try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[3]);
+        try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, case.modes, hooks.credential_refresh_modes.items);
+        try std.testing.expectEqualStrings("COMPACTION_LOGIN_RENEWED", hooks.finish_assistant_text.?);
+        try std.testing.expect(hooks.http_status == null);
+    }
+}
+
 test "processQueuedPrompt stops after one context overflow recovery" {
     const alloc = std.testing.allocator;
     const model = "provider/repeated-context-overflow";
@@ -6361,10 +6435,191 @@ test "processQueuedPrompt runs the resend's tool call after a provider error lef
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
+/// A provider-run tool that does not only read, so fx cannot tell whether
+/// a failed attempt that started it ran it.
+const provider_publish_tool = blk: {
+    var spec = builtin_tools.web_search;
+    spec.name = "provider_publish";
+    spec.model_schema.name = "provider_publish";
+    spec.activity_kind = .write;
+    break :blk spec;
+};
+const provider_publish_tools = test_support.test_tools ++ [_]tool_dispatch.Tool{provider_publish_tool};
+const provider_publish_registry = tool_dispatch.Registry{ .tools = provider_publish_tools[0..] };
+
+/// No recovery-module status waited: the request went again at once.
+fn expectNoModuleWait(hooks: *const FakeAgentRuntimeDeps) !void {
+    for (hooks.route_recovery_statuses.items) |status| {
+        try std.testing.expect(status.kind != .waiting);
+    }
+}
+
+/// Some text fx showed contains `needle`.
+fn expectShownText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) !void {
+    for (hooks.texts.items) |text| {
+        if (std.mem.find(u8, text, needle) != null) return;
+    }
+    return error.TestExpectedShownText;
+}
+
+test "processQueuedPrompt answers a malformed tool call at once with feedback and tools, then runs the next call" {
+    const alloc = std.testing.allocator;
+    const failed = [_]ToolCall{toolCall("call_read_malformed", "read_file", "{\"path\":\"a\"}")};
+    const resent = [_]ToolCall{toolCall("call_read_resent", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &failed, .finish_reason = .provider_error, .finish_reason_raw = "MALFORMED_FUNCTION_CALL" },
+        .{ .tool_calls = &resent },
+        .{ .content = "Read after the feedback" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "Your last tool call to read_file could not be read: the provider reported MALFORMED_FUNCTION_CALL");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyNotContains(&gateway, 1, "fx did not execute that call");
+    try expectNoModuleWait(&hooks);
+    try expectShownText(&hooks, "Asking it to try again.");
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt asks for smaller calls after a second malformed tool call and ends the turn after a third" {
+    const alloc = std.testing.allocator;
+    const malformed = FakeCompletion{ .finish_reason = .provider_error, .finish_reason_raw = "MALFORMED_FUNCTION_CALL" };
+    const completions = [_]FakeCompletion{ malformed, malformed, malformed, .{ .content = "must not send" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "Your last tool call could not be read: the provider reported MALFORMED_FUNCTION_CALL");
+    try expectBodyContains(&gateway, 2, "could not be read again");
+    try expectBodyContains(&gateway, 2, "make smaller calls");
+    try expectNoModuleWait(&hooks);
+    try expectShownText(&hooks, "could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL)");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt gives the malformed tool call of each step its own first feedback" {
+    const alloc = std.testing.allocator;
+    const read = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const malformed = FakeCompletion{ .finish_reason = .provider_error, .finish_reason_raw = "MALFORMED_FUNCTION_CALL" };
+    const completions = [_]FakeCompletion{
+        malformed,
+        .{ .tool_calls = &read },
+        malformed,
+        .{ .content = "Answered after two separate stalls" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "Your last tool call could not be read:");
+    try expectBodyContains(&gateway, 3, "Your last tool call could not be read:");
+    try expectBodyNotContains(&gateway, 3, "could not be read again");
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt Esc during the malformed-call feedback request ends the turn without running anything" {
+    const alloc = std.testing.allocator;
+    const failed = [_]ToolCall{toolCall("call_read_malformed", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &failed, .finish_reason = .provider_error, .finish_reason_raw = "MALFORMED_FUNCTION_CALL" },
+        .{ .cancel_before_output = true },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "Your last tool call to read_file could not be read");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt stops for review when a malformed reply answers a resend with tools off" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("provider_publish_1", "provider_publish", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .finish_reason = .provider_error },
+        .{ .finish_reason = .provider_error, .finish_reason_raw = "MALFORMED_FUNCTION_CALL" },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.tool_registry = provider_publish_registry;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The model wanted a tool while tools were off, so another resend would
+    // fail the same way.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    const status = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.unsafe_tool_start, status.kind);
+    try std.testing.expectEqualStrings("MalformedToolCallDuringReconciliation", status.diagnostic.?.view());
+}
+
+test "processQueuedPrompt keeps tools after ReadFailed cut off a provider search start" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("call_search", "web_search", "{}")};
+    const completions = [_]FakeCompletion{
+        .{
+            .streamed_tool_starts = &starts,
+            .stream_error_after_tool_starts = error.ReadFailed,
+        },
+        .{ .content = "Searched again" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_retry_count = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // A search only reads, so a second one is safe: the resend keeps tools.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "search again if you still need one");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
 test "processQueuedPrompt stops for review when uncertain tool reconciliation returns another tool" {
     const alloc = std.testing.allocator;
-    const starts = [_]ToolCall{toolCall("provider_search", "web_search", "{}")};
-    const repeated = [_]ToolCall{toolCall("provider_search_repeat", "web_search", "{}")};
+    const starts = [_]ToolCall{toolCall("provider_publish_1", "provider_publish", "{}")};
+    const repeated = [_]ToolCall{toolCall("provider_publish_repeat", "provider_publish", "{}")};
     const completions = [_]FakeCompletion{
         .{
             .streamed_tool_starts = &starts,
@@ -6375,6 +6630,7 @@ test "processQueuedPrompt stops for review when uncertain tool reconciliation re
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.tool_registry = provider_publish_registry;
     hooks.enable_recovery_checkpoint = true;
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -6655,13 +6911,16 @@ test "processQueuedPrompt preserves the provider-executed subset of mixed failed
     );
 }
 
-test "processQueuedPrompt reconciles local calls when the failed stream also started a provider tool" {
+test "processQueuedPrompt keeps tools when a failed stream started a provider search beside a local call" {
     const alloc = std.testing.allocator;
-    const starts = [_]ToolCall{toolCall("provider_search", "web_search", "{}")};
+    const starts = [_]ToolCall{
+        toolCall("provider_search", "web_search", "{}"),
+        toolCall("call_read", "read_file", "{\"path\":\"a\"}"),
+    };
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
         .{ .streamed_tool_starts = &starts, .tool_calls = &calls, .finish_reason = .provider_error },
-        .{ .content = "Reconciled without tools" },
+        .{ .content = "Answered after the search note" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -6672,12 +6931,20 @@ test "processQueuedPrompt reconciles local calls when the failed stream also sta
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    // The provider may have run its search, so the local call does not make
-    // the attempt unexecuted: the resend reconciles with tools off.
+    // The provider may have run its search, but a search only reads, so the
+    // resend keeps tools and says the search may have run. The saved state
+    // stays uncertain, a value every version reads.
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 1, "Reconcile the available tool evidence");
+    try expectBodyNotContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "search again if you still need one");
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    // The local call never ran, and its row settles as one that did not run.
+    var local_settled = false;
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .terminal) continue;
+        if (std.mem.eql(u8, event.terminal.id.call_id, "call_read")) local_settled = true;
+    }
+    try std.testing.expect(local_settled);
     try std.testing.expectEqual(
         session_codec.RecoveryToolState.uncertain,
         hooks.recovery_checkpoints.items[1].tool_state,
@@ -8779,7 +9046,7 @@ test "processQueuedPrompt reconciles a regenerated local tool with the same stre
 
 test "processQueuedPrompt reconciles ReadFailed after provider-executed tool start" {
     const alloc = std.testing.allocator;
-    const starts = [_]ToolCall{toolCall("call_search", "web_search", "{}")};
+    const starts = [_]ToolCall{toolCall("call_publish", "provider_publish", "{}")};
     const completions = [_]FakeCompletion{
         .{
             .streamed_tool_starts = &starts,
@@ -8790,6 +9057,7 @@ test "processQueuedPrompt reconciles ReadFailed after provider-executed tool sta
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.tool_registry = provider_publish_registry;
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
@@ -11124,7 +11392,7 @@ test "processQueuedPrompt trace emits one canonical result for tool execution er
 test "processQueuedPrompt Esc during a reconcile wait settles carried tool starts before the turn ends" {
     const alloc = std.testing.allocator;
     const local = [_]ToolCall{toolCall("local-read", "read_file", "{}")};
-    const provider = [_]ToolCall{toolCall("provider-search", "web_search", "{}")};
+    const provider = [_]ToolCall{toolCall("provider-publish", "provider_publish", "{}")};
     const completions = [_]FakeCompletion{
         .{ .streamed_tool_starts = &local, .stream_error_after_tool_starts = error.ReadFailed },
         .{ .streamed_tool_starts = &provider, .stream_error_after_tool_starts = error.ReadFailed },
@@ -11133,6 +11401,7 @@ test "processQueuedPrompt Esc during a reconcile wait settles carried tool start
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.tool_registry = provider_publish_registry;
     hooks.enable_recovery_checkpoint = true;
     defer hooks.deinit();
     var fixture = PromptFixture{};
