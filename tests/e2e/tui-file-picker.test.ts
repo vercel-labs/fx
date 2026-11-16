@@ -1309,6 +1309,27 @@ describe("@ file picker", () => {
   );
 
   tmuxTest(
+    "stores the file index under FX_HOME instead of the default profile",
+    async () => {
+      const current = createFixture("fx-file-picker-custom-home-");
+      initGit(current.workspace);
+      writeFileSync(join(current.workspace, "tracked.txt"), "tracked");
+      git(current.workspace, "add", "tracked.txt");
+
+      const fxHome = join(current.root, "profile");
+      const active = await startMockFx(current, [], 1000, { FX_HOME: fxHome });
+      await waitForReadyAndAdoptedFileIndex(current.tracePath, 1);
+
+      expect(
+        readdirSync(join(fxHome, "file-index")).some((name) => name.endsWith(".idx")),
+      ).toBe(true);
+      expect(existsSync(join(current.home, ".fx", "file-index"))).toBe(false);
+      expectCleanRuntime(current, active);
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
     "submits an unmatched file mention without requiring dismissal",
     async () => {
       const current = createFixture("fx-file-picker-unmatched-submit-");
