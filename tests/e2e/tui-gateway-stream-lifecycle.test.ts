@@ -8283,13 +8283,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const compact = await session.captureFullScrollback();
       // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
       // The three commands share one row by their steps, which is the
-      // group's line; Ctrl+O shows each.
-      expect(compact).toContain("● Ran printf, pwd ✓\n");
+      // group's line; printf ran again after pwd, so it comes last. Ctrl+O
+      // shows each.
+      expect(compact).toContain("● Ran pwd, printf ✓\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
       expect(compact).not.toContain(`Ran ${firstCommand}`);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● Ran printf, pwd ✓", TIMEOUT);
+      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
@@ -8336,7 +8337,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● Ran printf, pwd ✓", TIMEOUT);
+      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -8352,7 +8353,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● Ran printf, pwd ✓\n");
+      expect(resumed).toContain("● Ran pwd, printf ✓\n");
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);

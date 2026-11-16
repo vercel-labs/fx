@@ -376,9 +376,11 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // Each file and pattern shows once, though other calls came between
-    // them, and the header names the kinds of work with no counts.
+    // them, where it was last read or searched, so window.ts, read again
+    // after main.ts, comes last. The header names the kinds of work with no
+    // counts.
     expect(treeRows(group(lines, "● Read files, searched, ran a command ✓"))).toEqual([
-      "├ Read window.ts, main.ts",
+      "├ Read main.ts, window.ts",
       "├ Searched createWindow, BrowserWindow",
       "└ Ran sh check.sh status",
     ]);
