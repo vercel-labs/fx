@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
 const sh_fx = @import("sh_fx.zig");
 const command_contract = @import("../core/execution/command_contract.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 
 pub const MessageIdBuffer = [32]u8;
 
@@ -247,7 +248,7 @@ pub const CommandResult = command_contract.CommandResult;
 /// The core's command result from its JSON, which uses fx's own snake_case
 /// names (`CommandResult.writeJson`). Strings point into `arena`.
 pub fn parseCommandResult(arena: std.mem.Allocator, json: []const u8) !CommandResult {
-    return std.json.parseFromSliceLeaky(CommandResult, arena, json, .{ .ignore_unknown_fields = true });
+    return json_decode.parseFromSliceLeaky(CommandResult, arena, json, .{ .ignore_unknown_fields = true });
 }
 
 /// `sh.fx/commandResult` in an update's `_meta`, in camelCase. Values the
