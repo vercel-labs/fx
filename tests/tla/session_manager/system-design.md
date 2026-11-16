@@ -1851,7 +1851,8 @@ as it was sent):
   whose command made it, the bridge's request id, the MCP tool's name, and
   `completed`, `failed` or `cancelled`. It never holds the call's
   arguments or its result. A resume shows the row again right after its
-  shell call's row, so the compact view groups it as it did live.
+  shell call's row, so the compact view groups it as it did live, except
+  in a turn interrupted while the command ran (below).
   - **Write:** the item goes out on its own write, outside the streamed
     pieces, as `tool_running` (D28) and `recovery` do, and that write takes
     the session's lock as every write does
@@ -1866,6 +1867,12 @@ as it was sent):
     record whose shell call the turn no longer holds, such as after a
     compaction, shows no row. A turn closed as superseded loses its
     records with it.
+  - **Interrupted turn:** a resume draws a cancelled command's row only
+    from the output its turn saved, as it did before D99. When the user
+    cancels a turn while the command runs and the command saved no
+    output, such as one cancelled before it printed anything, the
+    resume shows the call's row alone, without the command's row that
+    shared its group live.
   - **Older fx:** an fx from before D99 leaves the item out (D17).
 
   **Why:** the rows existed only in the live screen, so a resumed session
