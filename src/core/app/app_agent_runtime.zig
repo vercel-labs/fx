@@ -211,7 +211,7 @@ pub fn Runtime(comptime App: type) type {
         /// `arena`. `executeToolCallAuthorized` takes the list a call runs
         /// under from the request and overwrites any list set on the context,
         /// so the nested check of a command's own `fx mcp call` reads this one.
-        pub fn requestForExecution(app: *App, agent: *AppAgent, arena: Allocator, request: agent_runtime.ToolExecutionRequest) agent_runtime.ToolExecutionRequest {
+        fn requestForExecution(app: *App, agent: *AppAgent, arena: Allocator, request: agent_runtime.ToolExecutionRequest) agent_runtime.ToolExecutionRequest {
             var execution = request;
             execution.session_grants = mergeLiveGrants(app, agent, arena, request.session_grants);
             return execution;
