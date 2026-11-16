@@ -177,6 +177,8 @@ const Summary = struct {
 
 const PresentationGroup = struct {
     anchor_index: usize,
+    /// How many user messages come before the group's first row.
+    user_messages_before: usize = 0,
     status_indices: std.ArrayList(usize) = .empty,
     summary: Summary = .{},
 
@@ -3821,8 +3823,13 @@ fn fillProjection(
 
     @memset(presentation_group_indices, null);
 
+    // A message the user sends while a turn runs joins that turn, so the
+    // calls after it share the turn's group. Their rows belong after the
+    // message, not above it, so they start a new group.
+    var user_messages: usize = 0;
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
+        if (entry == .user_turn) user_messages += 1;
         if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, stats);
@@ -3830,9 +3837,9 @@ fn fillProjection(
         const group_id = presentationGroupId(detail) orelse continue;
 
         const result = try presentation_group_by_id.getOrPut(alloc, group_id);
-        if (!result.found_existing) {
+        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].user_messages_before != user_messages) {
             result.value_ptr.* = presentation_groups.items.len;
-            try presentation_groups.append(alloc, .{ .anchor_index = entry_index });
+            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .user_messages_before = user_messages });
         }
         const group_index = result.value_ptr.*;
         const group = &presentation_groups.items[group_index];
@@ -7186,6 +7193,26 @@ fn storyReadDetailForTest(entry_id: u32, comptime path: []const u8) ToolDetailRe
         .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\"}"),
         .outcome = .completed,
     };
+}
+
+test "a message the user sends mid-turn starts a new group for the calls after it" {
+    // The message joins the turn, so both reads share its presentation group,
+    // but the second read's row belongs after the message, not above it.
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read README.md\n", .class = .tool_status } },
+        .{ .user_turn = .{ .id = 2, .turn = .{ .text = @constCast("Read it again.") } } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read README.md\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{ storyReadDetailForTest(1, "README.md"), storyReadDetailForTest(3, "README.md") };
+    for (&details) |*detail| detail.presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Read README.md\n● Read README.md", std.mem.trim(u8, text, "\n"));
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] != .hide);
 }
 
 test "every read in a group shares one row, and so does each search tool" {
