@@ -359,6 +359,90 @@ async function waitForTtyAskExit(
 
 describe("modern MCP stdio compatibility", () => {
   test.skipIf(!tmuxAvailable())(
+    "a toolbox run of an MCP tool streams into that tool's row, with no Using row",
+    async () => {
+      // The shell can ask, so it says so in every request's capabilities.
+      const root = createRoot("tui-streamed-toolbox-run", MODERN_FIXTURE, {
+        expectedElicitation: "both",
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_1", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+        fakeGatewayToolCall("call_2", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                const send = (event: object) =>
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                send({ type: "tool-input-start", id: "call_3", toolName: "toolbox" });
+                send({ type: "tool-input-delta", id: "call_3", delta: `{"run":"${TOOL_NAME}",` });
+                timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                sendRest = () => {
+                  clearInterval(timer);
+                  send({ type: "tool-input-delta", id: "call_3", delta: '"arguments":{"text":"third"}}' });
+                  send({ type: "tool-input-end", id: "call_3" });
+                  send({
+                    type: "tool-call",
+                    toolCallId: "call_3",
+                    toolName: "toolbox",
+                    input: { run: TOOL_NAME, arguments: { text: "third" } },
+                  });
+                  send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  controller.close();
+                };
+              },
+              cancel() {
+                clearInterval(timer);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        fakeGatewayFinalText("MCP_STREAMED_RUN_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture three times.");
+      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^[●├└] /.test(line) && line.includes(`MCP ${TOOL_NAME}`));
+      // The held call's arguments name its tool and nothing more: it waits
+      // in that tool's row, which says it runs, and shows no row of its own.
+      await tui.waitForPane((pane) => sendRest !== undefined && pane.includes(`Running MCP ${TOOL_NAME} ×3`), 20_000);
+      for (let sample = 0; sample < 6; sample += 1) {
+        const pane = await tui.capturePane();
+        expect(pane).not.toMatch(/^[●├└] Using\b/m);
+        expect(toolRows(pane)).toHaveLength(1);
+        await Bun.sleep(100);
+      }
+
+      sendRest?.();
+      const done = await tui.waitForText("MCP_STREAMED_RUN_DONE", 20_000);
+      expect(toolRows(done)).toEqual([expect.stringContaining(`Ran MCP ${TOOL_NAME} ×3`)]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "the TUI shows exact dynamic MCP arguments before human approval",
     async () => {
       // The shell can ask, so it says so in every request's capabilities.
