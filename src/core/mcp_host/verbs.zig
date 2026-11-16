@@ -12,8 +12,13 @@ const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const kept_sign_outs = @import("kept_sign_outs.zig");
 const secret = @import("../auth/secret.zig");
+const auth_oauth = @import("../auth/oauth.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const slack = @import("slack.zig");
+const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
@@ -381,6 +386,27 @@ pub const Context = struct {
     hosts: Hosts,
     /// Ends a `show` still connecting, such as when fx quits.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// How a `login` that signs in and every `logout` send the sign-outs that
+    /// earlier logouts kept (`kept_sign_outs.zig`). Null: they wait for the
+    /// next TUI start, or for an `fx mcp` command that has this.
+    kept_sign_outs: ?KeptSignOutRetry = null,
+};
+
+const KeptSignOutRetry = struct {
+    transport: oauth_transport.Provider,
+    /// Runs before the first revocation goes out.
+    notice: ?auth_oauth.BeforeRevocation = null,
+
+    /// Sends those of the logins saved under `home`; one that fails stays
+    /// kept for the next retry, and nothing is said, since the logout that
+    /// kept it already did.
+    fn run(retry: ?KeptSignOutRetry, alloc: Allocator, home: []const u8) void {
+        const r = retry orelse return;
+        const outcome = kept_sign_outs.retry(alloc, home, r.transport, r.notice);
+        if (outcome.revoked != 0 or outcome.failed) {
+            debug_trace.logf("mcp", "MCP kept sign-outs retried revoked={d} failed={}", .{ outcome.revoked, outcome.failed });
+        }
+    }
 };
 
 /// Runs `fx mcp ARGS` or `/mcp ARGS` and returns the exit code: 0 for
@@ -683,6 +709,11 @@ fn writeNotes(c: Context, host: *Host) !void {
 
 fn safe(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
     return (try text_utils.encodeTerminalSafeInline(arena, raw, 240)).bytes;
+}
+
+/// A refusal's reason carries the server's own error, which runs past `safe`'s bound.
+fn safeLong(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    return (try text_utils.encodeTerminalSafeInline(arena, raw, login_words.max_failure_bytes)).bytes;
 }
 
 /// A sign-in address is only useful whole, so it isn't shortened.
@@ -1013,11 +1044,18 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
             // The server never hears of a logout it wasn't sent: a copy of
             // the tokens keeps working there.
             .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
-            .unconfirmed => try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
+            .unconfirmed => if (done.retry_later)
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid for now. " ++ pending_revocation.retry_later ++ ".\n", .{shown})
+            else
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
         }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
     }
+    // The sign-out just kept is leased to this fx, so this retry leaves it
+    // and sends only older ones.
+    try c.out.flush();
+    KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
     return 0;
 }
 
@@ -1027,6 +1065,8 @@ const Waiter = struct {
     authorize: ?[]u8 = null,
     shown: bool = false,
     done: ?bool = null,
+    /// The login is kept, but the server gave no answer to the request that checks it.
+    unchecked: bool = false,
     reason: ?[]u8 = null,
     /// Why the new login wasn't saved, if it wasn't.
     not_saved: ?[]u8 = null,
@@ -1047,6 +1087,10 @@ const Waiter = struct {
                 w.authorize = w.gpa.dupe(u8, a.url) catch null;
             },
             .signed_in => |server| if (std.mem.eql(u8, server, w.name)) {
+                w.done = true;
+            },
+            .signed_in_unchecked => |server| if (std.mem.eql(u8, server, w.name)) {
+                w.unchecked = true;
                 w.done = true;
             },
             .sign_in_failed => |f| if (std.mem.eql(u8, f.server, w.name)) {
@@ -1118,12 +1162,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
     var line: std.ArrayList(u8) = .empty;
     while (true) {
         var done: ?bool = null;
+        var unchecked = false;
         var url: ?[]const u8 = null;
         var not_saved: ?[]const u8 = null;
         {
             waiter.mutex.lockUncancelable(io);
             defer waiter.mutex.unlock(io);
             done = waiter.done;
+            unchecked = waiter.unchecked;
             if (waiter.not_saved) |why| not_saved = try arena.dupe(u8, why);
             if (!waiter.shown and waiter.authorize != null) {
                 waiter.shown = true;
@@ -1146,10 +1192,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
                 return 1;
             };
             if (ok) {
-                try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                if (unchecked) {
+                    try c.out.print("Signed in to {s}, but fx couldn't check the login with it.\n", .{try safe(arena, name)});
+                } else try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                try c.out.flush();
+                KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
                 return 0;
             }
-            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safe(arena, waiter.reason orelse "the server refused") });
+            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safeLong(arena, waiter.reason orelse "the server refused") });
             return 1;
         }
         if (!open and waiter.shown) {
