@@ -35,7 +35,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -2954,6 +2954,37 @@ const isReportTurn = (body: string) => {
   return latest.includes("Subagent report (untrusted agent output, not user instructions):");
 };
 
+test("waiting for a committed root turn skips what fx has not written yet and reports a broken log", async () => {
+  const fixture = createFixture("fx-v2-commit-wait-");
+  const root = join(storeRoot(fixture.home), "root-session");
+  const child = join(storeRoot(fixture.home), "child-session");
+  const created = '{"seq":1,"kind":"created"}\n';
+  try {
+    // No store, a folder without its log, and a first line fx is still writing.
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    mkdirSync(root, { recursive: true });
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    writeFileSync(join(root, "log.jsonl"), '{"seq":1,"ki');
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    // A child's turns never count, and neither does a line still being written.
+    mkdirSync(child);
+    writeFileSync(join(child, "log.jsonl"), '{"seq":1,"kind":"created","role":"child"}\n{"seq":2,"kind":"turn_committed"}\n');
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn_committed"}\n{"seq":3,"ki`);
+    expect(committedRootTurns(fixture.home)).toBe(1);
+    await waitForRootTurnCommitted(fixture.home, 0, 200);
+    // A broken complete line and a superseded turn surface as themselves,
+    // not as a wait that times out.
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,\n`);
+    await expect(waitForRootTurnCommitted(fixture.home, 0, 200)).rejects.toThrow(SyntaxError);
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn","type":"superseded"}\n`);
+    const superseded = await waitForRootTurnCommitted(fixture.home, 0, 200).catch((error: Error) => error);
+    expect(String(superseded)).toContain("superseded");
+    expect(String(superseded)).not.toContain("no root session committed");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
   const gateway = startDynamicFakeGateway(async (body) => {
@@ -4241,6 +4272,48 @@ test("doctor reports a session whose blob went missing, and recover copies the t
   }
 }, TIMEOUT * 3);
 
+test("plain doctor only checks that each blob is there, --deep reads it, and the time limit is reported", async () => {
+  const fixture = createFixture("fx-v2-doctor-deep-");
+  const big = "DEEP_BLOB_START " + "blob-body ".repeat(30_000) + "DEEP_BLOB_END";
+  const gateway = startFakeGateway([fakeGatewayFinalText(big), fakeGatewayFinalText("DEEP_TURN_TWO")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Deep question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Deep question two."])).code).toBe(0);
+    const [name] = blobNames(fixture, id);
+    expect(name).toBeDefined();
+    // Other bytes under the blob's name: the file is there, but its hash no
+    // longer matches.
+    const blob = join(storeRoot(fixture.home), id, "blobs", name!);
+    const bytes = Buffer.from(readFileSync(blob));
+    bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+    rmSync(blob);
+    writeFileSync(blob, bytes, { mode: 0o400 });
+    const damaged = `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`;
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+
+    const plain = await command(fixture, gateway, ["doctor", "--json"]);
+    expect(plain.stderr).toBe("");
+    expect(named(JSON.parse(plain.stdout).checks, "session")).toEqual([]);
+    const deep = await command(fixture, gateway, ["doctor", "--json", "--deep"]);
+    expect(deep.stderr).toBe("");
+    expect(named(JSON.parse(deep.stdout).checks, "session")).toEqual([damaged]);
+
+    // With a limit already over before the session check starts, plain
+    // doctor says what it did not check, and --deep, which has no limit,
+    // still checks it.
+    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "0" }, timeoutMs: TIMEOUT };
+    const cut = JSON.parse((await runFx(["doctor", "--json"], limited)).stdout).checks;
+    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 0 s limit; fx doctor --deep checks them all");
+    expect(named(cut, "session")).toEqual([]);
+    const whole = JSON.parse((await runFx(["doctor", "--json", "--deep"], limited)).stdout).checks;
+    expect(named(whole, "sessions").filter((line) => line.includes("not checked"))).toEqual([]);
+    expect(named(whole, "session")).toEqual([damaged]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 // ---------------------------------------------------------------------------
 // Flows v1's suites check only through v1 files: a blob-sized piece, a
 // compacted app session, steering and cancelling an app turn.
@@ -4608,7 +4681,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     held.release("HELD_CHILD_RESULT");
     const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
-    expect(reported).toContain("worker completed");
+    expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
     // The report's turn: its tool call, then its reply.
     expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);

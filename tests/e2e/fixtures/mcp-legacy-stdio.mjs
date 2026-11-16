@@ -46,6 +46,57 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+// FX_MCP_MODE=refused_reply: each tools/call follows its entry in FX_MCP_REFUSED's `calls`, a JSON
+// array of { bad, then, slowMs, progressEveryMs }. `bad` first writes a line fx refuses and cannot
+// attach to a call: "utf8_last" (bytes that are not UTF-8, the id after them), "deep_last" (JSON
+// nested past the engine's limit, the id last), "garbage" (a line with no JSON, as a notification
+// the server mangled would be) or "cut" (a reply cut in the middle). `then` is "silent" (nothing
+// more), "exit" (the server exits), or by default the valid reply, `slowMs` later, with progress
+// for the call's own token every `progressEveryMs` until then.
+const refused = JSON.parse(process.env.FX_MCP_REFUSED ?? "{}");
+let refusedCalls = 0;
+
+function writeRaw(...parts) {
+  process.stdout.write(Buffer.concat(parts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(part)))));
+}
+
+function refusedLine(id, bad) {
+  switch (bad) {
+    case "utf8_last":
+      return [
+        '{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x',
+        Buffer.from([0xff, 0xfe]),
+        `"}]},"id":${id}}\n`,
+      ];
+    case "deep_last":
+      return [`{"jsonrpc":"2.0","result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}},"id":${id}}\n`];
+    case "garbage":
+      return [`${"x".repeat(80)}\n`];
+    case "cut":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"te\n`];
+    default:
+      return [];
+  }
+}
+
+function handleRefusedReply(message, spec) {
+  const token = message.params?._meta?.progressToken;
+  writeRaw(...refusedLine(message.id, spec.bad));
+  if (spec.then === "silent") return;
+  if (spec.then === "exit") {
+    setTimeout(() => process.exit(0), 50);
+    return;
+  }
+  let progress = 0;
+  const timer = spec.progressEveryMs
+    ? setInterval(() => send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: token, progress: ++progress } }), spec.progressEveryMs)
+    : undefined;
+  setTimeout(() => {
+    clearInterval(timer);
+    send({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: resultText }] } });
+  }, spec.slowMs ?? 0);
+}
+
 function log(message) {
   if (wireLogPath) {
     appendFileSync(
@@ -406,6 +457,11 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/call") {
+    if (mode === "refused_reply") {
+      refusedCalls += 1;
+      handleRefusedReply(message, refused.calls?.[refusedCalls - 1] ?? {});
+      return;
+    }
     if (mode === "invalid_params") {
       // A server built on the Go MCP SDK refuses arguments of the wrong type
       // with -32602, in its validator's words, then the tool's schema, as

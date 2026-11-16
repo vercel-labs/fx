@@ -289,6 +289,15 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn attachHistoricalBridgeCall(
+        self: *ResumeProjection,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.runtime.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
+    }
+
     pub fn attachHistoricalToolCallWithoutResult(
         self: *ResumeProjection,
         entry_id: u32,

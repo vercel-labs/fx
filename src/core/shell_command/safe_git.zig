@@ -54,6 +54,40 @@ pub const Subcommand = enum { status, diff, log, branch, rev_parse };
 /// process, and confirms git resolves the same repository fx read. All memory
 /// belongs to `arena`.
 pub fn prepare(arena: Allocator, cwd: []const u8) Allocator.Error!Prepared {
+    return prepareWith(arena, cwd, unbounded_checks) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // `runCaptured` has no deadline.
+        error.TimeoutExpired => unreachable,
+    };
+}
+
+pub const CheckError = Allocator.Error || error{TimeoutExpired};
+
+/// Runs one of `prepare`'s own git checks, `argv` in `cwd`, in safe git's
+/// environment. Returns its standard output when it exited 0, or null when
+/// it could not start, failed, or printed more than `output_limit` bytes.
+/// Memory belongs to `arena`.
+pub const CheckRunner = struct {
+    context: ?*const anyopaque = null,
+    run: *const fn (
+        context: ?*const anyopaque,
+        arena: Allocator,
+        argv: []const []const u8,
+        cwd: []const u8,
+        output_limit: usize,
+    ) CheckError!?[]const u8,
+};
+
+const unbounded_checks: CheckRunner = .{ .run = runCheckUnbounded };
+
+fn runCheckUnbounded(_: ?*const anyopaque, arena: Allocator, argv: []const []const u8, cwd: []const u8, output_limit: usize) CheckError!?[]const u8 {
+    return runCaptured(arena, argv, cwd, output_limit);
+}
+
+/// `prepare` with `checks` running its git checks, so a caller can give them
+/// a deadline. A check that returns `error.TimeoutExpired` ends it with no
+/// decision, and git does not run; a timed-out version check is not cached.
+pub fn prepareWith(arena: Allocator, cwd: []const u8, checks: CheckRunner) CheckError!Prepared {
     const filters = indexer.repoFilters(arena, cwd) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.RepoConfigUnavailable => return refuse(.repo_config_unavailable, cwd),
@@ -62,13 +96,13 @@ pub fn prepare(arena: Allocator, cwd: []const u8) Allocator.Error!Prepared {
         if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) return refuse(.unsupported_filter_name, cwd);
     }
     const executable = trustedExecutable() orelse return refuse(.git_missing, cwd);
-    switch (try versionCheck(arena, executable)) {
+    switch (try versionCheck(arena, executable, checks)) {
         .supported => {},
         .too_old => return refuse(.git_too_old, cwd),
         .unknown => return refuse(.git_version_unknown, cwd),
     }
     const ready: Ready = .{ .executable = executable, .filter_names = filters.names };
-    if (!try sameRepository(arena, ready, cwd, filters.git_dir)) return refuse(.repository_mismatch, cwd);
+    if (!try sameRepository(arena, ready, cwd, filters.git_dir, checks)) return refuse(.repository_mismatch, cwd);
     return .{ .ready = ready };
 }
 
@@ -168,14 +202,14 @@ var cached_version: ?struct { executable: []const u8, check: VersionCheck } = nu
 
 /// Runs `git --version` once per executable and process. A failed probe is not
 /// cached, so a transient spawn failure does not disable git for the session.
-fn versionCheck(arena: Allocator, executable: []const u8) Allocator.Error!VersionCheck {
+fn versionCheck(arena: Allocator, executable: []const u8, checks: CheckRunner) CheckError!VersionCheck {
     const io = io_mod.getIo();
     version_lock.lockUncancelable(io);
     defer version_lock.unlock(io);
     if (cached_version) |cached| {
         if (std.mem.eql(u8, cached.executable, executable)) return cached.check;
     }
-    const output = try runCaptured(arena, &.{ executable, "--version" }, "/") orelse return .unknown;
+    const output = try checks.run(checks.context, arena, &.{ executable, "--version" }, "/", max_probe_output) orelse return .unknown;
     const check = classifyVersion(output);
     cached_version = .{ .executable = executable, .check = check };
     return check;
@@ -202,11 +236,11 @@ fn leadingNumber(text: []const u8) ?u32 {
 /// git directory used as the workspace, and fx's discovery does not, so
 /// without this check git could run with config fx never read. `rev-parse`
 /// reads config but runs none of the programs above.
-fn sameRepository(arena: Allocator, ready: Ready, cwd: []const u8, expected: ?[]const u8) Allocator.Error!bool {
+fn sameRepository(arena: Allocator, ready: Ready, cwd: []const u8, expected: ?[]const u8, checks: CheckRunner) CheckError!bool {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendCommand(arena, &argv, ready, .rev_parse);
     try argv.append(arena, "--absolute-git-dir");
-    const output = try runCaptured(arena, argv.items, cwd);
+    const output = try checks.run(checks.context, arena, argv.items, cwd, max_probe_output);
     const expected_dir = expected orelse return output == null;
     const reported = std.mem.trimEnd(u8, output orelse return false, "\r\n");
     const expected_real = io_mod.realpathAlloc(arena, expected_dir) catch |err| switch (err) {
@@ -222,14 +256,14 @@ fn sameRepository(arena: Allocator, ready: Ready, cwd: []const u8, expected: ?[]
 
 /// Standard output of a successful run, or null when git could not start or
 /// failed. Memory belongs to `arena`.
-fn runCaptured(arena: Allocator, argv: []const []const u8, cwd: []const u8) Allocator.Error!?[]const u8 {
+fn runCaptured(arena: Allocator, argv: []const []const u8, cwd: []const u8, output_limit: usize) Allocator.Error!?[]const u8 {
     var env = try environment(arena);
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .environ_map = &env,
-        .stdout_limit = .limited(max_probe_output),
-        .stderr_limit = .limited(max_probe_output),
+        .stdout_limit = .limited(output_limit),
+        .stderr_limit = .limited(output_limit),
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -290,6 +324,40 @@ test "safe git environment keeps only fixed values and user config locations" {
     }
 }
 
+test "a git check that times out ends safe git's preparation with no decision" {
+    const TimedOut = struct {
+        var calls: usize = 0;
+        fn run(_: ?*const anyopaque, _: Allocator, _: []const []const u8, _: []const u8, _: usize) CheckError!?[]const u8 {
+            calls += 1;
+            return error.TimeoutExpired;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cwd = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    if (trustedExecutable() == null) return error.SkipZigTest;
+
+    const io = io_mod.getIo();
+    version_lock.lockUncancelable(io);
+    const saved = cached_version;
+    cached_version = null;
+    version_lock.unlock(io);
+    defer {
+        version_lock.lockUncancelable(io);
+        cached_version = saved;
+        version_lock.unlock(io);
+    }
+
+    TimedOut.calls = 0;
+    try std.testing.expectError(error.TimeoutExpired, prepareWith(arena, cwd, .{ .run = TimedOut.run }));
+    try std.testing.expectEqual(@as(usize, 1), TimedOut.calls);
+    // The version check that timed out is not remembered as unknown.
+    try std.testing.expect(cached_version == null);
+}
+
 /// A real repository with a sentinel program that appends to a log whenever
 /// git runs it. Setup and control runs use plain git; helper runs use the
 /// helper's environment. Both are isolated from the developer's git config.
@@ -313,7 +381,7 @@ const SentinelRepo = struct {
 
     fn init(arena: Allocator, dir: std.Io.Dir) !SentinelRepo {
         const git = trustedExecutable() orelse return error.SkipZigTest;
-        if (try versionCheck(arena, git) != .supported) return error.SkipZigTest;
+        if (try versionCheck(arena, git, unbounded_checks) != .supported) return error.SkipZigTest;
         const root = try io_mod.dirRealpathAlloc(arena, dir, ".");
         const self: SentinelRepo = .{
             .arena = arena,

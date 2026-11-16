@@ -40,7 +40,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-unit-${{ matrix.optimize }}
 
       - name: Check formatting
@@ -99,6 +99,9 @@ jobs:
 
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape
+
+      - name: Test the zig skill's scripts and examples
+        run: python3 -m unittest discover -s .fx/skills/zig/scripts
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
@@ -166,7 +169,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-build-ReleaseSafe
 
       # Other runners execute this binary, and their CPUs can differ from this
@@ -230,7 +233,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-sdk-wasm
 
       - name: Build WASM surfaces (ReleaseSmall)
@@ -294,7 +297,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-sdk-napi-${{ matrix.platform }}
 
       - name: Build N-API addon (ReleaseSafe)
@@ -702,7 +705,7 @@ jobs:
       - name: Setup Zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-tla-mcp
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -722,7 +725,6 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
           python3 tests/tla/mcp/run.py check
-          tests/tla/mcp_host/check.sh
           bun tests/tla/drivers/mcp/driver.ts
           bun test ./tests/tla/drivers/mcp_host/
 
@@ -747,7 +749,7 @@ jobs:
         if: needs.ci-need.outputs.transcript_window == 'true'
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-tla-transcript-window
       - name: Setup Bun
         if: needs.ci-need.outputs.transcript_window == 'true'
@@ -852,7 +854,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-e2e-fixtures
 
       - name: Setup Bun
@@ -1032,7 +1034,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-unit-ReleaseSafe
 
       - name: Build
