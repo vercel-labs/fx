@@ -1845,6 +1845,12 @@ const FakeWorker = struct {
     propagated_grants: usize = 0,
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
+    /// Finished turns the app told this worker it dropped without saving.
+    dropped_finishes: usize = 0,
+
+    pub fn acknowledgeFinishDropped(self: *FakeWorker, _: []const u8) void {
+        self.dropped_finishes += 1;
+    }
 
     pub fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
         self.compaction_reads += 1;
@@ -2226,6 +2232,8 @@ const FakeShell = struct {
 const FakePacer = struct {
     flushed: usize = 0,
     completed_assistant_presentation_tail: bool = false,
+    deferred_turn: ?types.FinishedPrompt = null,
+    deferred_started_ns: ?i128 = null,
 
     fn flushPendingText(self: *FakePacer, callbacks: anytype) !void {
         _ = callbacks;
@@ -2297,6 +2305,7 @@ const FakeApp = struct {
     }
 
     fn deinit(self: *FakeApp) void {
+        if (self.pacer.deferred_turn) |finished| types.freeFinishedPrompt(self.alloc, finished);
         for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
         self.persisted_finishes.deinit(self.alloc);
         self.program_status_reports.deinit(self.alloc);
@@ -5636,6 +5645,37 @@ test "unaccepted worker finish records save failure and stops the detached suffi
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.agent().session_persistence.shutdown_failure);
     try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
+}
+
+test "a finish the drain's handler cannot save after the pacer's turn failed to save is acknowledged as dropped" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp.init(alloc);
+    defer app.deinit();
+    app.agent().worker.processing = true;
+    app.finish_persistence_error = error.InputOutput;
+    // The pacer still holds an earlier finished turn. When the handler fails,
+    // the drain saves that turn first, and the save fails, so it may not save
+    // the finish the handler was applying.
+    app.pacer.deferred_turn = try types.dupeFinishedPrompt(alloc, .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("earlier request") },
+        .assistant = @constCast("earlier answer"),
+    } } });
+    const Capture = struct {
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return error.InjectedDeliveryFailure;
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.append_history_turn = Capture.history;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("request") },
+        .assistant = @constCast("answer"),
+    } } } });
+    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, (&app).agent(), handlers));
+    try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    // The finish that was not saved is acknowledged as dropped, once.
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.dropped_finishes);
 }
 
 test "a segment scan resumed at any split point decides like one full scan" {

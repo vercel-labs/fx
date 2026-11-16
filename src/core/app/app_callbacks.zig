@@ -1781,7 +1781,7 @@ const FakePacer = struct {
         try self.text.appendSlice(alloc, text);
     }
 
-    fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
+    pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
         _ = alloc;
         _ = finished;
         return self.defer_history;

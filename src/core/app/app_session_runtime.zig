@@ -5485,7 +5485,7 @@ test "session transition retires queued and running compaction only after worker
             worker: worker_runtime.WorkerRuntime = .{},
         } = .{},
         pacer: struct {
-            fn clear(_: *@This(), _: Allocator) void {}
+            pub fn clear(_: *@This(), _: Allocator) void {}
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
