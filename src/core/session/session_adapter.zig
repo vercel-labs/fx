@@ -10160,7 +10160,7 @@ test "recover on a v1 session whose lock file others can write says its storage 
     try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
 }
 
-test "recover and conversion refuse a v1 family whose subagent folder others can write as unsafe, and keep it (D61)" {
+test "a v1 family whose subagent folder others can write: recover refuses it as unsafe, conversion as unreadable, and every member keeps its v1 folder (D61)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
@@ -10175,10 +10175,8 @@ test "recover and conversion refuse a v1 family whose subagent folder others can
         return error.TestUnexpectedResult;
     } else |err| err;
     try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
-    if (openConverted(&t, family[0])) |s| {
-        s.close();
-        return error.TestUnexpectedResult;
-    } else |_| {}
+    // Conversion reports it unreadable, as it does a damaged member.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
     // Nothing was copied or removed: every member keeps its v1 folder.
     for (family) |id| try testing.expect(V1Home.exists(&t, id));
     try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
