@@ -1115,6 +1115,48 @@ describe("MCP login", () => {
     expect(auth.revocations).toBe(2);
   }, 60_000);
 
+  test("the next fx mcp login that signs in revokes a sign-out its server didn't confirm", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+
+    delete options.revokeStatus;
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(1);
+    // After the sign-in, the kept revocation goes, and nothing stays kept.
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+    expect(await statusOf(root)).toBe("signed_in");
+  }, 60_000);
+
+  test("an fx mcp login that fails sends no kept sign-out and keeps it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number; rejectCodeExchange?: boolean } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+
+    delete options.revokeStatus;
+    options.rejectCodeExchange = true;
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.code).toBe(1);
+    expect(login.stderr).toContain("Couldn't sign in to fixture");
+    expect(auth.revocations).toBe(1);
+    expect(readFileSync(keptSignOuts(root), "utf8")).toContain(`"refresh_token":"${REFRESH_INITIAL}"`);
+  }, 60_000);
+
   test("a confirmed logout keeps nothing", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
