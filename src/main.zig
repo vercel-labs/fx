@@ -7578,6 +7578,148 @@ test "a report reaches the agent that owns its host as its subagent's message" {
     try std.testing.expect(queued.delivery == .continuation);
 }
 
+/// A subagent that owns the host `reporter`, with a run installed so that a
+/// report for it can build its turn. Clear `session_persistence.subagent_host`
+/// before the app is torn down.
+fn addReportTarget(
+    app: *App,
+    id: []const u8,
+    reporter: *subagent_tool_host.Runtime,
+    resolver: *@import("core/subagent/authority.zig").Resolver,
+) !*app_agents_runtime.ChildAgent {
+    const child = try addTestChildAgent(app, id);
+    const credential = credentials.Credential{
+        .token = try app.alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    App.AgentsAppRuntime.installChildRun(app, child, try testChildRun(app.alloc, resolver, false, credential));
+    child.agent.session_persistence.subagent_host = reporter;
+    return child;
+}
+
+fn postTestReport(app: *App, reporter: *subagent_tool_host.Runtime, output: []const u8) !void {
+    try app_agents_runtime.postDelivery(&app.child_handoffs, reporter, .{ .report = .{
+        .agent = "worker",
+        .child_id = "c1",
+        .work_id = "w1",
+        .outcome = .completed,
+        .output = output,
+    } });
+}
+
+/// The lines of a saved session's log that hold `needle`.
+fn countLogLines(alloc: Allocator, tp: *@import("core/subagent/child_state.zig").TestParent, needle: []const u8) !usize {
+    const log_path = try std.Io.Dir.path.join(alloc, &.{ ".fx", "sessions", "v2", tp.parent.id(), "log.jsonl" });
+    defer alloc.free(log_path);
+    const bytes = try tp.tmp.dir.readFileAlloc(io_mod.getIo(), log_path, alloc, .limited(1 << 20));
+    defer alloc.free(bytes);
+    return std.mem.count(u8, bytes, needle);
+}
+
+/// Turn N, streamed to `tp.parent` the way an agent's worker writes it, has
+/// finished and the loop has not committed it. A report that missed the turn
+/// is then posted to the agent. `gated` is whether the agent's worker has
+/// the commit gate on, as the app's threads do. The loop commits turn N
+/// through the app's own path, which acknowledges it. `spawn_child` makes a
+/// subagent during turn N.
+fn runReportBetweenFinishAndCommit(
+    alloc: Allocator,
+    tp: *@import("core/subagent/child_state.zig").TestParent,
+    gated: bool,
+    spawn_child: bool,
+) !void {
+    const session = tp.parent;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var reporter: subagent_tool_host.Runtime = undefined;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const child = try addReportTarget(&app, "child-1", &reporter, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer child.agent.session_persistence.subagent_host = null;
+    child.agent.session_persistence.v2 = session;
+    defer child.agent.session_persistence.v2 = null;
+    if (gated) child.agent.worker.enableCommitGate();
+
+    const user_n: types.UserTurn = .{ .text = @constCast("turn N") };
+    const turn_n: types.HistoryTurn = .{ .assistant = .{ .user = user_n, .assistant = @constCast("answer N") } };
+    const user_report: types.UserTurn = .{ .text = @constCast("report turn") };
+    const turn_report: types.HistoryTurn = .{ .assistant = .{ .user = user_report, .assistant = @constCast("answer report") } };
+    const language = types.ConversationLanguage.default();
+
+    // The worker streamed turn N and finished it. Its finish waits for the loop.
+    try session.appendProgress(user_n, .{}, .{});
+    if (spawn_child) try session.appendChildLines(&.{.{ .spawned = .{ .child = "late", .work_id = "w-late", .data = "{\"kind\":\"persistent\"}" } }});
+    try child.agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = turn_n } });
+    try postTestReport(&app, &reporter, "SECOND_CHILD_REPORT");
+    App.AgentsAppRuntime.takePosts(&app);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+
+    const early = try child.agent.worker.tryTakeNextWork(std.heap.c_allocator);
+    if (early) |work| {
+        // Without the gate the report's turn begins before the commit.
+        defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+        try std.testing.expect(!gated);
+        try session.appendProgress(user_report, .{}, .{});
+        try session.commitTurn(turn_n, language);
+        try session.commitTurn(turn_report, language);
+        return;
+    }
+    try std.testing.expect(gated);
+    // The loop applies the finish: the app's own commit, which acknowledges it.
+    var events = child.agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    events.deinit(std.heap.c_allocator);
+    try std.testing.expect((try child.agent.worker.tryTakeNextWork(std.heap.c_allocator)) == null);
+    try App.SessionAppRuntime.appendFinishedPrompt(&app, &child.agent, .{ .turn = turn_n });
+    // The worker begins the report's turn and finishes it.
+    const work = (try child.agent.worker.tryTakeNextWork(std.heap.c_allocator)).?;
+    defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+    try std.testing.expect(std.mem.find(u8, work.prompt.prompt, "SECOND_CHILD_REPORT") != null);
+    try session.appendProgress(user_report, .{}, .{});
+    try session.commitTurn(turn_report, language);
+}
+
+test "a report that missed a finished turn starts no turn until the loop commits it, and the log shows no superseded turn" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    var tp: child_state.TestParent = undefined;
+    try tp.init(alloc);
+    defer tp.deinit();
+    // A subagent is made during turn N, as a prompt's own work makes one.
+    try runReportBetweenFinishAndCommit(alloc, &tp, true, true);
+    try std.testing.expectEqual(@as(usize, 0), try countLogLines(alloc, &tp, "\"superseded\""));
+    try std.testing.expectEqual(@as(usize, 0), try countLogLines(alloc, &tp, "turn_interrupted"));
+    // The setup's turn, turn N, and the report's turn, each committed once.
+    try std.testing.expectEqual(@as(usize, 3), try countLogLines(alloc, &tp, "turn_committed"));
+
+    // A fork before turn N's prompt offers none of the subagents that turn made.
+    // A superseded turn N is written again after them, so a fork before the
+    // rewritten prompt offers them as if they came first.
+    const session_adapter = @import("core/session/session_adapter.zig");
+    const points = try tp.parent.forkPoints(alloc);
+    defer session_adapter.Session.freeForkPoints(alloc, points);
+    var turn_n: ?u64 = null;
+    for (points) |point| if (std.mem.eql(u8, point.prompt, "turn N")) {
+        turn_n = point.turn;
+    };
+    const offered = try tp.parent.forkChildren(alloc, turn_n.?);
+    defer session_adapter.freeChildren(alloc, offered);
+    try std.testing.expectEqual(@as(usize, 0), offered.len);
+}
+
+test "the same turns written without the gate supersede each other, which the log shows" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    var tp: child_state.TestParent = undefined;
+    try tp.init(alloc);
+    defer tp.deinit();
+    try runReportBetweenFinishAndCommit(alloc, &tp, false, false);
+    try std.testing.expect(try countLogLines(alloc, &tp, "\"superseded\"") > 0);
+    try std.testing.expect(try countLogLines(alloc, &tp, "turn_interrupted") > 0);
+}
+
 test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
