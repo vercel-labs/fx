@@ -7493,13 +7493,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
       // The failed call is not a command, so the header keeps the command's
-      // mark and counts the failure on its own, and its reason follows its row.
-      const header = "● Ran a command ✓ · 1 failed";
-      const failedRow = `├ Couldn't run ${unsupportedToolName} · Unsupported tool: ${unsupportedToolName}`;
+      // mark. The turn went on after it, so its row says only that it
+      // failed, and the header does not count it.
+      const header = "● Ran a command ✓";
+      const failedRow = `├ Couldn't run ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
       expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
       expect(countOccurrences(compact, `Couldn't run ${unsupportedToolName}`)).toBe(1);
+      expect(compact).not.toContain(`Unsupported tool: ${unsupportedToolName}`);
       expect(compact).not.toContain(`Failed ${unsupportedToolName}`);
       expect(countOccurrences(compact, `Ran ${supportedCommand}`)).toBe(1);
       expect(compact).not.toContain(`Running ${unsupportedToolName}`);
@@ -7956,7 +7958,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● Started subagents, read a file · 1 failed");
+        expect(compact).toContain("● Started subagents, read a file");
         expect(compact).toContain("Couldn't message Invalid Agent");
         expect(compact).not.toContain("Messaged Invalid Agent");
         expect(compact).not.toContain("Check failure visibility");
@@ -7992,7 +7994,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● Started subagents, read a file · 1 failed");
+        expect(resumed).toContain("● Started subagents, read a file");
         expect(resumed).toContain("Couldn't message Invalid Agent");
         expect(resumed).toContain("Messaged helper");
         expect(resumed).toContain("Messaged checker");

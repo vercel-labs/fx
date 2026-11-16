@@ -12581,12 +12581,14 @@ test "current compact projection groups tool rows without mutating entries" {
     const entry_count = runtime.notebook.entries.items.len;
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
+    // The failed edit is not a command, so its row says only that it failed,
+    // in the failure style, and the header does not count it.
     try std.testing.expect(std.mem.find(
         u8,
         compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file · 1 failed\x1b[0m\n" ++
+        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245mRead a file\x1b[0m\n" ++
             "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
-            "\x1b[38;5;245m└ Edit failed\x1b[0m",
+            "\x1b[38;5;245m└ \x1b[38;5;245mEdit failed\x1b[0m\x1b[38;5;245m\x1b[0m",
     ) != null);
     try std.testing.expectEqual(entry_count, runtime.notebook.entries.items.len);
 }
