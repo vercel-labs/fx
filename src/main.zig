@@ -2768,6 +2768,15 @@ const App = struct {
         try self.shell.attachHistoricalToolCallWithoutResult(self.alloc, entry_id, call);
     }
 
+    pub fn attachHistoricalBridgeCall(
+        self: *App,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.shell.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
+    }
+
     pub fn attachHistoricalCommandOutput(self: *App, entry_id: u32) void {
         self.shell.attachHistoricalCommandOutput(self.alloc, entry_id);
     }

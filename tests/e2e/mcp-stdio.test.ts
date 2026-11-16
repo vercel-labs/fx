@@ -4569,6 +4569,67 @@ describe("fx mcp call", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "in the TUI, the MCP row of a command's calls comes back after --resume last, without their arguments or results",
+    async () => {
+      const root = bridgeRoot("bridge-tui-resumed-rows", {}, { mode: "paged", expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command: pageLoop }),
+        fakeGatewayFinalText("BRIDGE_ROWS_SAVED"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Page through the list.");
+      await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
+      await tui.waitForComposer(10_000);
+      expect(await tui.captureFullScrollback()).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // The resumed session shows the rows the live one did, in the
+      // command's group, and asks the model nothing.
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("BRIDGE_ROWS_SAVED", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      expect(resumed).toContain("● Used MCP tools, ran a command ✓");
+      expect(resumed.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
+      expect(resumed).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(resumed).not.toContain("Running MCP");
+
+      // Ctrl+O shows each call's row, and neither the arguments the
+      // command sent nor the pages the tool returned.
+      await tui.sendKeys("C-o");
+      const full = await tui.waitForPane((pane) => pane.split(`Ran MCP ${TOOL_NAME}`).length === 4, 10_000);
+      expect(full).not.toContain('"text":"1"');
+      expect(full).not.toContain("item-0");
+      await tui.sendKeys("C-o");
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(activeGateway.requests).toHaveLength(2);
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "in the TUI, a call that runs when the user cancels shows as running, then as cancelled",
     async () => {
       const root = bridgeRoot("bridge-tui-cancel", {}, { mode: "stall_operation", operationTimeoutMs: 30_000, expectedElicitation: "both" });
@@ -4580,13 +4641,14 @@ describe("fx mcp call", () => {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
+      const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 140,
         height: 40,
         stderrPath,
-        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+        env,
       });
 
       await tui.waitForComposer(15_000);
@@ -4601,8 +4663,34 @@ describe("fx mcp call", () => {
       // The session goes on.
       await tui.sendText("Go on.");
       await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // A resume shows the call as it ended, cancelled.
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("BRIDGE_AFTER_CANCEL", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      expect(resumed).toContain(`Cancelled ${TOOL_NAME}`);
+      expect(resumed).not.toContain("Running MCP");
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
-    60_000,
+    90_000,
   );
 });

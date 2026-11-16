@@ -2415,6 +2415,20 @@ pub const Session = struct {
         return true;
     }
 
+    /// Saves a call a command made through `fx mcp call` in the open turn,
+    /// as it ends (`bridge_call_type`). The shell call that ran the command
+    /// is still running, so the turn is open; with none open, nothing is
+    /// written and the caller logs the row as dropped.
+    pub fn saveBridgeCall(self: *Session, record: types.BridgeCallRecord) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return error.NoOpenTurn;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        _ = try self.write(&.{.{ .item = .{ .type = bridge_call_type, .data = try encodeBridgeCall(a, record) } }});
+    }
+
     fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
         const bytes: []u8 = switch (record) {
             .keep => return null,
@@ -5202,6 +5216,10 @@ noinline fn replay(
                         try attachFileReview(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, bridge_call_type)) {
+                        try attachBridgeCall(src, pa, &builder, piece);
+                        continue;
+                    }
                     if (std.mem.eql(u8, piece.type, author_type)) {
                         try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
                         continue;
@@ -5658,6 +5676,52 @@ fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
     var record: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&record, rest[0..64]) catch return null;
     return record;
+}
+
+/// A call a command made through `fx mcp call`, saved in the open turn as it
+/// ends, while its shell call still runs. Its data is a
+/// `types.BridgeCallRecord`: the shell call's id, the request id, the tool's
+/// name, and how the call ended, never its arguments or its result. Replay
+/// gives it to the turn, and a resume shows its row in its shell call's
+/// group (D99). Older fx drops it as an unknown item.
+const bridge_call_type = "mcp_bridge_call";
+
+/// The `mcp_bridge_call` item data for `record`, owned by `a`.
+fn encodeBridgeCall(a: Allocator, record: types.BridgeCallRecord) ![]u8 {
+    if (!types.validBridgeCallRecord(record)) return error.InvalidBridgeCall;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(record, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// A bridge call's record from the log, or null when it can't be parsed or
+/// fails its checks, as a newer fx's outcome would. A newer fx's extra
+/// fields are ignored. Strings are in `arena`.
+fn decodeBridgeCall(arena: Allocator, data: []const u8) ?types.BridgeCallRecord {
+    const record = json_decode.parseFromSliceLeaky(types.BridgeCallRecord, arena, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    return if (types.validBridgeCallRecord(record)) record else null;
+}
+
+/// Gives the turn the record an `mcp_bridge_call` item holds. One that can't
+/// be read is logged and left out: it only draws a row, so it never fails
+/// the session.
+fn attachBridgeCall(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_bridge_call_unreadable session={s} err={s} dropped=bridge_call_row", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const record = decodeBridgeCall(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_bridge_call_invalid session={s} dropped=bridge_call_row", .{src.id});
+        return;
+    };
+    try builder.appendBridgeCall(record);
 }
 
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
@@ -8144,6 +8208,81 @@ test "replay keeps a model call record a newer fx wrote and leaves out one it ca
     try testing.expect(decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"outcome\":\"exploded\"}") == null);
     try testing.expect(decodeModelCall(a, "{\"at_ms\":-1,\"provider\":\"gateway\",\"model\":\"m\"}") == null);
     try testing.expect(decodeModelCall(a, "not json") == null);
+}
+
+test "the calls a command made through fx mcp call come back on resume with their shell call, tool, and outcome only (D99)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    const user: types.UserTurn = .{ .text = @constCast("page through the list") };
+    // No turn is open before the first write, so there is nothing to save into.
+    try testing.expectError(error.NoOpenTurn, s.saveBridgeCall(.{ .call_id = "call-1", .request_id = "fx-mcp-call-0", .tool = "mcp_fixture_echo", .outcome = .completed }));
+    // The shell call is saved as running, then its command's calls end.
+    try s.appendProgress(user, .{}, .{ .calls = fixture.calls[0..1] });
+    const records = [_]types.BridgeCallRecord{
+        .{ .call_id = "call-1", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call-1", .request_id = "fx-mcp-call-2", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call-1", .request_id = "fx-mcp-call-3", .tool = "mcp_fixture_echo", .outcome = .failed },
+    };
+    for (records) |record| try s.saveBridgeCall(record);
+    // A record a newer fx wrote with an outcome this one doesn't know.
+    _ = try s.write(&.{.{ .item = .{ .type = bridge_call_type, .data = "{\"call_id\":\"call-1\",\"request_id\":\"fx-mcp-call-4\",\"tool\":\"mcp_fixture_echo\",\"outcome\":\"retried\"}" } }});
+    try testing.expectError(error.InvalidBridgeCall, s.saveBridgeCall(.{ .call_id = "call-1", .request_id = "fx-mcp-call-5", .tool = "mcp_\x1b[2J", .outcome = .completed }));
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..1] },
+    } }, types.ConversationLanguage.default());
+    try testing.expectError(error.NoOpenTurn, s.saveBridgeCall(records[0]));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Each call is one line with exactly these four fields, outside the
+    // streamed pieces, so the turn was never rewritten.
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\"" ++ bridge_call_type ++ "\""));
+    try testing.expect(std.mem.find(u8, bytes, "\"data\":{\"call_id\":\"call-1\",\"request_id\":\"fx-mcp-call-1\",\"tool\":\"mcp_fixture_echo\",\"outcome\":\"completed\"}") != null);
+    try testing.expect(std.mem.find(u8, bytes, "fx-mcp-call-5") == null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const saved = restored.history[0].assistant.execution.bridge_calls;
+    try testing.expectEqual(records.len, saved.len);
+    for (records, saved) |want, got| {
+        try testing.expectEqualStrings(want.call_id, got.call_id);
+        try testing.expectEqualStrings(want.request_id, got.request_id);
+        try testing.expectEqualStrings(want.tool, got.tool);
+        try testing.expectEqual(want.outcome, got.outcome);
+    }
+    try testing.expectEqual(@as(usize, 1), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const newer = decodeBridgeCall(a, "{\"call_id\":\"c\",\"request_id\":\"r\",\"tool\":\"mcp_s_t\",\"outcome\":\"cancelled\",\"elapsed_ms\":4}").?;
+    try testing.expectEqualStrings("mcp_s_t", newer.tool);
+    try testing.expectEqual(types.BridgeCallOutcome.cancelled, newer.outcome);
+    // An outcome this fx doesn't know, escape bytes, an empty name, a
+    // missing field, and bytes that aren't JSON.
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"c\",\"request_id\":\"r\",\"tool\":\"t\",\"outcome\":\"exploded\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"c\",\"request_id\":\"r\",\"tool\":\"t\\u001b]0;x\\u0007\",\"outcome\":\"failed\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"\",\"request_id\":\"r\",\"tool\":\"t\",\"outcome\":\"failed\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "{\"call_id\":\"c\",\"tool\":\"t\",\"outcome\":\"failed\"}") == null);
+    try testing.expect(decodeBridgeCall(a, "not json") == null);
 }
 
 test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {

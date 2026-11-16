@@ -456,7 +456,11 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(agent),
                 .on_tool_progress = app_callbacks.Bindings(App).onToolProgress,
-                .nested_tool_lifecycle = .{ .context = @ptrCast(agent), .push_fn = app_callbacks.Bindings(App).pushNestedToolLifecycle },
+                .nested_tool_lifecycle = .{
+                    .context = @ptrCast(agent),
+                    .push_fn = app_callbacks.Bindings(App).pushNestedToolLifecycle,
+                    .save_bridge_call_fn = app_callbacks.Bindings(App).saveNestedBridgeCall,
+                },
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(agent),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,

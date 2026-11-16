@@ -949,6 +949,21 @@ pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const
     return alloc.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
+/// The label of the row a call made through `fx mcp call` ends with.
+pub fn bridgeCallRowLabel(outcome: types.BridgeCallOutcome) []const u8 {
+    return switch (outcome) {
+        .completed => mcp_ran_label,
+        .cancelled => "Cancelled",
+        .failed => "Failed",
+    };
+}
+
+/// The status line of a call made through `fx mcp call` once it ended, the
+/// same live and when a resume shows the row again.
+pub fn bridgeCallRowSummary(alloc: Allocator, tool: []const u8, outcome: types.BridgeCallOutcome) Allocator.Error![]u8 {
+    return formatToolActionValue(alloc, bridgeCallRowLabel(outcome), tool);
+}
+
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const call = input.call;
