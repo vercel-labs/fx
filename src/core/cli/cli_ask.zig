@@ -2231,17 +2231,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .propagate_grant = propagateGrant,
-        .push_event = pushEvent,
-        .push_text = pushText,
-        .push_tool_lifecycle = pushToolLifecycle,
-        .push_diff_block = pushDiffBlock,
-        .push_system_notice = pushSystemNotice,
-        .push_context_notice = pushContextNotice,
-        .push_session_notice = pushSessionNotice,
-        .push_route_recovery_status = pushRouteRecoveryStatus,
+        .emit_event = emitEvent,
         .begin_route_recovery_request = beginRouteRecoveryRequest,
-        .push_command_output_complete = pushCommandOutputComplete,
-        .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
@@ -3219,10 +3210,30 @@ fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []typ
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 
-fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+/// fx ask's one sink for the agent loop's events, each lent for the call
+/// (`tests/tla/agent_runtime/TurnEvents.tla` InOrder).
+fn emitEvent(raw_ctx: *anyopaque, event: agent_runtime.TurnEvent) !void {
     switch (event) {
+        .worker => |worker| try pushWorkerEvent(raw_ctx, worker),
+        .text => |emission| try pushText(raw_ctx, emission),
+        // fx ask doesn't show the model's reasoning.
+        .reasoning_delta => {},
+        // fx ask shows no semantic notices, so it writes the plain text, and
+        // nothing for a notice that has none.
+        .notice => |notice| if (notice.plain) |text| try pushSystemNotice(raw_ctx, text),
+        .context_notice => |text| try pushContextNotice(raw_ctx, text),
+        .session_notice => |text| try pushSessionNotice(raw_ctx, text),
+        .http_error => |failure| try pushHttpError(raw_ctx, failure.status, failure.detail, failure.credential_source),
+    }
+}
+
+fn pushWorkerEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    switch (event) {
+        .tool_lifecycle => |lifecycle| try pushToolLifecycle(raw_ctx, lifecycle),
+        .diff_block => |payload| try pushDiffBlock(raw_ctx, payload),
+        .route_recovery_status => |status| try pushRouteRecoveryStatus(raw_ctx, status),
+        .command_output_complete => |lifecycle_id| try pushCommandOutputComplete(raw_ctx, lifecycle_id),
         .clear_route_recovery_status => {
             ctx.last_recovery_status = null;
             ctx.last_recovery_notice_kind = null;
@@ -3543,7 +3554,6 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
 fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.presenter) |presenter| return presenter.pushDiffBlock(payload);
-    defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
     try ctx.writeStderr(payload.preview);
 }
 
@@ -4579,8 +4589,8 @@ fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, de
     var notice: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer notice.deinit();
     try skill_runtime.writeDiagnosticSummary(std.testing.allocator, &notice.writer, &diagnostics);
-    try deps.push_context_notice.?(deps.ctx, notice.written());
-    try deps.push_context_notice.?(deps.ctx, notice.written());
+    try deps.emit(.{ .context_notice = notice.written() });
+    try deps.emit(.{ .context_notice = notice.written() });
     try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
 
