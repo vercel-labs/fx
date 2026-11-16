@@ -844,9 +844,9 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("history feedback live complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      // The two commands share one row by their steps, and the feedback comes
-      // after it.
-      const commandsRow = scrollback.indexOf("└ Ran touch, printf");
+      // The two commands share one row by their steps, which is the group's
+      // line, and the feedback comes after it.
+      const commandsRow = scrollback.indexOf("● Ran touch, printf");
       expect(commandsRow).toBeGreaterThanOrEqual(0);
       expect(scrollback.indexOf(feedback)).toBeGreaterThan(commandsRow);
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
@@ -1210,18 +1210,24 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the prepared command matrix.");
-      await activeSession.waitForText("Running ./fxc110-stream.sh", TIMEOUT);
+      // The running command joins the row of the command that ran before it,
+      // so no row of its own shows first and then folds away.
+      const joinedRow = /Running \S*fxc110-fast\.sh, \S*fxc110-stream\.sh/;
+      await activeSession.waitForText(joinedRow, TIMEOUT);
       await Bun.sleep(250);
       const running = await activeSession.captureFullScrollback();
-      expect(running).toContain("Running ./fxc110-stream.sh");
+      expect(running).toMatch(joinedRow);
+      expect(running).not.toContain("Running ./fxc110-stream.sh\n");
       expectNoOutputRows(running);
 
-      // The last command failed, so the group ends in ✗, and its reason line
-      // shows one line of the error while the full output stays in Ctrl-O.
+      // The last command failed, so the group ends in ✗, and its row shows
+      // one line of the error after the command while the full output stays
+      // in Ctrl-O.
       const header = "● Ran commands ✗";
       await activeSession.waitForText(header, TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
-      expect(completed).toContain("✗ exit 7 · FXC110_FAILED_STDERR");
+      expect(completed).toMatch(/Exited 7 .* · FXC110_FAILED_STDERR/);
+      expect(completed).not.toContain("✗ exit 7");
       for (const script of scripts) expect(completed).toContain(script.name);
       expectNoOutputRows(completed);
 

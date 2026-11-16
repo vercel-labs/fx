@@ -33,7 +33,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -47,6 +47,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const MODEL = "openai/gpt-5.5";
 /** The frame every subagent report arrives in (`src/core/subagent/reports.zig`). */
@@ -200,14 +201,14 @@ function compactionRaceFixture(label: string) {
 const RACE_PROMPT = "Read notes.txt until told to stop. RACE_MAIN_PROMPT";
 
 /// The records the `compaction_records` lines of session `id` list, besides
-/// each line's own map, which every such line lists too (D50). The log is
-/// read raw: the mid-turn compaction makes fx write the turn afresh as
-/// superseded, which logLines refuses.
+/// each line's own map, which every such line lists too (D50). The mid-turn
+/// compaction makes fx write the turn afresh as superseded, which logLines
+/// refuses. logLinesAfterCompaction accepts that supersede only when a
+/// compaction in the same turn explains it, so this read also checks it is the
+/// designed one.
 function listedRecords(home: string, id: string): string[] {
-  const lines = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8")
-    .split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const listed: string[] = [];
-  for (const line of lines) {
+  for (const line of logLinesAfterCompaction(home, id) as any[]) {
     if (line.kind !== "set" || line.key !== "compaction_records") continue;
     expect(line.blobs).toContain(line.value.map);
     listed.push(...(line.blobs as string[]).filter((hash) => hash !== line.value.map));
@@ -8107,6 +8108,64 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     60_000,
   );
 
+  test.skipIf(!tmuxAvailable())(
+    "a read_tool_result request the model wrote as JSON text of over 4 KiB still names what it reads",
+    async () => {
+      const root = createFixtureRoot("read-request-long-text");
+      const tracePath = join(root.root, "trace.log");
+      const stderrPath = join(root.root, "stderr.log");
+      const marker = "READ_LONG_MATCH";
+      // A query as long as a model can make it. Text past about 2 KB once
+      // lost the row's verb, and no saved output holds this one.
+      const query = `${marker} ${"x".repeat(5000)}`;
+      let step = 0;
+      let readOutput = "";
+      const gateway = startDynamicFakeGateway((body) => {
+        switch (step++) {
+          case 0:
+            return fakeGatewayToolCall("read-long-source", "shell", {
+              request: { action: "run", command: `printf '${marker} found\\n'`, profile: "clean", yield_time_ms: 30000 },
+            });
+          case 1: {
+            const source = JSON.parse(toolResultOutput(body, "read-long-source"));
+            expect(source.full_output_handle).toBeString();
+            return fakeGatewayToolCall("read-long-page", "read_tool_result", {
+              request: JSON.stringify({ handle: source.full_output_handle, query }),
+            });
+          }
+          case 2:
+            readOutput = toolResultOutput(body, "read-long-page");
+            return fakeGatewayFinalText("READ_LONG_COMPLETE");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+      let tui: TmuxSession | null = null;
+      try {
+        const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0" };
+        tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
+        await tui.waitForComposer(15000);
+        await tui.sendText("Run the fixture command, then search its output for a long text.");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
+        expect(pane).not.toContain("request failed:");
+        expect(pane).toContain("READ_LONG_COMPLETE");
+        expect(readOutput).not.toContain("must be an object");
+        // The row says what the call does, as it does for a short query, and
+        // not the tool's default verb.
+        expect(pane).toMatch(new RegExp(`Searched[^\\n]*output for "${marker}`));
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(15000)).toBe(true);
+        tui = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        await tui?.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   test("fx ask --json names the question of an ask_user_question call whose questions are JSON text", async () => {
     const root = createFixtureRoot("ask-questions-text");
     const tracePath = join(root.root, "trace.log");
@@ -10136,7 +10195,49 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 45_000);
 
-  test("subagent failure retains its cause after effects and worker cleanup", async () => {
+  // How a test breaks the child's blobs folder, and the cause the child then
+  // reports.
+  type BlobsFault = {
+    cause: string;
+    inject: (blobs: string) => void;
+    // Puts the folder back, so the next message to the same child works.
+    restore: (blobs: string) => void;
+  };
+
+  // A user that file modes do not hold back, such as root or one that holds
+  // CAP_DAC_OVERRIDE, writes into a read-only folder, so the restored test
+  // cannot force its failure for them and skips.
+  const fileModesIgnored = ignoresFileModes();
+  if (fileModesIgnored) {
+    console.warn(
+      'skipping "subagent failure retains its cause after effects and worker cleanup": a write into a read-only folder was not refused for this user (root, or a user that holds CAP_DAC_OVERRIDE), so the folder cannot force the write failure that test needs',
+    );
+  }
+
+  // The child's next tool result needs a new blob, which a read-only blobs
+  // folder refuses, so the write fails while the child streams the step and
+  // the cause is the refused write.
+  const readOnlyBlobs: BlobsFault = {
+    cause: "AccessDenied",
+    inject: (blobs) => chmodSync(blobs, 0o500),
+    restore: (blobs) => chmodSync(blobs, 0o700),
+  };
+
+  // A file where the blobs folder must be fails the child's commit for every
+  // user. The step still streams, and the cause is the failed commit.
+  const fileInPlaceOfBlobs: BlobsFault = {
+    cause: "SessionCommitFailed",
+    inject: (blobs) => {
+      renameSync(blobs, `${blobs}.aside`);
+      writeFileSync(blobs, "");
+    },
+    restore: (blobs) => {
+      rmSync(blobs);
+      renameSync(`${blobs}.aside`, blobs);
+    },
+  };
+
+  async function runFailedChildAfterEffects(fault: BlobsFault) {
     const root = createFixtureRoot("subagent-failure-detail");
     const marker = join(root.workspace, "effect.txt");
     const childTask = "Write the effect once, then read it.";
@@ -10156,15 +10257,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (latestUserIsReport(body)) {
         const report = latestUserText(body);
         expect(report).toContain("failed");
-        expect(report).toContain("agent_turn_failed: AccessDenied");
+        expect(report).toContain(`agent_turn_failed: ${fault.cause}`);
         expect(report).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
         // The parent's log records the child's work failed, with its cause.
         expect(childWork(root.home, parentId).outcome).toBe("failed");
-        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain("AccessDenied");
+        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain(fault.cause);
         failureObserved = true;
-        chmodSync(childBlobs, 0o700);
+        fault.restore(childBlobs);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -10179,12 +10280,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-          // The child's next tool result needs a new blob, which a read-only
-          // blobs folder refuses, so the child's turn fails after its effect
-          // and reports that cause.
+          // Breaking the child's blobs folder makes its turn fail after its
+          // effect and report that cause.
           parentId = rootSessionIds(root.home)[0]!;
           childBlobs = join(sessionDir(root.home, childWork(root.home, parentId).child), "blobs");
-          chmodSync(childBlobs, 0o500);
+          fault.inject(childBlobs);
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -10204,7 +10304,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The message was sent; its failure is saved as the report's turn.
       const persisted = savedToolResults(history).find((entry) => entry.tool_call_id === "delegate");
       expect(persisted?.status).toBe("success");
-      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes("agent_turn_failed: AccessDenied"))).toBe(true);
+      expect(history.some((turn: any) => JSON.stringify(turn.user ?? turn).includes(`agent_turn_failed: ${fault.cause}`))).toBe(true);
       // Parent call, two child requests, the receipt, the failure's report
       // turn, the follow-up's receipt, the child, and its report's turn.
       expect(scripted.requestCount()).toBe(8);
@@ -10213,7 +10313,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       scripted.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }
+
+  test.skipIf(fileModesIgnored)("subagent failure retains its cause after effects and worker cleanup", () => runFailedChildAfterEffects(readOnlyBlobs), 20_000);
+
+  test("subagent failure keeps its cause when the child's commit fails after effects, whatever the user's permissions", () => runFailedChildAfterEffects(fileInPlaceOfBlobs), 20_000);
 
   test.each([
     ["before output", 401, false],

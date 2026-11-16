@@ -2643,6 +2643,67 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a streaming toolbox call's row names what it runs before its arguments end",
+    async () => {
+      const finalSentinel = "FX_TOOLBOX_STREAMED_LABEL_COMPLETE";
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-toolbox-streamed-label-",
+        [
+          () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  const send = (event: object) =>
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                  send({ type: "tool-input-start", id: "toolbox_run", toolName: "toolbox" });
+                  send({ type: "tool-input-delta", id: "toolbox_run", delta: '{"run":"glob_files",' });
+                  timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                  sendRest = () => {
+                    clearInterval(timer);
+                    send({ type: "tool-input-delta", id: "toolbox_run", delta: '"arguments":{"pattern":"*.md"}}' });
+                    send({ type: "tool-input-end", id: "toolbox_run" });
+                    send({
+                      type: "tool-call",
+                      toolCallId: "toolbox_run",
+                      toolName: "toolbox",
+                      input: { run: "glob_files", arguments: { pattern: "*.md" } },
+                    });
+                    send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                  };
+                },
+                cancel() {
+                  clearInterval(timer);
+                },
+              }),
+              { headers: { "content-type": "text/event-stream" } },
+            ),
+          () => fakeGatewayFinalText(finalSentinel),
+        ],
+      );
+
+      await session!.sendText("Find the markdown files.");
+      // The tool's whole name is in and the rest of the arguments are not,
+      // so the row names the tool instead of a bare "Using".
+      await waitForScrollback(
+        session!,
+        (value) => value.includes("Running glob_files"),
+        "the toolbox row naming its tool while its arguments stream in",
+      );
+      expect(queuedGateway.requests).toHaveLength(1);
+
+      sendRest?.();
+      await session!.waitForText(finalSentinel, TIMEOUT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "follow-up input counter excludes retained context and provider input usage",
     async () => {
       const firstFinal = `FIRST_TURN_CONTEXT_COMPLETE ${"retained assistant context ".repeat(128)}`;
@@ -3468,8 +3529,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(13);
       // Both reads render inside one uninterrupted tool group now that the
-      // turn no longer pauses between them.
-      expect(scrollback).toContain("└ Read before.txt, after.txt");
+      // turn no longer pauses between them, and their one row is its line.
+      expect(scrollback).toContain("● Read before.txt, after.txt");
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -4132,7 +4193,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const savedSession = readSavedSession();
 
       expect(pane).toContain(finalText);
-      expect(scrollback).toContain("Failed more output");
+      expect(scrollback).toContain("Couldn't read more output");
       expect(continuation).toContain(expectedFailure);
       expect(savedSession).toContain('"status":"failure"');
       expect(savedSession).toContain(expectedFailure);
@@ -6781,8 +6842,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(line_index).toBeGreaterThan(previous_index);
         previous_index = line_index;
       }
-      // Both reads share one row that names each file.
-      expect(scrollback).toContain("└ Read one.txt, two.txt");
+      // Both reads share one row that names each file, which is the group's
+      // line.
+      expect(scrollback).toContain("● Read one.txt, two.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -7492,20 +7554,22 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
       // The failed call is not a command, so the header keeps the command's
-      // mark and counts the failure on its own, and its reason shows below it.
-      const header = "● Ran a command ✓ · 1 failed";
-      const failedRow = `├ Failed ${unsupportedToolName}`;
-      const reasonRow = `│ ✗ Unsupported tool: ${unsupportedToolName}`;
+      // mark. The turn went on after it, so its row says only that it
+      // failed, and the header does not count it.
+      const header = "● Ran a command ✓";
+      const failedRow = `├ Couldn't run ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
-      expect(compact).toContain(`${header}\n${failedRow}\n${reasonRow}\n${completedRow}`);
-      expect(countOccurrences(compact, `Failed ${unsupportedToolName}`)).toBe(1);
+      expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
+      expect(countOccurrences(compact, `Couldn't run ${unsupportedToolName}`)).toBe(1);
+      expect(compact).not.toContain(`Unsupported tool: ${unsupportedToolName}`);
+      expect(compact).not.toContain(`Failed ${unsupportedToolName}`);
       expect(countOccurrences(compact, `Ran ${supportedCommand}`)).toBe(1);
       expect(compact).not.toContain(`Running ${unsupportedToolName}`);
 
       await session.resizeWindow(72, 24);
       const resized = await session.waitForText(header, TIMEOUT);
-      expect(resized).toContain(`Failed ${unsupportedToolName}`);
+      expect(resized).toContain(`Couldn't run ${unsupportedToolName}`);
       expect(resized).toContain(`Ran ${supportedCommand}`);
 
       await session.sendKeys("C-o");
@@ -7561,8 +7625,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.capturePane();
-      expect(resumed).toContain(`${header}\n${failedRow}\n${reasonRow}\n${completedRow}`);
-      expect(countOccurrences(resumed, `Failed ${unsupportedToolName}`)).toBe(1);
+      expect(resumed).toContain(`${header}\n${failedRow}\n${completedRow}`);
+      expect(countOccurrences(resumed, `Couldn't run ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(resumed, `Ran ${supportedCommand}`)).toBe(1);
       expect(unsupportedGateway.requests).toHaveLength(2);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
@@ -7955,7 +8019,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● Started subagents, read a file · 1 failed");
+        expect(compact).toContain("● Started subagents, read a file");
         expect(compact).toContain("Couldn't message Invalid Agent");
         expect(compact).not.toContain("Messaged Invalid Agent");
         expect(compact).not.toContain("Check failure visibility");
@@ -7991,7 +8055,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● Started subagents, read a file · 1 failed");
+        expect(resumed).toContain("● Started subagents, read a file");
         expect(resumed).toContain("Couldn't message Invalid Agent");
         expect(resumed).toContain("Messaged helper");
         expect(resumed).toContain("Messaged checker");
@@ -8217,15 +8281,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
 
       const compact = await session.captureFullScrollback();
-      expect(compact).toContain("● Ran commands ✓");
       // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
-      // The three commands share one row by their steps; Ctrl+O shows each.
-      expect(compact).toContain("└ Ran printf, pwd\n");
+      // The three commands share one row by their steps, which is the
+      // group's line; Ctrl+O shows each.
+      expect(compact).toContain("● Ran printf, pwd ✓\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
       expect(compact).not.toContain(`Ran ${firstCommand}`);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● Ran commands ✓", TIMEOUT);
+      await session.waitForText("● Ran printf, pwd ✓", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
@@ -8272,7 +8336,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● Ran commands ✓", TIMEOUT);
+      await session.waitForText("● Ran printf, pwd ✓", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -8288,8 +8352,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● Ran commands ✓");
-      expect(resumed).toContain("└ Ran printf, pwd\n");
+      expect(resumed).toContain("● Ran printf, pwd ✓\n");
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);
