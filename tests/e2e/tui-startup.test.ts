@@ -22,6 +22,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
+import { catalogMenuItemCount } from "./tui-render-assertions";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
@@ -834,7 +835,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         await session.waitForComposer(10_000);
         expect(loaded()).toBe(false);
         await session.sendText("/mcp");
-        await session.waitForText("MCP servers  1", 5_000);
+        await session.waitForPane((pane) => catalogMenuItemCount(pane.split("\n"), "MCP servers") === 1, 5_000);
         // Still being read when the menu shows.
         expect(loaded()).toBe(false);
         // Once they're read, the menu goes on working.
@@ -842,7 +843,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
         expect(loaded()).toBe(true);
         await session.sendKeys("Enter");
-        await session.waitForText("› Remove        /mcp remove remote", 5_000);
+        await session.waitForText("  Remove        /mcp remove remote", 5_000);
       } finally {
         holder.kill();
         if (session) {

@@ -938,7 +938,11 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("enter confirm     esc cancel", 5_000);
     await tui.sendKeys("Enter");
     // The reload follows, and the screen with it.
-    await tui.waitForText("  Reject        /mcp reject proj", 10_000);
+    // Approve leaves the choices once the reload lands; Reject stays.
+    await tui.waitForPane(
+      (pane) => pane.includes("  Reject        /mcp reject proj") && !pane.includes("/mcp approve proj"),
+      10_000,
+    );
     expect(await tui.captureFullScrollback()).not.toContain("Approved proj");
 
     // Remove asks which file it edits; Esc keeps the server, Enter removes it.

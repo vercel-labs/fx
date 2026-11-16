@@ -2776,7 +2776,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(await session.captureFullScrollback()).not.toContain(`* model: ${currentModel}`);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
+        (current) => hasEmptyComposer(current) && !/^models\s/m.test(current),
         5_000,
       );
 
@@ -2786,7 +2786,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "/model") &&
           current.includes(currentModel) &&
-          !current.includes("tab provider"),
+          !/^models\s/m.test(current),
         5_000,
       );
       expect(stagedPane).not.toMatch(/^models\s/m);
@@ -2854,7 +2854,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("tab provider"),
+        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !/^models\s/m.test(current),
         5_000,
       );
 
@@ -3069,7 +3069,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       const closePicker = async () => {
         await session!.sendKeys("Escape");
-        await session!.waitForPane((current) => !current.includes("tab provider"), 5_000);
+        await session!.waitForPane((current) => !/^models\s/m.test(current), 5_000);
       };
 
       await session.sendKeys("C-p");
@@ -3420,7 +3420,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(row("zai/glm-5.3")).toContain("200K context   Fast mode");
       expect(row("deepseek/deepseek-v4.1-flash")).toContain("128K context   Fast mode");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
 
       // A Token Pass model starts its speed stage on Fast, as any model
       // that offers Fast mode does, with no warning.
@@ -3505,7 +3505,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(row("provider/fast-model")).toContain("128K context   Fast mode");
       expect(row("zai/glm-5.3").indexOf(" context")).toBe(row("provider/plain-model").indexOf(" context"));
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
 
       // A Token Pass model has no speed stage: the pick sets normal speed.
       await session.sendKeys("C-p");
@@ -3540,7 +3540,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // the picker's row.
       expect(plain.find((line) => !isComposerLine(line) && !line.includes("Token Pass is active") && line.includes("deepseek/deepseek-v4.1-flash"))).toContain("Fast mode");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
 
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -3593,7 +3593,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const menu = await waitForModelsMenu(session, 4);
       expect(menu.join("\n")).not.toContain("All Models");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
       await session.sendText("Keep going.");
       await session.waitForText("AFTER_CHECK_REPLY", 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash"]);
@@ -3729,7 +3729,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const menu = await waitForModelsMenu(session, 4);
       expect(menu.join("\n")).not.toContain("All Models");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3826,7 +3826,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(menu[index("deepseek/deepseek-v4.1-flash")]).toContain("Fast mode");
       expect(menu[index("zai/glm-5.3")]).not.toContain("Fast");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3870,7 +3870,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const menu = await waitForModelsMenu(session, 4);
       expect(menu.some((line) => /^\s*Token Pass\s*$/.test(line))).toBe(true);
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3920,7 +3920,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(rows[0]).toContain(tokenPassModel);
       expect(rows[1]).toContain("provider/plain-model");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
 
       // `token_pass: null` means the team has no active Token Pass, so fx
       // forgets it: no headings and no tags.
@@ -3932,7 +3932,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(plain.join("\n")).not.toContain("Token Pass");
       expect(plain.join("\n")).not.toContain("All Models");
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
       expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
@@ -4194,7 +4194,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(row(menu, "glm-5.3-flash")).not.toBe("");
 
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.waitForPane((pane) => !/^models\s/m.test(pane), 5_000);
       expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
