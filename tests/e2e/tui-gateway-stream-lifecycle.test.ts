@@ -2643,6 +2643,67 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a streaming toolbox call's row names what it runs before its arguments end",
+    async () => {
+      const finalSentinel = "FX_TOOLBOX_STREAMED_LABEL_COMPLETE";
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-toolbox-streamed-label-",
+        [
+          () =>
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  const send = (event: object) =>
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                  send({ type: "tool-input-start", id: "toolbox_run", toolName: "toolbox" });
+                  send({ type: "tool-input-delta", id: "toolbox_run", delta: '{"run":"glob_files",' });
+                  timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                  sendRest = () => {
+                    clearInterval(timer);
+                    send({ type: "tool-input-delta", id: "toolbox_run", delta: '"arguments":{"pattern":"*.md"}}' });
+                    send({ type: "tool-input-end", id: "toolbox_run" });
+                    send({
+                      type: "tool-call",
+                      toolCallId: "toolbox_run",
+                      toolName: "toolbox",
+                      input: { run: "glob_files", arguments: { pattern: "*.md" } },
+                    });
+                    send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                  };
+                },
+                cancel() {
+                  clearInterval(timer);
+                },
+              }),
+              { headers: { "content-type": "text/event-stream" } },
+            ),
+          () => fakeGatewayFinalText(finalSentinel),
+        ],
+      );
+
+      await session!.sendText("Find the markdown files.");
+      // The tool's whole name is in and the rest of the arguments are not,
+      // so the row names the tool instead of a bare "Using".
+      await waitForScrollback(
+        session!,
+        (value) => value.includes("Running glob_files"),
+        "the toolbox row naming its tool while its arguments stream in",
+      );
+      expect(queuedGateway.requests).toHaveLength(1);
+
+      sendRest?.();
+      await session!.waitForText(finalSentinel, TIMEOUT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "follow-up input counter excludes retained context and provider input usage",
     async () => {
       const firstFinal = `FIRST_TURN_CONTEXT_COMPLETE ${"retained assistant context ".repeat(128)}`;
@@ -7493,13 +7554,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
       // The failed call is not a command, so the header keeps the command's
-      // mark and counts the failure on its own, and its reason follows its row.
-      const header = "● Ran a command ✓ · 1 failed";
-      const failedRow = `├ Couldn't run ${unsupportedToolName} · Unsupported tool: ${unsupportedToolName}`;
+      // mark. The turn went on after it, so its row says only that it
+      // failed, and the header does not count it.
+      const header = "● Ran a command ✓";
+      const failedRow = `├ Couldn't run ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
       expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
       expect(countOccurrences(compact, `Couldn't run ${unsupportedToolName}`)).toBe(1);
+      expect(compact).not.toContain(`Unsupported tool: ${unsupportedToolName}`);
       expect(compact).not.toContain(`Failed ${unsupportedToolName}`);
       expect(countOccurrences(compact, `Ran ${supportedCommand}`)).toBe(1);
       expect(compact).not.toContain(`Running ${unsupportedToolName}`);
@@ -7956,7 +8019,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● Started subagents, read a file · 1 failed");
+        expect(compact).toContain("● Started subagents, read a file");
         expect(compact).toContain("Couldn't message Invalid Agent");
         expect(compact).not.toContain("Messaged Invalid Agent");
         expect(compact).not.toContain("Check failure visibility");
@@ -7992,7 +8055,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● Started subagents, read a file · 1 failed");
+        expect(resumed).toContain("● Started subagents, read a file");
         expect(resumed).toContain("Couldn't message Invalid Agent");
         expect(resumed).toContain("Messaged helper");
         expect(resumed).toContain("Messaged checker");

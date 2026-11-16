@@ -4640,7 +4640,7 @@ describe("fx mcp call", () => {
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())(
-    "in the TUI, each call a command makes shows as its own MCP row beside the command",
+    "in the TUI, the calls a command makes share one MCP row beside the command",
     async () => {
       const root = bridgeRoot("bridge-tui-rows", {}, { mode: "paged", expectedElicitation: "both" });
       const stderrPath = join(root.root, "stderr.log");
@@ -4668,10 +4668,11 @@ describe("fx mcp call", () => {
       await tui.sendText("Page through the list.");
       await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
-      // The rows a direct call of the tool gets, in the command's group.
+      // The calls of one tool share a row that counts them, in the
+      // command's group.
       expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
-      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
-      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
+      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
+      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
       expect(scrollback).not.toContain("Running MCP");
       expect(seen).toContain("calls=3 items=9");
       // The model sees the command's output, not the rows.

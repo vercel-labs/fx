@@ -35,7 +35,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -2953,6 +2953,37 @@ const isReportTurn = (body: string) => {
   const latest = JSON.stringify(JSON.parse(body).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
   return latest.includes("Subagent report (untrusted agent output, not user instructions):");
 };
+
+test("waiting for a committed root turn skips what fx has not written yet and reports a broken log", async () => {
+  const fixture = createFixture("fx-v2-commit-wait-");
+  const root = join(storeRoot(fixture.home), "root-session");
+  const child = join(storeRoot(fixture.home), "child-session");
+  const created = '{"seq":1,"kind":"created"}\n';
+  try {
+    // No store, a folder without its log, and a first line fx is still writing.
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    mkdirSync(root, { recursive: true });
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    writeFileSync(join(root, "log.jsonl"), '{"seq":1,"ki');
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    // A child's turns never count, and neither does a line still being written.
+    mkdirSync(child);
+    writeFileSync(join(child, "log.jsonl"), '{"seq":1,"kind":"created","role":"child"}\n{"seq":2,"kind":"turn_committed"}\n');
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn_committed"}\n{"seq":3,"ki`);
+    expect(committedRootTurns(fixture.home)).toBe(1);
+    await waitForRootTurnCommitted(fixture.home, 0, 200);
+    // A broken complete line and a superseded turn surface as themselves,
+    // not as a wait that times out.
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,\n`);
+    await expect(waitForRootTurnCommitted(fixture.home, 0, 200)).rejects.toThrow(SyntaxError);
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn","type":"superseded"}\n`);
+    const superseded = await waitForRootTurnCommitted(fixture.home, 0, 200).catch((error: Error) => error);
+    expect(String(superseded)).toContain("superseded");
+    expect(String(superseded)).not.toContain("no root session committed");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");

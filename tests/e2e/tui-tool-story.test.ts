@@ -3,7 +3,8 @@
 // repeat one task, a reason line under a failed call, and a recap on the turn
 // summary.
 import { afterEach, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
   CHILD_MARKER,
@@ -13,7 +14,14 @@ import {
   type StoryRoot,
   type StoryStep,
 } from "./fixtures/story-model";
-import { FAKE_GATEWAY_MODEL, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  fakeGatewaySse,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const TIMEOUT = 90_000;
 
@@ -119,7 +127,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root.root, { recursive: true, force: true });
 });
 
-function storyEnv(root: StoryRoot, gateway: ReturnType<typeof startStoryGateway>) {
+function storyEnv(root: StoryRoot, gateway: { baseUrl: string; chatUrl: string }) {
   return {
     HOME: root.home,
     AI_GATEWAY_API_KEY: "fake-tool-story-key",
@@ -224,6 +232,78 @@ test.skipIf(!tmuxAvailable())(
     const resumedLines = paneLines(await resumed.waitForComposer(TIMEOUT));
     expect(group(resumedLines, "● Ran commands ✗")).toEqual(checks);
     expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "calls after a message sent into an open turn show under that message, also after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    writeFileSync(join(root.workspace, "README.md"), "hello\n");
+    const gateway = startFakeGateway([
+      fakeGatewaySse([
+        { type: "tool-call", toolCallId: "read_1", toolName: "read_file", input: { path: "README.md" } },
+        {
+          type: "tool-call",
+          toolCallId: "edit_1",
+          toolName: "edit_file",
+          input: { path: "README.md", old_string: "NOT_THERE", new_string: "x" },
+        },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      // The next request fails and leaves the turn open, so the next message
+      // joins that turn.
+      new Response(
+        JSON.stringify({ error: { message: "STORY_BAD_REQUEST", type: "invalid_request_error" } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      ),
+      fakeGatewaySse([
+        { type: "tool-call", toolCallId: "read_2", toolName: "read_file", input: { path: "README.md" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("The readme says hello."),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("Edit the readme.");
+    await session.waitForText("STORY_BAD_REQUEST", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Read it again.");
+    await session.waitForText("The readme says hello.", TIMEOUT);
+
+    const expectReadUnderMessage = (lines: string[]) => {
+      const message = lines.findIndex((line) => line.includes("Read it again."));
+      expect(message).toBeGreaterThan(0);
+      // The first read keeps its own row, without the later one.
+      expect(lines.slice(0, message)).toContain("├ Read README.md");
+      expect(lines.some((line) => line.includes("· 2 parts"))).toBe(false);
+      // The later read shows under the message that asked for it.
+      expect(lines.slice(message + 1)).toContain("● Read README.md");
+    };
+    expectReadUnderMessage(paneLines(await session.waitForComposer(TIMEOUT)));
+
+    // The message is saved as steering, which resumes as a user message.
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The readme says hello.", TIMEOUT);
+    expectReadUnderMessage(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
 );

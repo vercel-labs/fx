@@ -507,6 +507,63 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
+  test("recover answers that a whole v1 family an old fx left readable by others needs none, and the family still converts", async () => {
+    const fixture = createFixture("fx-session-readable-v1-");
+    const gateway = startFakeGateway([fakeGatewayFinalText("READABLE_V1_CONTINUED")]);
+    try {
+      const ids = copyV1Fixture(fixture.home, "family", 3);
+      // An old release left every folder 0755 and every file 0644, its
+      // lock files and the root's subagent folder too (D61).
+      const sessions = join(fixture.home, ".fx", "sessions");
+      const readable = (path: string) => {
+        if (lstatSync(path).isDirectory()) {
+          chmodSync(path, 0o755);
+          for (const name of readdirSync(path)) readable(join(path, name));
+        } else chmodSync(path, 0o644);
+      };
+      for (const id of ids) readable(join(sessions, id));
+      const id = ids[0]!;
+      const source = join(sessions, id);
+      const before = savedFileHashes(source);
+      const env = gatewayEnv(fixture, gateway);
+
+      const json = await runFx(["session", "recover", id, "--json"], { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
+      expect(json.code).toBe(1);
+      expect(json.stderr).toBe("");
+      expect(JSON.parse(json.stdout).code).toBe("SessionRecoveryNotNeeded");
+      const text = await runFx(["session", "recover", id], { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
+      expect(text.code).toBe(1);
+      expect(text.stdout).toBe("");
+      expect(text.stderr).toBe("fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n");
+      // Nothing was copied, and the v1 folder keeps its files and modes.
+      expect(savedFileHashes(source)).toEqual(before);
+      expect(lstatSync(join(source, "session.lock")).mode & 0o777).toBe(0o644);
+      expect(readdirSync(sessions).sort()).toEqual([...ids].sort());
+      expect(gateway.requests).toHaveLength(0);
+
+      // Resuming it, as recover said to, converts the family.
+      const continued = await continueSession(fixture, gateway, id);
+      expect(continued.code).toBe(0);
+      expect(withoutConversionNotice(continued.stderr)).toBe("");
+      expect(JSON.parse(continued.stdout)).toMatchObject({ session_id: id, output: "READABLE_V1_CONTINUED" });
+      expect(existsSync(source)).toBe(false);
+
+      // One with a saved tool result shows read only, and needs no recovery.
+      const [side] = copyV1Fixture(fixture.home, "side");
+      readable(join(sessions, side!));
+      const shown = await runFx(["session", side!, "--json"], { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
+      expect(shown.stderr).toBe("");
+      expect(shown.code).toBe(0);
+      expect(JSON.parse(shown.stdout).history_len).toBe(1);
+      const sideRecover = await runFx(["session", "recover", side!, "--json"], { cwd: fixture.workspace, env, timeoutMs: TIMEOUT });
+      expect(sideRecover.code).toBe(1);
+      expect(JSON.parse(sideRecover.stdout).code).toBe("SessionRecoveryNotNeeded");
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+
   for (const { checkpointedTurn, fullCoverage } of [
     { checkpointedTurn: false, fullCoverage: false },
     { checkpointedTurn: true, fullCoverage: false },
