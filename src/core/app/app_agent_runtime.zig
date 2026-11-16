@@ -41,6 +41,7 @@ const subagent_execution = @import("../subagent/execution.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const diff = @import("../output/diff.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
@@ -1747,7 +1748,7 @@ fn formatToolAction(
         return formatToolActionValue(
             arena,
             specLabel(spec, state, denied_label),
-            display_target orelse spec.label_arg_default,
+            display_target orelse try mutationPathFromArgs(arena, ctx.workspace_root, call) orelse spec.label_arg_default,
         );
     }
     // The subagents a call that concerns them all names reach its row as
@@ -1772,6 +1773,18 @@ fn formatToolAction(
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
+}
+
+/// The path a write or edit call names, as its live row names it: relative
+/// to the workspace when it is inside it, and terminal-safe. A live call
+/// brings this as its display target; a saved call, as on resume, brings
+/// only its arguments. Null when they name no path.
+fn mutationPathFromArgs(arena: Allocator, workspace_root: []const u8, call: ToolCall) !?[]const u8 {
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
+    const path = tool_args.optionalStringArg(args, "path") orelse return null;
+    if (path.len == 0) return null;
+    const shown = try permissions.displayTargetForPolicy(arena, workspace_root, path, .path_create_parent);
+    return (try text_utils.encodeTerminalSafe(arena, shown, diff.max_encoded_label_bytes)).bytes;
 }
 
 fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
@@ -2350,6 +2363,35 @@ test "app model id loading uses the injected catalog provider" {
     try std.testing.expectEqual(@as(usize, 2), ids.items.len);
     try std.testing.expectEqualStrings("provider/first", ids.items[0]);
     try std.testing.expectEqualStrings("provider/second", ids.items[1]);
+}
+
+test "a saved write or edit call names the path its arguments give" {
+    // Resume describes a saved call with no display target, so its row
+    // names the file the way the live row did, not the tool's "file".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { args: []const u8, want: ?[]const u8 }{
+        .{ .args = "{\"path\":\"README.md\",\"old_string\":\"a\",\"new_string\":\"b\"}", .want = "README.md" },
+        .{ .args = "{\"path\":\"/tmp/workspace/src/a.zig\",\"content\":\"x\"}", .want = "src/a.zig" },
+        .{ .args = "{\"path\":\"/etc/hosts\"}", .want = "/etc/hosts" },
+        .{ .args = "{\"old_string\":\"a\"}", .want = null },
+        .{ .args = "{\"path\":\"\"}", .want = null },
+        .{ .args = "{", .want = null },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "saved", .name = "edit_file", .arguments_json = case.args };
+        const got = try mutationPathFromArgs(arena, "/tmp/workspace", call);
+        if (case.want) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+    // A control byte in the path shows escaped, never raw.
+    const hostile: ToolCall = .{ .id = "hostile", .name = "edit_file", .arguments_json = "{\"path\":\"a\\u001b[2J.zig\"}" };
+    const shown = (try mutationPathFromArgs(arena, "/tmp/workspace", hostile)).?;
+    try std.testing.expect(std.mem.findScalar(u8, shown, 0x1b) == null);
 }
 
 test "app agent runtime builds tool context from app state and MCP callbacks" {
