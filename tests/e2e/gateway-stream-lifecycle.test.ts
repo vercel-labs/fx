@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { processAlive as isProcessAlive } from "./process-alive";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import {
   chmodSync,
@@ -1105,15 +1106,6 @@ process.stdin.on("data", (chunk) => {
     }),
   );
   return { callLogPath, pidPath, readyPath };
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // Whether a pid a fixture recorded names one process other than this runner.

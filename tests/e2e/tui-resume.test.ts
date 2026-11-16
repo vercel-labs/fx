@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -9140,14 +9141,7 @@ async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
   const pid = session.processPid();
   process.kill(pid, signal);
   const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      break;
-    }
-    await Bun.sleep(25);
-  }
+  while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
   await session.kill();
 }
 

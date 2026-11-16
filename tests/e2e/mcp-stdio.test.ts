@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as isProcessAlive } from "./process-alive";
 import {
   existsSync,
   mkdirSync,
@@ -312,15 +313,6 @@ function readAttemptedPids(path: string): number[] {
     .split("\n")
     .filter(Boolean)
     .map(Number);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function expectFixtureProcessesExited(wire: WireEntry[], timeoutMs = 5_000) {

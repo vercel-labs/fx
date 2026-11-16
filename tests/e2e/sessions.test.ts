@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -4582,7 +4583,7 @@ test("a parent killed while a named child runs a tool records that work interrup
     child.kill("SIGKILL");
     await exited;
     // fx's own processes go with it.
-    await until(() => { try { process.kill(toolPid, 0); return false; } catch { return true; } }, "the child's tool to stop");
+    await until(() => !processAlive(toolPid), "the child's tool to stop");
 
     const last = await command(fixture, gateway, ["session", "last", "--json"]);
     expect(last.code).toBe(0);
@@ -5153,17 +5154,6 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     fakeGatewayFinalText("TTY_ENDED_REPORTED"),
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
-  const alive = (pid: number) => {
-    // Signal 0 to pid 0 or below reaches a whole process group, which is
-    // always alive, so only a real pid can be checked.
-    if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   try {
     const app = await startApp(fixture, gateway, [], true, appEnv);
     await app.session.sendText("Start a terminal.");
@@ -5181,14 +5171,14 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
       await Bun.sleep(10);
     }
     expect(shellPid).toBeGreaterThan(0);
-    expect(alive(shellPid)).toBe(true);
+    expect(processAlive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
     // The terminal belonged to the crashed process and ended with it.
     const deadline = Date.now() + 2_000;
-    while (alive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
-    expect(alive(shellPid)).toBe(false);
+    while (processAlive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
+    expect(processAlive(shellPid)).toBe(false);
 
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
     await resumed.session.sendText("Talk to the terminal, then stop it.");

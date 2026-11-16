@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as isRunning } from "./process-alive";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,15 +23,6 @@ afterEach(async () => {
   if (cleanup) rmSync(cleanup, { recursive: true, force: true });
   cleanup = null;
 });
-
-function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function createRoot(profile?: unknown, project?: unknown) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-verbs-")));
