@@ -356,18 +356,8 @@ pub fn Bindings(comptime App: type) type {
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
-                .push_event = agentPushEvent,
-                .push_text = agentPushText,
-                .push_tool_lifecycle = agentPushToolLifecycle,
-                .push_diff_block = agentPushDiffBlock,
-                .push_system_notice = agentPushSystemNotice,
-                .push_interactive_notice = agentPushInteractiveNotice,
-                .push_context_notice = agentPushContextNotice,
-                .push_session_notice = agentPushSessionNotice,
-                .push_route_recovery_status = agentPushRouteRecoveryStatus,
+                .emit_event = agentEmit,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
-                .push_command_output_complete = agentPushCommandOutputComplete,
-                .push_http_error = agentPushHttpError,
                 .refresh_gateway_credential = if (comptime @hasField(App, "auth"))
                     refreshGatewayCredential
                 else
@@ -1238,20 +1228,44 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).propagateGrant(app, agent, tool_name, target_path);
         }
 
+        /// The TUI's one sink for the agent loop's events. Each event is lent
+        /// for the call, so the worker queue takes a copy, and the screen
+        /// thread shows the queue in the loop's order
+        /// (`tests/tla/agent_runtime/TurnEvents.tla` InOrder, MemorySafe).
+        fn agentEmit(ctx: *anyopaque, event: agent_runtime.TurnEvent) !void {
+            switch (event) {
+                .worker => |worker| try agentPushEvent(ctx, worker),
+                .text => |emission| try agentPushText(ctx, emission),
+                // The TUI doesn't show the model's reasoning as it streams.
+                .reasoning_delta => {},
+                .notice => |notice| if (notice.semantic) |semantic| {
+                    try agentPushInteractiveNotice(ctx, semantic);
+                } else if (notice.plain) |text| {
+                    try agentPushSystemNotice(ctx, text);
+                },
+                .context_notice => |text| try agentPushContextNotice(ctx, text),
+                .session_notice => |text| try agentPushSessionNotice(ctx, text),
+                .http_error => |failure| try agentPushHttpError(ctx, failure.status, failure.detail, failure.credential_source),
+            }
+        }
+
+        /// Copies a lent worker event into the queue. A finished prompt's copy
+        /// also takes the prompt's active snapshots, so the screen thread
+        /// can still read them.
         fn agentPushEvent(ctx: *anyopaque, event: WorkerEvent) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            var owned_event = event;
             if (event == .finish_prompt and
                 comptime @hasDecl(@TypeOf(agent.worker), "handoffActivePromptSnapshots"))
             {
                 var finished = event.finish_prompt;
                 finished.snapshot_file_ownership =
                     try agent.worker.handoffActivePromptSnapshots(std.heap.c_allocator);
-                owned_event = .{ .finish_prompt = finished };
+                // The queue's copy retains the snapshots; release the handoff's own.
+                defer if (finished.snapshot_file_ownership) |ownership| ownership.release();
+                return app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .finish_prompt = finished });
             }
-            defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, owned_event);
-            try app_worker_runtime.Runtime(App).pushEvent(app, agent, owned_event);
+            try app_worker_runtime.Runtime(App).pushEvent(app, agent, event);
         }
 
         fn agentPushText(ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
@@ -1291,22 +1305,6 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             try app_worker_runtime.Runtime(App).pushThematicRule(app, agent);
-        }
-
-        fn agentPushToolLifecycle(
-            ctx: *anyopaque,
-            event: types.ToolLifecycleEvent,
-        ) !void {
-            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            try app_worker_runtime.Runtime(App).pushToolLifecycle(app, agent, event);
-        }
-
-        fn agentPushDiffBlock(ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
-            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            errdefer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
-            try app_worker_runtime.Runtime(App).pushDiffBlock(app, agent, payload);
         }
 
         fn agentPushSystemNotice(ctx: *anyopaque, text: []const u8) !void {
@@ -1354,23 +1352,11 @@ pub fn Bindings(comptime App: type) type {
             });
         }
 
-        fn agentPushRouteRecoveryStatus(ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
-            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .route_recovery_status = status });
-        }
-
         fn agentRestoreFailedPrompt(ctx: *anyopaque, prompt: []const u8) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             // pushEvent copies the payload into the queue's ownership.
             try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .restore_failed_prompt = @constCast(prompt) });
-        }
-
-        fn agentPushCommandOutputComplete(ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
-            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            try app_worker_runtime.Runtime(App).pushCommandOutputComplete(app, agent, lifecycle_id);
         }
 
         fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
@@ -2804,16 +2790,13 @@ test "agent context and system notices share semantic transport with distinct fi
     defer app.deinit();
 
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app, (&app).agent());
-    try deps.push_context_notice.?(
-        deps.ctx,
-        "[context] first warning\n[context] second warning",
-    );
+    try deps.emit(.{ .context_notice = "[context] first warning\n[context] second warning" });
     try deps.emit(.{ .notice = .{ .plain = "ordinary-system" } });
-    try deps.push_interactive_notice.?(deps.ctx, .{
+    try deps.emit(.{ .notice = .{ .semantic = .{
         .topic = "background",
         .tone = .information,
         .body = "Command #1 started. Log: /tmp/run.log",
-    });
+    } } });
 
     try std.testing.expectEqual(@as(usize, 3), app.agent().worker.events.items.len);
     try std.testing.expect(app.agent().worker.events.items[0] == .semantic_notice);

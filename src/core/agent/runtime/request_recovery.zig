@@ -405,7 +405,7 @@ pub const RequestRecovery = struct {
     /// The turn loop keeps calling the host's other callbacks meanwhile, and
     /// each host takes a status from another thread safely:
     ///
-    /// - TUI (`app_callbacks.agentPushRouteRecoveryStatus`): copies the event
+    /// - TUI (`app_callbacks.agentEmit`): copies the event
     ///   with `std.heap.c_allocator` and queues it under `worker_mutex`.
     /// - ACP (`AcpContext.sendModelRecoveryStatus`): formats into a local
     ///   writer and writes one frame under `jsonrpc.Writer.mutex`; libfx's
