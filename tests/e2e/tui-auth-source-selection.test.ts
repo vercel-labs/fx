@@ -1779,6 +1779,48 @@ tmuxTest("the TUI revokes kept sign-outs on a worker when it starts", async () =
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
+tmuxTest("the TUI revokes kept MCP sign-outs at their servers when it starts", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-tui-kept-mcp-sign-out-retry-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  const forms: Array<{ form: Record<string, string>; authorization: string | null }> = [];
+  const authServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname !== "/revoke") return new Response(null, { status: 404 });
+      forms.push({ form: Object.fromEntries(new URLSearchParams(await request.text())), authorization: request.headers.get("authorization") });
+      return new Response(null, { status: 200 });
+    },
+  });
+  try {
+    const origin = `http://127.0.0.1:${authServer.port}`;
+    const pending = writeKeptSignOuts(home, "mcp-revocations.json", [{
+      saved_at_ms: Date.now() - 60_000,
+      refresh_token: "earlier-mcp-refresh",
+      token_type_hint: "refresh_token",
+      revocation_endpoint: `${origin}/revoke`,
+      client_id: "mcp-client",
+      client_secret: "mcp-secret",
+      client_auth: "client_secret_basic",
+      server_url: `${origin}/mcp`,
+    }]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await waitForRemoval(pending);
+    // Sent as the logout's own revocation was: the token and its kind in the
+    // form, and the client's id and secret in the header.
+    expect(forms).toEqual([{
+      form: { token: "earlier-mcp-refresh", token_type_hint: "refresh_token" },
+      authorization: `Basic ${Buffer.from("mcp-client:mcp-secret").toString("base64")}`,
+    }]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    authServer.stop(true);
+  }
+}, 60_000);
+
 tmuxTest("fx quits promptly while a Codex revocation still waits", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-tui-codex-logout-quit-"));
   stderrPath = join(home, "stderr.log");

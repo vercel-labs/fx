@@ -773,6 +773,15 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushToolLifecycle(appOf(agent), agent, event);
         }
 
+        /// Keeps the row of a call made through `fx mcp call` in the
+        /// agent's session, so a resume shows it again
+        /// (`tool_runtime.ToolLifecyclePublisher`).
+        pub fn saveNestedBridgeCall(ctx: *anyopaque, record: types.BridgeCallRecord) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveBridgeCall(agent, record);
+        }
+
         fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1620,7 +1629,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (try app.pacer.deferFinish(app.alloc, finished)) return .retained;
+            if (try app_worker_runtime.Runtime(App).deferFinish(app, agent, finished)) return .retained;
             return .{ .settled = try appendHistoryTurn(app, agent, finished) };
         }
 
@@ -1781,7 +1790,7 @@ const FakePacer = struct {
         try self.text.appendSlice(alloc, text);
     }
 
-    fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
+    pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
         _ = alloc;
         _ = finished;
         return self.defer_history;

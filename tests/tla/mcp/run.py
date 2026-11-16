@@ -3,10 +3,11 @@
 
 Modes:
   list      show the models in spec/catalog.json
-  check     exhaustive TLC run of each model (smoke or stress preset)
-  mutate    run every planted bug in <Module>.mutants.json
+  check     exhaustive TLC run of each model (smoke or stress preset); the smoke preset also runs
+            the configs a catalog entry lists under "also"
+  mutate    run every planted bug in <Module>.mutants.json (an entry may name its own "config")
   simulate  seeded random simulation (SAMPLED, never counted as PASS)
-  gate      for a unit: smoke, stress if present, and every planted bug
+  gate      for a unit: smoke, its "also" configs, stress if present, and every planted bug
 
 Exit codes: 0 every selected run passed (PASS, SAMPLED, CAUGHT), 1 a run failed,
 2 usage or tooling error. Results go to <evidence-dir>/<unit>/tlc/<UTC>-<id>/, by
@@ -115,6 +116,11 @@ def load_catalog(spec_dir):
                 raise ToolingError(f'catalog entry {module}: missing {spec_dir / needed}')
         if not re.fullmatch(r'U\d\d', entry.get('unit', '')):
             raise ToolingError(f'catalog entry {module}: unit must look like U02')
+        # Configs besides the smoke one that the module must also pass: each states a property the
+        # smoke config cannot afford the ids for (Request.scoped.cfg has two normal requests).
+        for extra in entry.get('also', []):
+            if not re.fullmatch(re.escape(module) + r'\.[A-Za-z0-9_]+\.cfg', extra) or not (spec_dir / extra).is_file():
+                raise ToolingError(f'catalog entry {module}: "also" names {extra}, which is not a {module}.<name>.cfg file here')
     return entries
 
 
@@ -127,6 +133,8 @@ def load_mutants(spec_dir, module):
         for field in ('description', 'old', 'new'):
             if not mutant.get(field):
                 raise ToolingError(f'{path.name} entry {number}: missing {field}')
+        if mutant.get('config') and not (spec_dir / mutant['config']).is_file():
+            raise ToolingError(f"{path.name} entry {number}: missing config {mutant['config']}")
         if bool(mutant.get('invariant')) == bool(mutant.get('property')):
             raise ToolingError(f'{path.name} entry {number}: name exactly one of invariant or property')
         if mutant.get('property'):
@@ -171,18 +179,21 @@ def keep_property(cfg_text, name):
     return '\n'.join(kept + [f'PROPERTY {name}']) + '\n'
 
 
-def config_for(spec_dir, module, preset):
+def config_for(spec_dir, module, preset, mutant=None):
+    # A planted bug may name the config that can show it, when the smoke config cannot afford the ids it needs.
+    if mutant and mutant.get('config'):
+        return mutant['config']
     if preset == 'stress':
         stress = module + '.stress.cfg'
         return stress if (spec_dir / stress).is_file() else None
     return module + '.cfg'
 
 
-def run_one(ctx, entry, mode, preset, mutant=None):
+def run_one(ctx, entry, mode, preset, mutant=None, extra=None):
     spec_dir, args = ctx['spec_dir'], ctx['args']
     module = entry['module']
-    config = config_for(spec_dir, module, preset)
-    label = module + ('' if preset == 'smoke' else '-' + preset) + ('' if mutant is None else f"-mutant-{mutant['number']}")
+    config = extra or config_for(spec_dir, module, preset, mutant)
+    label = (extra[:-len('.cfg')] if extra else module + ('' if preset == 'smoke' else '-' + preset)) + ('' if mutant is None else f"-mutant-{mutant['number']}")
     work = ctx['reports'][entry['unit']] / label
     (work / 'tmp').mkdir(parents=True)
     for path in spec_dir.iterdir():
@@ -233,20 +244,25 @@ def plan_runs(entries, args, spec_dir):
         if args.mode in ('check', 'simulate'):
             if config_for(spec_dir, module, args.preset) is None:
                 raise ToolingError(f'{module} has no {args.preset} config')
-            runs.append((entry, args.mode, args.preset, None))
+            runs.append((entry, args.mode, args.preset, None, None))
+            # The other configs of the module check what the smoke config cannot afford (one exhaustive
+            # run each); a seeded simulation or the stress preset is for the smoke model alone.
+            if args.mode == 'check' and args.preset == 'smoke':
+                runs += [(entry, 'check', 'smoke', None, extra) for extra in entry.get('also', [])]
         elif args.mode == 'mutate':
             mutants = load_mutants(spec_dir, module)
             if not mutants:
                 raise ToolingError(f'{module} has no planted bugs in {module}.mutants.json')
-            runs += [(entry, 'check', 'smoke', {**m, 'number': n}) for n, m in enumerate(mutants, 1)]
+            runs += [(entry, 'check', 'smoke', {**m, 'number': n}, None) for n, m in enumerate(mutants, 1)]
         elif args.mode == 'gate':
             mutants = load_mutants(spec_dir, module)
             if not mutants:
                 raise ToolingError(f'gate for {module} needs at least one planted bug')
-            runs.append((entry, 'check', 'smoke', None))
+            runs.append((entry, 'check', 'smoke', None, None))
+            runs += [(entry, 'check', 'smoke', None, extra) for extra in entry.get('also', [])]
             if config_for(spec_dir, module, 'stress'):
-                runs.append((entry, 'check', 'stress', None))
-            runs += [(entry, 'check', 'smoke', {**m, 'number': n}) for n, m in enumerate(mutants, 1)]
+                runs.append((entry, 'check', 'stress', None, None))
+            runs += [(entry, 'check', 'smoke', {**m, 'number': n}, None) for n, m in enumerate(mutants, 1)]
     return runs
 
 
@@ -295,7 +311,7 @@ def main(argv=None):
     # a file or link where a log will be written.
     evidence = Path(args.evidence_dir or tempfile.mkdtemp(prefix='fx-tla-mcp-')).resolve()
     reports = {}
-    for unit in sorted({e['unit'] for e, _, _, _ in runs}):
+    for unit in sorted({run[0]['unit'] for run in runs}):
         reports[unit] = evidence / unit / 'tlc' / run_id
         reports[unit].mkdir(parents=True)
         (reports[unit] / 'environment.json').write_text(json.dumps({
@@ -306,8 +322,8 @@ def main(argv=None):
     ctx = {'args': args, 'spec_dir': spec_dir, 'java': java, 'jar': jar, 'jar_sha256': sha256(jar), 'reports': reports}
     results = []
     try:
-        for entry, mode, preset, mutant in runs:
-            results.append(run_one(ctx, entry, mode, preset, mutant))
+        for entry, mode, preset, mutant, extra in runs:
+            results.append(run_one(ctx, entry, mode, preset, mutant, extra))
     finally:
         for unit, report in reports.items():
             mine = [r for r in results if r['unit'] == unit]

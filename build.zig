@@ -345,6 +345,9 @@ pub fn build(b: *std.Build) void {
             .approval_review => "pgso/approval-review.bc",
             .unit_tests => "pgso/unit-tests.bc",
         };
+        // Zig 0.17.1 writes this bitcode after LLVM's passes. PGSO needs the
+        // module before them, so scripts/pgso/pipeline.py runs this compile
+        // again with --verbose-llvm-bc (`emit_bitcode`).
         const install_ir = b.addInstallFile(
             selected.getEmittedLlvmBc(),
             output_name,

@@ -74,5 +74,6 @@ test {
     _ = @import("tools/web/url_policy.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
+    _ = @import("ui/transcript/tool_group_projection.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
 }

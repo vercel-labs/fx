@@ -712,6 +712,14 @@ fn expandWorkspaceTemplate(
             return .{ .expanded = try output.toOwnedSlice(alloc) };
         };
         const start = cursor + relative_start;
+        // `$${` is a literal `${`, so a server that expands its own
+        // variables, such as mcp-remote, receives the placeholder unchanged.
+        if (start > cursor and input[start - 1] == '$') {
+            if (!try appendExpandedBytes(alloc, &output, input[cursor .. start - 1], budget)) return .limit_exceeded;
+            if (!try appendExpandedBytes(alloc, &output, "${", budget)) return .limit_exceeded;
+            cursor = start + 2;
+            continue;
+        }
         if (!try appendExpandedBytes(alloc, &output, input[cursor..start], budget)) return .limit_exceeded;
         const expression_start = start + 2;
         const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse
@@ -1651,6 +1659,11 @@ test "workspace template expansion is explicit bounded and deterministic" {
         .{ .input = "${MISSING:-fallback}", .expected = "fallback" },
         .{ .input = "${EMPTY:-fallback}", .expected = "" },
         .{ .input = "${SET}/${SET}", .expected = "value/value" },
+        .{ .input = "$${SET}", .expected = "${SET}" },
+        .{ .input = "header:$${MISSING}", .expected = "header:${MISSING}" },
+        .{ .input = "$${MISSING}-${SET}", .expected = "${MISSING}-value" },
+        .{ .input = "pa$$word", .expected = "pa$$word" },
+        .{ .input = "$${", .expected = "${" },
     };
     for (cases) |case| {
         var budget = WorkspaceExpansionBudget.init();
