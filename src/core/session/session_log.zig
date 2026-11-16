@@ -1225,6 +1225,7 @@ pub const ConversationTurnBuilder = struct {
     context_notes: std.ArrayList(types.PersistedContextNote) = .empty,
     runtime_context: ?[][]u8 = null,
     model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
+    bridge_calls: std.ArrayList(types.BridgeCallRecord) = .empty,
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1255,6 +1256,8 @@ pub const ConversationTurnBuilder = struct {
         if (self.runtime_context) |texts| types.freeRuntimeContext(self.alloc, texts);
         for (self.model_calls.items) |record| types.freeModelCallRecordStrings(self.alloc, record);
         self.model_calls.deinit(self.alloc);
+        for (self.bridge_calls.items) |record| types.freeBridgeCallRecordStrings(self.alloc, record);
+        self.bridge_calls.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1265,6 +1268,16 @@ pub const ConversationTurnBuilder = struct {
         const owned = try types.dupeModelCallRecord(self.alloc, record);
         errdefer types.freeModelCallRecordStrings(self.alloc, owned);
         try self.model_calls.append(self.alloc, owned);
+    }
+
+    /// Keeps the record of a call a command made through `fx mcp call` with
+    /// the turn, for the row a resume shows in its shell call's group. Like
+    /// a model call's, one before the turn's user message is left out.
+    pub fn appendBridgeCall(self: *ConversationTurnBuilder, record: types.BridgeCallRecord) !void {
+        if (self.user == null) return;
+        const owned = try types.dupeBridgeCallRecord(self.alloc, record);
+        errdefer types.freeBridgeCallRecordStrings(self.alloc, owned);
+        try self.bridge_calls.append(self.alloc, owned);
     }
 
     pub fn isIdle(self: *const ConversationTurnBuilder) bool {
@@ -1589,6 +1602,8 @@ pub const ConversationTurnBuilder = struct {
         const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
         errdefer types.freeFileEvidenceSlice(self.alloc, files);
         const model_calls = try self.model_calls.toOwnedSlice(self.alloc);
+        errdefer types.freeModelCallRecords(self.alloc, model_calls);
+        const bridge_calls = try self.bridge_calls.toOwnedSlice(self.alloc);
         const runtime_context = self.runtime_context;
         self.runtime_context = null;
         return .{
@@ -1599,6 +1614,7 @@ pub const ConversationTurnBuilder = struct {
             .runtime_context = runtime_context,
             .turn_summary = turn_summary,
             .model_calls = model_calls,
+            .bridge_calls = bridge_calls,
         };
     }
 };
