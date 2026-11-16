@@ -2305,7 +2305,14 @@ pub const Runtime = struct {
     fn keepSignOut(r: *Runtime, saved: []const u8, url: []const u8) ?[]u8 {
         var arena: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena.deinit();
-        const tokens = (kept_sign_outs.tokensOf(arena.allocator(), saved, url) catch return null) orelse return null;
+        const found = kept_sign_outs.tokensOf(arena.allocator(), saved, url) catch |err| {
+            debug_trace.logf("mcp", "MCP sign-out not kept err={s}", .{@errorName(err)});
+            return null;
+        };
+        const tokens = found orelse {
+            debug_trace.logf("mcp", "MCP sign-out not kept reason=its login has no revocation endpoint fx may use", .{});
+            return null;
+        };
         if (!kept_sign_outs.keep(r.gpa, r.options.credentials.store, tokens)) return null;
         return r.gpa.dupe(u8, tokens.refresh_token) catch {
             // It stays kept, and a later retry revokes it.

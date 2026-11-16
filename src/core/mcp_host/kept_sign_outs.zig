@@ -132,10 +132,18 @@ fn revoke(alloc: Allocator, transport: oauth_transport.Provider, tokens: Tokens)
         .authorization = authorization,
     });
     defer response.deinit(alloc);
-    if (response.disposition != .accepted) {
-        debug_trace.logf("mcp", "MCP kept sign-out refused by its server", .{});
+    if (!confirmed(response)) {
+        debug_trace.logf("mcp", "MCP kept sign-out refused by its server status={d}", .{response.status});
         return error.RevocationRefused;
     }
+}
+
+/// Whether the server confirmed the revocation: any 2xx, as the logout itself
+/// takes it (RFC 7009 section 2.2), or `accepted` from a transport that
+/// gives no status.
+fn confirmed(response: oauth_transport.Response) bool {
+    if (response.status == 0) return response.disposition == .accepted;
+    return response.status >= 200 and response.status < 300;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +196,8 @@ test "a saved credential with nothing to revoke, or an endpoint its server may n
 /// `accept`.
 const FakeTransport = struct {
     accept: bool = true,
+    /// The HTTP status to give, 0 for none.
+    status: u16 = 0,
     url: ?[]u8 = null,
     payload: ?[]u8 = null,
     authorization: ?[]u8 = null,
@@ -206,7 +216,7 @@ const FakeTransport = struct {
         self.url = try testing.allocator.dupe(u8, request.url);
         self.payload = try testing.allocator.dupe(u8, request.payload.?);
         if (request.authorization) |v| self.authorization = try testing.allocator.dupe(u8, v);
-        return .{ .disposition = if (self.accept) .accepted else .rejected, .body = try alloc.dupe(u8, "") };
+        return .{ .disposition = if (self.accept) .accepted else .rejected, .body = try alloc.dupe(u8, ""), .status = self.status };
     }
 };
 
@@ -238,6 +248,32 @@ test "a kept sign-out is revoked as the engine's sign-out sends it" {
     });
     try testing.expectEqualStrings("token=at&token_type_hint=access_token&client_id=cid", public.payload.?);
     try testing.expect(public.authorization == null);
+}
+
+test "any 2xx confirms a kept revocation, as it confirms the logout's own" {
+    const tokens: Tokens = .{
+        .refresh_token = "rt",
+        .token_type_hint = "refresh_token",
+        .revocation_endpoint = "https://auth.example.com/revoke",
+        .client_id = "cid",
+        .client_auth = "none",
+        .server_url = "https://mcp.example.com/mcp",
+    };
+    // The transport calls only a 200 accepted, but the status says 204.
+    for ([_]u16{ 200, 204, 299 }) |status| {
+        var fake: FakeTransport = .{ .accept = status == 200, .status = status };
+        defer fake.deinit();
+        try revoke(testing.allocator, fake.provider(), tokens);
+    }
+    for ([_]u16{ 199, 300, 401, 503 }) |status| {
+        var fake: FakeTransport = .{ .accept = false, .status = status };
+        defer fake.deinit();
+        try testing.expectError(error.RevocationRefused, revoke(testing.allocator, fake.provider(), tokens));
+    }
+    // A transport without a status is taken at its word.
+    var bare: FakeTransport = .{ .accept = true };
+    defer bare.deinit();
+    try revoke(testing.allocator, bare.provider(), tokens);
 }
 
 test "a refused revocation is retried later, and an unusable record is never sent" {

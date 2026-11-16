@@ -1115,6 +1115,29 @@ describe("MCP login", () => {
     expect(auth.revocations).toBe(2);
   }, 60_000);
 
+  // RFC 7009 confirms a revocation with any 2xx. Before, the retry took only
+  // a 200, so a server that answers 204 got the same kept sign-out again at
+  // every later command.
+  test("a kept sign-out its server confirms with a 204 is forgotten", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const first = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(first.stdout).toBe(unconfirmedLogout);
+
+    options.revokeStatus = 204;
+    const second = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(second);
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+    const third = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(third);
+    expect(auth.revocations).toBe(2);
+  }, 60_000);
+
   test("the next fx mcp login that signs in revokes a sign-out its server didn't confirm", async () => {
     upstream = startModernMcpHttpFixture("json");
     const options: { revokeStatus?: number } = { revokeStatus: 503 };
