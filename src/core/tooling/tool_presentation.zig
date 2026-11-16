@@ -168,11 +168,34 @@ pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?Subagen
 /// wrongly; the finished call's row names it once its arguments parse. The
 /// result is a slice of `json`.
 pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
+    return streamedStringField(json, "agent", 1, 2);
+}
+
+/// What a `toolbox` call does, read from its arguments while they still
+/// stream in: the first of its own `run`, `search`, and `open` keys whose
+/// value is a whole string, with no escape in it, as a JSON object with that
+/// one key, so its row can read as the finished call's will. A search with
+/// no words yet may list one server's tools, so it waits. Null until then.
+/// The caller owns the result.
+pub fn toolboxStreamedAction(alloc: std.mem.Allocator, json: []const u8) !?[]const u8 {
+    for ([_][]const u8{ "run", "search", "open" }) |key| {
+        const value = streamedStringField(json, key, 1, 1) orelse continue;
+        if (std.mem.eql(u8, key, "search") and std.mem.trim(u8, value, " \t\r\n").len == 0) continue;
+        return try std.mem.concat(alloc, u8, &.{ "{\"", key, "\":\"", value, "\"}" });
+    }
+    return null;
+}
+
+/// The value of `key` in `json` at a depth from `min_depth` to `max_depth`,
+/// read while the JSON still streams in and may stop anywhere. Null until
+/// that value is a complete string, and for one with an escape in it, which
+/// a row would show wrongly. The result is a slice of `json`.
+fn streamedStringField(json: []const u8, key: []const u8, min_depth: usize, max_depth: usize) ?[]const u8 {
     // Each open object or array, so a key is known from a value.
     var containers: [8]u8 = undefined;
     var depth: usize = 0;
     var expect_key = false;
-    var after_agent_key = false;
+    var after_key = false;
     var i: usize = 0;
     while (i < json.len) {
         const byte = json[i];
@@ -182,19 +205,19 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
                 containers[depth] = byte;
                 depth += 1;
                 expect_key = byte == '{';
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
             '}', ']' => {
                 if (depth == 0) return null;
                 depth -= 1;
                 expect_key = false;
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
             ',' => {
                 expect_key = depth > 0 and containers[depth - 1] == '{';
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
             '"' => {
@@ -214,21 +237,48 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
                 i = end + 1;
                 if (expect_key) {
                     expect_key = false;
-                    after_agent_key = !escaped and (depth == 1 or depth == 2) and std.mem.eql(u8, text, "agent");
+                    after_key = !escaped and depth >= min_depth and depth <= max_depth and std.mem.eql(u8, text, key);
                 } else {
-                    if (after_agent_key) return if (escaped or text.len == 0) null else text;
-                    after_agent_key = false;
+                    if (after_key) return if (escaped or text.len == 0) null else text;
+                    after_key = false;
                 }
             },
             ':', ' ', '\t', '\n', '\r' => i += 1,
             else => {
                 // A number or literal is no name.
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
         }
     }
     return null;
+}
+
+test "a streaming toolbox call names its action once its whole value arrives" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, action: ?[]const u8 }{
+        .{ .json = "", .action = null },
+        .{ .json = "{\"run\":\"glob", .action = null },
+        .{ .json = "{\"run\":\"glob_files\"", .action = "{\"run\":\"glob_files\"}" },
+        .{ .json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .action = "{\"run\":\"mcp_fixture_echo\"}" },
+        .{ .json = "{\"search\":\"list fi", .action = null },
+        .{ .json = "{\"search\":\"list files\"", .action = "{\"search\":\"list files\"}" },
+        // An empty search may list one server's tools, so it waits.
+        .{ .json = "{\"search\":\"\",\"ser", .action = null },
+        .{ .json = "{\"open\":\"fixture\",\"res", .action = "{\"open\":\"fixture\"}" },
+        // Only the call's own keys count, not ones inside its arguments.
+        .{ .json = "{\"arguments\":{\"run\":\"x\"},\"run\":\"gl", .action = null },
+        .{ .json = "{\"run\":\"a\\u001b[2J\"", .action = null },
+    };
+    for (cases) |case| {
+        const got = try toolboxStreamedAction(alloc, case.json);
+        defer if (got) |bytes| alloc.free(bytes);
+        if (case.action) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
 }
 
 test "a streaming subagent call names its agent once the whole name arrives" {
