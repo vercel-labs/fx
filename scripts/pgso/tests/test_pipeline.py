@@ -7,8 +7,9 @@ import pathlib
 import tempfile
 import types
 import unittest
+from unittest import mock
 
-from scripts.pgso import macos
+from scripts.pgso import macos, runner
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.macos import (
     CandidateMetadata,
@@ -315,10 +316,16 @@ if 'check-outlined' not in sys.argv:
 print('{{}}')""",
         )
 
-    def write_bitcode_zig(self, actions: pathlib.Path, *, rerun_output: bytes = b"BC\xc0\xdezig") -> pathlib.Path:
+    def write_bitcode_zig(
+        self,
+        actions: pathlib.Path,
+        *,
+        rerun_output: bytes = b"BC\xc0\xdezig",
+        stderr_before: str = "",
+    ) -> pathlib.Path:
         """`zig build pgso-ir --verbose` installs an optimized, wrapped module
-        and prints its compile; that compile run again writes `rerun_output`
-        to its `--verbose-llvm-bc` path."""
+        and prints `stderr_before`, then its compile; that compile run again
+        writes `rerun_output` to its `--verbose-llvm-bc` path."""
         return self.write_executable(
             "bitcode-zig",
             f"""import pathlib,sys
@@ -328,6 +335,7 @@ if sys.argv[1] == 'build':
     prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
     (prefix / 'pgso').mkdir(parents=True, exist_ok=True)
     (prefix / 'pgso' / 'fx.bc').write_bytes(b'\\xde\\xc0\\x17\\x0boptimized')
+    sys.stderr.write({stderr_before!r})
     sys.stderr.write('info(verbose): ' + sys.argv[0] + ' build-exe -Osafe -Mroot=src/main.zig -femit-llvm-bc --name fx --listen=-\\n')
 else:
     out = [a for a in sys.argv if a.startswith('--verbose-llvm-bc=')][0].split('=', 1)[1]
@@ -414,6 +422,30 @@ if sys.argv[1] == 'build':
         with self.assertRaisesRegex(PgsoError, "ReleaseSafe LLVM bitcode"):
             emit_bitcode(toolchain, self.spec, self.paths)
         self.assertFalse(self.paths.bitcode.exists())
+
+    def test_emitted_bitcode_rejects_pgso_ir_output_it_only_saw_the_end_of(self) -> None:
+        # pgso-ir must print exactly one compile that emits bitcode. When the
+        # capture keeps only the tail, an earlier one can be cut off, and the
+        # one left would pass that check.
+        actions = self.root / "emit-truncated"
+        earlier_compile = "info(verbose): zig build-exe -Mroot=src/other.zig -femit-llvm-bc --listen=-\n"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_bitcode_zig(actions, stderr_before=earlier_compile + "x" * 2048 + "\n"),
+            ir_size=self.write_ir_size(actions),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        with self.assertRaisesRegex(PgsoError, "found 2"):
+            emit_bitcode(toolchain, self.spec, self.paths)
+        actions.unlink()
+        with mock.patch.object(runner, "MAX_CAPTURED_OUTPUT_CHARS", 1024):
+            with self.assertRaisesRegex(PgsoError, "pgso-ir output was truncated"):
+                emit_bitcode(toolchain, self.spec, self.paths)
+
+        lines = actions.read_text().splitlines()
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].startswith("zig build pgso-ir "))
 
     def write_unreproducible_zig(self, actions: pathlib.Path, *, new_result_each_build: bool = False) -> pathlib.Path:
         """Like Zig 0.17.1: the printed compile writes different bytes on every
