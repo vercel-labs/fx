@@ -36,6 +36,8 @@ pub const Extension = enum {
     model_calls,
     /// `sh.fx/usage` in the `_meta` of a `session/prompt` response.
     usage,
+    /// `sh.fx/commandResult` on the `tool_call_update` that ends a shell call.
+    command_result,
 
     pub fn capabilityName(self: Extension) []const u8 {
         return switch (self) {
@@ -50,6 +52,7 @@ pub const Extension = enum {
             .turn_progress => "sh.fx/turnProgress",
             .model_calls => "sh.fx/modelCalls",
             .usage => "sh.fx/usage",
+            .command_result => "sh.fx/commandResult",
         };
     }
 };

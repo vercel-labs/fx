@@ -44,7 +44,8 @@
         "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" },
         "sh.fx/turnProgress": { "$ref": "#/$defs/Capability" },
         "sh.fx/modelCalls": { "$ref": "#/$defs/Capability" },
-        "sh.fx/usage": { "$ref": "#/$defs/Capability" }
+        "sh.fx/usage": { "$ref": "#/$defs/Capability" },
+        "sh.fx/commandResult": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -72,7 +73,8 @@
         "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" },
         "sh.fx/turnProgress": { "$ref": "#/$defs/Capability" },
         "sh.fx/modelCalls": { "$ref": "#/$defs/Capability" },
-        "sh.fx/usage": { "$ref": "#/$defs/Capability" }
+        "sh.fx/usage": { "$ref": "#/$defs/Capability" },
+        "sh.fx/commandResult": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -335,6 +337,27 @@
         "outputExact": { "description": "False when `usage.outputTokens` is fx's estimate.", "type": "boolean" }
       },
       "required": ["durationMs", "thinkingMs", "inputExact", "outputExact"]
+    },
+    "CommandResult": {
+      "description": "The value of `sh.fx/commandResult` in the `_meta` of the `tool_call_update` that ends a shell call. Values fx doesn't know are left out, and so are `terminationIndeterminate` and `outputIncomplete` when they are false.",
+      "type": "object",
+      "properties": {
+        "command": { "description": "The command as fx ran it.", "type": "string" },
+        "cwd": { "description": "The folder it ran in.", "type": "string" },
+        "exitCode": { "description": "Its exit code.", "type": "integer" },
+        "signal": { "description": "The signal that stopped it.", "type": "integer", "minimum": 0 },
+        "timedOut": { "description": "It ran past its time limit.", "type": "boolean" },
+        "terminationIndeterminate": { "description": "fx couldn't confirm how the command ended, so its effects may exist. Always true when present.", "const": true },
+        "outputIncomplete": { "description": "fx couldn't read all of its output. Always true when present.", "const": true },
+        "durationMs": { "description": "How long it ran.", "type": "integer", "minimum": 0 },
+        "stdoutBytes": { "description": "Bytes it wrote to standard output.", "type": "integer", "minimum": 0 },
+        "stderrBytes": { "description": "Bytes it wrote to standard error.", "type": "integer", "minimum": 0 },
+        "truncated": { "description": "The output was larger than fx keeps in the call's text; the saved output holds all of it.", "type": "boolean" },
+        "outputFile": { "description": "The name under which fx saved the whole output, in the session's own store. A name, not a path.", "type": "string" },
+        "stdoutFile": { "description": "The name under which fx saved the whole standard output, in the session's own store.", "type": "string" },
+        "stderrFile": { "description": "The name under which fx saved the whole standard error, in the session's own store.", "type": "string" }
+      },
+      "required": ["command", "cwd", "timedOut", "stdoutBytes", "stderrBytes", "truncated"]
     }
   }
 }

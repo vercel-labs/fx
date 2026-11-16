@@ -599,13 +599,51 @@ A client that runs tools for fx lists them in the value of its `sh.fx/hostTools`
 
 ### Details on standard messages
 
-Three keys add fx's details to standard ACP messages. Each has a capability of the same name, which fx always lists and a client lists to receive the key:
+Four keys add fx's details to standard ACP messages. Each has a capability of the same name, which fx always lists and a client lists to receive the key:
 
 | Key | Where | What it carries |
 | --- | --- | --- |
 | `sh.fx/toolCall` | `tool_call` updates | Whether the call is fx's own bookkeeping step, and the server and tool name of an MCP call |
 | `sh.fx/permissionMode` | each value of the `mode` config option | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
 | `sh.fx/modelResponseRecovery` | `session_info_update` | A model request that an earlier fx process was running when it stopped. fx sends this update only to a client that lists the key |
+| `sh.fx/commandResult` | the `tool_call_update` that ends a shell call | The command, its folder, how it ended, how long it ran, the size of its output, and where fx saved the whole output |
+
+`sh.fx/commandResult` lets a client show a shell call's result without reading the call's text. Values fx doesn't know, such as the exit code of a command that a signal stopped, are left out, and so are `terminationIndeterminate` and `outputIncomplete` when they are false:
+
+```json
+{
+  "sessionUpdate": "tool_call_update",
+  "toolCallId": "call_7",
+  "status": "completed",
+  "content": [{ "type": "content", "content": { "type": "text", "text": "exit_code=0\n<stdout>\nok\n</stdout>\n" } }],
+  "_meta": {
+    "sh.fx/commandResult": {
+      "command": "printf ok",
+      "cwd": "/home/dev/app",
+      "exitCode": 0,
+      "timedOut": false,
+      "durationMs": 12,
+      "stdoutBytes": 2,
+      "stderrBytes": 0,
+      "truncated": false
+    }
+  }
+}
+```
+
+| Field | What it means |
+| --- | --- |
+| `command` | The command as fx ran it |
+| `cwd` | The folder it ran in |
+| `exitCode` | Its exit code |
+| `signal` | The signal that stopped it |
+| `timedOut` | It ran past its time limit |
+| `terminationIndeterminate` | fx couldn't confirm how the command ended, so its effects may exist |
+| `outputIncomplete` | fx couldn't read all of its output |
+| `durationMs` | How long it ran |
+| `stdoutBytes`, `stderrBytes` | The bytes it wrote to standard output and standard error |
+| `truncated` | The output was larger than fx keeps in the call's text; the saved output holds all of it |
+| `outputFile`, `stdoutFile`, `stderrFile` | The names under which fx saved the whole output, and each stream, in the session's own store. They are names, not paths |
 
 ### Keys a client sends
 
@@ -637,7 +675,7 @@ fx and its SDK moved to the new names together, so fx accepts only the new names
 
 ## Keys fx used before sh.fx
 
-Before sh.fx, fx's ACP server put its extra data under `_meta.fx.<key>`, and it read two fields of a custom `libfx` object at the root of `clientCapabilities`, which ACP forbids. Each one became an `sh.fx/` key or capability in this table, or went away in favor of a standard ACP field:
+Before sh.fx, fx's ACP server put its extra data under `_meta.fx.<key>`, it read two fields of a custom `libfx` object at the root of `clientCapabilities`, and it sent a shell call's result in a custom field at the root of `tool_call_update`, which ACP forbids. Each one became an `sh.fx/` key or capability in this table, or went away in favor of a standard ACP field:
 
 | Before | Where | New | Kind | What it carries |
 | --- | --- | --- | --- | --- |
@@ -665,6 +703,7 @@ Before sh.fx, fx's ACP server put its extra data under `_meta.fx.<key>`, and it 
 | `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt` field |
 | `systemPromptMode` | `session/new` params, a custom field at the root | - | removed | How fx combines the system prompt with its own. ACP v1 puts it in `systemPrompt.mode` |
 | `clientCapabilities.libfx.tools` | the `initialize` request | `sh.fx/hostTools` | capability | The tools that the client runs for fx, as `{ "tools": [...] }` in the capability's value |
+| `command_result` | the `tool_call_update` that ends a shell call, a custom field at the root | `sh.fx/commandResult` | `_meta` key | The shell call's result, with camelCase names, for a client that lists the key |
 | `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` in `append` mode on `_sh.fx/session/new` |
 
 The keys and capabilities moved with the method names: fx reads and sends only the new forms, and a client that lists no `sh.fx/` capability receives none of them.
@@ -708,3 +747,4 @@ The keys and capabilities moved with the method names: fx reads and sends only t
 | `TurnProgressParams` | The params of `_sh.fx/session/turn_progress` |
 | `ModelCallParams` | The params of `_sh.fx/session/model_call` |
 | `TurnUsage` | The value of `sh.fx/usage`: how long the turn ran, and whether its token counts are exact |
+| `CommandResult` | The value of `sh.fx/commandResult`: how a shell call ended, the size of its output, and where fx saved it |

@@ -62,6 +62,10 @@ export class Client {
   }
 }
 
+/// The third turn's shell call. Its ACP tool call id is the model's call id.
+export const SHELL_CALL_ID = "turn_events_shell_1";
+export const SHELL_COMMAND = "cat note.txt";
+
 /// A large reply: past 20 percent of the fake model's 128,000-token window,
 /// so the next turn compacts first, with no model call.
 const LARGE = "TURN_EVENTS_LARGE\n" + "historical reference line, not new completed work.\n".repeat(2_400);
@@ -83,7 +87,7 @@ export class Fixture {
   }
 
   /// Turn 1: the large reply. Turn 2: compaction, then a reply. Turn 3: a
-  /// tool call, then a reply.
+  /// shell call, then a reply.
   async start(capabilities: object): Promise<Client> {
     const helpers = await targetHelpers();
     const reply = (text: string, usage: boolean) => helpers.fakeGatewaySse([
@@ -97,7 +101,7 @@ export class Fixture {
     // The large reply reports no usage, so fx sizes the conversation by its
     // own estimate and compacts before the next turn.
     this.gateway = helpers.startFakeGateway(
-      [reply(LARGE, false), reply("TURN_EVENTS_SECOND", true), helpers.fakeGatewayToolCall("turn_events_call_1", "read_file", { path: "note.txt" }), reply("TURN_EVENTS_THIRD", true)],
+      [reply(LARGE, false), reply("TURN_EVENTS_SECOND", true), helpers.fakeGatewayToolCall(SHELL_CALL_ID, "shell", { request: { action: "run", command: SHELL_COMMAND, yield_time_ms: 30_000 } }), reply("TURN_EVENTS_THIRD", true)],
       { models: [{ id: helpers.FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }] },
     );
     const env = testEnvironment({

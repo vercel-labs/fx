@@ -20,12 +20,21 @@
 (*    is its only update.                                                 *)
 (*  - The turn's response comes after every message of the turn, and      *)
 (*    carries the turn's usage when the client lists "usage".             *)
+(*  - A shell call that ends sends a standard tool_call_update to every   *)
+(*    client. Its command result rides in the update's _meta as           *)
+(*    sh.fx/commandResult, only for a client that lists it ("command").   *)
+(*    fx never adds a field at the root of a standard message.            *)
 (*                                                                         *)
 (* `Rules` set to FALSE gives fx acp before these rules (#2021 at         *)
 (* 76de31e82): the loop's progress, model calls, compactions, and finish  *)
 (* reach fx acp's catch-all arm or no hook at all, and nothing is sent,   *)
 (* so only the response reaches the client. AcpTurnEventsToday.cfg shows  *)
 (* Complete failing.                                                      *)
+(*                                                                         *)
+(* `CommandMeta` set to FALSE gives fx acp before S8g (#2044 at           *)
+(* 49ccc40cd): every client gets a shell call's command result as a       *)
+(* command_result field at the root of its tool_call_update.              *)
+(* AcpTurnEventsRootField.cfg shows StandardOnly failing.                 *)
 (*                                                                         *)
 (* Compactions have the ids in Ks and run one at a time, in id order, in  *)
 (* any turn. A compaction's stage is "chosen" once fx-compactor picked    *)
@@ -40,13 +49,15 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Rules,          \* TRUE: the S8d rules; FALSE: fx acp before them
+    CommandMeta,    \* TRUE: sh.fx/commandResult (S8g); FALSE: the root field
     Parts,          \* the parts the client lists
     Ks,             \* compaction ids, 1..n
     MaxProgress,    \* progress reports per turn
     MaxCalls,       \* model calls per turn
+    MaxShells,      \* shell calls per turn
     MaxTurns
 
-AllParts == {"progress", "calls", "usage", "compaction"}
+AllParts == {"progress", "calls", "usage", "compaction", "command"}
 Outcomes == {"succeeded", "failed", "cancelled", "no_op"}
 Ends == {"completed", "failed", "cancelled"}
 Stages == {"none", "chosen", "summary", "published", "ended"}
@@ -58,6 +69,7 @@ VARIABLES
     running,    \* the current turn runs
     prog,       \* progress reports the loop made in this turn
     calls,      \* model calls that ended in this turn
+    shells,     \* shell calls that ended in this turn
     finished,   \* the loop reported the finished turn
     stage,      \* [Ks -> Stages]
     outcome,    \* [Ks -> Outcomes \cup {"none"}]
@@ -67,7 +79,7 @@ VARIABLES
     seen,       \* [Ks -> Seq(statuses)]: compaction updates the client read
     late        \* the client read a message of a turn after its response
 
-vars == <<turn, running, prog, calls, finished, stage, outcome, started, chan, got, seen, late>>
+vars == <<turn, running, prog, calls, shells, finished, stage, outcome, started, chan, got, seen, late>>
 
 Listed(p) == Rules /\ p \in Parts
 
@@ -75,7 +87,8 @@ Msg(kind, k, status, usage) == [kind |-> kind, k |-> k, status |-> status, usage
 
 WriteIf(cond, m) == chan' = IF cond THEN Append(chan, m) ELSE chan
 
-NoGot == [progress |-> 0, calls |-> 0, response |-> FALSE, usage |-> FALSE]
+NoGot == [progress |-> 0, calls |-> 0, response |-> FALSE, usage |-> FALSE,
+          tools |-> 0, commands |-> 0, root |-> FALSE]
 
 Active == {k \in Ks : stage[k] \in {"chosen", "summary", "published"}}
 
@@ -84,6 +97,7 @@ Init ==
     /\ running = FALSE
     /\ prog = 0
     /\ calls = 0
+    /\ shells = 0
     /\ finished = FALSE
     /\ stage = [k \in Ks |-> "none"]
     /\ outcome = [k \in Ks |-> "none"]
@@ -99,7 +113,7 @@ Prompt ==
     /\ turn = 0 \/ got.response
     /\ turn' = turn + 1
     /\ running' = TRUE
-    /\ prog' = 0 /\ calls' = 0 /\ finished' = FALSE
+    /\ prog' = 0 /\ calls' = 0 /\ shells' = 0 /\ finished' = FALSE
     /\ got' = NoGot
     /\ UNCHANGED <<stage, outcome, started, chan, seen, late>>
 
@@ -107,20 +121,34 @@ Progress ==
     /\ running /\ ~finished /\ prog < MaxProgress
     /\ prog' = prog + 1
     /\ WriteIf(Listed("progress"), Msg("progress", 0, "none", FALSE))
-    /\ UNCHANGED <<turn, running, calls, finished, stage, outcome, started, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, running, calls, finished, stage, outcome, started, got, seen, late>>
 
 Call ==
     /\ running /\ ~finished /\ calls < MaxCalls
     /\ calls' = calls + 1
     /\ WriteIf(Listed("calls"), Msg("call", 0, "none", FALSE))
-    /\ UNCHANGED <<turn, running, prog, finished, stage, outcome, started, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, running, prog, finished, stage, outcome, started, got, seen, late>>
+
+\* A shell call ends. Its tool_call_update is standard ACP and goes to every
+\* client, and its command result rides in it: under the rules in _meta as
+\* sh.fx/commandResult ("meta"), only for a client that lists "command";
+\* before S8g as a command_result field at the update's root ("root").
+CommandTag == IF Rules /\ CommandMeta
+              THEN IF "command" \in Parts THEN "meta" ELSE "none"
+              ELSE "root"
+
+Shell ==
+    /\ running /\ ~finished /\ shells < MaxShells
+    /\ shells' = shells + 1
+    /\ chan' = Append(chan, Msg("tool", 0, CommandTag, FALSE))
+    /\ UNCHANGED <<turn, running, prog, calls, finished, stage, outcome, started, got, seen, late>>
 
 \* fx-compactor picks what to compact. Compactions run one at a time.
 Choose(k) ==
     /\ running /\ ~finished /\ stage[k] = "none" /\ Active = {}
     /\ \A j \in Ks : j < k => stage[j] = "ended"
     /\ stage' = [stage EXCEPT ![k] = "chosen"]
-    /\ UNCHANGED <<turn, running, prog, calls, finished, outcome, started, chan, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, running, prog, calls, finished, outcome, started, chan, got, seen, late>>
 
 \* Its summary starts, or it is being saved: the first sends in_progress.
 Advance(k, next) ==
@@ -130,7 +158,7 @@ Advance(k, next) ==
     /\ stage' = [stage EXCEPT ![k] = next]
     /\ started' = [started EXCEPT ![k] = started[k] \/ Listed("compaction")]
     /\ WriteIf(Listed("compaction") /\ ~started[k], Msg("comp", k, "in_progress", FALSE))
-    /\ UNCHANGED <<turn, running, prog, calls, finished, outcome, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, running, prog, calls, finished, outcome, got, seen, late>>
 
 EndOf(o) == CASE o = "succeeded" -> "completed"
               [] o = "failed" -> "failed"
@@ -146,19 +174,19 @@ Settle(k, o) ==
     /\ stage' = [stage EXCEPT ![k] = "ended"]
     /\ outcome' = [outcome EXCEPT ![k] = o]
     /\ WriteIf(Listed("compaction") /\ (started[k] \/ o = "failed"), Msg("comp", k, EndOf(o), FALSE))
-    /\ UNCHANGED <<turn, running, prog, calls, finished, started, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, running, prog, calls, finished, started, got, seen, late>>
 
 Finish ==
     /\ running /\ ~finished /\ Active = {}
     /\ finished' = TRUE
-    /\ UNCHANGED <<turn, running, prog, calls, stage, outcome, started, chan, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, running, prog, calls, stage, outcome, started, chan, got, seen, late>>
 
 \* fx answers the prompt once the loop has finished the turn.
 Respond ==
     /\ running /\ finished
     /\ running' = FALSE
     /\ chan' = Append(chan, Msg("response", 0, "none", Listed("usage")))
-    /\ UNCHANGED <<turn, prog, calls, finished, stage, outcome, started, got, seen, late>>
+    /\ UNCHANGED <<shells, turn, prog, calls, finished, stage, outcome, started, got, seen, late>>
 
 Deliver ==
     /\ chan # <<>>
@@ -168,12 +196,15 @@ Deliver ==
        /\ got' = CASE m.kind = "progress" -> [got EXCEPT !.progress = @ + 1]
                    [] m.kind = "call" -> [got EXCEPT !.calls = @ + 1]
                    [] m.kind = "response" -> [got EXCEPT !.response = TRUE, !.usage = m.usage]
+                   [] m.kind = "tool" -> [got EXCEPT !.tools = @ + 1,
+                                                     !.commands = @ + (IF m.status = "meta" THEN 1 ELSE 0),
+                                                     !.root = @ \/ m.status = "root"]
                    [] OTHER -> got
        /\ seen' = IF m.kind = "comp" THEN [seen EXCEPT ![m.k] = Append(@, m.status)] ELSE seen
-    /\ UNCHANGED <<turn, running, prog, calls, finished, stage, outcome, started>>
+    /\ UNCHANGED <<shells, turn, running, prog, calls, finished, stage, outcome, started>>
 
 Next ==
-    \/ Prompt \/ Progress \/ Call \/ Finish \/ Respond \/ Deliver
+    \/ Prompt \/ Progress \/ Call \/ Shell \/ Finish \/ Respond \/ Deliver
     \/ \E k \in Ks : \/ Choose(k) \/ Advance(k, "summary") \/ Advance(k, "published")
                      \/ \E o \in Outcomes : Settle(k, o)
 
@@ -181,16 +212,18 @@ Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
 Statuses == Ends \cup {"in_progress"}
-Message == [kind : {"progress", "call", "comp", "response"}, k : Ks \cup {0},
-            status : Statuses \cup {"none"}, usage : BOOLEAN]
+Message == [kind : {"progress", "call", "comp", "tool", "response"}, k : Ks \cup {0},
+            status : Statuses \cup {"none", "meta", "root"}, usage : BOOLEAN]
 
 TypeOK ==
     /\ turn \in 0..MaxTurns /\ running \in BOOLEAN
-    /\ prog \in 0..MaxProgress /\ calls \in 0..MaxCalls /\ finished \in BOOLEAN
+    /\ prog \in 0..MaxProgress /\ calls \in 0..MaxCalls /\ shells \in 0..MaxShells
+    /\ finished \in BOOLEAN
     /\ stage \in [Ks -> Stages] /\ outcome \in [Ks -> Outcomes \cup {"none"}]
     /\ started \in [Ks -> BOOLEAN]
     /\ \A i \in 1..Len(chan) : chan[i] \in Message
-    /\ got \in [progress : Nat, calls : Nat, response : BOOLEAN, usage : BOOLEAN]
+    /\ got \in [progress : Nat, calls : Nat, response : BOOLEAN, usage : BOOLEAN,
+               tools : Nat, commands : Nat, root : BOOLEAN]
     /\ \A k \in Ks : \A i \in 1..Len(seen[k]) : seen[k][i] \in Statuses
     /\ late \in BOOLEAN
 
@@ -199,11 +232,14 @@ PartOf(m) == CASE m.kind = "progress" -> "progress"
                [] m.kind = "comp" -> "compaction"
                [] OTHER -> "none"
 
-\* A client gets only the parts it lists: a plain ACP client gets none.
+\* A client gets only the parts it lists: a plain ACP client gets none. A
+\* shell call's update is standard ACP, but its sh.fx/commandResult is a part.
 OptIn ==
     /\ \A i \in 1..Len(chan) :
-         /\ chan[i].kind # "response" => PartOf(chan[i]) \in Parts
+         /\ chan[i].kind \notin {"response", "tool"} => PartOf(chan[i]) \in Parts
          /\ chan[i].usage => "usage" \in Parts
+         /\ chan[i].status = "meta" => "command" \in Parts
+    /\ got.commands > 0 => "command" \in Parts
     /\ got.progress > 0 => "progress" \in Parts
     /\ got.calls > 0 => "calls" \in Parts
     /\ got.usage => "usage" \in Parts
@@ -227,6 +263,8 @@ Complete ==
         /\ "progress" \in Parts => got.progress = prog
         /\ "calls" \in Parts => got.calls = calls
         /\ "usage" \in Parts => got.usage
+        /\ got.tools = shells
+        /\ "command" \in Parts => got.commands = shells
         /\ "compaction" \in Parts =>
              \A k \in Ks : stage[k] = "ended" =>
                  IF started[k] \/ outcome[k] = "failed"
@@ -235,4 +273,10 @@ Complete ==
 
 \* No message of a turn reaches the client after the turn's response.
 BeforeResponse == ~late
+
+\* fx never adds a field at the root of a standard ACP message: a shell
+\* call's command result rides only in _meta.
+StandardOnly ==
+    /\ \A i \in 1..Len(chan) : chan[i].status # "root"
+    /\ ~got.root
 =============================================================================
