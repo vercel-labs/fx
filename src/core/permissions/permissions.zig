@@ -1113,20 +1113,9 @@ pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permissi
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
 }
 
-/// The permission rules every MCP path uses for an agent running in `mode`:
-/// none in full access, and the host's `rules` otherwise.
-///
-/// Full access skips fx's permission policy, so no deny rule hides or blocks
-/// an MCP tool on any path there: toolbox search and open, a toolbox run, a
-/// shell command's `fx mcp call`, the per-step refresh, and a subagent's
-/// integrations list (src/core/subagent/authority.zig). In ask and auto a
-/// denied tool is hidden and refused on every path. What an agent's access
-/// allows (a subagent's view of its parent's servers) is a separate check and
-/// holds in every mode. Every MCP reader takes its rules from here, with the
-/// mode of the agent that uses the tool, which a profile may set apart from
-/// its host's. The model is tests/tla/mcp_host/McpRules.tla: its properties
-/// FullAccessIgnoresRules, DenyHoldsOutside, PathsAgree, UndeniedShown and
-/// AccessHolds are what the paths below the catalog must keep.
+/// The permission rules every MCP path uses for an agent running in `mode`: none in full access, the
+/// host's `rules` otherwise. Each reader passes the mode of the agent that uses the tool. The model is
+/// tests/tla/mcp_host/McpRules.tla (`FullAccessIgnoresRules`, `DenyHoldsOutside`, `PathsAgree`).
 pub fn mcpRules(mode: types.PermissionMode, rules: types.PermissionRuleSet) types.PermissionRuleSet {
     return if (mode == .yolo) .{} else rules;
 }

@@ -4880,7 +4880,7 @@ describe("MCP deny rules by permission mode", () => {
     expect(hidden(run, UNDENIED)).toEqual([]);
   }, 240_000);
 
-  test("guard: in auto a denied tool stays hidden and refused on every path, in today's words", async () => {
+  test("guard: in auto a denied tool stays hidden and refused on every path, in the words it has always had", async () => {
     const run = await runPaths({ bin: FX_BIN, mode: "auto", rules });
     ok(run);
     expect(shown(run, DENIED)).toEqual([]);
@@ -4940,7 +4940,7 @@ describe("MCP deny rules by permission mode", () => {
     const full = await runPaths({ bin: FX_BIN, mode: "full", rules: {}, down: true, readOnly: true, label: "down-full" });
     ok(auto);
     ok(full);
-    // A server that exits at start is not in the menu: today's words, in both modes.
+    // A server that exits at start is not in the menu: the same words in both modes.
     expect(seen(auto, "open_small", SMALL_TOOL).text).toContain("Nothing named fixture is in the toolbox menu.");
     for (const path of ["search", "open_small", "open_tool"] as const) {
       expect([path, seen(full, path, SMALL_TOOL).text]).toEqual([path, seen(auto, path, SMALL_TOOL).text]);

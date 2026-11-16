@@ -7103,6 +7103,7 @@ const McpFixture = struct {
     const PermissionContext = struct {
         search_rule_count: usize = 0,
         schema_rule_count: usize = 0,
+        snapshot_rule_count: usize = 0,
     };
 
     const AuthorityContext = struct {
@@ -7174,6 +7175,12 @@ const McpFixture = struct {
         return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel);
     }
 
+    fn snapshotRecordingRules(raw_ctx: *anyopaque, _: Allocator, _: []const u8, _: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
+        const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
+        ctx.snapshot_rule_count = permission_rules.rules.len;
+        return .current;
+    }
+
     fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
@@ -7218,9 +7225,12 @@ test "toolbox search forwards permission rules to MCP search" {
 
 // Full access ignores deny rules on every MCP path, so each reader of the
 // rules takes them from `permissions.mcpRules` with the mode of its context
-// (tests/tla/mcp_host/McpRules.tla): the dispatch field, a toolbox run or the
-// bridge (`resolveUnselectedMcpTool`), and an open of a tool. In ask and auto
-// each reads the host's rules.
+// (tests/tla/mcp_host/McpRules.tla). The six readers are the dispatch field
+// (toolbox search reads it), the bridge's list and search (`lookupBridge`), a
+// toolbox run or the bridge (`resolveUnselectedMcpTool`), an open of a tool, the
+// refresh of a tool whose definition changed (`refreshChangedMcpTool`), and the
+// per-step snapshot (`snapshotMcpDefinition`). In ask and auto each reads the
+// host's rules.
 test "every MCP reader takes the host's rules outside full access and none in it" {
     var permission_context = McpFixture.PermissionContext{};
     var rules = [_]types.PermissionRule{
@@ -7229,6 +7239,8 @@ test "every MCP reader takes the host's rules outside full access and none in it
     var rt = TestRuntime{
         .mcp_ctx = @ptrCast(&permission_context),
         .mcp_tool_schema = McpFixture.schemaRecordingRules,
+        .mcp_search_tools = McpFixture.searchRecordingRules,
+        .mcp_snapshot_tool = McpFixture.snapshotRecordingRules,
         .permission_rules = .{ .rules = &rules },
     };
     defer rt.deinit(std.testing.allocator);
@@ -7236,6 +7248,8 @@ test "every MCP reader takes the host's rules outside full access and none in it
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const binding: tool_mcp_runtime.Binding = .{ .runtime_generation = 1, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 };
+    var cancel: std.atomic.Value(bool) = .init(false);
 
     for ([_]struct { mode: types.PermissionMode, rules: usize }{
         .{ .mode = .ask, .rules = 1 },
@@ -7254,6 +7268,19 @@ test "every MCP reader takes the host's rules outside full access and none in it
         permission_context.schema_rule_count = 99;
         _ = try lookupToolboxMcpTool(context, arena, "mcp_fs_read");
         try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+
+        permission_context.schema_rule_count = 99;
+        _ = try refreshChangedMcpTool(context, arena, .{ .id = "refresh", .name = "mcp_fs_read", .arguments_json = "{}" });
+        try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+
+        permission_context.snapshot_rule_count = 99;
+        _ = try snapshotMcpDefinition(context, arena, "mcp_fs_read", binding);
+        try std.testing.expectEqual(case.rules, permission_context.snapshot_rule_count);
+
+        permission_context.search_rule_count = 99;
+        var bridge = McpCallBridgeState{ .runtime = context };
+        _ = try lookupBridge(@ptrCast(&bridge), arena, .{ .search = "read" }, &cancel);
+        try std.testing.expectEqual(case.rules, permission_context.search_rule_count);
     }
 }
 
