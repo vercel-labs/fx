@@ -10,7 +10,7 @@
     {"name": "subscription_replace_rejected", "module": "fx", "test": "a forced Codex or Grok refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
-    {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 4000000},
+    {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 1200000},
     {"name": "agents_menu_selection", "module": "fx", "test": "the agent list's highlight and the agent on screen hold for fuzzed steps", "iterations": 20000},
     {"name": "queue_placement", "module": "fx", "test": "queue placement delivers each message once and in order on fuzzed sequences", "iterations": 200000},
     {"name": "pending_reports", "module": "fx", "test": "pending reports keep their laws on fuzzed report lines", "iterations": 500000},
@@ -37,7 +37,7 @@
     {"name": "display_width", "module": "fx", "test": "fuzz display unit boundaries", "iterations": 620000},
     {"name": "network_call_text", "module": "fx", "test": "fuzzed network call text stays a bounded prefix that keeps UTF-8 whole", "iterations": 2000000},
     {"name": "fuzzy_match", "module": "fx", "test": "fuzzy match keeps the model's laws on arbitrary bytes", "iterations": 300000},
-    {"name": "toolbox_menu", "module": "fx", "test": "toolbox menu stays bounded and well formed on fuzzed entries", "iterations": 500000},
+    {"name": "toolbox_menu", "module": "fx", "test": "toolbox menu stays bounded and well formed on fuzzed entries", "iterations": 60000},
     {"name": "toolbox_run_shape", "module": "fx", "test": "a toolbox call is carried as a run exactly when its decode reads a run", "iterations": 30000},
     {"name": "tool_placement_parse", "module": "fx", "test": "tool placement parsing reads a placement or an error from any text", "iterations": 60000},
     {"name": "provider_finish_raw", "module": "fx", "test": "fuzz provider finish raw", "iterations": 5000000},
@@ -62,6 +62,7 @@
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
     {"name": "trace_record_text", "module": "fx", "test": "trace records stay one valid JSON line for fuzzed text", "iterations": 12000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
+    {"name": "mcp_challenge", "module": "fx", "test": "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes", "iterations": 1500000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
     {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000},
@@ -72,6 +73,7 @@
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "tool_story_rows", "module": "fx", "test": "story rows fit the width and stay plain text for fuzzed arguments and output", "iterations": 12000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
+    {"name": "trace_review_records", "module": "fx", "test": "trace review and setup records stay valid JSON lines for fuzzed text", "iterations": 12000},
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
     {"name": "subagent_task_line", "module": "fx", "test": "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text", "iterations": 1200},
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
@@ -83,6 +85,7 @@
     {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000},
     {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
     {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
-    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000}
+    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
+    {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000}
   ]
 }

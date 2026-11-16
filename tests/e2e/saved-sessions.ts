@@ -45,7 +45,7 @@ export function savedText(home: string, id: string): string {
   return [readFileSync(join(dir, "log.jsonl"), "utf8"), ...readdirSync(blobs).map((name) => readFileSync(join(blobs, name), "utf8"))].join("\n");
 }
 
-export type LogLine = { seq: number; kind: string; type?: string; reason?: string; key?: string };
+export type LogLine = { seq: number; kind: string; role?: string; type?: string; reason?: string; key?: string };
 
 /// Every complete line of a session's log. A line fx is still appending is
 /// left out, so a test may read the log while fx runs.
@@ -100,17 +100,36 @@ export function rootSessionIds(home: string): string[] {
   });
 }
 
-/// How many turns the saved root sessions have committed. A session fx is
-/// still creating counts as none yet.
+/// Whether `error` says fx has not created a file yet.
+function notCreatedYet(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/// How many turns the saved root sessions have committed. A store, folder,
+/// or log fx has not created yet, and a first line it is still writing,
+/// count as none yet. Any other error, such as a broken complete line or a
+/// superseded turn, is thrown.
 export function committedRootTurns(home: string): number {
+  let ids: string[];
   try {
-    return rootSessionIds(home).reduce(
-      (sum, id) => sum + logLines(home, id).filter((line) => line.kind === "turn_committed").length,
-      0,
-    );
-  } catch {
-    return 0;
+    ids = savedSessionIds(home);
+  } catch (error) {
+    if (notCreatedYet(error)) return 0;
+    throw error;
   }
+  let sum = 0;
+  for (const id of ids) {
+    let first: LogLine | undefined;
+    try {
+      first = readLog(home, id)[0];
+    } catch (error) {
+      if (notCreatedYet(error)) continue;
+      throw error;
+    }
+    if (!first || first.role === "child") continue;
+    sum += logLines(home, id).filter((line) => line.kind === "turn_committed").length;
+  }
+  return sum;
 }
 
 /// Waits until the saved root sessions hold more than `after` committed

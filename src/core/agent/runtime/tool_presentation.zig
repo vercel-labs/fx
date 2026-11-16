@@ -78,6 +78,9 @@ pub const ProvisionalToolStatuses = struct {
         id: []u8,
         tool_name: []u8,
         label_value: ?[]u8,
+        /// Whether the call's row was published. A toolbox call's row waits,
+        /// hidden, until its arguments name what it does.
+        shown: bool = true,
 
         fn deinit(self: *TrackedStatus, alloc: Allocator) void {
             alloc.free(self.id);
@@ -160,7 +163,13 @@ pub const ProvisionalToolStatuses = struct {
         var observed_kind = activity_kind;
         const argument_label: ?[]const u8 = if (is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
-            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
+            // While the arguments stream in they do not parse yet, but the
+            // action and the whole name after it already say what the call
+            // does, so its row does not read as a bare "Using" until they end.
+            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch streamed: {
+                const action = tooling_presentation.toolboxStreamedAction(scratch.allocator(), json) catch break :resource null;
+                break :streamed tool_args.parseToolArgsObject(scratch.allocator(), action orelse break :resource null) catch break :resource null;
+            };
             const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
             const presentation = tool_dispatch.presentationForArgs(spec.*, args);
             const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
@@ -189,6 +198,16 @@ pub const ProvisionalToolStatuses = struct {
             tool_name,
             observed_label,
         );
+        const index = self.findTracked(tool_id).?;
+        // A toolbox call says nothing about itself until its arguments name
+        // what it opens, runs, or searches, so its row never reads a bare
+        // "Using": it stays hidden until that name streams in, or until the
+        // call itself starts.
+        if (is_toolbox and argument_label == null) {
+            if (recorded) self.tracked.items[index].shown = false;
+            return;
+        }
+        self.tracked.items[index].shown = true;
         hooks.push_tool_lifecycle(hooks.ctx, .{
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
@@ -208,9 +227,12 @@ pub const ProvisionalToolStatuses = struct {
         }) catch {};
     }
 
-    /// Names the subagent a streaming `subagent` call's row is for as soon
-    /// as its arguments so far hold the whole name, so the row reads
-    /// `Managing reviewer` while the rest of the call streams in.
+    /// Names a streaming call's row as soon as its arguments so far say what
+    /// it is for, while the rest of the call streams in: the subagent a
+    /// `subagent` call is for once its whole name is in, so the row reads
+    /// `Managing reviewer`, and what a `toolbox` call runs, searches, or
+    /// opens once that whole value is in, so the row reads
+    /// `Running glob_files`. A row already named stays as it is.
     pub fn observeArguments(
         self: *ProvisionalToolStatuses,
         hooks: *const AgentRuntimeDeps,
@@ -221,8 +243,13 @@ pub const ProvisionalToolStatuses = struct {
     ) !void {
         const index = self.findTracked(tool_id) orelse return;
         const status = self.tracked.items[index];
-        if (!std.mem.eql(u8, status.tool_name, "subagent") or status.label_value != null) return;
-        if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        if (status.label_value != null) return;
+        if (std.mem.eql(u8, status.tool_name, "subagent")) {
+            if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        } else if (std.mem.eql(u8, status.tool_name, toolbox.tool_name)) {
+            const action = try tooling_presentation.toolboxStreamedAction(alloc, arguments) orelse return;
+            alloc.free(action);
+        } else return;
         const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
             .ineligible => return,
             .eligible => |metadata| metadata,
@@ -606,8 +633,11 @@ pub const ProvisionalToolStatuses = struct {
         return true;
     }
 
+    /// Whether the call's row was published. A hidden call has no row to
+    /// settle, so the call's own start shows it.
     fn has(self: *const ProvisionalToolStatuses, id: []const u8) bool {
-        return self.findTracked(id) != null;
+        const index = self.findTracked(id) orelse return false;
+        return self.tracked.items[index].shown;
     }
 
     fn findTracked(self: *const ProvisionalToolStatuses, id: []const u8) ?usize {
@@ -2143,10 +2173,18 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
 test "provisional toolbox labels read as what the call opens, runs, or searches" {
     // The stream's hint is the first string in the arguments, which may name
     // what a run runs or what a search looks for, so it never labels the row.
+    // The action and its whole value label it as soon as they stream in.
     const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
         .{ .arguments_json = null, .label = "Using" },
         .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
         .{ .arguments_json = "{}", .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
+        .{ .arguments_json = "{\"search\":\"list files\"", .label = "Searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\",\"res", .label = "Opening", .value = "fixture" },
+        // A streamed skill location reads as the skill's name, never the
+        // opaque location.
+        .{ .arguments_json = "{\"open\":\"skill:0123456789abcdef:6/ste-english\",\"res", .label = "Opening", .value = "ste-english" },
         .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
         .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
@@ -2162,6 +2200,12 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
         var statuses = ProvisionalToolStatuses{};
         defer statuses.deinit(alloc);
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "glob_files", case.arguments_json);
+        // A call that names nothing yet shows no row, so no bare "Using".
+        if (std.mem.eql(u8, case.label, "Using")) {
+            try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+            try std.testing.expect(!statuses.has("toolbox_1"));
+            continue;
+        }
         try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
         var expected_buf: [512]u8 = undefined;
         const expected = try formatProvisionalProgressLabel(&expected_buf, case.label, case.value);
@@ -2172,6 +2216,41 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
+}
+
+test "a streaming toolbox call's row names what it runs once that name arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, toolbox.tool_name);
+    const action = eligibleActionLabel(toolbox.tool_name);
+    var named_buf: [512]u8 = undefined;
+    const named = try formatProvisionalProgressLabel(&named_buf, "Running", "glob_files");
+
+    // The call shows no row until its arguments name what it does.
+    try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, kind, action, null, null);
+    try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+    try std.testing.expect(!statuses.has("toolbox_1"));
+    // Part of the name is not yet a name.
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob");
+    try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("toolbox_1", capture.events.items[0].provisional.id.call_id);
+    try std.testing.expectEqualStrings(named, capture.events.items[1].progress.text);
+    try std.testing.expect(statuses.has("toolbox_1"));
+    // The rest of the call streams in without another publication.
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pat");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+
+    // A search with no words yet may list one server's tools, so it waits.
+    try statuses.publish(&hooks, alloc, 7, "toolbox_2", toolbox.tool_name, kind, action, null, null);
+    const before = capture.events.items.len;
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_2", "{\"search\":\"\",\"server\":\"sl");
+    try std.testing.expectEqual(before, capture.events.items.len);
 }
 
 test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
@@ -2236,7 +2315,7 @@ test "provisional toolbox labels decode escaped UTF-8 and encode terminal contro
     try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
 }
 
-test "provisional toolbox labels fall back when an encoded resource exceeds the progress buffer" {
+test "provisional toolbox labels wait for the call when an encoded resource exceeds the progress buffer" {
     const alloc = std.testing.allocator;
     const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
     for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
@@ -2251,13 +2330,16 @@ test "provisional toolbox labels fall back when an encoded resource exceeds the 
         const json = try alloc.print("{{\"open\":\"skill:opaque/location\",\"resource\":\"{s}\"}}", .{resource});
         defer alloc.free(json);
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
-        const text = capture.events.items[1].progress.text;
         if (len == max_detail) {
+            const text = capture.events.items[1].progress.text;
             try std.testing.expectEqual(@as(usize, 512), text.len);
             try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
         } else {
-            try std.testing.expectEqualStrings("● Using\x1b[0m", text);
+            // A label too long for the row names nothing, so the call shows
+            // no row until it starts, rather than a bare "Using".
+            try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
+            try std.testing.expect(!statuses.has("toolbox_1"));
         }
     }
 }

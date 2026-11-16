@@ -10750,6 +10750,59 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP report turn sends the sign-in its first turn refreshed",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-report-refreshed-sign-in-");
+      const callId = "acp_refresh_child";
+      const route = (body: string) => {
+        if (!body.includes('"name":"subagent"')) return codexFinalText("child done");
+        if (body.includes("Subagent report (untrusted agent output")) return codexFinalText("ACP_REFRESHED_REPORT_TURN");
+        if (codexLatestToolResult(body)?.callId === callId) return codexFinalText("ACP_REFRESHED_PARENT_DONE");
+        return codexToolCall(callId, "subagent", {
+          request: { action: "message", agent: "helper", message: "Reply with the single word done." },
+        });
+      };
+      const gateway = startFakeGateway([]);
+      // The first request's 401 refreshes the login, which the server
+      // publishes while the turn still runs.
+      const codex = startAcpFakeCodex({ unauthorizedResponses: 1, route });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_TEST_CHATGPT_TOKEN_URL: codex.tokenUrl,
+          },
+        });
+        await startAutoSession(client);
+        await client.request("session/set_config_option", { configId: "provider", value: "codex" }, 4);
+
+        const result = await runPrompt(client, "Delegate one reply.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_REFRESHED_REPORT_TURN");
+        expect(codex.tokenRequests).toHaveLength(1);
+        const parent = codex.requests.filter((request) => request.body.includes('"name":"subagent"'));
+        expect(parent[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
+        const report = parent.find((request) => request.body.includes("Subagent report (untrusted agent output"));
+        expect(report?.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        for (const request of parent.slice(1)) {
+          expect(request.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        codex.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP's wait says a report starts the next turn, since an ACP report never joins a running turn",
     async () => {
       const root = createIsolatedRoot("fx-acp-subagent-wait-");
