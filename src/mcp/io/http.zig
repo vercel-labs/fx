@@ -423,7 +423,7 @@ pub const Client = struct {
             .extra_headers = headers,
             .redirect_behavior = .unhandled,
         }, body)) orelse return .{ .how = .broken };
-        defer req.deinit();
+        defer endRequest(&req);
         var response = req.receiveHead(&.{}) catch return .{ .how = .broken };
         const status: u16 = @backingInt(response.head.status);
         // The head's bytes don't outlive reading the body.
@@ -599,7 +599,7 @@ pub const Client = struct {
             .extra_headers = headers,
             .redirect_behavior = .unhandled,
         }, body)) orelse return none;
-        defer req.deinit();
+        defer endRequest(&req);
         var response = req.receiveHead(&.{}) catch return none;
         var got: @FieldType(Posted, "fetched") = .{ .key = key, .status = @backingInt(response.head.status) };
         var challenge: std.ArrayList(u8) = .empty;
@@ -696,6 +696,17 @@ test {
     // Behavior is tested against real servers by the Bun driver and the
     // conformance suite; this makes sure every declaration compiles.
     std.testing.refAllDecls(Client);
+}
+
+/// Ends `req`, closing its connection when it sent a body and its answer was
+/// never read. `std.http` reads such an answer to its end to keep the
+/// connection, and one without a length runs until the server closes it, so
+/// that read could wait forever; Zig 0.17.0 closed the connection instead.
+fn endRequest(req: *std.http.Client.Request) void {
+    if (req.method.requestHasBody() and req.reader.state == .received_head) {
+        if (req.connection) |connection| connection.closing = true;
+    }
+    req.deinit();
 }
 
 fn now(io: Io) i64 {
@@ -829,6 +840,44 @@ test "an answer over max_message ends too_large, not broken, in a JSON body and 
             else => {},
         };
     }
+}
+
+/// Answers one request on `server` with a 202 that has no length, then holds
+/// the connection open until the client closes it.
+fn holdAfterAccepted(server: *Io.net.Server) !void {
+    const stream = try server.accept(testing.io);
+    defer stream.close(testing.io);
+    var in: [4096]u8 = undefined;
+    var r = stream.reader(testing.io, &in);
+    while ((try r.interface.takeDelimiterInclusive('\n')).len > 2) {}
+    var out: [256]u8 = undefined;
+    var w = stream.writer(testing.io, &out);
+    try w.interface.writeAll("HTTP/1.1 202 Accepted\r\n\r\n");
+    try w.interface.flush();
+    _ = r.interface.discardRemaining() catch {};
+}
+
+test "a request that leaves its answer unread ends at once while the server holds the connection open" {
+    // Without a length, the 202's body runs until the connection closes, so
+    // reading it to the end to keep the connection would wait on the server.
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var serving = try testing.io.concurrent(holdAfterAccepted, .{&server});
+    defer serving.cancel(testing.io) catch {};
+    var url: [64]u8 = undefined;
+    var c: Client = undefined;
+    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}) });
+    defer c.deinit();
+    try c.send(1, .post, "{}", &.{});
+    while (true) switch (try c.next(5_000)) {
+        .ended => |e| {
+            try testing.expectEqual(Ending.accepted, e.how);
+            break;
+        },
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
 }
 
 test "events past the budget all arrive, each once the one before it is taken" {

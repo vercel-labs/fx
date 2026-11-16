@@ -40,6 +40,7 @@ import {
   sharedRefresh,
   spawnSharedAsk,
   startSharedLoginWorld,
+  type SharedHoldResult,
   type SharedLoginWorld,
   type SharedProvider,
 } from "./shared-login-fakes";
@@ -1147,7 +1148,7 @@ test(
 
 const SHARED_TIMEOUT = 60_000;
 
-type SharedHold = (label: string, attempt: number) => Promise<void> | void;
+type SharedHold = (label: string, attempt: number) => Promise<SharedHoldResult> | SharedHoldResult;
 
 async function inSharedLogin(
   name: string,
@@ -1372,7 +1373,7 @@ test(
         } else if (label === "p1") {
           // p1's retry, sent after it saved the refreshed login, never gets an answer.
           await killed;
-          throw new Error("p1 was killed");
+          return "drop";
         }
       };
       world.revoke(0);
@@ -1562,8 +1563,9 @@ for (const provider of ["codex", "grok"] as const) {
             await bothSent();
             if (label === "p2") await killed;
           } else if (label === "p1") {
+            // p1's retry, sent after it saved the refreshed login, never gets an answer.
             await killed;
-            throw new Error("p1 was killed");
+            return "drop";
           }
         };
         world.revoke(0);

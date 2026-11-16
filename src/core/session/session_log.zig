@@ -1867,7 +1867,7 @@ fn restoreExecutionResultBodies(
             if (capability.* == null) {
                 const path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
                 defer alloc.free(path);
-                capability.* = try session_child_store.SessionChildCapability.init(alloc, dir.dir, path, .read_only);
+                capability.* = try session_child_store.SessionChildCapability.initOlderReadOnly(alloc, dir.dir, path);
             }
             break :blk result_store.readForReplayManaged(alloc, &capability.*.?, handle, result.stored_output_bytes) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
