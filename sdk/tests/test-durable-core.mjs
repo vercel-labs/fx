@@ -7,7 +7,7 @@
 //
 // LIBFX_TEST_ONLY=<part of a name> runs only the tests whose names contain it.
 import { strict as assert } from "node:assert";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, extendLogView, foldSessionLog, handoffEntries, memory, wakeHandler } from "../durable.js";
@@ -417,28 +417,71 @@ if (durabilityKind === "local") {
     },
   });
 
+  // `durability`, with each World's start counted, and taking a while, so
+  // starts that overlap show.
+  const countingWorldStarts = (durability, starts) => wrappingWorldStart(durability, async (start) => {
+    starts.count += 1;
+    starts.running += 1;
+    starts.most = Math.max(starts.most, starts.running);
+    try {
+      await sleep(20);
+      return await start();
+    } finally {
+      starts.running -= 1;
+    }
+  });
+
   // world-local fails a start that reads its data folder's version file
   // while another start is writing it.
   test("agents that start their Worlds on one store at once start them one at a time", async () => {
     const starts = { count: 0, running: 0, most: 0 };
-    const durability = wrappingWorldStart(await durabilityFor(), async (start) => {
-      starts.count += 1;
-      starts.running += 1;
-      starts.most = Math.max(starts.most, starts.running);
-      try {
-        // A start that takes a while, so starts that overlap show.
-        await sleep(20);
-        return await start();
-      } finally {
-        starts.running -= 1;
-      }
-    });
+    const durability = countingWorldStarts(await durabilityFor(), starts);
     const names = ["support", "coding", "billing", "ops"];
     const agents = names.map((name) => createTaggedAgent({ durability, name, tag: name }));
     const results = await Promise.all(agents.map((agent, index) => textOf(agent.session().prompt(`w${index}`))));
     results.forEach(({ text }, index) => assert.equal(text, `w${index}-0 w${index}-1 w${index}-2`));
     assert.deepEqual([starts.count, starts.most], [names.length, 1], "each agent started its World, one at a time");
     for (const agent of agents) await agent.close();
+  });
+
+  test("Worlds on one folder named through a symlink start one at a time", async () => {
+    const real = await mkdtemp(join(tmpdir(), "libfx-core-real-"));
+    const link = `${real}-link`;
+    await symlink(real, link);
+    dirs.push(real, link);
+    // The folder itself does not exist yet: the first start creates it.
+    const starts = { count: 0, running: 0, most: 0 };
+    const agents = [join(real, "sessions"), join(link, "sessions")].map((dir, index) => createTaggedAgent({
+      durability: countingWorldStarts(local({ dir }), starts),
+      name: `folder-${index}`,
+      tag: `folder-${index}`,
+    }));
+    const results = await Promise.all(agents.map((agent, index) => textOf(agent.session().prompt(`f${index}`))));
+    results.forEach(({ text }, index) => assert.equal(text, `f${index}-0 f${index}-1 f${index}-2`));
+    assert.deepEqual([starts.count, starts.most], [2, 1], "the two Worlds of one folder started one at a time");
+    for (const agent of agents) await agent.close();
+  });
+
+  // A World an app creates through world() may connect to a service at its
+  // start, with no time limit.
+  test("a World whose durability names no start turn starts while another start on its store hangs", async () => {
+    // local()'s own Worlds start in turn; this one is local() without that.
+    const { startTurnKey: _, ...durability } = await durabilityFor();
+    const hung = [];
+    const hanging = wrappingWorldStart(durability, (start, instance) => {
+      if (hung.length > 0) return start();
+      hung.push(instance);
+      return new Promise(() => {});
+    });
+    const agents = ["support", "coding"].map((name) => createTaggedAgent({ durability: hanging, name, tag: name }));
+    const ids = agents.map((agent) => agent.newSessionId());
+    const first = await Promise.race([Promise.any(ids.map((id, index) => id.then(() => index))), sleep(3000).then(() => null)]);
+    assert.notEqual(first, null, "an agent started its World within 3 s");
+    const { text } = await textOf(agents[first].session().prompt("after"));
+    assert.equal(text, "after-0 after-1 after-2");
+    await agents[first].close();
+    // The other agent's World never starts, so its close never ends.
+    void agents[1 - first].close();
   });
 
   test("a World that fails to start leaves the next World on its store free to start", async () => {

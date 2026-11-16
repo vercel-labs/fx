@@ -945,19 +945,19 @@ function claimName(name, member) {
   }
 }
 
-// The start of the World libfx created last for each store in this process,
-// settled either way. libfx creates a World for each agent, and a World's
-// start may set up its store, which two starts at once can break:
-// world-local creates its data folder's version file and then writes it, so
-// a start that reads it between the two finds it empty and fails. Each start
-// waits for the one before it on its store.
+// The start libfx began last for each key in this process, settled either
+// way. libfx creates a World for each agent, and a durability whose Worlds'
+// starts break when two run at once on one store names that store with
+// `startTurnKey()`, as local() names its folder. Each such start waits for
+// the one before it with its key; every other World starts on its own, so a
+// start that never settles holds only its own agent.
 const worldStarts = new Map();
-function startInTurn(store, start) {
-  const started = (worldStarts.get(store) ?? Promise.resolve()).then(start);
+function startInTurn(key, start) {
+  const started = (worldStarts.get(key) ?? Promise.resolve()).then(start);
   const settled = started.then(() => {}, () => {});
-  worldStarts.set(store, settled);
+  worldStarts.set(key, settled);
   void settled.then(() => {
-    if (worldStarts.get(store) === settled) worldStarts.delete(store);
+    if (worldStarts.get(key) === settled) worldStarts.delete(key);
   });
   return started;
 }
@@ -1071,7 +1071,10 @@ function createWorldBackend(world, durability) {
       else liveHolders.delete(holder);
     },
     async start() {
-      if (owned && typeof world.start === "function") await startInTurn(store, () => world.start());
+      if (owned && typeof world.start === "function") {
+        if (typeof durability.startTurnKey === "function") await startInTurn(await durability.startTurnKey(), () => world.start());
+        else await world.start();
+      }
       if (typeof world.getRuntimeDeadline === "function") {
         backend.deadline = () => backend.runtimeDeadline ?? null;
       }
