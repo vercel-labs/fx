@@ -1346,7 +1346,8 @@ pub const Runtime = struct {
                 // refresh or a retry that 401 started is still pending), else kept with a note. So a
                 // retry the server would accept, still waiting at this deadline, is refused too: the
                 // engine keeps the first 401 until a request carrying the token is answered, and fx
-                // saves no login the server has not accepted. The person can sign in again.
+                // saves no login the server refused and has not accepted since. The person can sign
+                // in again.
                 debug_trace.logf("mcp", "MCP login check ended server={s} reason=no answer in time", .{name});
                 r.checkFailed(l.server) catch |err| {
                     debug_trace.logf("mcp", "MCP login not concluded server={s} err={s}", .{ name, @errorName(err) });
