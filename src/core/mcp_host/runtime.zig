@@ -20,6 +20,7 @@ const url_opener = @import("../hosts/url_opener.zig");
 const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
+const kept_sign_outs = @import("kept_sign_outs.zig");
 const login_words = @import("login_words.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
@@ -125,6 +126,9 @@ pub const Logout = struct {
     /// signed out, but every other fx, and the next one, still has it.
     kept: ?anyerror = null,
     revocation: Revocation = .none,
+    /// An `.unconfirmed` revocation is kept, and fx sends it again later
+    /// (`kept_sign_outs.zig`).
+    retry_later: bool = false,
 
     /// What the server did with the login's tokens.
     pub const Revocation = enum {
@@ -134,8 +138,8 @@ pub const Logout = struct {
         /// The server answered the revocation with a 2xx, so the tokens no
         /// longer work there (RFC 7009 section 2.2).
         confirmed,
-        /// It answered otherwise, or not within `revoke_wait_ms`: the tokens
-        /// may still work there.
+        /// It answered otherwise, not within `revoke_wait_ms`, or the
+        /// request couldn't be sent: the tokens may still work there.
         unconfirmed,
     };
 };
@@ -240,6 +244,17 @@ pub const Error = Allocator.Error || error{
     CallbackPortInUse,
 };
 
+/// A logout waiting for its revocation's answer.
+const PendingLogout = struct {
+    server: usize,
+    request: *Request,
+    deadline_ms: i64,
+    /// The kept sign-out whose revocation this waits for, owned by the
+    /// runtime's allocator: forgotten once the server confirms it, else it
+    /// stays kept for a later retry (`kept_sign_outs.zig`).
+    kept_token: ?[]u8 = null,
+};
+
 const Request = struct {
     observation: ?observation.McpCall = null,
     kind: Kind,
@@ -264,6 +279,8 @@ const Request = struct {
     /// Set by the owner before a logout ends: what the server did with the
     /// revocation.
     logout_revocation: Logout.Revocation = .none,
+    /// Set by the owner before a logout ends: its `Logout.retry_later`.
+    logout_retry_later: bool = false,
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
@@ -476,7 +493,7 @@ pub const Runtime = struct {
     /// Calls held for their URLs after a -32042 answer.
     held: std.ArrayList(*Request) = .empty,
     /// Logouts waiting for their revocation's answer.
-    logouts: std.ArrayList(struct { server: usize, request: *Request, deadline_ms: i64 }) = .empty,
+    logouts: std.ArrayList(PendingLogout) = .empty,
     refreshes: std.ArrayList(Refresh) = .empty,
     /// Finished requests, woken only once the snapshot that follows them is
     /// published, so a caller never reads a status older than its result.
@@ -588,6 +605,7 @@ pub const Runtime = struct {
         r.calls.deinit(r.gpa);
         r.tool_waiters.deinit(r.gpa);
         r.logins.deinit(r.gpa);
+        for (r.logouts.items) |l| if (l.kept_token) |token| secret.zeroAndFree(r.gpa, token);
         r.logouts.deinit(r.gpa);
         r.refreshes.deinit(r.gpa);
         for (r.url_questions.items) |q| r.gpa.free(q.id);
@@ -767,7 +785,7 @@ pub const Runtime = struct {
     pub fn logout(r: *Runtime, server: []const u8) Error!Logout {
         var req: Request = .{ .kind = .{ .logout = server }, .alloc = r.gpa };
         try r.submitOk(&req);
-        return .{ .kept = req.logout_kept, .revocation = req.logout_revocation };
+        return .{ .kept = req.logout_kept, .revocation = req.logout_revocation, .retry_later = req.logout_retry_later };
     }
 
     /// Every server that needs a login takes one saved since by another fx,
@@ -1022,10 +1040,11 @@ pub const Runtime = struct {
                     r.finish(target, .{ .failed = error.Cancelled });
                     break;
                 };
-                // A logout is done locally; only the wait for the revocation stops.
+                // A logout is done locally; only the wait for the revocation
+                // stops, and its sign-out stays kept.
                 for (r.logouts.items, 0..) |l, k| if (l.request == target) {
                     _ = r.logouts.swapRemove(k);
-                    r.finish(target, .ok);
+                    r.endLogout(l, false);
                     break;
                 };
                 r.finish(req, .ok);
@@ -1118,19 +1137,35 @@ pub const Runtime = struct {
                     },
                 };
                 defer if (saved) |c| secret.zeroAndFree(r.gpa, c);
+                // Each revocation is kept before the saved login goes, so one
+                // the server never confirms is sent again later
+                // (`kept_sign_outs.zig`).
+                var held_token = try r.keepHeldSignOut(i);
+                defer if (held_token) |t| secret.zeroAndFree(r.gpa, t);
+                const revokes_saved = if (saved) |c| !r.holds(i, c) else false;
+                var saved_token = if (revokes_saved) r.keepSignOut(saved.?, s.url.?) else null;
+                defer if (saved_token) |t| secret.zeroAndFree(r.gpa, t);
                 // The saved login goes first: a store that can't be read leaves
                 // the session signed in rather than half signed out.
                 if (r.options.credentials.store.remove(r.gpa, s.credentialKey())) |_| {} else |err| switch (err) {
-                    error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
+                    error.CredentialStoreUnreadable => {
+                        // Nothing is revoked, so nothing stays kept.
+                        if (held_token) |t| kept_sign_outs.forget(r.gpa, r.options.credentials.store, t);
+                        if (saved_token) |t| kept_sign_outs.forget(r.gpa, r.options.credentials.store, t);
+                        return r.finish(req, .{ .failed = error.CredentialStoreUnreadable });
+                    },
                     else => {
                         debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
                         req.logout_kept = err;
                     },
                 }
                 try r.engine.signOut(s.name);
-                if (saved) |c| if (!r.holds(i, c) and try r.engine.adoptCredential(s.name, c)) {
+                // The engine waits for its latest revocation only.
+                var last = &held_token;
+                if (saved) |c| if (revokes_saved and try r.engine.adoptCredential(s.name, c)) {
                     debug_trace.logf("mcp", "MCP logout also revokes server={s} reason=another fx saved a newer login", .{s.name});
                     try r.engine.signOut(s.name);
+                    last = &saved_token;
                 };
                 // A new login that waits for its check request goes with the logout: its tokens
                 // are gone, so the answer would have nothing to save, and "Signed in" would follow
@@ -1144,9 +1179,17 @@ pub const Runtime = struct {
                 // A program that exits next would lose a revocation still on
                 // its way, so the logout ends when it's answered. Until then,
                 // whether it worked isn't known.
-                if (!r.engine.revoking(s.name)) return r.finish(req, .ok);
+                if (!r.engine.revoking(s.name)) {
+                    // A kept revocation that isn't on its way couldn't be sent.
+                    if (last.* != null) {
+                        req.logout_revocation = .unconfirmed;
+                        req.logout_retry_later = true;
+                    }
+                    return r.finish(req, .ok);
+                }
                 req.logout_revocation = .unconfirmed;
-                try r.logouts.append(r.gpa, .{ .server = i, .request = req, .deadline_ms = r.nowMs() + revoke_wait_ms });
+                try r.logouts.append(r.gpa, .{ .server = i, .request = req, .deadline_ms = r.nowMs() + revoke_wait_ms, .kept_token = last.* });
+                last.* = null;
             },
         }
     }
@@ -1368,11 +1411,21 @@ pub const Runtime = struct {
                 continue;
             }
             _ = r.logouts.swapRemove(k);
-            if (r.engine.revocationAnswer(r.resolved.servers[l.server].name)) |status| {
-                if (status >= 200 and status < 300) l.request.logout_revocation = .confirmed;
-            }
-            r.finish(l.request, .ok);
+            const confirmed = if (r.engine.revocationAnswer(r.resolved.servers[l.server].name)) |status| status >= 200 and status < 300 else false;
+            r.endLogout(l, confirmed);
         }
+    }
+
+    /// Ends a logout that waited for its revocation. A confirmed one forgets
+    /// its kept sign-out; any other leaves it kept to send again later.
+    fn endLogout(r: *Runtime, l: PendingLogout, confirmed: bool) void {
+        if (confirmed) l.request.logout_revocation = .confirmed;
+        if (l.kept_token) |token| {
+            if (confirmed) kept_sign_outs.forget(r.gpa, r.options.credentials.store, token);
+            l.request.logout_retry_later = !confirmed;
+            secret.zeroAndFree(r.gpa, token);
+        }
+        r.finish(l.request, .ok);
     }
 
     fn onEvent(r: *Runtime, event: engine.Event) !void {
@@ -1987,7 +2040,7 @@ pub const Runtime = struct {
                 continue;
             }
             _ = r.logouts.swapRemove(k);
-            r.finish(l.request, .ok);
+            r.endLogout(l, false);
         }
         r.endRefresh(i);
         k = 0;
@@ -2087,7 +2140,7 @@ pub const Runtime = struct {
         r.required.clearRetainingCapacity();
         for (r.tool_waiters.items) |w| r.finish(w.request, .{ .failed = error.Stopped });
         r.tool_waiters.clearRetainingCapacity();
-        for (r.logouts.items) |l| r.finish(l.request, .ok);
+        for (r.logouts.items) |l| r.endLogout(l, false);
         r.logouts.clearRetainingCapacity();
         for (r.refreshes.items) |*f| if (f.lock) |*l| l.release();
         r.refreshes.clearRetainingCapacity();
@@ -2424,6 +2477,42 @@ pub const Runtime = struct {
     fn sendRefresh(r: *Runtime, f: *Refresh) !void {
         if (f.lock) |*l| l.restamp();
         try r.engine.refresh(r.resolved.servers[f.server].name);
+    }
+
+    /// Keeps the sign-out of the login server `i` holds now, which its next
+    /// `signOut` revokes. Returns the kept token, owned, or null when nothing
+    /// was kept.
+    fn keepHeldSignOut(r: *Runtime, i: usize) !?[]u8 {
+        const s = r.resolved.servers[i];
+        var out: std.Io.Writer.Allocating = .init(r.gpa);
+        defer {
+            std.crypto.secureZero(u8, out.writer.buffer);
+            out.deinit();
+        }
+        if (!try r.engine.writeSignOutCredential(s.name, &out.writer)) return null;
+        return r.keepSignOut(out.written(), s.url.?);
+    }
+
+    /// Keeps the sign-out of `saved`, a login of the server at `url`, before
+    /// its revocation is sent. Returns the kept token, owned, or null when
+    /// it revokes nothing or wasn't kept; the debug trace says why.
+    fn keepSignOut(r: *Runtime, saved: []const u8, url: []const u8) ?[]u8 {
+        var arena: std.heap.ArenaAllocator = .init(r.gpa);
+        defer arena.deinit();
+        const found = kept_sign_outs.tokensOf(arena.allocator(), saved, url) catch |err| {
+            debug_trace.logf("mcp", "MCP sign-out not kept err={s}", .{@errorName(err)});
+            return null;
+        };
+        const tokens = found orelse {
+            debug_trace.logf("mcp", "MCP sign-out not kept reason=its login has no revocation endpoint fx may use", .{});
+            return null;
+        };
+        if (!kept_sign_outs.keep(r.gpa, r.options.credentials.store, tokens)) return null;
+        return r.gpa.dupe(u8, tokens.refresh_token) catch {
+            // It stays kept, and a later retry revokes it.
+            debug_trace.logf("mcp", "MCP kept sign-out not tracked reason=out of memory", .{});
+            return null;
+        };
     }
 
     /// Whether `saved` is the login server `i` last saved or took.
