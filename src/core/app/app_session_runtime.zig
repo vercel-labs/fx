@@ -2103,11 +2103,23 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null);
         }
 
+        /// Tells the agent's worker that a finished turn is committed, or
+        /// failed to commit, so mail held for it may start the next turn
+        /// (`WorkerRuntime.acknowledgeFinishCommitted`).
+        fn acknowledgeFinishCommitted(agent: *AppAgent) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommitted"))
+            {
+                agent.worker.acknowledgeFinishCommitted();
+            }
+        }
+
         pub fn appendFinishedPrompt(
             app: *App,
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            defer acknowledgeFinishCommitted(agent);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
@@ -2143,13 +2155,17 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !HistoryAppendOutcome {
-            return appendHistoryTurnWithPendingPresentation(
+            const outcome = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
             );
+            // An uncommitted turn stays with the pacer, which commits it later
+            // through `appendFinishedPrompt`.
+            if (outcome == .committed) acknowledgeFinishCommitted(agent);
+            return outcome;
         }
 
         const AppendHistoryMode = enum {

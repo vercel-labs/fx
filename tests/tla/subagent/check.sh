@@ -90,8 +90,18 @@
 #   lost-at-finish       a finished turn drops the mail left for it    NoneLost
 #   close-with-mail      a final boundary closes with mail unread      JoinsOpenTurn
 #
+# main-mail-commit.cfg is the design where the host commits a finished turn
+# in a step of its own, as the app's main loop does: mail that missed the
+# turn waits for the commit (the worker's commit gate) unless the gate
+# gives up, and the gate never waits for a commit that is not coming. Two
+# more planted defects, each caught by the rule named for it:
+#
+#   no-gate              the next turn starts before the commit              CommitBeforeNextTurn
+#   stuck-gate           a commit leaves the gate's count as it was          GateNeverStuck
+#
 # tests/tla/drivers/subagent/main-mail.test.ts checks runs of the built fx
-# against it (MainMailTrace.tla).
+# against it (MainMailTrace.tla) where turns commit as they finish, as in
+# fx ask and ACP.
 
 set -eu
 
@@ -135,6 +145,9 @@ MainMail main-mail-today-acp WaitHonest
 MainMail main-mail-mutation-wait-always-follows WaitHonest
 MainMail main-mail-mutation-lost-at-finish NoneLost
 MainMail main-mail-mutation-close-with-mail JoinsOpenTurn
+MainMail main-mail-commit -
+MainMail main-mail-mutation-no-gate CommitBeforeNextTurn
+MainMail main-mail-mutation-stuck-gate GateNeverStuck
 QuietRelay quiet-relay -
 QuietRelay quiet-relay-deep -
 QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell
