@@ -103,15 +103,16 @@
 //!   that work failed, `model`, `effort`, `title` (masked), `status`
 //!   (masked), its status row, such as a failed request that waits for the
 //!   user, `task` (masked), the start of its newest retained turn's prompt:
-//!   at most 240 bytes, without the end of a word that cut would split (its
-//!   ASCII bytes, or the whole word when it holds `://`), and left out when
-//!   none of it is kept, and `task_bytes`, that prompt's whole length,
+//!   at most 240 bytes, without part of a secret that cut would split, and
+//!   left out when none of it is kept, and `task_bytes`, that prompt's whole
+//!   length,
 //!   `turns_retained`,
 //!   `turns_omitted`, and `tool_calls` {`retained`, `not_succeeded`}, its
 //!   calls in the tool-call window. A subagent that is not open has only
 //!   `open`, `session_id`, and the fields from `task` on. Masked text is cut
 //!   at 400 bytes; a cut `last_reason`, `title`, or `status` comes with
-//!   `<name>_bytes`, its whole masked length.
+//!   `<name>_bytes`, its whole masked length. A secret that a display cut
+//!   short and marked with `...` or `…` is masked too.
 //!   After each `subagent` comes a `subagent_turn` for each of its newest 8
 //!   retained turns, newest first: `session_id`, `source` with the
 //!   `subagent_id` that the turn's `tool_call`, `network_call`, and
@@ -393,7 +394,7 @@ const Records = struct {
 
     /// Text with obvious secrets replaced by `[redacted]`.
     fn masked(self: *Records, name: []const u8, value: []const u8) !void {
-        try self.text(name, try text_utils.maskSecrets(self.arena, value));
+        try self.text(name, try text_utils.maskSecretsCutShort(self.arena, value));
     }
 
     /// Text that is left out when it is empty.
@@ -1243,7 +1244,7 @@ fn endSubagentRecord(r: *Records, input: SubagentsInput, session_id: []const u8)
 /// nothing when it is empty.
 fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) !void {
     if (value.len == 0) return;
-    const masked = try text_utils.maskSecrets(r.arena, value);
+    const masked = try text_utils.maskSecretsCutShort(r.arena, value);
     const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
     try r.text(name, kept);
     if (kept.len < masked.len) try r.number(name ++ "_bytes", masked.len);
@@ -1251,12 +1252,11 @@ fn writeSubagentText(r: *Records, comptime name: []const u8, value: []const u8) 
 
 /// `value` with secrets masked, cut to `subagent_text_max_bytes` on a UTF-8
 /// boundary. Masking comes first, so this cut never splits a secret the mask
-/// would have found. A task comes already cut from the turn ring, which
-/// leaves out the end of the word its own cut splits
-/// (`subagent_turn_metrics.keptPrompt`), so no part of a secret that cut
-/// shortened reaches the mask.
+/// would have found. A task comes already cut from the turn ring, which keeps
+/// no part of a secret its cut splits (`text_utils.secretSafePrefixLen`), so
+/// no part of a secret that cut shortened reaches the mask.
 fn maskedSubagentText(r: *Records, value: []const u8) ![]const u8 {
-    return text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(r.arena, value), subagent_text_max_bytes);
+    return text_utils.utf8PrefixByBytes(try text_utils.maskSecretsCutShort(r.arena, value), subagent_text_max_bytes);
 }
 
 fn findTraceChild(registry: []const subagent_tool_host.Runtime.TraceChild, id: []const u8) ?*const subagent_tool_host.Runtime.TraceChild {
@@ -1736,7 +1736,7 @@ fn writeToolPayload(r: *Records, comptime name: []const u8, body: []const u8, bo
     if (total_bytes == 0) return;
     // The ring cuts at a byte count; a character it cut in two is left out.
     const kept = if (total_bytes > body_len) withoutCutCharacter(body) else body;
-    const masked = try text_utils.maskSecrets(r.arena, std.mem.trim(u8, kept, " \t\r\n"));
+    const masked = try text_utils.maskSecretsCutShort(r.arena, std.mem.trim(u8, kept, " \t\r\n"));
     const trimmed = std.mem.trim(u8, masked, " \t\r\n");
     if (trimmed.len == 0) return;
     try r.text(name, trimmed);
@@ -1760,7 +1760,7 @@ fn withoutCutCharacter(text: []const u8) []const u8 {
 
 fn writeToolResultPreview(r: *Records, body: []const u8, total_bytes: u32) !void {
     if (total_bytes == 0) return;
-    const masked = try text_utils.maskSecrets(r.arena, std.mem.trim(u8, body, " \t\r\n"));
+    const masked = try text_utils.maskSecretsCutShort(r.arena, std.mem.trim(u8, body, " \t\r\n"));
     const trimmed = std.mem.trim(u8, masked, " \t\r\n");
     if (trimmed.len == 0) return;
     try r.text("result_preview", text_utils.utf8PrefixByBytes(firstUsefulPreviewLine(trimmed), result_preview_max_bytes));
@@ -1866,7 +1866,7 @@ const skills_shown_max: usize = 400;
 /// `text` with secrets masked, cut to `setup_line_max_bytes` on a UTF-8
 /// boundary, and ending in its full size when it was cut.
 fn setupLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    const masked = try text_utils.maskSecrets(arena, text);
+    const masked = try text_utils.maskSecretsCutShort(arena, text);
     const kept = text_utils.utf8PrefixByBytes(masked, setup_line_max_bytes);
     if (kept.len == masked.len) return masked;
     return arena.print("{s} ... ({d} bytes)", .{ kept, masked.len });
@@ -2322,7 +2322,7 @@ fn timelineText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
         if (trimmed.len == 0) continue;
         if (isBannerNoiseLine(trimmed)) continue;
         if (out.items.len > 0) try out.append(arena, '\n');
-        try out.appendSlice(arena, try text_utils.maskSecrets(arena, trimmed));
+        try out.appendSlice(arena, try text_utils.maskSecretsCutShort(arena, trimmed));
     }
     return out.items;
 }
@@ -2396,7 +2396,7 @@ fn writeTraceLog(r: *Records, path: []const u8) !void {
     try r.end();
     for (lines.items[start..]) |line| {
         try r.begin("trace_log_line");
-        try r.text("text", try neutralized(r.arena, try text_utils.maskSecrets(r.arena, line)));
+        try r.text("text", try neutralized(r.arena, try text_utils.maskSecretsCutShort(r.arena, line)));
         try r.end();
     }
 }
@@ -3684,7 +3684,7 @@ fn checkSubagentText(fuzzed: []const u8) !void {
                 try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, name), try testString(record, field));
             }
         }
-        const masked = try text_utils.maskSecrets(ta, text);
+        const masked = try text_utils.maskSecretsCutShort(ta, text);
         const kept = text_utils.utf8PrefixByBytes(masked, subagent_text_max_bytes);
         inline for (.{ "last_reason", "title", "status" }) |field| {
             try std.testing.expectEqualStrings(try text_utils.dupeValidUtf8(ta, kept), try testString(record, field));
@@ -3692,7 +3692,7 @@ fn checkSubagentText(fuzzed: []const u8) !void {
                 try std.testing.expectEqual(@as(i64, @intCast(masked.len)), try testInt(record, field ++ "_bytes"));
             } else try expectAbsent(record, field ++ "_bytes");
         }
-        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecrets(ta, turn.prompt()), subagent_text_max_bytes);
+        const task = text_utils.utf8PrefixByBytes(try text_utils.maskSecretsCutShort(ta, turn.prompt()), subagent_text_max_bytes);
         if (task.len == 0) {
             // The ring kept nothing, such as a first word that holds a URL.
             try expectAbsent(record, "task");
@@ -4517,10 +4517,16 @@ test "trace keeps a failed call whole in its own record after the window moves o
     try expectAbsent(failed, "args_omitted_bytes");
     try expectAbsent(failed, "args_tail");
     try expectStartsWith(try testString(failed, "result"), "no such dir \x1b[31mred\x1b[0m \\xff\nzzz");
-    try expectEndsWith(try testString(failed, "result_tail"), "zzz\nOUTPUT_TAIL_MARKER");
-    try std.testing.expectEqual(@as(i64, @intCast(output.len)), try testInt(failed, "result_bytes"));
+    // The tail starts inside the one long run of `z`, and a tail holds no
+    // part of a run its start splits, so it begins at the last line.
     const kept_bytes = @typeInfo(@FieldType(diagnostics.KeptText, "buf")).array.len;
-    try std.testing.expectEqual(@as(i64, @intCast(output.len - kept_bytes)), try testInt(failed, "result_omitted_bytes"));
+    const result_tail = try testString(failed, "result_tail");
+    try std.testing.expectEqualStrings("\nOUTPUT_TAIL_MARKER", result_tail);
+    try std.testing.expectEqual(@as(i64, @intCast(output.len)), try testInt(failed, "result_bytes"));
+    try std.testing.expectEqual(
+        @as(i64, @intCast(output.len - kept_bytes / 2 - result_tail.len)),
+        try testInt(failed, "result_omitted_bytes"),
+    );
 
     // The window has moved past the failed call.
     try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, trace.count("tool_call"));
@@ -5388,7 +5394,7 @@ fn checkTextRoundTrip(input: []const u8) !void {
     const plain = try text_utils.dupeValidUtf8(a, input);
     try std.testing.expectEqualStrings(plain, try testString(record, "plain"));
     try std.testing.expectEqualStrings(plain, record.get("items").?.array.items[0].string);
-    const masked = try text_utils.dupeValidUtf8(a, try text_utils.maskSecrets(a, input));
+    const masked = try text_utils.dupeValidUtf8(a, try text_utils.maskSecretsCutShort(a, input));
     try std.testing.expectEqualStrings(masked, try testString(record, "masked"));
     const neutral = try testString(record, "neutral");
     try std.testing.expect(std.mem.count(u8, neutral, "web_search") >= std.mem.count(u8, input, "web_search"));
