@@ -17,6 +17,7 @@ const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_contracts = @import("tool_contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
+const turn_event = @import("turn_event.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -165,13 +166,8 @@ pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
 
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
 /// duration of the callback.
-pub const TextEmission = union(enum) {
-    assistant_started,
-    assistant_source: []const u8,
-    assistant_rendered: []const u8,
-    assistant_restarted: []const u8,
-    operational: []const u8,
-};
+pub const TextEmission = turn_event.TextEmission;
+pub const TurnEvent = turn_event.TurnEvent;
 
 /// Accent colors for diff add/remove markers. Named fields so the two styles
 /// cannot be swapped silently at a call site. Empty means the neutral accent.
@@ -292,6 +288,10 @@ pub const AgentRuntimeDeps = struct {
     /// Another process may have taken the session over.
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
+    /// The one sink for every `TurnEvent`, which the event is lent to. Null
+    /// while a front end still sets the `push_*` sinks below; `emit` then
+    /// forwards each event to the sink it replaces.
+    emit_event: ?*const fn (ctx: *anyopaque, event: TurnEvent) anyerror!void = null,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
     push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
@@ -344,6 +344,41 @@ pub const AgentRuntimeDeps = struct {
     // Captured by value at construction; that is safe only while the marker
     // colors never change after startup (they are theme-independent).
     diff_marker_styles: DiffMarkerStyles = .{},
+
+    /// Tells the front end about the running turn. The event is lent: its
+    /// payload is valid only during the call, and the caller frees what it
+    /// allocated once `emit` returns.
+    pub fn emit(self: *const AgentRuntimeDeps, event: TurnEvent) !void {
+        if (self.emit_event) |emit_fn| return emit_fn(self.ctx, event);
+        return self.forwardToSinks(event);
+    }
+
+    /// For a front end that still sets the `push_*` sinks: each event goes to
+    /// the sink it replaces, as the loop called it before. `push_event` and
+    /// `push_diff_block` free what they get, so they get a copy.
+    fn forwardToSinks(self: *const AgentRuntimeDeps, event: TurnEvent) !void {
+        switch (event) {
+            .worker => |worker| switch (worker) {
+                .tool_lifecycle => |lifecycle| return self.push_tool_lifecycle(self.ctx, lifecycle),
+                .diff_block => {
+                    const copy = try worker_runtime.dupeWorkerEvent(std.heap.c_allocator, worker);
+                    return self.push_diff_block(self.ctx, copy.diff_block);
+                },
+                .route_recovery_status => |status| return self.push_route_recovery_status(self.ctx, status),
+                .command_output_complete => |id| return self.push_command_output_complete(self.ctx, id),
+                else => return self.push_event(self.ctx, try worker_runtime.dupeWorkerEvent(std.heap.c_allocator, worker)),
+            },
+            .text => |emission| return self.push_text(self.ctx, emission),
+            .reasoning_delta => |delta| if (self.push_reasoning_delta) |push| return push(self.ctx, delta),
+            .notice => |notice| {
+                if (notice.semantic) |semantic| if (self.push_interactive_notice) |push| return push(self.ctx, semantic);
+                if (notice.plain) |text| return self.push_system_notice(self.ctx, text);
+            },
+            .context_notice => |text| return self.pushContextNotice(text),
+            .session_notice => |text| if (self.push_session_notice) |push| return push(self.ctx, text),
+            .http_error => |failure| return self.push_http_error(self.ctx, failure.status, failure.detail, failure.credential_source),
+        }
+    }
 
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
