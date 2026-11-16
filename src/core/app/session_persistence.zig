@@ -995,6 +995,17 @@ pub const TranscriptArchiveRead = struct {
         return task;
     }
 
+    /// Drops a finished read that started at another archive generation,
+    /// which a compaction, resume, drop, or clear made stale. Returns
+    /// whether it dropped one.
+    pub fn dropIfStale(self: *TranscriptArchiveRead, generation: u64) bool {
+        const task = self.completed() orelse return false;
+        if (task.request.generation == generation) return false;
+        debug_trace.logf("full_transcript_cache", "archive_read_dropped back={d} reason=stale turns={d}", .{ task.request.back, task.turns.items.len });
+        self.finish();
+        return true;
+    }
+
     /// Frees the finished read `completed` returned.
     pub fn finish(self: *TranscriptArchiveRead) void {
         const task = self.task orelse return;
@@ -1191,4 +1202,96 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_cache.ready);
     try std.testing.expect(persistence.resume_handoff_intent == .none);
+}
+
+/// A saved session with `turns` turns in one compaction cycle, for the
+/// Ctrl+O archive read tests.
+const ArchiveReadTestHome = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    store: session_adapter.Store,
+    session: *session_adapter.Session,
+    model: [1]u8 = "m".*,
+
+    fn init(self: *ArchiveReadTestHome, turns: usize) !void {
+        const alloc = std.testing.allocator;
+        self.* = .{ .tmp = std.testing.tmpDir(.{ .iterate = true }), .home = undefined, .store = undefined, .session = undefined };
+        errdefer self.tmp.cleanup();
+        self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        errdefer alloc.free(self.home);
+        self.store = try session_adapter.Store.open(alloc, self.home);
+        errdefer self.store.deinit(alloc);
+        self.session = try session_adapter.Session.create(alloc, &self.store, "/w", .ask, .{
+            .preferences = .{ .model = &self.model, .effort = .auto, .fast_mode = false },
+            .language = types.ConversationLanguage.default(),
+            .permission_state = .{},
+        });
+        errdefer self.session.close();
+        for (0..turns) |_| {
+            try self.session.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("question") },
+                .assistant = @constCast("answer"),
+            } }, types.ConversationLanguage.default());
+        }
+    }
+
+    fn deinit(self: *ArchiveReadTestHome) void {
+        self.session.close();
+        self.store.deinit(std.testing.allocator);
+        std.testing.allocator.free(self.home);
+        self.tmp.cleanup();
+    }
+
+    fn start(self: *ArchiveReadTestHome, read: *TranscriptArchiveRead, generation: u64) !void {
+        try read.start(try self.session.cycleReader(std.heap.c_allocator), .{ .back = 1, .start = null, .generation = generation });
+    }
+};
+
+fn waitForArchiveRead(read: *TranscriptArchiveRead) !*TranscriptArchiveRead.Task {
+    for (0..5000) |_| {
+        if (read.completed()) |task| return task;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestArchiveReadTimedOut;
+}
+
+test "a finished Ctrl+O archive read at an older generation is dropped, and one at the current generation stays" {
+    var home: ArchiveReadTestHome = undefined;
+    try home.init(2);
+    defer home.deinit();
+    var read: TranscriptArchiveRead = .{};
+    defer read.cancel();
+
+    try home.start(&read, 4);
+    const task = try waitForArchiveRead(&read);
+    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+    try std.testing.expectEqual(@as(usize, 2), task.turns.items.len);
+    // Still the transcript's generation: it waits for its replay.
+    try std.testing.expect(!read.dropIfStale(4));
+    try std.testing.expect(read.busy());
+    // A compaction, resume, drop, or clear since then: it goes.
+    try std.testing.expect(read.dropIfStale(5));
+    try std.testing.expect(!read.busy());
+    try std.testing.expect(!read.dropIfStale(5));
+}
+
+test "cancelling a running Ctrl+O archive read stops it, and the next read finishes whole" {
+    var home: ArchiveReadTestHome = undefined;
+    try home.init(300);
+    defer home.deinit();
+    var read: TranscriptArchiveRead = .{};
+    defer read.cancel();
+
+    // Cancelled right after it starts, mostly while it still reads.
+    try home.start(&read, 1);
+    read.cancel();
+    try std.testing.expect(!read.busy());
+    try std.testing.expect(read.completed() == null);
+
+    try home.start(&read, 1);
+    const task = try waitForArchiveRead(&read);
+    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+    try std.testing.expectEqual(@as(usize, 300), task.turns.items.len);
+    read.finish();
+    try std.testing.expect(!read.busy());
 }

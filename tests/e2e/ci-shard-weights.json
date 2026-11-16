@@ -17,7 +17,7 @@
   { "file": "file-tool-permissions.test.ts", "weight": 2 },
   { "file": "gateway-stream-lifecycle.test.ts", "weight": 98 },
   { "file": "host-managed-auth.test.ts", "weight": 2 },
-  { "file": "mcp-auth.test.ts", "weight": 86 },
+  { "file": "mcp-auth.test.ts", "weight": 173 },
   { "file": "mcp-http.test.ts", "weight": 8 },
   { "file": "mcp-legacy-remote.test.ts", "weight": 90 },
   { "file": "mcp-stdio.test.ts", "weight": 129 },

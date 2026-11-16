@@ -969,6 +969,16 @@ const StoryTally = struct {
         try list.append(scratch, value);
     }
 
+    /// Adds `value` once, as the newest: a value already there moves to the
+    /// end, so the list's order is the order of each value's latest call.
+    fn addLatest(list: *std.ArrayList([]const u8), scratch: std.mem.Allocator, value: []const u8) !void {
+        for (list.items, 0..) |existing, index| if (std.mem.eql(u8, existing, value)) {
+            _ = list.orderedRemove(index);
+            break;
+        };
+        try list.append(scratch, value);
+    }
+
     fn observe(
         self: *StoryTally,
         scratch: std.mem.Allocator,
@@ -1594,7 +1604,9 @@ fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: Transcrip
     };
 }
 
-/// The steps of a `.commands` row's calls, each once, in the order they ran.
+/// The steps of a `.commands` row's calls, each once where it last ran, in
+/// that order. The newest few show and the older ones are counted before
+/// them, so the last step is the newest call's, which may still run.
 fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const ToolDetailRecord) !ShortCommand {
     var all: std.ArrayList([]const u8) = .empty;
     for (records) |record| {
@@ -1602,14 +1614,14 @@ fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const Tool
         var steps: std.ArrayList([]const u8) = .empty;
         var raw_steps: usize = 0;
         if (try collectShortSteps(scratch, source, &steps, &raw_steps, 0) and steps.items.len > 0) {
-            for (steps.items) |step| try StoryTally.addDistinct(&all, scratch, step);
+            for (steps.items) |step| try StoryTally.addLatest(&all, scratch, step);
         } else {
             const first = std.mem.trim(u8, source, " \t\r\n");
-            if (first.len > 0) try StoryTally.addDistinct(&all, scratch, first[0 .. std.mem.findAny(u8, first, " \t\r\n") orelse first.len]);
+            if (first.len > 0) try StoryTally.addLatest(&all, scratch, first[0 .. std.mem.findAny(u8, first, " \t\r\n") orelse first.len]);
         }
     }
     const kept = @min(all.items.len, short_command_max_steps);
-    return .{ .steps = all.items[0..kept], .more = all.items.len - kept };
+    return .{ .steps = all.items[all.items.len - kept ..], .more = 0, .earlier = all.items.len - kept };
 }
 
 const link_close = "\x1b]8;;\x1b\\";
@@ -1834,11 +1846,12 @@ fn writeFileName(writer: *std.Io.Writer, path: []const u8) !void {
     if (link) try writer.writeAll(link_close);
 }
 
-/// The text of a row that names several files or patterns: its past verb, the
-/// names that fit in `cols` after the row's two-column connector, then how
-/// many did not, such as "Read a.zig, b.zig +3 more". At least one name
-/// shows; the row clips it when even that one is too wide, and keeps the
-/// count. Ctrl+O shows every call.
+/// The text of a row that names several files or patterns: its past verb,
+/// how many older names do not fit, then the newest names that fit in `cols`
+/// after the row's two-column connector, oldest first, such as
+/// "Read +3, c.zig, d.zig". The last name is the newest call's, which may
+/// still run. At least one name shows; the row clips it when even that one
+/// is too wide. Ctrl+O shows every call.
 fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) !StoryRowText {
     const is_read = row.identity.kind == .read;
     const tool = if (is_read) "read_file" else storySearchTool(row.identity.key);
@@ -1847,31 +1860,35 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
     const verb = if (is_read) "Read" else if (std.mem.eql(u8, tool, "glob_files")) "Matched" else "Searched";
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
+    const names = row.names.items;
+    const pieces = try scratch.alloc([]const u8, names.len);
+    for (names, pieces) |name, *piece| {
+        var text: std.Io.Writer.Allocating = .init(scratch);
+        if (is_read) try writeFileName(&text.writer, name) else try writeTerminalSafe(&text.writer, name);
+        piece.* = text.written();
+    }
+    // The most names, counted from the newest, whose row fits.
+    const head_width = verb.len + 1;
+    var shown: usize = 0;
+    var names_width: usize = 0;
+    while (shown < names.len) {
+        const piece_width = display_width.visibleWidthIgnoringAnsi(pieces[names.len - shown - 1]) + @as(usize, if (shown > 0) 2 else 0);
+        const left_out = names.len - shown - 1;
+        const count_width: usize = if (left_out == 0) 0 else display_width.visibleWidthIgnoringAnsi(try countNote(scratch, "+", left_out, ", "));
+        if (shown > 0 and head_width + count_width + names_width + piece_width > budget) break;
+        names_width += piece_width;
+        shown += 1;
+    }
+
     var body: std.Io.Writer.Allocating = .init(scratch);
     try body.writer.writeAll(verb);
     try body.writer.writeByte(' ');
-    const names = row.names.items;
-    var shown: usize = 0;
-    var width: usize = 0;
-    for (names) |name| {
-        var piece: std.Io.Writer.Allocating = .init(scratch);
-        if (shown > 0) try piece.writer.writeAll(", ");
-        if (is_read) try writeFileName(&piece.writer, name) else try writeTerminalSafe(&piece.writer, name);
-        if (shown == 0) width = display_width.visibleWidthIgnoringAnsi(body.written());
-        const piece_width = display_width.visibleWidthIgnoringAnsi(piece.written());
-        const rest = names.len - shown - 1;
-        const more_width: usize = if (rest == 0) 0 else display_width.visibleWidthIgnoringAnsi(try countNote(scratch, " +", rest, " more"));
-        if (shown > 0 and width + piece_width + more_width > budget) break;
-        try body.writer.writeAll(piece.written());
-        width += piece_width;
-        shown += 1;
+    if (shown < names.len) try writeCount(&body.writer, "+", names.len - shown, ", ");
+    for (pieces[names.len - shown ..], 0..) |piece, position| {
+        if (position > 0) try body.writer.writeAll(", ");
+        try body.writer.writeAll(piece);
     }
-    const suffix: []const u8 = if (shown < names.len) try countNote(scratch, " +", names.len - shown, " more") else "";
-    return .{
-        .display = try std.mem.concat(scratch, u8, &.{ body.written(), suffix }),
-        .body = body.written(),
-        .suffix = suffix,
-    };
+    return .{ .display = body.written(), .body = body.written(), .suffix = "" };
 }
 
 /// The key that joins searches for the same pattern with the same tool,
@@ -1888,7 +1905,7 @@ fn addSearchPath(scratch: std.mem.Allocator, row: *StoryRow, detail: ?*const Too
     const record = detail orelse return;
     const path = storyArgString(scratch, record, "path") orelse "";
     const trimmed = std.mem.trimEnd(u8, path, "/");
-    try StoryTally.addDistinct(&row.search_paths, scratch, if (trimmed.len == 0 and path.len > 0) "/" else trimmed);
+    try StoryTally.addLatest(&row.search_paths, scratch, if (trimmed.len == 0 and path.len > 0) "/" else trimmed);
 }
 
 /// How many leading parts two paths share, split at "/".
@@ -1923,18 +1940,19 @@ fn folderName(path: []const u8, shared: usize) []const u8 {
 }
 
 /// Names the folders of a search row by the part of each path that differs
-/// from the others, so "/w/reviews" and "/w/docs" are "reviews, docs". Up
-/// to three show, then "+N more". Every name is terminal-safe.
+/// from the others, so "/w/reviews" and "/w/docs" are "reviews, docs". The
+/// newest three show, after how many older ones do not, such as
+/// "+2, c, d, e". Every name is terminal-safe.
 fn searchFolderNames(scratch: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
     var shared: usize = std.math.maxInt(usize);
     for (paths[1..]) |path| shared = @min(shared, sharedPathParts(paths[0], path));
     var out: std.Io.Writer.Allocating = .init(scratch);
     const shown = @min(paths.len, short_command_max_steps);
-    for (paths[0..shown], 0..) |path, position| {
+    if (paths.len > shown) try writeCount(&out.writer, "+", paths.len - shown, ", ");
+    for (paths[paths.len - shown ..], 0..) |path, position| {
         if (position > 0) try out.writer.writeAll(", ");
         try writeTerminalSafe(&out.writer, folderName(path, shared));
     }
-    if (paths.len > shown) try writeCount(&out.writer, " +", paths.len - shown, " more");
     return out.written();
 }
 
@@ -2126,7 +2144,11 @@ fn collectStoryRows(
             // that still goes on, which is the one that started it.
             if (identity.kind == .session) if (sessionRunRow(rows.items, detail.?)) |run_row| {
                 // A row of several commands keeps naming their steps.
-                if (run_row.identity.kind == .commands) run_row.session = identity.key else run_row.identity = identity;
+                if (run_row.identity.kind == .commands) {
+                    run_row.session = identity.key;
+                    // The session's command is the newest step the row ran.
+                    try run_row.combined.append(scratch, detail.?);
+                } else run_row.identity = identity;
                 break :new run_row;
             };
             // A different command right after one with the same label joins
@@ -2159,7 +2181,7 @@ fn collectStoryRows(
         if (try commandStillRunning(scratch, entry)) target.background = detail;
         target.tries = retries.tries.get(entry_id) orelse 0;
         try addSearchPath(scratch, target, detail);
-        if (storyRowName(identity)) |name| try StoryTally.addDistinct(&target.names, scratch, name);
+        if (storyRowName(identity)) |name| try StoryTally.addLatest(&target.names, scratch, name);
         if (identity.kind == .edit) {
             const totals = diffTotalsOfPhrase(try entryStatus(scratch, entry) orelse "");
             target.diff.added +|= totals.added;
@@ -2223,8 +2245,16 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     if (rowListsNames(row)) return nameListRowText(scratch, row, cols);
     if (row.identity.kind == .commands) {
         const label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
-        const steps = try combinedCommandSteps(scratch, row.combined.items);
-        const display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        var steps = try combinedCommandSteps(scratch, row.combined.items);
+        var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        // A narrow row leaves out its oldest steps first, so the newest stays
+        // in view. The budget leaves room for the connector and the mark.
+        const budget: usize = if (cols > 4) cols - 4 else 1;
+        while (steps.steps.len > 1 and display_width.visibleWidthIgnoringAnsi(display) > budget) {
+            steps.steps = steps.steps[1..];
+            steps.earlier += 1;
+            display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        }
         return .{ .display = display, .body = display, .suffix = "" };
     }
     const merged_read = row.identity.kind == .read and row.count > 1;
@@ -3162,7 +3192,10 @@ fn gapHasNewline(command: []const u8, from: usize, to: usize) bool {
 /// A shell command's short form: the first steps it runs, and how many more.
 const ShortCommand = struct {
     steps: []const []const u8,
+    /// How many steps after `steps` the form leaves out.
     more: usize,
+    /// How many steps before `steps` the form leaves out.
+    earlier: usize = 0,
 };
 
 const short_command_max_steps = 3;
@@ -3180,6 +3213,7 @@ fn formatShortCommand(scratch: std.mem.Allocator, short: ShortCommand, base_styl
     const profile = if (base_style != null) code_highlight_languages.resolve("sh") else null;
     const variant: code_highlight.Theme = if (shared_theme.current().light) .light else .dark;
     var out: std.Io.Writer.Allocating = .init(scratch);
+    if (short.earlier > 0) try writeCount(&out.writer, "+", short.earlier, ", ");
     for (short.steps, 0..) |step, position| {
         if (position > 0) try out.writer.writeAll(", ");
         const safe = try terminalSafeText(scratch, step);
@@ -6783,7 +6817,8 @@ test "commands one after the other share a row, and reads show the file by name"
         rows.next().?,
     );
     // The passing commands before the failure share one row, each step once.
-    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252mrg\x1b[39m, \x1b[38;5;252msed\x1b[39m", rows.next().?);
+    // rg ran again after sed, so it is the newest step.
+    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252msed\x1b[39m, \x1b[38;5;252mrg\x1b[39m", rows.next().?);
     // The failure keeps its own row and reason line, and the command after it
     // starts a new row.
     try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ Exited 1 "));
@@ -6931,7 +6966,7 @@ test "search folder names stay terminal-safe and short" {
     try std.testing.expectEqualStrings("w, docs", try searchFolderNames(arena, &.{ "/w", "/w/docs" }));
     try std.testing.expectEqualStrings("., src", try searchFolderNames(arena, &.{ "", "src" }));
     try std.testing.expectEqualStrings("a/x, b/y", try searchFolderNames(arena, &.{ "/r/a/x", "/r/b/y" }));
-    try std.testing.expectEqualStrings("a, b, c +2 more", try searchFolderNames(arena, &.{ "/r/a", "/r/b", "/r/c", "/r/d", "/r/e" }));
+    try std.testing.expectEqualStrings("+2, c, d, e", try searchFolderNames(arena, &.{ "/r/a", "/r/b", "/r/c", "/r/d", "/r/e" }));
     // A path from the model never reaches the terminal as raw control bytes.
     const hostile = try searchFolderNames(arena, &.{ "/w/a\x1b]0;owned\x07", "/w/b" });
     try std.testing.expect(std.mem.findScalar(u8, hostile, 0x1b) == null);
@@ -7249,7 +7284,8 @@ test "every read in a group shares one row, and so does each search tool" {
     try std.testing.expectEqualStrings("● Read files, searched, ran a command ✓", rows.next().?);
     // Each file shows once, though the model read a.zig twice with other
     // calls between, and each search tool keeps one row of its patterns.
-    try std.testing.expectEqualStrings("├ Read a.zig, b.zig, c.zig", rows.next().?);
+    // a.zig was read again after b.zig, so it comes after it.
+    try std.testing.expectEqualStrings("├ Read b.zig, a.zig, c.zig", rows.next().?);
     try std.testing.expectEqualStrings("├ Searched retry, backoff", rows.next().?);
     try std.testing.expectEqualStrings("├ Matched *.zig", rows.next().?);
     // A failed read keeps its own row.
@@ -7264,7 +7300,8 @@ test "every read in a group shares one row, and so does each search tool" {
     defer narrow.deinit(alloc);
     var narrow_rows = std.mem.splitScalar(u8, narrow.entry_actions.items[0].override.bytes, '\n');
     _ = narrow_rows.next();
-    try std.testing.expectEqualStrings("├ Read a.zig +2 more", narrow_rows.next().?);
+    // A narrow row keeps the newest name and counts the older ones first.
+    try std.testing.expectEqualStrings("├ Read +2, c.zig", narrow_rows.next().?);
 
     // A narrow header drops its last parts first and keeps the failure; the
     // mark goes with the commands it is for.
@@ -8041,6 +8078,48 @@ test "a command that ran after one still running keeps its own row and no check 
     try std.testing.expect(std.mem.find(u8, text, "├ Still running sleep") != null);
     try std.testing.expect(std.mem.find(u8, text, "└ Ran printf") != null);
     try std.testing.expect(std.mem.find(u8, text, "✓") == null);
+}
+
+test "a row of commands shows its newest steps and counts the older ones first" {
+    // The newest step is the one that may still run, so it is never the one
+    // left out, also on a narrow row.
+    const alloc = std.testing.allocator;
+    const commands = [_][]const u8{ "echo a", "cat notes.md", "git status", "sed -n 1p notes.md", "python3 run.py" };
+    var entries: [commands.len]TranscriptEntry = undefined;
+    var details: [commands.len]ToolDetailRecord = undefined;
+    var json_bufs: [commands.len][64]u8 = undefined;
+    var status_bufs: [commands.len][64]u8 = undefined;
+    for (commands, 0..) |command, index| {
+        const running = index == commands.len - 1;
+        const status = try std.mem.print(&status_bufs[index], "● {s} {s}\n", .{ if (running) "Running" else "Ran", command });
+        entries[index] = .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = status, .class = .tool_status } };
+        const json = try std.mem.print(&json_bufs[index], "{{\"command\":\"{s}\"}}", .{command});
+        details[index] = storyCommandDetail(@intCast(index + 1), json, 0, null);
+        details[index].command_display = @constCast(command);
+        if (running) {
+            details[index].outcome = null;
+            details[index].command_process_presentation = null;
+        }
+    }
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py", std.mem.trim(u8, text, "\n"));
+
+    var narrow = try build(alloc, &entries, &details, 30);
+    defer narrow.deinit(alloc);
+    var painted: std.ArrayList(u8) = .empty;
+    defer painted.deinit(alloc);
+    for (narrow.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(alloc, override.bytes);
+            try painted.append(alloc, '\n');
+        },
+        else => {},
+    };
+    errdefer std.debug.print("narrow group:\n{s}\n", .{painted.items});
+    const narrow_text = try visibleLinesForTest(alloc, painted.items, 30);
+    defer alloc.free(narrow_text);
+    try std.testing.expectEqualStrings("● Running +4, python3 run.py", std.mem.trim(u8, narrow_text, "\n"));
 }
 
 test "a session's input finds its run after a quick command joined the run's row" {
