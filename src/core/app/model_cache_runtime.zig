@@ -1201,7 +1201,8 @@ fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry:
 
 /// Fills `menu` from `catalog`, in catalog order. With `token_pass_first`,
 /// for a team that has Token Pass, the models the catalog marks as paid by
-/// its Token Pass lead the list, in catalog order.
+/// its Token Pass lead the list, in catalog order. A model that Fast mode on
+/// another listed model runs gets no row; see `model_catalog.foldsIntoFastMode`.
 fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
@@ -1217,11 +1218,13 @@ fn hydrateMenuSnapshot(
 
     if (token_pass_first) {
         for (catalog) |entry| {
-            if (entry.token_pass) try appendMenuItem(alloc, &items, entry);
+            if (entry.token_pass and !model_catalog.foldsIntoFastMode(entry, catalog)) try appendMenuItem(alloc, &items, entry);
         }
     }
     for (catalog) |entry| {
         if (token_pass_first and entry.token_pass) continue;
+        // Fast mode on the base model's row already selects this model.
+        if (model_catalog.foldsIntoFastMode(entry, catalog)) continue;
         try appendMenuItem(alloc, &items, entry);
     }
 
@@ -2256,6 +2259,49 @@ test "model menu owns resolved catalog state and filters without changing catalo
     const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings("standalone", selected);
+}
+
+test "model menu leaves out a fast variant that Fast mode on a listed model runs" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("anthropic/claude-opus-5"), .model_type = @constCast("language"), .supports_fast_mode = true },
+        .{
+            .id = @constCast("anthropic/claude-opus-5-fast"),
+            .model_type = @constCast("language"),
+            .fast_variant_of = @constCast("anthropic/claude-opus-5"),
+        },
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+        .{
+            .id = @constCast("provider/plain-fast"),
+            .model_type = @constCast("language"),
+            .fast_variant_of = @constCast("provider/plain"),
+        },
+    };
+    runtime.state = .ready;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
+    runtime.menu.active = true;
+
+    // `provider/plain` has no Fast mode, so its variant is the only way to run fast.
+    try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("anthropic/claude-opus-5", runtime.menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("provider/plain", runtime.menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("provider/plain-fast", runtime.menu.itemAt(2).?.id);
+
+    // A session that names the left-out model still finds it in the catalog.
+    try std.testing.expect(findCatalogModel(&entries, "anthropic/claude-opus-5-fast") != null);
+
+    // For a team with Token Pass, a variant the catalog marks as Token Pass
+    // stays out too, while its base keeps the Fast mode row.
+    var marked = entries;
+    marked[1].token_pass = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &marked, true);
+    try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
+    for (runtime.menu.items.items) |item| {
+        try std.testing.expect(!std.mem.eql(u8, item.id, "anthropic/claude-opus-5-fast"));
+    }
 }
 
 test "model menu leads with the models the catalog marks as Token Pass, for a team with Token Pass" {
