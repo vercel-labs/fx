@@ -39,7 +39,7 @@ export function isDividerRow(line: string): boolean {
 
 /**
  * Counts a catalog menu's items from its title row: the item rows it shows
- * plus the hidden ones a `↓ N more` row reports. Empty-state messages and
+ * plus the hidden ones a `↓ N more` row reports. Messages, status lines, and
  * group headings are not items. Returns null when no row starts with `title`.
  */
 export function catalogMenuItemCount(grid: string[], title: string): number | null {
@@ -58,8 +58,11 @@ export function catalogMenuItemCount(grid: string[], title: string): number | nu
       count += Number(more[1]);
       continue;
     }
-    if (/^(no |add one |press tab |loading |unable to load )/.test(text)) continue;
-    if (/^(Token Pass|All Models|Needs attention|Tools)$/.test(text)) continue;
+    // An item is a name without spaces, alone or followed by columns two or
+    // more spaces apart. A phrase with single spaces and no columns is a
+    // message, a status line, or a group heading.
+    if (/ /.test(text) && !/ {2,}/.test(text)) continue;
+    if (text === "Tools") continue;
     count += 1;
   }
   return count;

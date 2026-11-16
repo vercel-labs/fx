@@ -42,7 +42,7 @@ const TIMEOUT = 60_000;
 const LOCAL_MENU_ACTIONS = [
   { name: "helpOpen", command: "/help", marker: "Commands " },
   { name: "settingsOpen", command: "/settings", marker: "Settings" },
-  { name: "modelOpen", command: "/model", marker: "Models " },
+  { name: "modelOpen", command: "/model", marker: "models" },
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
   { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
   { name: "usageOpen", command: "/usage", marker: "usage: API key" },
@@ -618,8 +618,12 @@ test.skipIf(!tmuxAvailable())(
 
       sendOverlappingSkillCommands(active, "global-skill");
       await active.waitForText("global-skill", 5_000);
+      await closeSurface(active, "skills   <");
+      // `/skills show` scrolls to its skill; from the top, the more row
+      // counts the whole catalog: 5 shown and 285 below.
+      await active.sendText("/skills");
       await active.waitForText("↓ 285 more", 5_000);
-      await closeSurface(active, "skills   < All >");
+      await closeSurface(active, "skills   <");
 
       await active.sendText("Submit after canonical home refresh.");
       await active.waitForText("SYMLINKED_HOME_PROMPT_OK", TIMEOUT);
