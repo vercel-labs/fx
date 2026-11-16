@@ -87,6 +87,22 @@ pub const StartCapturedInput = struct {
     /// `yield_time_ms`: the command is waiting on an `fx mcp call` whose
     /// owner is this call, which must not end before the answer does.
     yield_hold: ?*const std.atomic.Value(u32) = null,
+    /// Sent once: when the command this input starts has ended, or before
+    /// `startCaptured` returns when the input starts none.
+    end_notice: ?EndNotice = null,
+};
+
+/// Tells the caller that a command has ended, so what the command holds
+/// while it runs can end with it: the shell tool's `fx mcp call` token
+/// (`mcp_call_bridge.zig` `commandEnded`). `notify` runs once, without a
+/// lock of this runtime held, and must not call into it.
+pub const EndNotice = struct {
+    id: u64,
+    notify: *const fn (id: u64) void,
+
+    fn send(self: EndNotice) void {
+        self.notify(self.id);
+    }
 };
 
 pub const TtyCursor = struct {
@@ -277,6 +293,8 @@ const Entry = struct {
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
+    /// Sent by the worker when the command has ended. Set once, at `init`.
+    end_notice: ?EndNotice = null,
 
     fn init(runtime: *Runtime, input: StartCapturedInput) !*Entry {
         const entry = try runtime.alloc.create(Entry);
@@ -352,6 +370,7 @@ const Entry = struct {
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
+            .end_notice = input.end_notice,
         };
         entry.started_ms = io_mod.milliTimestamp();
         entry.last_output_ms = entry.started_ms;
@@ -509,6 +528,9 @@ const Entry = struct {
             .captured => |*value| value,
             .tty, .tombstone => return,
         };
+        // After the state is terminal and the entry's lock is free, on
+        // either way out.
+        defer if (self.end_notice) |notice| notice.send();
         const started_ms = io_mod.milliTimestamp();
         const routed = execution_router.executePreparedRoute(.{
             .max_command_output_bytes = self.max_output_bytes,
@@ -629,10 +651,16 @@ pub const Runtime = struct {
         alloc: Allocator,
         input: StartCapturedInput,
     ) !PreparedSnapshot {
+        // An input that starts no command has its end notice sent here; the
+        // worker sends that of a command it runs.
         if (input.yield_time_ms > contract.max_yield_time_ms) {
+            if (input.end_notice) |notice| notice.send();
             return error.InvalidYieldTime;
         }
-        const admission = try self.admitCaptured(input);
+        const admission = self.admitCaptured(input) catch |err| {
+            if (input.end_notice) |notice| notice.send();
+            return err;
+        };
         const entry = admission.entry;
         var published = false;
         errdefer if (admission.created and !published) {
@@ -640,6 +668,8 @@ pub const Runtime = struct {
         };
 
         if (!admission.created) {
+            // The command already runs with its own notice.
+            if (input.end_notice) |notice| notice.send();
             published = true;
             return self.prepareSnapshot(alloc, entry.execution_id);
         }
@@ -832,6 +862,19 @@ pub const Runtime = struct {
         return entry.statusSnapshot();
     }
 
+    /// The id of the end notice a captured command will send, while it has
+    /// not ended (`StartCapturedInput.end_notice`).
+    pub fn endNoticeId(self: *Runtime, execution_id: []const u8) ?u64 {
+        const entry = self.acquireEntry(execution_id) orelse return null;
+        defer self.releaseEntry(entry);
+        const notice = entry.end_notice orelse return null;
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        if (entry.isTerminal()) return null;
+        return notice.id;
+    }
+
     pub fn ttyCursorFor(
         self: *Runtime,
         execution_id: []const u8,
@@ -952,11 +995,13 @@ pub const Runtime = struct {
     ) !PreparedSnapshot {
         // `waitOrYield` without steering, for callers no steering reaches,
         // such as tests.
-        return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null);
+        return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null, null);
     }
 
     /// `wait`, which also returns the command running once `tool_yield_flag`
     /// is set and `steerYieldDue` passes, so steering need not wait for it.
+    /// While `yield_hold` is above zero, it neither yields nor ends at its
+    /// ceiling or the quiet limit (`StartCapturedInput.yield_hold`).
     pub fn waitOrYield(
         self: *Runtime,
         alloc: Allocator,
@@ -964,6 +1009,7 @@ pub const Runtime = struct {
         wait_ceiling_ms: u32,
         cancel_flag: ?*std.atomic.Value(bool),
         tool_yield_flag: ?*const std.atomic.Value(bool),
+        yield_hold: ?*const std.atomic.Value(u32),
     ) !PreparedSnapshot {
         if (wait_ceiling_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidWaitCeiling;
@@ -1003,20 +1049,23 @@ pub const Runtime = struct {
                 if (flag.load(.seq_cst)) return error.Cancelled;
             }
             const now_ms = io_mod.milliTimestamp();
-            if (steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
+            const held = if (yield_hold) |hold| hold.load(.acquire) > 0 else false;
+            if (!held and steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
                 debug_trace.logf("managed-execution", "wait yielded for steering execution={s} elapsed_ms={d}", .{ execution_id, now_ms - wait_started_ms });
                 break;
             }
             const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
             quiet_wait = step.wait;
             if (step.end) |end| {
-                if (end == .quiet) {
-                    var prepared = try self.prepareSnapshotForEntry(alloc, entry);
-                    // A command that ended as the wait crossed is no crossing.
-                    prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
-                    return prepared;
+                if (!held) {
+                    if (end == .quiet) {
+                        var prepared = try self.prepareSnapshotForEntry(alloc, entry);
+                        // A command that ended as the wait crossed is no crossing.
+                        prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
+                        return prepared;
+                    }
+                    break;
                 }
-                break;
             }
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
@@ -2109,7 +2158,7 @@ test "steering yield returns a captured command running and keeps it running" {
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 
     // A follow-up wait yields too, and the command still runs.
-    var followed = try runtime.waitOrYield(alloc, input.execution_id, 30_000, null, &yield_flag);
+    var followed = try runtime.waitOrYield(alloc, input.execution_id, 30_000, null, &yield_flag, null);
     defer followed.deinit(alloc);
     try std.testing.expectEqual(SnapshotState.running, followed.snapshot.state);
     try runtime.commitDelivery(followed.snapshot.execution_id, followed.reservation_id);

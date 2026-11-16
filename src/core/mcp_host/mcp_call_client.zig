@@ -7,8 +7,9 @@
 //! it without first inspecting it.
 //!
 //! The call meets the same permission rules, prompt, and review as a direct
-//! call of the tool by the agent that ran the command. It works only while
-//! that shell call runs.
+//! call of the tool by the agent that ran the command. It works while that
+//! command runs. When the shell call that started the command returns first,
+//! a call waits until the agent follows the command with `interact`.
 //!
 //! `fx mcp call list SERVER`, `search QUERY`, and `help TOOL` print plain
 //! text about the tools that agent may use, so a command can find a tool and
@@ -30,7 +31,7 @@ pub const exit = struct {
     pub const failed: u8 = 1;
     /// A usage mistake, as for every `fx mcp` verb.
     pub const usage: u8 = 2;
-    /// No running fx shell call to reach: outside fx, after the shell call
+    /// No running fx shell command to reach: outside fx, after the command
     /// ended, or another fx version.
     pub const unavailable: u8 = 3;
     /// Too many calls are running; nothing ran.
@@ -294,7 +295,7 @@ fn repeatedValues(items: []const std.json.Value, key: []const u8, out: *[max_hin
 }
 
 fn unavailable(err: *Writer) !u8 {
-    try err.writeAll("fx mcp call: no running fx shell call to reach. It works only in a command that fx's shell tool runs, while that call runs.\n");
+    try err.writeAll("fx mcp call: no running fx shell call to reach. It works only in a command that fx's shell tool runs, while that command runs.\n");
     return exit.unavailable;
 }
 

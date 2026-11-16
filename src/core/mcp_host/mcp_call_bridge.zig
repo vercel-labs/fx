@@ -3,12 +3,16 @@
 //! session's MCP tools through it, so a large result can go to a file
 //! instead of into the model's context.
 //!
-//! Each running shell call registers as an owner with its own token and
-//! lends the bridge its permission check and MCP call
+//! Each command the shell tool runs registers as an owner with its own token
+//! for as long as it runs. The shell call that follows the command lends the
+//! bridge its permission check and MCP call
 //! (`../tooling/mcp_call_capability.zig`), so a call meets the same rules,
-//! prompt, review, and access as a direct one by the same agent. The bridge
-//! listens on one Unix socket in a private directory while any shell call is
-//! registered, and closes it after the last one ends.
+//! prompt, review, and access as a direct one by the same agent: first the
+//! call that started the command, then each `interact` on its session. A
+//! command can outlive the call that started it, when that call yields or
+//! steering arrives, and its requests then wait for the next call that
+//! follows it. The bridge listens on one Unix socket in a private directory
+//! while any command is registered, and closes it after the last one ends.
 //!
 //! The core decides everything: admission, the order of the permission
 //! check and the call, one call and one reply per request, and what to let
@@ -38,29 +42,50 @@ const poll_ms = 100;
 /// How long a client may take to send its request line.
 const request_deadline_ms: i64 = 10_000;
 
-/// One running shell call, registered as an owner.
+/// One running command, registered as an owner. It ends when the command
+/// has ended and no shell call follows it (`finishLocked`).
 pub const Registration = struct {
     owner: mcp_call.OwnerId,
-    capability: capability_mod.Capability,
+    /// What the shell call that follows the command lends, or null while
+    /// none does. Guarded by the bridge mutex.
+    capability: ?capability_mod.Capability,
+    /// Whether a shell call follows the command: from `register` or
+    /// `follow` until `unfollow`. Guarded by the bridge mutex.
+    followed: bool = true,
+    /// Whether the command still runs, until `commandEnded`. Guarded by the
+    /// bridge mutex.
+    command_running: bool = true,
     /// The owner's requests the bridge is working on. While above zero the
-    /// shell call does not yield (`managed_execution` `yield_hold`).
+    /// shell call that follows the command does not yield
+    /// (`managed_execution` `yield_hold`).
     hold: std.atomic.Value(u32) = .init(0),
-    /// Requests whose work borrows `capability`. Guarded by the bridge mutex.
+    /// Requests being served, waiting ones included. Guarded by the bridge
+    /// mutex.
     in_use: u32 = 0,
+    /// Requests whose work borrows `capability`. Guarded by the bridge mutex.
+    borrowing: u32 = 0,
+    /// Requests admitted for this owner so far. Guarded by the bridge mutex.
+    requests: u32 = 0,
     token_hex: [wire.token_hex_len]u8,
     variables: [2]command_runner.EnvironmentVariable = undefined,
 
     /// The variables a command needs to reach the bridge as this owner.
-    /// Valid until `unregister`.
+    /// Valid while a shell call follows the command.
     pub fn environment(self: *const Registration) []const command_runner.EnvironmentVariable {
         return &self.variables;
     }
 };
 
-/// A request being served, so a `cancel` effect can reach its call.
+/// A request being served, so a `cancel` effect can reach its call and a
+/// `withdraw` effect a request that waits for a shell call.
 const Live = struct {
     id: mcp_call.RequestId,
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Its client or owner left. Guarded by the bridge mutex.
+    withdrawn: bool = false,
+    /// The registration whose capability its work uses. Guarded by the
+    /// bridge mutex.
+    lender: ?*const Registration = null,
 };
 
 const Phase = enum { idle, running, stopping };
@@ -89,8 +114,10 @@ const Bridge = struct {
 
 var bridge: Bridge = .{};
 
-/// Registers a running shell call, starting the bridge if this is the
-/// first. The caller must `unregister` before `capability` goes away.
+/// Registers a command a shell call is about to start, starting the bridge
+/// if this is the first, with that call as its follower. The call must
+/// `unfollow` before `capability` goes away, and `commandEnded` must follow
+/// the command's end (`managed_execution` `EndNotice`).
 pub fn register(capability: capability_mod.Capability) !*Registration {
     const io = io_mod.getIo();
     bridge.mutex.lockUncancelable(io);
@@ -113,12 +140,106 @@ pub fn register(capability: capability_mod.Capability) !*Registration {
     return registration;
 }
 
-/// Ends a shell call's registration: its token is revoked, a running call
-/// is cancelled, and a waiting prompt stays until it is answered. Returns
-/// once nothing borrows its capability. Stops the bridge after the last one.
-pub fn unregister(registration: *Registration) void {
+/// The id `follow` and `commandEnded` take for `registration`'s command.
+pub fn commandId(registration: *const Registration) u64 {
+    return @backingInt(registration.owner);
+}
+
+/// Lends `capability` to the command `id` names while a later shell call,
+/// an `interact` on its session, follows it. Returns null when the command
+/// has ended, is not registered, or another call follows it; its requests
+/// then do not use `capability`. The call must `unfollow` the registration
+/// it returns before `capability` goes away.
+pub fn follow(id: u64, capability: capability_mod.Capability) ?*Registration {
     const io = io_mod.getIo();
     bridge.mutex.lockUncancelable(io);
+    defer bridge.mutex.unlock(io);
+    const registration = findLocked(id) orelse return null;
+    if (registration.followed or !registration.command_running) return null;
+    // The last follower's `unfollow` waited until nothing borrowed its
+    // capability, so no request still uses one.
+    std.debug.assert(registration.borrowing == 0);
+    registration.followed = true;
+    registration.capability = capability;
+    bridge.changed.broadcast(io);
+    return registration;
+}
+
+/// Ends a shell call's following of its command. When the command still
+/// runs, its token stays in force and this returns once no request uses
+/// the call's capability; a later request waits for the next call that
+/// follows the command. When the command has ended, it ends the
+/// registration (`finishLocked`). When `cancelled`, the call is being
+/// cancelled, so the MCP calls its capability runs are cancelled too; a
+/// prompt one shows stays until it is answered.
+pub fn unfollow(registration: *Registration, cancelled: bool) void {
+    const io = io_mod.getIo();
+    bridge.mutex.lockUncancelable(io);
+    // No request takes the capability from here on.
+    registration.capability = null;
+    if (cancelled) {
+        for (bridge.live.items) |live| {
+            if (live.lender == registration) live.cancel.store(true, .release);
+        }
+    }
+    while (registration.borrowing > 0 and registration.command_running) bridge.changed.waitUncancelable(io, &bridge.mutex);
+    registration.followed = false;
+    if (registration.command_running) {
+        bridge.mutex.unlock(io);
+        return;
+    }
+    finishLocked(io, registration);
+}
+
+/// Records that the command `id` names has ended. It ends the registration
+/// at once when no shell call follows the command, and otherwise leaves
+/// that to the call's `unfollow`. A second call for the same command, or one
+/// for a registration that is gone, does nothing.
+pub fn commandEnded(id: u64) void {
+    const io = io_mod.getIo();
+    bridge.mutex.lockUncancelable(io);
+    const registration = findLocked(id) orelse {
+        bridge.mutex.unlock(io);
+        return;
+    };
+    if (!registration.command_running) {
+        bridge.mutex.unlock(io);
+        return;
+    }
+    registration.command_running = false;
+    if (registration.followed) {
+        // A follower's `unfollow` may wait for its borrowers; it ends the
+        // registration now.
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+        return;
+    }
+    finishLocked(io, registration);
+}
+
+/// Whether the command `registration` names has sent a request, so the
+/// shell call that returns while it runs can tell the agent its requests
+/// wait for the next call that follows it.
+pub fn hasRequests(registration: *Registration) bool {
+    const io = io_mod.getIo();
+    bridge.mutex.lockUncancelable(io);
+    defer bridge.mutex.unlock(io);
+    return registration.requests > 0;
+}
+
+fn findLocked(id: u64) ?*Registration {
+    for (bridge.registrations.items) |registration| {
+        if (commandId(registration) == id) return registration;
+    }
+    return null;
+}
+
+/// Ends a registration that neither its command nor a shell call holds: its
+/// token is revoked, a running call is cancelled, a request that waits for a
+/// shell call ends, and a waiting prompt stays until it is answered. Returns
+/// once no request is left. Stops the bridge after the last one. Called with
+/// the bridge mutex held, which it releases.
+fn finishLocked(io: std.Io, registration: *Registration) void {
     applyLocked(mcp_call.step(bridge.state, .{ .owner_removed = registration.owner }));
     while (registration.in_use > 0) bridge.changed.waitUncancelable(io, &bridge.mutex);
     for (bridge.registrations.items, 0..) |item, index| {
@@ -223,7 +344,15 @@ fn applyLocked(out: mcp_call.Output) void {
                 if (live.id == id) live.cancel.store(true, .release);
             }
         },
-        .withdraw => |id| debug_trace.logf("mcp-call", "request={d} client or owner gone; its permission prompt stays until answered, and nothing runs", .{@backingInt(id)}),
+        .withdraw => |id| {
+            // A request that waits for a shell call to follow its command
+            // ends now; one whose prompt shows ends when it is answered.
+            for (bridge.live.items) |live| {
+                if (live.id == id) live.withdrawn = true;
+            }
+            bridge.changed.broadcast(io_mod.getIo());
+            debug_trace.logf("mcp-call", "request={d} client or owner gone; its permission prompt stays until answered, and nothing runs", .{@backingInt(id)});
+        },
         .log => |log| debug_trace.logf("mcp-call", "request={d} dropped={s}", .{ @backingInt(log.id), @tagName(log.drop) }),
         .refuse, .authorize, .call, .reply => {},
     };
@@ -319,8 +448,8 @@ fn writeReply(stream: std.Io.net.Stream, status: wire.Status, reason: ?wire.Reas
 
 fn refusalMessage(reason: wire.Reason) []const u8 {
     return switch (reason) {
-        .closed => "The fx session's shell call that started this command has ended. Run fx mcp call from a command in a new shell call.",
-        .unauthorized => "This command was not started by a running fx shell call, or that call has ended. Run fx mcp call from a command fx's shell tool runs, not from one left running in the background.",
+        .closed => "The command fx's shell tool started for this call has ended. Run fx mcp call from a command in a new shell call.",
+        .unauthorized => "This command was not started by fx's shell tool, or the command that was has ended. Run fx mcp call from a command fx's shell tool runs, while that command runs.",
         .unsupported_version => "This fx mcp call is from another fx version than the running session. Run the fx that started the session, or restart the session with this one.",
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
         .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
@@ -404,6 +533,7 @@ fn serve(stream: std.Io.net.Stream) void {
     live = .{ .id = work.id };
     bridge.live.appendAssumeCapacity(&live);
     registration.in_use += 1;
+    registration.requests +|= 1;
     _ = registration.hold.fetchAdd(1, .acq_rel);
     bridge.mutex.unlock(io);
     defer {
@@ -430,6 +560,26 @@ fn serve(stream: std.Io.net.Stream) void {
         task.await(io);
     };
 
+    // The command can outlive the shell call that started it. Its request
+    // then waits for the next call that follows it, or ends when its client
+    // or owner leaves first.
+    bridge.mutex.lockUncancelable(io);
+    while (registration.capability == null and !live.withdrawn) bridge.changed.waitUncancelable(io, &bridge.mutex);
+    const lent: ?capability_mod.Capability = if (live.withdrawn) null else registration.capability;
+    if (lent != null) {
+        registration.borrowing += 1;
+        live.lender = registration;
+    }
+    if (lent == null) _ = step(.{ .authorized = .{ .id = work.id, .decision = .deny } });
+    bridge.mutex.unlock(io);
+    const capability = lent orelse return;
+    defer {
+        bridge.mutex.lockUncancelable(io);
+        registration.borrowing -= 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+    }
+
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
     // A lookup reads tool metadata only, like the agent's own toolbox
     // search, so it has no permission check to wait for.
@@ -437,7 +587,7 @@ fn serve(stream: std.Io.net.Stream) void {
         .call => |value| blk: {
             bridge.prompt.lockUncancelable(io);
             defer bridge.prompt.unlock(io);
-            break :blk registration.capability.authorize(arena, request_id, value.tool, value.arguments_json) catch |err|
+            break :blk capability.authorize(arena, request_id, value.tool, value.arguments_json) catch |err|
                 .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(value.tool), @errorName(err) }) catch "The permission check failed." };
         },
         .list, .search, .help => .{ .allow = .{} },
@@ -449,7 +599,7 @@ fn serve(stream: std.Io.net.Stream) void {
     var reply: ?struct { status: wire.Status, bytes: []const u8 } = null;
     for (decided.effects()) |effect| switch (effect) {
         .call => {
-            const outcome = runOperation(arena, registration.capability, request_id, request.operation, authorization.allow, &live.cancel) catch |err|
+            const outcome = runOperation(arena, capability, request_id, request.operation, authorization.allow, &live.cancel) catch |err|
                 capability_mod.CallOutcome{ .status = .failed, .bytes = arena.print("The MCP call failed: {s}", .{@errorName(err)}) catch "The MCP call failed." };
             bridge.mutex.lockUncancelable(io);
             const finished = step(.{ .call_finished = .{ .id = work.id, .outcome = switch (outcome.status) {
@@ -500,6 +650,9 @@ const FakeTool = struct {
     gate: std.atomic.Value(bool) = .init(false),
     authorizing: std.atomic.Value(bool) = .init(false),
     calls: std.atomic.Value(u32) = .init(0),
+    /// While set, a call runs until it is cancelled, as a long MCP call does.
+    long_call: std.atomic.Value(bool) = .init(false),
+    calling: std.atomic.Value(bool) = .init(false),
 
     fn capability(self: *FakeTool) capability_mod.Capability {
         return .{ .context = @ptrCast(self), .authorize_fn = authorize, .call_fn = run, .lookup_fn = lookup };
@@ -522,9 +675,12 @@ const FakeTool = struct {
     }
 
     fn run(raw: *anyopaque, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8, allowed: @FieldType(capability_mod.Authorization, "allow"), cancel: *std.atomic.Value(bool)) anyerror!capability_mod.CallOutcome {
-        _ = .{ request_id, allowed, cancel };
+        _ = .{ request_id, allowed };
         const self: *FakeTool = @ptrCast(@alignCast(raw));
         _ = self.calls.fetchAdd(1, .acq_rel);
+        self.calling.store(true, .release);
+        while (self.long_call.load(.acquire) and !cancel.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
+        if (cancel.load(.acquire)) return .{ .status = .failed, .bytes = "Cancelled by the test." };
         return .{ .status = .ok, .bytes = try arena.print("{s} {s}\n", .{ tool, arguments_json }) };
     }
 };
@@ -538,6 +694,158 @@ fn waitFor(flag: *const std.atomic.Value(bool)) !void {
 }
 
 const client = @import("mcp_call_client.zig");
+
+/// What happens when a command ends while the shell call that started it
+/// follows it: the call returns, and the registration ends with it.
+fn unregister(registration: *Registration) void {
+    commandEnded(commandId(registration));
+    unfollow(registration, false);
+}
+
+/// One `fx mcp call` from a command, sent on its own thread, since it waits
+/// while no shell call follows the command.
+const PendingCall = struct {
+    arena_state: std.heap.ArenaAllocator,
+    socket_path: []const u8,
+    token: mcp_call.Token,
+    reply: ?client.Reply = null,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *PendingCall) void {
+        defer self.done.store(true, .release);
+        self.reply = client.call(self.arena_state.allocator(), io_mod.getIo(), self.socket_path, self.token, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } }) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
+fn waitForHold(registration: *const Registration, count: u32) !void {
+    var waited: u32 = 0;
+    while (registration.hold.load(.acquire) != count) : (waited += 1) {
+        if (waited > 1000) return error.TestTimedOut;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    }
+}
+
+test "a command's call waits while no shell call follows it, and the next call that follows it serves the call" {
+    if (!supported) return error.SkipZigTest;
+    var started: FakeTool = .{};
+    var later: FakeTool = .{};
+    const registration = try register(started.capability());
+    const id = commandId(registration);
+    var pending: PendingCall = .{
+        .arena_state = .init(std.testing.allocator),
+        .socket_path = registration.environment()[0].value,
+        .token = wire.parseToken(registration.environment()[1].value).?,
+    };
+    defer pending.arena_state.deinit();
+    // The call that started the command returns while it runs, as when it
+    // yields or steering arrives.
+    unfollow(registration, false);
+    const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
+    defer thread.join();
+    // A failed check ends the command, which lets the waiting call go.
+    errdefer commandEnded(id);
+    try waitForHold(registration, 1);
+    io_mod.sleep(3 * poll_ms * std.time.ns_per_ms);
+    try std.testing.expect(!pending.done.load(.acquire));
+    try std.testing.expect(!started.authorizing.load(.acquire));
+    try std.testing.expect(!later.authorizing.load(.acquire));
+
+    // An `interact` on its session follows the command, and the call runs
+    // with that call's permission check and access.
+    const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
+    errdefer unfollow(followed, false);
+    try std.testing.expectEqual(registration, followed);
+    try waitFor(&pending.done);
+    try std.testing.expectEqual(@as(?anyerror, null), pending.err);
+    try std.testing.expectEqual(wire.Status.ok, pending.reply.?.header.status);
+    try std.testing.expectEqualStrings("mcp_s_t {}\n", pending.reply.?.bytes);
+    try std.testing.expectEqual(@as(u32, 0), started.calls.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), later.calls.load(.acquire));
+    try std.testing.expect(hasRequests(followed));
+    // A second call cannot follow the command while one does.
+    try std.testing.expectEqual(@as(?*Registration, null), follow(id, started.capability()));
+    unregister(followed);
+}
+
+test "a cancelled shell call cancels the call it runs for its command, and the command keeps its token" {
+    if (!supported) return error.SkipZigTest;
+    var tool: FakeTool = .{};
+    tool.long_call.store(true, .release);
+    const registration = try register(tool.capability());
+    const id = commandId(registration);
+    var pending: PendingCall = .{
+        .arena_state = .init(std.testing.allocator),
+        .socket_path = registration.environment()[0].value,
+        .token = wire.parseToken(registration.environment()[1].value).?,
+    };
+    defer pending.arena_state.deinit();
+    const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
+    defer thread.join();
+    {
+        // A failed check ends the command, which cancels the call.
+        errdefer unregister(registration);
+        try waitFor(&tool.calling);
+    }
+
+    // The turn is cancelled while the call runs, as with Esc during an
+    // `interact` that follows the command.
+    unfollow(registration, true);
+    // The command still runs; a failed check ends it.
+    errdefer commandEnded(id);
+    try waitFor(&pending.done);
+    try std.testing.expectEqual(@as(?anyerror, null), pending.err);
+    try std.testing.expectEqual(wire.Status.failed, pending.reply.?.header.status);
+    try std.testing.expectEqualStrings("Cancelled by the test.", pending.reply.?.bytes);
+    // Its token is still in force, so a later call can follow the command.
+    var later: FakeTool = .{};
+    const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
+    unregister(followed);
+}
+
+test "the end of a command no shell call follows lets its waiting call go and revokes its token" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tool: FakeTool = .{};
+    // Another command keeps the bridge open, so the revoked token is refused
+    // rather than finding no socket.
+    const other = try register(tool.capability());
+    defer unregister(other);
+    const registration = try register(tool.capability());
+    const id = commandId(registration);
+    const token = wire.parseToken(registration.environment()[1].value).?;
+    var pending: PendingCall = .{
+        .arena_state = .init(std.testing.allocator),
+        .socket_path = registration.environment()[0].value,
+        .token = token,
+    };
+    defer pending.arena_state.deinit();
+    unfollow(registration, false);
+    const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
+    {
+        errdefer {
+            commandEnded(id);
+            thread.join();
+        }
+        try waitForHold(registration, 1);
+    }
+
+    commandEnded(id);
+    thread.join();
+    // The request ended without running; its client gets no reply.
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionLost), pending.err);
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+    // The ended command's token reaches nothing, and no call follows it.
+    const late = try client.call(arena_state.allocator(), std.testing.io, other.environment()[0].value, token, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
+    try std.testing.expectEqual(wire.Reason.unauthorized, late.header.reason.?);
+    try std.testing.expectEqual(@as(?*Registration, null), follow(id, tool.capability()));
+    commandEnded(id);
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
 
 test "a shell call's command reaches its MCP tool, and a forged token reaches nothing" {
     if (!supported) return error.SkipZigTest;

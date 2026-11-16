@@ -347,7 +347,7 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  asks permission as a direct call of TOOL would; list, search, and
             \\  help need none and show only the tools that agent may use.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
-            \\  3 outside a running fx shell call, 4 when too many calls are
+            \\  3 outside a command fx's shell tool runs, 4 when too many calls are
             \\  running, 5 when permission is not granted, and 6 when the tool
             \\  returns an error.
             \\
