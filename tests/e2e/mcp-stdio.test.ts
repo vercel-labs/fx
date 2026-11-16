@@ -1940,13 +1940,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         // Call again only after the first server has exited.
         const firstExited = () => {
           const [pid] = readAttemptedPids(root.launchLogPath);
-          if (pid === undefined) return false;
-          try {
-            process.kill(Number(pid), 0);
-            return false;
-          } catch {
-            return true;
-          }
+          return pid !== undefined && !isProcessAlive(pid);
         };
         const deadline = Date.now() + 5_000;
         while (!firstExited()) {
