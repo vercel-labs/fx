@@ -1146,8 +1146,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const cases = [
         {
           name: "denied",
-          // The group's only call is its header, which says it was denied.
-          outcome: "● Denied file",
+          // The group's only call is its header, which says it was denied
+          // and names the file it would have written.
+          outcome: "● Denied marker-denied.txt",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
