@@ -3539,8 +3539,12 @@ describe("gateway stream lifecycle", () => {
           await tui.sendText(attached
             ? `$${skillName} read its supporting resource.`
             : "Load streamed-workflow and read its supporting resource.");
-          // Before its arguments arrive, a toolbox call may open, run, or search.
-          await tui.waitForPane((pane) => stream !== undefined && pane.includes("Using"), 15_000);
+          // Before its arguments arrive, a toolbox call may open, run, or
+          // search, so it shows no row until they name what it does: no bare
+          // "Using" that turns into another row later.
+          await tui.waitForPane(() => stream !== undefined, 15_000);
+          await Bun.sleep(300);
+          expect(await tui.capturePane()).not.toMatch(/● Using\b/);
           expect(gateway.requestCount()).toBe(heldRequestCount);
 
           // Keep streamed input location-first even when final argument keys are reversed.

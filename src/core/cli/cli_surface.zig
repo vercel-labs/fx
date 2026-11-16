@@ -2863,6 +2863,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
     var out: DepsWriter = .init(deps, .stdout, &out_buffer);
     var err: DepsWriter = .init(deps, .stderr, &err_buffer);
     var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.mcp_kept };
     const code = mcp_verbs.run(.{
         .gpa = alloc,
         .out = &out.interface,
@@ -2871,6 +2872,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
         .home = home,
         .workspace_root = workspace_root,
         .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+        .kept_sign_outs = .{ .transport = cfg.gateway_provider.oauth_transport, .notice = wait_line.notice() },
     }, args);
     return switch (code) {
         0 => .handled_success,
@@ -4489,6 +4491,7 @@ const LogoutWaitLine = struct {
     const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
     const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
     const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
+    const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
 
     fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
         if (builtin.is_test or !stderrIsTerminal()) return null;

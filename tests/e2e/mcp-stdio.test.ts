@@ -110,7 +110,8 @@ type RootOptions = {
     | "startup_exit_after_delay"
     | "startup_garbage"
     | "exit_after_result"
-    | "typed_arguments";
+    | "typed_arguments"
+    | "refused_reply";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
   /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
@@ -134,6 +135,16 @@ type RootOptions = {
   resourceTtlMs?: number;
   captureEnvironment?: boolean;
   image?: Buffer;
+  /** For mode "refused_reply": what the server does with each tools/call, in order. */
+  refused?: { calls: RefusedCall[] };
+};
+
+/** A line fx refuses and cannot attach to a call, then what the server does (mcp-legacy-stdio.mjs says). */
+type RefusedCall = {
+  bad?: "utf8_last" | "deep_last" | "garbage" | "cut";
+  then?: "silent" | "exit";
+  slowMs?: number;
+  progressEveryMs?: number;
 };
 
 function createRoot(
@@ -214,6 +225,7 @@ function createRoot(
               options.legacyRejectNewerInitialize ? "1" : undefined,
             FX_MCP_DRAFT7_PATTERN: options.draft7Pattern,
             FX_MCP_URL_REQUIRED_OPERATION: options.urlRequiredOperation,
+            FX_MCP_REFUSED: options.refused ? JSON.stringify(options.refused) : undefined,
             FX_MCP_ENV_CAPTURE: options.captureEnvironment
               ? environmentCapturePath
               : undefined,
@@ -291,6 +303,39 @@ function startToolGateway(finalText: string) {
   });
 }
 
+/**
+ * One `fx ask` against the legacy fixture in refused_reply mode, with its own root, gateway and
+ * clean-up so that several can run at once. The model calls the tool once per entry in `calls`.
+ */
+async function askRefused(label: string, calls: RefusedCall[], timeoutMs = 75_000) {
+  const root = createRoot(label, LEGACY_FIXTURE, { mode: "refused_reply", refused: { calls } });
+  const ids = calls.map((_, index) => `call_mcp${index === 0 ? "" : index + 1}`);
+  const activeGateway = startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    ...ids.map((id) => fakeGatewayToolCall(id, "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } })),
+    fakeGatewayFinalText("Refused reply complete."),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const started = Date.now();
+  try {
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the refused-reply fixture."],
+      { cwd: root.workspace, env: fixtureEnv(root, activeGateway), timeoutMs },
+    );
+    const body = activeGateway.requests.at(-1)?.body ?? "";
+    return {
+      code: result.code,
+      seconds: (Date.now() - started) / 1000,
+      requests: activeGateway.requests.length,
+      results: activeGateway.requests.length === ids.length + 2 ? ids.map((id) => toolResultText(body, id)) : [],
+      wire: existsSync(root.wireLogPath) ? readWire(root.wireLogPath) : [],
+      trace: existsSync(root.traceLogPath) ? readFileSync(root.traceLogPath, "utf8") : "",
+    };
+  } finally {
+    activeGateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
 function writeFakeUrlOpeners(directory: string, script: string): void {
   for (const name of ["open", "xdg-open"]) {
     writeFileSync(join(directory, name), script, { mode: 0o755 });
@@ -358,6 +403,90 @@ async function waitForTtyAskExit(
 }
 
 describe("modern MCP stdio compatibility", () => {
+  test.skipIf(!tmuxAvailable())(
+    "a toolbox run of an MCP tool streams into that tool's row, with no Using row",
+    async () => {
+      // The shell can ask, so it says so in every request's capabilities.
+      const root = createRoot("tui-streamed-toolbox-run", MODERN_FIXTURE, {
+        expectedElicitation: "both",
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let sendRest: (() => void) | undefined;
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_1", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+        fakeGatewayToolCall("call_2", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                const send = (event: object) =>
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                send({ type: "tool-input-start", id: "call_3", toolName: "toolbox" });
+                send({ type: "tool-input-delta", id: "call_3", delta: `{"run":"${TOOL_NAME}",` });
+                timer = setInterval(() => controller.enqueue(encoder.encode(": hold-toolbox-arguments\n\n")), 50);
+                sendRest = () => {
+                  clearInterval(timer);
+                  send({ type: "tool-input-delta", id: "call_3", delta: '"arguments":{"text":"third"}}' });
+                  send({ type: "tool-input-end", id: "call_3" });
+                  send({
+                    type: "tool-call",
+                    toolCallId: "call_3",
+                    toolName: "toolbox",
+                    input: { run: TOOL_NAME, arguments: { text: "third" } },
+                  });
+                  send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  controller.close();
+                };
+              },
+              cancel() {
+                clearInterval(timer);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        fakeGatewayFinalText("MCP_STREAMED_RUN_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture three times.");
+      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^[●├└] /.test(line) && line.includes(`MCP ${TOOL_NAME}`));
+      // The held call's arguments name its tool and nothing more: it waits
+      // in that tool's row, which says it runs, and shows no row of its own.
+      await tui.waitForPane((pane) => sendRest !== undefined && pane.includes(`Running MCP ${TOOL_NAME} ×3`), 20_000);
+      for (let sample = 0; sample < 6; sample += 1) {
+        const pane = await tui.capturePane();
+        expect(pane).not.toMatch(/^[●├└] Using\b/m);
+        expect(toolRows(pane)).toHaveLength(1);
+        await Bun.sleep(100);
+      }
+
+      sendRest?.();
+      const done = await tui.waitForText("MCP_STREAMED_RUN_DONE", 20_000);
+      expect(toolRows(done)).toEqual([expect.stringContaining(`Ran MCP ${TOOL_NAME} ×3`)]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    60_000,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "the TUI shows exact dynamic MCP arguments before human approval",
     async () => {
@@ -2371,6 +2500,75 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
     await expectFixtureProcessesExited(wire);
   }, 30_000);
+
+  test("fx ask ends a call that a refused line leaves silent 30 seconds later, as malformed, and cancels it; one that shows progress, or starts after the line, goes on", async () => {
+    // Each server writes a line fx refuses and cannot attach to the call (its id comes after the
+    // bad part, or it has none), then says nothing. Until now fx waited out the operation timeout,
+    // 5 minutes by default, and then said that the server did not answer.
+    const variants: Array<[string, RefusedCall]> = [
+      ["bytes that are not UTF-8, the id after them", { bad: "utf8_last", then: "silent" }],
+      ["JSON nested past the engine's limit, the id last", { bad: "deep_last", then: "silent" }],
+      ["a line with no JSON in it", { bad: "garbage", then: "silent" }],
+    ];
+    // All of them at once, so the test takes as long as its slowest wait, not their sum.
+    const [runs, progress, later] = await Promise.all([
+      Promise.all(variants.map(([, spec], index) => askRefused(`refused-grace-${index}`, [spec]))),
+      // The line, then 36 s of work with progress for the call's own token: the grace is cleared.
+      askRefused("refused-progress", [{ bad: "garbage", slowMs: 36_000, progressEveryMs: 4_000 }]),
+      // The first call ends at once; the second starts after the line and is slow with no
+      // progress at all: it gets no grace, so it returns its result after 36 s.
+      askRefused("refused-later", [{ bad: "garbage" }, { slowMs: 36_000 }]),
+    ]);
+    for (const [index, run] of runs.entries()) {
+      const what = variants[index]![0];
+      expect({ what, code: run.code, requests: run.requests }).toEqual({ what, code: 0, requests: 3 });
+      expect({ what, text: run.results[0] }).toEqual({
+        what,
+        text: expect.stringContaining("the server's answer was malformed"),
+      });
+      expect(run.results[0]).not.toContain("operation timeout");
+      // About 30 s after the line: not at once, and nowhere near the 300 s default.
+      expect({ what, late: run.seconds > 28, early: run.seconds < 55 }).toEqual({ what, late: true, early: true });
+      const call = run.wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+      const cancelled = run.wire.find((entry) => entry.message.method === "notifications/cancelled");
+      expect({ what, cancelled: cancelled?.message.params?.requestId }).toEqual({ what, cancelled: call?.message.id });
+      // The debug trace says what ended the call and how long the line was. Nothing of the line.
+      expect({ what, line: run.trace.match(/MCP call ended server=fixture transport=stdio code=malformed reason=unreadable_line bytes=\d+/)?.[0] }).toEqual({
+        what,
+        line: expect.stringContaining("code=malformed"),
+      });
+      for (const text of ["xxxxxxxxxxxxxxxxxxxx", '"jsonrpc"', "structuredContent", '{"a":{"a":']) {
+        expect({ what, text, traced: run.trace.includes(text) }).toEqual({ what, text, traced: false });
+      }
+    }
+    // A call that showed progress, or started after the line, was not ended: no such line.
+    expect(progress.trace).not.toContain("code=malformed");
+    expect(later.trace).not.toContain("code=malformed");
+    expect({ code: progress.code, requests: progress.requests }).toEqual({ code: 0, requests: 3 });
+    expect(progress.results[0]).toContain(LEGACY_RESULT);
+    expect(progress.seconds).toBeGreaterThan(33);
+    expect({ code: later.code, requests: later.requests }).toEqual({ code: 0, requests: 4 });
+    expect(later.results[0]).toContain(LEGACY_RESULT);
+    expect(later.results[1]).toContain(LEGACY_RESULT);
+    expect(later.results[1]).not.toContain("malformed");
+    expect(later.seconds).toBeGreaterThan(33);
+  }, 90_000);
+
+  test("fx ask still returns a valid reply that follows a refused line inside the grace, and ends at once when the server exits", async () => {
+    const [late, notified, cut] = await Promise.all([
+      askRefused("refused-valid-late", [{ bad: "utf8_last", slowMs: 3_000 }], 30_000),
+      askRefused("refused-notification", [{ bad: "garbage" }], 30_000),
+      askRefused("refused-cut", [{ bad: "cut", then: "exit" }], 30_000),
+    ]);
+    for (const run of [late, notified]) {
+      expect({ code: run.code, requests: run.requests }).toEqual({ code: 0, requests: 3 });
+      expect(run.results[0]).toContain(LEGACY_RESULT);
+      expect(run.seconds).toBeLessThan(20);
+    }
+    expect({ code: cut.code, requests: cut.requests }).toEqual({ code: 0, requests: 3 });
+    expect(cut.results[0]).toContain("the server went away");
+    expect(cut.seconds).toBeLessThan(20);
+  }, 60_000);
 
   test.skipIf(!tmuxAvailable())(
     "the TUI calls the modern stdio fixture through the shared runtime",
@@ -4643,6 +4841,67 @@ describe("fx mcp call", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "in the TUI, the MCP row of a command's calls comes back after --resume last, without their arguments or results",
+    async () => {
+      const root = bridgeRoot("bridge-tui-resumed-rows", {}, { mode: "paged", expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command: pageLoop }),
+        fakeGatewayFinalText("BRIDGE_ROWS_SAVED"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Page through the list.");
+      await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
+      await tui.waitForComposer(10_000);
+      expect(await tui.captureFullScrollback()).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // The resumed session shows the rows the live one did, in the
+      // command's group, and asks the model nothing.
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("BRIDGE_ROWS_SAVED", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      expect(resumed).toContain("● Used MCP tools, ran a command ✓");
+      expect(resumed.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
+      expect(resumed).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(resumed).not.toContain("Running MCP");
+
+      // Ctrl+O shows each call's row, and neither the arguments the
+      // command sent nor the pages the tool returned.
+      await tui.sendKeys("C-o");
+      const full = await tui.waitForPane((pane) => pane.split(`Ran MCP ${TOOL_NAME}`).length === 4, 10_000);
+      expect(full).not.toContain('"text":"1"');
+      expect(full).not.toContain("item-0");
+      await tui.sendKeys("C-o");
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(activeGateway.requests).toHaveLength(2);
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "in the TUI, a call that runs when the user cancels shows as running, then as cancelled",
     async () => {
       const root = bridgeRoot("bridge-tui-cancel", {}, { mode: "stall_operation", operationTimeoutMs: 30_000, expectedElicitation: "both" });
@@ -4654,13 +4913,14 @@ describe("fx mcp call", () => {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
+      const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 140,
         height: 40,
         stderrPath,
-        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+        env,
       });
 
       await tui.waitForComposer(15_000);
@@ -4675,8 +4935,34 @@ describe("fx mcp call", () => {
       // The session goes on.
       await tui.sendText("Go on.");
       await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // A resume shows the call as it ended, cancelled.
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("BRIDGE_AFTER_CANCEL", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      expect(resumed).toContain(`Cancelled ${TOOL_NAME}`);
+      expect(resumed).not.toContain("Running MCP");
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
-    60_000,
+    90_000,
   );
 });

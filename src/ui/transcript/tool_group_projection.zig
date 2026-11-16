@@ -14,6 +14,7 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const ascii_case = @import("../../core/shared/ascii_case.zig");
 const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
+const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
@@ -1961,6 +1962,23 @@ noinline fn storyRowCallFailed(scratch: std.mem.Allocator, detail: ?*const ToolD
     return isShellCommandCall(scratch, record) and storyCallFailed(detail);
 }
 
+/// A running toolbox call's identity by the MCP tool its status names, such
+/// as "Running MCP mcp_x", while its arguments, which name the tool, have
+/// not arrived, so it joins that tool's row at once instead of showing on a
+/// row of its own that folds into it later.
+fn streamingToolboxIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    if (identity.kind != .mcp) return identity;
+    const record = detail orelse return identity;
+    if (record.outcome != null or !std.mem.eql(u8, record.tool_name, "toolbox")) return identity;
+    if (storyArgString(scratch, record, "run") != null) return identity;
+    const phrase = try entryStatus(scratch, entry) orelse return identity;
+    const prefix = tooling_presentation.mcp_running_label ++ " ";
+    if (!std.mem.startsWith(u8, phrase, prefix)) return identity;
+    const name = std.mem.trim(u8, phrase[prefix.len..], " \t\r\n");
+    if (name.len == 0) return identity;
+    return .{ .kind = .mcp, .key = name };
+}
+
 fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !StoryIdentity {
     const record = detail orelse return .{};
     // A deferred call waits for project instructions and has not run, so it
@@ -2121,7 +2139,7 @@ fn collectStoryRows(
         // runs once they load shows instead, so the hold gets no row; Ctrl+O
         // still shows it.
         if (detail) |record| if (record.outcome == .deferred) continue;
-        const identity = try storyIdentity(scratch, detail);
+        const identity = try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -7002,6 +7020,26 @@ test "input to a running session and its stop are not new commands" {
     const follow_bytes = follow_ups.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.startsWith(u8, follow_bytes, "● Stopped "));
     try std.testing.expect(std.mem.endsWith(u8, follow_bytes, " · 2 calls ✓") or std.mem.endsWith(u8, follow_bytes, " · 2 calls"));
+}
+
+test "a running toolbox run of an MCP tool joins that tool's row before its arguments arrive" {
+    // Its status names the tool first; its arguments, which name it too,
+    // come later, so it must not show on its own row and fold away.
+    const alloc = std.testing.allocator;
+    const run_args = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran MCP mcp_fixture_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running MCP mcp_fixture_echo\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast(run_args) },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Running MCP mcp_fixture_echo ×3", std.mem.trim(u8, text, "\n"));
 }
 
 test "toolbox lookups and wrapped arguments name what the group did" {

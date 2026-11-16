@@ -285,6 +285,9 @@ test.skipIf(!tmuxAvailable())(
       expect(message).toBeGreaterThan(0);
       // The first read keeps its own row, without the later one.
       expect(lines.slice(0, message)).toContain("├ Read README.md");
+      // The failed edit names its file, also when the saved session is
+      // read back.
+      expect(lines.slice(0, message)).toContain("└ Couldn't edit README.md");
       expect(lines.some((line) => line.includes("· 2 parts"))).toBe(false);
       // The later read shows under the message that asked for it.
       expect(lines.slice(message + 1)).toContain("● Read README.md");

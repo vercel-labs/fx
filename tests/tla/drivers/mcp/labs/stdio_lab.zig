@@ -460,6 +460,15 @@ const Lab = struct {
                     } else i += 1;
                 }
             },
+            .disarm_refused => |epoch| {
+                var i: usize = 0;
+                while (i < lab.timer_count) {
+                    if (lab.timers[i].timer.kind == .refused and lab.timers[i].timer.generation == epoch) {
+                        lab.timer_count -= 1;
+                        lab.timers[i] = lab.timers[lab.timer_count];
+                    } else i += 1;
+                }
+            },
         };
         if (lost) |id| try lab.stepRequest(.{ .transport_lost = id });
     }

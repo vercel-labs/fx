@@ -2768,6 +2768,15 @@ const App = struct {
         try self.shell.attachHistoricalToolCallWithoutResult(self.alloc, entry_id, call);
     }
 
+    pub fn attachHistoricalBridgeCall(
+        self: *App,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.shell.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
+    }
+
     pub fn attachHistoricalCommandOutput(self: *App, entry_id: u32) void {
         self.shell.attachHistoricalCommandOutput(self.alloc, entry_id);
     }
@@ -5426,6 +5435,7 @@ test {
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
+    _ = @import("core/workspace/auto_review_metrics.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
@@ -5507,6 +5517,7 @@ test {
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/pending_revocation.zig");
+    _ = @import("core/mcp_host/kept_sign_outs.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");

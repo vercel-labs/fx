@@ -73,6 +73,7 @@
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "tool_story_rows", "module": "fx", "test": "story rows fit the width and stay plain text for fuzzed arguments and output", "iterations": 12000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
+    {"name": "trace_review_records", "module": "fx", "test": "trace review and setup records stay valid JSON lines for fuzzed text", "iterations": 12000},
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
     {"name": "subagent_task_line", "module": "fx", "test": "trace subagent records stay valid JSON lines and never show part of a planted secret for fuzzed text", "iterations": 1200},
     {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
@@ -84,6 +85,7 @@
     {"name": "gateway_team_display", "module": "fx", "test": "fuzzed team slugs and ids show only a valid team name", "iterations": 2000000},
     {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
     {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
-    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000}
+    {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
+    {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000}
   ]
 }

@@ -1522,6 +1522,79 @@ pub fn freeModelCallRecords(alloc: std.mem.Allocator, records: []const ModelCall
     alloc.free(records);
 }
 
+/// How a call a command made through `fx mcp call` ended.
+pub const BridgeCallOutcome = enum {
+    completed,
+    failed,
+    cancelled,
+
+    pub fn toolOutcome(self: BridgeCallOutcome) ToolOutcomeKind {
+        return switch (self) {
+            .completed => .completed,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        };
+    }
+};
+
+/// A call a command made through `fx mcp call`, which the TUI showed as a
+/// row in its shell call's group. The session keeps it so a resume shows
+/// that row again: the tool's name and how the call ended, never its
+/// arguments or its result. Display data, never sent to the model.
+pub const BridgeCallRecord = struct {
+    /// The shell call whose command made the call.
+    call_id: []const u8,
+    /// The bridge's id for the call.
+    request_id: []const u8,
+    tool: []const u8,
+    outcome: BridgeCallOutcome,
+};
+
+/// Whether a record may be saved and shown: each string short, valid UTF-8
+/// and free of control characters, as a model call record's are
+/// (`validModelCallText`).
+pub fn validBridgeCallRecord(record: BridgeCallRecord) bool {
+    inline for (.{ record.call_id, record.request_id, record.tool }) |text| {
+        if (!validModelCallText(text)) return false;
+    }
+    return true;
+}
+
+/// Caller owns the copy's strings; free them with `freeBridgeCallRecordStrings`.
+pub fn dupeBridgeCallRecord(alloc: std.mem.Allocator, record: BridgeCallRecord) !BridgeCallRecord {
+    const call_id = try alloc.dupe(u8, record.call_id);
+    errdefer alloc.free(call_id);
+    const request_id = try alloc.dupe(u8, record.request_id);
+    errdefer alloc.free(request_id);
+    return .{ .call_id = call_id, .request_id = request_id, .tool = try alloc.dupe(u8, record.tool), .outcome = record.outcome };
+}
+
+pub fn freeBridgeCallRecordStrings(alloc: std.mem.Allocator, record: BridgeCallRecord) void {
+    alloc.free(record.call_id);
+    alloc.free(record.request_id);
+    alloc.free(record.tool);
+}
+
+/// Caller owns the copy; free it with `freeBridgeCallRecords`.
+pub fn dupeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) ![]BridgeCallRecord {
+    const copies = try alloc.alloc(BridgeCallRecord, records.len);
+    var done: usize = 0;
+    errdefer {
+        for (copies[0..done]) |copy| freeBridgeCallRecordStrings(alloc, copy);
+        alloc.free(copies);
+    }
+    for (records, copies) |record, *copy| {
+        copy.* = try dupeBridgeCallRecord(alloc, record);
+        done += 1;
+    }
+    return copies;
+}
+
+pub fn freeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) void {
+    for (records) |record| freeBridgeCallRecordStrings(alloc, record);
+    alloc.free(records);
+}
+
 pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
@@ -1552,6 +1625,11 @@ pub const ExecutionMemory = struct {
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
     model_calls: []ModelCallRecord = &.{},
+    /// The calls the turn's commands made through `fx mcp call`, in the
+    /// order they ended, each naming its shell call. Only a resumed turn
+    /// holds them, for the rows its replay shows; display data, never part
+    /// of what the model is sent.
+    bridge_calls: []BridgeCallRecord = &.{},
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
@@ -3190,6 +3268,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
+    errdefer freeModelCallRecords(alloc, model_calls);
+    const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -3198,10 +3278,12 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .runtime_context = runtime_context,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
+        .bridge_calls = bridge_calls,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
+    freeBridgeCallRecords(alloc, memory.bridge_calls);
     freeModelCallRecords(alloc, memory.model_calls);
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
