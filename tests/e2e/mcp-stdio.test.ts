@@ -4856,7 +4856,16 @@ describe("fx mcp call", () => {
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       await tui.waitForStableComposer(10_000);
-      expect(await tui.captureFullScrollback()).not.toContain("Running MCP");
+      const liveScreen = await tui.captureFullScrollback();
+      expect(liveScreen).not.toContain("Running MCP");
+      // The compact rows of the cancelled turn: its command by its short
+      // name, in one group with the call.
+      const compactRows = (screen: string) =>
+        screen.split("\n").map((line) => line.trimEnd()).filter((line) => /^\s*[●├└▪] /.test(line));
+      const live = compactRows(liveScreen);
+      expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
+      expect(live).toContain(`└ Cancelled ${TOOL_NAME}`);
+      expect(live.filter((line) => !line.startsWith("▪")).join("\n")).not.toContain("> out.txt");
 
       // The session goes on.
       await tui.sendText("Go on.");
@@ -4881,7 +4890,11 @@ describe("fx mcp call", () => {
       await tui.waitForComposer(15_000);
       await tui.waitForText("BRIDGE_AFTER_CANCEL", 15_000);
       const resumed = await tui.captureFullScrollback();
-      expect(resumed).toContain(`Cancelled ${TOOL_NAME}`);
+      // The cancelled turn's rows read as they did live, the command's row
+      // and the call's in one group.
+      const followUp = resumed.indexOf("┃ Go on.");
+      expect(followUp).toBeGreaterThan(0);
+      expect(compactRows(resumed.slice(0, followUp))).toEqual(live);
       expect(resumed).not.toContain("Running MCP");
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendText("/quit");

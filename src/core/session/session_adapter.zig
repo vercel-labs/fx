@@ -2576,6 +2576,10 @@ pub const Session = struct {
             }
         }
         for (events, encoded, reviews) |event, bytes, review| {
+            // Before the interruption, which ends the turn when replay reads it.
+            if (try encodeCancelledCommand(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, cancelled_command_type, data) });
+            }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
             if (event == .user and author != .user) {
@@ -5220,6 +5224,10 @@ noinline fn replay(
                         try attachBridgeCall(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, cancelled_command_type)) {
+                        try noteCancelledCommand(src, pa, &builder, piece);
+                        continue;
+                    }
                     if (std.mem.eql(u8, piece.type, author_type)) {
                         try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
                         continue;
@@ -5722,6 +5730,56 @@ fn attachBridgeCall(src: Source, a: Allocator, builder: *session_log.Conversatio
         return;
     };
     try builder.appendBridgeCall(record);
+}
+
+/// The item right before an `interruption` piece when the turn cancelled a
+/// command that saved no output, `{"call_id":…}`: the piece names neither a
+/// command replay nor an artifact, so only this says the command ran, and a
+/// resume shows its row (D100). Older fx versions reject an unknown field in
+/// the piece but skip an unknown item, so they read the turn as before.
+const cancelled_command_type = "cancelled_command";
+
+const CancelledCommandData = struct { call_id: []const u8 };
+
+/// The `cancelled_command` item data for `event`, or null when it needs
+/// none. The data is owned by `a`.
+fn encodeCancelledCommand(a: Allocator, event: Event) !?[]u8 {
+    const interruption = switch (event) {
+        .interrupted => |value| value,
+        else => return null,
+    };
+    const call_id = interruption.cancelled_command_call_id orelse return null;
+    if (call_id.len == 0 or call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(CancelledCommandData{ .call_id = call_id }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Gives the turn the cancelled command a `cancelled_command` item names.
+/// One that can't be read is logged and left out, and the turn reads as it
+/// did before the item existed.
+fn noteCancelledCommand(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_cancelled_command_unreadable session={s} err={s} dropped=cancelled_command_row", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const call_id = decodeCancelledCommand(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_cancelled_command_invalid session={s} dropped=cancelled_command_row", .{src.id});
+        return;
+    };
+    try builder.noteCancelledCommand(call_id);
+}
+
+/// The call id a `cancelled_command` item's data names, or null when the
+/// data isn't one. Fields a newer fx adds are ignored.
+fn decodeCancelledCommand(a: Allocator, data: []const u8) ?[]const u8 {
+    const value = json_decode.parseFromSliceLeaky(CancelledCommandData, a, data, .{ .ignore_unknown_fields = true }) catch return null;
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    return value.call_id;
 }
 
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
@@ -8267,6 +8325,68 @@ test "the calls a command made through fx mcp call come back on resume with thei
         try testing.expectEqual(want.outcome, got.outcome);
     }
     try testing.expectEqual(@as(usize, 1), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "a command cancelled before it printed anything keeps its row on resume (D100)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const silent: types.ToolCall = .{ .id = "call-silent", .name = "shell", .arguments_json = "{\"command\":\"touch .ready && sleep 30\"}" };
+    const printed: types.ToolCall = .{ .id = "call-printed", .name = "shell", .arguments_json = "{\"command\":\"echo hi; sleep 30\"}" };
+    const lang = types.ConversationLanguage.default();
+    // A command that printed nothing, one whose output was kept, and a
+    // turn cancelled with no command.
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("silent") }, .tool_call = silent, .cancelled_command = .{}, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("printed") }, .tool_call = printed, .cancelled_command = .{ .command_artifact_handle = "fx-command-printed.log" }, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("no command") }, .tool_call = printed, .terminal_reason = .cancelled } }, lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Only the command with no saved output gets the item: its call id and
+    // nothing else, right before the interruption that ends its turn.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"" ++ cancelled_command_type ++ "\""));
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ cancelled_command_type ++ "\",\"data\":{\"call_id\":\"call-silent\"},") orelse return error.TestExpectedItem;
+    const interruption_at = std.mem.find(u8, bytes, "\"type\":\"interruption\"") orelse return error.TestExpectedInterruption;
+    try testing.expect(item_at < interruption_at);
+    // Its own line, the one right before the interruption's.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[item_at..interruption_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"interruption\",\"data\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,") != null);
+    // The piece itself is the same bytes as before the item existed.
+    try testing.expect(std.mem.find(u8, bytes, "cancelled_command_call_id") == null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const kept = restored.history[0].interrupted.cancelled_command orelse return error.TestExpectedPresentation;
+    try testing.expect(kept.output_replay == null);
+    try testing.expect(kept.command_artifact_handle == null);
+    try testing.expectEqualStrings("call-silent", restored.history[0].interrupted.tool_call.?.id);
+    try testing.expectEqualStrings("fx-command-printed.log", restored.history[1].interrupted.cancelled_command.?.command_artifact_handle.?);
+    try testing.expect(restored.history[2].interrupted.cancelled_command == null);
+}
+
+test "replay reads a cancelled command item a newer fx wrote and leaves out one it can't read (D100)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("c", decodeCancelledCommand(a, "{\"call_id\":\"c\",\"exit_signal\":15}").?);
+    // An empty or missing call id, one too long, and bytes that aren't JSON.
+    try testing.expect(decodeCancelledCommand(a, "{\"call_id\":\"\"}") == null);
+    try testing.expect(decodeCancelledCommand(a, "{\"tool\":\"shell\"}") == null);
+    const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
+    @memset(long_id, 'c');
+    try testing.expect(decodeCancelledCommand(a, try std.fmt.allocPrint(a, "{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(decodeCancelledCommand(a, "not json") == null);
 }
 
 test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {
