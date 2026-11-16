@@ -1861,6 +1861,14 @@ fn fileMutationPermissionRequest(
             .intent = intent,
             .preview = prepared.preview,
             .scope = offer.scope,
+            .change = .{
+                .path = prepared.target_path,
+                .old_text = switch (prepared.preimage) {
+                    .absent => null,
+                    .present => |present| present.content,
+                },
+                .new_text = prepared.after_content,
+            },
         },
     };
     _ = try permission_request.fileRequestFootprint(request);

@@ -14,11 +14,24 @@ const max_subagent_origin_bytes: usize = 128;
 pub const FileApprovalIntent = file_mutation_contract.FileApprovalIntent;
 pub const FileApprovalScope = file_mutation_contract.FileApprovalScope;
 
+/// A file's whole text before and after a prepared change.
+pub const FileChange = struct {
+    /// Absolute.
+    path: []const u8,
+    /// Null when the change creates the file.
+    old_text: ?[]const u8,
+    new_text: []const u8,
+};
+
 pub const FileApprovalRequest = struct {
     kind: file_mutation_contract.Kind,
     intent: FileApprovalIntent,
     preview: diff_mod.FileChangePreview,
     scope: FileApprovalScope,
+    /// The whole file before and after the prepared change, for a host that
+    /// shows it in full, such as an ACP client's `diff`. Borrowed from the
+    /// prepared mutation for the prompt call only; a copy leaves it out.
+    change: ?FileChange = null,
 };
 
 pub const RequestOrigin = union(enum) {
@@ -623,6 +636,22 @@ test "owned permission request deep copies every byte range" {
             view.file.?.scope.external_tree.ptr,
     );
     try std.testing.expect(PermissionRequest.eql(request, view));
+}
+
+test "an owned file request leaves out the borrowed whole-file change" {
+    const alloc = std.testing.allocator;
+    var owned = try OwnedPermissionRequest.dupe(alloc, .{
+        .label = "file_mutation",
+        .file = .{
+            .kind = .edit,
+            .intent = .mutation,
+            .preview = samplePreview(),
+            .scope = .workspace_files,
+            .change = .{ .path = "/work/note.txt", .old_text = "beta\n", .new_text = "BETA\n" },
+        },
+    });
+    defer owned.deinit(alloc);
+    try std.testing.expect(owned.file.?.change == null);
 }
 
 test "file request footprint counts root and owned backing exactly once" {

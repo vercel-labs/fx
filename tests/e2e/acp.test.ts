@@ -2961,6 +2961,86 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP shows an edit's whole file before and after as a diff, in its approval and its completed update",
+    async () => {
+      const lines = () => client.rawLines.map((line) => JSON.parse(line));
+      const diffOf = (content: any[] | undefined) => content?.find((block) => block.type === "diff");
+      for (const answer of ["allow_once", "reject_once"] as const) {
+        const root = createIsolatedRoot("fx-acp-tool-diffs-");
+        writeFileSync(join(root.workspace, "keep.txt"), "keep\n");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("diff_edit_1", "edit_file", { path: "keep.txt", old_string: "keep", new_string: "kept" }),
+          fakeGatewayToolCall("diff_write_1", "write_file", { path: "made.txt", content: "made\n" }),
+          finalText("ACP_DIFFS_DONE"),
+        ]);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          client.setPermissionOption(answer);
+          await startAutoSession(client);
+          await client.request("session/set_mode", { modeId: "ask" }, 4);
+          expect((await runPrompt(client, "Edit keep.txt, then write made.txt.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+          const asked = lines().filter((m) => m.method === "session/request_permission").map((m) => m.params.toolCall);
+          const finals = lines()
+            .filter((m) => m.method === "session/update" && m.params.update.sessionUpdate === "tool_call_update" && ["completed", "failed"].includes(m.params.update.status))
+            .map((m) => m.params.update);
+          // The approval shows the change it asks to make: the whole file.
+          expect(diffOf(asked.find((call) => call.toolCallId === "diff_edit_1")?.content)).toEqual({
+            type: "diff", path: join(root.workspace, "keep.txt"), oldText: "keep\n", newText: "kept\n",
+          });
+          const edit = finals.find((update) => update.toolCallId === "diff_edit_1");
+          if (answer === "allow_once") {
+            // The completed update carries the diff, then the text result.
+            expect(edit.status).toBe("completed");
+            expect(edit.content[0]).toEqual({ type: "diff", path: join(root.workspace, "keep.txt"), oldText: "keep\n", newText: "kept\n" });
+            expect(edit.content[1].type).toBe("content");
+            const made = finals.find((update) => update.toolCallId === "diff_write_1");
+            expect(diffOf(made.content)).toEqual({ type: "diff", path: join(root.workspace, "made.txt"), oldText: null, newText: "made\n" });
+            expect(readFileSync(join(root.workspace, "keep.txt"), "utf8")).toBe("kept\n");
+          } else {
+            // A rejected edit fails with text only.
+            expect(edit.status).toBe("failed");
+            expect(diffOf(edit.content)).toBeUndefined();
+            expect(readFileSync(join(root.workspace, "keep.txt"), "utf8")).toBe("keep\n");
+          }
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP leaves the diff out of a write over 1 MiB, which keeps its text result",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-tool-diff-limit-");
+      const big = "x".repeat((1 << 20) + 16);
+      const gateway = startFakeGateway(
+        [fakeGatewayToolCall("diff_big_1", "write_file", { path: "big.txt", content: big }), finalText("ACP_BIG_DONE")],
+        { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 4_000_000 }] },
+      );
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const { promptResult, messages } = await runPrompt(client, "Write big.txt.", TIMEOUT);
+        expect(promptResult.result.stopReason).toBe("end_turn");
+        const done = messages.find((m) => m.method === "session/update" && m.params.update.toolCallId === "diff_big_1" && m.params.update.status === "completed");
+        expect(done.params.update.content.map((block: any) => block.type)).toEqual(["content"]);
+        expect(readFileSync(join(root.workspace, "big.txt"), "utf8")).toBe(big);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP session/load replays structured tool call frames",
     async () => {
       const root = createIsolatedRoot("fx-acp-load-tool-replay-");
