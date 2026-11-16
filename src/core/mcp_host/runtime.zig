@@ -1461,6 +1461,13 @@ pub const Runtime = struct {
                     const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
                     if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
                 }
+                // The server sent something fx could not read: a 2xx body that is no JSON-RPC message,
+                // or a line that no request named, whose grace ran out. Nothing of it is logged,
+                // only its length.
+                if (result == .ended and result.ended.outcome == .malformed and (c.refused_body or c.refused_bytes > 0)) {
+                    const s = r.resolved.servers[i];
+                    debug_trace.logf("mcp", "MCP call ended server={s} transport={s} code=malformed reason={s} bytes={d}", .{ s.name, @tagName(s.transport), if (c.refused_body) "unreadable_body" else "unreadable_line", c.refused_bytes });
+                }
                 if (r.holdForUrls(i, req, result)) return;
                 r.finish(req, .{ .call = result });
             },
