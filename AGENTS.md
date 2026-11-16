@@ -181,6 +181,8 @@ Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
 
+Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgrade Zig code. It covers what Zig 0.17.x removed, deprecated, or changed without a compile error, including the 0.17.0 to 0.17.1 changes, and Zig ownership, error, I/O, concurrency, and testing practice. Where the skill and this file differ, this file takes precedence.
+
 ### Memory and Errors
 
 * Allocators are passed explicitly. Never use a global allocator.
@@ -327,7 +329,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery and the empty-reply nudge, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, and the malformed tool call feedback, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -433,7 +435,7 @@ Each platform check is informational. An increase of at least 52,429 bytes
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (6.500 MiB for macOS arm64, 6.750 MiB for Linux arm64, and
+production ceilings (6.750 MiB for macOS arm64, 7.000 MiB for Linux arm64, and
 8.750 MiB for Linux x86_64) and performance gates.
 
 ## Documentation

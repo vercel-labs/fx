@@ -445,7 +445,8 @@ pub fn commandError(err: anyerror) CommandError {
         error.SessionRecoveryNotNeeded => error.SessionRecoveryNotNeeded,
         error.SessionRecoveryBoundaryInvalid, error.SessionRecoveryRequiresCurrentSchema => error.SessionRecoveryBoundaryInvalid,
         error.SessionRecoveryUnsupportedSchema => error.UnsupportedSessionSchema,
-        error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
+        // A v1 file others can write, say: unsafe, not damaged.
+        error.DurablePathUnsafe, error.SessionPathUnsafe, error.PrivateStatePermissionsUnsupported => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig => blk: {
@@ -1049,6 +1050,13 @@ pub const Doctor = struct {
     checked: usize = 0,
     /// Checked sessions with a damaged line or a stale snapshot.
     damaged: std.ArrayList([]u8) = .empty,
+    /// Sessions within the limit whose check the caller's stop cut short or
+    /// never started, with no damage found in what was read.
+    unfinished: usize = 0,
+    /// The caller's stop ended the scan of the sessions an older fx saved,
+    /// so `unconverted`, `keeps_left_out`, and `kept_children` count only
+    /// the folders read before it.
+    v1_incomplete: bool = false,
     /// Side folders removed because their session is gone.
     removed: usize = 0,
     /// Side folders whose session is gone that `fx doctor --fix` would
@@ -1105,9 +1113,49 @@ pub const OrphanSweep = enum {
 /// folders whose session is gone, counting or removing them as `orphans`
 /// says. Rebuilds nothing. Caller owns the report.
 pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphans: OrphanSweep) !Doctor {
+    return doctorWith(store, alloc, .{ .limit = limit, .now_ms = now_ms, .orphans = orphans });
+}
+
+pub const DoctorOptions = struct {
+    /// The most sessions whose log is checked.
+    limit: usize,
+    now_ms: i64,
+    orphans: OrphanSweep,
+    /// `hash` reads every blob; `exists` only checks that each is a file.
+    blobs: @FieldType(sm.VerifyOptions, "blobs") = .hash,
+    /// When it says stop, the session being checked and the ones after it
+    /// are counted in `Doctor.unfinished`, not checked.
+    stop: ?sm.Stop = null,
+    /// Told before each session's check, with how many are done and how
+    /// many will be checked, so a long check can show where it is.
+    progress: ?Progress = null,
+
+    pub const Progress = struct {
+        context: *anyopaque,
+        report: *const fn (context: *anyopaque, done: usize, total: usize) void,
+    };
+
+    fn stopRequested(options: DoctorOptions) bool {
+        return sm.Stop.now(options.stop);
+    }
+
+    fn tell(options: DoctorOptions, done: usize, total: usize) void {
+        const progress = options.progress orelse return;
+        progress.report(progress.context, done, total);
+    }
+};
+
+/// `doctor`, with the blob check, stop, and progress `options` choose.
+pub fn doctorWith(store: *Store, alloc: Allocator, options: DoctorOptions) !Doctor {
     var report: Doctor = .{};
     errdefer report.deinit(alloc);
     var latest_ms: u64 = 0;
+    // The sessions to check, listed first so progress can say how many.
+    var to_check: std.ArrayList([]u8) = .empty;
+    defer {
+        for (to_check.items) |id| alloc.free(id);
+        to_check.deinit(alloc);
+    }
     var cursor: ?sm.ListCursor = null;
     while (true) {
         var page = try store.manager.list(alloc, .all, cursor, list_page_size);
@@ -1121,33 +1169,59 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphan
                 report.latest = id;
                 latest_ms = item.updated_ms;
             }
-            if (report.checked == limit) continue;
-            report.checked += 1;
-            const verified = store.manager.verify(item.id) catch |err| switch (err) {
-                error.NotFound => continue,
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ item.id, @errorName(err) });
-                    try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
-                    continue;
-                },
-            };
-            if (verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0) try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
+            if (to_check.items.len == options.limit) continue;
+            try to_check.ensureUnusedCapacity(alloc, 1);
+            to_check.appendAssumeCapacity(try alloc.dupe(u8, item.id));
         }
         cursor = page.next orelse break;
     }
-    try doctorV1(store, alloc, &report, limit);
-    report.kept_children = try keptChildren(store, alloc);
+    for (to_check.items, 0..) |id, done| {
+        options.tell(done, to_check.items.len);
+        if (options.stopRequested()) {
+            report.unfinished += 1;
+            continue;
+        }
+        const verified = store.manager.verifyWith(id, .{ .blobs = options.blobs, .stop = options.stop }) catch |err| switch (err) {
+            error.NotFound => {
+                report.checked += 1;
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                report.checked += 1;
+                debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ id, @errorName(err) });
+                try report.damaged.append(alloc, try alloc.dupe(u8, id));
+                continue;
+            },
+        };
+        // What the check read before it stopped still reports damage.
+        const damaged = verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0;
+        if (damaged) try report.damaged.append(alloc, try alloc.dupe(u8, id));
+        if (verified.stopped_at != null and !damaged) {
+            debug_trace.logf("session", "event=sessions_v2_doctor_stopped session={s} at={d}", .{ id, verified.stopped_at.? });
+            report.unfinished += 1;
+        } else report.checked += 1;
+    }
+    options.tell(to_check.items.len, to_check.items.len);
+    const limit = options.limit -| report.unfinished;
+    try doctorV1(store, alloc, &report, limit, options.stop);
+    var kept_complete = true;
+    report.kept_children = try keptChildrenUntil(store, alloc, options.stop, &kept_complete);
+    if (!kept_complete) report.v1_incomplete = true;
     for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
-    try store.sweepFiles(alloc, &report, now_ms, orphans);
+    try store.sweepFiles(alloc, &report, options.now_ms, options.orphans);
     return report;
 }
 
 /// Counts the roots an older fx saved that v2 does not hold yet, and names
 /// each checked one that can't be converted with what `fx session recover`
 /// copies of it (D73). Reads only; a busy family is left out.
-fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !void {
-    const roots = v1_conversion.rootIds(alloc, store.home) catch |err| switch (err) {
+fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize, stop: ?sm.Stop) !void {
+    var complete = true;
+    defer if (!complete) {
+        report.v1_incomplete = true;
+    };
+    const roots = v1_conversion.rootIdsUntil(alloc, store.home, stop, &complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("session", "event=doctor_v1_unlisted err={s}", .{@errorName(err)});
@@ -1159,6 +1233,10 @@ fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !voi
         alloc.free(roots);
     }
     for (roots) |root| {
+        if (sm.Stop.now(stop)) {
+            complete = false;
+            break;
+        }
         if (store.manager.peek(alloc, root.id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -1394,6 +1472,17 @@ const BlobHost = struct {
         defer host.mutex.unlock(io);
         if (host.pending.items.len > 0) debug_trace.logf("session", "event=sessions_v2_blobs_unlisted session={s} count={d}", .{ host.id, host.pending.items.len });
         if (host.records_generation != host.records_written) debug_trace.logf("session", "event=sessions_v2_records_unlisted session={s} count={d}", .{ host.id, host.records_added.items.len });
+    }
+
+    /// A page of the session's log for a reader that holds the host: through
+    /// the open session, or through the process's manager once it closed.
+    /// A close waits for a read in flight, as it waits for a store.
+    fn readLog(host: *BlobHost, sa: Allocator, from_cursor: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        if (host.session) |handle| return handle.read(sa, from_cursor, direction, limit);
+        return host.store.manager.read(sa, host.id, from_cursor, direction, limit);
     }
 
     fn put(ctx: *anyopaque, bytes: []const u8) session_child_store.BlobError!Hash {
@@ -3016,23 +3105,14 @@ pub const Session = struct {
         }
     }
 
-    /// `visitHistory` over one compaction cycle: the turns after the
-    /// compaction line at `start`, or from the log's start when null, up to
-    /// the next compaction line. A turn the next compaction splits is not
-    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
-    /// when reading stopped at a damaged line, so turns are missing.
-    pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        var sink: VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
-        const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
-        const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
-        var damaged = false;
-        var replay_sink = ReplaySink.init(&sink);
-        replay_sink.damaged = &damaged;
-        replay(self.source(), alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
-            error.CycleEnd => {},
-            else => |other| return other,
-        };
-        return damaged;
+    /// A reader of this session's log that another thread can keep after
+    /// this call returns, such as the one that reads a cycle for Ctrl+O.
+    /// Caller owns it; free it with `CycleReader.deinit` on any thread.
+    pub fn cycleReader(self: *Session, alloc: Allocator) !CycleReader {
+        const files_path = try alloc.dupe(u8, self.files_path);
+        errdefer alloc.free(files_path);
+        BlobHost.retain(self.host);
+        return .{ .alloc = alloc, .store = self.store, .host = self.host, .files_path = files_path };
     }
 
     /// This open's report lines, the first time it is asked, so the reports
@@ -3534,6 +3614,9 @@ const Source = struct {
 
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
         if (src.handle) |handle| return handle.read(sa, from, direction, limit);
+        // A `CycleReader` on another thread: through the host, which knows
+        // whether the session is still open.
+        if (src.host) |host| return host.readLog(sa, from, direction, limit);
         return src.store.manager.read(sa, src.id, from, direction, limit);
     }
 
@@ -3659,6 +3742,53 @@ const Source = struct {
         };
     }
 };
+
+/// A session's log as a background thread reads it (`Session.cycleReader`).
+/// It holds the session's blob host, so it reads through the open session
+/// while it is open and through the process's manager after it closes, as a
+/// background reader's capability does (D44). It never touches the
+/// `Session`, which may close and free while the reader works.
+pub const CycleReader = struct {
+    alloc: Allocator,
+    store: *Store,
+    host: *BlobHost,
+    files_path: []u8,
+
+    pub fn deinit(self: *CycleReader) void {
+        self.alloc.free(self.files_path);
+        BlobHost.release(self.host);
+        self.* = undefined;
+    }
+
+    fn source(self: *const CycleReader) Source {
+        return .{ .store = self.store, .id = self.host.id, .host = self.host, .files_path = self.files_path };
+    }
+
+    /// `visitHistory` over one compaction cycle: the turns after the
+    /// compaction line at `start`, or from the log's start when null, up to
+    /// the next compaction line. A turn the next compaction splits is not
+    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
+    /// when reading stopped at a damaged line, so turns are missing.
+    pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+        return visitCycle(self.source(), alloc, start, visitor);
+    }
+};
+
+/// The turns of one compaction cycle from `src`, each handed to
+/// `visitor.append` and freed after it returns (`CycleReader.visitHistoryCycle`).
+fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+    var sink: Session.VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
+    const from: sm.From = if (start) |cursor| .{ .at = try src.cycleStart(alloc, cursor) } else .start;
+    const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
+    var damaged = false;
+    var replay_sink = ReplaySink.init(&sink);
+    replay_sink.damaged = &damaged;
+    replay(src, alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
+        error.CycleEnd => {},
+        else => |other| return other,
+    };
+    return damaged;
+}
 
 // ---------------------------------------------------------------------------
 // Converting v1 sessions (D55 to D61, `tests/tla/session_manager/V1Conversion.tla`)
@@ -4620,7 +4750,13 @@ pub fn freeKeptChildren(alloc: Allocator, kept: []KeptChild) void {
 /// whose parent is gone or does not list it. Reads only. Caller owns the
 /// result; free it with `freeKeptChildren`.
 fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
-    const strays = v1_conversion.strayChildren(alloc, store.home) catch |err| switch (err) {
+    var complete = true;
+    return keptChildrenUntil(store, alloc, null, &complete);
+}
+
+/// `keptChildren`, ended early when `stop` says so; `complete` is then false.
+fn keptChildrenUntil(store: *Store, alloc: Allocator, stop: ?sm.Stop, complete: *bool) ![]KeptChild {
+    const strays = v1_conversion.strayChildren(alloc, store.home, stop, complete) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("convert", "action=ChildrenUnlisted err={s}", .{@errorName(err)});
@@ -6978,15 +7114,78 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
     const older = (try s.previousCompactionCursor(testing.allocator, newest)).cursor.?;
     try testing.expect(older.offset < newest.offset);
     try testing.expectEqual(Session.PreviousCompaction{ .cursor = null }, try s.previousCompactionCursor(testing.allocator, older));
+    var cycles = try s.cycleReader(testing.allocator);
+    defer cycles.deinit();
     var visitor: Visitor = .{};
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{ "one", "two" });
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, older, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, older, &visitor));
     try visitor.expectPrompts(&.{"three"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, newest, &visitor));
     try visitor.expectPrompts(&.{"four"});
     try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{"four"});
+}
+
+test "a cycle reader reads a compaction cycle on another thread, and after its session closes" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var open = true;
+    defer if (open) s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var summary = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    const newest = (try s.previousCompactionCursor(testing.allocator, null)).cursor.?;
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    const Read = struct {
+        fn run(reader: *const CycleReader, visitor: *Visitor, damaged: *bool, failure: *?anyerror) void {
+            damaged.* = reader.visitHistoryCycle(testing.allocator, null, visitor) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var reader = try s.cycleReader(testing.allocator);
+    defer reader.deinit();
+
+    // While the session is open, through its own log.
+    var visitor: Visitor = .{};
+    var damaged = true;
+    var failure: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{}, Read.run, .{ &reader, &visitor, &damaged, &failure });
+    thread.join();
+    try testing.expectEqual(@as(?anyerror, null), failure);
+    try testing.expect(!damaged);
+    try visitor.expectPrompts(&.{ "one", "two" });
+
+    // The session closes under the reader, which reads on through the manager.
+    s.close();
+    open = false;
+    try testing.expect(!try reader.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try visitor.expectPrompts(&.{"three"});
 }
 
 test "a damaged line in a compaction cycle shows that cycle's turns before it and says so" {
@@ -7042,14 +7241,16 @@ test "a damaged line in a compaction cycle shows that cycle's turns before it an
             for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
         }
     };
+    var cycles = try s.cycleReader(testing.allocator);
+    defer cycles.deinit();
     var visitor: Visitor = .{};
     // Forward, cycle 1 shows its turn before the damage and says the read
     // stopped there; the other cycles read whole.
-    try testing.expect(try s.visitHistoryCycle(testing.allocator, opens_one, &visitor));
+    try testing.expect(try cycles.visitHistoryCycle(testing.allocator, opens_one, &visitor));
     try visitor.expectPrompts(&.{"one-a"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, opens_two, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, opens_two, &visitor));
     try visitor.expectPrompts(&.{"two"});
-    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{"zero"});
     // Backward, the search across cycle 2 still finds the line opening it,
     // and the search across cycle 1 stops at the damage and says so instead
@@ -7169,9 +7370,11 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     // Ctrl+O: the cycle before leaves the split turn out, and the one the
     // compaction opens shows it whole.
     const compaction = (try r.previousCompactionCursor(testing.allocator, null)).cursor.?;
-    try testing.expect(!try r.visitHistoryCycle(testing.allocator, null, &visitor));
+    var cycles = try r.cycleReader(testing.allocator);
+    defer cycles.deinit();
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{"first"});
-    try testing.expect(!try r.visitHistoryCycle(testing.allocator, compaction, &visitor));
+    try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, compaction, &visitor));
     try visitor.expectPrompts(&.{ "split", "after" });
 }
 
@@ -9343,6 +9546,25 @@ const V1Home = struct {
         try (if (target) |value| value.dir else dir.dir).writeFile(io_mod.getIo(), .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
     }
 
+    /// Makes `ids`' v1 folders readable by others, as an old release left
+    /// them (D61): every folder 0755 and every file 0644, lock files too.
+    fn readableByOthers(v1: *V1Home, ids: []const []const u8) !void {
+        const io = io_mod.getIo();
+        const a = v1.arena.allocator();
+        for (ids) |id| {
+            var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
+            defer dir.close(io);
+            dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+            var walker = try dir.walk(a);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| switch (entry.kind) {
+                .directory => try dir.setFilePermissions(io, entry.path, .fromMode(0o755), .{}),
+                .file => try dir.setFilePermissions(io, entry.path, .fromMode(0o644), .{}),
+                else => {},
+            };
+        }
+    }
+
     /// v1's `session.json` of `id`. The arena's.
     fn metadata(v1: *V1Home, id: []const u8) !std.json.ObjectMap {
         const a = v1.arena.allocator();
@@ -9873,6 +10095,61 @@ test "recover salvages a damaged v1 session into a fresh v2 root and leaves its 
     try testing.expectError(error.SessionNotFound, recover(&t.store, alloc, "v1-none"));
 }
 
+test "recover on a v1 session an old fx left readable by others answers that none is needed, salvages a damaged one, and both convert (D61, D64)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // A family: its root's `subagent` folder and every member's lock file
+    // are readable by others too.
+    const family = try v1.fixture("family", 3);
+    try v1.readableByOthers(family);
+    try testing.expectError(error.SessionRecoveryNotNeeded, recover(&t.store, alloc, family[0]));
+
+    // Two turns, then a torn line.
+    const torn = (try v1.fixture("cancelled", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put(torn, null, "events.jsonl", damaged);
+    try v1.readableByOthers(&.{torn});
+    var recovered = try recover(&t.store, alloc, torn);
+    defer recovered.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), recovered.history_len);
+    const after = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(after);
+    try testing.expectEqualStrings(damaged, after);
+    // The lock file keeps the mode it had.
+    const lock = try t.tmp.dir.statFile(io_mod.getIo(), try v1.sessionPath(torn, "session.lock"), .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(lock.permissions.toMode() & 0o777)));
+
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    var copy = try t.store.manager.peek(alloc, family[0]);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(sm.Role.root, copy.role);
+}
+
+test "recover on a v1 session whose lock file others can write says its storage is unsafe, not that it is corrupt" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("plain", 1))[0];
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "session.lock"), .fromMode(0o666), .{});
+    const err = if (recover(&t.store, alloc, id)) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+}
+
 test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
@@ -9897,6 +10174,101 @@ test "recover copies a v1 conversation without saved rules it can't read and lea
         defer alloc.free(after);
         try testing.expectEqualStrings(rules, after);
     }
+}
+
+test "doctor told to stop leaves no older-fx scan unfinished when no older fx saved anything" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const Always = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    var report = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &context, .requested = Always.requested },
+    });
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.sessions);
+    try testing.expectEqual(@as(usize, 0), report.unfinished);
+    try testing.expect(!report.v1_incomplete);
+}
+
+test "doctor told to stop counts the sessions it did not finish, and reports its progress" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    for ([_][]const u8{ "first", "second" }) |text| {
+        const s = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+        defer s.close();
+        try s.commitTurn(assistantTurn(text, "a"), types.ConversationLanguage.default());
+    }
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("plain", 2);
+
+    const Watch = struct {
+        stop: bool,
+        calls: [4][2]usize = undefined,
+        len: usize = 0,
+
+        fn requested(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.stop;
+        }
+
+        fn report(context: *anyopaque, done: usize, total: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.len < self.calls.len) self.calls[self.len] = .{ done, total };
+            self.len += 1;
+        }
+    };
+
+    var stopped: Watch = .{ .stop = true };
+    var cut = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &stopped, .requested = Watch.requested },
+        .progress = .{ .context = &stopped, .report = Watch.report },
+    });
+    defer cut.deinit(alloc);
+    // However many of the older fx's sessions a read converted, the stop
+    // leaves every saved session unchecked and the older scan unfinished.
+    const total = cut.sessions;
+    try testing.expect(total >= 2);
+    try testing.expectEqual(@as(usize, 0), cut.checked);
+    try testing.expectEqual(total, cut.unfinished);
+    try testing.expect(cut.v1_incomplete);
+    try testing.expectEqual(@as(usize, 0), cut.damaged.items.len);
+    // Told before each session and once at the end.
+    try testing.expectEqual(total + 1, stopped.len);
+    for (stopped.calls[0..stopped.len], 0..) |call, done| try testing.expectEqualSlices(usize, &.{ done, total }, &call);
+
+    var running: Watch = .{ .stop = false };
+    var whole = try doctorWith(&t.store, alloc, .{
+        .limit = 64,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = .count,
+        .blobs = .exists,
+        .stop = .{ .context = &running, .requested = Watch.requested },
+    });
+    defer whole.deinit(alloc);
+    // The limit's count covers the older fx's unconverted sessions too (D73).
+    try testing.expectEqual(whole.sessions + whole.unconverted, whole.checked);
+    try testing.expectEqual(@as(usize, 0), whole.unfinished);
+    try testing.expect(!whole.v1_incomplete);
+    try testing.expectEqual(@as(usize, 4), whole.sessions + whole.unconverted);
+    try testing.expectEqual(@as(usize, 0), whole.damaged.items.len);
 }
 
 test "doctor counts sessions an older fx saved and names each that can't be converted with what recover copies (D73)" {

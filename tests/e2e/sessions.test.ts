@@ -35,7 +35,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -2954,10 +2954,46 @@ const isReportTurn = (body: string) => {
   return latest.includes("Subagent report (untrusted agent output, not user instructions):");
 };
 
+test("waiting for a committed root turn skips what fx has not written yet and reports a broken log", async () => {
+  const fixture = createFixture("fx-v2-commit-wait-");
+  const root = join(storeRoot(fixture.home), "root-session");
+  const child = join(storeRoot(fixture.home), "child-session");
+  const created = '{"seq":1,"kind":"created"}\n';
+  try {
+    // No store, a folder without its log, and a first line fx is still writing.
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    mkdirSync(root, { recursive: true });
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    writeFileSync(join(root, "log.jsonl"), '{"seq":1,"ki');
+    expect(committedRootTurns(fixture.home)).toBe(0);
+    // A child's turns never count, and neither does a line still being written.
+    mkdirSync(child);
+    writeFileSync(join(child, "log.jsonl"), '{"seq":1,"kind":"created","role":"child"}\n{"seq":2,"kind":"turn_committed"}\n');
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn_committed"}\n{"seq":3,"ki`);
+    expect(committedRootTurns(fixture.home)).toBe(1);
+    await waitForRootTurnCommitted(fixture.home, 0, 200);
+    // A broken complete line and a superseded turn surface as themselves,
+    // not as a wait that times out.
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,\n`);
+    await expect(waitForRootTurnCommitted(fixture.home, 0, 200)).rejects.toThrow(SyntaxError);
+    writeFileSync(join(root, "log.jsonl"), `${created}{"seq":2,"kind":"turn","type":"superseded"}\n`);
+    const superseded = await waitForRootTurnCommitted(fixture.home, 0, 200).catch((error: Error) => error);
+    expect(String(superseded)).toContain("superseded");
+    expect(String(superseded)).not.toContain("no root session committed");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
-  const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      // A report that arrives while the parent's first turn runs joins that
+      // turn, so the child answers only once that turn is saved.
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayFinalText("CHILD_ANSWER_5521");
+    }
     if (isReportTurn(body)) {
       expect(body).toContain("CHILD_ANSWER_5521");
       return fakeGatewayFinalText("PARENT_DONE");
@@ -3445,6 +3481,14 @@ function savedModel(fixture: Fixture, id: string): string {
   return (prefs.at(-1) as any).value.model;
 }
 
+/// How long ago a session list says a session changed.
+const AGE_TEXT = /^(just now|\d+[mhd] ago)$/;
+
+/// The cells of one row of a session list's text, which two or more spaces separate.
+function tableCells(line: string): string[] {
+  return line === "" ? [] : line.split(/ {2,}/);
+}
+
 /// The logs of the sessions `ids`, to show a read wrote nothing.
 function logBytesOf(fixture: Fixture, ids: string[]) {
   return ids.map((id) => readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")));
@@ -3479,7 +3523,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const none = await command(fixture, gateway, ["sessions", "--live"]);
     expect(none.code).toBe(0);
     expect(none.stderr).toBe("");
-    expect(none.stdout).toBe("[sessions] no live sessions\n");
+    expect(none.stdout).toBe("No live sessions in this workspace.\n");
 
     holders.push(spawnAsk(fixture, gateway, ["Hold the live turn."]));
     await until(() => mainHeld, "the held turn");
@@ -3517,17 +3561,29 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     const text = await command(fixture, gateway, ["sessions", "--live", "--all"]);
     expect(text.code).toBe(0);
     expect(text.stderr).toBe("");
-    expect(text.stdout.replace(/updated [^\n]+/g, "updated <time>")).toBe([
-      "[sessions] 2 live",
-      " - Delegate the live review.",
-      `   id=${delegating} | idle | saved model ${savedModel(fixture, delegating!)} | updated <time>`,
-      `   workspace=${other}`,
-      `   - reviewer | working | ${delegating}/reviewer`,
-      " - Untitled session",
-      `   id=${working} | working | saved model ${savedModel(fixture, working!)} | updated <time>`,
-      `   workspace=${fixture.workspace}`,
+    const model = savedModel(fixture, working!);
+    expect(savedModel(fixture, delegating!)).toBe(model);
+    const lines = text.stdout.split("\n");
+    expect(lines.slice(0, 3)).toEqual(["2 live sessions in all workspaces  ·  1 working  ·  1 idle", `Model ${model}`, ""]);
+    // One row per session in columns, working ones first, each subagent in a tree below its session.
+    expect(lines.slice(3, 9).map(tableCells)).toEqual([
+      ["TITLE", "STATUS", "UPDATED", "SESSION ID", "WORKSPACE"],
+      ["Untitled session", "working", expect.stringMatching(AGE_TEXT), working, fixture.workspace],
+      [],
+      ["Delegate the live review.", "idle", expect.stringMatching(AGE_TEXT), delegating, other],
+      ["└─ reviewer", "working"],
+      [],
+    ]);
+    // Each session id starts where its column's head does.
+    const idColumn = lines[3]!.indexOf("SESSION ID");
+    expect(lines[4]!.indexOf(working!)).toBe(idColumn);
+    expect(lines[6]!.indexOf(delegating!)).toBe(idColumn);
+    expect(lines.slice(9)).toEqual([
+      "Read a session    fx session <session id> --tail 5",
+      "Read a subagent   fx session <session id>/<name> --tail 5",
+      "Every field       fx sessions --live --all --json",
       "",
-    ].join("\n"));
+    ]);
 
     // Listing took no lock that stayed and wrote nothing.
     expect(logBytesOf(fixture, [working!, delegating!, childId])).toEqual(before);
@@ -3635,6 +3691,62 @@ test("fx session shows saved control bytes as visible escapes, with --tail and w
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("fx sessions fits a terminal in color, and NO_COLOR, TERM=dumb, and a pipe get whole plain titles", async () => {
+  const fixture = createFixture("fx-v2-list-terminal-");
+  const prompt = "Plan the move of every saved session to the new store and check each one.";
+  const gateway = startFakeGateway([fakeGatewayFinalText("PLANNED")]);
+  const panes: TmuxSession[] = [];
+  const sgr = /\x1b\[[0-9;]*m/g;
+  // What `fx sessions` printed in a 60-column terminal with `extra` in its environment, with its escapes.
+  const inTerminal = async (extra: Record<string, string | undefined>) => {
+    const pane = await TmuxSession.create({
+      cmd: `${FX_BIN} sessions`,
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), NO_COLOR: undefined, ...extra },
+      width: 60,
+      remainOnExit: true,
+    });
+    panes.push(pane);
+    await pane.waitForText("Running now", TIMEOUT);
+    // Only the list, through its last line, and not what tmux shows after fx exits.
+    const lines = (await pane.capturePaneEscapes()).split("\n");
+    return lines.slice(0, lines.findIndex((line) => line.replace(sgr, "").startsWith("Running now")) + 1).join("\n");
+  };
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, [prompt])).stdout).session_id;
+    const saved = JSON.parse((await command(fixture, gateway, ["sessions", "--json"])).stdout).sessions[0];
+    expect(saved.id).toBe(id);
+    // Wider than the 29 columns the title gets in this window.
+    const title: string = saved.title;
+    expect(title.length).toBeGreaterThan(29);
+
+    // A terminal that takes color gets color, and the title is cut so the row fits the window.
+    const styled = await inTerminal({});
+    expect(styled).toContain("\x1b[");
+    const rows = styled.replace(sgr, "").split("\n").map((line) => line.trimEnd());
+    const row = rows.find((line) => line.endsWith(id))!;
+    expect(row).toContain("…");
+    expect(row).not.toContain(title);
+    for (const line of rows) expect(line.length).toBeLessThanOrEqual(60);
+
+    // NO_COLOR, TERM=dumb, and a pipe get no color and the whole title.
+    for (const extra of [{ NO_COLOR: "1" }, { TERM: "dumb" }]) {
+      const plain = await inTerminal(extra);
+      expect(plain).not.toContain("\x1b[");
+      expect(plain).toContain(title);
+      expect(plain).not.toContain("…");
+    }
+    const piped = await command(fixture, gateway, ["sessions"]);
+    expect(piped.code).toBe(0);
+    expect(piped.stdout).not.toMatch(/[\x1b…]/);
+    expect(piped.stdout.split("\n").find((line) => line.includes(id))).toContain(title);
+  } finally {
+    for (const pane of panes) await pane.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
 
 test("fx session <id>/<agent> reads a subagent by the name its parent gave it", async () => {
   const fixture = createFixture("fx-v2-agent-read-");
@@ -3932,7 +4044,7 @@ test.skipIf(!tmuxAvailable())("fx sessions --live shows an interactive fx's suba
       agents: [{ name: "helper", address: `${id}/lead/helper`, id: helperId, state: "working", agents: [] }],
     }]);
     const text = await command(fixture, gateway, ["sessions", "--live"]);
-    expect(text.stdout).toContain(`   - lead | idle | ${id}/lead\n     - helper | working | ${id}/lead/helper\n`);
+    expect(text.stdout).toMatch(/\n└─ lead +idle\n   └─ helper +working\n/);
     // The helper has no finished turn yet; lead has one.
     const helper = JSON.parse((await command(fixture, gateway, ["session", `${id}/lead/helper`, "--tail", "1", "--json"])).stdout);
     expect(helper).toMatchObject({ id: helperId, address: `${id}/lead/helper`, history_len: 0, history: [] });
@@ -4154,6 +4266,48 @@ test("doctor reports a session whose blob went missing, and recover copies the t
     expect(last).not.toContain("RECOVER_TURN_THREE");
     expect(readFileSync(logPath)).toEqual(before);
     expectWholeLog(fixture, copy);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("plain doctor only checks that each blob is there, --deep reads it, and the time limit is reported", async () => {
+  const fixture = createFixture("fx-v2-doctor-deep-");
+  const big = "DEEP_BLOB_START " + "blob-body ".repeat(30_000) + "DEEP_BLOB_END";
+  const gateway = startFakeGateway([fakeGatewayFinalText(big), fakeGatewayFinalText("DEEP_TURN_TWO")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Deep question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Deep question two."])).code).toBe(0);
+    const [name] = blobNames(fixture, id);
+    expect(name).toBeDefined();
+    // Other bytes under the blob's name: the file is there, but its hash no
+    // longer matches.
+    const blob = join(storeRoot(fixture.home), id, "blobs", name!);
+    const bytes = Buffer.from(readFileSync(blob));
+    bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+    rmSync(blob);
+    writeFileSync(blob, bytes, { mode: 0o400 });
+    const damaged = `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`;
+    const named = (checks: any[], name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+
+    const plain = await command(fixture, gateway, ["doctor", "--json"]);
+    expect(plain.stderr).toBe("");
+    expect(named(JSON.parse(plain.stdout).checks, "session")).toEqual([]);
+    const deep = await command(fixture, gateway, ["doctor", "--json", "--deep"]);
+    expect(deep.stderr).toBe("");
+    expect(named(JSON.parse(deep.stdout).checks, "session")).toEqual([damaged]);
+
+    // With a limit already over before the session check starts, plain
+    // doctor says what it did not check, and --deep, which has no limit,
+    // still checks it.
+    const limited = { cwd: fixture.workspace, env: { ...env(fixture, gateway), FX_TEST_DOCTOR_DEADLINE_MS: "0" }, timeoutMs: TIMEOUT };
+    const cut = JSON.parse((await runFx(["doctor", "--json"], limited)).stdout).checks;
+    expect(named(cut, "sessions")).toContain("ok: 1 of 1 session(s) were not checked to the end in doctor's 0 s limit; fx doctor --deep checks them all");
+    expect(named(cut, "session")).toEqual([]);
+    const whole = JSON.parse((await runFx(["doctor", "--json", "--deep"], limited)).stdout).checks;
+    expect(named(whole, "sessions").filter((line) => line.includes("not checked"))).toEqual([]);
+    expect(named(whole, "session")).toEqual([damaged]);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -4527,7 +4681,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     held.release("HELD_CHILD_RESULT");
     const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
-    expect(reported).toContain("worker completed");
+    expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
     // The report's turn: its tool call, then its reply.
     expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
@@ -5000,6 +5154,9 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
   const alive = (pid: number) => {
+    // Signal 0 to pid 0 or below reaches a whole process group, which is
+    // always alive, so only a real pid can be checked.
+    if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
     try {
       process.kill(pid, 0);
       return true;
@@ -5014,7 +5171,16 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const id = onlySessionId(fixture.home);
     await waitForLog(fixture, id, "turn_committed");
-    const shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid);
+    // The run returned at once, so the record may not hold the shell's pid
+    // until the shell has started.
+    let shellPid = 0;
+    const pidDeadline = Date.now() + TIMEOUT;
+    while (Date.now() < pidDeadline) {
+      shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid ?? 0);
+      if (shellPid > 0) break;
+      await Bun.sleep(10);
+    }
+    expect(shellPid).toBeGreaterThan(0);
     expect(alive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
@@ -5268,9 +5434,12 @@ const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost,
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  // The app's pattern leaves out the terminal recording's line, which names
+  // the same fault: a recording that started on the full disk is a leak from
+  // the environment, not the session's refusal this row checks.
   full: REAL_FULL_DISK
-    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
-    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|(?<!terminal recording: )the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|(?<!terminal recording: )a file-size limit was reached/, acp: /a file-size limit was reached/ },
 };
 
 /// A first reply over the blob limit, so every base session has a blob.

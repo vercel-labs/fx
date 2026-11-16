@@ -3,6 +3,8 @@ const result_store = @import("../../core/session/result_store.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const json_depth = @import("../../core/shared/json_depth.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
@@ -41,12 +43,10 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var decoder: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "read_tool_result" };
     var parsed = decoder.parse(args_json) catch |err| return .{ .failure = try decoder.takeFailure(err) };
     defer parsed.deinit();
-    const args = if (parsed.value.object.get("request")) |request| blk: {
-        if (request != .object) {
-            return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
-        }
-        break :blk request.object;
-    } else parsed.value.object;
+    // The row reads the request the same way (read_tool_result_presentation.zig).
+    const args = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
+    };
     if (args.get("search")) |value| {
         // search reads saved history and ignores a handle, so a call that
         // sends both meant to look inside the handle's output.
@@ -344,6 +344,149 @@ test "read_tool_result decodes nested model requests" {
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
     }
+}
+
+const request_refusal = "read_tool_result field \"request\" must be an object";
+
+fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    switch (try decode(.{ .allocator = alloc }, args_json)) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expectEqualStrings(expected, failure);
+        },
+    }
+}
+
+test "read_tool_result decodes a request sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"request\":\"{\\\"handle\\\":\\\"h.txt\\\",\\\"query\\\":\\\"needle\\\"}\"}");
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed.handle);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range, .search => return error.TestUnexpectedDecodeFailure,
+    }
+
+    const search = try decode(.{ .allocator = alloc }, "{\"request\":\"{\\\"search\\\":[\\\"retry budget\\\"]}\"}");
+    switch (search) {
+        .input => |value| {
+            defer value.deinit(alloc);
+            try std.testing.expect(value.as(Input).selector == .search);
+        },
+        .failure => return error.TestUnexpectedDecodeFailure,
+    }
+
+    // Text that is not one object, an object encoded twice, and text nested
+    // deeper than tool input may be are refused as before.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "{\"handle\":\"h.txt\"}", .{});
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |text| {
+        try expectDecodeFailure(try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{}), request_refusal);
+    }
+}
+
+const max_fuzz_request_text_bytes: usize = 16 * 1024;
+
+fn fuzzRequestText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_request_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before request is read.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+    const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
+    const request = try tool_args.unwrapRequest(arena, args);
+
+    // decode refuses the request exactly when the row finds no object in it.
+    switch (try decode(.{ .allocator = alloc }, args_json)) {
+        .input => |input| {
+            input.deinit(alloc);
+            try std.testing.expect(request != null);
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expectEqual(request == null, std.mem.eql(u8, failure, request_refusal));
+        },
+    }
+
+    // The row reads the text in place, whatever its length, and gives it the
+    // label of the object a full parse finds in it. Its two differences are
+    // here. A parse refuses a text that repeats a field, at any depth, but the
+    // row sees only a repeat of a field it reads. And a handle written with
+    // escapes that decodes to more than the row has room for keeps the tool's
+    // default label.
+    const from_text = presentation(args);
+    const object = request orelse {
+        if (from_text != null) try expectRefusedOnlyForRepeatedField(arena, text);
+        return;
+    };
+    const object_json = try std.json.Stringify.valueAlloc(arena, .{ .request = std.json.Value{ .object = object } }, .{});
+    const object_args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, object_json, .{})).object;
+    const from_object = presentation(object_args);
+    const label = from_text orelse {
+        if (from_object != null) {
+            try std.testing.expect(object.get("search") == null);
+            const handle = object.get("handle") orelse return error.TestExpectedHandle;
+            try std.testing.expect(handle == .string);
+            try std.testing.expect(handle.string.len > read_result_presentation.max_escaped_handle_bytes);
+            try std.testing.expect(std.mem.findScalar(u8, text, '\\') != null);
+        }
+        return;
+    };
+    const expected = from_object orelse return error.TestRowNamesWhatTheObjectDoesNot;
+    try std.testing.expectEqual(expected.activity_kind, label.activity_kind);
+    try std.testing.expectEqualStrings(expected.action_label, label.action_label);
+    try std.testing.expectEqualStrings(expected.completed_action_label, label.completed_action_label);
+    try std.testing.expectEqualStrings(expected.label_arg_default, label.label_arg_default);
+}
+
+/// The text a parse refuses and the row names anyway: a parse of it fails only
+/// on a field that repeats.
+fn expectRefusedOnlyForRepeatedField(arena: Allocator, text: []const u8) !void {
+    try std.testing.expect(!json_depth.exceeds(text));
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .allocate = .alloc_always });
+    if (parsed) |_| return error.TestParseAcceptedTheText else |err| {
+        if (err != error.DuplicateField) return error.TestParseFailedForAnotherReason;
+    }
+}
+
+test "read_tool_result requests sent as JSON text decode and label alike" {
+    try std.testing.fuzz({}, fuzzRequestText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"handle\":\"fx-command-replay-0123.bin\",\"query\":\"error:\"}",
+            "{\"handle\":\"result-x\",\"start_byte\":9}",
+            "{\"handle\":\" t5 \"}",
+            "{\"search\":[\"retry budget\"]}",
+            "{\"handle\":\"h.txt\",\"search\":[\"x\"]}",
+            "[1]",
+            "\"{\\\"handle\\\":\\\"h.txt\\\"}\"",
+            "{",
+            // Text past what a parse in a small buffer once held, a repeated field the row reads and one it does not, and a handle with escapes past its room.
+            "{\"handle\":\"result-x\",\"query\":\"" ++ text_utils.repeat("q", 5000) ++ "\"}",
+            "{\"handle\":\"t5\",\"handle\":\"t6\"}",
+            "{\"handle\":\"t5\",\"x\":1,\"x\":2}",
+            "{\"h\\u0061ndle\":\"result-\\u0078\",\"query\":\"e\"}",
+            "{\"handle\":\"" ++ text_utils.repeat("\\u0078", 1030) ++ "\"}",
+        }) ++ @import("fuzz_corpus").read_tool_result_request_text.*),
+    });
 }
 
 test "read_tool_result treats exact empty legacy query as range" {

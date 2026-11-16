@@ -53,6 +53,7 @@ pub const usage_options = [_]command_specs.OptionDoc{
 pub const doctor_options = [_]command_specs.OptionDoc{
     json_option,
     .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
 pub const upgrade_options = [_]command_specs.OptionDoc{
@@ -348,7 +349,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json] [--fix]",
+        .usage = "doctor [--json] [--fix] [--deep]",
         .summary = "Check that fx can work here, with a fix for each problem",
         .options = &doctor_options,
     },
@@ -378,7 +379,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
         .options = &sessions_options,
         .details = &.{
-            "--live shows each session's state (working or idle), the model saved with it, and its subagents with the <id>/<agent> address fx session reads them by.",
+            "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",
         },
     },
     .{

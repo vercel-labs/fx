@@ -3170,6 +3170,15 @@ test "input escape parser admits raw ctrl+p control byte" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));
 }
 
+test "input escape parser admits ctrl+t, raw or reported as a key, as the effort cycle" {
+    try std.testing.expectEqual(@as(?InputEscapeAction, .cycle_effort), controlByteFeatureAction(20));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(19));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(21));
+    // The kitty keyboard protocol reports Ctrl+T as a key, which replays as
+    // the raw byte above.
+    try expectEscapeAction("[116;5u", .{ .remapped_byte = 20 });
+}
+
 test "input escape parser admits ctrl+x, raw or reported as a key, as the agent list" {
     try std.testing.expectEqual(@as(?InputEscapeAction, .open_agent_list), controlByteFeatureAction(24));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(25));

@@ -23,6 +23,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -871,7 +872,7 @@ pub fn Runtime(comptime App: type) type {
                 error.SessionScrollbackHandoffGeometryChanged => {
                     agent.session_persistence.pending_live_session_policy = null;
                     agent.session_persistence.pending_live_session_wait = null;
-                    app.shell.cancelSessionScrollbackHandoff();
+                    app.shell.cancelSessionScrollbackHandoff("geometry_changed");
                     releaseLiveSessionTransitionHold(app, agent);
                     debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
@@ -905,15 +906,36 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             agent.session_persistence.pending_live_session_policy = null;
             agent.session_persistence.pending_live_session_wait = null;
-            app.shell.cancelSessionScrollbackHandoff();
+            try giveUpScrollbackHandoff(app, reason);
             releaseLiveSessionTransitionHold(app, agent);
             debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
         }
 
+        /// Gives up a scrollback handoff that still has rows to write. When
+        /// its frame already pushed some rows into scrollback, the terminal
+        /// is cleared and the transcript printed again, as after a resize, so
+        /// the switch's next handoff does not push those rows a second time.
+        fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
+            if (comptime !@hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff") or !@hasField(App, "metrics")) return;
+            const pending = app.shell.pending_session_scrollback_handoff orelse return;
+            app.shell.cancelSessionScrollbackHandoff(reason);
+            if (pending.remaining_rows < pending.total_rows) {
+                try app.shell.requestTerminalReset(&app.metrics);
+                debug_trace.logf("session", "event=scrollback_handoff_reset reason={s} pushed_rows={d}", .{ reason, pending.total_rows - pending.remaining_rows });
+            }
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App, agent: *AppAgent) !void {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             const processing = agent.worker.isProcessing();
+            // The handoff goes on only while the agent is idle, and no agent's
+            // transcript can be swapped in until it ends. A turn that starts
+            // meanwhile, such as one a subagent's report starts, would hold
+            // the handoff, and every hidden agent, until it ends, and that
+            // turn may wait on a hidden agent. So the handoff yields; the
+            // change hands the rows off again once the agent is idle.
+            if (processing) try giveUpScrollbackHandoff(app, "agent_busy");
             const now = operation_control.monotonicMillis(io_mod.getIo());
             var wait = agent.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
             if (wait == .worker and !processing) wait = .{ .geometry = now };
@@ -2638,13 +2660,14 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
-        /// The provider's title model, or a Token Pass model when the
-        /// agent's AI Gateway model is a Token Pass model.
+        /// The provider's title model, or a Token Pass model when the team
+        /// has Token Pass and the agent's AI Gateway model is a Token Pass
+        /// model.
         fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
             const default_model = provider_title_model orelse return null;
             if (comptime !provider_runtime.supported(App)) return default_model;
             if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
-            return token_pass.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+            return token_pass_team.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
         }
 
         /// Applies a finished background title generation on the main loop.
@@ -3520,14 +3543,19 @@ pub fn Runtime(comptime App: type) type {
             gop.value_ptr.* = .{ .label = label, .reflow = reflow };
         }
 
-        /// Replays an older compaction cycle of `agent`, whose transcript is
-        /// on screen, from its session log into a detached transcript for
-        /// Ctrl+O: `back` cycles before the held entries, 1 being the newest.
-        /// Reads only that cycle, after finding its start by walking back
-        /// from the cycles already found.
+        /// Reads an older compaction cycle of `agent`, whose transcript is
+        /// on screen, from its session log for Ctrl+O: `back` cycles before
+        /// the held entries, 1 being the newest. Finds where the cycle
+        /// starts here, walking back from the cycles already found, and
+        /// reads only that cycle's turns, on a background thread;
+        /// `pollTranscriptArchive` replays them once they are read. A read of
+        /// the same cycle already running goes on.
         pub fn loadTranscriptArchive(app: *App, agent: *AppAgent, back: u32) !void {
             if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return error.TranscriptArchiveUnavailable;
             if (back == 0) return error.TranscriptArchiveUnavailable;
+            const read = &agent.session_persistence.transcript_archive_read;
+            const generation = app.shell.transcript_archive_generation;
+            if (read.pendingFor(back, generation)) return;
             const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const started_ns = io_mod.nanoTimestamp();
             const newest = (try v2.previousCompactionCursor(app.alloc, null)).cursor orelse return error.TranscriptArchiveUnavailable;
@@ -3540,64 +3568,146 @@ pub fn Runtime(comptime App: type) type {
                 cache.damaged_from = null;
                 cache.held_start = if (holds_previous) cache.startOf(1, try v2.previousCompactionCursor(app.alloc, newest)) else newest;
             }
-            // A read that stops at a damaged line still shows what it read.
-            var read_damaged = false;
-            while (true) {
-                while (cache.starts.items.len < back) {
-                    // Below `back`, a u32, so the cast holds.
-                    const next_back: u32 = @intCast(cache.starts.items.len + 1);
-                    const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
-                        return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
-                    try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
-                }
-                const start = cache.starts.items[back - 1];
-
-                var projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1);
-                defer projection.deinit();
-                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
-                projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
-                var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
-                defer labels.deinit(app.alloc);
-                var sink = DetachedHistorySink(@TypeOf(projection)){
-                    .app = app,
-                    .projection = &projection,
-                    .labels = &labels,
-                };
-                const Visitor = struct {
-                    app: *App,
-                    agent: *AppAgent,
-                    sink: *@TypeOf(sink),
-                    labels: *HistoricalSessionLabels,
-                    has_prior_turns: bool = false,
-
-                    pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                        return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
-                    }
-                };
-                var visitor = Visitor{ .app = app, .agent = agent, .sink = &sink, .labels = &labels };
-                if (try v2.visitHistoryCycle(app.alloc, start, &visitor)) read_damaged = true;
-                if (projection.runtime.notebook.entries.items.len == 0) if (start) |empty_start| {
-                    // Two compactions with no turn between leave an empty
-                    // cycle; it is not a page of its own, so the cycle before
-                    // it takes its place. Each skip moves to an older
-                    // compaction line, so this ends.
-                    cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
-                    cache.starts.shrinkRetainingCapacity(back);
-                    debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
-                    continue;
-                };
-                const archived = try projection.intoArchivedRuntime();
-                const entries = archived.notebook.entries.items.len;
-                const damaged = read_damaged or cache.damages(back);
-                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived, damaged);
-                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} us={d}", .{
-                    back,
-                    entries,
-                    damaged,
-                    @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
-                });
-                return;
+            while (cache.starts.items.len < back) {
+                // Below `back`, a u32, so the cast holds.
+                const next_back: u32 = @intCast(cache.starts.items.len + 1);
+                const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
+                    return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
+                try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
             }
+            const start = cache.starts.items[back - 1];
+            const reader = try v2.cycleReader(std.heap.c_allocator);
+            try read.start(reader, .{ .back = back, .start = start, .generation = generation });
+            debug_trace.logf("full_transcript_cache", "archive_read_started back={d} generation={d} find_us={d}", .{
+                back,
+                generation,
+                @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+            });
+        }
+
+        /// The detached transcript a finished read's turns replay into, a
+        /// few turns per loop turn (`pollTranscriptArchive`).
+        const ArchiveReplay = struct {
+            alloc: Allocator,
+            projection: resume_projection.ResumeProjection,
+            labels: HistoricalSessionLabels,
+            has_prior_turns: bool = false,
+            /// The next turn to replay.
+            next: usize = 0,
+            replay_ns: i128 = 0,
+            /// The longest loop turn spent replaying.
+            longest_slice_ns: i128 = 0,
+
+            fn create(app: *App, back: u32) !*ArchiveReplay {
+                const self = try app.alloc.create(ArchiveReplay);
+                errdefer app.alloc.destroy(self);
+                self.* = .{
+                    .alloc = app.alloc,
+                    .projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1),
+                    .labels = .{ .workspace_root = app.workspace_root },
+                };
+                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
+                self.projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
+                return self;
+            }
+
+            fn destroy(context: *anyopaque) void {
+                const self: *ArchiveReplay = @ptrCast(@alignCast(context));
+                self.projection.deinit();
+                self.labels.deinit(self.alloc);
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// How long one loop turn replays a read's turns before it lets
+        /// input and painting run; a turn always replays whole.
+        const archive_replay_slice_ns: i128 = 4 * std.time.ns_per_ms;
+
+        /// Replays the cycle a background read of `agent`'s session log
+        /// finished into a detached transcript, a few turns per call, and
+        /// installs it for Ctrl+O once every turn is in. A read that a
+        /// compaction, resume, or drop made stale is dropped. Returns whether
+        /// it installed one.
+        pub fn pollTranscriptArchive(app: *App, agent: *AppAgent) !bool {
+            if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return false;
+            const read = &agent.session_persistence.transcript_archive_read;
+            if (read.dropIfStale(app.shell.transcript_archive_generation)) return false;
+            const task = read.completed() orelse return false;
+            const back = task.request.back;
+            const outcome = advanceTranscriptArchiveReplay(app, agent, task) catch |err| {
+                read.finish();
+                return err;
+            };
+            switch (outcome) {
+                .replaying => return false,
+                .installed => {
+                    read.finish();
+                    return true;
+                },
+                .empty_cycle_skipped => {
+                    // This read is done, so the next one is not taken for it.
+                    read.finish();
+                    try loadTranscriptArchive(app, agent, back);
+                    return false;
+                },
+            }
+        }
+
+        const ArchiveReplayOutcome = enum { replaying, installed, empty_cycle_skipped };
+
+        /// One loop turn of `pollTranscriptArchive`'s replay of `task`'s
+        /// turns, and the install once they are all in.
+        fn advanceTranscriptArchiveReplay(app: *App, agent: *AppAgent, task: *session_persistence.TranscriptArchiveRead.Task) !ArchiveReplayOutcome {
+            if (task.failure) |err| return err;
+            const back = task.request.back;
+            const cache = &agent.session_persistence.transcript_archive_boundaries;
+            const replay: *ArchiveReplay = if (task.replay) |held| @ptrCast(@alignCast(held.state)) else blk: {
+                const created = try ArchiveReplay.create(app, back);
+                task.replay = .{ .state = created, .deinit_fn = ArchiveReplay.destroy };
+                break :blk created;
+            };
+            var sink = DetachedHistorySink(resume_projection.ResumeProjection){
+                .app = app,
+                .projection = &replay.projection,
+                .labels = &replay.labels,
+            };
+            const slice_started_ns = io_mod.nanoTimestamp();
+            while (replay.next < task.turns.items.len) {
+                try replayHistoryToSinkIncremental(app, agent, &sink, task.turns.items[replay.next..][0..1], &replay.has_prior_turns, &replay.labels);
+                replay.next += 1;
+                if (io_mod.nanoTimestamp() - slice_started_ns >= archive_replay_slice_ns) break;
+            }
+            const slice_ns = io_mod.nanoTimestamp() - slice_started_ns;
+            replay.replay_ns += slice_ns;
+            replay.longest_slice_ns = @max(replay.longest_slice_ns, slice_ns);
+            if (replay.next < task.turns.items.len) return .replaying;
+            const projection = &replay.projection;
+            if (projection.runtime.notebook.entries.items.len == 0) if (task.request.start) |empty_start| {
+                // Two compactions with no turn between leave an empty cycle;
+                // it is not a page of its own, so the cycle before it takes
+                // its place. Each skip moves to an older compaction line, so
+                // this ends.
+                const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+                if (cache.starts.items.len < back) return error.TranscriptArchiveUnavailable;
+                cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
+                cache.starts.shrinkRetainingCapacity(back);
+                debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
+                return .empty_cycle_skipped;
+            };
+            const archived = try projection.intoArchivedRuntime();
+            const entries = archived.notebook.entries.items.len;
+            // A read that stops at a damaged line still shows what it read.
+            const damaged = task.damaged or cache.damages(back);
+            try app.shell.installTranscriptArchive(app.alloc, back, task.request.start != null, archived, damaged);
+            debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} read_us={d} replay_us={d} longest_slice_us={d}", .{
+                back,
+                entries,
+                damaged,
+                @divTrunc(task.read_ns, std.time.ns_per_us),
+                @divTrunc(replay.replay_ns, std.time.ns_per_us),
+                @divTrunc(replay.longest_slice_ns, std.time.ns_per_us),
+            });
+            return .installed;
         }
 
         /// Whether `agent`'s transcript is the one on the screen's slot: the
@@ -4094,7 +4204,10 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
-            const outcome_decision = command_decision orelse terminal_action_decision;
+            // A shell run that returned its command running, captured or tty,
+            // has no exit status and reads "Still running", as it did live.
+            const outcome_decision = command_decision orelse terminal_action_decision orelse
+                try tool_presentation.runningCommandDecision(action_arena.allocator(), call, result.output);
             const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     agent,

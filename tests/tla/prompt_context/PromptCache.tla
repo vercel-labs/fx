@@ -97,6 +97,13 @@
 (* stale_shell_handles_note). Mutation "stale_in_instructions" is fx       *)
 (* before that: the notice joins the runtime block of the instructions     *)
 (* and stays there.                                                        *)
+(* Event "attach" is a user turn that attaches a file from a folder with   *)
+(* its own AGENTS.md, as an ACP client such as Zed does: fx carries the    *)
+(* folder's rules on that turn's own message, once                         *)
+(* (src/core/agent/runtime/orchestrator.zig queueAttachedFolderRules),     *)
+(* and needs Notes. Mutation "attach_in_instructions" is fx before that:   *)
+(* the rules join the instructions for that turn and are gone from the     *)
+(* next one, which MidSessionKeepsHistory catches.                         *)
 (* Event "outside" is a user turn after the runtime context changed        *)
 (* outside the session's own tool steps: the date rolled over, the branch  *)
 (* was switched outside fx, or the permission mode or workspace            *)
@@ -126,7 +133,7 @@ CONSTANTS
   Limit,        \* blocks per request that may carry a cache marker
   PathScoped,   \* toolbox menu and project rules embed the worktree path
   Family,       \* "anthropic" | "openai": the provider's cache rules
-  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside"}
+  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"}
   Notes,        \* mid-session changes join the conversation, not the instructions
   Carrier       \* "message" | "note": where such a change goes
 
@@ -135,11 +142,12 @@ ASSUME Family \in {"anthropic", "openai"}
 ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto",
                      "note_not_saved", "contract_late", "remind_old_result",
                      "stale_in_instructions", "overlay_rebuilt", "overlay_not_saved",
-                     "skill_swapped"}
+                     "skill_swapped", "attach_in_instructions"}
 ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
-ASSUME Events \subseteq {"switch", "deliver", "skill", "remind", "resume", "outside"} /\ Notes \in BOOLEAN
+ASSUME Events \subseteq {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"} /\ Notes \in BOOLEAN
+ASSUME "attach" \in Events => Notes
 
 Block(k, v) == [k |-> k, v |-> v]
 
@@ -246,7 +254,8 @@ NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |->
               skilled |-> FALSE, scopedTurn |-> FALSE, scopedStable |-> FALSE,
               skill |-> FALSE, skillText |-> 0,
               carrierAt |-> 0, remindable |-> FALSE, reminded |-> FALSE,
-              resumed |-> FALSE, stale |-> FALSE, out |-> FALSE, out0 |-> FALSE]
+              resumed |-> FALSE, stale |-> FALSE, out |-> FALSE, out0 |-> FALSE,
+              attached |-> FALSE, attach |-> FALSE]
 
 (* Whether the request's turn context and runtime block show the outside  *)
 (* change, and which branch they show.                                    *)
@@ -266,6 +275,8 @@ LeadBlocks(a) ==
   IF Notes THEN
     IF Mutation = "contract_late" /\ a.delivered
     THEN [Instructions(a.w, LeadBranch(a)) EXCEPT ![2] = Block("base", "p+contract")]
+    ELSE IF a.attach
+    THEN Stable(a.w) \o << Block("scoped", Scoped(a.w)) >> \o Overlay(a.w, LeadBranch(a))
     ELSE Instructions(a.w, LeadBranch(a))
   ELSE Stable(a.w)
          \o (IF a.scopedStable THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
@@ -324,8 +335,8 @@ Uncarried(b) ==
     [] OTHER -> b
 
 (* The next request of the session. "step" is a tool step and "turn" a new *)
-(* user turn; "switch", "deliver", "skill", "remind", "resume" and         *)
-(* "outside" are the events in Events, described above. Each event happens *)
+(* user turn; "switch", "deliver", "skill", "remind", "resume", "outside"  *)
+(* and "attach" are the events in Events, described above. Each event happens *)
 (* at most once per session, and "remind" only after a user turn that      *)
 (* followed the delivery. Before P6 (Notes = FALSE) the rules sit in the   *)
 (* instructions and "remind" is a plain step; there, as with mutation      *)
@@ -335,11 +346,12 @@ Uncarried(b) ==
 Continue(kind) ==
   LET a == active
       n == a.n + 1
-      isTurn == kind \in {"turn", "skill", "resume", "outside"}
+      isTurn == kind \in {"turn", "skill", "resume", "outside", "attach"}
       staleInLead == kind = "resume" /\ (~Notes \/ Mutation = "stale_in_instructions")
       \* The change shows up ahead of the history instead of on a message.
       inLead == staleInLead \/ (kind \in {"switch", "outside"} /\ (~Notes \/ Mutation = "overlay_rebuilt"))
-      event == kind \in {"switch", "deliver", "skill", "resume", "outside"} \/ (kind = "remind" /\ Notes)
+                \/ (kind = "attach" /\ Mutation = "attach_in_instructions")
+      event == kind \in {"switch", "deliver", "skill", "resume", "outside", "attach"} \/ (kind = "remind" /\ Notes)
       carried == Notes /\ Carrier = "message"
       recapture == kind = "resume" /\ Mutation = "overlay_not_saved"
       misplaced == kind = "remind" /\ carried /\ Mutation = "remind_old_result"
@@ -386,19 +398,23 @@ Continue(kind) ==
                         !.resumed = a.resumed \/ kind = "resume",
                         !.stale = a.stale \/ staleInLead,
                         !.out = a.out \/ kind = "outside",
+                        !.attached = a.attached \/ kind = "attach",
+                        !.attach = (IF isTurn THEN kind = "attach" /\ Mutation = "attach_in_instructions"
+                                    ELSE a.attach),
                         !.br0 = IF recapture THEN a.br ELSE a.br0,
                         !.out0 = IF recapture THEN a.out ELSE a.out0]
       req == Lead(next) \o hist
       keep == LastKept(a.last)
   IN /\ a.on
      /\ a.n < MaxSteps
-     /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside"} => kind \in Events
+     /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"} => kind \in Events
      /\ kind = "switch" => ~a.switched
      /\ kind = "deliver" => ~a.delivered
      /\ kind = "skill" => ~a.skilled
      /\ kind = "remind" => a.remindable /\ ~a.reminded
      /\ kind = "resume" => ~a.resumed
      /\ kind = "outside" => ~a.out
+     /\ kind = "attach" => ~a.attached
      /\ active' = [next EXCEPT !.last = req]
      /\ Send(a.w, a.s, req, FALSE, a.last, event, keep)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
@@ -419,7 +435,7 @@ ExternalSwitch(w) ==
 
 Next ==
   \/ \E w \in Worktrees : Start(w)
-  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind", "resume", "outside"} : Continue(kind)
+  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind", "resume", "outside", "attach"} : Continue(kind)
   \/ End
   \/ \E w \in Worktrees : ExternalSwitch(w)
 

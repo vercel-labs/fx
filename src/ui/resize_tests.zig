@@ -3028,8 +3028,9 @@ test "assistant paragraph and next tool keep one gap after inspected tool" {
     const creating_row = try findRowContaining(&h, "Creating project");
     try expectExactlyOneBlankRowBetween(&h, inspected_after, assistant_row);
     try expectRowEmpty(&h, assistant_row + 3);
-    try expectRowTrimmedEquals(&h, assistant_row + 4, "● 1 tool call · 1 read");
-    try std.testing.expectEqual(assistant_row + 5, creating_row);
+    // The group's only row is its header, one blank row after the paragraph.
+    try expectRowTrimmedEquals(&h, assistant_row + 4, "● Creating project");
+    try std.testing.expectEqual(assistant_row + 4, creating_row);
     try expectGridNotContains(&h, "Thinking");
 }
 
@@ -8536,6 +8537,78 @@ test "partial fresh session scrollback handoff does not duplicate committed rows
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old third"));
 }
 
+test "a handoff that gives way after pushing rows leaves each row once in scrollback" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(40, 12);
+    defer probe.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old first\nold second\nold third\n", true);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+
+    // The first frame of the handoff pushes one row into scrollback, then
+    // the terminal stops taking bytes.
+    const PartialSink = struct {
+        file: std.Io.File,
+        writes: usize = 0,
+
+        fn write(ctx: *anyopaque, _: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            const accepted = if (self.writes == 1)
+                (std.mem.findScalar(u8, bytes, '\n') orelse return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestMissingScroll } }) + 1
+            else
+                bytes.len;
+            self.file.writeStreamingAll(io_mod.getIo(), bytes[0..accepted]) catch |err| {
+                return .{ .partial = .{ .accepted_bytes = 0, .err = err } };
+            };
+            return if (self.writes == 1)
+                .{ .partial = .{ .accepted_bytes = accepted, .err = error.TestPartialFrame } }
+            else
+                .complete;
+        }
+    };
+    var sink = PartialSink{ .file = h.file };
+    h.shell.test_frame_sink = .{ .ctx = &sink, .write_frame = PartialSink.write };
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffIncomplete,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    h.shell.test_frame_sink = null;
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expect(h.shell.sessionScrollbackHandoffPending());
+
+    // A turn starts on the agent on screen: the handoff gives way, and the
+    // terminal is cleared and printed again, as after a resize.
+    h.shell.cancelSessionScrollbackHandoff("agent_busy");
+    try h.shell.requestTerminalReset(&h.metrics);
+    try h.shell.writeTranscript(alloc, &h.metrics, "turn output\n", true);
+    try h.renderTranscriptFrame();
+    const end = try h.file.length(std.testing.io);
+    const reset_frame = try alloc.alloc(u8, @intCast(end - h.read_offset));
+    defer alloc.free(reset_frame);
+    _ = try h.file.readPositionalAll(std.testing.io, reset_frame, h.read_offset);
+    // The probe keeps no scrollback of its own past a clear, so it drops
+    // what the terminal drops.
+    const clear_scrollback = "\x1b[3J";
+    const cut = (std.mem.find(u8, reset_frame, clear_scrollback) orelse return error.TestExpectedScrollbackClear) + clear_scrollback.len;
+    try probe.feed(reset_frame[0..cut]);
+    probe.history.clearRetainingCapacity();
+    try probe.feed(reset_frame[cut..]);
+    try h.flush();
+
+    // Once the agent is idle, the switch hands every row off again.
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    for ([_][]const u8{ "old first", "old second", "old third", "turn output" }) |row| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, row));
+    }
+}
+
 test "resizing after a partial session handoff cancels without clearing transcript" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 40, 12, 4);
@@ -8556,7 +8629,7 @@ test "resizing after a partial session handoff cancels without clearing transcri
         error.SessionScrollbackHandoffGeometryChanged,
         h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
     );
-    h.shell.cancelSessionScrollbackHandoff();
+    h.shell.cancelSessionScrollbackHandoff("geometry_changed");
     try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
     try std.testing.expect(std.mem.find(u8, h.shell.notebook.transcript.items, "old session retained") != null);
     try std.testing.expect(h.shell.render_requests.hasReason(.footer));
@@ -9090,7 +9163,7 @@ test "a dropped prefix preserves expanded tool projection rows" {
     try expectDroppedPrefixPreservesToolProjection(false);
 }
 
-test "command tool rows reclip to live width across lifecycle states" {
+test "command tool rows reproject frozen phrases across lifecycle states" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 200, 30, 4);
     defer h.deinit();
@@ -9106,6 +9179,8 @@ test "command tool rows reclip to live width across lifecycle states" {
     const command = "printf '" ++ text_utils.repeat("x", 60) ++ "' && sleep 1 && printf '" ++ text_utils.repeat("y", 60) ++ "'";
     const frozen_command = command[0..117] ++ "...";
     const full_tail = text_utils.repeat("y", 60);
+    // A long command shows its steps in short form; Ctrl+O keeps it whole.
+    const short = "printf, sleep, printf";
 
     const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-live" };
     const args_json = try alloc.print("{{\"command\":{f}}}", .{std.json.fmt(command, .{})});
@@ -9129,8 +9204,8 @@ test "command tool rows reclip to live width across lifecycle states" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The active row reclips to the live width and keeps its own label.
-    try expectGridContains(&h, "Running " ++ command);
+    // The active row drops the frozen phrase and keeps its own label.
+    try expectGridContains(&h, "Running " ++ short);
     try expectGridNotContains(&h, frozen_command);
 
     // Settled success: the frozen "Ran" phrase reclips the same way.
@@ -9141,7 +9216,7 @@ test "command tool rows reclip to live width across lifecycle states" {
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try expectGridContains(&h, "Ran " ++ command);
+    try expectGridContains(&h, "Ran " ++ short);
     try expectGridNotContains(&h, frozen_command);
 
     // Settled with a nonzero exit: the settled label carries the exit code,
@@ -9162,16 +9237,16 @@ test "command tool rows reclip to live width across lifecycle states" {
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try expectGridContains(&h, "Exited 1 " ++ command);
+    try expectGridContains(&h, "Exited 1 " ++ short);
     try expectGridNotContains(&h, frozen_command);
 
-    // Reclipped rows still respect the live width: narrow them and the row
-    // folds to the width with the single-cell clip marker, not the frozen
-    // generation marker.
+    // The rows keep the short form through a resize, and the full command
+    // never returns to the main view.
     try h.driveResize(90, 30, 4, true);
     try expectGridNotContains(&h, full_tail);
     try h.driveResize(200, 30, 4, true);
-    try expectGridContains(&h, "Exited 1 " ++ command);
+    try expectGridContains(&h, "Exited 1 " ++ short);
+    try expectGridNotContains(&h, full_tail);
 }
 
 test "full transcript shows terminal session launch commands in full across widths" {
@@ -9209,7 +9284,7 @@ test "full transcript shows terminal session launch commands in full across widt
     try h.flush();
 
     // The main view still trails a row that does not fit.
-    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridContains(&h, "Observed python3");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
 
     // Ctrl+O shows the whole launch command at every width.
@@ -9230,7 +9305,7 @@ test "full transcript shows terminal session launch commands in full across widt
     // Leaving Ctrl+O restores the trailing main view.
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
     try h.driveResize(100, 30, 4, true);
-    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridContains(&h, "Observed python3");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
 }
 

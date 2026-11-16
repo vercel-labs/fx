@@ -47,6 +47,8 @@ const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -1795,6 +1797,43 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     }
 
+    // A team with Token Pass starts a new session on the Token Pass default
+    // when nothing chose the model. The check refreshes the saved answer
+    // while the turn runs, and waits for it only when fx has none.
+    var token_pass_run: ?token_pass_check.Check = null;
+    defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
+    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    if (token_pass_source) |source| {
+        if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
+            token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
+            token_pass_run.?.begin(
+                alloc,
+                cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+                .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
+                token_pass_check.first_prompt_wait_ms,
+            );
+            const nothing_chose_model = startup.model_source == .compiled_default and
+                options.model_override == null and
+                ctx.requested_resume == null and
+                ctx.session.agent.history.items.len == 0;
+            // Without an answer, the catalog's Token Pass marks can answer for
+            // the team; the turn reuses the catalog this loads.
+            if (nothing_chose_model and !token_pass_run.?.has_pass and !token_pass_run.?.answered) {
+                _ = resolveModelCapabilities(&ctx, alloc, ctx.model) catch |err| {
+                    debug_trace.logf("token_pass", "catalog not loaded for the start model err={s}", .{@errorName(err)});
+                };
+                _ = token_pass_run.?.observeCatalog(alloc);
+            }
+            if (token_pass_run.?.has_pass and nothing_chose_model) {
+                debug_trace.logf("token_pass", "start model={s}", .{token_pass.default_model});
+                ctx.model = token_pass.default_model;
+                // Token Pass credit pays only for standard speed.
+                if (options.fast_override == null) ctx.fast_mode = false;
+                if (options.ultrafast_override == null) ctx.ultrafast_mode = false;
+            }
+        }
+    }
+
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
@@ -2033,11 +2072,15 @@ fn maybeStartAskTitleTask(
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const provider_title_model = bundle.title_model orelse return null;
-    // A Token Pass session titles itself with a Token Pass model.
-    const title_model = if (ctx.provider == .gateway)
-        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
-    else
-        provider_title_model;
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model the catalog marks, so the title waits for the catalog
+    // the turn would load anyway.
+    const title_model = if (ctx.provider == .gateway) title: {
+        _ = resolveModelCapabilities(ctx, ctx.alloc, ctx.model) catch |err| {
+            debug_trace.logf("token_pass", "catalog not loaded for the title model err={s}", .{@errorName(err)});
+        };
+        break :title token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model);
+    } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     // A custom connection may need no key; its adapter checks the one it gets.
@@ -2960,10 +3003,7 @@ fn shell_action_for_call(arena: Allocator, call: ToolCall) ?ShellAction {
         .object => |object| object,
         else => return null,
     };
-    const request = if (root.get("request")) |value| switch (value) {
-        .object => |object| object,
-        else => return null,
-    } else root;
+    const request = (tool_args.unwrapRequest(arena, root) catch return null) orelse return null;
     const action = switch (request.get("action") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -3075,7 +3115,13 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const questions_value = parsed.value.object.get("questions") orelse return null;
+    var questions_value = parsed.value.object.get("questions") orelse return null;
+    // The tool reads the batch from JSON text too, so the record names the
+    // same question.
+    tool_args.normalizeCompositeArrayValue(parsed.arena.allocator(), &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (questions_value != .array or questions_value.array.items.len == 0) return null;
     const first = questions_value.array.items[0];
     if (first != .object) return null;
@@ -4800,8 +4846,6 @@ const TestContextRegistryFixture = struct {
     var gather_calls: usize = 0;
     var process_calls: usize = 0;
     var gather_error: ?context_contract.ProviderError = null;
-    var expected_target_paths: []const []const u8 = &.{};
-    var targets_match: bool = false;
     var expected_queued_image: ?[]const u8 = null;
     var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
@@ -4812,8 +4856,6 @@ const TestContextRegistryFixture = struct {
         gather_calls = 0;
         process_calls = 0;
         gather_error = null;
-        expected_target_paths = &.{};
-        targets_match = false;
         expected_queued_image = null;
         queued_image_folder_rules = false;
         expected_static_context = expected_static;
@@ -4821,17 +4863,8 @@ const TestContextRegistryFixture = struct {
         transient_permission_mode = null;
     }
 
-    fn gather(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
+    fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
         gather_calls += 1;
-        targets_match = input.targets.len == expected_target_paths.len;
-        if (targets_match) {
-            for (input.targets, expected_target_paths) |target, expected_path| {
-                if (target.kind != .file or !std.mem.eql(u8, target.path, expected_path)) {
-                    targets_match = false;
-                    break;
-                }
-            }
-        }
         if (gather_error) |err| return err;
         var result: context_contract.ProviderContext = .{
             .content = try alloc.dupe(u8, test_registry_static_context),
@@ -4871,7 +4904,6 @@ const TestContextRegistryFixture = struct {
         process_calls += 1;
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
-        if (expected_gather_calls > 0) try std.testing.expect(targets_match);
         queued_image_folder_rules = deps.image_folder_rules;
         if (expected_queued_image) |path| {
             try std.testing.expectEqual(@as(usize, 1), job.images.len);
@@ -8173,6 +8205,7 @@ test "shell diagnostic action projection accepts only current actions" {
         .{ .arguments_json = "{\"action\":\"run\"}", .expected = .run },
         .{ .arguments_json = "{\"action\":\"interact\"}", .expected = .interact },
         .{ .arguments_json = "{\"request\":{\"action\":\"stop\"}}", .expected = .stop },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"interact\\\"}\"}", .expected = .interact },
     };
     for (cases) |case| {
         try std.testing.expectEqual(
@@ -8431,6 +8464,30 @@ test "fx ask JSON records ask_user_question text for matching assertions" {
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
 }
 
+test "fx ask JSON names the question of a batch sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const call = struct {
+        fn of(arguments_json: []const u8) ToolCall {
+            return .{ .id = "question", .name = "ask_user_question", .arguments_json = arguments_json };
+        }
+    }.of;
+
+    const text = (try questionTextForAskCall(alloc, call("{\"questions\":\"[{\\\"question\\\":\\\" Which path? \\\"}]\"}"))).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Which path?", text);
+
+    // Text that does not hold a batch names no question, including a batch
+    // encoded twice.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "[{\"question\":\"Twice?\"}]", .{});
+    for ([_][]const u8{ "not json", "{}", "[]", "[1]", twice }) |questions_text| {
+        const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = questions_text }, .{});
+        try std.testing.expect((try questionTextForAskCall(alloc, call(arguments_json))) == null);
+    }
+}
+
 test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
     const alloc = std.testing.allocator;
     var question_bytes: [257]u8 = undefined;
@@ -8612,10 +8669,9 @@ test "default fx ask keeps image paths out of the initial context and has the ru
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
-    // The instructions' context names no target, so an image never changes
-    // them; the turn carries the image's path and the runtime delivers its
-    // folder's rules as a note.
-    try std.testing.expect(TestContextRegistryFixture.targets_match);
+    // The instructions' context cannot name a target, so an image never
+    // changes them; the turn carries the image's path and the runtime
+    // delivers its folder's rules as a note.
     try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 
