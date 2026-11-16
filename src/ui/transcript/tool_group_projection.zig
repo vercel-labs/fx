@@ -8091,9 +8091,9 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     var status_bufs: [commands.len][64]u8 = undefined;
     for (commands, 0..) |command, index| {
         const running = index == commands.len - 1;
-        const status = try std.fmt.bufPrint(&status_bufs[index], "● {s} {s}\n", .{ if (running) "Running" else "Ran", command });
+        const status = try std.mem.print(&status_bufs[index], "● {s} {s}\n", .{ if (running) "Running" else "Ran", command });
         entries[index] = .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = status, .class = .tool_status } };
-        const json = try std.fmt.bufPrint(&json_bufs[index], "{{\"command\":\"{s}\"}}", .{command});
+        const json = try std.mem.print(&json_bufs[index], "{{\"command\":\"{s}\"}}", .{command});
         details[index] = storyCommandDetail(@intCast(index + 1), json, 0, null);
         details[index].command_display = @constCast(command);
         if (running) {
