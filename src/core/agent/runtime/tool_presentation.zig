@@ -1016,7 +1016,7 @@ pub noinline fn startToolVisibleLifecycle(
         display_target,
         advertised_dynamic_tool_names,
     ) else null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .authoritative_started = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .authoritative_started = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .presentation_group_id = presentation_group_id,
         .reconciles_provisional_call_id = call.provisional_id,
@@ -1025,12 +1025,12 @@ pub noinline fn startToolVisibleLifecycle(
         .arguments_json = redacted_arguments,
         .place_after_current_transcript = false,
         .resolved_display_target = call.resolved_display_target,
-    } });
+    } } } });
     if (activity_line) |line| {
-        try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+        try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .text = line,
-        } });
+        } } } });
     }
     return true;
 }

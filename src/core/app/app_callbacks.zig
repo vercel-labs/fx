@@ -2311,7 +2311,7 @@ test "agent deps forward app callbacks through core types" {
     defer app.deinit();
 
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app, (&app).agent());
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = "hello" });
+    try deps.emit(.{ .text = .{ .assistant_rendered = "hello" } });
     try deps.finalize_turn(deps.ctx, 9, .completed, .length_limited);
     try deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = .{
         .summary = @constCast("summary"),
@@ -2326,7 +2326,8 @@ test "agent deps forward app callbacks through core types" {
             .compaction_count = 1,
         },
     } });
-    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+    defer types.freeFinishedPrompt(std.heap.c_allocator, finished);
+    try deps.emit(.{ .worker = .{ .finish_prompt = finished } });
 
     try std.testing.expectEqual(@as(usize, 3), app.agent().worker.events.items.len);
     try std.testing.expectEqualStrings("hello", app.agent().worker.events.items[0].assistant_presentation.text);
@@ -2537,7 +2538,7 @@ test "interactive stream adapter queues byte-identical rendered spans" {
         "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = **literal**;\n",
     };
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app, (&app).agent());
-    for (spans) |span| try deps.push_text(deps.ctx, .{ .assistant_rendered = span });
+    for (spans) |span| try deps.emit(.{ .text = .{ .assistant_rendered = span } });
 
     try std.testing.expectEqual(spans.len, app.agent().worker.events.items.len);
     for (spans, app.agent().worker.events.items) |expected, event| {
@@ -2586,9 +2587,9 @@ test "agent diff block callback enqueues worker event without direct transcript 
     defer app.deinit();
 
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app, (&app).agent());
-    try deps.push_diff_block(deps.ctx, .{
-        .preview = try c_alloc.dupe(u8, "diff preview"),
-    });
+    const preview = try c_alloc.dupe(u8, "diff preview");
+    defer c_alloc.free(preview);
+    try deps.emit(.{ .worker = .{ .diff_block = .{ .preview = preview } } });
 
     try std.testing.expectEqual(@as(usize, 0), app.diff_register_count);
     try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
@@ -2807,7 +2808,7 @@ test "agent context and system notices share semantic transport with distinct fi
         deps.ctx,
         "[context] first warning\n[context] second warning",
     );
-    try deps.push_system_notice(deps.ctx, "ordinary-system");
+    try deps.emit(.{ .notice = .{ .plain = "ordinary-system" } });
     try deps.push_interactive_notice.?(deps.ctx, .{
         .topic = "background",
         .tone = .information,

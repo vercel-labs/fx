@@ -4877,15 +4877,15 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
         const deps = agentRuntimeDeps(&ctx);
 
         for (source_spans, rendered_spans) |source, rendered| {
-            try deps.push_text(deps.ctx, .{ .assistant_source = source });
-            try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered });
+            try deps.emit(.{ .text = .{ .assistant_source = source } });
+            try deps.emit(.{ .text = .{ .assistant_rendered = rendered } });
         }
-        try deps.push_text(deps.ctx, .{ .assistant_source = "" });
-        try deps.push_text(deps.ctx, .{ .operational = operational_span });
-        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Response interrupted. Restarting.\n" });
+        try deps.emit(.{ .text = .{ .assistant_source = "" } });
+        try deps.emit(.{ .text = .{ .operational = operational_span } });
+        try deps.emit(.{ .text = .{ .assistant_restarted = "Response interrupted. Restarting.\n" } });
         const interrupted_message_id = ctx.message_id;
-        try deps.push_text(deps.ctx, .assistant_started);
-        try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement response." });
+        try deps.emit(.{ .text = .assistant_started });
+        try deps.emit(.{ .text = .{ .assistant_source = "Replacement response." } });
         try std.testing.expect(!std.mem.eql(u8, &interrupted_message_id, &ctx.message_id));
         try capture.sync(io_mod.getIo());
     }
@@ -4937,7 +4937,7 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
     try std.testing.expect(writer_failed);
 
     const failed_deps = agentRuntimeDeps(&failed_ctx);
-    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_source = "writer failure remains suppressed" });
+    try failed_deps.emit(.{ .text = .{ .assistant_source = "writer failure remains suppressed" } });
 }
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
@@ -4964,12 +4964,7 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     );
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.push_http_error(
-        deps.ctx,
-        .unauthorized,
-        "provider rejected access-token-secret",
-        server.firstSession(&state).?.credential_source,
-    );
+    try deps.emit(.{ .http_error = .{ .status = .unauthorized, .detail = "provider rejected access-token-secret", .credential_source = server.firstSession(&state).?.credential_source } });
     try capture.sync(io_mod.getIo());
 
     var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-auth-failure.jsonl", .{});
