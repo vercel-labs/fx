@@ -9357,6 +9357,16 @@ test "a prompt image the store does not save keeps its bytes inline and gets no 
     try testing.expectEqualStrings(images[1].snapshot_path.?, kept[1].snapshot_path.?);
 }
 
+/// Whether this process writes into `dir` whatever its mode, as root or a
+/// process with `CAP_DAC_OVERRIDE` does. A test of a refused write can't
+/// run then, so it skips.
+fn writesWhateverTheMode(dir: std.Io.Dir) bool {
+    const io = io_mod.getIo();
+    dir.writeFile(io, .{ .sub_path = ".mode-probe", .data = "" }) catch return false;
+    dir.deleteFile(io, ".mode-probe") catch {};
+    return true;
+}
+
 test "a turn the store cannot start keeps its prompt images inline and does not fail the prompt (D89)" {
     var t: TestHome = undefined;
     try t.init();
@@ -9375,10 +9385,11 @@ test "a turn the store cannot start keeps its prompt images inline and does not 
     // which a read-only store refuses.
     const io = io_mod.getIo();
     try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
-    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
+    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{ .iterate = true });
     defer root.close(io);
-    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
+    try root.setPermissions(io, .fromMode(0o500));
     defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(root)) return error.SkipZigTest;
     try s.savePromptImages(arena.allocator(), &images);
     try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
     try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
@@ -9553,7 +9564,7 @@ const V1Home = struct {
         for (ids) |id| {
             var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
             defer dir.close(io);
-            dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+            try dir.setPermissions(io, .fromMode(0o755));
             var walker = try dir.walk(a);
             defer walker.deinit();
             while (try walker.next(io)) |entry| switch (entry.kind) {
@@ -9837,9 +9848,9 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
     for ([_][]const u8{ "", "/state", "/proofs" }) |sub| {
         const path = try alloc.print("{s}/{s}{s}", .{ try v1.sessionPath(id, ""), terminal_dir_name, sub });
         defer alloc.free(path);
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
 
     const s = try openConverted(&t, id);
@@ -10147,6 +10158,30 @@ test "recover on a v1 session whose lock file others can write says its storage 
         return error.TestUnexpectedResult;
     } else |err| err;
     try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+}
+
+test "recover and conversion refuse a v1 family whose subagent folder others can write as unsafe, and keep it (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    const err = if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (openConverted(&t, family[0])) |s| {
+        s.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    // Nothing was copied or removed: every member keeps its v1 folder.
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
 }
 
 test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
@@ -11065,9 +11100,9 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     const roots = try v1.fixture("plain", 1);
     const v1_open_id = roots[0];
     for ([_][]const u8{ ".fx", ".fx/sessions", try v1.sessionPath(v1_open_id, "") }) |path| {
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
     const s = try openConverted(&t, v1_open_id);
     defer s.close();
@@ -11450,10 +11485,11 @@ test "a new session never takes an id v1's folder could not be checked for (D61)
     defer t.deinit();
     const io = io_mod.getIo();
     try t.tmp.dir.createDirPath(io, ".fx/sessions");
-    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
+    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{ .iterate = true });
     defer sessions.close(io);
-    sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
+    try sessions.setPermissions(io, .fromMode(0o000));
     defer sessions.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(sessions)) return error.SkipZigTest;
     var model = "m".*;
     try testing.expectError(error.SessionStoreUnavailable, Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model)));
 }
