@@ -214,9 +214,12 @@ pub const ProvisionalToolStatuses = struct {
         }) catch {};
     }
 
-    /// Names the subagent a streaming `subagent` call's row is for as soon
-    /// as its arguments so far hold the whole name, so the row reads
-    /// `Managing reviewer` while the rest of the call streams in.
+    /// Names a streaming call's row as soon as its arguments so far say what
+    /// it is for, while the rest of the call streams in: the subagent a
+    /// `subagent` call is for once its whole name is in, so the row reads
+    /// `Managing reviewer`, and what a `toolbox` call runs, searches, or
+    /// opens once that whole value is in, so the row reads
+    /// `Running glob_files`. A row already named stays as it is.
     pub fn observeArguments(
         self: *ProvisionalToolStatuses,
         hooks: *const AgentRuntimeDeps,
@@ -227,8 +230,13 @@ pub const ProvisionalToolStatuses = struct {
     ) !void {
         const index = self.findTracked(tool_id) orelse return;
         const status = self.tracked.items[index];
-        if (!std.mem.eql(u8, status.tool_name, "subagent") or status.label_value != null) return;
-        if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        if (status.label_value != null) return;
+        if (std.mem.eql(u8, status.tool_name, "subagent")) {
+            if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        } else if (std.mem.eql(u8, status.tool_name, toolbox.tool_name)) {
+            const action = try tooling_presentation.toolboxStreamedAction(alloc, arguments) orelse return;
+            alloc.free(action);
+        } else return;
         const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
             .ineligible => return,
             .eligible => |metadata| metadata,
@@ -2186,6 +2194,38 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
+}
+
+test "a streaming toolbox call's row names what it runs once that name arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, toolbox.tool_name);
+    const action = eligibleActionLabel(toolbox.tool_name);
+    var named_buf: [512]u8 = undefined;
+    const named = try formatProvisionalProgressLabel(&named_buf, "Running", "glob_files");
+
+    try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, kind, action, null, null);
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    // Part of the name is not yet a name.
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expectEqualStrings("toolbox_1", capture.events.items[2].provisional.id.call_id);
+    try std.testing.expectEqualStrings(named, capture.events.items[3].progress.text);
+    // The rest of the call streams in without another publication.
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pat");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+
+    // A search with no words yet may list one server's tools, so it waits.
+    try statuses.publish(&hooks, alloc, 7, "toolbox_2", toolbox.tool_name, kind, action, null, null);
+    const before = capture.events.items.len;
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_2", "{\"search\":\"\",\"server\":\"sl");
+    try std.testing.expectEqual(before, capture.events.items.len);
 }
 
 test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
