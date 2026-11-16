@@ -316,6 +316,8 @@ createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "high", fast: 
 
 AI Gateway is the default. libfx uses the first credential it finds: the `apiKey` option, then `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token.
 
+libfx asks AI Gateway to cache the start of each request, as the fx CLI does. Later requests in a session start with the same instructions, tools, and earlier messages, so models that support prompt caching read that part from the cache instead of processing it again.
+
 ### ChatGPT plans
 
 An agent can run on a user's ChatGPT plan through Codex. Set `provider: "codex"` and give libfx the user's credentials:

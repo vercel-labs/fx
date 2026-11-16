@@ -1121,10 +1121,11 @@ describe("modern MCP stdio compatibility", () => {
         { text: "later" },
       ]);
 
-      // Each turn's tool group counts its MCP call as one, never as a command.
+      // Each turn's tool group names its MCP call as MCP work, never as a
+      // command.
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain("1 MCP call");
-      expect(scrollback).not.toMatch(/\b\d+ commands?\b/);
+      expect(scrollback).toContain("● Used an MCP tool");
+      expect(scrollback).not.toMatch(/\b\d+ commands?\b|\b[Rr]an (a )?commands?\b/);
       expect(scrollback).not.toContain("not selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -2442,13 +2443,15 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the failing MCP fixture once.");
+      // The failed call's reason follows its row on the same line.
       await tui.waitForText(
-        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`,
+        " · Invalid input: labels require at least one item retry rejected",
         20_000,
       );
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`└ Couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -2492,8 +2495,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the MCP fixture with a typed argument.");
       const cause = "arguments rejected: limit is a string, the schema wants a number";
-      await tui.waitForText(`Failed ${TOOL_NAME}: ${cause}`, 20_000);
+      // The row names the failed call, and the cause follows it on its line.
+      await tui.waitForText(cause, 20_000);
       await tui.waitForText("Rejected arguments complete.", 20_000);
+      expect(await tui.captureFullScrollback()).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
 
@@ -4521,7 +4526,7 @@ describe("fx mcp call", () => {
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())(
-    "in the TUI, each call a command makes shows as its own MCP row beside the command",
+    "in the TUI, the calls a command makes share one MCP row beside the command",
     async () => {
       const root = bridgeRoot("bridge-tui-rows", {}, { mode: "paged", expectedElicitation: "both" });
       const stderrPath = join(root.root, "stderr.log");
@@ -4549,10 +4554,11 @@ describe("fx mcp call", () => {
       await tui.sendText("Page through the list.");
       await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
-      // The rows a direct call of the tool gets, in the command's group.
-      expect(scrollback).toContain("● 4 tool calls · 3 MCP calls · 1 command");
-      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
-      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
+      // The calls of one tool share a row that counts them, in the
+      // command's group.
+      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
+      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
+      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
       expect(scrollback).not.toContain("Running MCP");
       expect(seen).toContain("calls=3 items=9");
       // The model sees the command's output, not the rows.

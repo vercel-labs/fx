@@ -20,6 +20,7 @@ const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
 const image_provider = @import("../agent/runtime/image_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -1828,6 +1829,18 @@ fn terminal_lease_cleanup_dispatch_context(
     return dispatch;
 }
 
+/// Stops the shell commands that steering moved to the background during
+/// turn `turn_id`, after the user cancelled that turn. The stop ignores the
+/// turn's cancel flag, which is set by then.
+pub fn stop_steering_detached_commands(ctx: Context, turn_id: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return shell_impl.stopSteeringDetached(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        turn_id,
+    );
+}
+
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
     defer arena_state.deinit();
@@ -1940,10 +1953,11 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
-        // A Token Pass session reads images with a Token Pass model.
-        // A custom connection reads images with its own vision_model.
+        // A Token Pass session of a team with Token Pass reads images with a
+        // Token Pass model. A custom connection reads images with its own
+        // vision_model.
         .model = if (state.runtime.provider == .gateway)
-            token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+            token_pass_team.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
         else
             state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };

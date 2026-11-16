@@ -1973,6 +1973,7 @@ fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
                 .tone = e.tone,
                 .body = e.body,
                 .visibility = e.visibility,
+                .detail = e.detail,
             },
             .{},
             std.math.maxInt(u16),

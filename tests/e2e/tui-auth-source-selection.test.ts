@@ -448,6 +448,13 @@ function startRequestCatcher() {
   };
 }
 
+/// Waits until the credits fake has seen `count` requests.
+async function waitForCreditsRequests(creditsGateway: { requests: unknown[] }, count: number) {
+  const deadline = Date.now() + TIMEOUT;
+  while (creditsGateway.requests.length < count && Date.now() < deadline) await Bun.sleep(25);
+  expect(creditsGateway.requests).toHaveLength(count);
+}
+
 function startFakeCreditsGateway() {
   const requests: Array<{
     method: string;
@@ -3012,6 +3019,11 @@ tmuxTest(
     // The login was already on this team, so nothing changed.
     const signedIn = await session.captureFullScrollback();
     expect(signedIn).toContain("Using Vercel team Vercel Labs (vercel-labs).");
+    expect(signedIn).not.toContain("auth: Using Vercel team");
+    expect(signedIn).toContain("Get $150 of tokens for $30 with Vercel Token Pass.");
+    // The link sits behind the name, so the address never shows.
+    expect(signedIn).not.toContain("vercel.com/get/token-pass");
+    expect(signedIn).not.toContain("Preparing Vercel AI Gateway");
     expect(signedIn).not.toContain("Changed Vercel team");
 
     expect(gateway.requests).toHaveLength(2);
@@ -3982,7 +3994,10 @@ tmuxTest(
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
         pane.includes("gpt-5.4-mini") &&
-        !pane.includes("openai/gpt-5.6-sol"),
+        !pane
+          .split("\n")
+          .filter((line) => /^\s+\S*gpt-/.test(line))
+          .some((line) => line.includes("openai/gpt-5.6-sol")),
       TIMEOUT,
     );
     expect(codexCatalog).toContain("[All]");
@@ -9566,11 +9581,11 @@ tmuxTest(
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
     ]);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // /credits, and the Token Pass check the renewed login starts: both
+    // with the renewed token.
+    await waitForCreditsRequests(creditsGateway, 2);
+    const renewed = { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` };
+    expect(creditsGateway.requests).toEqual([renewed, renewed]);
     await waitForModelRequestCount(gateway, 2);
     expect(gateway.modelRequests).toHaveLength(2);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
@@ -9614,11 +9629,13 @@ tmuxTest(
 
     await session.waitForText("* credits: balance=42", TIMEOUT);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(1);
-    expect(creditsGateway.requests).toEqual([{
-      method: "GET",
-      path: "/v1/credits",
-      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
-    }]);
+    // The Token Pass check at launch, with the login that was current
+    // then, and /credits with the renewed one.
+    await waitForCreditsRequests(creditsGateway, 2);
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -9731,11 +9748,16 @@ tmuxTest(
       FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
     });
     await session.waitForComposer(TIMEOUT);
+    // The Token Pass check at launch uses the login while it is current.
+    await waitForCreditsRequests(creditsGateway, 1);
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
 
     await session.sendText("/credits");
     await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
-    expect(creditsGateway.requests).toEqual([]);
+    // /credits sends nothing with the expired login.
+    expect(creditsGateway.requests).toEqual([
+      { method: "GET", path: "/v1/credits", authorization: `Bearer ${LOGIN_TOKEN}` },
+    ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
