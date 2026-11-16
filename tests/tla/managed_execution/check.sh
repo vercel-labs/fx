@@ -12,6 +12,7 @@
 #   no-crossing-end   a wait never ends at the crossing                   CrossingEnds
 #   no-rearm          output during a wait does not arm it                CrossingEnds
 #   ceiling-late      a wait runs one tick past its ceiling               WaitBounded
+#   hold-ignored      a held wait ends for quiet or at its ceiling        HeldWaitStaysOpen
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -33,4 +34,5 @@ QuietWait quiet-wait-mutation-end-unarmed QuietEndNeedsCrossing
 QuietWait quiet-wait-mutation-no-crossing-end CrossingEnds
 QuietWait quiet-wait-mutation-no-rearm CrossingEnds
 QuietWait quiet-wait-mutation-ceiling-late WaitBounded
+QuietWait quiet-wait-mutation-hold-ignored HeldWaitStaysOpen
 VERDICTS

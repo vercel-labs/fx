@@ -1,8 +1,9 @@
 // Walks fx's quiet notice (src/core/execution/quiet_notice.zig) along its
 // model, tests/tla/managed_execution/QuietWait.tla.
 //
-// TLC writes the model's state graph. Two of its variables, under and
-// outDuring, and the last result are history the code does not keep. Edges
+// TLC writes the model's state graph. Three of its variables, under,
+// outDuring, and heldLate, and the last result are history the code does not
+// keep. Edges
 // that look the same to the code, the same action from the same visible
 // state to the same visible state, are walked once: the driver walks to each
 // such edge along a shortest path, so every transition the code can tell
@@ -138,7 +139,7 @@ async function loadGraph(out: string): Promise<Graph> {
 
 // What the code can see of a model state: everything but the ghosts and the
 // last result.
-const codeView = (s: Model) => JSON.stringify([s.cmd, s.quiet, s.waiting, s.ceil, s.waitAge, s.armed, s.polled]);
+const codeView = (s: Model) => JSON.stringify([s.cmd, s.quiet, s.waiting, s.ceil, s.waitAge, s.armed, s.polled, s.held]);
 
 // The operations one model step becomes, at the driver's clock `now` after
 // the step's time has passed.
@@ -146,6 +147,8 @@ function opsFor(label: string, t: Model, now: number): Op[] {
   switch (label) {
     case "Output": return [{ op: "output", now }];
     case "Finish": return [{ op: "finish", now }];
+    case "Hold": return [{ op: "hold", now }];
+    case "Release": return [{ op: "release", now }];
     case "Begin": return [{ op: "begin", now, ceiling: t.ceil * TickMs }];
     case "Poll": return [{ op: "poll", now }];
     case "Tick": return [];

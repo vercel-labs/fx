@@ -4337,6 +4337,80 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(1);
   }, 60_000);
 
+  test("a command keeps fx mcp call after its shell call returns, and a later interact runs its call", async () => {
+    const root = bridgeRoot("bridge-outlives-call");
+    let started = "";
+    let paused = "";
+    let followed = "";
+    // The run serves the first call, then returns at its 1 s yield while the
+    // command still runs.
+    const first = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"first"}' > first.txt`;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `${first}; sleep 2; ${command}`, yield_time_ms: 1_000 }),
+      // The second call arrives while another command runs, so no shell call
+      // follows its own command: it waits.
+      (body: string) => {
+        started = toolResultText(body, "run_call");
+        return fakeGatewayToolCall("pause_call", "shell", { action: "run", command: "sleep 3; echo paused" });
+      },
+      (body: string) => {
+        paused = toolResultText(body, "pause_call");
+        const sessionId = (JSON.parse(started) as { session_id: string }).session_id;
+        return fakeGatewayToolCall("wait_call", "shell", { action: "interact", session_id: sessionId, yield_time_ms: 30_000 });
+      },
+      (body: string) => {
+        followed = toolResultText(body, "wait_call");
+        return fakeGatewayFinalText("BRIDGE_FOLLOWED");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_FOLLOWED");
+    const run = JSON.parse(started) as { state: string; mcp_call_notice?: string };
+    expect(run.state).toBe("running");
+    // The command has used fx mcp call, so the result says to follow it.
+    expect(run.mcp_call_notice).toContain("use interact with this session_id");
+    expect(readFileSync(join(root.workspace, "first.txt"), "utf8").trimEnd().endsWith("BRIDGE_TAIL:first")).toBe(true);
+    expect(paused).toContain("paused");
+    expect(followed).toContain("exit=0");
+    expect(followed).toContain("BRIDGE_TAIL:hello");
+    expect(followed).not.toContain("mcp_call_notice");
+    expect(readFileSync(join(root.workspace, "out.txt"), "utf8").length).toBeGreaterThan(1536 * 1024);
+    expect(toolCalls(root)).toHaveLength(2);
+  }, 60_000);
+
+  test("fx exits while a command's call waits for a shell call to follow it, and the call never runs", async () => {
+    const root = bridgeRoot("bridge-waiting-at-exit");
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `sleep 1; ${command}`, yield_time_ms: 0 }),
+      // The turn ends after the command's call has started to wait.
+      async () => {
+        await Bun.sleep(2_000);
+        return fakeGatewayFinalText("BRIDGE_LEFT_WAITING");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const started = Date.now();
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_LEFT_WAITING");
+    // stderr holds only the progress lines of `fx ask`.
+    expect(result.stderr).not.toMatch(/panic|leaked/i);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())(
     "in the TUI, a command's call waits for the user's approval, then saves the result",
     async () => {
