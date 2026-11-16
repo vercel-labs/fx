@@ -724,7 +724,7 @@ pub fn secretSafePrefixLen(value: []const u8, limit: usize) usize {
 const max_split_secret_run = 512;
 const secret_prefix_window = 64;
 /// The starts of the keys and tokens `maskSecrets` finds without a space.
-const token_prefixes = [_][]const u8{ "sk-", "sk_live_", "pk_live_", "github_pat_", "xoxb-", "xoxp-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "AKIA", "ASIA", "AIDA", "AGPA", "AROA", "ANPA" };
+const token_prefixes = inline_key_prefixes ++ github_token_prefixes ++ aws_key_prefixes;
 
 /// `end`, moved back past the run of secret bytes it splits, if any; in a
 /// run longer than `max_split_secret_run`, only past a key or token that
@@ -744,15 +744,44 @@ fn withoutSplitSecretRun(value: []const u8, end: usize) usize {
     return cut;
 }
 
+/// How far back `secretSafeSuffixStart` looks for a secret that the tail's
+/// start falls inside.
+const max_secret_lookback = 1024;
+
 /// Where a tail of `value` that would start at `start`, a UTF-8 boundary,
 /// starts instead so it holds no part of a secret the start splits: past the
 /// rest of a run of secret bytes it splits, and then past the `@` of a URL
 /// credential whose scheme the tail no longer holds. `maskSecrets` could find
 /// neither, because each lacks the start it matches on. A token after
 /// `Bearer `, which `maskSecrets` finds only with that prefix, is left out
-/// when the tail does not hold all of the prefix.
+/// when the tail does not hold all of the prefix. A start inside a secret
+/// that `maskSecrets` finds in the whole value moves past that secret first.
+/// It applies its rules again wherever a step ends, until the start stays put.
 pub fn secretSafeSuffixStart(value: []const u8, start: usize) usize {
+    var at = start;
+    while (true) {
+        const next = suffixStartStep(value, at);
+        if (next <= at) return at;
+        at = next;
+    }
+}
+
+/// `secretSafeSuffixStart`'s rules, applied once.
+fn suffixStartStep(value: []const u8, start: usize) usize {
     if (start == 0 or start >= value.len) return start;
+    // A start inside a secret `maskSecrets` finds in the whole value moves
+    // past that secret: the tail alone lacks the start the mask matches on,
+    // such as an assignment's key or a quoted value's opening quote.
+    var match = start -| max_secret_lookback;
+    while (match < start) {
+        const span = findSecretSpan(value, match) orelse {
+            match += 1;
+            continue;
+        };
+        const span_end = span.prefix_end + span.value_len;
+        if (span_end > start) return @min(span_end, value.len);
+        match = @max(span_end, match + 1);
+    }
     var begin = start;
     if (!std.ascii.isWhitespace(value[start - 1])) {
         if (inSecretRun(value[start - 1]) and inSecretRun(value[start])) {
@@ -791,6 +820,7 @@ pub fn maskSecretsCutShort(arena: std.mem.Allocator, text: []const u8) ![]const 
     var out: std.ArrayList(u8) = .empty;
     var copied: usize = 0;
     var changed = false;
+    var last_marker_end: usize = 0;
     var i: usize = 0;
     while (i < masked.len) {
         const marker_len: usize = if (std.mem.startsWith(u8, masked[i..], "...") or std.mem.startsWith(u8, masked[i..], "\u{2026}")) 3 else 0;
@@ -798,7 +828,7 @@ pub fn maskSecretsCutShort(arena: std.mem.Allocator, text: []const u8) ![]const 
             i += 1;
             continue;
         }
-        if (cutShortSecretStart(masked, @max(copied, i -| max_cut_short_secret_len), i)) |start| {
+        if (cutShortSecretStart(masked, @max(@max(copied, last_marker_end), i -| max_cut_short_secret_len), i)) |start| {
             try out.appendSlice(arena, masked[copied..start]);
             try out.appendSlice(arena, "[redacted]");
             copied = i;
@@ -806,6 +836,7 @@ pub fn maskSecretsCutShort(arena: std.mem.Allocator, text: []const u8) ![]const 
         }
         i += marker_len;
         while (i < masked.len and masked[i] == '.') i += 1;
+        last_marker_end = i;
     }
     if (!changed) return masked;
     try out.appendSlice(arena, masked[copied..]);
@@ -1045,9 +1076,15 @@ fn findSecretSpan(text: []const u8, start: usize) ?SecretSpan {
     return null;
 }
 
+/// The starts of the keys and tokens `matchesInlineKey` finds, without
+/// `Bearer `, which holds a space.
+const inline_key_prefixes = [_][]const u8{ "sk-", "sk_live_", "pk_live_", "github_pat_", "xoxb-", "xoxp-" };
+const github_token_prefixes = [_][]const u8{ "ghp_", "gho_", "ghu_", "ghs_", "ghr_" };
+const aws_key_prefixes = [_][]const u8{ "AKIA", "ASIA", "AIDA", "AGPA", "AROA", "ANPA" };
+
 fn matchesInlineKey(text: []const u8, start: usize) ?SecretSpan {
     if (start > 0 and isTokenChar(text[start - 1])) return null;
-    const prefixes = [_][]const u8{ "sk-", "sk_live_", "pk_live_", "github_pat_", "xoxb-", "xoxp-", "Bearer " };
+    const prefixes = inline_key_prefixes ++ [_][]const u8{"Bearer "};
     for (prefixes) |prefix| {
         if (start + prefix.len < text.len and std.mem.startsWith(u8, text[start..], prefix)) {
             var end = start + prefix.len;
@@ -1062,11 +1099,14 @@ fn matchesInlineKey(text: []const u8, start: usize) ?SecretSpan {
 
 fn matchesGithubToken(text: []const u8, start: usize) ?SecretSpan {
     if (start + 40 > text.len) return null;
-    if (!(std.mem.startsWith(u8, text[start..], "ghp_") or
-        std.mem.startsWith(u8, text[start..], "gho_") or
-        std.mem.startsWith(u8, text[start..], "ghu_") or
-        std.mem.startsWith(u8, text[start..], "ghs_") or
-        std.mem.startsWith(u8, text[start..], "ghr_"))) return null;
+    var found = false;
+    for (github_token_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, text[start..], prefix)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return null;
     var end = start + 4;
     while (end < text.len and isTokenChar(text[end])) : (end += 1) {}
     if (end - (start + 4) < 36) return null;
@@ -1074,8 +1114,7 @@ fn matchesGithubToken(text: []const u8, start: usize) ?SecretSpan {
 }
 
 fn matchesAwsAccessKey(text: []const u8, start: usize) ?SecretSpan {
-    const prefixes = [_][]const u8{ "AKIA", "ASIA", "AIDA", "AGPA", "AROA", "ANPA" };
-    for (prefixes) |prefix| {
+    for (aws_key_prefixes) |prefix| {
         if (start + 20 > text.len or !std.mem.startsWith(u8, text[start..], prefix)) continue;
         const candidate = text[start .. start + 20];
         for (candidate) |c| {
@@ -1670,6 +1709,50 @@ test "secretSafeSuffixStart skips the rest of a split token or a URL credential"
     for (value_start..end_space) |start| {
         try std.testing.expectEqual(end_space, secretSafeSuffixStart(assignment, start));
     }
+
+    // A quoted value holds a space, so the run skip stops inside it; the mask
+    // finds the whole value, so the tail moves past the closing quote.
+    const quoted = "run PASSWORD=\"hunter2 topsecretvalue\" next";
+    const key_start = std.mem.find(u8, quoted, "PASSWORD").?;
+    const closing_quote = std.mem.findScalarLast(u8, quoted, '"').?;
+    var start = key_start;
+    while (start <= closing_quote) : (start += 1) {
+        const masked = try maskSecrets(arena, quoted[secretSafeSuffixStart(quoted, start)..]);
+        try std.testing.expect(std.mem.find(u8, masked, "hunter2") == null);
+        try std.testing.expect(std.mem.find(u8, masked, "topsecret") == null);
+        try std.testing.expect(std.mem.find(u8, masked, "secretvalue") == null);
+    }
+}
+
+test "secretSafeSuffixStart skips many adjacent secrets without a deep stack" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `K` is no sensitive key, so `K="a b"` holds no secret and the rules
+    // leave its value alone.
+    const plain = "K=\"a b\" ";
+    const plain_value = try arena.alloc(u8, plain.len * 20000 + "end".len);
+    var index: usize = 0;
+    while (index < 20000) : (index += 1) @memcpy(plain_value[index * plain.len ..][0..plain.len], plain);
+    @memcpy(plain_value[plain.len * 20000 ..], "end");
+    try std.testing.expectEqual(@as(usize, "K=\"".len), secretSafeSuffixStart(plain_value, "K=\"".len));
+
+    // 20000 adjacent secrets, each with a space that stops the run skip, so
+    // every step lands on the next one.
+    const repeat_text = "PASSWORD=\"a b\" ";
+    const value = try arena.alloc(u8, repeat_text.len * 20000 + "end".len);
+    index = 0;
+    while (index < 20000) : (index += 1) @memcpy(value[index * repeat_text.len ..][0..repeat_text.len], repeat_text);
+    @memcpy(value[repeat_text.len * 20000 ..], "end");
+
+    const tail_start = secretSafeSuffixStart(value, "PASSWORD=\"".len);
+    // The tail starts at the first value's closing quote: the rules move past
+    // the secret the start is inside, not past the whole next one, and every
+    // value after it is whole, so `maskSecrets` still finds them.
+    try std.testing.expectEqual("PASSWORD=\"a b\"".len - 1, tail_start);
+    const masked = try maskSecrets(arena, value[tail_start..]);
+    try std.testing.expect(std.mem.find(u8, masked, "a b") == null);
 }
 
 test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted secret" {
@@ -1689,6 +1772,10 @@ test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted s
         .{
             .secret = "https://admin:P\u{e4}ss1234@example.com/repo",
             .probes = &[_][]const u8{ "admin:", "ss1234" },
+        },
+        .{
+            .secret = "PASSWORD=\"hunter2 topsecretvalue\"",
+            .probes = &[_][]const u8{ "hunter2", "topsecret" },
         },
     };
 
@@ -1794,6 +1881,16 @@ test "maskSecretsCutShort masks a secret a cut marker ends and leaves other text
     // A long run of dots stays one cut marker, so the scan stays linear.
     const dots = "a " ++ repeat(".", 20000);
     try std.testing.expectEqualStrings(dots, try maskSecretsCutShort(arena, dots));
+
+    // A long line of markers scans back no further than the marker before it.
+    const long_a = try arena.alloc(u8, "a...".len * 50000);
+    for (long_a, 0..) |*byte, index| byte.* = "a..."[index % "a...".len];
+    const masked_a = try maskSecretsCutShort(arena, long_a);
+    try std.testing.expect(std.mem.find(u8, masked_a, "[redacted]") == null);
+
+    const long_partial = try arena.alloc(u8, "xsk-...".len * 30000);
+    for (long_partial, 0..) |*byte, index| byte.* = "xsk-..."[index % "xsk-...".len];
+    _ = try maskSecretsCutShort(arena, long_partial);
 }
 
 test "redactUrlForDisplay masks credential-like query values" {

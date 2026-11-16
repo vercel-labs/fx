@@ -3,6 +3,11 @@
 // tools, without forcing a persistent trace log. web_fetch is compact-only
 // because its prompt and fetched content are sensitive.
 //
+// The rings keep text as it was recorded, cut so that no part of a secret is
+// kept (`text_utils.secretSafePrefixLen` and `secretSafeSuffixStart`), and
+// `/trace` masks it when it writes the trace, so recording a call runs no
+// mask.
+//
 // Two rings hold them. The window keeps the last calls of every outcome, so a
 // busy agent or a few subagents move a failure out of it within minutes. The
 // failure ring keeps only calls that did not succeed, with larger head and

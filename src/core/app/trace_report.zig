@@ -1032,7 +1032,7 @@ fn writeInterruptedTurn(r: *Records, history: []const types.HistoryTurn) !void {
     if (entry.tool_call) |call| {
         try r.text("in_flight_tool", traceToolDisplayName(call.name));
         if (call.arguments_json.len > 0) {
-            try r.masked("in_flight_args", text_utils.utf8PrefixByBytes(call.arguments_json, tool_args_max_bytes));
+            try r.masked("in_flight_args", call.arguments_json[0..text_utils.secretSafePrefixLen(call.arguments_json, tool_args_max_bytes)]);
             try r.number("in_flight_args_bytes", call.arguments_json.len);
         }
     }
@@ -2379,8 +2379,14 @@ fn writeTraceLog(r: *Records, path: []const u8) !void {
     const n = file.readPositionalAll(io_mod.getIo(), buf, offset) catch return;
     if (n == 0) return;
 
+    // A read that starts after the file's start begins inside a line, which
+    // can hold the end of a secret without the start `maskSecrets` matches
+    // on, so that partial line is left out.
+    var body = buf[0..n];
+    if (offset > 0) body = if (std.mem.findScalar(u8, body, '\n')) |line_end| body[line_end + 1 ..] else body[0..0];
+
     var lines: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trimEnd(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
@@ -5292,6 +5298,63 @@ test "trace review and setup records stay valid JSON lines for fuzzed text" {
             "\xff\xc3\x28\xe2\x82\xf0\x9f\x91",
         }) ++ @import("fuzz_corpus").trace_review_records.*),
     });
+}
+
+test "trace log tail leaves out a line its read starts inside" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const cut_path = try alloc.print("{s}/cut.log", .{dir});
+    defer alloc.free(cut_path);
+
+    // The read starts 20 bytes into this line, inside its token, and 77 whole
+    // lines follow it, under `trace_max_lines`, so every one is written.
+    const token_line = "token ghp_" ++ text_utils.repeat("A", 36) ++ " end\n";
+    const cut_inside = "token ghp_".len + 10;
+    try std.testing.expect(cut_inside < token_line.len);
+    const after_bytes = trace_tail_bytes + cut_inside - token_line.len;
+
+    var log: std.Io.Writer.Allocating = .init(alloc);
+    defer log.deinit();
+    for (0..200) |index| try log.writer.print("before {d}\n", .{index});
+    try log.writer.writeAll(token_line);
+    var written: usize = 0;
+    var line_index: usize = 0;
+    while (written < after_bytes) : (line_index += 1) {
+        // Lines of 79 bytes and a newline, so 77 of them fit under the cap.
+        var line: [80]u8 = undefined;
+        @memset(&line, '.');
+        _ = try std.mem.print(&line, "after line {d} ", .{line_index});
+        line[79] = '\n';
+        const take = @min(after_bytes - written, line.len);
+        try log.writer.writeAll(line[0..take]);
+        written += take;
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "cut.log", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), log.written());
+    }
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeTraceLog(&w.records, cut_path);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("trace_log");
+    try std.testing.expectEqual(@as(i64, trace_tail_bytes), try testInt(summary, "bytes"));
+    try std.testing.expect(try testBool(summary, "older_lines_cut"));
+    // The partial line is gone, and every whole line after it stays.
+    try std.testing.expectEqual(@as(usize, 77), trace.count("trace_log_line"));
+    for (0..trace.count("trace_log_line")) |index| {
+        const line = try testString(try trace.nth("trace_log_line", index), "text");
+        try expectNotIn(line, "AAAAAA");
+    }
+    try expectStartsWith(try testString(try trace.nth("trace_log_line", 0), "text"), "after line 0 ");
+    try expectStartsWith(try testString(try trace.nth("trace_log_line", 76), "text"), "after line 76 ");
+    try expectNotIn(w.out.written(), "AAAAAA");
 }
 
 test "trace log tail keeps the newest lines, masked, and skips logs it cannot read" {
