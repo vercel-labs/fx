@@ -321,7 +321,7 @@ pub fn assembleParallelToolResults(
             );
         }
         for (execution.context_notices) |notice| {
-            try hooks.pushContextNotice(notice);
+            try hooks.emit(.{ .context_notice = notice });
         }
         debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ original_call.id, original_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
         try appendToolResultContent(
@@ -496,10 +496,7 @@ pub fn processCommittedFileResult(
         }
     }
     if (reporting_degraded) {
-        hooks.push_system_notice(
-            hooks.ctx,
-            "File change committed, but some secondary reporting failed.",
-        ) catch |err| {
+        hooks.emit(.{ .notice = .{ .plain = "File change committed, but some secondary reporting failed." } }) catch |err| {
             debug_trace.eventf(
                 "tool",
                 "committed_reporting_warning_failed",

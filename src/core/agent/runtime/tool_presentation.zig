@@ -189,23 +189,23 @@ pub const ProvisionalToolStatuses = struct {
             tool_name,
             observed_label,
         );
-        hooks.push_tool_lifecycle(hooks.ctx, .{
+        hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = tool_name,
                 .activity_kind = observed_kind,
             },
-        }) catch |err| {
+        } } }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
             return err;
         };
-        hooks.push_tool_lifecycle(hooks.ctx, .{
+        hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
             .progress = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .text = label,
             },
-        }) catch {};
+        } } }) catch {};
     }
 
     /// Names the subagent a streaming `subagent` call's row is for as soon
@@ -247,12 +247,12 @@ pub const ProvisionalToolStatuses = struct {
             "{s} failed: {s}",
             .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
-        try hooks.push_tool_lifecycle(hooks.ctx, .{
+        try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
             .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = call_id },
                 .outcome = .{ .kind = .failed, .summary = summary },
             },
-        });
+        } } });
     }
 
     pub fn finishMalformedProviderToolArguments(
@@ -507,10 +507,10 @@ pub const ProvisionalToolStatuses = struct {
                 diff.max_encoded_label_bytes,
             );
             const summary = try arena.print("Cancelled {s}", .{encoded.bytes});
-            try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+            try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .cancelled, .summary = summary },
-            } });
+            } } } });
             self.forget(alloc, status.id);
         }
     }
@@ -555,10 +555,10 @@ pub const ProvisionalToolStatuses = struct {
                 "Connection interrupted before {s} ran",
                 .{encoded.bytes},
             );
-            try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+            try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .failed, .summary = summary },
-            } });
+            } } } });
             self.forget(alloc, status.id);
         }
     }
@@ -1075,13 +1075,13 @@ fn finishDeferredToolStatus(
         types.context_deferred_tool_status_label,
         advertised_dynamic_tool_names,
     );
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .outcome = .{
             .kind = .deferred,
             .summary = line,
         },
-    } });
+    } } } });
 }
 
 fn finishDeniedToolStatusInternal(
@@ -1110,7 +1110,7 @@ fn finishDeniedToolStatusInternal(
         try commandArtifactHandle(arena, command_result_json)
     else
         null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
@@ -1126,7 +1126,7 @@ fn finishDeniedToolStatusInternal(
             .result_memory = result_memory,
             .command_artifact_handle = command_artifact_handle,
         },
-    });
+    } } });
 }
 
 pub fn finishCancelledToolStatus(
@@ -1165,7 +1165,7 @@ pub fn finishCancelledToolStatus(
         }
     else
         null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .terminal = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .outcome = .{
             .kind = .cancelled,
@@ -1173,7 +1173,7 @@ pub fn finishCancelledToolStatus(
         },
         .result_memory = result.tool_result_memory,
         .command_artifact_handle = command_artifact_handle,
-    } });
+    } } } });
 }
 
 fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
@@ -1240,10 +1240,10 @@ pub fn publishSubagentCompletionPreview(
         renderedSubagentSummary(hooks, arena, base_line, status)
     else
         base_line;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{ .progress = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .text = line,
-    } });
+    } } } });
     return true;
 }
 
@@ -1365,7 +1365,7 @@ pub fn finishExecutedToolStatus(
         try commandArtifactHandle(arena, result.command_result_json)
     else
         null;
-    try hooks.push_tool_lifecycle(hooks.ctx, .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
@@ -1381,7 +1381,7 @@ pub fn finishExecutedToolStatus(
             .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
         },
-    });
+    } } });
 }
 
 fn presentedToolResult(
@@ -1722,7 +1722,7 @@ pub fn finishCommittedFileStatus(
         preview.deletions,
         hooks.diff_marker_styles,
     );
-    try hooks.push_tool_lifecycle(hooks.ctx, .{
+    try hooks.emit(.{ .worker = .{ .tool_lifecycle = .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
@@ -1730,7 +1730,7 @@ pub fn finishCommittedFileStatus(
                 .summary = line,
             },
         },
-    });
+    } } });
 }
 
 fn renderedSubagentSummary(

@@ -5920,12 +5920,13 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.exec_plans = &.{.{ .result = .{
+    // The loop frees a diff it emitted with the allocator tools use for it.
+    const preview = try std.heap.c_allocator.dupe(u8, "diff preview");
+    const plans = [_]test_support.FakeExecPlan{.{ .result = .{
         .model_output = "patched",
-        .diff_entry = .{
-            .preview = @constCast("diff preview"),
-        },
+        .diff_entry = .{ .preview = preview },
     } }};
+    hooks.exec_plans = &plans;
     defer hooks.deinit();
     var fixture = PromptFixture{};
 

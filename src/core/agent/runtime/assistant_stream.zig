@@ -132,7 +132,7 @@ pub const StreamChunkContext = struct {
 
     pub fn start_response(self: *StreamChunkContext) !void {
         if (self.response_started) return;
-        try self.hooks.push_text(self.hooks.ctx, .assistant_started);
+        try self.hooks.emit(.{ .text = .assistant_started });
         self.response_started = true;
     }
 
@@ -142,9 +142,9 @@ pub const StreamChunkContext = struct {
         }
         if (self.raw_text.items.len > 0) {
             try flushAssistantStream(self);
-            try self.hooks.push_text(self.hooks.ctx, .{
+            try self.hooks.emit(.{ .text = .{
                 .assistant_restarted = "\n\n↻ Restarted the answer\n\n",
-            });
+            } });
             debug_trace.logf("agent", "restarting response preview_bytes={d} superseded_preview_bytes={d}", .{
                 self.raw_text.items.len,
                 self.interrupted_source.items.len,
@@ -263,20 +263,18 @@ pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
             debug_trace.logf("agent", "token progress publication failed source=reasoning err={s}", .{@errorName(err)});
         };
     }
-    if (stream_ctx.hooks.push_reasoning_delta) |push| {
-        push(stream_ctx.hooks.ctx, chunk) catch |err| {
-            debug_trace.logf("agent", "reasoning publication failed err={s}", .{@errorName(err)});
-        };
-    }
+    stream_ctx.hooks.emit(.{ .reasoning_delta = chunk }) catch |err| {
+        debug_trace.logf("agent", "reasoning publication failed err={s}", .{@errorName(err)});
+    };
 }
 
 pub fn publishTurnPhase(stream_ctx: *StreamChunkContext, phase: types.TurnPhase) void {
     if (stream_ctx.published_phase == phase) return;
-    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .{ .turn_phase_update = .{
+    stream_ctx.hooks.emit(.{ .worker = .{ .turn_phase_update = .{
         .turn_id = stream_ctx.turn_id,
         .step_id = stream_ctx.step_id,
         .phase = phase,
-    } }) catch |err| {
+    } } }) catch |err| {
         debug_trace.logf("agent", "turn phase publication failed phase={s} err={s}", .{ @tagName(phase), @errorName(err) });
         return;
     };
@@ -314,7 +312,7 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
         .unchanged => {},
         .changed => {
             const progress = stream_ctx.token_progress orelse return;
-            try stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .{ .turn_token_update = progress.tokenProgress() });
+            try stream_ctx.hooks.emit(.{ .worker = .{ .turn_token_update = progress.tokenProgress() } });
         },
         .invalid => debug_trace.logf("agent", "token progress observation ignored reason=invalid_sequence", .{}),
     }
@@ -331,7 +329,7 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
     stream_ctx.markModelOutput();
     flushAssistantStream(stream_ctx) catch {};
     if (stream_ctx.saw_visible_text and !stream_ctx.last_byte_was_newline) {
-        stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = "\n" }) catch {};
+        stream_ctx.hooks.emit(.{ .text = .{ .assistant_rendered = "\n" } }) catch {};
         stream_ctx.recordTextOutput("\n");
     }
     if (first_tool_in_step and
@@ -410,7 +408,7 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
     try stream_ctx.start_response();
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_source = chunk });
+    try stream_ctx.hooks.emit(.{ .text = .{ .assistant_source = chunk } });
     if (!stream_ctx.hooks.render_assistant_text) {
         if (std.mem.trim(u8, chunk, " \t\r\n").len > 0) stream_ctx.saw_visible_text = true;
         stream_ctx.recordTextOutput(chunk);
@@ -477,7 +475,7 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
         .thematic_rule = semantic_thematic_rule_completion,
     });
     if (out.items.len == 0) return;
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
+    try stream_ctx.hooks.emit(.{ .text = .{ .assistant_rendered = out.items } });
     stream_ctx.recordTextOutput(out.items);
 }
 
@@ -523,7 +521,7 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
         out.items[1..]
     else
         out.items;
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = text });
+    try stream_ctx.hooks.emit(.{ .text = .{ .assistant_rendered = text } });
     stream_ctx.recordTextOutput(text);
 }
 
@@ -536,7 +534,7 @@ fn deliverSemanticTable(raw: *anyopaque, table: TablePayload, out: *std.ArrayLis
     const alloc = stream_ctx.alloc;
 
     if (out.items.len > 0) {
-        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
+        try stream_ctx.hooks.emit(.{ .text = .{ .assistant_rendered = out.items } });
         stream_ctx.recordTextOutput(out.items);
         out.clearRetainingCapacity();
     }
@@ -554,7 +552,7 @@ fn deliverSemanticCodeBlock(raw: *anyopaque, block: CodeBlockPayload, out: *std.
     const alloc = stream_ctx.alloc;
 
     if (out.items.len > 0) {
-        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
+        try stream_ctx.hooks.emit(.{ .text = .{ .assistant_rendered = out.items } });
         stream_ctx.recordTextOutput(out.items);
         out.clearRetainingCapacity();
     }
@@ -572,7 +570,7 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
     const alloc = stream_ctx.alloc;
 
     if (out.items.len > 0) {
-        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
+        try stream_ctx.hooks.emit(.{ .text = .{ .assistant_rendered = out.items } });
         stream_ctx.recordTextOutput(out.items);
         out.clearRetainingCapacity();
     }
@@ -588,7 +586,7 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
 pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
     const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
-    try hooks.push_system_notice(hooks.ctx, line);
+    try hooks.emit(.{ .notice = .{ .plain = line } });
 }
 
 pub fn finishLengthLimitedToolCallCompletion(
@@ -608,16 +606,16 @@ pub fn finishLengthLimitedToolCallCompletion(
 
     if (!has_content or streamed_content_len == 0) {
         if (has_content) {
-            try hooks.push_text(hooks.ctx, .{ .assistant_source = completion.content.? });
-            try hooks.push_text(hooks.ctx, .{ .assistant_rendered = normalized });
-            try hooks.push_text(hooks.ctx, .{ .operational = "\n\n" });
+            try hooks.emit(.{ .text = .{ .assistant_source = completion.content.? } });
+            try hooks.emit(.{ .text = .{ .assistant_rendered = normalized } });
+            try hooks.emit(.{ .text = .{ .operational = "\n\n" } });
         }
-        try hooks.push_text(hooks.ctx, .{ .operational = blocker });
-        try hooks.push_text(hooks.ctx, .{ .operational = "\n" });
+        try hooks.emit(.{ .text = .{ .operational = blocker } });
+        try hooks.emit(.{ .text = .{ .operational = "\n" } });
     } else {
-        try hooks.push_text(hooks.ctx, .{ .operational = "\n" });
-        try hooks.push_text(hooks.ctx, .{ .operational = blocker });
-        try hooks.push_text(hooks.ctx, .{ .operational = "\n" });
+        try hooks.emit(.{ .text = .{ .operational = "\n" } });
+        try hooks.emit(.{ .text = .{ .operational = blocker } });
+        try hooks.emit(.{ .text = .{ .operational = "\n" } });
     }
     return rendered;
 }

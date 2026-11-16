@@ -8,7 +8,7 @@
 //!
 //! A front end gets the events in the order the loop emits them, so text and
 //! tool lifecycle stay ordered relative to each other
-//! (`tests/tla/core/TurnEventStream.tla`).
+//! (`tests/tla/agent_runtime/TurnEvents.tla` InOrder).
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
