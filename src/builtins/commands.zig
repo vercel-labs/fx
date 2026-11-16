@@ -48,6 +48,14 @@ pub const usage_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
+/// Options for `fx doctor`. Its parser in `src/core/cli/cli_surface.zig`
+/// reads this list, so help and parsing can't disagree.
+pub const doctor_options = [_]command_specs.OptionDoc{
+    json_option,
+    .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
+};
+
 pub const upgrade_options = [_]command_specs.OptionDoc{
     .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
     json_option,
@@ -341,9 +349,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json]",
-        .summary = "Run local health and preflight checks",
-        .options = &.{json_option},
+        .usage = "doctor [--json] [--fix] [--deep]",
+        .summary = "Check that fx can work here, with a fix for each problem",
+        .options = &doctor_options,
     },
     .{
         .kind = .teams,
@@ -371,7 +379,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
         .options = &sessions_options,
         .details = &.{
-            "--live shows each session's state (working or idle), the model saved with it, and its subagents with the <id>/<agent> address fx session reads them by.",
+            "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; fx session <id>/<agent> reads one.",
         },
     },
     .{
@@ -729,7 +737,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
-    .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
+    .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace as JSONL", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "summarize context into a fresh window", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },

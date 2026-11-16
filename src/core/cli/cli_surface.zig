@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -27,6 +28,9 @@ const profiles = @import("../profiles/profiles.zig");
 const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
+const doctor_probes = @import("doctor_probes.zig");
+const mcp_runtime = @import("../mcp_host/runtime.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
@@ -37,6 +41,8 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
+const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
@@ -1206,7 +1212,17 @@ fn activateProviderSelection(
     };
 }
 
+/// `FX_TRACE` and `FX_TRACE_LOG` keep a trace for the auth commands too, such
+/// as why a sign-in starts on the first team or whether a sign-out forgot the
+/// kept team. Without a working directory the command goes on without one.
+fn configureAuthCommandTrace(alloc: Allocator) void {
+    const workspace_root = io_mod.realpathAlloc(alloc, ".") catch return;
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+}
+
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    configureAuthCommandTrace(alloc);
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
@@ -1243,7 +1259,9 @@ fn activateProviderSelectionFallible(
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
-        try writeProviderActivationError(alloc, deps, caller, "could not load settings");
+        const message = try config_runtime.configuredProviderMessage(alloc, err);
+        defer if (message) |text| alloc.free(text);
+        try writeProviderActivationError(alloc, deps, caller, message orelse "could not load settings");
         debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
         return false;
     };
@@ -1259,7 +1277,7 @@ fn activateProviderSelectionFallible(
                 // exits as a usage error.
                 return error.UnknownConfiguredProvider;
             },
-            error.ConfiguredProviderChanged => return err,
+            error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => return err,
         };
         const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
@@ -1636,6 +1654,7 @@ fn runNonInteractiveWithDeps(
                 .provider_login,
                 if (login_provider == .gateway) .fx_login else null,
             )) return .handled_failure;
+            retryKeptSignOuts(alloc, cfg, deps, login_provider);
             try writeStdout(deps, switch (login_provider) {
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
@@ -1653,14 +1672,24 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
+                const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
-                return switch (outcome) {
+                if (outcome.revocation_failed) {
+                    try writeStderr(deps, if (outcome.retry_kept)
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                    else
+                        "fx logout: local Codex session removed, but remote revocation could not be confirmed\n");
+                } else {
+                    retryKeptSignOuts(alloc, cfg, deps, .codex);
+                }
+                return switch (outcome.deletion) {
                     .deleted => result: {
                         try writeStdout(deps, "Signed out of Codex.\n");
                         break :result .handled_success;
@@ -1676,12 +1705,18 @@ fn runNonInteractiveWithDeps(
                 };
             }
             if (login_provider == .grok) {
-                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok };
+                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, if (outcome.retry_kept)
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ "\n"
+                    else
+                        "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                } else {
+                    retryKeptSignOuts(alloc, cfg, deps, .grok);
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1698,7 +1733,8 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login };
+            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
                     return .handled_failure;
@@ -1732,8 +1768,10 @@ fn runNonInteractiveWithDeps(
                 );
             }
             if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
+                try writeStderr(deps, if (result.retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning);
                 try writeStderr(deps, "\n");
+            } else {
+                retryKeptSignOuts(alloc, cfg, deps, .gateway);
             }
             return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
@@ -1746,6 +1784,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            configureAuthCommandTrace(alloc);
             var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
             login_flow.runTeams(
                 alloc,
@@ -1971,6 +2010,12 @@ fn runNonInteractiveWithDeps(
             defer collections.freeStringList(alloc, &ids);
             var entries = loaded.entries;
             defer model_catalog.freeModelCatalog(alloc, &entries);
+            defer if (loaded.notice) |notice| alloc.free(notice);
+            if (loaded.notice) |notice| {
+                try writeStderr(deps, "fx models: ");
+                try writeStderr(deps, notice);
+                try writeStderr(deps, "\n");
+            }
             const details = try modelDetails(
                 alloc,
                 ids.items,
@@ -1992,38 +2037,11 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .doctor => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseDoctorArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .doctor, "doctor", err, rest);
                 return usage_failure;
             };
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
-            var snapshot = try doctor_runtime.collect(
-                alloc,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-                mcp_inspection.profile_diagnostic,
-            );
-            defer snapshot.deinit(alloc);
-
-            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
-            output_snapshot.mcp = localMcpView(&mcp_inspection);
-            if (opts.format == .json) {
-                try writeDoctorJsonLine(alloc, deps, output_snapshot);
-                return .handled_success;
-            }
-
-            const text = try output_snapshot.render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
+            return runDoctor(alloc, cfg, deps, opts);
         },
         .session => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "recover")) {
@@ -2845,6 +2863,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
     var out: DepsWriter = .init(deps, .stdout, &out_buffer);
     var err: DepsWriter = .init(deps, .stderr, &err_buffer);
     var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.mcp_kept };
     const code = mcp_verbs.run(.{
         .gpa = alloc,
         .out = &out.interface,
@@ -2853,6 +2872,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
         .home = home,
         .workspace_root = workspace_root,
         .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+        .kept_sign_outs = .{ .transport = cfg.gateway_provider.oauth_transport, .notice = wait_line.notice() },
     }, args);
     return switch (code) {
         0 => .handled_success,
@@ -3000,7 +3020,8 @@ fn writeUsageOrJsonError(
 /// absent.
 fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     return switch (kind) {
-        .status, .doctor, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .status, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .doctor => &builtin_commands.doctor_options,
         .slack => &command_specs.slack_options,
         .sessions => &builtin_commands.sessions_options,
         .login => &builtin_commands.login_options,
@@ -3047,6 +3068,15 @@ fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
         return null;
     }
     return try writer.toOwnedSlice();
+}
+
+test "a doctor usage error names the flag that is wrong, not --fix" {
+    const alloc = std.testing.allocator;
+    const args = [_][:0]const u8{ "--fix", "--bogus" };
+    const problem = (try flagProblem(alloc, .doctor, @as([]const [:0]const u8, &args))).?;
+    defer alloc.free(problem);
+    try std.testing.expect(std.mem.find(u8, problem, "--bogus") != null);
+    try std.testing.expect(std.mem.find(u8, problem, "--fix") == null);
 }
 
 fn writeUsageCommandFailure(
@@ -3298,6 +3328,22 @@ fn writeJsonCommandFailureCode(
     try writeJsonLine(deps, json);
 }
 
+/// How `fx sessions` prints for a person: in color and fitted to the window
+/// when it writes to a terminal that takes color, with ages counted from
+/// now. A pipe, `NO_COLOR`, or `TERM=dumb` gets plain text with whole titles,
+/// and output a test captures is plain, so it reads the same everywhere.
+fn sessionListStyle(deps: RunDeps) output_contracts.ListStyle {
+    const styled = deps.write_stdout == &writeRealStdout and
+        terminal_env.stdoutIsTerminal() and
+        !terminal_env.colorDisabled();
+    return .{
+        .color = styled,
+        .columns = if (styled) terminal_env.stdoutColumns() else null,
+        .now_ms = io_mod.milliTimestamp(),
+        .home = io_mod.homeDir(),
+    };
+}
+
 fn writeSessionList(
     alloc: Allocator,
     deps: RunDeps,
@@ -3319,6 +3365,7 @@ fn writeSessionList(
         .next_cursor = next_cursor,
         .skipped_invalid = page.skipped_invalid,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -3407,6 +3454,7 @@ fn runLiveSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions)
     const text = try (output_contracts.LiveSessionListSnapshot{
         .sessions = list.sessions,
         .all_workspaces = opts.scope == .all_workspaces,
+        .style = sessionListStyle(deps),
     }).render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -4284,6 +4332,428 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
         .option => options.format = .json,
     };
     return options;
+}
+
+const DoctorOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    fix: bool = false,
+    deep: bool = false,
+};
+const DoctorFlag = enum { json, fix, deep };
+const doctor_flag_ids = cli_flags.idTable(DoctorFlag, &builtin_commands.doctor_options);
+
+fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
+    var options = DoctorOptions{};
+    var parser: cli_flags.Parser = .init(&builtin_commands.doctor_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => |match| switch (doctor_flag_ids[match.index].?) {
+            .json => options.format = .json,
+            .fix => options.fix = true,
+            .deep => options.deep = true,
+        },
+    };
+    return options;
+}
+
+/// The network and process checks `fx doctor` started, until `wait` stops
+/// and joins them. Probes are allocated with `std.heap.c_allocator` and left
+/// to the process exit, which follows the report.
+const DoctorProbes = struct {
+    deadline: i64,
+    /// The limit `deadline` ends, in milliseconds.
+    limit_ms: i64,
+    catalog: ?*doctor_probes.CatalogProbe = null,
+    /// The MCP server checks first, then gh.
+    processes: std.ArrayList(*doctor_probes.ProcessProbe) = .empty,
+    server_children: usize = 0,
+    /// The MCP server checks, which `wait` starts from as slots free.
+    servers: doctor_probes.ServerChecks = .{},
+    gh: ?*doctor_probes.ProcessProbe = null,
+    waiters: std.Io.Group = .init,
+    mcp_statuses: []const mcp_runtime.Status = &.{},
+    mcp_checked: bool = false,
+
+    /// Starts the provider, MCP server, and gh checks. Whatever it started
+    /// before an error is still in `self`, for `wait` to stop.
+    fn start(self: *DoctorProbes, cfg: Config, deps: RunDeps, snapshot: *const doctor_runtime.Snapshot, workspace_root: []const u8) !void {
+        const probe_alloc = std.heap.c_allocator;
+        // An expired login is reported as it is: doctor never refreshes it. A
+        // configured provider's model list comes from its settings, with no
+        // request, so asking it would confirm nothing.
+        if (snapshot.auth.missingHelp(.cli) == null and !snapshot.auth.expired and snapshot.model.len > 0 and snapshot.provider != .configured) {
+            try self.startCatalog(cfg, deps, snapshot.model);
+        }
+        if (cfg.load_mcp_host) |load| {
+            // A config doctor cannot load is already a check of its own.
+            const doctor_host = load(probe_alloc, workspace_root, cfg.tool_set.registry, .{}) catch |err| blk: {
+                debug_trace.logf("doctor", "MCP server checks skipped: host failed to load err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (doctor_host) |loaded_host| {
+                self.mcp_statuses = try loaded_host.runtime.statuses(probe_alloc);
+                const exe_path = try self_exe.pathForReexec(probe_alloc);
+                defer self.server_children = self.processes.items.len;
+                self.servers = try doctor_probes.startServerChildren(probe_alloc, &self.waiters, &self.processes, self.mcp_statuses, exe_path, self.deadline, self.limit_ms, doctor_probes.serverCap());
+                self.mcp_checked = true;
+            }
+        }
+        // gh matters only to fx pr and fx issue, which need a repository; outside
+        // one, doctor does not run it, so gh writes nothing on its behalf. Unit
+        // tests run inside this repository and must not reach GitHub.
+        if (snapshot.in_git_repository and !builtin.is_test) {
+            self.gh = try doctor_probes.startGh(probe_alloc, &self.waiters, &self.processes);
+        }
+    }
+
+    /// Starts the provider catalog request, when the provider has a catalog.
+    fn startCatalog(self: *DoctorProbes, cfg: Config, deps: RunDeps, model: []const u8) !void {
+        const probe_alloc = std.heap.c_allocator;
+        const startup = try probe_alloc.create(app_lifecycle.StartupState);
+        startup.* = (if (cfg.auth_mode == .host_managed)
+            deps.load_catalog_startup_state_with_auth_mode(probe_alloc, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, null, null)
+        else
+            deps.load_startup_state(probe_alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit)) catch |err| {
+            // Startup itself refuses this setup, and the config check says why.
+            debug_trace.logf("doctor", "provider check skipped: startup state failed err={s}", .{@errorName(err)});
+            return;
+        };
+        var available = cfg.provider_set;
+        available.definitions = startup.configured_providers.definitions;
+        const catalog = available.select(startup.provider).cli_model_catalog orelse return;
+        const probe = try probe_alloc.create(doctor_probes.CatalogProbe);
+        probe.* = .{
+            .provider = catalog,
+            .access = startup.modelCatalogAccess(),
+            .endpoint = cfg.models_path,
+            .model = try probe_alloc.dupe(u8, model),
+        };
+        probe.start();
+        self.catalog = probe;
+    }
+
+    /// Waits for the checks until the deadline, then stops and joins them.
+    /// The ending signal that stopped the checks, if one did.
+    fn wait(self: *DoctorProbes) ?std.posix.SIG {
+        return doctor_probes.wait(self.deadline, self.catalog, self.processes.items, &self.waiters, &self.servers);
+    }
+
+    /// One line on a terminal's stderr while doctor waits on its network
+    /// checks, so a slow one does not look like a hang.
+    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, progress: *DoctorProgress, provider: model_provider.ProviderId, deadline_ms: i64) !void {
+        if (!progress.enabled) return;
+        var servers: usize = 0;
+        for (self.processes.items[0..self.server_children]) |probe| {
+            if (!probe.not_started and probe.spawn_error == null) servers += 1;
+        }
+        const gh_started = if (self.gh) |gh| gh.spawn_error == null else false;
+        const notice = try doctor_probes.waitNotice(alloc, .{
+            .provider = if (self.catalog != null) provider else null,
+            .mcp_servers = servers,
+            .gh = if (gh_started) .checking else .not_checked,
+        }, deadline_ms) orelse return;
+        defer alloc.free(notice);
+        progress.line(notice);
+    }
+
+    /// The probe check lines, and what doctor found for each MCP server.
+    fn checks(
+        self: *const DoctorProbes,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+        deadline_ms: i64,
+        out: *std.ArrayList(doctor_runtime.Check),
+        results: *std.ArrayList(output_contracts.McpServerResult),
+    ) !void {
+        if (self.catalog) |probe| try doctor_probes.catalogChecks(out, alloc, probe, provider, deadline_ms);
+        try doctor_probes.serverStatusChecks(out, alloc, self.mcp_statuses);
+        try doctor_probes.serverChildChecks(out, results, alloc, self.processes.items[0..self.server_children], deadline_ms);
+        try doctor_probes.ghCheck(out, alloc, self.gh, deadline_ms);
+    }
+};
+
+/// The line `fx logout` writes to a terminal's stderr while it waits for the
+/// provider to revoke the login, so a slow provider does not look like a hang.
+/// Like doctor's wait notice, pipes and unit tests never get it.
+const LogoutWaitLine = struct {
+    deps: RunDeps,
+    text: []const u8,
+
+    const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
+    const codex = std.fmt.comptimePrint("revoking the Codex login at OpenAI (up to {d} s)...\n", .{request_s});
+    const grok = std.fmt.comptimePrint("revoking the Grok login at xAI (up to {d} s)...\n", .{request_s});
+    /// The fx login asks for its issuer's endpoints, then revokes two tokens
+    /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
+    const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
+
+    /// Before a retry of sign-outs that earlier logouts kept
+    /// (`pending_revocation.retry`), which sends one sign-out after another.
+    const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
+    const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
+    const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
+    const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
+
+    fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
+        if (builtin.is_test or !stderrIsTerminal()) return null;
+        return .{ .context = self, .run = write };
+    }
+
+    fn write(context: *const anyopaque) void {
+        const self: *const LogoutWaitLine = @ptrCast(@alignCast(context));
+        writeStderr(self.deps, self.text) catch |err| {
+            debug_trace.logf("auth", "logout wait line not written err={s}", .{@errorName(err)});
+        };
+    }
+};
+
+/// Revokes the provider's sign-outs that earlier logouts kept because it did
+/// not confirm them (`pending_revocation`). A refused retry keeps them for the
+/// next one and prints nothing: the logout that kept them already warned.
+fn retryKeptSignOuts(alloc: Allocator, cfg: Config, deps: RunDeps, provider: model_provider.ProviderId) void {
+    const transport = cfg.gateway_provider.oauth_transport;
+    switch (provider) {
+        .codex => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex_kept };
+            _ = chatgpt_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .grok => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok_kept };
+            _ = grok_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .gateway => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login_kept };
+            _ = login_flow.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        else => {},
+    }
+}
+
+/// Whether doctor's stderr is a terminal, for its wait notice.
+fn stderrIsTerminal() bool {
+    return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
+}
+
+/// The local checks with the probe checks after them. The provider's answer
+/// replaces the local auth line, which only saw a credential; a credential
+/// the provider was asked about and never answered for is not confirmed.
+/// `unconfirmed` holds that line's detail, which the caller frees.
+fn mergeDoctorChecks(
+    alloc: Allocator,
+    local: []const doctor_runtime.Check,
+    probe_checks: []const doctor_runtime.Check,
+    provider_asked: bool,
+    out: *std.ArrayList(doctor_runtime.Check),
+    unconfirmed: *?[]u8,
+) !void {
+    var verified_auth = false;
+    for (probe_checks) |entry| verified_auth = verified_auth or std.mem.eql(u8, entry.name, "auth");
+    for (local) |entry| {
+        if (std.mem.eql(u8, entry.name, "auth") and entry.status == .ok) {
+            if (verified_auth) continue;
+            if (provider_asked) {
+                unconfirmed.* = try alloc.print("{s}; the provider did not confirm it", .{entry.detail});
+                try out.append(alloc, .{ .name = entry.name, .status = .warn, .detail = unconfirmed.*.?, .fix = "run fx doctor again once the provider check passes" });
+                continue;
+            }
+        }
+        try out.append(alloc, entry);
+    }
+    try out.appendSlice(alloc, probe_checks);
+}
+
+/// `fx doctor`: the local checks, then the provider, MCP, and gh checks
+/// under one deadline (`doctor_probes.zig`). Exits 1 when a check fails.
+fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) !RunResult {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var progress: DoctorProgress = .{
+        .deps = deps,
+        .enabled = opts.format == .text and !builtin.is_test and stderrIsTerminal(),
+        .erase = !terminal_env.dumbTerminal(),
+    };
+    if (progress.enabled) progress.columns = terminal_env.stderrColumns();
+    // Never leaves a progress line above the report, or above an error.
+    defer progress.clear();
+    if (progress.erase) progress.line("checking fx setup...\n");
+    var mcp_inspection = try cfg.inspect_mcp_local_config(alloc, workspace_root);
+    defer mcp_inspection.deinit(alloc);
+    var snapshot = try doctor_runtime.collect(
+        alloc,
+        cfg.secret_store,
+        cfg.default_model,
+        cfg.default_agent_step_limit,
+        mcp_inspection.profile_diagnostic,
+        mcp_inspection.snapshot.configuration_issues,
+        .{
+            .version = cfg.version,
+            .channel = cfg.build_channel.label(),
+            .skill_root_policy = cfg.skill_root_policy,
+        },
+    );
+    defer snapshot.deinit(alloc);
+    progress.clear();
+
+    const deadline_ms = doctor_probes.deadlineMs();
+    var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms, .limit_ms = deadline_ms };
+    const started = probes.start(cfg, deps, &snapshot, workspace_root);
+    probes.writeWaitNotice(alloc, &progress, snapshot.provider, deadline_ms) catch |err| {
+        debug_trace.logf("doctor", "wait notice not written err={s}", .{@errorName(err)});
+    };
+
+    var state_checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer {
+        for (state_checks.items) |*entry| entry.deinit(alloc);
+        state_checks.deinit(alloc);
+    }
+    var stop: DoctorSessionStop = .{ .deadline = if (opts.deep) null else probes.deadline, .probes = if (opts.deep) null else &probes };
+    const state_options: doctor_runtime.StateOptions = .{
+        .orphans = if (opts.fix) .remove else .count,
+        .blobs = if (opts.deep) .hash else .exists,
+        .stop = .{ .context = &stop, .requested = DoctorSessionStop.requested },
+        .progress = .{ .context = &progress, .report = DoctorProgress.sessions },
+        .limit_ms = if (opts.deep) null else deadline_ms,
+    };
+    // Plain doctor checks the sessions while the network checks run, within
+    // their deadline. `--deep` has no limit, so it checks them after.
+    const state_result: anyerror!void = if (opts.deep) {} else doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
+    // Runs on every path, so nothing doctor started outlives it.
+    if (probes.wait()) |sig| doctor_probes.endBySignal(sig);
+    try started;
+    try state_result;
+    if (opts.deep) try doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
+    progress.clear();
+
+    var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer {
+        for (probe_checks.items) |*entry| entry.deinit(alloc);
+        probe_checks.deinit(alloc);
+    }
+    var server_results: std.ArrayList(output_contracts.McpServerResult) = .empty;
+    defer server_results.deinit(alloc);
+    try probes.checks(alloc, snapshot.provider, deadline_ms, &probe_checks, &server_results);
+
+    var local: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer local.deinit(alloc);
+    try local.appendSlice(alloc, snapshot.checks);
+    try local.appendSlice(alloc, state_checks.items);
+    var checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer checks.deinit(alloc);
+    var unconfirmed: ?[]u8 = null;
+    defer if (unconfirmed) |detail| alloc.free(detail);
+    try mergeDoctorChecks(alloc, local.items, probe_checks.items, probes.catalog != null, &checks, &unconfirmed);
+
+    var failed = false;
+    for (checks.items) |entry| failed = failed or entry.status == .fail;
+    var output_snapshot = doctorSnapshotFromRuntime(snapshot);
+    output_snapshot.version = cfg.version;
+    output_snapshot.checks = checks.items;
+    var mcp_view = localMcpView(&mcp_inspection);
+    if (probes.mcp_checked) {
+        mcp_view.connection_check = .checked;
+        mcp_view.results = server_results.items;
+    }
+    output_snapshot.mcp = mcp_view;
+    try writeDoctorReport(alloc, deps, output_snapshot, opts.format);
+    return if (failed) .handled_failure else .handled_success;
+}
+
+/// Stops doctor's session check at its deadline, or when an ending signal
+/// reached doctor while its handler was in place. Each time it is asked, it
+/// also starts the queued MCP server checks a free slot allows, as `wait`
+/// does, so the session check costs them none of the limit.
+const DoctorSessionStop = struct {
+    deadline: ?i64,
+    /// Null once `wait` has stopped the probes, as for `--deep`.
+    probes: ?*DoctorProbes,
+
+    fn requested(context: *anyopaque) bool {
+        const self: *DoctorSessionStop = @ptrCast(@alignCast(context));
+        if (self.probes) |probes| probes.servers.startMore(&probes.waiters, probes.deadline);
+        if (doctor_probes.stopRequested()) return true;
+        const deadline = self.deadline orelse return false;
+        return io_mod.milliTimestamp() >= deadline;
+    }
+};
+
+/// What doctor is doing, on a terminal's stderr while it works: whole lines,
+/// then one line it rewrites in place. `clear` erases them all, so the
+/// report starts on a clean screen. Each line is cut to fit one row, since
+/// `clear` erases one row per line. Pipes and unit tests get none of it, and
+/// a `TERM=dumb` terminal, which cannot move the cursor, gets only the whole
+/// lines, which stay.
+const DoctorProgress = struct {
+    deps: RunDeps,
+    enabled: bool,
+    erase: bool,
+    /// The terminal's width, when known. The lines are ASCII, so a byte is
+    /// a column.
+    columns: ?usize = null,
+    /// Whole lines written since the last `clear`.
+    lines: usize = 0,
+    /// Whether the cursor is at the end of a line `rewrite` wrote.
+    open_line: bool = false,
+
+    /// `text` ends with a newline.
+    fn line(self: *DoctorProgress, text: []const u8) void {
+        if (!self.enabled) return;
+        self.closeOpenLine();
+        self.write(self.fit(text[0 .. text.len - 1]));
+        self.write("\n");
+        self.lines += 1;
+    }
+
+    fn rewrite(self: *DoctorProgress, text: []const u8) void {
+        if (!self.enabled or !self.erase) return;
+        self.write(if (self.open_line) "\r\x1b[2K" else "");
+        self.write(self.fit(text));
+        self.open_line = true;
+    }
+
+    /// `text` cut short of the last column, so it never wraps.
+    fn fit(self: *const DoctorProgress, text: []const u8) []const u8 {
+        const columns = self.columns orelse return text;
+        return text[0..@min(text.len, columns -| 1)];
+    }
+
+    fn sessions(context: *anyopaque, done: usize, total: usize) void {
+        const self: *DoctorProgress = @ptrCast(@alignCast(context));
+        if (!self.enabled or total == 0) return;
+        var buf: [96]u8 = undefined;
+        const text = std.mem.print(&buf, "checking saved sessions ({d} of {d})...", .{ @min(done + 1, total), total }) catch return;
+        self.rewrite(text);
+    }
+
+    fn clear(self: *DoctorProgress) void {
+        if (!self.enabled or !self.erase) return;
+        if (self.open_line) self.write("\r\x1b[2K");
+        self.open_line = false;
+        while (self.lines > 0) : (self.lines -= 1) self.write("\x1b[1A\x1b[2K");
+    }
+
+    fn closeOpenLine(self: *DoctorProgress) void {
+        if (!self.open_line) return;
+        self.write("\n");
+        self.open_line = false;
+        self.lines += 1;
+    }
+
+    fn write(self: *const DoctorProgress, text: []const u8) void {
+        if (text.len == 0) return;
+        writeStderr(self.deps, text) catch |err| {
+            debug_trace.logf("doctor", "progress line not written err={s}", .{@errorName(err)});
+        };
+    }
+};
+
+fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
+    if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
+    const terminal = !builtin.is_test and terminal_env.stdoutIsTerminal();
+    const text = try snapshot.renderTextStyled(alloc, .{
+        .color = terminal and !terminal_env.colorDisabled(),
+        .columns = if (terminal) terminal_env.stdoutColumns() else null,
+    });
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
 }
 
 const UpgradeFlag = enum { channel, json };
@@ -6593,7 +7063,7 @@ test "runIfRequested credits renders through the configured provider" {
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(probe.saw_expected_input);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\"}\n",
+        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\",\"token_pass\":null}\n",
         capture.stdout.written(),
     );
 }
@@ -6703,7 +7173,8 @@ test "status and doctor inspect MCP configuration once per command" {
         cfg,
         doctor_capture.deps(),
     );
-    try std.testing.expectEqual(RunResult.handled_success, doctor_result);
+    // The broken MCP config is a failed check, so doctor exits 1.
+    try std.testing.expectEqual(RunResult.handled_failure, doctor_result);
     try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),

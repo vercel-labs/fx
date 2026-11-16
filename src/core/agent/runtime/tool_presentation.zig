@@ -12,6 +12,7 @@ const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const mcp_tool_result = @import("../../mcp/tool_result.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -47,6 +48,17 @@ pub fn streamStartMayHaveExecutedAtProvider(
     return spec.provider_executed;
 }
 
+/// Whether a tool that may run at the provider only reads, as a search does,
+/// so running it again after a failed attempt is safe.
+pub fn providerToolOnlyReads(
+    registry: tool_dispatch.Registry,
+    tool_name: []const u8,
+) bool {
+    if (isProviderSearchAlias(tool_name)) return true;
+    const spec = registry.lookup(tool_name) orelse return false;
+    return spec.provider_executed and spec.activity_kind == .read;
+}
+
 fn fallbackToolDisplay(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
@@ -66,6 +78,9 @@ pub const ProvisionalToolStatuses = struct {
         id: []u8,
         tool_name: []u8,
         label_value: ?[]u8,
+        /// Whether the call's row was published. A toolbox call's row waits,
+        /// hidden, until its arguments name what it does.
+        shown: bool = true,
 
         fn deinit(self: *TrackedStatus, alloc: Allocator) void {
             alloc.free(self.id);
@@ -148,7 +163,13 @@ pub const ProvisionalToolStatuses = struct {
         var observed_kind = activity_kind;
         const argument_label: ?[]const u8 = if (is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
-            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
+            // While the arguments stream in they do not parse yet, but the
+            // action and the whole name after it already say what the call
+            // does, so its row does not read as a bare "Using" until they end.
+            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch streamed: {
+                const action = tooling_presentation.toolboxStreamedAction(scratch.allocator(), json) catch break :resource null;
+                break :streamed tool_args.parseToolArgsObject(scratch.allocator(), action orelse break :resource null) catch break :resource null;
+            };
             const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
             const presentation = tool_dispatch.presentationForArgs(spec.*, args);
             const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
@@ -177,6 +198,16 @@ pub const ProvisionalToolStatuses = struct {
             tool_name,
             observed_label,
         );
+        const index = self.findTracked(tool_id).?;
+        // A toolbox call says nothing about itself until its arguments name
+        // what it opens, runs, or searches, so its row never reads a bare
+        // "Using": it stays hidden until that name streams in, or until the
+        // call itself starts.
+        if (is_toolbox and argument_label == null) {
+            if (recorded) self.tracked.items[index].shown = false;
+            return;
+        }
+        self.tracked.items[index].shown = true;
         hooks.push_tool_lifecycle(hooks.ctx, .{
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
@@ -196,9 +227,12 @@ pub const ProvisionalToolStatuses = struct {
         }) catch {};
     }
 
-    /// Names the subagent a streaming `subagent` call's row is for as soon
-    /// as its arguments so far hold the whole name, so the row reads
-    /// `Managing reviewer` while the rest of the call streams in.
+    /// Names a streaming call's row as soon as its arguments so far say what
+    /// it is for, while the rest of the call streams in: the subagent a
+    /// `subagent` call is for once its whole name is in, so the row reads
+    /// `Managing reviewer`, and what a `toolbox` call runs, searches, or
+    /// opens once that whole value is in, so the row reads
+    /// `Running glob_files`. A row already named stays as it is.
     pub fn observeArguments(
         self: *ProvisionalToolStatuses,
         hooks: *const AgentRuntimeDeps,
@@ -209,8 +243,13 @@ pub const ProvisionalToolStatuses = struct {
     ) !void {
         const index = self.findTracked(tool_id) orelse return;
         const status = self.tracked.items[index];
-        if (!std.mem.eql(u8, status.tool_name, "subagent") or status.label_value != null) return;
-        if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        if (status.label_value != null) return;
+        if (std.mem.eql(u8, status.tool_name, "subagent")) {
+            if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        } else if (std.mem.eql(u8, status.tool_name, toolbox.tool_name)) {
+            const action = try tooling_presentation.toolboxStreamedAction(alloc, arguments) orelse return;
+            alloc.free(action);
+        } else return;
         const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
             .ineligible => return,
             .eligible => |metadata| metadata,
@@ -594,8 +633,11 @@ pub const ProvisionalToolStatuses = struct {
         return true;
     }
 
+    /// Whether the call's row was published. A hidden call has no row to
+    /// settle, so the call's own start shows it.
     fn has(self: *const ProvisionalToolStatuses, id: []const u8) bool {
-        return self.findTracked(id) != null;
+        const index = self.findTracked(id) orelse return false;
+        return self.tracked.items[index].shown;
     }
 
     fn findTracked(self: *const ProvisionalToolStatuses, id: []const u8) ?usize {
@@ -1180,10 +1222,7 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
         .object => |object| object,
         else => return false,
     };
-    const object = if (outer.get("request")) |request| switch (request) {
-        .object => |value| value,
-        else => return false,
-    } else outer;
+    const object = (try tool_args.unwrapRequest(parsed.arena.allocator(), outer)) orelse return false;
     const action = switch (object.get("action") orelse return false) {
         .string => |value| value,
         else => return false,
@@ -1254,7 +1293,8 @@ pub fn finishExecutedToolStatus(
     if (!status_started) return;
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     const command_decision = if (activity_kind == .command)
-        try commandOutcomeDecision(arena, result_memory.command_process_presentation)
+        (try commandOutcomeDecision(arena, result_memory.command_process_presentation)) orelse
+            try runningCommandDecision(arena, call, result.model_output)
     else
         null;
     const terminal_action_decision = if (std.mem.eql(u8, call.name, "shell"))
@@ -1452,6 +1492,77 @@ pub fn commandOutcomeDecision(
     };
 }
 
+/// The label of a shell `run` whose command was still running when the call
+/// returned, such as when steering moved it to the background or its
+/// `yield_time_ms` ran out. It has no exit status, so it must not read "Ran".
+pub const still_running_label = "Still running";
+
+/// The outcome of a shell `run` call whose result `output` reports
+/// `"state":"running"`, or null for any other call or result.
+pub fn runningCommandDecision(
+    arena: Allocator,
+    call: ToolCall,
+    output: []const u8,
+) !?ToolOutcomeDecision {
+    if (!std.mem.eql(u8, call.name, "shell")) return null;
+    if (std.mem.find(u8, output, "\"running\"") == null) return null;
+    // Only text that is not JSON gives no decision; running out of memory is
+    // reported, so the row does not read "Ran" for a command that still runs.
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const action = tool_args.optionalStringArg(args, "action") orelse "run";
+    if (!std.mem.eql(u8, action, "run")) return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const state = parsed.object.get("state") orelse return null;
+    if (state != .string or !std.mem.eql(u8, state.string, "running")) return null;
+    return .{ .outcome = .completed, .label = still_running_label };
+}
+
+test "a shell run that returns its command running reads Still running" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"steering_notice\":\"New steering arrived\"}";
+    const decision = (try runningCommandDecision(arena, run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, decision.outcome);
+
+    const no_action = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"command\":\"sleep 30\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, no_action, running)) != null);
+
+    const finished = "{\"session_id\":\"shell-1\",\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"running\"}";
+    try std.testing.expect((try runningCommandDecision(arena, run, finished)) == null);
+    const interact = ToolCall{ .id = "i", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, interact, running)) == null);
+    const read = ToolCall{ .id = "r", .name = "read_file", .arguments_json = "{}" };
+    try std.testing.expect((try runningCommandDecision(arena, read, running)) == null);
+    try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
+}
+
+fn checkRunningCommandDecisionAllocationFailures(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\"}";
+    const decision = (try runningCommandDecision(arena_state.allocator(), run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+}
+
+test "a running shell result reports out of memory instead of reading Ran" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkRunningCommandDecisionAllocationFailures,
+        .{},
+    );
+}
+
 pub fn terminalActionOutcomeDecision(
     arena: Allocator,
     presentation: ?types.TerminalActionPresentation,
@@ -1528,7 +1639,10 @@ fn failureStatusDetail(
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
-    const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    // A refused call's parameters read as which fields and types, not as the
+    // start of a protocol dump; the model still gets the server's own words.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -1900,6 +2014,26 @@ test "stream start execution certainty follows provider ownership" {
     ));
 }
 
+test "only a provider-run tool that reads is safe to run again" {
+    const writing_provider_tool = blk: {
+        var spec = test_builtin_tools.web_search;
+        spec.name = "provider_publish";
+        spec.activity_kind = .write;
+        break :blk spec;
+    };
+    const provider_registry = tool_dispatch.Registry{
+        .tools = &.{ test_builtin_tools.web_search, writing_provider_tool, test_builtin_tools.read_file },
+    };
+
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "web_search"));
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "exa_search"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "provider_publish"));
+    // A local tool is not a provider-run tool, and an unknown name is not
+    // known to read.
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "read_file"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "unknown_tool"));
+}
+
 test "tool lifecycle uses activity metadata from the supplied registry" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2039,10 +2173,18 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
 test "provisional toolbox labels read as what the call opens, runs, or searches" {
     // The stream's hint is the first string in the arguments, which may name
     // what a run runs or what a search looks for, so it never labels the row.
+    // The action and its whole value label it as soon as they stream in.
     const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
         .{ .arguments_json = null, .label = "Using" },
         .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
         .{ .arguments_json = "{}", .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"argu", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
+        .{ .arguments_json = "{\"search\":\"list files\"", .label = "Searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\",\"res", .label = "Opening", .value = "fixture" },
+        // A streamed skill location reads as the skill's name, never the
+        // opaque location.
+        .{ .arguments_json = "{\"open\":\"skill:0123456789abcdef:6/ste-english\",\"res", .label = "Opening", .value = "ste-english" },
         .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
         .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
@@ -2058,6 +2200,12 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
         var statuses = ProvisionalToolStatuses{};
         defer statuses.deinit(alloc);
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "glob_files", case.arguments_json);
+        // A call that names nothing yet shows no row, so no bare "Using".
+        if (std.mem.eql(u8, case.label, "Using")) {
+            try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+            try std.testing.expect(!statuses.has("toolbox_1"));
+            continue;
+        }
         try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
         var expected_buf: [512]u8 = undefined;
         const expected = try formatProvisionalProgressLabel(&expected_buf, case.label, case.value);
@@ -2068,6 +2216,41 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
+}
+
+test "a streaming toolbox call's row names what it runs once that name arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, toolbox.tool_name);
+    const action = eligibleActionLabel(toolbox.tool_name);
+    var named_buf: [512]u8 = undefined;
+    const named = try formatProvisionalProgressLabel(&named_buf, "Running", "glob_files");
+
+    // The call shows no row until its arguments name what it does.
+    try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, kind, action, null, null);
+    try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+    try std.testing.expect(!statuses.has("toolbox_1"));
+    // Part of the name is not yet a name.
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob");
+    try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("toolbox_1", capture.events.items[0].provisional.id.call_id);
+    try std.testing.expectEqualStrings(named, capture.events.items[1].progress.text);
+    try std.testing.expect(statuses.has("toolbox_1"));
+    // The rest of the call streams in without another publication.
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_1", "{\"run\":\"glob_files\",\"arguments\":{\"pat");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+
+    // A search with no words yet may list one server's tools, so it waits.
+    try statuses.publish(&hooks, alloc, 7, "toolbox_2", toolbox.tool_name, kind, action, null, null);
+    const before = capture.events.items.len;
+    try statuses.observeArguments(&hooks, alloc, 7, "toolbox_2", "{\"search\":\"\",\"server\":\"sl");
+    try std.testing.expectEqual(before, capture.events.items.len);
 }
 
 test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
@@ -2132,7 +2315,7 @@ test "provisional toolbox labels decode escaped UTF-8 and encode terminal contro
     try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
 }
 
-test "provisional toolbox labels fall back when an encoded resource exceeds the progress buffer" {
+test "provisional toolbox labels wait for the call when an encoded resource exceeds the progress buffer" {
     const alloc = std.testing.allocator;
     const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
     for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
@@ -2147,13 +2330,16 @@ test "provisional toolbox labels fall back when an encoded resource exceeds the 
         const json = try alloc.print("{{\"open\":\"skill:opaque/location\",\"resource\":\"{s}\"}}", .{resource});
         defer alloc.free(json);
         try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
-        const text = capture.events.items[1].progress.text;
         if (len == max_detail) {
+            const text = capture.events.items[1].progress.text;
             try std.testing.expectEqual(@as(usize, 512), text.len);
             try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
         } else {
-            try std.testing.expectEqualStrings("● Using\x1b[0m", text);
+            // A label too long for the row names nothing, so the call shows
+            // no row until it starts, rather than a bare "Using".
+            try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
+            try std.testing.expect(!statuses.has("toolbox_1"));
         }
     }
 }
@@ -3259,6 +3445,27 @@ test "cancelled command ignores malformed artifact metadata" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expect(terminal.command_artifact_handle == null);
+}
+
+test "a shell wait is read from top-level arguments and from either request wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { arguments_json: []const u8, wait: bool }{
+        .{ .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-1\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":{\"action\":\"wait\",\"session_id\":\"shell-1\"}}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\",\\\"session_id\\\":\\\"shell-1\\\"}\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\"}\"}", .wait = false },
+        .{ .arguments_json = "{\"request\":\"[\\\"wait\\\"]\"}", .wait = false },
+        .{ .arguments_json = "not json", .wait = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.wait, try isShellWaitCall(arena, .{
+            .id = "shell-wait",
+            .name = "shell",
+            .arguments_json = case.arguments_json,
+        }));
+    }
 }
 
 test "cancelled shell wait names the observation instead of the process" {

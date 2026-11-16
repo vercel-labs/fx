@@ -616,7 +616,12 @@ fn buildFooterSurfaceProjection(
                 shell.layout.rows,
             )
     else if (question_projection) |projection|
-        try question_ui.questionPanelRowsForLayout(alloc, projection, shell.layout.cols)
+        try question_ui.questionPanelRowsForLayout(
+            alloc,
+            projection,
+            shell.layout.cols,
+            question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows),
+        )
     else if (compact_command_menu) |menu|
         compact_command_menu_presentation.footerRowCount(menu, shell.layout.cols, shell.layout.rows)
     else if (show_auth_picker)

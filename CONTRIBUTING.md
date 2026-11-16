@@ -6,7 +6,7 @@ Code conventions live in [AGENTS.md](AGENTS.md): which module owns which behavio
 
 ## Report a problem
 
-Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, `/trace` copies a private diagnostic trace that you can attach. Issues are public, so review the trace and remove secrets before you post it.
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, run `/trace` to create a private diagnostic trace. Share it as a link from [fx.sh/share](https://fx.sh/share), which hides private data before upload. Or zip the trace file and attach the `.zip`; GitHub does not accept `.jsonl` files. On macOS, `/trace` copies the file itself to the clipboard, so paste it on fx.sh/share rather than in the issue. Issues are public, so review the trace and remove secrets before you post it.
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact), not in a public issue.
 
@@ -14,7 +14,7 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 You need:
 
-- [Zig 0.17.0](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build, because an older Zig fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
+- [Zig 0.17.1](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build. Zig 0.17.0 still builds fx without a warning, but CI tests only 0.17.1, and the PGSO pipeline stops on any other version. A Zig older than 0.17 fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
 - [Bun](https://bun.sh) and [tmux](https://github.com/tmux/tmux) for the end-to-end tests.
 - [hyperfine](https://github.com/sharkdp/hyperfine), if you want to run the startup benchmark locally.
 

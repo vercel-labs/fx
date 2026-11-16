@@ -2526,7 +2526,7 @@ pub const Runtime = struct {
         self.menu_index_ready = true;
     }
 
-    pub fn menuItemCount(self: Runtime) usize {
+    pub fn menuItemCount(self: *const Runtime) usize {
         if (self.menu_index_ready) return self.menu_index.count();
         return self.menu.filteredItemCount(self.items);
     }
@@ -2615,7 +2615,7 @@ pub const Runtime = struct {
         );
     }
 
-    pub fn selectedMenuSkill(self: Runtime) ?Skill {
+    pub fn selectedMenuSkill(self: *const Runtime) ?Skill {
         if (!self.menu.active) return null;
         const item_count = self.menuItemCount();
         if (item_count == 0) return null;
@@ -2629,7 +2629,7 @@ pub const Runtime = struct {
         return skillMenuSkillAtQuery(self.items, self.menu.source_filter, self.menu.query(), self.menu.selected_index % item_count);
     }
 
-    pub fn menuVisible(self: Runtime) bool {
+    pub fn menuVisible(self: *const Runtime) bool {
         if (!self.menu.active) return false;
         if (!self.menu.origin.isMention()) return true;
         return mentionMenuOpen(self.items, self.menu.query());
@@ -4996,6 +4996,11 @@ test "skill discovery decodes supported descriptions and isolates malformed neig
     );
     try writeTempFile(
         &tmp,
+        "root/plain/SKILL.md",
+        "---\nname: plain\ndescription:\n  React composition patterns that scale.\n  Use when building components.\nlicense: MIT\n---\nbody\n",
+    );
+    try writeTempFile(
+        &tmp,
         "root/bad/SKILL.md",
         "---\nname: bad\ndescription: >\n   first\n  smaller indent\n---\nbody\n",
     );
@@ -5005,7 +5010,11 @@ test "skill discovery decodes supported descriptions and isolates malformed neig
 
     var discovery = try loadVisibleSkills(alloc, null, null, root, test_managed_root_policy);
     defer discovery.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 4), discovery.skills.len);
+    try std.testing.expectEqualStrings(
+        "React composition patterns that scale. Use when building components.",
+        findSkillByName(discovery.skills, "plain").?.description,
+    );
     try std.testing.expectEqualStrings(
         "keeps  internal   spaces",
         findSkillByName(discovery.skills, "inline").?.description,

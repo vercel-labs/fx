@@ -5,6 +5,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -149,6 +150,10 @@ pub fn Runtime(comptime App: type) type {
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Couldn't make a secure connection."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
                 else => {},
+            }
+            if (try config_runtime.configuredProviderMessage(alloc, err)) |message| {
+                defer alloc.free(message);
+                return alloc.print("{s}: {s}", .{ context, message });
             }
             if (detailedErrorSummary(err)) |detail| {
                 return alloc.print("{s}: {s}", .{ context, detail });

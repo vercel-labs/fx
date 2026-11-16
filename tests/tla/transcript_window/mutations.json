@@ -70,7 +70,7 @@
       "law": "UpdateIsLocal",
       "constants": "MCTranscriptWindowSweep",
       "find": "    /\\ UNCHANGED <<core, alive, cycleStarts>>",
-      "replace": "    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
+      "replace": "    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen, prevWaits, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
     },
     {
       "id": "open-reads-log",
@@ -159,6 +159,14 @@
       "constants": "MCTranscriptWindowSweep",
       "find": "          THEN LET n == Min(Min(count, Step), Available(pendingDir))",
       "replace": "          THEN LET n == Min(count, Available(pendingDir))"
+    },
+    {
+      "id": "compaction-drops-at-once",
+      "bug": "A compaction between turns drops the previous cycle as soon as the log holds it, so a resize before the next turn end loses it.",
+      "law": "PreviousWaitsForTurnEnd",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "          /\\ prevFirst' = po /\\ prevWaits' = TRUE\n",
+      "replace": "          /\\ prevWaits' = TRUE\n          /\\ prevFirst' = IF CanDrop(po, nextSeq, turnOpen, savedThrough) THEN None ELSE po\n"
     }
   ],
   "core": [
@@ -259,6 +267,13 @@
       "sweep": "MCTranscriptWindowSweep",
       "find": "            next.ctrlo.open = false;\n            next.ctrlo.pending = 0;",
       "replace": "            next.ctrlo.open = false;"
+    },
+    {
+      "id": "core-compaction-drops-at-once",
+      "bug": "canDrop ignores the wait for the first turn end after a compaction.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    if (state.prev_waits_turn_end) return false;\n",
+      "replace": ""
     }
   ]
 }

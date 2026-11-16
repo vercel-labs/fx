@@ -1,10 +1,13 @@
 // Stress: the agent list far past the 10 rows it shows. Starts the built fx
 // with `--instances` instances, opens the list, and sends `--moves` seeded
-// Up and Down presses in bursts. After each burst exactly one row is drawn
-// highlighted, it is the instance the presses lead to (clamped at both
-// ends, scrolled into the window), and the trace log has no
-// `agent_switched`: the screen never changes while the highlight moves.
-// Enter then switches once, to the highlighted instance.
+// Up and Down presses in bursts, never Up on the first row, which would close
+// the list. After each burst exactly one row is drawn highlighted, it is the
+// instance the presses lead to (clamped at the last row, scrolled into the
+// window), the trace log's last `agents_menu_previewed` names that row, and
+// its last `agent_switched` shows that agent: every move shows the agent it
+// lands on. Enter then keeps it without another switch, and from the list
+// opened on it, Up back to the first row and one more Up close the list on
+// fx 1.
 //
 // Usage:
 //   bun tests/tla/drivers/agents_menu/stress.ts [--instances 100] [--moves 1000] [--seed 1]
@@ -31,7 +34,8 @@ const home: string = evals.createIsolatedTestHome();
 const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-tla-agents-menu-stress-")));
 mkdirSync(join(home, ".fx"), { recursive: true });
 const trace = join(home, "fx-trace.log");
-const switches = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("\n").filter((line) => line.includes("event=agent_switched")) : []);
+const events = (name: string) => (existsSync(trace) ? readFileSync(trace, "utf8").split("\n").filter((line) => line.includes(`event=${name} `)) : []);
+const switches = () => events("agent_switched");
 
 let session: any;
 const started = performance.now();
@@ -63,13 +67,18 @@ try {
   let sent = 0;
   let bursts = 0;
   let widest = 0;
+  const movesStarted = performance.now();
   while (sent < moves) {
     const down = random() < 0.55;
     const count = Math.min(moves - sent, 1 + Math.floor(random() * 5));
-    for (let i = 0; i < count; i += 1) await session.sendKeys(down ? "Down" : "Up");
+    for (let i = 0; i < count; i += 1) {
+      // Up on the first row closes the list, so the burst goes down there.
+      const key = down || expected === 0 ? "Down" : "Up";
+      await session.sendKeys(key);
+      expected = Math.max(0, Math.min(instances - 1, expected + (key === "Down" ? 1 : -1)));
+    }
     sent += count;
     bursts += 1;
-    expected = Math.max(0, Math.min(instances - 1, expected + (down ? count : -count)));
     const want = `fx ${expected + 1}`;
     const deadline = Date.now() + 10_000;
     for (;;) {
@@ -84,16 +93,36 @@ try {
       }
       await Bun.sleep(15);
     }
-    const seen = switches();
-    if (seen.length > 0) throw new Error(`the screen switched while the highlight moved, after ${sent} moves: ${seen[0]}`);
+    // The row the highlight is on is the agent shown.
+    const previewed = /position=(\d+) agent=(\S+)/.exec(events("agents_menu_previewed").at(-1) ?? "");
+    const shown = /agent=(\S+)/.exec(switches().at(-1) ?? "")?.[1];
+    if (expected > 0 || previewed) {
+      if (!previewed || Number(previewed[1]) !== expected + 1 || previewed[2] !== shown) {
+        throw new Error(`after ${sent} moves the highlight is on ${want}, but the last preview is ${previewed?.[0] ?? "none"} and the agent shown is ${shown ?? "none"}`);
+      }
+    }
   }
-  console.log(`${sent} moves in ${bursts} bursts: the highlight was on the expected row every time, in a window of ${widest} rows, and nothing switched`);
+  const moveMs = performance.now() - movesStarted;
+  const switched = switches().length;
+  console.log(`${sent} moves in ${bursts} bursts in ${Math.round(moveMs)} ms (${(moveMs / sent).toFixed(1)} ms a move): the highlight was on the expected row and its agent was shown every time, in a window of ${widest} rows, with ${switched} switches`);
   await session.sendKeys("Enter");
   const target = `fx ${expected + 1}/${instances}`;
   await session.waitForPane((pane: string) => !pane.includes(LIST_HINT) && pane.includes(target), 15_000);
-  const seen = switches();
-  if (seen.length !== 1) throw new Error(`Enter switched ${seen.length} times`);
-  console.log(`Enter switched once, to ${target}, in ${Math.round(performance.now() - started)} ms`);
+  if (switches().length !== switched) throw new Error(`Enter switched ${switches().length - switched} times, but the preview already showed ${target}`);
+  console.log(`Enter kept ${target} with no switch, in ${Math.round(performance.now() - started)} ms`);
+  // Back up to the first row, and one more Up closes the list on fx 1.
+  await session.sendKeys("C-x");
+  await session.waitForText(LIST_HINT, 15_000);
+  for (let row = expected; row > 0; row -= 1) await session.sendKeys("Up");
+  await session.waitForPane((pane: string) => pane.includes(LIST_HINT) && listRows(pane).length > 0, 15_000);
+  const top = Date.now() + 15_000;
+  while (listRows(await session.capturePaneEscapes()).find((row) => row.selected)?.name !== "fx 1") {
+    if (Date.now() > top) throw new Error(`Up ${expected} times never reached fx 1`);
+    await Bun.sleep(15);
+  }
+  await session.sendKeys("Up");
+  await session.waitForPane((pane: string) => !pane.includes(LIST_HINT) && pane.includes(`fx 1/${instances}`), 15_000);
+  console.log(`Up from the first row closed the list on fx 1/${instances}`);
 } catch (error) {
   console.error(`FAIL ${(error as Error).message}`);
   process.exitCode = 1;

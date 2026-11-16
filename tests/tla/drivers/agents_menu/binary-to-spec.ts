@@ -5,11 +5,14 @@
 // Each run starts one fx with --instances N and, under the first instance,
 // subagents whose turns the fake gateway holds. Then it takes `--steps` steps,
 // each one the person or the environment could take from where the list
-// stands: open the list (Ctrl+X or Down), Up, Down, Enter, Esc or Ctrl+X, the
-// first Delete on a row that can close, the second Delete, and, with the list
-// open, one held subagent finishing its turn, which can reorder the rows
-// under the highlight. After each step it reads the model's variables from
-// the binary (lib.ts `observe`) and records the state.
+// stands. With the list closed: open it (Ctrl+X, or Down on an empty
+// composer), or /close the instance on screen while another stays open. With
+// it open: Up, Down, Enter, Esc or Ctrl+X, a paste, a search letter,
+// Backspace, or Esc on a search, the first Delete on a row that can close, the
+// second Delete, and, with no search, one held subagent finishing its turn,
+// which can reorder the rows under the highlight. After each step it reads
+// the model's variables from the binary (lib.ts `observe`) and records the
+// state.
 //
 // Usage:
 //   bun tests/tla/drivers/agents_menu/binary-to-spec.ts [--seed 1] [--runs 3] [--steps 60]
@@ -66,13 +69,18 @@ for (let run = 1; run <= runs; run += 1) {
       const state = world.state;
       if (!state.open) {
         if (state.order.length < 2) break;
-        world.record(await perform(world, "open", random));
+        const slash = world.instances.includes(state.onScreen) && world.alive.length > 1 && random() < 0.04;
+        world.record(await perform(world, slash ? "slash_close" : "open", random));
         continue;
       }
-      const releasable = [...world.working].filter((sub) => state.order.includes(sub));
-      const choices: Array<[string, number]> = [["down", 30], ["up", 20], ["enter", 10], ["back", 8]];
-      if (closable(world, state.sel) && state.armed !== state.sel) choices.push(["arm", 8]);
-      if (state.armed !== NONE && state.armed === state.sel) choices.push(["delete", 14]);
+      // A search hides rows the pane can't show, so nothing changes them
+      // unseen: no release, and Delete erases the search instead.
+      const releasable = state.searching ? [] : [...world.working].filter((sub) => state.order.includes(sub));
+      const choices: Array<[string, number]> = [["down", 30], ["up", 16], ["enter", 10], ["back", 8], ["close", 3], ["search", 10]];
+      if (!state.searching && closable(world, state.sel) && state.armed !== state.sel) choices.push(["arm", 8]);
+      // An armed close is mostly confirmed, so closes happen often enough to
+      // check the row that takes the closed one's place.
+      if (!state.searching && state.armed !== NONE && state.armed === state.sel) choices.push(["delete", 300]);
       if (releasable.length > 0) choices.push(["release", 10]);
       const act = pick(random, choices);
       if (act === "release") {

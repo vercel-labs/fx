@@ -4,6 +4,7 @@ const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const token_pass_check = @import("token_pass_check.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1327,9 +1328,15 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeTokenPassDenial(app, notice);
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
                     .model_call => |record| {
+                        if (comptime @hasField(App, "model_cache")) {
+                            if (record.outcome == .completed) {
+                                if (record.served_by) |served_by| token_pass_check.Runtime(App).observeServedBy(app, served_by);
+                            }
+                        }
                         // After the text the call wrote. The line shows only
                         // in Ctrl+O, so it waits for text still being paced
                         // out instead of showing that text early, as in
@@ -1430,6 +1437,9 @@ pub fn Runtime(comptime App: type) type {
                             },
                             .progress, .terminal, .turn_finished => {},
                         }
+                        if (comptime agents.hasAgentField(App, "child_run")) {
+                            app_agents_runtime.Runtime(App).noteChildToolLifecycle(app, agent, lifecycle);
+                        }
                         try applyToolLifecycle(app, agent, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
@@ -1468,6 +1478,7 @@ pub fn Runtime(comptime App: type) type {
                         if (comptime @hasField(App, "program_status")) {
                             if (notice.tone == .@"error" and !offScreen(app, agent)) app.program_status.noteFailure();
                         }
+                        observeTokenPassDenial(app, notice);
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
                     },
@@ -1606,6 +1617,14 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        /// A warning or error that AI Gateway's Token Pass denial produced
+        /// tells the model cache the team has no active Token Pass.
+        fn observeTokenPassDenial(app: *App, notice: types.SemanticNotice) void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (notice.tone != .warning and notice.tone != .@"error") return;
+            token_pass_check.Runtime(App).observeErrorText(app, notice.body);
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {

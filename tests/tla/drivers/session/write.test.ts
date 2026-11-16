@@ -131,6 +131,13 @@ function recordBatches(log: string): Array<{ writer: Writer; count: number }> {
   return batches;
 }
 
+/// `text` without the runtime context updates fx adds to a message. Main's
+/// update lists its subagents with their tasks, which must not route main's
+/// request as a subagent's.
+function withoutContextUpdates(text: string): string {
+  return text.replace(/<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
 function mainLog(home: string): string {
   const root = join(home, ".fx", "sessions", "v2");
   if (!existsSync(root)) return "";
@@ -177,13 +184,15 @@ async function runWalk(walk: Walk, dir: string) {
       return notes.response;
     }
     const body = JSON.parse(raw);
-    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content) ?? "");
     const child = /WRITE_CHILD_TASK c(\d+)/.exec(latest ?? "");
     if (child) {
       const index = Number(child[1]) - 1;
       return walk.when === "before" ? helpers.fakeGatewayFinalText(`WRITE_CHILD_DONE c${index + 1}`) : helds[index]!.response;
     }
-    if (latest?.includes(REPORT_HEADER)) return helpers.fakeGatewayFinalText("WRITE_REPORT_SEEN");
+    // A report that arrives while main's turn runs joins that turn, so main
+    // keeps reading until its compaction; later reports start their own turns.
+    if (latest?.includes(REPORT_HEADER) && summaries > 0) return helpers.fakeGatewayFinalText("WRITE_REPORT_SEEN");
     mainSteps++;
     if (summaries > 0 || mainSteps > 14) return helpers.fakeGatewayFinalText("WRITE_MAIN_DONE");
     return helpers.fakeGatewaySse([

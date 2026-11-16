@@ -31,12 +31,23 @@
 (* Main writes a step of one or two calls. Calls to one subagent run in    *)
 (* the order written; calls to different subagents may run in any order.  *)
 (*                                                                         *)
+(* So that main gives related work to a subagent that has its context     *)
+(* rather than starting a new one: a message that starts a new subagent   *)
+(* names the subagents that are idle, and the report of a finished turn   *)
+(* says its subagent is idle (the `next` field) when nothing waits to     *)
+(* start its next turn. fx decides the note when the work ends, before    *)
+(* the waiting messages start that turn (deliverEnd, then                 *)
+(* nextOrIdleLocked in tool_host.zig). A turn that ends on its own, or    *)
+(* that the user stopped, owes main a report; a turn main stopped or      *)
+(* closed owes none.                                                       *)
+(*                                                                         *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
 (* stopped is refused, one to a work the user stopped joins it and is lost *)
 (* with it, a step's subagent calls run in any order, and a parent's stop  *)
 (* counts only the waiting messages, and a message to a starting turn     *)
-(* waits for the turn after it.                                            *)
+(* waits for the turn after it. "before_idle" is fx before the idle note:  *)
+(* no report says its subagent is idle and no start names any.             *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -44,8 +55,13 @@ CONSTANTS Subs, MsgsPer, MaxSteps, MaxStops, Bug
 
 Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
-         "queue_closing", "start_next_turn"}
+         "queue_closing", "start_next_turn",
+         "before_idle", "note_after_take", "names_busy"}
 ASSUME Bug \in Bugs
+
+\* What an end tells main: no report, a report that says its subagent is
+\* idle, or a plain report.
+Notes == {"none", "idle", "plain"}
 
 Msgs == Subs \X (1..MsgsPer)
 NoMsg == <<"none", 0>>
@@ -80,10 +96,17 @@ VARIABLES
     refusedOpen,  \* messages refused although their subagent was not closing
     coverBroken,  \* a stop dropped a message written after it in its step
     lateStart,    \* messages sent to a starting turn that fx held for a later one
-    last          \* the last action, which a trace of fx matches
+    last,         \* the last action, which a trace of fx matches
+    note,         \* what the last end told main (Notes)
+    named,        \* the subagents the last message named as idle
+    noteWrong,    \* an end's report said idle when its subagent was not, or the reverse
+    namedWrong    \* a new subagent's start named other than the idle subagents
+
+idleVars == <<note, named, noteWrong, namedWrong>>
 
 vars == <<phase, unread, waitq, read, dropped, toldDropped, told, sent,
-          stops, steps, step, covered, refusedOpen, coverBroken, lateStart, last>>
+          stops, steps, step, covered, refusedOpen, coverBroken, lateStart, last,
+          note, named, noteWrong, namedWrong>>
 
 Init ==
     /\ phase = [s \in Subs |-> "absent"]
@@ -102,6 +125,10 @@ Init ==
     /\ coverBroken = FALSE
     /\ lateStart = {}
     /\ last = None
+    /\ note = "none"
+    /\ named = {}
+    /\ noteWrong = FALSE
+    /\ namedWrong = FALSE
 
 -----------------------------------------------------------------------------
 (* Main writes its next step once the last one has run.                    *)
@@ -138,6 +165,7 @@ NewStep ==
        \/ \E c1, c2 \in Choices : c1 # c2 /\ Write(<<c1, c2>>)
     /\ UNCHANGED <<phase, unread, waitq, read, dropped, toldDropped, told,
                    refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
 
 -----------------------------------------------------------------------------
 (* One call of the step runs. Calls to one subagent wait for the earlier   *)
@@ -160,16 +188,18 @@ StartNextTurn(s) ==
 \* A call that waits for its subagent's turn to begin can't run yet.
 SendRuns(c) == phase[c.sub] # "starting" \/ StartNextTurn(c.sub)
 
-DoSend(c) ==
-    LET s == c.sub
-        m == c.msg
-    IN
-    \/ /\ phase[s] \in {"absent", "idle"}
-       /\ phase' = [phase EXCEPT ![s] = "starting"]
-       /\ read' = read \cup {m}
-       /\ told' = [told EXCEPT ![m] = "started"]
-       /\ last' = Event("send", s, m, "started", 0)
-       /\ UNCHANGED <<unread, waitq, dropped, toldDropped, refusedOpen, coverBroken, stops, lateStart>>
+\* The subagents other than `s` that are idle: what a start of a new `s`
+\* must name.
+IdleOthers(s) == {t \in Subs \ {s} : phase[t] = "idle"}
+
+\* What fx names when a message starts a new subagent `s`.
+NamedAtStart(s) ==
+    CASE Bug = "before_idle" -> {}
+      [] Bug = "names_busy" -> {t \in Subs \ {s} : phase[t] # "absent"}
+      [] OTHER -> IdleOthers(s)
+
+\* A message to a subagent that has a turn, or is closing.
+SendToBusy(s, m) ==
     \/ /\ StartNextTurn(s)
        /\ waitq' = [waitq EXCEPT ![s] = Append(@, m)]
        /\ told' = [told EXCEPT ![m] = "waits"]
@@ -205,6 +235,24 @@ DoSend(c) ==
        /\ told' = [told EXCEPT ![m] = "refused"]
        /\ last' = Event("send", s, m, "refused", 0)
        /\ UNCHANGED <<phase, read, unread, waitq, dropped, toldDropped, refusedOpen, coverBroken, stops, lateStart>>
+
+DoSend(c) ==
+    LET s == c.sub
+        m == c.msg
+    IN
+    /\ \/ /\ phase[s] \in {"absent", "idle"}
+          /\ phase' = [phase EXCEPT ![s] = "starting"]
+          /\ read' = read \cup {m}
+          /\ told' = [told EXCEPT ![m] = "started"]
+          /\ last' = Event("send", s, m, "started", 0)
+          \* Only a new subagent's start names the idle ones.
+          /\ named' = IF phase[s] = "absent" THEN NamedAtStart(s) ELSE {}
+          /\ namedWrong' = (namedWrong \/ (phase[s] = "absent" /\ named' # IdleOthers(s)))
+          /\ UNCHANGED <<unread, waitq, dropped, toldDropped, refusedOpen, coverBroken, stops, lateStart>>
+       \/ /\ phase[s] \notin {"absent", "idle"}
+          /\ named' = {}
+          /\ UNCHANGED namedWrong
+          /\ SendToBusy(s, m)
 
 \* A stop drops the waiting messages now, and the stopped turn's unread ones
 \* when it ends; its answer counts both.
@@ -263,11 +311,14 @@ Exec ==
         /\ Ready(i)
         /\ step[i].op = "send" => SendRuns(step[i])
         /\ step' = RemoveAt(step, i)
-        /\ CASE step[i].op = "send" -> DoSend(step[i])
+        /\ CASE step[i].op = "send" ->
+                    DoSend(step[i]) /\ UNCHANGED <<note, noteWrong>>
              [] step[i].op = "stop" ->
                     DoStop(step[i]) /\ UNCHANGED <<unread, read, told, refusedOpen, stops, lateStart>>
+                    /\ UNCHANGED idleVars
              [] step[i].op = "close" ->
                     DoClose(step[i]) /\ UNCHANGED <<read, told, refusedOpen, coverBroken, stops, lateStart>>
+                    /\ UNCHANGED idleVars
         /\ UNCHANGED <<sent, steps, covered>>
 
 -----------------------------------------------------------------------------
@@ -286,6 +337,7 @@ UserStop(s) ==
     /\ last' = Event("user_stop", s, NoMsg, "stopped",
                      Cardinality(Range(waitq[s]) \cup unread[s]))
     /\ UNCHANGED <<unread, read, told, sent, steps, step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
 
 \* A starting turn's worker begins: it takes messages from now on.
 Begin(s) ==
@@ -294,6 +346,7 @@ Begin(s) ==
     /\ last' = Event("begin", s, NoMsg, "none", 0)
     /\ UNCHANGED <<unread, waitq, read, dropped, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
 
 \* The running turn reads what joined it. A stopped turn reads nothing more.
 Read(s) ==
@@ -305,6 +358,26 @@ Read(s) ==
     /\ last' = Event("read", s, NoMsg, "none", Cardinality(unread[s]))
     /\ UNCHANGED <<phase, waitq, dropped, toldDropped, told, sent, stops, steps,
                    step, covered, refusedOpen, coverBroken, lateStart>>
+    /\ UNCHANGED idleVars
+
+\* What fx tells main when `s`'s work ends: no report when main stopped or
+\* closed it, and otherwise a report that says `s` is idle when no message
+\* waits to start its next turn. fx decides it before the next turn takes
+\* the waiting messages.
+EndNote(s, reports) ==
+    CASE ~reports -> "none"
+      [] Bug = "before_idle" -> "plain"
+      \* Decided after the next turn took the waiting messages.
+      [] Bug = "note_after_take" -> "idle"
+      [] OTHER -> IF waitq[s] = <<>> THEN "idle" ELSE "plain"
+
+\* Sets the note of `s`'s end, which goes to `after`, and whether it was
+\* wrong: a report must say idle exactly when the end leaves `s` idle.
+Noted(s, reports, after) ==
+    /\ note' = EndNote(s, reports)
+    /\ noteWrong' = (noteWrong \/
+         IF reports THEN (note' = "idle") # (after = "idle") ELSE note' # "none")
+    /\ UNCHANGED <<named, namedWrong>>
 
 \* The running turn ends on its own; waiting messages start the next one.
 Finish(s) ==
@@ -317,6 +390,8 @@ Finish(s) ==
             /\ waitq' = [waitq EXCEPT ![s] = <<>>]
             /\ phase' = [phase EXCEPT ![s] = "starting"]
     /\ last' = Event("finish", s, NoMsg, "none", 0)
+    \* A turn that ended on its own reports to main.
+    /\ Noted(s, TRUE, phase'[s])
     /\ UNCHANGED <<unread, dropped, toldDropped, told, sent, stops, steps, step,
                    covered, refusedOpen, coverBroken, lateStart>>
 
@@ -344,6 +419,9 @@ EndStopped(s) ==
                     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
                     /\ phase' = [phase EXCEPT ![s] = "starting"]
     /\ last' = Event("end", s, NoMsg, "none", Cardinality(Range(waitq[s])))
+    \* Only a turn the user stopped reports; main's own stop or close
+    \* already answered.
+    /\ Noted(s, phase[s] = "ending_user", phase'[s])
     /\ UNCHANGED <<toldDropped, told, sent, stops, steps, step, covered,
                    refusedOpen, coverBroken, lateStart>>
 
@@ -370,6 +448,10 @@ TypeOK ==
     /\ coverBroken \in BOOLEAN
     /\ lateStart \subseteq Msgs
     /\ last.op \in Ops
+    /\ note \in Notes
+    /\ named \subseteq Subs
+    /\ noteWrong \in BOOLEAN
+    /\ namedWrong \in BOOLEAN
 
 \* Main hears of every message fx throws away.
 NoSilentLoss == dropped \subseteq toldDropped
@@ -386,6 +468,16 @@ StopRunsFirst == ~coverBroken
 \* A message main sends to a turn that is still starting joins that turn:
 \* fx never holds it for a later one (Owner.steer's .starting).
 JoinsStartingWork == lateStart = {}
+
+\* A report says its subagent is idle exactly when its end leaves it idle:
+\* never when a waiting message starts its next turn, and always when
+\* nothing does. An end main stopped or closed sends no report.
+IdleNoteHonest == ~noteWrong
+
+\* A message that starts a new subagent names exactly the other subagents
+\* that are idle: none that works, starts, ends, or closes, and every idle
+\* one.
+NamesTheIdle == ~namedWrong
 
 \* Once main's steps have run and no subagent works, each message main
 \* sent was read, counted as dropped, or refused while a close was under way.

@@ -41,6 +41,7 @@ const subagent_execution = @import("../subagent/execution.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const diff = @import("../output/diff.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
@@ -739,6 +740,36 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        pub fn stopSteeringDetachedCommands(
+            app: *App,
+            agent: *AppAgent,
+            turn_id: u64,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !void {
+            return tool_runtime.stop_steering_detached_commands(
+                toolContext(
+                    app,
+                    agent,
+                    ignored_list_entries,
+                    max_list_entries,
+                    max_read_file_bytes,
+                    max_read_file_lines,
+                    max_read_file_line_len,
+                    max_command_output_bytes,
+                    gateway_retry_count,
+                    gateway_chat_url,
+                ),
+                turn_id,
+            );
+        }
+
         pub fn describeToolAction(
             app: *App,
             agent: *AppAgent,
@@ -1073,6 +1104,11 @@ pub fn Runtime(comptime App: type) type {
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent);
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
+            // The agent's own subagents, as its turn started with them.
+            const subagents: ?[]const u8 = if (comptime agents.hasAgentField(App, "session_persistence"))
+                if (app_session_runtime.Runtime(App).ownSubagentHost(agent)) |team_host| try team_host.teamNote(arena, agent.worker.activeTurnId()) else null
+            else
+                null;
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
@@ -1083,6 +1119,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .subagents = subagents,
             }, arena, messages);
         }
 
@@ -1312,7 +1349,11 @@ pub fn Runtime(comptime App: type) type {
                 .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
+                // A sign-in another fx process renewed since `/compact`
+                // started gets one more send, as an agent turn does.
+                .renewal_deps = &deps,
             };
+            defer summary_model.deinit();
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
                 .activity_origin = .manual,
@@ -1707,7 +1748,7 @@ fn formatToolAction(
         return formatToolActionValue(
             arena,
             specLabel(spec, state, denied_label),
-            display_target orelse spec.label_arg_default,
+            display_target orelse try mutationPathFromArgs(arena, ctx.workspace_root, call) orelse spec.label_arg_default,
         );
     }
     // The subagents a call that concerns them all names reach its row as
@@ -1732,6 +1773,18 @@ fn formatToolAction(
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
+}
+
+/// The path a write or edit call names, as its live row names it: relative
+/// to the workspace when it is inside it, and terminal-safe. A live call
+/// brings this as its display target; a saved call, as on resume, brings
+/// only its arguments. Null when they name no path.
+fn mutationPathFromArgs(arena: Allocator, workspace_root: []const u8, call: ToolCall) !?[]const u8 {
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
+    const path = tool_args.optionalStringArg(args, "path") orelse return null;
+    if (path.len == 0) return null;
+    const shown = try permissions.displayTargetForPolicy(arena, workspace_root, path, .path_create_parent);
+    return (try text_utils.encodeTerminalSafe(arena, shown, diff.max_encoded_label_bytes)).bytes;
 }
 
 fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
@@ -1884,12 +1937,10 @@ const test_prompt_policy = prompt_policy_contract.Policy{
 };
 
 var refresh_gather_calls: usize = 0;
-var refresh_named_target: bool = false;
 var refresh_gather_error: context_contract.ProviderError = error.WriteFailed;
 
 fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
     refresh_gather_calls += 1;
-    refresh_named_target = input.targets.len != 0;
     const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
@@ -2312,6 +2363,35 @@ test "app model id loading uses the injected catalog provider" {
     try std.testing.expectEqual(@as(usize, 2), ids.items.len);
     try std.testing.expectEqualStrings("provider/first", ids.items[0]);
     try std.testing.expectEqualStrings("provider/second", ids.items[1]);
+}
+
+test "a saved write or edit call names the path its arguments give" {
+    // Resume describes a saved call with no display target, so its row
+    // names the file the way the live row did, not the tool's "file".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { args: []const u8, want: ?[]const u8 }{
+        .{ .args = "{\"path\":\"README.md\",\"old_string\":\"a\",\"new_string\":\"b\"}", .want = "README.md" },
+        .{ .args = "{\"path\":\"/tmp/workspace/src/a.zig\",\"content\":\"x\"}", .want = "src/a.zig" },
+        .{ .args = "{\"path\":\"/etc/hosts\"}", .want = "/etc/hosts" },
+        .{ .args = "{\"old_string\":\"a\"}", .want = null },
+        .{ .args = "{\"path\":\"\"}", .want = null },
+        .{ .args = "{", .want = null },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "saved", .name = "edit_file", .arguments_json = case.args };
+        const got = try mutationPathFromArgs(arena, "/tmp/workspace", call);
+        if (case.want) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+    // A control byte in the path shows escaped, never raw.
+    const hostile: ToolCall = .{ .id = "hostile", .name = "edit_file", .arguments_json = "{\"path\":\"a\\u001b[2J.zig\"}" };
+    const shown = (try mutationPathFromArgs(arena, "/tmp/workspace", hostile)).?;
+    try std.testing.expect(std.mem.findScalar(u8, shown, 0x1b) == null);
 }
 
 test "app agent runtime builds tool context from app state and MCP callbacks" {
@@ -2801,7 +2881,6 @@ test "subagent labels show named request and reply" {
 test "app agent runtime refreshes enabled project context through registry" {
     const alloc = std.testing.allocator;
     refresh_gather_calls = 0;
-    refresh_named_target = true;
     var app = RefreshContextApp{
         .alloc = alloc,
         .context_enabled = true,
@@ -2813,9 +2892,6 @@ test "app agent runtime refreshes enabled project context through registry" {
     try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
-    // The instructions' context never names a target; a turn's folders reach
-    // the model as notes.
-    try std.testing.expect(!refresh_named_target);
     const contribution = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.fresh_context", contribution.provider_id);
     try std.testing.expectEqualStrings("fresh:/tmp/workspace", contribution.content);

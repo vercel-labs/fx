@@ -12,6 +12,8 @@ const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const session_commands = @import("../session/session_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -521,8 +523,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        /// Moves the agent list's highlight, keeping it in view. The agent
-        /// on screen stays until Enter.
+        /// Moves the agent list's highlight, keeping it in view, and shows
+        /// the agent it lands on; ↑ on the first row closes the list.
         pub fn routeAgentsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             const runtime = app_agents_runtime.Runtime(App);
@@ -1213,7 +1215,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
                     defer app.alloc.free(model);
                     const effort = selectedEffortCompletion(app) orelse return;
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = pickerCapabilities(app, model);
                     try setModelComposerText(app, "/model {s} {s}", .{ model, effort.label() });
                     try app.input_runtime.picker.beginModelPickerFlow(
                         app.alloc,
@@ -1254,7 +1256,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
                     defer app.alloc.free(model);
                     const effort = exactEffortCompletion(app, model, query.query) orelse return false;
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = pickerCapabilities(app, model);
                     if (!capabilities.supports_fast_mode and !capabilities.supports_ultrafast_mode) return false;
 
                     try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
@@ -1301,12 +1303,12 @@ pub fn CompletionRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return true;
                     };
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = pickerCapabilities(app, model);
                     if (capabilities.supports_fast_mode) {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, app.fast_mode, false);
+                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, pickerFastMode(app, model), false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     }
                     app.shell.render_requests.request(.footer);
@@ -1378,14 +1380,14 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn beginModelPickerOptions(app: *App, agent: *AppAgent, model: []const u8) !void {
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const capabilities = pickerCapabilities(app, model);
             const supports_effort = capabilities.reasoning_efforts.len > 0;
             const supports_fast = capabilities.supports_fast_mode;
             const supports_ultrafast = capabilities.supports_ultrafast_mode;
             const supports_speed = supports_fast or supports_ultrafast;
 
             if (!supports_effort and !supports_speed) {
-                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, app.fast_mode, false);
+                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, pickerFastMode(app, model), false);
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -1397,7 +1399,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             } else {
                 try setModelComposerText(app, "/model {s} auto ", .{model});
             }
-            // Preselect the product effort default and Fast mode when supported.
+            // Preselect the product effort default, and Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
                 model,
@@ -1407,6 +1409,22 @@ pub fn CompletionRuntime(comptime App: type) type {
                 stage,
             );
             app.shell.render_requests.request(.footer);
+        }
+
+        /// The capabilities the model picker offers for `model`. Token Pass
+        /// credit does not pay for Fast mode, so for a team with Token Pass
+        /// its models offer none, and the picker has no speed stage for them.
+        fn pickerCapabilities(app: *App, model: []const u8) model_capabilities.Capabilities {
+            var capabilities = model_capabilities.resolveForApp(App, app, model);
+            capabilities.supports_fast_mode = token_pass.offersFastMode(token_pass_team.paysFor(model), capabilities.supports_fast_mode);
+            return capabilities;
+        }
+
+        /// The Fast mode a pick without a speed stage keeps: the current
+        /// setting, but normal speed for a Token Pass model of a team with
+        /// Token Pass.
+        fn pickerFastMode(app: *App, model: []const u8) bool {
+            return if (token_pass_team.paysFor(model)) false else app.fast_mode;
         }
 
         pub fn beginExactModelSelection(app: *App, agent: *AppAgent, model: []const u8) !void {
