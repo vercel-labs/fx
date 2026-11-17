@@ -1256,7 +1256,29 @@ Settled for the converter (2026-10-06):
   82% of a real profile) convert too, through v1's older reader; a slow
   one shows the slow notice. So do v1 folders an old release left
   world-readable (0755), which today's v1 refuses: others could only read
-  them, the v2 copy is private, and the readable v1 copy is deleted. `--resume last` picks the newest of the
+  them, the v2 copy is private, and the readable v1 copy is deleted. A
+  member folder others can write, or one with a file or folder directly
+  in it or directly in its `subagent` folder that others can write (its
+  `session.json`, `events.jsonl`, `permissions.json`, lock file,
+  `subagent` folder, `children.json`, relationship index and child
+  markers, and side folders), is not taken (2026-11-16): those files have
+  no digest, so fx could not tell a change from what it saved. Every
+  command gives the same reason: what others can write ("its folder" or
+  the entry's name, written terminal-safe), for a subagent's folder its
+  id, and the fix `chmod -R go-w ~/.fx/sessions/{id}` (`"$FX_HOME"` in
+  place of `~/.fx` when that is set), which needs no quoting since an id
+  holds only letters, digits, `.`, `-` and `_`. A name too long for the reason
+  is left out, not cut. `fx session {id}` and `fx session recover` refuse
+  it as unsafe storage (`DurablePathUnsafe`) with that reason; a
+  symlinked or FIFO folder too, without one. Conversion, `fx ask
+  --resume` and `fx doctor` report it unreadable with that reason, and
+  its v1 folder stays. The leftover v1 folder of a session v2 already
+  holds is kept, not reported. Files deeper in side folders are not
+  checked by mode, so opening a member reads two folders: salvage checks
+  a saved result against the digest its handle names (D74), and
+  conversion copies them as they are. Only mode bits are read, not access
+  control lists, as for all of fx's private state, and a group that holds
+  only the owner counts as others. `--resume last` picks the newest of the
   merged listing. `fx session {id}` shows an unconverted v1 session read
   only, without converting it. A converted session is a v2 session and
   behaves as one: nothing special for converted sessions. The slow notice
