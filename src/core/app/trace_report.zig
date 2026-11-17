@@ -496,6 +496,8 @@ pub fn build(app: anytype) ![]u8 {
     const agent = agents.screenAgentOf(app);
     const history = agent.session.agent.history.items;
     const permission_view = app_permission_runtime.Runtime(App).viewOf(app, agent);
+    // A copy: a subagent's worker can add approvals while the report is built.
+    const permission_grants = try app_permission_runtime.Runtime(App).copyGrants(app, agent, arena);
     // Taken once, so the failed calls and the shell record agree.
     const shell_view = try arena.create(shell_snapshot.TraceView);
     shell_view.* = shell_snapshot.processOwner().traceView();
@@ -512,7 +514,7 @@ pub fn build(app: anytype) ![]u8 {
     try writeNetwork(r);
     try writeModelCatalog(r, app);
     try writeToolCalls(r, history, shell_view);
-    try writePermissions(r, permission_view.grants.items);
+    try writePermissions(r, permission_grants);
     try writeAutoReviews(r);
     try writeGit(r, app.workspace_root);
     try writeSettings(r, app.workspace_root);
