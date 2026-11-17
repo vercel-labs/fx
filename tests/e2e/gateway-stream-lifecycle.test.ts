@@ -14985,6 +14985,98 @@ test("a stop that drops an unread message says so", async () => {
   expect(result.code).toBe(0);
 }, 90_000);
 
+// Main closes its subagent `worker` and messages it while the close is not
+// written yet. The subagent's first turn is held until main closes it, and the
+// write of its close is held through FX_TEST_SUBAGENT_CLOSE_HELD
+// (src/core/subagent/close_test_controls.zig) until the message has been
+// answered, so the message lands while the subagent has no work and the
+// registry still holds it.
+type CloseMessageState = {
+  childRequests: number;
+  nextTurns: number;
+  afterMessage: string[];
+  heldMarker: string;
+  release: string;
+};
+
+async function runCloseMessage(
+  label: string,
+  main: (raw: string, state: CloseMessageState) => Promise<Response | undefined>,
+) {
+  const root = createFixtureRoot(label);
+  const held = heldFakeGatewayFinalText();
+  const state: CloseMessageState = {
+    childRequests: 0,
+    nextTurns: 0,
+    afterMessage: [],
+    heldMarker: join(root.root, "close-held"),
+    release: join(root.root, "close-release"),
+  };
+  const gateway = startDynamicFakeGateway(async raw => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("CLOSEMSG_REPORT_SEEN");
+    if (latest.includes("CLOSEMSG_NEXT")) {
+      state.nextTurns++;
+      return fakeGatewayFinalText("CLOSEMSG_NEXT_DONE");
+    }
+    if (latest.includes("CLOSEMSG_FIRST")) {
+      state.childRequests++;
+      return held.response;
+    }
+    const reply = await main(raw, state);
+    if (reply) return reply;
+    return fakeGatewayToolCall("closemsg-start", "subagent", { request: { action: "message", agent: "worker", message: "CLOSEMSG_FIRST" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Close the worker and message it."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        FX_SOUND: "0",
+        FX_TRACE_SCOPES: "mailbox,subagent,tool",
+        FX_TEST_SUBAGENT_CLOSE_HELD: state.heldMarker,
+        FX_TEST_SUBAGENT_CLOSE_RELEASE: state.release,
+      },
+      timeoutMs: 60_000,
+    });
+    return { result, state };
+  } finally {
+    writeFileSync(state.release, "");
+    held.release("CLOSEMSG_FIRST_LATE");
+    gateway.stop();
+  }
+}
+
+test("a message to a subagent whose close is not written yet is refused", async () => {
+  const { result, state } = await runCloseMessage("close-then-message", async (raw, state) => {
+    if (raw.includes("closemsg-message")) {
+      state.afterMessage.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("CLOSEMSG_MAIN_DONE");
+    }
+    if (raw.includes("closemsg-close")) {
+      // The close has answered, the closed work has ended, and its close is
+      // held before it is written.
+      await waitUntil(() => existsSync(`${state.heldMarker}.1`), 20_000);
+      return fakeGatewayToolCall("closemsg-message", "subagent", { request: { action: "message", agent: "worker", message: "CLOSEMSG_NEXT" } });
+    }
+    if (raw.includes("closemsg-start")) {
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewayToolCall("closemsg-close", "subagent", { request: { action: "close", agent: "worker" } });
+    }
+    return undefined;
+  });
+  expect(state.afterMessage.length).toBe(1);
+  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("close_write child=");
+  expect(toolResultText(state.afterMessage[0]!, "closemsg-close")).toContain("Closed worker");
+  // The message was refused at once, not held behind the close, and no turn
+  // started for the closed subagent.
+  expect(toolResultText(state.afterMessage[0]!, "closemsg-message")).toContain("child_closing");
+  expect(state.nextTurns).toBe(0);
+  expect(result.code).toBe(0);
+}, 90_000);
+
 // A message to subagent `worker`. With `emptyOptionalFields` it is a flat call
 // that carries every optional field set to an empty string.
 function startGapMessage(message: string, emptyOptionalFields: boolean) {

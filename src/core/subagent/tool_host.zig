@@ -16,6 +16,7 @@ const activity_status = @import("../output/activity_status.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
+const close_test_controls = @import("close_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -229,10 +230,12 @@ pub const Runtime = struct {
     /// the parent's log (`beginTurnWork`): the user's, typed on the child's
     /// screen, or one its own child's report woke.
     turn_works: std.ArrayList(TurnWork) = .empty,
-    /// Children being closed for good (`closeChild`) whose work is still
-    /// ending; the close is written once nothing of theirs runs. Guarded by
+    /// Children being closed for good (`closeChild`), until their close is
+    /// written (`settleClose`) or its write fails: the list, the trace, and
+    /// message admission all treat each as closing for that whole time
+    /// (`tests/tla/subagent/StopMessage.tla` ClosingHoldsNothing). Guarded by
     /// `admission_mutex`.
-    closing: std.ArrayList([]u8) = .empty,
+    closing: std.ArrayList(Closing) = .empty,
     /// Children closed or closing whose agents the app has not yet dropped
     /// (`takeClosed`). Guarded by `admission_mutex`.
     closed_unseen: std.ArrayList([]u8) = .empty,
@@ -287,7 +290,8 @@ pub const Runtime = struct {
         runtime.approvals = .{
             .alloc = alloc,
         };
-        runtime.profile_cache = .{ .alloc = alloc };
+        // The session's own workspace, not the process's: an ACP session can be bound to another.
+        runtime.profile_cache = .{ .alloc = alloc, .roots = .{ .home = io_mod.homeDir(), .workspace_root = children.workspace } };
         runtime.authority_resolver = .{
             .children = children,
             .root_id = runtime.root_id,
@@ -320,9 +324,9 @@ pub const Runtime = struct {
         self.user_closed.deinit(self.alloc);
         for (self.turn_works.items) |*work| work.deinit(self.alloc);
         self.turn_works.deinit(self.alloc);
-        for (self.closing.items) |id| {
-            debug_trace.eventf("mailbox", "close_dropped", .{}, "child={s} reason=host_closed", .{id});
-            self.alloc.free(id);
+        for (self.closing.items) |entry| {
+            debug_trace.eventf("mailbox", "close_dropped", .{}, "child={s} reason=host_closed", .{entry.id});
+            self.alloc.free(entry.id);
         }
         self.closing.deinit(self.alloc);
         for (self.closed_unseen.items) |id| self.alloc.free(id);
@@ -649,7 +653,7 @@ pub const Runtime = struct {
         // What the profile set, which a new child keeps (`child_state.Child`).
         var started_with: ?started_with_mod.StartedWith = null;
         if (model_override.profile) |name| {
-            const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
+            const profile = switch (try loadChildProfile(profile_arena.allocator(), self.profile_cache.?.roots, name)) {
                 .rejected => |failure| return self.encodeManaged(alloc, failure),
                 .loaded => |value| value,
             };
@@ -2009,7 +2013,7 @@ pub const Runtime = struct {
                 } else false,
                 .user => self.managed.closeByUser(child_id),
             } or self.stopTurnWorkLocked(child_id);
-            self.closing.appendAssumeCapacity(owned);
+            self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
             debug_trace.eventf("mailbox", "close", .{}, "target={s} by={s} running={} dropped={d}", .{ child_id, @tagName(by), stopped, dropped + unread });
@@ -2089,7 +2093,7 @@ pub const Runtime = struct {
     }
 
     fn closingIndexLocked(self: *const Runtime, child_id: []const u8) ?usize {
-        for (self.closing.items, 0..) |id, index| if (std.mem.eql(u8, id, child_id)) return index;
+        for (self.closing.items, 0..) |entry, index| if (std.mem.eql(u8, entry.id, child_id)) return index;
         return null;
     }
 
@@ -2114,45 +2118,65 @@ pub const Runtime = struct {
     }
 
     /// Writes the close of `child_id` once nothing of it runs, when it is
-    /// closing. False only when the write failed, which leaves the child
-    /// listed again, as before its close, and is traced.
+    /// closing. The child stays closing until the write returns: the write
+    /// runs outside `admission_mutex`, which the main loop takes, so the mark
+    /// is what keeps the child out of the list, marked in the trace, and
+    /// closed to messages meanwhile. One thread writes a close; another that
+    /// reaches it meanwhile leaves it to that one. False only when the write
+    /// failed, which leaves the child listed again, as before its close, and
+    /// is traced.
     fn settleClose(self: *Runtime, child_id: []const u8) bool {
-        const owned = blk: {
+        const work_id = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
             const index = self.closingIndexLocked(child_id) orelse return true;
+            const entry = &self.closing.items[index];
+            if (entry.settling) return true;
             if (self.isBusyLocked(child_id) or self.inTurnWorkLocked(child_id)) return true;
-            break :blk self.closing.swapRemove(index);
+            const id = self.alloc.print(close_work_prefix ++ "{s}", .{entry.id}) catch |err| {
+                self.finishCloseLocked(child_id, err);
+                return false;
+            };
+            entry.settling = true;
+            break :blk id;
         };
-        defer self.alloc.free(owned);
-        const work_id = self.alloc.print("fxclose:{s}", .{owned}) catch |err| return self.closeNotWritten(owned, err);
         defer self.alloc.free(work_id);
+        const owned = work_id[close_work_prefix.len..];
+        close_test_controls.holdWrite(owned);
         // The registry's lock is released before admission's is taken.
         const failure: ?anyerror = blk: {
             var lock = self.managed.state_store.acquireLock();
             defer lock.release();
+            if (close_test_controls.failedWrite()) |err| break :blk err;
             self.managed.state_store.close(owned, work_id) catch |err| break :blk err;
             break :blk null;
         };
-        if (failure) |err| return self.closeNotWritten(owned, err);
+        self.finishClose(owned, failure);
+        if (failure != null) return false;
         debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
         self.managed.forgetFeedback(owned);
         return true;
     }
 
-    /// A close that couldn't be written: the child stays, so the app, if it
-    /// hasn't yet, keeps its agent too. Returns false.
-    fn closeNotWritten(self: *Runtime, child_id: []const u8, err: anyerror) bool {
-        debug_trace.logf("mailbox", "close not written child={s} err={s}", .{ child_id, @errorName(err) });
+    /// The end of a close, written or not: the child stops being closing. A
+    /// close that couldn't be written leaves the child, so the app, if it
+    /// hasn't yet, keeps its agent too.
+    fn finishClose(self: *Runtime, child_id: []const u8, failure: ?anyerror) void {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
+        self.finishCloseLocked(child_id, failure);
+    }
+
+    fn finishCloseLocked(self: *Runtime, child_id: []const u8, failure: ?anyerror) void {
+        if (failure) |err| debug_trace.logf("mailbox", "close not written child={s} err={s}", .{ child_id, @errorName(err) });
+        if (self.closingIndexLocked(child_id)) |index| self.alloc.free(self.closing.swapRemove(index).id);
+        if (failure == null) return;
         for (self.closed_unseen.items, 0..) |id, index| {
             if (!std.mem.eql(u8, id, child_id)) continue;
             self.alloc.free(self.closed_unseen.orderedRemove(index));
             break;
         }
         if (self.closed_unseen.items.len == 0) self.closed_waiting.store(false, .release);
-        return false;
     }
 
     /// `message{agent: "parent"}`: a child of this host writes to the
@@ -2261,11 +2285,11 @@ pub const Runtime = struct {
     };
 
     /// Loads the profile a new child asks for, from the fx home and the
-    /// current directory, as `fx --profile` does. The result and any message
-    /// belong to `arena`.
-    fn loadChildProfile(arena: Allocator, name: []const u8) !ChildProfile {
-        const workspace_root = io_mod.realpathAlloc(arena, ".") catch null;
-        const roots = try profiles.Roots.init(arena, io_mod.homeDir(), workspace_root);
+    /// session's workspace root (`cache_roots`, the profile cache's), as
+    /// `fx --profile` does in the directory it runs in. The result and any
+    /// message belong to `arena`.
+    fn loadChildProfile(arena: Allocator, cache_roots: authority.ProfileCache.LoadRoots, name: []const u8) !ChildProfile {
+        const roots = try profiles.Roots.init(arena, cache_roots.home, cache_roots.workspace_root);
         var failure: ?[]const u8 = null;
         const profile = profiles.load(arena, roots, name, &failure) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -3425,6 +3449,62 @@ test "a work that ends after its tree closed owes no report and posts none" {
     try std.testing.expect(!registry.children[0].last_report_owed);
 }
 
+test "a closed tree's teardown ends a running work cancelled, so a reopen has no report to post" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    runtime.closeTree();
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    // The finish owes nothing, so it is saved without data. Only a cancelled
+    // one reads that way on reopen: an interrupted one reads as crash repair,
+    // which owes a report.
+    const lines = try parent.parent.reportLines(arena);
+    var finishes: usize = 0;
+    for (lines) |line| switch (line) {
+        .finished => |finished| {
+            finishes += 1;
+            try std.testing.expectEqual(session_adapter.ChildOutcome.cancelled, finished.outcome);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), finishes);
+    try std.testing.expectEqual(@as(usize, 0), (try reports.pendingReports(arena, lines)).len);
+}
+
+test "a quit's teardown ends a running work interrupted, and a reopen posts its report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], " interrupted fx stopped before it finished.") != null);
+    const lines = try parent.parent.reportLines(arena);
+    const pending = try reports.pendingReports(arena, lines);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(child_state.Outcome.interrupted, pending[0].outcome);
+}
+
 test "stop ends a subagent's turn without a report and drops what waits for it" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3526,6 +3606,251 @@ test "trace children show each subagent's work phase, last outcome, and closing"
         defer Runtime.freeTraceChildren(alloc, traced);
         try std.testing.expectEqual(@as(usize, 0), traced.len);
     }
+}
+
+/// Holds the thread that settles a close just before it writes the close,
+/// until a test lets it go, so the test can look at the host while the close
+/// is not written yet (`close_test_controls`).
+const CloseHold = struct {
+    var settles = std.atomic.Value(u32).init(0);
+    var reached: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn arm(write_error: ?anyerror) void {
+        settles.store(0, .seq_cst);
+        reached = .unset;
+        go = .unset;
+        close_test_controls.test_write_error = write_error;
+        close_test_controls.test_hold = hold;
+    }
+
+    /// Lets a held thread go, and stops holding.
+    fn disarm() void {
+        close_test_controls.test_hold = null;
+        close_test_controls.test_write_error = null;
+        go.set(io_mod.getIo());
+    }
+
+    /// Holds the first close's write; a later close's goes straight on.
+    fn hold(_: []const u8) void {
+        if (settles.fetchAdd(1, .seq_cst) != 0) return;
+        reached.set(io_mod.getIo());
+        while (!go.isSet()) io_mod.sleep(std.time.ns_per_ms);
+    }
+};
+
+/// A working subagent `reviewer` that its parent has closed, with its close
+/// held just before the write: the child is closing and the registry still
+/// holds it. Initialized in place, since the host points into it.
+const ClosingSubagent = struct {
+    arena_state: std.heap.ArenaAllocator,
+    parent: child_state.TestParent,
+    fixture: MailboxFixture,
+    runtime: *Runtime,
+    child_id: []const u8,
+    /// Set by a test that leaves a thread of the host blocked for good: the
+    /// host is not torn down, since that would wait for the thread.
+    abandoned: bool = false,
+
+    fn init(self: *ClosingSubagent, alloc: Allocator, write_error: ?anyerror) !void {
+        self.* = .{ .arena_state = .init(alloc), .parent = undefined, .fixture = .{ .hold = true }, .runtime = undefined, .child_id = undefined };
+        errdefer self.arena_state.deinit();
+        try self.parent.init(alloc);
+        errdefer self.parent.deinit();
+        self.runtime = try mailboxRuntime(alloc, &self.fixture, &self.parent);
+        errdefer self.runtime.deinit();
+        const arena = self.arena_state.allocator();
+        _ = try callTool(self.runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+        try waitForRuns(&self.fixture, 1);
+        self.child_id = try reviewerId(self.runtime, arena);
+        CloseHold.arm(write_error);
+        errdefer CloseHold.disarm();
+        _ = try callTool(self.runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-2", null);
+        if (!testing_event.setInTime(&CloseHold.reached)) return error.Timeout;
+    }
+
+    fn deinit(self: *ClosingSubagent) void {
+        CloseHold.disarm();
+        if (!self.abandoned) {
+            self.runtime.deinit();
+            self.fixture.deinit();
+            self.parent.deinit();
+        }
+        self.arena_state.deinit();
+    }
+
+    /// Lets the held close go on, and waits until the registry has dropped
+    /// the child.
+    fn letCloseGo(self: *ClosingSubagent) !void {
+        CloseHold.go.set(io_mod.getIo());
+        try waitUntilClosed(self.runtime, self.child_id);
+    }
+};
+
+/// One message to `reviewer` made on a thread of its own, so a call that
+/// blocks fails its test instead of hanging it.
+const MessageToClosing = struct {
+    runtime: *Runtime,
+    answer: ?[]u8 = null,
+    returned: std.Io.Event = .unset,
+
+    fn run(self: *MessageToClosing) void {
+        defer self.returned.set(io_mod.getIo());
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const body = callTool(self.runtime, arena_state.allocator(), .{ .message = .{ .agent = "reviewer", .message = "after the close" } }, "call-3", null) catch |err| {
+            self.answer = std.testing.allocator.print("error {s}", .{@errorName(err)}) catch null;
+            return;
+        };
+        self.answer = std.testing.allocator.dupe(u8, body) catch null;
+    }
+};
+
+test "a test build holds and fails a close's write only through its hooks" {
+    // Without a hook a hold returns at once and no write fails.
+    close_test_controls.holdWrite("child");
+    try std.testing.expect(close_test_controls.failedWrite() == null);
+}
+
+test "a subagent whose close is not written yet stays out of the list and marked in the trace" {
+    const alloc = std.testing.allocator;
+    var closing: ClosingSubagent = undefined;
+    try closing.init(alloc, null);
+    defer closing.deinit();
+
+    // The work has ended and the registry still holds the child; the list
+    // and the trace say it is closing, as they did while its work ended.
+    // The app has taken the child to drop its agent, and its next sync of the
+    // agent list adds an agent for every child this lists
+    // (`syncChildList` in `src/core/app/app_agents_runtime.zig`): a child
+    // listed now would come back as an agent that no close drops again.
+    const taken = try closing.runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    {
+        const listing = try closing.runtime.listChildren(alloc);
+        defer Runtime.freeChildListing(alloc, listing);
+        try std.testing.expectEqual(@as(usize, 0), listing.len);
+    }
+    {
+        const traced = try closing.runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 1), traced.len);
+        try std.testing.expectEqualStrings(closing.child_id, traced[0].id);
+        try std.testing.expect(traced[0].closing);
+    }
+    try closing.letCloseGo();
+    {
+        const traced = try closing.runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 0), traced.len);
+    }
+}
+
+test "a message to a subagent whose close is not written yet is refused with child_closing and does not block" {
+    const alloc = std.testing.allocator;
+    var closing: ClosingSubagent = undefined;
+    try closing.init(alloc, null);
+    defer closing.deinit();
+
+    var message = MessageToClosing{ .runtime = closing.runtime };
+    const thread = try std.Thread.spawn(.{}, MessageToClosing.run, .{&message});
+    if (!testing_event.setInTime(&message.returned)) {
+        // The call holds the host's admission lock and waits for the slot,
+        // which waits for that lock: neither goes on, so the host is left.
+        closing.abandoned = true;
+        thread.detach();
+        return error.MessageBlocked;
+    }
+    thread.join();
+    defer if (message.answer) |text| alloc.free(text);
+    try std.testing.expect(message.answer != null);
+    try std.testing.expect(std.mem.find(u8, message.answer.?, "child_closing") != null);
+    // No turn started for the closed subagent.
+    try std.testing.expectEqual(@as(usize, 1), closing.fixture.runs.load(.seq_cst));
+    try closing.letCloseGo();
+}
+
+test "a second close while the first is not written yet answers that it is closing, and the close is written once" {
+    const alloc = std.testing.allocator;
+    var closing: ClosingSubagent = undefined;
+    try closing.init(alloc, null);
+    defer closing.deinit();
+
+    const second = (try closing.runtime.closeChild(closing.child_id, .parent)).?;
+    // It ended nothing and dropped nothing: the first close did.
+    try std.testing.expect(!second.stopped);
+    try std.testing.expectEqual(@as(usize, 0), second.dropped);
+    try closing.letCloseGo();
+    try std.testing.expectEqual(@as(u32, 1), CloseHold.settles.load(.seq_cst));
+    // The app drops the agent once.
+    const taken = try closing.runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings(closing.child_id, taken[0]);
+}
+
+test "a settle of a close that is being written leaves the write to the thread that has it" {
+    const alloc = std.testing.allocator;
+    var closing: ClosingSubagent = undefined;
+    try closing.init(alloc, null);
+    defer closing.deinit();
+
+    // Asked again while the first writes, it answers and writes nothing.
+    try std.testing.expect(closing.runtime.settleClose(closing.child_id));
+    try std.testing.expectEqual(@as(u32, 1), CloseHold.settles.load(.seq_cst));
+    {
+        var lock = closing.runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try closing.runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expect(registry.findById(closing.child_id) != null);
+    }
+    try closing.letCloseGo();
+}
+
+test "a close whose write fails keeps the subagent closing until then, and lists it again" {
+    const alloc = std.testing.allocator;
+    var closing: ClosingSubagent = undefined;
+    try closing.init(alloc, error.ChildBusy);
+    defer closing.deinit();
+
+    {
+        const listing = try closing.runtime.listChildren(alloc);
+        defer Runtime.freeChildListing(alloc, listing);
+        try std.testing.expectEqual(@as(usize, 0), listing.len);
+    }
+    CloseHold.go.set(io_mod.getIo());
+    // The write failed: the child is no longer closing, and the registry
+    // still holds it.
+    var listed: usize = 0;
+    for (0..5000) |_| {
+        const listing = try closing.runtime.listChildren(alloc);
+        listed = listing.len;
+        Runtime.freeChildListing(alloc, listing);
+        if (listed == 1) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), listed);
+    {
+        const traced = try closing.runtime.traceChildren(alloc);
+        defer Runtime.freeTraceChildren(alloc, traced);
+        try std.testing.expectEqual(@as(usize, 1), traced.len);
+        try std.testing.expect(!traced[0].closing);
+    }
+    // The app keeps the agent: nothing of this child is left to drop.
+    try std.testing.expect(!closing.runtime.hasClosed());
+    try std.testing.expectEqual(@as(usize, 0), (try closing.runtime.takeClosed(alloc)).len);
+    // A later close goes through.
+    close_test_controls.test_write_error = null;
+    try std.testing.expect((try closing.runtime.closeChild(closing.child_id, .parent)) != null);
+    try waitUntilClosed(closing.runtime, closing.child_id);
 }
 
 test "the parent's close ends a working subagent's turn without a report and removes it for good" {
@@ -3770,6 +4095,41 @@ test "a new subagent starts in the main profile unless its message names one, an
     defer registry.deinit(alloc);
     try std.testing.expect(registry.findPersistent("reviewer").?.started_with == null);
     try std.testing.expectEqual(profiles.Source.builtin, registry.findPersistent("copier").?.started_with.?.source);
+}
+
+test "a subagent's profile loads from its session's workspace, not the directory the process runs in" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    // The session's workspace is the test parent's folder, and the profile is
+    // only there: the process runs in the repository checkout, which has none.
+    const io = io_mod.getIo();
+    try parent.tmp.dir.createDirPath(io, ".fx/agents/session-reviewer");
+    var settings = try parent.tmp.dir.createFile(io, ".fx/agents/session-reviewer/profile.json", .{});
+    defer settings.close(io);
+    try settings.writeStreamingAll(io, "{\"description\": \"Reads the session workspace\", \"tools\": [\"read_file\"]}");
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const sent = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look", .profile = "session-reviewer" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, sent, "profile_unavailable") == null);
+    try waitUntilQuiet(runtime);
+    var registry = try parent.stateStore().load(alloc);
+    defer registry.deinit(alloc);
+    const started = registry.findPersistent("reviewer").?.started_with.?;
+    try std.testing.expectEqual(profiles.Source.project, started.source);
+    try std.testing.expectEqual(@as(usize, 1), started.tools.?.len);
+    try std.testing.expectEqualStrings("read_file", started.tools.?[0]);
+
+    // A child saved with only its profile's name loads it from the same place.
+    const reloaded = try runtime.profile_cache.?.get("name-only-child", "session-reviewer", null);
+    try std.testing.expectEqualStrings("read_file", reloaded.tools.?[0]);
 }
 
 test "a new subagent saves what its profile set, unless that would not fit in a spawn line" {
@@ -4727,6 +5087,16 @@ fn terminalResult(
 const start_wait_poll_ns = 5 * std.time.ns_per_ms;
 
 /// One message waiting for its child's starting turn (`Runtime.start_waits`).
+/// A child being closed for good (`Runtime.closing`).
+const Closing = struct {
+    id: []u8,
+    /// Whether a thread is writing its close, so no other writes it too.
+    settling: bool = false,
+};
+
+/// What names a close's work in the log; the child's id follows.
+const close_work_prefix = "fxclose:";
+
 const StartWait = struct {
     child_id: []const u8,
     closed: bool = false,
