@@ -9759,7 +9759,7 @@ test "the commit gate logs what it held, what released it, and the limit it gave
     stuck.enableCommitGate();
     try finishedTurnWithMissedMail(alloc, &stuck);
     try std.testing.expect((try stuck.tryTakeNextWork(alloc)) == null);
-    // The loop never commits: the finish was pushed longer ago than the limit.
+    // The loop never commits: the hold began longer ago than the limit.
     stuck.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
     freeWorkItem(alloc, (try stuck.tryTakeNextWork(alloc)).?);
     try std.testing.expectEqual(@as(u32, 0), stuck.unacknowledged_finishes);

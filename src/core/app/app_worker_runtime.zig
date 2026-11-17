@@ -6155,9 +6155,25 @@ const FlushApp = struct {
         try worker.postMail(gpa, try queuedRequest(gpa, "a report"));
         try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
         worker.finishProcessing();
-        var events = worker.takeEvents();
+        self.dropWorkerEvents();
+        try self.pacerHoldsFinishedTurn(shown);
+    }
+
+    /// The loop took the worker's events, as its pass does before it hands a
+    /// finish to the pacer.
+    fn dropWorkerEvents(self: *FlushApp) void {
+        const gpa = std.heap.c_allocator;
+        var events = self.agent().worker.takeEvents();
         for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
         events.deinit(gpa);
+    }
+
+    /// The next turn's finish: the pacer's old text is gone, the worker has a
+    /// second finish, and the loop takes it into the pacer behind the prompt.
+    fn secondFinishBehindPacer(self: *FlushApp, shown: []const u8) !void {
+        self.pacer.clear(self.alloc);
+        try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = finished_turn } });
+        self.dropWorkerEvents();
         try self.pacerHoldsFinishedTurn(shown);
     }
 };
@@ -6249,12 +6265,7 @@ test "a flush whose commit fails is not held against the next hold" {
 
     // The next finish holds the same mail again, and the loop flushes for it.
     app.fail_commit = false;
-    app.pacer.clear(app.alloc);
-    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
-    var events = agent.worker.takeEvents();
-    for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-    events.deinit(std.heap.c_allocator);
-    try app.pacerHoldsFinishedTurn("second");
+    try app.secondFinishBehindPacer("second");
     try std.testing.expect(agent.worker.commitGateWaitsForCommit());
     Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
     try std.testing.expectEqual(@as(usize, 2), app.commits);
@@ -6321,12 +6332,7 @@ test "a flush that fails is logged once, keeps the finished turn, and is not tri
     agent.worker.acknowledgeFinishDropped("cancel");
     try std.testing.expect(!agent.worker.commit_gate_flush_failed);
     app.fail_emit = false;
-    app.pacer.clear(alloc);
-    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
-    var events = agent.worker.takeEvents();
-    for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-    events.deinit(std.heap.c_allocator);
-    try app.pacerHoldsFinishedTurn("second");
+    try app.secondFinishBehindPacer("second");
     Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
     try std.testing.expectEqual(@as(usize, 1), app.commits);
 
