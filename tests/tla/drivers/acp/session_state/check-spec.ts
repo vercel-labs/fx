@@ -73,7 +73,7 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: "list-busy",
-    note: "session/list is refused while a turn runs on the connection, as before many sessions (X24)",
+    note: "session/list is refused while a turn runs on the connection, as before many sessions",
     from: `RefusesList(c) == FALSE`,
     to: `RefusesList(c) == Busy(c)`,
     expect: "ListAnswered",

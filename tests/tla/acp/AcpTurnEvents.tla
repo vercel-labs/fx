@@ -21,8 +21,8 @@
 (*  - The turn's response comes after every message of the turn, and      *)
 (*    carries the turn's usage when the client lists "usage".             *)
 (*                                                                         *)
-(* `Rules` set to FALSE gives fx acp before these rules (#2021 at         *)
-(* 76de31e82): the loop's progress, model calls, compactions, and finish  *)
+(* `Rules` set to FALSE gives fx acp before these rules:                  *)
+(* the loop's progress, model calls, compactions, and finish              *)
 (* reach fx acp's catch-all arm or no hook at all, and nothing is sent,   *)
 (* so only the response reaches the client. AcpTurnEventsToday.cfg shows  *)
 (* Complete failing.                                                      *)
@@ -39,7 +39,7 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
-    Rules,          \* TRUE: the S8d rules; FALSE: fx acp before them
+    Rules,          \* TRUE: the turn events rules; FALSE: fx acp before them
     Parts,          \* the parts the client lists
     Ks,             \* compaction ids, 1..n
     MaxProgress,    \* progress reports per turn

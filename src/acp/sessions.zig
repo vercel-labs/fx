@@ -992,7 +992,7 @@ fn handleRestoreSession(
 }
 
 /// `session/load` or `session/resume` of a session open on this connection
-/// reuses it (Q108): its turn, mode, and MCP servers keep running, and load
+/// reuses it: its turn, mode, and MCP servers keep running, and load
 /// replays its saved history again. The open session keeps its workspace, so
 /// a request that names another one fails. A new system prompt applies at
 /// the next turn, so it fails while a turn runs.
