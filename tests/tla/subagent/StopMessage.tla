@@ -74,9 +74,13 @@
 (* is fx before this: a stop of an ended turn reached nothing, and the     *)
 (* hook queued the kept messages. "leftover_uncounted" drops them without  *)
 (* counting, "close_leaves_kept" leaves them with the closing subagent,    *)
-(* "user_ended_uncounted" is the user's Esc that counts none, and          *)
+(* "user_ended_uncounted" is the user's Esc that counts none,              *)
 (* "gap_uncounted" is a stop or close of the chosen work that counts none  *)
-(* of its messages.                                                        *)
+(* of its messages, and "user_next_counted" is the user's stop of the      *)
+(* chosen work that counts its messages although it ends no work and       *)
+(* cancels none (Owner.noteUserStop), so they run. That stop counts        *)
+(* nothing of the chosen work, and after the end is recorded it counts     *)
+(* what the slot kept.                                                     *)
 (*                                                                         *)
 (* Bug plants one defect; check.sh names the rule that must catch each.    *)
 (* "today" is fx before this design: a message to a work its parent        *)
@@ -98,7 +102,7 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "before_idle", "note_after_take", "names_busy", "gap_blind"}
 \* The defects of the kept and carried messages, beside `Bugs`.
 KeptBugs == {"leftover_gap", "leftover_uncounted", "close_leaves_kept",
-             "user_ended_uncounted", "gap_uncounted"}
+             "user_ended_uncounted", "gap_uncounted", "user_next_counted"}
 ASSUME Bug \in Bugs \cup KeptBugs
 
 \* What an end tells main: no report, a report that says its subagent is
@@ -434,11 +438,15 @@ Exec ==
 \* messages in its queue and tells main how many (noteUserStop).
 UserStop(s) ==
     LET waiting == Range(waitq[s])
+        \* The work the host chose, or that a slot is starting, has no worker:
+        \* the user's stop ends it and cancels it never, so it counts nothing.
+        chosen == phase[s] \in {"gap_next", "starting"}
         \* fx before the user's stop counted what the slot kept.
         keptCounted == IF phase[s] = "ended" /\ Bug # "user_ended_uncounted" THEN kept[s] ELSE {}
-        counted == waiting \cup unread[s] \cup keptCounted
+        chosenCounted == IF chosen /\ Bug = "user_next_counted" THEN startq[s] ELSE {}
+        counted == waiting \cup unread[s] \cup keptCounted \cup chosenCounted
     IN
-    /\ phase[s] \in {"running", "ended"}
+    /\ phase[s] \in {"running", "ended", "gap_next", "starting"}
     /\ stops < MaxStops
     /\ phase' = [phase EXCEPT ![s] = IF @ = "running" THEN "ending_user" ELSE @]
     /\ waitq' = [waitq EXCEPT ![s] = <<>>]
