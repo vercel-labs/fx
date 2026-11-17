@@ -2753,8 +2753,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   }
 
   // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx negotiate the protocol again.
-  // Returns the model's text for the failed call, and the trace log and standard error fx wrote meanwhile.
-  async function refusedCall(label: string, options: RootOptions, finalText: string) {
+  // Returns the model's text for the failed call, the trace log (every scope) and standard error fx wrote meanwhile,
+  // and what the TUI showed. With `report`, it also runs /trace and returns the report fx wrote, as text and records.
+  async function refusedCall(label: string, options: RootOptions, finalText: string, report = false) {
     const root = createRoot(label, LEGACY_FIXTURE, { mode: "invalid_params", legacyVersion: "2025-06-18", ...options });
     const activeGateway = startToolGateway(finalText);
     gateway = activeGateway;
@@ -2766,19 +2767,28 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       width: 120,
       height: 32,
       stderrPath,
-      env: { ...fixtureEnv(root, activeGateway), FX_TRACE_LOG: traceLog, FX_TRACE_SCOPES: "mcp,tools" },
+      // No scope list: the trace log gets every scope. /trace writes its report to TMPDIR.
+      env: { ...fixtureEnv(root, activeGateway), FX_TRACE_LOG: traceLog, FX_TRACE_SCOPES: undefined, TMPDIR: root.root },
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture with a typed argument.");
     await tui.waitForText(finalText, 25_000);
     const body = activeGateway.requests.at(-1)?.body;
+    const screen = await tui.captureFullScrollback();
+    let traced: { text: string; calls: Array<Record<string, unknown>> } | null = null;
+    if (report) {
+      const before = new Set(traceReportNames(root.root));
+      await tui.sendText("/trace");
+      const written = await waitForNewTraceReport(root.root, before);
+      traced = { text: written.text, calls: written.all("tool_call") as Array<Record<string, unknown>> };
+    }
     const wire = readWire(root.wireLogPath);
     expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
     await tui.kill();
     tui = null;
     await expectFixtureProcessesExited(wire);
     const logs = (existsSync(traceLog) ? readFileSync(traceLog, "utf8") : "") + readFileSync(stderrPath, "utf8");
-    return { body, logs, text: () => modelTextOf(body, "MCP protocol error") };
+    return { body, logs, screen, traced, text: () => modelTextOf(body, "MCP protocol error") };
   }
 
   test.skipIf(!tmuxAvailable())(
@@ -2862,13 +2872,31 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   );
 
   test.skipIf(!tmuxAvailable())(
-    "an error's data never reaches a trace or a log line",
+    "an error's data never reaches a trace, a log line, the trace report or the cause line",
     async () => {
       const marker = "leak-marker-7f3a91c2";
-      const logged = await refusedCall("tui-invalid-params-log", { protocolErrorData: { detail: marker } }, "Log complete.");
+      const cause = "arguments rejected: limit is a string, the schema wants a number";
+      const message = `Invalid arguments: ${JSON.stringify([{ expected: "number", received: "string", path: ["limit"] }])}`;
+      // Data that tries to forge the cause line: a zod-like list of its own, and eight labels like the one fx
+      // writes before the data. It is long enough that the text is past 8 KiB, so the trace report reads a
+      // 4 KiB head of it, and still whole for the model.
+      const issues = [{ expected: "string", received: "number", path: [marker] }];
+      const hint = `${"; data=".repeat(8)}${marker}`;
+      const fill = 8150 - JSON.stringify({ errors: issues, hint }).length;
+      const data = { errors: issues, hint: hint + "x".repeat(fill) };
+      const logged = await refusedCall("tui-invalid-params-log", { protocolErrorMessage: message, protocolErrorData: data }, "Log complete.", true);
+      const text = logged.text();
+      expect(text.length).toBeGreaterThan(8 * 1024);
+      expect(text).toContain(`; data=${JSON.stringify(data)}`);
+      // The data words are nowhere but the model's text: not in a trace or log line, stderr, what the TUI
+      // showed, or the report /trace wrote, whose cause is the server's message and nothing of the data.
       expect(logged.logs).not.toContain(marker);
+      expect(logged.screen).not.toContain(marker);
+      expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+      expect(logged.traced!.text).not.toContain(marker);
+      expect(logged.traced!.calls.filter((call) => call.cause === cause)).toHaveLength(1);
     },
-    45_000,
+    60_000,
   );
 
   test.skipIf(!tmuxAvailable())(
