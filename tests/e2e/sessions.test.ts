@@ -432,6 +432,29 @@ test("fx ask records the repository at each turn's start and end only with exper
   }
 }, TIMEOUT);
 
+test("fx ask ignores experimental.workspace_capture in a project's .fx.json", async () => {
+  const fixture = createFixture("fx-v2-capture-project-");
+  fixtureGit(fixture, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "one\n");
+  fixtureGit(fixture, ["add", "a.txt"]);
+  fixtureGit(fixture, ["commit", "-q", "-m", "first"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "two\n");
+  writeFileSync(join(fixture.workspace, ".env"), "SECRET=1\n");
+  // A project file holds committed defaults only; the profile owns this switch.
+  writeFileSync(join(fixture.workspace, ".fx.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+  const gateway = startFakeGateway([fakeGatewayFinalText("CAPTURE_PROJECT_OFF")]);
+  try {
+    const result = await ask(fixture, gateway, ["With a project setting."]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toBe("CAPTURE_PROJECT_OFF");
+    expect(workspaceCaptures(fixture, JSON.parse(result.stdout).session_id)).toEqual([]);
+    expect(existsSync(join(fixture.home, ".fx", "captures"))).toBe(false);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask captures another repository a tool writes in before the write, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-reach-");
   makeCaptureRepository(fixture);

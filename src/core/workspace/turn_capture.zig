@@ -875,6 +875,9 @@ const SessionLookup = struct {
     arena: Allocator,
     ids: std.StringHashMapUnmanaged([]const u8) = .empty,
     loaded: bool = false,
+    /// Whether this lookup has already listed the catalog a second time for
+    /// a key the first listing lacked.
+    relisted: bool = false,
     /// The catalog could not be read: every session counts as present and
     /// open, so nothing is evicted.
     unknown: bool = false,
@@ -902,17 +905,28 @@ const SessionLookup = struct {
         }
     }
 
+    /// The session id for `key`. A key the listing lacks is looked up
+    /// once more in a fresh listing, since another process may have
+    /// made the session after this one listed the catalog.
+    fn idFor(self: *SessionLookup, key: []const u8) ?[]const u8 {
+        self.load();
+        if (self.ids.get(key)) |id| return id;
+        if (self.relisted) return null;
+        self.relisted = true;
+        self.loaded = false;
+        self.load();
+        return self.ids.get(key);
+    }
+
     fn exists(ctx: *anyopaque, key: []const u8) bool {
         const self: *SessionLookup = @ptrCast(@alignCast(ctx));
-        self.load();
-        return self.unknown or self.ids.contains(key);
+        return self.unknown or self.idFor(key) != null;
     }
 
     fn busy(ctx: *anyopaque, key: []const u8) bool {
         const self: *SessionLookup = @ptrCast(@alignCast(ctx));
-        self.load();
+        const id = self.idFor(key) orelse return self.unknown;
         if (self.unknown) return true;
-        const id = self.ids.get(key) orelse return false;
         return self.store.sessionBusy(id);
     }
 };
@@ -1544,6 +1558,36 @@ test "retention finds a subagent's captures under a saved session, never as an o
     try std.testing.expect(sessions.exists(sessions.ctx, try capture_store.sessionKey(arena, child)));
     try std.testing.expect(!lookup.unknown);
     try std.testing.expect(!sessions.exists(sessions.ctx, try capture_store.sessionKey(arena, "1786460757755-gone")));
+}
+
+test "workspace capture maintenance finds a session made after its first catalog listing" {
+    var t: TestSession = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lookup: SessionLookup = .{ .store = &t.store, .arena = arena };
+    const sessions = lookup.view();
+    // The first question finds the session the fixture made, so it lists the
+    // catalog without a miss and leaves the relist for later. A session
+    // reaches the catalog at its first turn (D2), so the fixture runs one.
+    try t.session.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("first") }, .assistant = @constCast("ok") } }, @import("../shared/types.zig").ConversationLanguage.default());
+    try std.testing.expect(!lookup.unknown);
+    try std.testing.expect(sessions.exists(sessions.ctx, try capture_store.sessionKey(arena, t.session.id())));
+
+    var model = "m".*;
+    const later = try Session.create(std.testing.allocator, &t.store, "/w", .ask, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = @import("../shared/types.zig").ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    defer later.close();
+    // Another process made it, and its first turn put it in the catalog
+    // after this one listed it, so only the relist can find it.
+    try later.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("later") }, .assistant = @constCast("ok") } }, @import("../shared/types.zig").ConversationLanguage.default());
+    try std.testing.expect(sessions.exists(sessions.ctx, try capture_store.sessionKey(arena, later.id())));
+    try std.testing.expect(lookup.relisted);
 }
 
 /// A maintenance for the tests below: it waits until `release` or until
