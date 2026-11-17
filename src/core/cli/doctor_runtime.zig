@@ -563,6 +563,7 @@ fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_roo
                 .hook_config_unavailable => .{ "fx could not list the hooks your git config defines", "git config --get-regexp '^hook\\..*\\.command$'" },
                 .unsupported_hook_name => .{ "your git config names a hook with = in its name, which fx cannot turn off", "rename that hook so its name has no =" },
                 .timed_out => .{ "git did not answer fx's checks in time", "run fx doctor again" },
+                .cancelled => .{ "fx's git checks were cancelled", "run fx doctor again" },
             };
             try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = text[0], .fix = text[1] });
         },
