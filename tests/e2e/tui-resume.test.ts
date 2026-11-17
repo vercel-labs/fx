@@ -243,6 +243,24 @@ async function waitForCondition(
   throw new Error(`Timed out waiting for ${description}.`);
 }
 
+/// Waits until session `id`'s log holds its interrupted turn. fx traces
+/// `event=interrupt_persisted` when the agent worker builds that turn, and
+/// saves it a little later, when the app thread handles the worker's finish
+/// event (`finish` in `src/core/agent/runtime/finalization.zig`). The
+/// `turn_interrupted` record is the last one that save writes, after the
+/// turn's items and the blobs they name.
+async function waitForSavedInterruptedTurn(
+  home: string,
+  id: string,
+  timeout = TIMEOUT,
+): Promise<void> {
+  await waitForCondition(
+    () => logLines(home, id).some((line) => line.kind === "turn_interrupted"),
+    `session ${id} to save its interrupted turn (a turn_interrupted record in its log)`,
+    timeout,
+  );
+}
+
 async function waitForPersistedSessionMarker(
   home: string,
   marker: string,
@@ -2385,6 +2403,7 @@ while :; do :; done
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       const replayName = replays[0]!.name;
@@ -2592,6 +2611,7 @@ while :; do :; done
       expect(countOccurrences(compact, headMarker)).toBe(0);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
+      await waitForSavedInterruptedTurn(home, sessionId, timeout);
       const replays = commandReplays(home, sessionId);
       expect(replays).toHaveLength(1);
       expect(statSync(replays[0]!.path).size).toBeGreaterThan(0);
