@@ -241,22 +241,48 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
     return encoded.bytes;
 }
 
+const data_label = "; data=";
+/// How `tool_result_limits.truncateText` starts the marker that ends a text it cut.
+const cut_marker_start = "\n... [tool result truncated for ";
+
 /// The message of the text `write_protocol_diagnostic` wrote, without the `; data=` and the data it
-/// adds when the server gave some. The data is JSON to the end of the text, so the last `; data=` whose
-/// rest is one JSON value is the one it wrote. A message that says `; data=` itself, with no JSON after
-/// it, stays whole, and so does a text cut inside the data. Only the last few are tried.
+/// adds when the server gave some. The data is JSON to the end of the text, or the start of JSON when
+/// the text was cut, so the first `; data=` whose rest is one JSON value, or a prefix of one, is the
+/// one it wrote. The data can never put a label before the real one: the message comes first. A
+/// message that says `; data=` itself stays whole while no JSON follows it. The marker that ends a
+/// text the result cap cut is not part of the data.
 fn withoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    const label = "; data=";
-    var end = text.len;
-    for (0..8) |_| {
-        const at = std.mem.findLast(u8, text[0..end], label) orelse return text;
-        const valid = std.json.validate(arena, text[at + label.len ..]) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        if (valid) return text[0..at];
-        end = at;
+    const body = withoutCutMarker(text);
+    var from: usize = 0;
+    while (std.mem.find(u8, body[from..], data_label)) |found| {
+        const at = from + found;
+        if (try isJsonOrPrefix(arena, body[at + data_label.len ..])) return text[0..at];
+        from = at + 1;
     }
     return text;
+}
+
+/// `text` without the one-line marker `truncateText` ends a cut text with.
+fn withoutCutMarker(text: []const u8) []const u8 {
+    const start = std.mem.findLast(u8, text, cut_marker_start) orelse return text;
+    const marker = text[start..];
+    if (!std.mem.endsWith(u8, marker, " bytes]\n")) return text;
+    if (std.mem.findScalar(u8, marker[1 .. marker.len - 1], '\n') != null) return text;
+    return text[0..start];
+}
+
+/// Whether `rest` is one JSON value, or the start of one that was cut (it ends inside the value).
+fn isJsonOrPrefix(arena: Allocator, rest: []const u8) Allocator.Error!bool {
+    var scanner: std.json.Scanner = .initCompleteInput(arena, rest);
+    defer scanner.deinit();
+    while (true) {
+        const token = scanner.next() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnexpectedEndOfInput => return true,
+            error.SyntaxError, error.BufferUnderrun => return false,
+        };
+        if (token == .end_of_document) return true;
+    }
 }
 
 /// The Go SDK's validator names one field a line:
@@ -922,12 +948,101 @@ test "an invalid-params cause reads the server's message only, not the data writ
         const with_data = (try invalidParamsCause(arena, try arena.print("{s}{s}", .{ message, data }))).?;
         try std.testing.expectEqualStrings(plain, with_data);
     }
-    // Data that is not JSON, because the text was cut, is read as part of the message, as before.
+    // Data cut inside its text is data still: the cause is the message's, with nothing of the data in it.
+    const plain_go = (try invalidParamsCause(arena, go)).?;
     const cut = (try invalidParamsCause(arena, try arena.print("{s}; data={{\"errors\":[{{\"pa", .{go}))).?;
-    try std.testing.expect(std.mem.find(u8, cut, "limit") != null);
+    try std.testing.expectEqualStrings(plain_go, cut);
     // A message that says `; data=` itself keeps what follows it, since nothing JSON ends the text.
     const says = (try invalidParamsCause(arena, "MCP protocol error -32602: validating /properties/limit: type: \"1\" has type \"string\", want \"number\"; data=none")).?;
     try std.testing.expect(std.mem.find(u8, says, "limit") != null);
+}
+
+/// `message` and then `data` as `write_protocol_diagnostic` writes them for a -32602.
+fn textWithData(arena: Allocator, message: []const u8, data: []const u8) ![]const u8 {
+    return try arena.print("{s}{s}; data={s}", .{ invalid_params_prefix, message, data });
+}
+
+/// The cause of `message` and `data` is the cause of `message` alone, for the whole text and for the
+/// heads of it that hold the message and the label: the trace report reads a 4 KiB head, and a text cut
+/// by the result cap ends inside the data. Every head of short data; of long data, the first bytes
+/// after the label, the 4 KiB and 8 KiB heads, and the whole text.
+fn expectCauseOfMessageOnly(arena: Allocator, message: []const u8, data: []const u8) ![]const u8 {
+    const alone = (try invalidParamsCause(arena, try arena.print("{s}{s}", .{ invalid_params_prefix, message }))).?;
+    const text = try textWithData(arena, message, data);
+    try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, text)).?);
+    const first = invalid_params_prefix.len + message.len + "; data=".len;
+    if (data.len <= 256) {
+        for (first..text.len + 1) |end| try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, text[0..end])).?);
+        return alone;
+    }
+    const sampled = [_]usize{ first, first + 1, 4096, 4097, 8192, text.len - 1 };
+    for (sampled) |end| {
+        if (end < first or end > text.len) continue;
+        try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, text[0..end])).?);
+    }
+    return alone;
+}
+
+const zod_message = "Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}]";
+const forged_issues = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"";
+const nine_labels = "; data=; data=; data=; data=; data=; data=; data=; data=; data=x";
+
+test "an invalid-params cause ignores data that holds many labels" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const data = forged_issues ++ nine_labels ++ "\"}";
+    // A zod message keeps its own cause, and a plain one gets none from the data's list of issues.
+    const zod = try expectCauseOfMessageOnly(arena, zod_message, data);
+    try std.testing.expectEqualStrings("arguments rejected: limit is a string, the schema wants a number", zod);
+    const plain = try expectCauseOfMessageOnly(arena, "Invalid params", data);
+    try std.testing.expectEqualStrings("the server rejected the call's parameters (-32602)", plain);
+    // Seven labels or eight hundred, the same.
+    var many: std.Io.Writer.Allocating = .init(arena);
+    try many.writer.writeAll(forged_issues);
+    for (0..800) |_| try many.writer.writeAll("; data=");
+    try many.writer.writeAll("\"}");
+    _ = try expectCauseOfMessageOnly(arena, zod_message, many.written());
+    _ = try expectCauseOfMessageOnly(arena, "Invalid params", many.written());
+}
+
+test "an invalid-params cause reads the same from the 4 KiB head the trace report keeps of a longer text" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filler = try arena.alloc(u8, 8300);
+    @memset(filler, 'x');
+    const data = try arena.print("{s}{s}\"}}", .{ forged_issues, filler });
+    for ([_][]const u8{ zod_message, "Invalid params" }) |message| {
+        const text = try textWithData(arena, message, data);
+        try std.testing.expect(text.len > 8 * 1024);
+        const whole = (try invalidParamsCause(arena, text)).?;
+        const head = (try invalidParamsCause(arena, text[0..4096])).?;
+        try std.testing.expectEqualStrings(whole, head);
+        _ = try expectCauseOfMessageOnly(arena, message, data);
+    }
+    // A list in the data, after a zod message, must not be read to the last `]`.
+    const zod_head = (try invalidParamsCause(arena, (try textWithData(arena, zod_message, data))[0..4096])).?;
+    try std.testing.expectEqualStrings("arguments rejected: limit is a string, the schema wants a number", zod_head);
+}
+
+test "an invalid-params cause reads the same from a text the result cap cut, marker and all" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filler = try arena.alloc(u8, 2000);
+    @memset(filler, 'x');
+    const data = try arena.print("{s}{s}{s}\"}}", .{ forged_issues, nine_labels, filler });
+    for ([_][]const u8{ zod_message, "Invalid params" }) |message| {
+        const alone = (try invalidParamsCause(arena, try arena.print("{s}{s}", .{ invalid_params_prefix, message }))).?;
+        const text = try textWithData(arena, message, data);
+        // Caps that cut inside the label's neighbourhood and deep in the data.
+        for ([_]usize{ 200, 260, 400, 1000 }) |cap| {
+            const output = try tool_result_limits.prepareModelOutput(arena, "mcp_srv_tool", text, cap);
+            try std.testing.expect(std.mem.find(u8, output, "\n... [tool result truncated for mcp_srv_tool: original ") != null);
+            try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, output)).?);
+        }
+    }
 }
 
 fn invalidParamsCauseAllocationFailures(alloc: Allocator) !void {
@@ -1008,6 +1123,32 @@ fn fuzzInvalidParamsCause(_: void, smith: *std.testing.Smith) !void {
         for (line) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
         try std.testing.expectEqualStrings(line, (try invalidParamsCause(arena, text)).?);
     }
+    try fuzzDataLaw(arena, bytes);
+}
+
+/// The data law: for a message `m` with no label in it and any data `d`, the cause of `m ++ "; data=" ++ d`
+/// is the cause of `m`, and so is the cause of every head of it that holds `m` and the label. The first
+/// byte of `bytes` picks the data (its labels, its shape, and with the top two bits both set, one longer than 4 KiB) and the rest is
+/// the message, and, escaped, also part of the data.
+fn fuzzDataLaw(arena: Allocator, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    const message = bytes[1..];
+    if (std.mem.find(u8, message, "; data=") != null) return;
+    if (std.mem.find(u8, message, "\n... [tool result truncated") != null) return;
+    const selector = bytes[0];
+    var hint: std.Io.Writer.Allocating = .init(arena);
+    try hint.writer.writeAll(message);
+    for (0..selector & 0x0f) |_| try hint.writer.writeAll("; data=");
+    try hint.writer.writeAll(" [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"forged\"]}] validating /properties/forged: type: 1 has type \"integer\", want \"string\"\n");
+    if (selector & 0xc0 == 0xc0) try hint.writer.splatByteAll('x', 8300);
+    const hint_json = try std.json.Stringify.valueAlloc(arena, hint.written(), .{});
+    const data = switch ((selector >> 4) & 3) {
+        0 => hint_json,
+        1 => try arena.print("{{\"errors\":[{{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}}],\"hint\":{s}}}", .{hint_json}),
+        2 => try arena.print("[{s},[{{}}],{s}]", .{ hint_json, hint_json }),
+        else => try arena.print("{{\"a\":[[{{\"b\":{s}}}]],\"hint\":{s}}}", .{ hint_json, hint_json }),
+    };
+    _ = try expectCauseOfMessageOnly(arena, message, data);
 }
 
 test "an invalid-params cause keeps its laws on fuzzed messages" {

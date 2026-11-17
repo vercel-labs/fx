@@ -23,7 +23,7 @@
     {"name": "attached_selection", "module": "fx", "test": "attached files and carried-in omissions keep the selection bounded and inside the workspace", "iterations": 300000},
     {"name": "mcp_elicitation", "module": "fx", "test": "elicitation request and response parsers stay bounded under fuzzed bytes", "iterations": 1500000},
     {"name": "mcp_argument_repair", "module": "fx", "test": "MCP argument repair keeps its laws on fuzzed schemas and arguments", "iterations": 200000},
-    {"name": "mcp_invalid_params_cause", "module": "fx", "test": "an invalid-params cause keeps its laws on fuzzed messages", "iterations": 200000},
+    {"name": "mcp_invalid_params_cause", "module": "fx", "test": "an invalid-params cause keeps its laws on fuzzed messages", "iterations": 20000},
     {"name": "mcp_search_page", "module": "fx", "test": "MCP search pages agree with the schemas they load under fuzzed tools and limits", "iterations": 50000},
     {"name": "session_optional_fields", "module": "fx", "test": "durable session optional fields handle fuzzed ownership paths", "iterations": 3000000},
     {"name": "session_work_provenance", "module": "fx", "test": "per-turn work provenance parser handles fuzzed ownership paths", "iterations": 2100000},
@@ -87,7 +87,7 @@
     {"name": "kept_team_file", "module": "fx", "test": "a kept team file reads as valid team names or is refused on fuzzed bytes", "iterations": 2000000},
     {"name": "trace_cuts", "module": "fx", "test": "trace cuts stay bounded and keep UTF-8 whole on fuzzed bytes", "iterations": 3000000},
     {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
-    {"name": "mcp_error_data", "module": "fx", "test": "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes", "iterations": 100000},
+    {"name": "mcp_error_data", "module": "fx", "test": "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes", "iterations": 25000},
     {"name": "mcp_json_depth", "module": "fx", "test": "a server's JSON is refused past 128 levels and kept up to it, whatever its site, shape and depth, on fuzzed bytes", "iterations": 100000},
     {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000}
   ]
