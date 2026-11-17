@@ -8560,6 +8560,45 @@ test "a running search or edit without the argument its row needs waits in its t
     }
 }
 
+test "a subagent call whose arguments are still coming waits in the latest subagent row" {
+    const alloc = std.testing.allocator;
+    // After a status check, a call with no action yet shows no row of its own.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● checked reviewer\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Managing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"act") },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("after status:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
+        try std.testing.expect(std.mem.findScalar(u8, std.mem.trim(u8, text, "\n"), '\n') == null);
+    }
+    // After a message, with a read after it, the call waits in the message's
+    // row, not on a row of its own at the end.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Managing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
+            .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("after message:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
+        try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
+    }
+}
+
 test "a command that ran after one still running keeps its own row and no check mark" {
     const alloc = std.testing.allocator;
     var background = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sleep 25\"}", 0, "");
@@ -8720,43 +8759,4 @@ test "a failed command's reason is the error it reports, not code it printed" {
     errdefer std.debug.print("group:\n{s}\n", .{text});
     try std.testing.expect(std.mem.find(u8, text, "· sed: 1:") != null);
     try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
-}
-
-test "a subagent call whose arguments are still coming waits in the latest subagent row" {
-    const alloc = std.testing.allocator;
-    // After a status check, a call with no action yet shows no row of its own.
-    {
-        const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● checked reviewer\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Managing\n", .class = .tool_status } },
-        };
-        const details = [_]ToolDetailRecord{
-            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .outcome = .completed },
-            .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"act") },
-        };
-        const text = try groupTextForTest(alloc, &entries, &details);
-        defer alloc.free(text);
-        errdefer std.debug.print("after status:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
-        try std.testing.expect(std.mem.findScalar(u8, std.mem.trim(u8, text, "\n"), '\n') == null);
-    }
-    // After a message, with a read after it, the call waits in the message's
-    // row, not on a row of its own at the end.
-    {
-        const entries = [_]TranscriptEntry{
-            .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
-            .{ .raw_bytes = .{ .id = 3, .bytes = "● Managing\n", .class = .tool_status } },
-        };
-        const details = [_]ToolDetailRecord{
-            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}"), .outcome = .completed },
-            .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
-            .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
-        };
-        const text = try groupTextForTest(alloc, &entries, &details);
-        defer alloc.free(text);
-        errdefer std.debug.print("after message:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
-        try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
-    }
 }
