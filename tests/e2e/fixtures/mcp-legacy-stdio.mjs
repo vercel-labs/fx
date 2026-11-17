@@ -485,10 +485,12 @@ function handle(message) {
         id: message.id,
         error: {
           code: Number(process.env.FX_MCP_PROTOCOL_ERROR_CODE ?? -32602),
-          message: 'validating "arguments": validating root: validating /properties/limit: ' +
-            'type: "40" has type "string", want "number"\n\n' +
-            'Full input schema for tool "echo":\n' +
-            '{"type":"object","properties":{"limit":{"type":"number"}}}',
+          // FX_MCP_PROTOCOL_ERROR_MESSAGE replaces the whole message.
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            ('validating "arguments": validating root: validating /properties/limit: ' +
+              'type: "40" has type "string", want "number"\n\n' +
+              'Full input schema for tool "echo":\n' +
+              '{"type":"object","properties":{"limit":{"type":"number"}}}'),
           ...(dataBytes
             ? { data: { detail: "d".repeat(Number(dataBytes)) } }
             : dataText

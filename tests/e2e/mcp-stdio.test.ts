@@ -2775,12 +2775,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForText(finalText, 25_000);
     const body = activeGateway.requests.at(-1)?.body;
     const screen = await tui.captureFullScrollback();
-    let traced: { text: string; calls: Array<Record<string, unknown>> } | null = null;
+    let traced: { records: Array<Record<string, unknown>>; calls: Array<Record<string, unknown>> } | null = null;
     if (report) {
       const before = new Set(traceReportNames(root.root));
       await tui.sendText("/trace");
       const written = await waitForNewTraceReport(root.root, before);
-      traced = { text: written.text, calls: written.all("tool_call") as Array<Record<string, unknown>> };
+      traced = { records: written.records, calls: written.all("tool_call") as Array<Record<string, unknown>> };
     }
     const wire = readWire(root.wireLogPath);
     expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
@@ -2875,8 +2875,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     "an error's data never reaches a trace, a log line, the trace report or the cause line",
     async () => {
       const marker = "leak-marker-7f3a91c2";
-      const cause = "arguments rejected: limit is a string, the schema wants a number";
-      const message = `Invalid arguments: ${JSON.stringify([{ expected: "number", received: "string", path: ["limit"] }])}`;
       // Data that tries to forge the cause line: a zod-like list of its own, and eight labels like the one fx
       // writes before the data. It is long enough that the text is past 8 KiB, so the trace report reads a
       // 4 KiB head of it, and still whole for the model.
@@ -2884,19 +2882,37 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       const hint = `${"; data=".repeat(8)}${marker}`;
       const fill = 8150 - JSON.stringify({ errors: issues, hint }).length;
       const data = { errors: issues, hint: hint + "x".repeat(fill) };
-      const logged = await refusedCall("tui-invalid-params-log", { protocolErrorMessage: message, protocolErrorData: data }, "Log complete.", true);
-      const text = logged.text();
-      expect(text.length).toBeGreaterThan(8 * 1024);
-      expect(text).toContain(`; data=${JSON.stringify(data)}`);
-      // The data words are nowhere but the model's text: not in a trace or log line, stderr, what the TUI
-      // showed, or the report /trace wrote, whose cause is the server's message and nothing of the data.
-      expect(logged.logs).not.toContain(marker);
-      expect(logged.screen).not.toContain(marker);
-      expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
-      expect(logged.traced!.text).not.toContain(marker);
-      expect(logged.traced!.calls.filter((call) => call.cause === cause)).toHaveLength(1);
+      const cases = [
+        // A zod message keeps its own cause. The data's list used to take it in the 4 KiB head the report reads.
+        ["zod", `Invalid arguments: ${JSON.stringify([{ expected: "number", received: "string", path: ["limit"] }])}`, "arguments rejected: limit is a string, the schema wants a number"],
+        // A plain message has no cause of its own. The data's list used to give it one.
+        ["plain", "Invalid params", "the server rejected the call's parameters (-32602)"],
+      ] as const;
+      for (const [kind, message, cause] of cases) {
+        const logged = await refusedCall(`tui-invalid-params-log-${kind}`, { protocolErrorMessage: message, protocolErrorData: data }, `Log ${kind} complete.`, true);
+        const text = logged.text();
+        expect(text.length).toBeGreaterThan(8 * 1024);
+        expect(text).toContain(`; data=${JSON.stringify(data)}`);
+        // The data words are nowhere but the model's text: not in a trace or log line, stderr, or what the TUI
+        // showed. The report /trace wrote holds the failed call's result, which is that text, and the word is in
+        // no other field of it: the cause is the server's message's and nothing of the data.
+        expect({ kind, found: logged.logs.includes(marker) }).toEqual({ kind, found: false });
+        expect({ kind, found: logged.screen.includes(marker) }).toEqual({ kind, found: false });
+        expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+        const reportFields: string[] = [];
+        const walk = (value: unknown, path: string) => {
+          if (typeof value === "string") {
+            if (value.includes(marker)) reportFields.push(path);
+          } else if (Array.isArray(value)) value.forEach((item) => walk(item, path));
+          else if (value && typeof value === "object") for (const [key, item] of Object.entries(value)) walk(item, `${path}.${key}`);
+        };
+        for (const record of logged.traced!.records) walk(record, String(record.type));
+        expect(reportFields.length).toBeGreaterThan(0);
+        expect(reportFields.every((field) => field === "tool_call.result" || field === "failed_tool_call.result")).toBe(true);
+        expect({ kind, causes: logged.traced!.calls.filter((call) => call.cause === cause).length }).toEqual({ kind, causes: 1 });
+      }
     },
-    60_000,
+    120_000,
   );
 
   test.skipIf(!tmuxAvailable())(
