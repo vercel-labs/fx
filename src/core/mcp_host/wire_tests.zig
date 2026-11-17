@@ -186,8 +186,8 @@ const member_values = [_][]const u8{ "true", "false", "7", "\"s\"", "{\"a\":[1,{
 
 /// Code points that make a name look like another one without being it: NUL,
 /// a letter that is none of the asked names', a dotless i, an accent, an
-/// astral code point.
-const member_marks = [_]u21{ 0x00, 'x', 0x131, 0xe9, 0x1f600 };
+/// astral code point, and the four that JSON can write as a short escape.
+const member_marks = [_]u21{ 0x00, 'x', 0x131, 0xe9, 0x1f600, '/', '"', '\\', '\n' };
 
 fn appendMemberHex(alloc: Allocator, out: *std.ArrayList(u8), unit: u16, upper: bool) !void {
     const digits = if (upper) "0123456789ABCDEF" else "0123456789abcdef";
@@ -199,14 +199,34 @@ fn appendMemberHex(alloc: Allocator, out: *std.ArrayList(u8), unit: u16, upper: 
     }
 }
 
+/// The letter of the short escape JSON has for `point`, if it has one.
+fn shortEscape(point: u21) ?u8 {
+    return switch (point) {
+        '"' => '"',
+        '\\' => '\\',
+        '/' => '/',
+        0x08 => 'b',
+        0x0c => 'f',
+        '\n' => 'n',
+        '\r' => 'r',
+        '\t' => 't',
+        else => null,
+    };
+}
+
 /// `points` as a JSON string token. A code point is written plainly when JSON
-/// allows it and the style says so, otherwise as a `\uXXXX` escape in either
-/// case of hex digit, or as a surrogate pair above U+FFFF.
+/// allows it and the style says so, as its short escape (`\/`, `\"`, `\\`, `\n`)
+/// when it has one and the style says so, otherwise as a `\uXXXX` escape in
+/// either case of hex digit, or as a surrogate pair above U+FFFF.
 fn appendMemberName(alloc: Allocator, out: *std.ArrayList(u8), points: []const u21, s: *MemberScript) !void {
     try out.append(alloc, '"');
     for (points) |point| {
         const style = s.next() % 4;
         const plain_ok = point >= 0x20 and point != '"' and point != '\\';
+        if (style == 3) if (shortEscape(point)) |letter| {
+            try out.appendSlice(alloc, &.{ '\\', letter });
+            continue;
+        };
         if (style == 0 and plain_ok) {
             var encoded: [4]u8 = undefined;
             const n = std.unicode.utf8Encode(point, &encoded) catch unreachable;
@@ -242,6 +262,7 @@ fn fuzzMemberNames(_: void, smith: *testing.Smith) !void {
     var counts: [member_names.len]u8 = @splat(0);
     var wanted: [member_names.len]?[]const u8 = @splat(null);
     const members = script.next() % 6 + 1;
+    var key_spans: [6][2]usize = undefined;
     for (0..members) |position| {
         var points: [16]u21 = undefined;
         var n: usize = 0;
@@ -285,7 +306,9 @@ fn fuzzMemberNames(_: void, smith: *testing.Smith) !void {
         const value = member_values[script.next() % member_values.len];
         if (position > 0) try object.append(arena, ',');
         try object.appendSlice(arena, fuzz_spaces[script.next() % fuzz_spaces.len]);
+        const key_start = object.items.len;
         try appendMemberName(arena, &object, points[0..n], &script);
+        key_spans[position] = .{ key_start, object.items.len };
         try object.append(arena, ':');
         try object.appendSlice(arena, value);
         if (asked) |i| {
@@ -297,6 +320,19 @@ fn fuzzMemberNames(_: void, smith: *testing.Smith) !void {
 
     var duplicated = false;
     for (counts) |c| duplicated = duplicated or c > 1;
+
+    // The law for the two-token form that `mrtr.zig` uses: two keys are one name exactly when
+    // std.json decodes them to the same text, however each is spelled.
+    for (0..members) |i| for (i + 1..members) |j| {
+        const a = object.items[key_spans[i][0]..key_spans[i][1]];
+        const b = object.items[key_spans[j][0]..key_spans[j][1]];
+        const text_a = try std.json.parseFromSliceLeaky([]const u8, arena, a, .{});
+        const text_b = try std.json.parseFromSliceLeaky([]const u8, arena, b, .{});
+        const same = std.mem.eql(u8, text_a, text_b);
+        if (wire.sameString(a, b) != same) {
+            return memberDisagrees(object.items, "says sameString({s}, {s}) is {s}, and std.json decodes the keys {s}", .{ a, b, if (same) "false" else "true", if (same) "alike" else "apart" });
+        }
+    };
 
     var found: [member_names.len]?[]const u8 = undefined;
     const engine: wire.DecodeError!void = wire.objectFields(object.items, &member_names, &found);
