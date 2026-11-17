@@ -231,11 +231,16 @@ pub const Snapshot = struct {
 /// profile set (`started_with`) takes that, whatever the profile files say now;
 /// only the profile's prompt is read again, by name. A child saved with only a
 /// name loads it the first time its authority is resolved, from the fx home
-/// and the current directory, as `fx --profile` does.
+/// and the session's workspace root, as `fx --profile` does in the directory
+/// it runs in.
 pub const ProfileCache = struct {
+    /// Where profiles load from: the fx home, and the workspace root of the
+    /// session whose children these are, which the child registry holds
+    /// (`child_state.V2Children.workspace`). Both borrowed.
+    pub const LoadRoots = struct { home: ?[]const u8, workspace_root: ?[]const u8 };
+
     alloc: Allocator,
-    /// Where to look instead of the fx home and the current directory.
-    roots: ?struct { home: ?[]const u8, workspace_root: ?[]const u8 } = null,
+    roots: LoadRoots,
     mutex: std.Io.Mutex = .init,
     /// Keyed by child id, owned. Entries live until `deinit`.
     entries: std.array_hash_map.String(*profiles.Held) = .empty,
@@ -253,16 +258,12 @@ pub const ProfileCache = struct {
         const held = try self.alloc.create(profiles.Held);
         errdefer self.alloc.destroy(held);
         held.* = .{};
-        const process_root = if (self.roots == null) io_mod.realpathAlloc(self.alloc, ".") catch null else null;
-        defer if (process_root) |root| self.alloc.free(root);
-        const home = if (self.roots) |roots| roots.home else io_mod.homeDir();
-        const workspace_root = if (self.roots) |roots| roots.workspace_root else process_root;
         if (saved) |facts| {
-            try self.restore(held, child_id, home, workspace_root, name, facts);
+            try self.restore(held, child_id, self.roots.home, self.roots.workspace_root, name, facts);
         } else {
             var failure: ?[]u8 = null;
             defer if (failure) |message| self.alloc.free(message);
-            held.replace(self.alloc, home, workspace_root, name, "", &failure) catch |err| {
+            held.replace(self.alloc, self.roots.home, self.roots.workspace_root, name, "", &failure) catch |err| {
                 const reason = failure orelse @errorName(err);
                 debug_trace.eventf("profile", "profile_failed", .{}, "child={s} name={s} reason={s}", .{ child_id, name, reason });
                 if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -282,8 +283,8 @@ pub const ProfileCache = struct {
     /// Builds into `held` the profile `saved` describes for `name`. Its prompt
     /// is not saved: it is read again by name from the folder of the saved
     /// source alone, the fx home for a profile of the user's own and the
-    /// folder fx runs in for a repository's, so a profile of the same name in
-    /// the other can neither take the prompt away nor supply its own.
+    /// session's workspace root for a repository's, so a profile of the same
+    /// name in the other can neither take the prompt away nor supply its own.
     /// Without the file there, or for a built-in profile, the child has no
     /// profile prompt.
     fn restore(
