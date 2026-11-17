@@ -739,6 +739,27 @@ pub fn repositoryFacts(arena: Allocator, ready: Ready, cwd: []const u8, limits: 
     return repositoryFactsWith(arena, ready, cwd, limits, &base);
 }
 
+/// Which of `paths` the tree of commit `head` holds, read with one
+/// `ls-tree` through the read-only route; null when git could not
+/// answer. Paths match literally, never as patterns. Memory belongs to
+/// `arena`.
+pub fn pathsInTree(arena: Allocator, ready: Ready, cwd: []const u8, head: []const u8, paths: []const []const u8, limits: Limits) Allocator.Error!?[]const []const u8 {
+    if (paths.len == 0) return &.{};
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendPrelude(arena, &argv, ready);
+    try argv.appendSlice(arena, &.{ "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", "--full-tree", head, "--" });
+    try argv.appendSlice(arena, paths);
+    var base = try environment(arena);
+    const listing = switch (try runBounded(arena, argv.items, cwd, &base, null, null, limits)) {
+        .ok => |stdout| stdout,
+        .failed => return null,
+    };
+    var found: std.ArrayList([]const u8) = .empty;
+    var names = std.mem.splitScalar(u8, listing, 0);
+    while (names.next()) |name| if (name.len > 0) try found.append(arena, name);
+    return found.items;
+}
+
 /// The failure kinds every git run shares; `otherwise` names the step that
 /// failed for the rest.
 fn factsFailure(failure: Failure, otherwise: FactsFailure) FactsResult {
@@ -2169,6 +2190,32 @@ test "safe git reads repository facts as data, without running its programs" {
     env = try repo.childEnvironment(.{ .safe = null });
     const empty = try expectFacts(try repositoryFactsWith(repo.arena, try repo.ready(unborn), unborn, .{}, &env));
     try std.testing.expect(empty.head == null);
+}
+
+test "safe git lists which paths a commit's tree holds, matching them literally" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    // `a*` holds a wildcard, so a pattern match would also find `ab`.
+    try repo.write("repo/a*", "star\n");
+    try repo.write("repo/ab", "ab\n");
+    try repo.write("repo/d/.env", "SECRET=1\n");
+    try repo.plain(repo.repo, &.{ "add", "-A" });
+    try repo.commit(repo.repo);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const ready = try repo.ready(repo.repo);
+    const found = (try pathsInTree(repo.arena, ready, repo.repo, head, &.{ "a*", "d/.env", "missing" }, .{})).?;
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    for ([_][]const u8{ "a*", "d/.env" }) |path| {
+        var listed = false;
+        for (found) |name| listed = listed or std.mem.eql(u8, name, path);
+        try std.testing.expect(listed);
+    }
+    for (found) |name| try std.testing.expect(!std.mem.eql(u8, name, "ab"));
+    const none = (try pathsInTree(repo.arena, ready, repo.repo, head, &.{}, .{})).?;
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 fn expectFacts(result: FactsResult) !RepositoryFacts {
