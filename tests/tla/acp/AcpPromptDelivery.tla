@@ -16,15 +16,15 @@
 (*    -32600.                                                             *)
 (*  - A steer holds text only; one with an image fails with -32602. A     *)
 (*    steer that arrives while the model streams a reply cuts the reply   *)
-(*    short, and the turn takes it in its next request (X20). One that    *)
+(*    short, and the turn takes it in its next request. One that          *)
 (*    arrives between requests waits, and the turn takes it at its next   *)
 (*    request: after the running tool, or, when the reply has ended, by   *)
-(*    going on instead of ending (X22).                                   *)
+(*    going on instead of ending.                                         *)
 (*  - A steer that arrives after the turn's last check for steers, while  *)
 (*    it finishes, waits until the turn stops taking input; it then runs  *)
-(*    as the next turn (X19). Steers that arrive after that, and every    *)
+(*    as the next turn. Steers that arrive after that, and every          *)
 (*    waiting steer when the client stops the turn, run together as the   *)
-(*    next turn, before any queued prompt (Q39, Q40).                     *)
+(*    next turn, before any queued prompt.                                *)
 (*  - A queued prompt waits and runs as a turn of its own, in the order   *)
 (*    fx received them.                                                   *)
 (*  - $/cancel_request withdraws a steer or queued prompt that hasn't run *)
@@ -202,7 +202,7 @@ ToolEnd ==
     /\ UNCHANGED <<sent, running, late, queue, answers, started, tools, cancels, closed>>
 
 \* The reply asks for nothing more. With steers waiting, the turn goes on and
-\* takes them (X22), today too. Otherwise the turn finishes.
+\* takes them, today too. Otherwise the turn finishes.
 ReplyEnd ==
     /\ running /\ phase = "decide"
     /\ IF waiting # <<>>
@@ -215,7 +215,7 @@ ReplyEnd ==
     /\ UNCHANGED <<sent, running, late, queue, answers, started, tools, cancels, closed>>
 
 \* The finishing turn stops taking input. A steer that arrived while it
-\* finished runs as the next turn (X19); today it fails with -32600.
+\* finished runs as the next turn; today it fails with -32600.
 StopInput ==
     /\ running /\ phase = "finishing"
     /\ phase' = "closing"
@@ -235,7 +235,7 @@ Finish ==
     /\ UNCHANGED <<sent, waiting, tools, cancels, closed>>
 
 \* session/cancel stops the running turn. Under the rules its waiting steers
-\* run next with the late ones (Q39, Q40); today they fail with -32800.
+\* run next with the late ones; today they fail with -32800.
 Cancel ==
     /\ running /\ phase # "closing" /\ cancels < MaxCancels
     /\ cancels' = cancels + 1
@@ -316,10 +316,10 @@ AtMostOnce == \A m \in Msgs : placed[m] <= 1
 \* A prompt's answer, once given, never changes.
 AnsweredOnce == [][\A m \in Msgs : answers[m].kind # "none" => answers'[m] = answers[m]]_vars
 
-\* While the model streams a reply, no steer waits: it cut the reply short (X20).
+\* While the model streams a reply, no steer waits: it cut the reply short.
 NoSteerWaitsOnReply == (running /\ phase = "gen") => waiting = <<>>
 
-\* A reply never ends a turn while steers wait (X22).
+\* A reply never ends a turn while steers wait.
 ReplyEndContinues == [][(running /\ phase = "decide" /\ phase' = "finishing") => waiting = <<>>]_vars
 
 \* When nothing is pending, every prompt fx received has its answer, and no
@@ -331,7 +331,7 @@ NothingLost ==
             /\ answers[m].kind # "none"
             /\ (Kind(m) \in {"steer", "queue"} /\ m # "I" /\ answers[m].kind = "err") => answers[m].code = -32800
 
-\* A steer's delivery is where it ran; no steer is dropped (Q39).
+\* A steer's delivery is where it ran; no steer is dropped.
 DeliveryValues == \A m \in Msgs : answers[m].delivery \in {"", "none", "absorbed", "next_turn"}
 
 \* A stop fails no prompt: the steers it finds waiting run next (Q39).
@@ -345,7 +345,7 @@ QueuedInOrder ==
         (i < j /\ Kind(started[i]) = "queue" /\ Kind(started[j]) = "queue") =>
             SentIndex(started[i]) < SentIndex(started[j])
 
-\* When a turn starts while late steers wait, it starts with all of them (Q40),
+\* When a turn starts while late steers wait, it starts with all of them,
 \* before any queued prompt.
 LateRunTogether ==
     [][(Len(started') > Len(started) /\ late # <<>>) =>
