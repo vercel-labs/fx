@@ -11231,7 +11231,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       releaseWorker();
       expect(run.code).toBe(0);
       expect(results.refusal_busy).toBe(
-        '{"ok":false,"result":"The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.","error_code":"child_busy"}',
+        '{"ok":false,"result":"The subagent is busy, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.","error_code":"child_busy"}',
       );
       expect(results.refusal_stop).toBe(
         '{"ok":false,"result":"No open subagent is named \\"ghost\\". Open subagents: worker.","error_code":"child_unavailable"}',

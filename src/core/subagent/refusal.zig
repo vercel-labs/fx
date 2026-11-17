@@ -85,7 +85,7 @@ pub const Refusal = union(enum) {
                 .unidentified => "fx could not tell which agent made this call, so it was refused. Continue without it.",
             }),
             .wait_unavailable => try writer.writeAll("wait is not available here. A subagent's report arrives on its own when its work ends, so keep working or end your turn."),
-            .child_busy => try writer.writeAll("The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them."),
+            .child_busy => try writer.writeAll("The subagent is busy, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them."),
             .override_after_create => try writer.writeAll("model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation."),
             .child_closing => try writer.writeAll("The subagent is being closed and takes no message. Once it is gone, a message to its name starts a new one, or use another name."),
             .child_unavailable => |unavailable| switch (unavailable) {
@@ -376,7 +376,7 @@ test "a refusal says what to do next for the case it names" {
     const busy: Refusal = .child_busy;
     out.clearRetainingCapacity();
     try busy.sentence(&out.writer);
-    try std.testing.expectEqualStrings("The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.", out.written());
+    try std.testing.expectEqualStrings("The subagent is busy, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.", out.written());
 
     out.clearRetainingCapacity();
     try (Refusal{ .host_failure = .subagent_limit }).sentence(&out.writer);
@@ -403,4 +403,26 @@ test "each validation failure and each turned-away message maps to a refusal wit
     try std.testing.expectEqualStrings("child_busy", fromReject(.child_busy).code());
     try std.testing.expectEqualStrings("child_unavailable", fromReject(.child_unavailable).code());
     try std.testing.expectEqualStrings("child_not_persistent", fromReject(.child_not_persistent).code());
+}
+
+test "a subagent at work and one waiting for an approval get the same refusal for instructions" {
+    const alloc = std.testing.allocator;
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{
+        .agent = "reviewer",
+        .message = "next",
+        .instructions = "New rules.",
+    } });
+    defer request.deinit(alloc);
+    // `status` says "waiting for an approval" for the second phase, and
+    // "waiting for the user's answer" for a running subagent that has asked
+    // (`Runtime.ChildState`). `plan` refuses instructions in both phases, so
+    // the sentence says busy, which is true of each, not working.
+    const expected = "{\"ok\":false,\"result\":\"The subagent is busy, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.\",\"error_code\":\"child_busy\"}";
+    for ([_]child_state.Phase{ .running, .awaiting_approval }) |phase| {
+        const planned = model_contract.plan(request, .{ .kind = .persistent, .phase = phase });
+        try std.testing.expectEqual(model_contract.Plan{ .reject = .child_busy }, planned);
+        const body = try fromReject(planned.reject).body(alloc);
+        defer alloc.free(body);
+        try std.testing.expectEqualStrings(expected, body);
+    }
 }

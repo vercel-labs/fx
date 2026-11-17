@@ -625,7 +625,7 @@ test "a refusal's sentence for the model leaves its row's label as its code made
     const alloc = std.testing.allocator;
     const call: ToolCall = .{ .id = "refused", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"check this\"}}" };
     for ([_]struct { output: []const u8, label: []const u8 }{
-        .{ .output = "{\"ok\":false,\"result\":\"The subagent is working, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.\",\"error_code\":\"child_busy\"}", .label = "Busy" },
+        .{ .output = "{\"ok\":false,\"result\":\"The subagent is busy, and instructions can only be set while it is idle. Send the message again without instructions, or wait for its report and then send it with them.\",\"error_code\":\"child_busy\"}", .label = "Busy" },
         .{ .output = "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}", .label = "Message not sent to" },
         .{ .output = "{\"ok\":false,\"result\":\"No open subagent is named \\\"ghost\\\". You have no open subagents.\",\"error_code\":\"child_unavailable\"}", .label = "Failed" },
         .{ .output = "{\"ok\":false,\"result\":\"The subagent already has 64 of your messages waiting. Call wait for its report, then send this one again.\",\"error_code\":\"queue_full\"}", .label = "Failed" },
