@@ -114,6 +114,8 @@ type RootOptions = {
     | "refused_reply";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
+  /** Nests JSON `depth` levels deep at `site` in the legacy fixture's reply or tool list (see the fixture). */
+  deep?: { site: string; depth: number; shape?: "object" | "array" | "mixed"; fault?: "cut" };
   /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
   failureText?: string;
   operationTimeoutMs?: number;
@@ -199,6 +201,10 @@ function createRoot(
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
+            FX_MCP_DEEP_SITE: options.deep?.site,
+            FX_MCP_DEEP_DEPTH: options.deep?.depth.toString(),
+            FX_MCP_DEEP_SHAPE: options.deep?.shape,
+            FX_MCP_DEEP_FAULT: options.deep?.fault,
             // JSON, so the text can hold bytes an environment variable cannot.
             FX_MCP_FAILURE_TEXT: options.failureText === undefined
               ? undefined
@@ -4285,6 +4291,170 @@ describe("MCP stdio servers", () => {
     // Nothing needed the configured server, so it never started.
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
+
+  // A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so fx
+  // refuses a result or a listed tool nested past 128 levels (`src/core/mcp/server_json_depth.zig`).
+  const DEEP_WORDS = "the server's reply is nested deeper than fx accepts (128 levels)";
+  // What the toolbox says of a tool it does not list, and what it shows of one it does (the deep tool's description).
+  const NOT_LISTED = "Nothing named mcp_fixture_deep is in the toolbox menu";
+  const DEEP_TOOL_SHOWN = "A tool whose listing is nested deeper than fx accepts";
+  const deepResultSites = ["structured", "content_meta", "content_annotations"] as const;
+  const deepToolSites = ["tool_meta", "tool_annotations", "tool_icons"] as const;
+  const trace = (root: FixtureRoot) => readFileSync(root.traceLogPath, "utf8");
+  // The trace lines the limit writes, as the text after "[mcp] ": the code, the limit and the place, and no server text.
+  const refusedLines = (root: FixtureRoot) =>
+    trace(root).split("\n").filter((line) => line.includes("JSON refused")).map((line) => line.slice(line.indexOf("[mcp] ") + "[mcp] ".length));
+  const refusedAt = (place: string) => `MCP server JSON refused code=NestingTooDeep limit=128 at=${place}`;
+  const deepGateway = (final: string, withDeepTool: boolean) => startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
+    ...(withDeepTool ? [fakeGatewayToolCall("select_deep", "toolbox", { open: "mcp_fixture_deep" })] : []),
+    fakeGatewayFinalText(final),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const deepRoot = (label: string, site: string, depth: number, extra: Partial<NonNullable<RootOptions["deep"]>> = {}) =>
+    createRoot(label, LEGACY_FIXTURE, { legacyVersion: "2025-11-25", deep: { site, depth, ...extra } });
+
+  for (const site of deepResultSites) {
+    test(`a result nested past the limit in ${site} ends the call with the limit's words, and fx stays up`, async () => {
+      for (const depth of [2000, 258, 256, 129]) {
+        const root = deepRoot(`deep-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_${depth}_DONE`, false);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        // Not a crash: without the limit, a result 257 levels deep or more aborts fx.
+        expect({ depth, code: result.code, signal: result.signal }).toEqual({ depth, code: 0, signal: null });
+        expect(result.stdout).toContain(`DEEP_${depth}_DONE`);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(`MCP protocol failure: ${DEEP_WORDS}`);
+        expect(refusedLines(root)).toEqual([refusedAt("result")]);
+        expect(calls(root)).toHaveLength(1);
+        await expectFixtureProcessesExited(readWire(root.wireLogPath));
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test(`a result nested 127 and 128 levels deep in ${site} reaches the model as before`, async () => {
+      for (const depth of [127, 128]) {
+        const root = deepRoot(`deep-ok-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_OK_${depth}_DONE`, false);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        expect(result.code).toBe(0);
+        const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+        expect(seen).toContain(LEGACY_RESULT);
+        expect(seen).not.toContain("MCP protocol failure");
+        expect(refusedLines(root)).toEqual([]);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
+
+  for (const site of deepToolSites) {
+    test(`a tool listed with ${site} nested past the limit is dropped and the server's other tool stays`, async () => {
+      for (const depth of [2000, 258, 256, 129]) {
+        const root = deepRoot(`deep-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_TOOL_${depth}_DONE`, true);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        // Not a crash at connect: without the limit, a tool listing 258 levels deep or more aborts fx.
+        expect({ depth, code: result.code, signal: result.signal }).toEqual({ depth, code: 0, signal: null });
+        expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).toContain(NOT_LISTED);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(LEGACY_RESULT);
+        expect([...new Set(refusedLines(root))]).toEqual([refusedAt("tool")]);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test(`a tool listed with ${site} nested 127 and 128 levels deep stays listed`, async () => {
+      for (const depth of [127, 128]) {
+        const root = deepRoot(`deep-ok-${site}-${depth}`, site, depth);
+        gateway = deepGateway(`DEEP_TOOL_OK_${depth}_DONE`, true);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        expect(result.code).toBe(0);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).toContain(DEEP_TOOL_SHOWN);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "select_deep")).not.toContain(NOT_LISTED);
+        expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).toContain(LEGACY_RESULT);
+        expect(refusedLines(root)).toEqual([]);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
+
+  test("deep arrays, deep objects and mixed nesting count the same at the limit", async () => {
+    for (const shape of ["object", "array", "mixed"] as const) {
+      for (const [depth, refused] of [[128, false], [129, true]] as const) {
+        const root = deepRoot(`deep-shape-${shape}-${depth}`, "structured", depth, { shape });
+        gateway = deepGateway(`DEEP_SHAPE_${shape}_${depth}_DONE`, false);
+        const result = await ask(root, "Use the stdio MCP echo tool.");
+        expect(result.code).toBe(0);
+        const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+        if (refused) expect(seen).toContain(DEEP_WORDS);
+        else expect(seen).toContain(LEGACY_RESULT);
+        gateway.stop();
+        gateway = null;
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
+  test("a protocol error whose data is nested 2000 levels deep still reaches the model with its message", async () => {
+    // The host drops an error's `data` and keeps its code and message, so no depth refusal is traced here:
+    // this test does not reach the check on `data`, which the Zig tests of `parseProtocolError` pin.
+    const root = deepRoot("deep-error-data", "error_data", 2000);
+    gateway = deepGateway("DEEP_ERROR_DATA_DONE", false);
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+    expect(seen).toContain("MCP protocol error -32602: bad");
+    expect(seen).not.toContain(DEEP_WORDS);
+    expect(refusedLines(root)).toEqual([]);
+  }, 25_000);
+
+  test("a reply cut inside deep nesting ends the call, and fx neither crashes nor waits", async () => {
+    const root = deepRoot("deep-cut", "structured", 300, { fault: "cut" });
+    gateway = deepGateway("DEEP_CUT_DONE", false);
+    const started = Date.now();
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(result.stdout).toContain("DEEP_CUT_DONE");
+    expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).not.toContain(LEGACY_RESULT);
+  }, 25_000);
+
+  test("a result nested past the engine's own limit ends the call after the grace for an unreadable line, as malformed, and cancels it", async () => {
+    // The engine reads a message up to about 2,584 levels deep and drops a deeper one, so fx never sees
+    // the depth limit's check: the call waits out the grace for a line it cannot read (30 seconds), then
+    // ends as malformed and is cancelled on the server.
+    const root = deepRoot("deep-past-engine", "structured", 3000);
+    gateway = deepGateway("DEEP_PAST_ENGINE_DONE", false);
+    const started = Date.now();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool."], {
+      cwd: root.workspace,
+      env: v2Env(root, gateway),
+      timeoutMs: 60_000,
+    });
+    const seconds = (Date.now() - started) / 1000;
+    expect({ code: result.code, signal: result.signal }).toEqual({ code: 0, signal: null });
+    expect(result.stdout).toContain("DEEP_PAST_ENGINE_DONE");
+    const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+    expect(seen).toContain("the server's answer was malformed");
+    expect(seen).not.toContain(DEEP_WORDS);
+    expect(seen).not.toContain(LEGACY_RESULT);
+    // About 30 seconds after the line: not at once, and far from the 5 minutes an operation waits by default.
+    expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    const wire = readWire(root.wireLogPath);
+    const call = wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+    const cancelled = wire.find((entry) => entry.message.method === "notifications/cancelled");
+    expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
+    // The depth check never ran: the engine dropped the message first.
+    expect(refusedLines(root)).toEqual([]);
+    await expectFixtureProcessesExited(wire);
+  }, 90_000);
 });
 
 // `fx mcp call` lets a command fx's shell tool runs call the session's MCP
@@ -4856,7 +5026,25 @@ describe("fx mcp call", () => {
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       await tui.waitForStableComposer(10_000);
-      expect(await tui.captureFullScrollback()).not.toContain("Running MCP");
+      const liveScreen = await tui.captureFullScrollback();
+      expect(liveScreen).not.toContain("Running MCP");
+      // The compact rows of the cancelled turn: its command by its short
+      // name, in one group with the call.
+      const compactRows = (screen: string) =>
+        screen.split("\n").map((line) => line.trimEnd()).filter((line) => /^\s*[●├└▪] /.test(line));
+      const live = compactRows(liveScreen);
+      expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
+      expect(live).toContain(`└ Cancelled ${TOOL_NAME}`);
+      // The command's notice names no command, so no row holds the command
+      // line, its fx path, or its arguments; the call's own notice names its
+      // tool, as before.
+      const cancelledNotices = [
+        "▪ Cancelled · What can fx do differently?",
+        `▪ Cancelled ${TOOL_NAME} · What can fx do differently?`,
+      ];
+      expect(live.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(live.join("\n")).not.toContain("> out.txt");
+      expect(live.join("\n")).not.toContain(FX_BIN);
 
       // The session goes on.
       await tui.sendText("Go on.");
@@ -4881,7 +5069,14 @@ describe("fx mcp call", () => {
       await tui.waitForComposer(15_000);
       await tui.waitForText("BRIDGE_AFTER_CANCEL", 15_000);
       const resumed = await tui.captureFullScrollback();
-      expect(resumed).toContain(`Cancelled ${TOOL_NAME}`);
+      // The cancelled turn's rows read as they did live, the command's row
+      // and the call's in one group.
+      const followUp = resumed.indexOf("┃ Go on.");
+      expect(followUp).toBeGreaterThan(0);
+      const resumedRows = compactRows(resumed.slice(0, followUp));
+      expect(resumedRows).toEqual(live);
+      expect(resumedRows.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(resumedRows.join("\n")).not.toContain("> out.txt");
       expect(resumed).not.toContain("Running MCP");
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendText("/quit");

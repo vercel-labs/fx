@@ -768,10 +768,9 @@ while :; do sleep 1; done
       ]);
 
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
-      await session.waitForText(
-        "Cancelled ./hold-workspace-cancel.sh · What can fx do differently?",
-        TIMEOUT,
-      );
+      // The command's row names it once its cancellation lands; the notice
+      // under the row names no command.
+      await session.waitForText("● Cancelled ./hold-workspace-cancel.sh", TIMEOUT);
       await session.sendText("/workspace list");
       await session.waitForText("available=false active=false", TIMEOUT);
       expect(countOccurrences(readTrace(tracePath), "file index generation started")).toBe(

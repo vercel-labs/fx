@@ -503,8 +503,15 @@ fn detailOf(store: *Store, alloc: Allocator, id: []const u8, peeked: sm.Peeked) 
 /// it (D61). Caller owns the result.
 fn readV1Session(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     store.problem = .{};
-    var detail = (v1_conversion.readDetail(alloc, store.home, id) catch |err| switch (err) {
-        error.OutOfMemory, error.SessionNotFound => return err,
+    var detail = (v1_conversion.readDetail(alloc, store.home, id, &store.problem) catch |err| switch (err) {
+        // A folder others can write, a symlink or a FIFO is unsafe, not
+        // damaged: recover refuses it the same way (D61).
+        error.OutOfMemory,
+        error.SessionNotFound,
+        error.PrivateStatePermissionsUnsupported,
+        error.DurablePathUnsafe,
+        error.SessionPathUnsafe,
+        => return err,
         else => return v1Unreadable(store, alloc, id, err),
     }) orelse return error.SessionNotFound;
     defer detail.summary.deinit(alloc);
@@ -1296,7 +1303,8 @@ fn checkV1(store: *Store, alloc: Allocator, root_id: []const u8) !?Doctor.Stuck 
         error.OutOfMemory => return err,
         error.SessionBusy, error.SessionNotFound => return null,
         error.InvalidSessionFormat => return try stuckRoot(alloc, root_id, store.problem.text(), .nothing),
-        else => return try stuckRoot(alloc, root_id, @errorName(err), .nothing),
+        // A member folder others can write: `problem` names it and its fix (D61).
+        else => return try stuckRoot(alloc, root_id, if (store.problem.len > 0) store.problem.text() else @errorName(err), .nothing),
     };
     defer locks.release();
     for (locks.members.items) |*locked| {
@@ -2576,6 +2584,10 @@ pub const Session = struct {
             }
         }
         for (events, encoded, reviews) |event, bytes, review| {
+            // Before the interruption, which ends the turn when replay reads it.
+            if (try encodeCancelledCommand(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, cancelled_command_type, data) });
+            }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
             if (event == .user and author != .user) {
@@ -3957,6 +3969,12 @@ const Conversion = struct {
             switch (err) {
                 error.SessionBusy => debug_trace.logf("convert", "action=Busy session={s}", .{root_id}),
                 error.InvalidSessionFormat => c.traceUnreadable(root_id, root_id),
+                // A member folder others can write, which `problem` names
+                // with its fix (D61): unreadable, as a damaged one is.
+                error.PrivateStatePermissionsUnsupported => {
+                    c.traceUnreadable(root_id, root_id);
+                    return error.InvalidSessionFormat;
+                },
                 // Another process converted it while this one waited, and
                 // removed its v1 folder once v2 held it (D61).
                 error.SessionNotFound => if (holdsV2(store, c.alloc, root_id)) return traceHeld(root_id),
@@ -4020,7 +4038,7 @@ const Conversion = struct {
         store.problem = .{};
         var v1 = try session_store.Store.initReadOnlyFromHome(c.alloc, store.home, "/");
         defer v1.deinit(c.alloc);
-        if (try v1_conversion.kindOf(&v1, c.alloc, root_id) != .root) return error.SessionNotFound;
+        if (try v1_conversion.kindOfRecorded(&v1, c.alloc, root_id, &store.problem) != .root) return error.SessionNotFound;
         var locks = try v1_conversion.lockFamily(c.alloc, &v1, root_id, 0, &store.problem);
         defer locks.release();
         const locked = &locks.members.items[0];
@@ -4683,10 +4701,8 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
     var reason: [v1_conversion.Problem.capacity]u8 = undefined;
     for (roots) |root| {
         const id = root.id;
-        if (root.unreadable) |why| {
-            try report.skip(alloc, id, "InvalidSessionFormat", why);
-            continue;
-        }
+        // A session v2 holds is converted, whatever its leftover v1 folder
+        // holds; `cleanLeftovers` keeps one it may not take (D61).
         if (store.manager.peek(alloc, id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -4698,6 +4714,10 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
                 try report.skip(alloc, id, "InvalidSessionFormat", std.mem.print(&reason, "the new store can't read its copy ({s})", .{@errorName(err)}) catch null);
                 continue;
             },
+        }
+        if (root.unreadable) |why| {
+            try report.skip(alloc, id, "InvalidSessionFormat", why);
+            continue;
         }
         var conversion: Conversion = .{ .store = store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
         defer conversion.deinit();
@@ -5220,6 +5240,10 @@ noinline fn replay(
                         try attachBridgeCall(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, cancelled_command_type)) {
+                        try noteCancelledCommand(src, pa, &builder, piece);
+                        continue;
+                    }
                     if (std.mem.eql(u8, piece.type, author_type)) {
                         try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
                         continue;
@@ -5722,6 +5746,56 @@ fn attachBridgeCall(src: Source, a: Allocator, builder: *session_log.Conversatio
         return;
     };
     try builder.appendBridgeCall(record);
+}
+
+/// The item right before an `interruption` piece when the turn cancelled a
+/// command that saved no output, `{"call_id":…}`: the piece names neither a
+/// command replay nor an artifact, so only this says the command ran, and a
+/// resume shows its row (D100). Older fx versions reject an unknown field in
+/// the piece but skip an unknown item, so they read the turn as before.
+const cancelled_command_type = "cancelled_command";
+
+const CancelledCommandData = struct { call_id: []const u8 };
+
+/// The `cancelled_command` item data for `event`, or null when it needs
+/// none. The data is owned by `a`.
+fn encodeCancelledCommand(a: Allocator, event: Event) !?[]u8 {
+    const interruption = switch (event) {
+        .interrupted => |value| value,
+        else => return null,
+    };
+    const call_id = interruption.cancelled_command_call_id orelse return null;
+    if (call_id.len == 0 or call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(CancelledCommandData{ .call_id = call_id }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Gives the turn the cancelled command a `cancelled_command` item names.
+/// One that can't be read is logged and left out, and the turn reads as it
+/// did before the item existed.
+fn noteCancelledCommand(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_cancelled_command_unreadable session={s} err={s} dropped=cancelled_command_row", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const call_id = decodeCancelledCommand(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_cancelled_command_invalid session={s} dropped=cancelled_command_row", .{src.id});
+        return;
+    };
+    try builder.noteCancelledCommand(call_id);
+}
+
+/// The call id a `cancelled_command` item's data names, or null when the
+/// data isn't one. Fields a newer fx adds are ignored.
+fn decodeCancelledCommand(a: Allocator, data: []const u8) ?[]const u8 {
+    const value = json_decode.parseFromSliceLeaky(CancelledCommandData, a, data, .{ .ignore_unknown_fields = true }) catch return null;
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    return value.call_id;
 }
 
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
@@ -8269,6 +8343,68 @@ test "the calls a command made through fx mcp call come back on resume with thei
     try testing.expectEqual(@as(usize, 1), restored.history[0].assistant.execution.tool_steps.len);
 }
 
+test "a command cancelled before it printed anything keeps its row on resume (D100)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const silent: types.ToolCall = .{ .id = "call-silent", .name = "shell", .arguments_json = "{\"command\":\"touch .ready && sleep 30\"}" };
+    const printed: types.ToolCall = .{ .id = "call-printed", .name = "shell", .arguments_json = "{\"command\":\"echo hi; sleep 30\"}" };
+    const lang = types.ConversationLanguage.default();
+    // A command that printed nothing, one whose output was kept, and a
+    // turn cancelled with no command.
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("silent") }, .tool_call = silent, .cancelled_command = .{}, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("printed") }, .tool_call = printed, .cancelled_command = .{ .command_artifact_handle = "fx-command-printed.log" }, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("no command") }, .tool_call = printed, .terminal_reason = .cancelled } }, lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Only the command with no saved output gets the item: its call id and
+    // nothing else, right before the interruption that ends its turn.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"" ++ cancelled_command_type ++ "\""));
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ cancelled_command_type ++ "\",\"data\":{\"call_id\":\"call-silent\"},") orelse return error.TestExpectedItem;
+    const interruption_at = std.mem.find(u8, bytes, "\"type\":\"interruption\"") orelse return error.TestExpectedInterruption;
+    try testing.expect(item_at < interruption_at);
+    // Its own line, the one right before the interruption's.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[item_at..interruption_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"interruption\",\"data\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,") != null);
+    // The piece itself is the same bytes as before the item existed.
+    try testing.expect(std.mem.find(u8, bytes, "cancelled_command_call_id") == null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const kept = restored.history[0].interrupted.cancelled_command orelse return error.TestExpectedPresentation;
+    try testing.expect(kept.output_replay == null);
+    try testing.expect(kept.command_artifact_handle == null);
+    try testing.expectEqualStrings("call-silent", restored.history[0].interrupted.tool_call.?.id);
+    try testing.expectEqualStrings("fx-command-printed.log", restored.history[1].interrupted.cancelled_command.?.command_artifact_handle.?);
+    try testing.expect(restored.history[2].interrupted.cancelled_command == null);
+}
+
+test "replay reads a cancelled command item a newer fx wrote and leaves out one it can't read (D100)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("c", decodeCancelledCommand(a, "{\"call_id\":\"c\",\"exit_signal\":15}").?);
+    // An empty or missing call id, one too long, and bytes that aren't JSON.
+    try testing.expect(decodeCancelledCommand(a, "{\"call_id\":\"\"}") == null);
+    try testing.expect(decodeCancelledCommand(a, "{\"tool\":\"shell\"}") == null);
+    const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
+    @memset(long_id, 'c');
+    try testing.expect(decodeCancelledCommand(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(decodeCancelledCommand(a, "not json") == null);
+}
+
 test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -9497,6 +9633,16 @@ test "a prompt image the store does not save keeps its bytes inline and gets no 
     try testing.expectEqualStrings(images[1].snapshot_path.?, kept[1].snapshot_path.?);
 }
 
+/// Whether this process writes into `dir` whatever its mode, as root or a
+/// process with `CAP_DAC_OVERRIDE` does. A test of a refused write can't
+/// run then, so it skips.
+fn writesWhateverTheMode(dir: std.Io.Dir) bool {
+    const io = io_mod.getIo();
+    dir.writeFile(io, .{ .sub_path = ".mode-probe", .data = "" }) catch return false;
+    dir.deleteFile(io, ".mode-probe") catch {};
+    return true;
+}
+
 test "a turn the store cannot start keeps its prompt images inline and does not fail the prompt (D89)" {
     var t: TestHome = undefined;
     try t.init();
@@ -9515,10 +9661,11 @@ test "a turn the store cannot start keeps its prompt images inline and does not 
     // which a read-only store refuses.
     const io = io_mod.getIo();
     try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
-    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
+    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{ .iterate = true });
     defer root.close(io);
-    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
+    try root.setPermissions(io, .fromMode(0o500));
     defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(root)) return error.SkipZigTest;
     try s.savePromptImages(arena.allocator(), &images);
     try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
     try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
@@ -9693,7 +9840,7 @@ const V1Home = struct {
         for (ids) |id| {
             var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
             defer dir.close(io);
-            dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+            try dir.setPermissions(io, .fromMode(0o755));
             var walker = try dir.walk(a);
             defer walker.deinit();
             while (try walker.next(io)) |entry| switch (entry.kind) {
@@ -9977,9 +10124,9 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
     for ([_][]const u8{ "", "/state", "/proofs" }) |sub| {
         const path = try alloc.print("{s}/{s}{s}", .{ try v1.sessionPath(id, ""), terminal_dir_name, sub });
         defer alloc.free(path);
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
 
     const s = try openConverted(&t, id);
@@ -10287,6 +10434,28 @@ test "recover on a v1 session whose lock file others can write says its storage 
         return error.TestUnexpectedResult;
     } else |err| err;
     try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+}
+
+test "a v1 family whose subagent folder others can write: recover refuses it as unsafe, conversion as unreadable, and every member keeps its v1 folder (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    const err = if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    // Conversion reports it unreadable, as it does a damaged member.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    // Nothing was copied or removed: every member keeps its v1 folder.
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
 }
 
 test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
@@ -11194,6 +11363,215 @@ test "fx sessions convert converts every v1 family, and counts what it skipped (
     plain.deinit(alloc);
 }
 
+test "a v1 session whose folder others can write is refused as unsafe by show, recover and conversion, and stays (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("side", 1);
+    const id = ids[0];
+    for ([_]std.posix.mode_t{ 0o757, 0o775 }) |mode| {
+        try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(mode), .{});
+        if (readSession(&t.store, alloc, id)) |shown| {
+            var value = shown;
+            value.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+        if (recover(&t.store, alloc, id)) |recovered| {
+            var value = recovered;
+            value.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+        try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+        try expectUnsafeProblem(&t, "", id, "");
+        try testing.expect(V1Home.exists(&t, id));
+        try testing.expectError(error.NotFound, t.store.manager.peek(alloc, id));
+    }
+    // Readable by others only, it shows and converts (D61).
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o755), .{});
+    var shown = try readSession(&t.store, alloc, id);
+    shown.deinit(alloc);
+    const s = try openConverted(&t, id);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, id));
+}
+
+/// `t.store.problem` is exactly the reason fx gives when others can write
+/// `id`'s v1 folder, or `entry` in it, naming the subagent when `child` is
+/// set, with the command that makes the folder private (D61).
+fn expectUnsafeProblem(t: *TestHome, child: []const u8, id: []const u8, entry: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    const expected = try std.mem.print(&buffer, "{s}{s}{s}others can write {s}{s}, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{
+        if (child.len > 0) "its subagent " else "",
+        child,
+        if (child.len > 0) ": " else "",
+        entry,
+        if (entry.len > 0) " in its folder" else "its folder",
+        id,
+    });
+    try testing.expectEqualStrings(expected, t.store.problem.text());
+}
+
+test "a v1 family whose subagent folder others can write is refused with the subagent, its folder and the fix, and stays (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[1], ""), .fromMode(0o757), .{});
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, family[1], family[1], "");
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.converted);
+    const root_reason = for (report.skipped.items) |skipped| {
+        if (std.mem.eql(u8, skipped.id, family[0])) break skipped.reason.?;
+    } else return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, root_reason, "its subagent "));
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
+}
+
+test "a v1 family whose root's subagent folder others can write is refused, naming that folder and the fix (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    if (readSession(&t.store, alloc, family[0])) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    // Conversion reports it unreadable, with the reason.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, "", family[0], "subagent");
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a v1 family whose children.json others can write is refused before it changes the family, naming the file (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent/children.json"), .fromMode(0o646), .{});
+    if (readSession(&t.store, alloc, family[0])) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a writable v1 entry's name reaches the reason terminal-safe, and a name too long to fit is left out, not cut (D61)" {
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    var folder = try t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
+    defer folder.close(io);
+    const hostile = "x\x1b]0;PWNED\x07\x1b[31mred";
+    folder.writeFile(io, .{ .sub_path = hostile, .data = "", .flags = .{ .permissions = .fromMode(0o666) } }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, hostile, .fromMode(0o666), .{});
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    const text = t.store.problem.text();
+    try testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try testing.expect(std.mem.findScalar(u8, text, 0x07) == null);
+    try testing.expect(std.mem.find(u8, text, "PWNED") != null);
+    var buffer: [256]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, text, try std.mem.print(&buffer, "in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id})));
+    try folder.deleteFile(io, hostile);
+
+    // Each control byte is written as a four-byte escape, so this name's
+    // reason would not fit whole.
+    const long: [255]u8 = @splat(0x01);
+    folder.writeFile(io, .{ .sub_path = &long, .data = "" }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, &long, .fromMode(0o666), .{});
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try testing.expectEqualStrings(try std.mem.print(&buffer, "others can write something in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id}), t.store.problem.text());
+}
+
+test "a v1 session whose events file others can write is refused like a writable folder, naming the file (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "events.jsonl"), .fromMode(0o646), .{});
+    if (readSession(&t.store, alloc, id)) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (recover(&t.store, alloc, id)) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try expectUnsafeProblem(&t, "", id, "events.jsonl");
+    try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a converted session whose v1 folder comes back writable by others is kept, not reported unreadable (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    const s = try openConverted(&t, id);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, id));
+    // The v1 copy is back, and others can write it.
+    _ = try v1.fixture("side", 1);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o757), .{});
+    for (0..2) |_| {
+        var report = try convertAll(&t.store, alloc);
+        defer report.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), report.unreadable);
+        try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    }
+    try testing.expect(V1Home.exists(&t, id));
+    var shown = try readSession(&t.store, alloc, id);
+    shown.deinit(alloc);
+}
+
 test "a v1 profile an old release left readable by others converts (D61)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
@@ -11205,9 +11583,9 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     const roots = try v1.fixture("plain", 1);
     const v1_open_id = roots[0];
     for ([_][]const u8{ ".fx", ".fx/sessions", try v1.sessionPath(v1_open_id, "") }) |path| {
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
     const s = try openConverted(&t, v1_open_id);
     defer s.close();
@@ -11590,10 +11968,11 @@ test "a new session never takes an id v1's folder could not be checked for (D61)
     defer t.deinit();
     const io = io_mod.getIo();
     try t.tmp.dir.createDirPath(io, ".fx/sessions");
-    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
+    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{ .iterate = true });
     defer sessions.close(io);
-    sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
+    try sessions.setPermissions(io, .fromMode(0o000));
     defer sessions.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(sessions)) return error.SkipZigTest;
     var model = "m".*;
     try testing.expectError(error.SessionStoreUnavailable, Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model)));
 }

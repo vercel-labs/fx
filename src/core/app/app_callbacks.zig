@@ -442,6 +442,14 @@ pub fn Bindings(comptime App: type) type {
             )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            // This session's own sign-in saved this login before its team is
+            // chosen; that sign-in continues the request with the team.
+            if (comptime @hasField(@TypeOf(app.auth), "sign_in_flow")) {
+                if (mode == .stored and app.auth.sign_in_flow.savedToken(refreshed.token)) {
+                    debug_trace.logf("auth", "stored login skipped source={t} reason=saved_by_this_session", .{source});
+                    return null;
+                }
+            }
             if (app.auth.preparedCredentialChange(refreshed) == .authority) {
                 return error.CredentialAuthorityChanged;
             }

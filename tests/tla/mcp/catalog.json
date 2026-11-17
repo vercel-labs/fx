@@ -55,5 +55,9 @@
   {
     "module": "ExitReaper",
     "unit": "U03"
+  },
+  {
+    "module": "WireDepth",
+    "unit": "U01"
   }
 ]
