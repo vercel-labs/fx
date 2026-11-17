@@ -168,7 +168,7 @@ const form = { mode: "form", message: "Name?", requestedSchema: { type: "object"
 const askName = { k: { method: "elicitation/create", params: form } };
 const FORM = ["--capabilities", JSON.stringify({ elicitation: { form: {} } })];
 
-// ---- a form the server writes with escapes (D1) ----
+// ---- a form the server writes with escapes ----
 //
 // The host reads the person's answer with std.json and writes it back, which spells a string without the escapes
 // the server used (café, a/b, A, a surrogate pair as UTF-8). JSON gives both spellings one meaning, so the engine must

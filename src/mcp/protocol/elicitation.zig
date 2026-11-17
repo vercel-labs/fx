@@ -3,7 +3,7 @@
 //! host's answer, whose form content is checked against the schema before
 //! anything is sent. Keys, enum values, and defaults
 //! stay the server's raw JSON tokens. An answer's key or choice matches one
-//! by the string the two tokens spell, not by their bytes (`sameString`):
+//! by the string the two tokens spell, not by their bytes (`wire.sameString`):
 //! the host writes the answer back with `std.json`, which drops escapes the
 //! server used. Nothing here allocates. Pure.
 
@@ -110,89 +110,6 @@ fn isString(raw: []const u8, value: []const u8) bool {
     return std.mem.eql(u8, wire.plainString(raw) orelse return false, value);
 }
 
-/// Whether two JSON string tokens, quotes included, spell the same string
-/// once decoded: `"caf\u00e9"` and `"café"`, `"a\/b"` and `"a/b"`, and a
-/// surrogate pair and the character in UTF-8 are one string each. This is
-/// JSON's equality, which is `std.json`'s. It decodes both tokens as it goes
-/// and allocates nothing. A token that is not a string, or holds an escape or
-/// UTF-8 that is not valid, matches only a token with the same bytes. Tokens
-/// that reach here have been through the scanner, which refuses invalid ones.
-fn sameString(a: []const u8, b: []const u8) bool {
-    if (std.mem.eql(u8, a, b)) return true;
-    if (a.len < 2 or b.len < 2 or a[0] != '"' or b[0] != '"' or a[a.len - 1] != '"' or b[b.len - 1] != '"') return false;
-    var x: Decoder = .{ .raw = a[1 .. a.len - 1] };
-    var y: Decoder = .{ .raw = b[1 .. b.len - 1] };
-    while (true) {
-        const p = x.next() catch return false;
-        const q = y.next() catch return false;
-        if (p == null or q == null) return p == null and q == null;
-        if (p.? != q.?) return false;
-    }
-}
-
-/// The code points of the inside of a JSON string token, one at a time.
-const Decoder = struct {
-    raw: []const u8,
-    at: usize = 0,
-
-    const Invalid = error{Invalid};
-
-    /// The next code point, or null at the end. A surrogate pair written as
-    /// two escapes is one code point, and a lone surrogate is invalid.
-    fn next(d: *Decoder) Invalid!?u21 {
-        if (d.at >= d.raw.len) return null;
-        const c = d.raw[d.at];
-        if (c != '\\') {
-            const n = std.unicode.utf8ByteSequenceLength(c) catch return error.Invalid;
-            if (d.at + n > d.raw.len) return error.Invalid;
-            const bytes = d.raw[d.at..][0..n];
-            // Each decoder refuses an overlong form; the three-byte one also refuses an encoded surrogate half.
-            const code_point: u21 = switch (n) {
-                1 => c,
-                2 => std.unicode.utf8Decode2(bytes[0..2].*) catch return error.Invalid,
-                3 => std.unicode.utf8Decode3(bytes[0..3].*) catch return error.Invalid,
-                4 => std.unicode.utf8Decode4(bytes[0..4].*) catch return error.Invalid,
-                else => return error.Invalid,
-            };
-            d.at += n;
-            return code_point;
-        }
-        if (d.at + 1 >= d.raw.len) return error.Invalid;
-        const escape = d.raw[d.at + 1];
-        d.at += 2;
-        switch (escape) {
-            '"' => return '"',
-            '\\' => return '\\',
-            '/' => return '/',
-            'b' => return 0x08,
-            'f' => return 0x0c,
-            'n' => return '\n',
-            'r' => return '\r',
-            't' => return '\t',
-            'u' => {},
-            else => return error.Invalid,
-        }
-        const unit = try d.hex4();
-        if (unit >= 0xdc00 and unit <= 0xdfff) return error.Invalid;
-        if (unit < 0xd800 or unit > 0xdbff) return unit;
-        // A high surrogate needs a low one, written as the next escape.
-        if (d.at + 1 >= d.raw.len or d.raw[d.at] != '\\' or d.raw[d.at + 1] != 'u') return error.Invalid;
-        d.at += 2;
-        const low = try d.hex4();
-        if (low < 0xdc00 or low > 0xdfff) return error.Invalid;
-        return 0x10000 + ((@as(u21, unit) - 0xd800) << 10) + (low - 0xdc00);
-    }
-
-    /// Four hex digits, in either case, and nothing else: no sign.
-    fn hex4(d: *Decoder) Invalid!u16 {
-        if (d.at + 4 > d.raw.len) return error.Invalid;
-        var unit: u16 = 0;
-        for (d.raw[d.at..][0..4]) |digit| unit = unit * 16 + (std.fmt.charToDigit(digit, 16) catch return error.Invalid);
-        d.at += 4;
-        return unit;
-    }
-};
-
 fn readSchema(schema: []const u8, form: *Form) Error!void {
     var s: [3]?[]const u8 = undefined;
     wire.objectFields(schema, &.{ "type", "properties", "required" }, &s) catch return error.Unreadable;
@@ -201,7 +118,7 @@ fn readSchema(schema: []const u8, form: *Form) Error!void {
     properties.init(s[1] orelse return error.Unreadable) catch return error.Unreadable;
     while (properties.next() catch return error.Unreadable) |p| {
         if (form.count == max_fields) return error.Unreadable;
-        for (form.slice()) |other| if (sameString(other.key, p.key)) return error.Unreadable;
+        for (form.slice()) |other| if (wire.sameString(other.key, p.key)) return error.Unreadable;
         form.fields[form.count] = try readField(p.key, p.value);
         form.count += 1;
     }
@@ -210,7 +127,7 @@ fn readSchema(schema: []const u8, form: *Form) Error!void {
         names.init(required) catch return error.Unreadable;
         while (names.next() catch return error.Unreadable) |name| {
             const field = for (form.fields[0..form.count]) |*field| {
-                if (sameString(field.key, name)) break field;
+                if (wire.sameString(field.key, name)) break field;
             } else return error.Unreadable;
             field.required = true;
         }
@@ -382,7 +299,7 @@ fn validContent(form: *const Form, content: []const u8) bool {
     var seen: u32 = 0;
     while (fields.next() catch return false) |c| {
         const i = for (form.slice(), 0..) |f, i| {
-            if (sameString(f.key, c.key)) break i;
+            if (wire.sameString(f.key, c.key)) break i;
         } else return false;
         const bit = @as(u32, 1) << @intCast(i);
         if (seen & bit != 0 or !validValue(&form.fields[i], c.value)) return false;
@@ -403,7 +320,7 @@ fn validValue(f: *const Field, value: []const u8) bool {
             if (f.kind == .integer and @trunc(x) != x) return false;
             return within(x, f.min, f.max);
         },
-        .string => return value[0] == '"' and within(@floatFromInt(codepoints(value)), f.min, f.max) and validFormat(f.format, value),
+        .string => return value[0] == '"' and within(@floatFromInt(wire.codePointCount(value) orelse return false), f.min, f.max) and validFormat(f.format, value),
         .choice => return isOption(f, value),
         .choices => {
             var items: wire.Elements = undefined;
@@ -425,28 +342,8 @@ fn isOption(f: *const Field, value: []const u8) bool {
     if (value[0] != '"') return false;
     var options: Options = undefined;
     options.init(f) catch return false;
-    while (options.next()) |o| if (sameString(o.value, value)) return true;
+    while (options.next()) |o| if (wire.sameString(o.value, value)) return true;
     return false;
-}
-
-/// The code points of a valid JSON string token: an escape is one, and a
-/// surrogate pair written as two escapes is one.
-fn codepoints(raw: []const u8) usize {
-    const end = raw.len - 1;
-    var i: usize = 1;
-    var n: usize = 0;
-    while (i < end) : (n += 1) {
-        if (raw[i] != '\\') {
-            i += std.unicode.utf8ByteSequenceLength(raw[i]) catch 1;
-        } else if (raw[i + 1] != 'u') {
-            i += 2;
-        } else {
-            const unit = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch 0;
-            i += 6;
-            if (unit >= 0xD800 and unit <= 0xDBFF and i + 1 < end and raw[i] == '\\' and raw[i + 1] == 'u') i += 6;
-        }
-    }
-    return n;
 }
 
 /// Structural checks of the spec's four formats, on strings written
@@ -997,9 +894,6 @@ test "a form at its field limit, with every name and choice escaped and long, ta
 
 test "a form or an answer cut anywhere, inside an escape or not, is refused cleanly" {
     // Fault injection: every prefix of a valid escaped form is unreadable, and every prefix of a valid escaped answer is invalid.
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const form_text =
         \\{"message":"m","requestedSchema":{"type":"object","properties":{"caf\u00e9":{"type":"string","enum":["\ud83d\ude00","a\/b"]}},"required":["caf\u00e9"]}}
     ;
@@ -1022,97 +916,6 @@ test "a form or an answer cut anywhere, inside an escape or not, is refused clea
             return err;
         };
     }
-    _ = arena;
-}
-
-test "sameString is JSON's equality of two string tokens" {
-    const same = [_][2][]const u8{
-        .{ "\"\"", "\"\"" },
-        .{ "\"\\u0041\"", "\"A\"" },
-        .{ "\"A\"", "\"\\u0041\"" },
-        .{ "\"\\u00e9\"", "\"é\"" },
-        .{ "\"\\u00E9\"", "\"\\u00e9\"" },
-        .{ "\"\\uD83D\\uDE00\"", "\"😀\"" },
-        .{ "\"\\ud83d\\ude00\"", "\"\\uD83D\\uDE00\"" },
-        .{ "\"\\ud800\\udc00\"", "\"\u{10000}\"" }, // the first astral code point
-        .{ "\"\\udbff\\udfff\"", "\"\u{10ffff}\"" }, // the last
-        .{ "\"\\ud7ff\"", "\"\u{d7ff}\"" }, // just below the surrogates
-        .{ "\"\\ue000\"", "\"\u{e000}\"" }, // just above
-        .{ "\"\\uffff\"", "\"\u{ffff}\"" },
-        .{ "\"\\u0080\"", "\"\u{80}\"" }, // the first two-byte code point
-        .{ "\"\\u07ff\"", "\"\u{7ff}\"" }, // the last
-        .{ "\"\\u0800\"", "\"\u{800}\"" }, // the first three-byte one
-        .{ "\"\\u20ac\"", "\"€\"" },
-        .{ "\"a\\/b\"", "\"a/b\"" },
-        .{ "\"\\n\"", "\"\\u000a\"" },
-        .{ "\"\\b\\f\\r\\t\"", "\"\\u0008\\u000C\\u000d\\u0009\"" },
-        .{ "\"\\\"\\\\\"", "\"\\u0022\\u005c\"" },
-        .{ "\"\\u0000\"", "\"\\u0000\"" },
-        .{ "\"x\\u00e9y\\ud83d\\ude00z\"", "\"xéy😀z\"" },
-    };
-    for (same) |pair| {
-        testing.expect(sameString(pair[0], pair[1]) and sameString(pair[1], pair[0])) catch |err| {
-            std.debug.print("expected the same string: {s} and {s}\n", .{ pair[0], pair[1] });
-            return err;
-        };
-    }
-    const different = [_][2][]const u8{
-        .{ "\"A\"", "\"a\"" },
-        .{ "\"\\u0041\"", "\"B\"" },
-        .{ "\"\\u00e9\"", "\"e\"" },
-        .{ "\"\\u00e9\"", "\"\\u00e8\"" },
-        .{ "\"ab\"", "\"a\"" },
-        .{ "\"a\"", "\"ab\"" },
-        .{ "\"\\u0041\"", "\"AA\"" },
-        .{ "\"\\ud83d\\ude00\"", "\"\\ud83d\\ude01\"" },
-        .{ "\"\\ud83d\\ude00\"", "\"😁\"" },
-        .{ "\"\\u0041\"", "\"\\u0041\\u0000\"" },
-        // An escape or a surrogate that is not valid matches only the same bytes.
-        .{ "\"\\u+041\"", "\"A\"" },
-        .{ "\"\\u 041\"", "\"A\"" },
-        .{ "\"\\u004\"", "\"A\"" },
-        .{ "\"\\u00\"", "\"\\u00\"x" },
-        .{ "\"\\q\"", "\"q\"" },
-        .{ "\"\\ud83d\"", "\"\\uD83D\"" }, // a lone high surrogate, spelled two ways
-        .{ "\"\\ude00\"", "\"\\uDE00\"" }, // a lone low one
-        .{ "\"\\ud83d\\u0041\"", "\"\\uD83D\\u0041\"" }, // a high surrogate then another escape
-        .{ "\"\\ud83dx\"", "\"\\uD83Dx\"" },
-        .{ "\"\\ude00\\ud83d\"", "\"\\uDE00\\uD83D\"" }, // the pair the wrong way round
-        // UTF-8 that is not valid matches only the same bytes: an overlong form, an encoded surrogate half, a code
-        // point past U+10FFFF, a cut sequence, a stray continuation byte.
-        .{ "\"\xc0\xaf\"", "\"/\"" },
-        .{ "\"\xe0\x80\xaf\"", "\"/\"" },
-        .{ "\"\xf0\x80\x80\xaf\"", "\"/\"" },
-        .{ "\"\xed\xa0\x80\"", "\"\\ud800\"" },
-        .{ "\"\xed\xb0\x80\"", "\"\\udc00\"" },
-        // The same encoded half on both sides, then the same text spelled two ways: still not valid.
-        .{ "\"\xed\xa0\x80\\u0041\"", "\"\xed\xa0\x80A\"" },
-        .{ "\"\xed\xb0\x80\\u0041\"", "\"\xed\xb0\x80A\"" },
-        .{ "\"\xf4\x90\x80\x80\"", "\"x\"" },
-        .{ "\"\xe2\x82\"", "\"\\u20ac\"" },
-        .{ "\"\xc3\"", "\"\\u00c3\"" },
-        .{ "\"\x80\"", "\"\\u0080\"" },
-        // Not strings.
-        .{ "1", "\"1\"" },
-        .{ "\"\\u0031\"", "1" },
-        .{ "true", "\"true\"" },
-        .{ "\"", "\"a\"" },
-        // A token whose inside is empty is not the empty string.
-        .{ "12", "\"\"" },
-        .{ "{}", "\"\"" },
-        .{ "[]", "\"\"" },
-        .{ "true", "\"ru\"" },
-    };
-    for (different) |pair| {
-        testing.expect(!sameString(pair[0], pair[1]) and !sameString(pair[1], pair[0])) catch |err| {
-            std.debug.print("expected different strings: {s} and {s}\n", .{ pair[0], pair[1] });
-            return err;
-        };
-    }
-    // The same bytes are the same string, whatever they hold.
-    try testing.expect(sameString("1", "1"));
-    try testing.expect(sameString("\"\\ud83d\"", "\"\\ud83d\""));
-    try testing.expect(sameString("\"\xed\xa0\x80\"", "\"\xed\xa0\x80\""));
 }
 
 test "an empty name and a name made of NUL are names like any other" {
