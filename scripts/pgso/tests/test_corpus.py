@@ -51,6 +51,7 @@ TRAINING_E2E_TESTS = (
     "tui-terminal-tool.test.ts",
     "tui-native-clear-recovery.test.ts",
     "tui-gateway-stream-lifecycle.test.ts",
+    "tui-tool-story.test.ts",
 )
 
 VERIFICATION_E2E_TESTS = (
@@ -77,6 +78,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-input-line-delete.test.ts",
     "tui-input-navigation.test.ts",
     "tui-host-switch.test.ts",
+    "tui-mcp-deny-rules.test.ts",
     "tui-mcp-http-many-servers.test.ts",
     "tui-render-replay.test.ts",
     "tui-resume.test.ts",
@@ -422,8 +424,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(72, len(corpus.candidate_scenarios))
+        self.assertEqual(37, len(corpus.scenarios))
+        self.assertEqual(74, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

@@ -12,6 +12,7 @@ const compactor = @import("../../compactor/compactor.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const token_pass = @import("../../gateway/token_pass.zig");
+const token_pass_team = @import("../../gateway/token_pass_team.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const types = @import("../../shared/types.zig");
@@ -67,8 +68,9 @@ pub const Outcome = union(enum) {
     text: []u8,
     /// No usable text. `detail` names the cause in `key=value` form, safe to
     /// trace; allocated with the caller's allocator. `unauthorized` when the
-    /// provider rejected the credential with 401.
-    failed: struct { reason: Reason, detail: []u8, unauthorized: bool = false },
+    /// provider rejected the credential with 401, `context_overflow` when it
+    /// refused the request as longer than the model's context window.
+    failed: struct { reason: Reason, detail: []u8, unauthorized: bool = false, context_overflow: bool = false },
 };
 
 pub const Error = error{ Cancelled, OutOfMemory };
@@ -166,6 +168,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked), 240);
             var outcome = try failed(alloc, .provider, "kind={s} detail={s}", .{ @tagName(failure.kind), safe_detail });
             outcome.failed.unauthorized = failure.kind == .unauthorized;
+            outcome.failed.context_overflow = agent_stream_provider.isContextOverflow(failure);
             return outcome;
         },
         .completed => |completed| completed.completion,
@@ -285,8 +288,9 @@ pub const CompactorCaller = struct {
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,
-            // A Token Pass conversation retries its summary on Token Pass.
-            .fallback_model = if (self.provider == .gateway) token_pass.compactionFallback(self.model) else null,
+            // A Token Pass conversation of a team with Token Pass retries its
+            // summary on Token Pass.
+            .fallback_model = if (self.provider == .gateway) token_pass_team.compactionFallback(self.model) else null,
         };
     }
 
@@ -393,7 +397,7 @@ pub const CompactorCaller = struct {
         return switch (outcome) {
             .text => |text| .{ .text = text },
             .failed => |failure| .{ .failed = .{
-                .reason = switch (failure.reason) {
+                .reason = if (failure.context_overflow) .overflow else switch (failure.reason) {
                     .transport => .transport,
                     .provider => .provider,
                     .tool_call => .tool_call,

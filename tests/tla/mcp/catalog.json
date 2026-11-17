@@ -1,7 +1,8 @@
 [
   {
     "module": "Request",
-    "unit": "U02"
+    "unit": "U02",
+    "also": ["Request.scoped.cfg"]
   },
   {
     "module": "StdioConn",
@@ -54,5 +55,9 @@
   {
     "module": "ExitReaper",
     "unit": "U03"
+  },
+  {
+    "module": "WireDepth",
+    "unit": "U01"
   }
 ]

@@ -222,7 +222,7 @@ export function eventFor(act: Act, target: Record<string, unknown>): Event {
 }
 
 const CORE_FIELDS = [
-  "cycle", "cycleFirst", "prevFirst", "nextSeq", "savedThrough", "turnOpen", "paintedThrough", "reprinting",
+  "cycle", "cycleFirst", "prevFirst", "nextSeq", "savedThrough", "turnOpen", "prevWaits", "paintedThrough", "reprinting",
   "coOpen", "coLo", "coHi", "coAtStart", "pending", "pendingDir", "nextToken",
 ] as const;
 

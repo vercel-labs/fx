@@ -6,7 +6,7 @@
 //!
 //! Usage: engine_lab <trace-path> <script> [--deny TOOL]... [--capabilities JSON]
 //!          [--max-attempts N] [--no-listen] [--preferred V1,V2] [--probe-ms N]
-//!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N]
+//!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N] [--refused-ms N]
 //!          [--define NAME=VALUE]... (each {NAME} in the script becomes VALUE)
 //!
 //! Script, one action per line (blank lines and lines starting with # are skipped):
@@ -327,6 +327,9 @@ pub fn main(init: std.process.Init) !void {
             options.timeouts.idle_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--hard-ms")) {
             options.timeouts.hard_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--refused-ms")) {
+            // The grace for a refused line that names no request.
+            options.timeouts.refused_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--start-ms")) {
             options.timeouts.start_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--preferred")) {

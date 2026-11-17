@@ -17,6 +17,7 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
@@ -1345,13 +1346,6 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try app.alloc.print("Preparing {s}.", .{provider_catalog.label(input.target())});
-            defer app.alloc.free(body);
-            try app.writeDomainNotice(.{
-                .topic = "provider",
-                .tone = .neutral,
-                .body = body,
-            }, true);
         }
 
         pub fn collectProviderPreparationFacts(app: *App, agent: *AppAgent) !void {
@@ -1795,7 +1789,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!try finishProviderSwitch(app, agent, task)) return false;
                     rememberCredentialSource(app, .fx_login);
                     app.auth.closePicker(app.alloc);
-                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+                    try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body, .detail = tokenPassOffer(app) }, true);
                     return true;
                 }
             }
@@ -1842,12 +1836,22 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .warning,
                 .body = "The Vercel team changed and a valid model was selected for this run, but the model preference could not be saved.",
             } else .{
-                .topic = "auth",
+                .topic = "",
                 .tone = .neutral,
                 .body = body,
+                .detail = tokenPassOffer(app),
             }, true);
             try resumePromptAfterAuth(app, agent);
             return true;
+        }
+
+        /// The Token Pass offer under the team notice, or "" when fx already
+        /// knows this team has an active Token Pass.
+        fn tokenPassOffer(app: *App) []const u8 {
+            if (comptime @hasField(App, "model_cache") and @hasDecl(@FieldType(App, "model_cache"), "tokenPassStatus")) {
+                if (app.model_cache.tokenPassStatus() == .active) return "";
+            }
+            return token_pass.offer_line;
         }
 
         /// Whether fx already sends with an fx login on this team, so choosing
@@ -2221,6 +2225,25 @@ pub fn Runtime(comptime App: type) type {
                 .grok_subscription => try beginGrokSignIn(app, agent),
                 .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => {},
             }
+        }
+
+        /// The request that waits for a sign-in took a login another fx
+        /// process saved: the sign-in fx opened for it here, still waiting
+        /// for its code, is no longer needed.
+        pub fn closeRecoverySignInForStoredLogin(app: *App, source: credentials.Source) !void {
+            if (!app.auth.signInEntryActive()) return;
+            // A sign-in for another provider, which the user opened, stays.
+            if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) {
+                if (app.auth.pickerView().sign_in_source != source) return;
+            }
+            debug_trace.logf("auth", "sign-in closed: the waiting request took the login another fx saved, and this sign-in's device code is dropped", .{});
+            _ = app.auth.popPickerStage(app.alloc);
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "Signed in from another fx session. Continuing with that login.",
+            });
+            app.shell.render_requests.request(.footer);
         }
 
         fn recoverPromptCredentialRefreshFailure(app: *App, agent: *AppAgent, err: anyerror) !bool {

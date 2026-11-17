@@ -32,6 +32,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   startFakeGateway,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 import { onlySessionId, savedSession, savedText, sessionDir } from "./saved-sessions";
 import {
@@ -444,7 +445,8 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
+JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -841,7 +843,7 @@ describe("cli: status", () => {
           mcp_config_error: "McpConfigInvalidJson",
         });
         expect(doctorText.stdout).toContain(
-          "[fail] mcp_config: failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
+          "MCP servers\n  \u2717 mcp_config failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
         );
         const doctorJson = JSON.parse(doctorJsonResult.stdout);
         expect(doctorJson.fail_count).toBe(1);
@@ -1535,11 +1537,10 @@ describe("cli: status", () => {
         };
         expect(JSON.parse(statusJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         expect(JSON.parse(doctorJsonResult.stdout.trim())).toMatchObject(expectedAuth);
-        for (const output of [statusText.stdout, doctorText.stdout]) {
-          expect(output).toContain("auth=fx login");
-          expect(output).toContain("auth_refreshable=true");
-          expect(output).toContain("team=vercel-labs");
-        }
+        expect(statusText.stdout).toContain("auth=fx login");
+        expect(statusText.stdout).toContain("auth_refreshable=true");
+        expect(statusText.stdout).toContain("team=vercel-labs");
+        expect(doctorText.stdout).toContain("  Auth         fx login \u00b7 team vercel-labs\n");
         for (const output of [
           statusText.stdout,
           statusJsonResult.stdout,
@@ -3283,6 +3284,45 @@ describe("cli: missing durable home", () => {
 
 describe("cli: sessions", () => {
   test(
+    "fx sessions ls lists the same sessions as fx sessions",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-ls-"));
+      try {
+        const bare = await runFx(["sessions", "--json"], { env: { HOME: home } });
+        const explicit = await runFx(["sessions", "ls", "--json"], {
+          env: { HOME: home },
+        });
+        expect(bare.code).toBe(0);
+        expect(explicit.code).toBe(0);
+        expect(explicit.stderr).toBe("");
+        const listed = JSON.parse(explicit.stdout);
+        expect(listed).toMatchObject({ kind: "sessions", count: 0, sessions: [] });
+        expect(listed).toEqual(JSON.parse(bare.stdout));
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx sessions --help lists ls and convert",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-help-"));
+      try {
+        const help = await runFx(["sessions", "--help"], { env: { HOME: home } });
+        expect(help.code).toBe(0);
+        expect(help.stdout).toContain("sessions [ls]");
+        expect(help.stdout).toContain("  ls");
+        expect(help.stdout).toContain("  convert");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx sessions --json returns valid sessions JSON",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-empty-"));
@@ -4673,6 +4713,108 @@ describe("cli: credits", () => {
         expect(text.stdout).toContain("[credits] token_pass_resets_at=2026-12-05T08:00:00.000Z\n");
       } finally {
         server.stop(true);
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask starts a team with Token Pass on the Token Pass default, keeps a chosen model, and saves the answer",
+    async () => {
+      const home = createIsolatedTestHome();
+      let hasPass = true;
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("TOKEN_PASS_ASK"),
+        fakeGatewayFinalText("CHOSEN_MODEL_ASK"),
+        fakeGatewayFinalText("SAVED_ANSWER_ASK"),
+        fakeGatewayFinalText("NO_PASS_ASK"),
+      ], {
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
+          : null,
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-token-pass-ask-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        };
+        const ask = async (args: string[], answer: string) => {
+          const result = await runFx(["ask", "--json", "--no-save", ...args, "Which model answers?"], { env, timeoutMs: TIMEOUT });
+          expect(result.code, result.stderr).toBe(0);
+          expect(result.stdout).toContain(answer);
+        };
+        const models = () => gateway.requests.map((request) => request.headers.get("ai-language-model-id"));
+        const saved = () => Object.values(JSON.parse(readFileSync(join(home, ".fx", "token-pass.json"), "utf8")).teams);
+
+        // No saved answer: fx waits for the check and starts on Token Pass.
+        await ask([], "TOKEN_PASS_ASK");
+        expect(models()).toEqual(["deepseek/deepseek-v4.1-flash"]);
+        expect(saved()).toEqual(["has_pass"]);
+
+        // A model the run names wins.
+        await ask(["--model", FAKE_GATEWAY_MODEL], "CHOSEN_MODEL_ASK");
+        expect(models()[1]).toBe(FAKE_GATEWAY_MODEL);
+
+        // The team loses Token Pass: this run still follows the saved
+        // answer, its check saves the new one, and the next run follows it.
+        hasPass = false;
+        await ask([], "SAVED_ANSWER_ASK");
+        expect(models()[2]).toBe("deepseek/deepseek-v4.1-flash");
+        expect(saved()).toEqual(["no_pass"]);
+        await ask([], "NO_PASS_ASK");
+        expect(models()[3]).toBe("spacexai/grok-4.7");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask takes Token Pass from the model list's marks when the credits check fails",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace);
+      const gateway = startFakeGateway([fakeGatewayFinalText("CATALOG_PASS_ASK")], {
+        models: tokenPassCatalog(true),
+        titleResponses: [fakeGatewayFinalText("Catalog Pass Title")],
+        usage: (url) => url.pathname === "/coding-agent/v1/credits" ? new Response("unavailable", { status: 503 }) : null,
+      });
+      try {
+        const result = await runFx(["ask", "--json", "Which model answers?"], {
+          cwd: workspace,
+          env: {
+            AI_GATEWAY_API_KEY: "fake-catalog-pass-ask-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+          },
+          timeoutMs: TIMEOUT,
+        });
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toContain("CATALOG_PASS_ASK");
+        // The marks answer for the team: the run starts on the Token Pass
+        // default, titles itself with a Token Pass model, and saves the answer.
+        expect(gateway.requests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["deepseek/deepseek-v4.1-flash"]);
+        expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id"))).toEqual(["zai/glm-5.3-flash"]);
+        expect(Object.values(JSON.parse(readFileSync(join(home, ".fx", "token-pass.json"), "utf8")).teams)).toEqual(["has_pass"]);
+      } finally {
+        gateway.stop();
         cleanupIsolatedTestHome(home);
       }
     },
@@ -6600,6 +6742,7 @@ describe("cli: completion", () => {
     [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
     [["fx", "mcp", ""], "list show add remove login logout approve reject call"],
+    [["fx", "sessions", ""], "ls convert"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
     [["fx", "login", ""], "vercel codex grok"],

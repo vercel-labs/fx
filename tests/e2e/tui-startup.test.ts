@@ -21,28 +21,11 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
-
-/// Whether this process can write into a folder whose mode forbids it, as root
-/// or a sandbox that holds every capability can.
-function ignoresFileModes(): boolean {
-  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-mode-probe-"));
-  try {
-    chmodSync(probe, 0o500);
-    try {
-      writeFileSync(join(probe, "probe"), "");
-      return true;
-    } catch {
-      return false;
-    }
-  } finally {
-    chmodSync(probe, 0o700);
-    rmSync(probe, { recursive: true, force: true });
-  }
-}
 
 /// Whether `chflags` can make a file immutable here, as macOS can and Linux
 /// cannot without root.
@@ -981,14 +964,18 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
     async () => {
       // A file-size limit of zero fails the tape's first write as a full disk
       // does. The limit also covers a stderr file, so the message is read from
-      // the pane.
+      // the pane. It also stops an instrumented build's profile writer, so the
+      // script points LLVM_PROFILE_FILE into this test's folder: the empty
+      // profile then stays out of the PGSO training profiles. Unsetting it is
+      // not enough, because the Linux instrumented build falls back to a
+      // profile path inside the training folder.
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-fault-")));
       const home = join(root, "home");
       const limited = join(root, "limited.sh");
       mkdirSync(home, { recursive: true });
       writeFileSync(
         limited,
-        `#!/bin/sh\ntrap '' XFSZ\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
+        `#!/bin/sh\ntrap '' XFSZ\nLLVM_PROFILE_FILE='${join(root, "limited-%p.profraw").replaceAll("'", "'\\''")}'\nexport LLVM_PROFILE_FILE\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
         { mode: 0o700 },
       );
 

@@ -18,3 +18,23 @@ set -eu
 cd "$(dirname "$0")"
 python3 run.py check "$@"
 python3 run.py mutate "$@"
+
+# A property that the model of the code before the grace breaks must stay broken: Request.findings.cfg
+# models that code (GraceOn = FALSE) and states that a request in flight at a refused line that
+# names no request, and silent, ends within the grace. It fails there, because the request waits
+# for its own deadline (5 minutes by default); Request.cfg models the code with the grace, where
+# it holds. Each verdict is required (../lib/tlc.sh). Other pull requests add findings blocks to this
+# file too: when two land, merge them into one tlc_verdicts block.
+#
+# Request.scoped.cfg (two normal requests and no more, for the scope of a refused line,
+# ScopedGrantsOnlyItsCall) is not here: catalog.json lists it under "also", so `run.py check` runs it
+# next to the smoke config, in CI too.
+#
+# WireDepth.findings.cfg models the code before the depth limit on a server's JSON (before this change)
+# and states that every writer can write whatever an entry point accepts, which fails while there is no
+# limit but the engine's.
+. ../lib/tlc.sh
+tlc_verdicts <<'EOF_FINDINGS'
+Request Request.findings SoonAfterRefusal
+WireDepth WireDepth.findings NoWriterOverflow
+EOF_FINDINGS
