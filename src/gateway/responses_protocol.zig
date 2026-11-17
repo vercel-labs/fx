@@ -6,7 +6,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
-const json_depth = @import("json_depth.zig");
+const json_depth = @import("../core/shared/json_depth.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 

@@ -28,6 +28,7 @@ const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
+const io_mod = @import("../shared/io.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
@@ -36,6 +37,7 @@ const authority_mod = @import("authority.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_host = @import("tool_host.zig");
 const child_state = @import("child_state.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -74,6 +76,9 @@ pub const Config = struct {
     context_enabled: bool,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The parent's capture target while `experimental.workspace_capture` is
+    /// on; the child's own session receives its captures (D98).
+    workspace_capture: ?turn_capture.Target = null,
 };
 
 const Context = struct {
@@ -218,11 +223,16 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    turn.workspace_capture = config.workspace_capture;
+    turn.capture_cancel = cancel;
     turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
+    // The child has done work in this run, whatever its replies report: the
+    // run's `subagents` result lists it (`usage_ledger.zig`).
+    if (turn.child_id) |child_id| try config.host.noteChildTurnStarted(child_id, turn.child_name);
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -508,6 +518,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .start_workspace_capture = if (context.turn.capturesWorkspace()) startWorkspaceCapture else null,
+        .reach_workspace = if (context.turn.capturesWorkspace()) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
@@ -523,6 +535,16 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .report_usage = reportUsage,
         .record_usage = recordUsage,
     };
+}
+
+fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.startWorkspaceCapture(fresh, step);
+}
+
+fn reachWorkspace(raw: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.reachWorkspace(dir, tool_name);
 }
 
 fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -675,6 +697,7 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?agent_runtime.RefreshedGatewayCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -687,6 +710,7 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
@@ -990,6 +1014,9 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
 /// own (D92). The parent's total leaves the child's out.
 fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    // The reply was billed whether or not it is saved, so the run's result
+    // counts it first (`usage_ledger.zig`).
+    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, usage);
     // A hosted run has no session here; its own agent saves its usage.
     const child = context.turn.child orelse return;
     try child.recordUsage(usage);
@@ -1024,7 +1051,37 @@ fn pushLiveToolLifecycle(
     event: types.ToolLifecycleEvent,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    noteCallActivity(context, event);
     context.turn.appendLiveEvent(.{ .tool_lifecycle = event });
+}
+
+/// Keeps the turn's current call, with the label its own rows use, for the
+/// parent's status and agent list, and relays a shell command that crossed
+/// the quiet limit to the parent (`Runtime.noteChildQuiet`).
+fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
+    switch (event) {
+        .authoritative_started => |started| {
+            const metrics = context.turn.live_metrics orelse return;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            const call: types.ToolCall = .{
+                .id = started.id.call_id,
+                .name = started.tool_name,
+                .arguments_json = started.arguments_json orelse "{}",
+            };
+            const target = resolveToolActionDisplayTarget(context, arena.allocator(), call) catch null;
+            const label = describeToolAction(context, arena.allocator(), call, target, &.{}) catch started.tool_name;
+            metrics.callStarted(started.id.call_id, label, io_mod.milliTimestamp());
+        },
+        .terminal => |terminal| {
+            if (context.turn.live_metrics) |metrics| metrics.callEnded(terminal.id.call_id);
+            const memory = terminal.result_memory orelse return;
+            const crossing = memory.quiet_crossing orelse return;
+            const child_id = context.turn.child_id orelse return;
+            context.config.host.noteChildQuiet(child_id, context.turn.child_name orelse child_id, crossing);
+        },
+        .provisional, .progress, .turn_finished => {},
+    }
 }
 
 fn pushLiveDiff(

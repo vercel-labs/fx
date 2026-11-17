@@ -8,6 +8,11 @@ const pidPath = process.env.FX_MCP_PID_PATH;
 const resultText = "p".repeat(Number(process.env.FX_MCP_RESULT_PAD_BYTES ?? "0")) +
   (process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT");
 const mode = process.env.FX_MCP_MODE ?? "normal";
+// FX_MCP_FAILURE_TEXT is a JSON string: the text a `tool_failure` error carries,
+// or the message of a `tool_protocol_error` JSON-RPC error.
+const failureText = process.env.FX_MCP_FAILURE_TEXT === undefined
+  ? "Invalid input: labels require at least one item\nretry rejected"
+  : JSON.parse(process.env.FX_MCP_FAILURE_TEXT);
 const imagePath = process.env.FX_MCP_IMAGE_PATH;
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
@@ -37,6 +42,17 @@ const callDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
 );
+// FX_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
+// FX_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
+// test can act while a call is out and then let it end.
+const callReleasePath = process.env.FX_MCP_CALL_RELEASE_PATH;
+const callStartedPath = process.env.FX_MCP_CALL_STARTED_PATH;
+// A held call ends with its input: fx closing a stopped server's input must
+// still let the process exit.
+const heldCalls = new Set();
+process.stdin.on("end", () => {
+  for (const timer of heldCalls) clearInterval(timer);
+});
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -90,8 +106,19 @@ if (process.env.FX_MCP_ENV_NAMES_CAPTURE) {
 }
 if (stallRecovery) setInterval(() => {}, 1000);
 
+// FX_MCP_ESCAPE_KEYS=mode,url: write each of these keys with one \uXXXX escape (mode becomes m\u006fde) in every
+// message this server sends. The bytes still mean the same key to any JSON reader that decodes keys.
+const escapedKeys = (process.env.FX_MCP_ESCAPE_KEYS ?? "").split(",").filter(Boolean);
+function writeEscapedKeys(line) {
+  for (const key of escapedKeys) {
+    const escaped = `${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}`;
+    line = line.replaceAll(`"${key}":`, `"${escaped}":`);
+  }
+  return line;
+}
+
 function send(message) {
-  let line = JSON.stringify(message);
+  let line = writeEscapedKeys(JSON.stringify(message));
   // A form schema given as raw JSON text goes out as written, with its escapes.
   if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
   process.stdout.write(`${line}\n`);
@@ -675,10 +702,15 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item\nretry rejected",
+            text: failureText,
           }],
         },
       });
+      return;
+    }
+    if (mode === "tool_protocol_error") {
+      // An error answering the call itself, not a tool result with isError.
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failureText } });
       return;
     }
     if (mode === "crash_always") process.exit(42);
@@ -947,7 +979,16 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.subarray(lineEnd + 1);
     if (line.length === 0) continue;
     const message = JSON.parse(line);
-    if (callDelayMs > 0 && message.method === "tools/call") {
+    if (callReleasePath && message.method === "tools/call") {
+      if (callStartedPath) appendFileSync(callStartedPath, `${process.pid}\n`);
+      const timer = setInterval(() => {
+        if (!existsSync(callReleasePath)) return;
+        clearInterval(timer);
+        heldCalls.delete(timer);
+        handle(message);
+      }, 20);
+      heldCalls.add(timer);
+    } else if (callDelayMs > 0 && message.method === "tools/call") {
       setTimeout(() => handle(message), callDelayMs);
     } else {
       handle(message);

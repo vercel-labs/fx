@@ -1,5 +1,6 @@
 // `/effort` opens a footer menu of the current model's reasoning effort
 // levels, like the `/model` menu, and `/effort <level>` applies one directly.
+// Ctrl+T steps through default and the model's levels without opening anything.
 // Every view of the menu is read back from the recorded tape through
 // `fx replay`, and the highlight from the bytes fx wrote for it, so these
 // tests check what the terminal showed, not the live pane alone.
@@ -46,6 +47,7 @@ type Shell = {
   root: string;
   home: string;
   tape: string;
+  trace: string;
   stderrPath: string;
 };
 
@@ -84,6 +86,7 @@ async function launch(options: {
     },
   });
   const tape = join(root, "session.fxtape");
+  const trace = join(root, "trace.log");
   const stderrPath = join(root, "stderr.log");
   const session = await TmuxSession.create({
     cwd: workspace,
@@ -105,9 +108,11 @@ async function launch(options: {
       FX_PERMISSION_MODE: "auto",
       FX_RECORD: tape,
       FX_RECORD_INPUT: "1",
+      FX_TRACE_LOG: trace,
+      FX_TRACE_SCOPES: "input",
     },
   });
-  shell = { session, gateway, root, home, tape, stderrPath };
+  shell = { session, gateway, root, home, tape, trace, stderrPath };
   await session.waitForComposer(10_000);
   await session.waitForPane(() => catalogServed > 0, 10_000);
   // The shell adopts the served catalog on its next loop turn.
@@ -189,6 +194,45 @@ function highlightsAfter(current: Shell, key: RegExp): string[] {
   });
 }
 
+type Traced = { session: TmuxSession; tape: string; trace: string };
+
+/// Waits for `text` in the `/effort` menu after `/effort` and Enter. CI keeps
+/// no tape or trace, so when the menu does not show it this prints what fx
+/// read and what its input code did, then fails as the wait failed.
+async function waitForEffortMenu(current: Traced, text = "Effort 5"): Promise<void> {
+  try {
+    await current.session.waitForText(text, 5_000);
+  } catch (error) {
+    console.error(effortMenuDiagnostics(current));
+    throw error;
+  }
+}
+
+/// Each read fx made from the terminal, with its time in milliseconds since
+/// the epoch, and fx's last input trace lines, which carry the same clock and
+/// say whether Enter reached the submit step.
+function effortMenuDiagnostics(current: Traced): string {
+  const lines = ["The /effort menu did not open. Input fx read, oldest first:"];
+  try {
+    // The tape header holds its start time after the magic, columns, and rows.
+    let atMs = Number(readFileSync(current.tape).readBigInt64LE(9));
+    for (const frame of readTapeFrames(current.tape, { ignoreTruncatedTail: true })) {
+      atMs += frame.deltaMs;
+      if (frame.kind === STDIN) lines.push(`  ${atMs} ${JSON.stringify(frame.payload.toString("latin1"))}`);
+    }
+  } catch (error) {
+    lines.push(`  tape unreadable: ${error}`);
+  }
+  lines.push("Last input trace lines:");
+  try {
+    const trace = readFileSync(current.trace, "utf8").split("\n").filter((line) => line.length > 0);
+    for (const line of trace.slice(-60)) lines.push(`  ${line}`);
+  } catch (error) {
+    lines.push(`  trace unreadable: ${error}`);
+  }
+  return lines.join("\n");
+}
+
 const ARROW = /^\x1b(?:\[|O)[AB]$/;
 const TAB = /^\t$/;
 
@@ -229,7 +273,7 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   const current = await launch();
   const { session } = current;
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   // ↑ from the first level wraps to the last, as the /model menu does.
   for (const key of ["Up", "Down", "Down", "Down", "Down"]) await press(session, key);
   await session.sendKeys("Enter");
@@ -239,12 +283,12 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   // Opened again, the menu marks and highlights the level now in use. Esc
   // closes it without a change.
   await session.sendText("/effort");
-  await session.waitForText("high     current", 5_000);
+  await waitForEffortMenu(current, "high     current");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
   // A typed character closes the menu and lands in the composer.
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   await session.sendLiteral("x");
   await session.waitForPane((pane) => !pane.includes("Effort 5") && /^┃ x$/m.test(pane), 5_000);
   await session.sendKeys("C-u");
@@ -333,7 +377,7 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   await session.sendText("first question");
   await session.waitForText("Thinking", 10_000);
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   await press(session, "Up");
   await session.sendKeys("Enter");
   await session.waitForText("Next turn will use reasoning effort xhigh for acme/thinker", 5_000);
@@ -361,7 +405,7 @@ test.skipIf(!tmuxAvailable())("a short terminal shows one level at a time, ↓ s
   const { session } = current;
   const kept = lastTranscriptRow((await session.capturePane()).split("\n"));
   await session.sendText("/effort");
-  await session.waitForText("Effort 5", 5_000);
+  await waitForEffortMenu(current);
   for (let step = 1; step < LEVELS.length; step++) await press(session, "Down");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
@@ -447,6 +491,66 @@ test.skipIf(!tmuxAvailable())("a model without levels opens no /effort column, a
   expect(columnViews(current, "plain-column")).toEqual([]);
 }, TIMEOUT);
 
+test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's levels and back to default, and the next request carries the one in use", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  // Over the open /effort menu, Ctrl+T closes it and steps from the level in
+  // use, here from default to the lowest, whatever the menu highlights.
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await press(session, "Up");
+  await session.sendKeys("C-t");
+  await session.waitForPane((pane) => !pane.includes("Effort 5") && pane.includes("auto · thinker · low"), 5_000);
+  expect(savedEffort(current)).toBe("low");
+
+  // The status line names each level, and the draft stays as typed. After
+  // the highest level comes default, which the status line leaves out.
+  await session.sendLiteral("keep this draft");
+  for (const level of ["medium", "high", "xhigh", "default", "low", "medium"]) {
+    await session.sendKeys("C-t");
+    if (level === "default") {
+      await session.waitForPane((pane) => /^auto · thinker *$/m.test(pane), 5_000);
+      expect(savedEffort(current)).toBe("auto");
+    } else {
+      await session.waitForText(`auto · thinker · ${level}`, 5_000);
+      expect(savedEffort(current)).toBe(level);
+    }
+  }
+  const pane = await session.capturePane();
+  expect(pane).toMatch(/^┃ keep this draft$/m);
+  // The shortcut writes nothing to the transcript.
+  expect(pane).not.toContain("Reasoning effort");
+
+  await session.sendKeys("Enter");
+  await session.waitForText("ANSWER", 10_000);
+  await session.waitForComposer(10_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+
+  const sent = gateway.requests
+    .filter((request) => request.body.includes("keep this draft"))
+    .map((request) => JSON.parse(request.body) as { reasoning?: string })[0];
+  expect(sent?.reasoning).toBe("medium");
+  // Only the /effort command opened the menu, before any level was chosen.
+  const views = menuViews(current, "cycle");
+  expect(views.length).toBeGreaterThan(0);
+  expect(views.every((view) => view.menu.current === "default")).toBe(true);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Ctrl+T on a model without levels says why and saves nothing", async () => {
+  const current = await launch({ model: PLAIN_MODEL });
+  const { session } = current;
+  await session.sendLiteral("keep this draft");
+  await session.sendKeys("C-t");
+  await session.waitForText("acme/plain has no levels to choose from", 5_000);
+  expect(await session.capturePane()).toMatch(/^┃ keep this draft$/m);
+  expect(savedEffort(current)).toBeUndefined();
+  await session.sendKeys("C-u");
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(menuViews(current, "plain-cycle")).toEqual([]);
+}, TIMEOUT);
+
 /// A shell on a custom model connection (`fixtures/chat-completions.ts`)
 /// whose model declares `levels`, recording every byte to a tape.
 async function launchCustom(levels: Record<string, Record<string, unknown>>, settings: Record<string, unknown> = {}) {
@@ -455,6 +559,7 @@ async function launchCustom(levels: Record<string, Record<string, unknown>>, set
   Object.assign(f.settings, settings);
   f.save();
   const tape = join(f.home, "session.fxtape");
+  const trace = join(f.home, "trace.log");
   const stderrPath = join(f.home, "stderr.log");
   const session = await TmuxSession.create({
     cwd: f.workspace,
@@ -462,10 +567,18 @@ async function launchCustom(levels: Record<string, Record<string, unknown>>, set
     isolated: true,
     width: 80,
     height: 24,
-    env: { ...f.env, FX_DISABLE_KEYCHAIN: "1", FX_PERMISSION_MODE: "auto", FX_RECORD: tape, FX_RECORD_INPUT: "1" },
+    env: {
+      ...f.env,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_PERMISSION_MODE: "auto",
+      FX_RECORD: tape,
+      FX_RECORD_INPUT: "1",
+      FX_TRACE_LOG: trace,
+      FX_TRACE_SCOPES: "input",
+    },
   });
   await session.waitForComposer(10_000);
-  return { f, session, tape, stderrPath, root: f.home };
+  return { f, session, tape, trace, stderrPath, root: f.home };
 }
 
 test.skipIf(!tmuxAvailable())("on a custom connection, /effort lists the levels the model's settings declare, in their order, and the request carries the chosen one's fields", async () => {
@@ -473,7 +586,7 @@ test.skipIf(!tmuxAvailable())("on a custom connection, /effort lists the levels 
   const { session, f } = current;
   try {
     await session.sendText("/effort");
-    await session.waitForText("Effort 3", 5_000);
+    await waitForEffortMenu(current, "Effort 3");
     // default, high, low: Down twice reaches low.
     await press(session, "Down");
     await press(session, "Down");

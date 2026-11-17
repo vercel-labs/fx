@@ -150,6 +150,18 @@ pub fn prepare(
     return .{ .host = h };
 }
 
+/// Applies `configs` to a running host where it stands, as the terminal app's
+/// reload does (`Host.reload`). A server whose config is the same keeps
+/// running with its connection and calls. A removed or changed one stops, and
+/// its calls end cancelled. An added one starts when the model first needs it.
+/// Threads that use the host meanwhile are safe.
+pub fn reloadHost(alloc: Allocator, host: *mcp_host.Host, configs: *const OwnedServerConfigs) !void {
+    // Read only while the host reloads.
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    try host.reload(configs.items.items, &inherited, &.{});
+}
+
 pub fn parseErrorMessage(err: ParseError) []const u8 {
     return switch (err) {
         error.OutOfMemory => "Out of memory",
@@ -556,6 +568,42 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         var owned = configs;
         owned.deinit(std.testing.allocator);
     } else |_| {}
+}
+
+test "reloadHost gives a running host its new servers where it stands" {
+    const alloc = std.testing.allocator;
+    // The host starts a server only when the model first needs it, so none starts here.
+    var before = try parse(alloc,
+        \\{"mcpServers":[{"name":"one","command":"/bin/one","args":[],"env":[]}]}
+    );
+    defer before.deinit(alloc);
+    var after = try parse(alloc,
+        \\{"mcpServers":[{"name":"two","command":"/bin/two","args":[],"env":[]},{"name":"three","command":"/bin/three","args":[],"env":[]}]}
+    );
+    defer after.deinit(alloc);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    const host = try mcp_host.Host.create(alloc, io_mod.getIo(), before.items.items, &inherited, .{
+        .client_version = build_options.app_version,
+        .credentials = .{ .detect = home },
+        .workspace_root = home,
+    }, builtin_tools.registry);
+    defer host.destroy();
+
+    try reloadHost(alloc, host, &after);
+
+    const names = try host.catalog.serverNames(alloc);
+    defer {
+        for (names) |name| alloc.free(name);
+        alloc.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("two", names[0]);
+    try std.testing.expectEqualStrings("three", names[1]);
 }
 
 test "ACP MCP parser handles fuzzed request bytes" {
