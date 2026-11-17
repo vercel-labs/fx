@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const display_width = @import("../../shared/display_width.zig");
 const ansi = @import("ansi.zig");
+const shared_theme = @import("../../shared/theme.zig");
 const tu = @import("text_util.zig");
 const bp = @import("block_parse.zig");
 const payload = @import("payload.zig");
@@ -33,14 +34,19 @@ pub fn writeHeading(
         6 => try out.appendSlice(alloc, ansi.dim_open),
         else => unreachable,
     }
+    // A theme's heading color goes on top of the level's attributes.
+    const heading_open = shared_theme.current().heading_open;
+    if (heading_open.len != 0) try out.appendSlice(alloc, heading_open);
     try inline_render.writeInlineNoBold(
         alloc,
         content,
         out,
         level == 1 or level == 3 or level == 5,
+        heading_open,
         footnotes,
         link_id,
     );
+    if (heading_open.len != 0) try out.appendSlice(alloc, shared_theme.closingFor(heading_open));
     switch (level) {
         1 => {
             try out.appendSlice(alloc, ansi.underline_close);
@@ -66,7 +72,7 @@ pub fn writeBlockquoteLine(
     link_id: *u32,
 ) !void {
     try out.appendNTimes(alloc, ' ', blockquote.indent);
-    for (0..blockquote.depth) |_| try ansi.writeDim(alloc, out, ansi.vertical_rule_prefix);
+    for (0..blockquote.depth) |_| try ansi.writeMarked(alloc, out, shared_theme.current().quote_open, ansi.vertical_rule_prefix, .dim);
     try writeQuotedBlockContent(alloc, content, line_has_lf, out, footnotes, link_id);
 }
 
@@ -114,14 +120,14 @@ pub fn writeListLine(
             try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, footnotes, link_id);
             return true;
         }
-        try ansi.writeDim(alloc, out, ansi.bullet_marker);
+        try ansi.writeMarked(alloc, out, shared_theme.current().list_marker_open, ansi.bullet_marker, .dim);
         try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, footnotes, link_id);
         return true;
     }
     if (bp.parseOrderedList(line)) |parsed| {
         try out.appendSlice(alloc, parsed.indent);
         if (ordered_markers == .right_aligned) try out.appendNTimes(alloc, ' ', orderedMarkerPad(parsed.marker));
-        try ansi.writeDim(alloc, out, parsed.marker);
+        try ansi.writeMarked(alloc, out, shared_theme.current().list_marker_open, parsed.marker, .dim);
         try out.append(alloc, ' ');
         if (bp.parseTaskListItem(parsed.content)) |task| {
             try writeTaskListMarker(alloc, out, task);
@@ -305,7 +311,7 @@ fn writeTableRow(
     out: *std.ArrayList(u8),
 ) !void {
     for (widths, 0..) |col_width, col| {
-        if (col > 0) try out.appendSlice(alloc, ansi.table_column_sep);
+        if (col > 0) try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, ansi.table_column_sep, .plain);
 
         const col_align: payload.TableColumnAlign = if (is_header) .left else alignments[col];
 
@@ -347,11 +353,14 @@ pub fn writeTableHeaderCell(alloc: Allocator, out: *std.ArrayList(u8), cell: []c
 }
 
 fn writeTableSeparator(alloc: Allocator, widths: []const usize, out: *std.ArrayList(u8)) !void {
+    const rule = ansi.mark(shared_theme.current().rule_open, .plain);
+    try out.appendSlice(alloc, rule.open);
     for (widths, 0..) |col_width, col| {
         if (col > 0) try out.appendSlice(alloc, ansi.table_junction);
         var remaining = col_width;
         while (remaining > 0) : (remaining -= 1) try out.appendSlice(alloc, ansi.table_horiz);
     }
+    try out.appendSlice(alloc, rule.close);
     try out.append(alloc, '\n');
 }
 
@@ -405,7 +414,7 @@ fn writeTablePayloadRow(
     out: *std.ArrayList(u8),
 ) !void {
     for (widths, 0..) |col_width, col| {
-        if (col > 0) try out.appendSlice(alloc, ansi.table_column_sep);
+        if (col > 0) try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, ansi.table_column_sep, .plain);
 
         const col_align: payload.TableColumnAlign = if (is_header) .left else alignments[col];
         if (col < cells.len) {
@@ -552,10 +561,55 @@ pub fn renderCodeBlockPayload(
     var start: usize = 0;
     while (start < block.code.len) {
         const end = std.mem.findScalarPos(u8, block.code, start, '\n') orelse block.code.len;
-        try ansi.writeDim(alloc, out, ansi.vertical_rule_prefix);
+        try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, ansi.vertical_rule_prefix, .dim);
         try out.appendSlice(alloc, block.code[start..end]);
         try out.append(alloc, '\n');
         if (end == block.code.len) break;
         start = end + 1;
     }
+}
+
+test "markdown structure takes the theme's heading, list, quote, and rule colors" {
+    const alloc = std.testing.allocator;
+    var theme = shared_theme.fx_dark;
+    theme.heading_open = "\x1b[38;5;1m";
+    theme.list_marker_open = "\x1b[38;5;2m";
+    theme.quote_open = "\x1b[38;5;3m";
+    theme.rule_open = "\x1b[38;5;4m";
+    shared_theme.activate(theme);
+    defer shared_theme.activate(shared_theme.fx_dark);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var link_id: u32 = 0;
+    try writeHeading(alloc, 2, "Plan", &out, null, &link_id);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[38;5;1mPlan\x1b[39m") != null);
+
+    // Text after a code span or a link inside the heading keeps its color.
+    out.clearRetainingCapacity();
+    try writeHeading(alloc, 2, "Use `foo` then [docs](https://x.dev) end", &out, null, &link_id);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[39m\x1b[38;5;1m then ") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[38;5;1m end") != null);
+
+    out.clearRetainingCapacity();
+    try std.testing.expect(try writeListLine(alloc, "- water", false, .as_written, &out, null, &link_id));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[38;5;2m" ++ ansi.bullet_marker ++ "\x1b[39m"));
+
+    out.clearRetainingCapacity();
+    try writeBlockquoteLine(alloc, .{ .indent = 0, .depth = 1 }, "note", false, &out, null, &link_id);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[38;5;3m" ++ ansi.vertical_rule_prefix ++ "\x1b[39m"));
+
+    out.clearRetainingCapacity();
+    try ansi.writeHorizontalRule(alloc, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[38;5;4m"));
+}
+
+test "builtin markdown structure keeps its terminal attributes" {
+    const alloc = std.testing.allocator;
+    shared_theme.activate(shared_theme.fx_dark);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var link_id: u32 = 0;
+    try std.testing.expect(try writeListLine(alloc, "- water", false, .as_written, &out, null, &link_id));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, ansi.dim_open ++ ansi.bullet_marker ++ ansi.dim_close));
 }

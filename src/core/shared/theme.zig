@@ -32,6 +32,18 @@ pub const SyntaxPalette = struct {
     variable_style: []const u8,
     /// `&&`, `|`, redirects, glob stars.
     operator_style: []const u8,
+    /// Language literals such as `true`, `null`, and `None`. Follows
+    /// `number` when a theme sets that slot and not this one.
+    constant_style: []const u8,
+    /// PascalCase names in code, which most languages use for types.
+    /// Empty leaves them plain.
+    type_style: []const u8 = "",
+    /// Brackets, commas, semicolons, dots, and colons in code. Empty leaves
+    /// them plain.
+    punctuation_style: []const u8 = "",
+    /// Names called in code (`name(`). Set from a theme's `function` slot;
+    /// empty, as in the builtins, leaves calls plain.
+    code_function_style: []const u8 = "",
 };
 
 pub const Theme = struct {
@@ -51,6 +63,10 @@ pub const Theme = struct {
     red_style: []const u8,
     diff_added_style: []const u8,
     diff_removed_style: []const u8,
+    /// The changed part of a removed or added line paired with its
+    /// counterpart. Empty leaves the whole line in its diff color.
+    diff_added_word_style: []const u8 = "",
+    diff_removed_word_style: []const u8 = "",
     // When selected, the line number and +/- sign carry the diff color:
     // green for additions (#30A46C), red for deletions (#E5484D).
     // Unconfigured builtins keep markers monochrome. Both truecolor and
@@ -59,17 +75,33 @@ pub const Theme = struct {
     diff_removed_marker_truecolor: []const u8,
     diff_added_marker_fallback: []const u8,
     diff_removed_marker_fallback: []const u8,
-    approval_button_active_style: []const u8,
     approval_button_inactive_style: []const u8,
     selected_completion_style: []const u8,
     permission_auto_style: []const u8,
+    /// The activity marker while fx works. Follows `permission_auto` when a
+    /// theme sets that slot and not this one.
+    accent_style: []const u8,
     user_card_marker_style: []const u8,
     user_card_accent_style: []const u8,
     inline_code_open: []const u8,
     task_completed_open: []const u8,
+    /// Markdown headings, quote rails, list markers, and rules. Empty keeps
+    /// the terminal attributes alone (bold, dim, underline).
+    heading_open: []const u8 = "",
+    quote_open: []const u8 = "",
+    list_marker_open: []const u8 = "",
+    rule_open: []const u8 = "",
     tool_stdout_style: []const u8,
     tool_stderr_style: []const u8,
     link_style: []const u8,
+    /// Colors that tell agents apart, picked per agent name. Empty leaves
+    /// names in the surrounding text color.
+    agent_1_style: []const u8 = "",
+    agent_2_style: []const u8 = "",
+    agent_3_style: []const u8 = "",
+    agent_4_style: []const u8 = "",
+    agent_5_style: []const u8 = "",
+    agent_6_style: []const u8 = "",
     syntax: SyntaxPalette,
 };
 
@@ -94,10 +126,10 @@ pub const fx_dark: Theme = .{
     .diff_removed_marker_truecolor = "\x1b[38;2;229;72;77m",
     .diff_added_marker_fallback = "\x1b[38;5;71m",
     .diff_removed_marker_fallback = "\x1b[38;5;167m",
-    .approval_button_active_style = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m",
     .approval_button_inactive_style = "\x1b[48;5;239m\x1b[38;5;255m",
     .selected_completion_style = "\x1b[1;38;5;255m",
     .permission_auto_style = "\x1b[38;5;252m",
+    .accent_style = "\x1b[38;5;252m",
     .user_card_marker_style = "\x1b[38;5;255m",
     .user_card_accent_style = "\x1b[38;5;252m",
     .inline_code_open = "\x1b[38;5;255m",
@@ -113,6 +145,7 @@ pub const fx_dark: Theme = .{
         .function_style = "\x1b[38;5;252m",
         .variable_style = "\x1b[38;5;252m",
         .operator_style = "\x1b[38;5;252m",
+        .constant_style = "\x1b[38;5;250m",
     },
 };
 
@@ -137,10 +170,10 @@ pub const fx_light: Theme = .{
     .diff_removed_marker_truecolor = "\x1b[38;2;229;72;77m",
     .diff_added_marker_fallback = "\x1b[38;5;71m",
     .diff_removed_marker_fallback = "\x1b[38;5;167m",
-    .approval_button_active_style = "\x1b[48;5;236m\x1b[38;5;255m\x1b[1m",
     .approval_button_inactive_style = "\x1b[48;5;251m\x1b[38;5;237m",
     .selected_completion_style = "\x1b[1;38;5;235m",
     .permission_auto_style = "\x1b[38;5;238m",
+    .accent_style = "\x1b[38;5;238m",
     .user_card_marker_style = "\x1b[38;5;235m",
     .user_card_accent_style = "\x1b[38;5;238m",
     .inline_code_open = "\x1b[38;5;235m",
@@ -156,6 +189,7 @@ pub const fx_light: Theme = .{
         .function_style = "\x1b[38;5;238m",
         .variable_style = "\x1b[38;5;238m",
         .operator_style = "\x1b[38;5;238m",
+        .constant_style = "\x1b[38;5;241m",
     },
 };
 
@@ -356,6 +390,39 @@ fn lastColorValueStarts(escape: []const u8, starts: *[3]usize) ?usize {
     }
     if (!ends_with_color) return null;
     return color_values;
+}
+
+pub const agent_style_count = 6;
+
+/// The color that tells the agent called `name` apart, or "" when the theme
+/// leaves agents uncolored. A name keeps its color across turns and
+/// sessions, since it hashes to the slot. Slots the theme leaves empty are
+/// skipped, so a theme that sets a few colors spreads names over those.
+pub fn agentStyle(theme: Theme, name: []const u8) []const u8 {
+    const styles = [agent_style_count][]const u8{
+        theme.agent_1_style, theme.agent_2_style, theme.agent_3_style,
+        theme.agent_4_style, theme.agent_5_style, theme.agent_6_style,
+    };
+    var set: [agent_style_count][]const u8 = undefined;
+    var count: usize = 0;
+    for (styles) |style| {
+        if (style.len == 0) continue;
+        set[count] = style;
+        count += 1;
+    }
+    if (count == 0 or name.len == 0) return "";
+    return set[std.hash.Fnv1a_32.hash(name) % count];
+}
+
+test "agentStyle keeps a name on one set color and leaves agents plain without any" {
+    try std.testing.expectEqualStrings("", agentStyle(fx_dark, "scout"));
+    var theme = fx_dark;
+    theme.agent_2_style = "\x1b[38;5;1m";
+    theme.agent_5_style = "\x1b[38;5;2m";
+    const first = agentStyle(theme, "scout");
+    try std.testing.expect(std.mem.eql(u8, first, theme.agent_2_style) or std.mem.eql(u8, first, theme.agent_5_style));
+    try std.testing.expectEqualStrings(first, agentStyle(theme, "scout"));
+    try std.testing.expectEqualStrings("", agentStyle(theme, ""));
 }
 
 /// The theme currently applied to the process. Core producers that cannot
@@ -742,6 +809,11 @@ fn parseNative(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
             const spec = try parseSlotSpec(entry.value_ptr.*);
             try applySlot(&theme, alloc, entry.key_ptr.*, spec, options);
         }
+        // Themes written before `accent` colored the activity marker
+        // through `permission_auto`; keep that for them.
+        if (colors_value.object.get("accent") == null and colors_value.object.get("permission_auto") != null) {
+            theme.accent_style = theme.permission_auto_style;
+        }
     }
     if (root.get("syntax")) |syntax_value| {
         switch (syntax_value) {
@@ -754,6 +826,7 @@ fn parseNative(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
 }
 
 fn applySyntax(theme: *Theme, alloc: std.mem.Allocator, syntax: std.json.ObjectMap, options: ParseOptions) ParseError!void {
+    defer followSyntaxSlots(theme, syntax.get("constant") != null);
     var it = syntax.iterator();
     while (it.next()) |entry| {
         const spec = try parseSlotSpec(entry.value_ptr.*);
@@ -772,7 +845,26 @@ fn applySyntax(theme: *Theme, alloc: std.mem.Allocator, syntax: std.json.ObjectM
             theme.syntax.variable_style = resolved;
         } else if (std.mem.eql(u8, entry.key_ptr.*, "operator")) {
             theme.syntax.operator_style = resolved;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "constant")) {
+            theme.syntax.constant_style = resolved;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "type")) {
+            theme.syntax.type_style = resolved;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "punctuation")) {
+            theme.syntax.punctuation_style = resolved;
         }
+    }
+}
+
+/// Slots that older themes colored through another one keep following it:
+/// literals took the number color, and a theme's function color now covers
+/// calls in code too. The builtins leave calls plain.
+fn followSyntaxSlots(theme: *Theme, constant_set: bool) void {
+    const base = builtin(theme.light).syntax;
+    if (!constant_set and !std.mem.eql(u8, theme.syntax.number_style, base.number_style)) {
+        theme.syntax.constant_style = theme.syntax.number_style;
+    }
+    if (!std.mem.eql(u8, theme.syntax.function_style, base.function_style)) {
+        theme.syntax.code_function_style = theme.syntax.function_style;
     }
 }
 
@@ -805,7 +897,6 @@ const vscode_slot_map = [_]VsCodeSlot{
     .{ .key = "diff_removed", .sources = &.{ "editorGutter.deletedBackground", "terminal.ansiRed" } },
     .{ .key = "diff_added_marker", .sources = &.{ "editorGutter.addedBackground", "terminal.ansiGreen" } },
     .{ .key = "diff_removed_marker", .sources = &.{ "editorGutter.deletedBackground", "terminal.ansiRed" } },
-    .{ .key = "approval_button_active", .sources = &.{ "button.foreground", "editor.background" }, .bg_sources = &.{ "button.background", "editor.foreground" }, .bold = true },
     .{ .key = "approval_button_inactive", .sources = &.{ "editor.foreground", "foreground" }, .bg_sources = &.{"editor.lineHighlightBackground"} },
     .{ .key = "selected_completion", .sources = &.{ "editor.foreground", "foreground" }, .bold = true },
     .{ .key = "permission_auto", .sources = &.{ "editor.foreground", "foreground" } },
@@ -815,6 +906,22 @@ const vscode_slot_map = [_]VsCodeSlot{
     .{ .key = "task_completed", .sources = &.{ "terminal.ansiGreen", "editor.foreground", "foreground" } },
     .{ .key = "tool_stdout", .sources = &.{ "terminal.foreground", "editor.foreground", "foreground" } },
     .{ .key = "tool_stderr", .sources = &.{ "editorWarning.foreground", "terminal.foreground", "editor.foreground" } },
+    .{ .key = "accent", .sources = &.{ "focusBorder", "button.background" } },
+    .{ .key = "diff_added_word", .sources = &.{}, .bg_sources = &.{ "diffEditor.insertedTextBackground", "diffEditor.insertedLineBackground" } },
+    .{ .key = "diff_removed_word", .sources = &.{}, .bg_sources = &.{ "diffEditor.removedTextBackground", "diffEditor.removedLineBackground" } },
+    .{ .key = "agent_1", .sources = &.{"terminal.ansiBlue"} },
+    .{ .key = "agent_2", .sources = &.{"terminal.ansiMagenta"} },
+    .{ .key = "agent_3", .sources = &.{"terminal.ansiCyan"} },
+    .{ .key = "agent_4", .sources = &.{"terminal.ansiYellow"} },
+    .{ .key = "agent_5", .sources = &.{"terminal.ansiGreen"} },
+    .{ .key = "agent_6", .sources = &.{"terminal.ansiRed"} },
+};
+
+/// Markdown slots read from the editor's markup scopes.
+const vscode_markdown_scopes = [_]struct { slot: []const u8, scope: []const u8 }{
+    .{ .slot = "heading", .scope = "markup.heading" },
+    .{ .slot = "quote", .scope = "markup.quote" },
+    .{ .slot = "list_marker", .scope = "punctuation.definition.list" },
 };
 
 const vscode_syntax_scopes = [_]struct { slot: []const u8, scope: []const u8 }{
@@ -825,6 +932,9 @@ const vscode_syntax_scopes = [_]struct { slot: []const u8, scope: []const u8 }{
     .{ .slot = "function", .scope = "entity.name.function" },
     .{ .slot = "variable", .scope = "variable" },
     .{ .slot = "operator", .scope = "keyword.operator" },
+    .{ .slot = "constant", .scope = "constant.language" },
+    .{ .slot = "type", .scope = "entity.name.type" },
+    .{ .slot = "punctuation", .scope = "punctuation" },
 };
 
 fn vscodeColor(colors: ?std.json.ObjectMap, sources: []const []const u8, bg: Rgb) ?Rgb {
@@ -951,9 +1061,65 @@ fn parseVsCode(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
                     @field(theme.syntax, target.slot ++ "_style") = resolved;
                 }
             }
+            inline for (vscode_markdown_scopes) |target| {
+                if (tokenColorMatch(token_colors.array.items, target.scope, blend_bg)) |match| {
+                    try applySlot(&theme, alloc, target.slot, .{ .fg = match.rgb, .bold = match.bold, .italic = match.italic }, options);
+                }
+            }
+            followSyntaxSlots(&theme, !std.mem.eql(u8, theme.syntax.constant_style, builtin(light).syntax.constant_style));
         }
     }
+    // As in native themes, the activity marker keeps the permission_auto
+    // color it had before `accent` existed when the editor names no accent.
+    const base = builtin(light);
+    if (std.mem.eql(u8, theme.accent_style, base.accent_style) and
+        !std.mem.eql(u8, theme.permission_auto_style, base.permission_auto_style))
+    {
+        theme.accent_style = theme.permission_auto_style;
+    }
     return theme;
+}
+
+// --- Named themes that ship with fx ---
+
+/// A named theme compiled into fx, with a dark and a light variant, so it
+/// follows the terminal's mode the way fx's own theme does. It loads like a
+/// theme file otherwise, and a file with the same name under ~/.fx/themes
+/// takes its place. WebAssembly hosts, which have no theme files, get these
+/// too.
+pub const NamedTheme = struct {
+    name: []const u8,
+    description: []const u8,
+    dark: []const u8,
+    light: []const u8,
+
+    pub fn bytes(self: NamedTheme, light: bool) []const u8 {
+        return if (light) self.light else self.dark;
+    }
+};
+
+fn shipped(comptime name: []const u8, comptime description: []const u8) NamedTheme {
+    return .{
+        .name = name,
+        .description = description,
+        .dark = @embedFile("themes/" ++ name ++ "-dark.json"),
+        .light = @embedFile("themes/" ++ name ++ "-light.json"),
+    };
+}
+
+pub const named_themes = [_]NamedTheme{
+    shipped("phosphor", "green phosphor with rainbow accents"),
+    shipped("breadbin", "light blue and lavender, like an 8-bit home computer"),
+    shipped("dotmatrix", "olive greens, like a handheld game screen"),
+    shipped("beige", "cream, brown, and olive, like a beige PC"),
+    shipped("geist", "grays and blue, only colors from the Geist palette"),
+};
+
+pub fn namedTheme(name: []const u8) ?NamedTheme {
+    for (named_themes) |theme| {
+        if (std.mem.eql(u8, theme.name, name)) return theme;
+    }
+    return null;
 }
 
 // --- Loading from ~/.fx/themes ---
@@ -988,13 +1154,13 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
 /// mismatches, and returns null to signal the builtin variant when neither
 /// file fits. Used both at startup and on live terminal theme notifications.
 pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
-    const theme = loadNamed(alloc, name, options) catch |err| {
+    const theme = loadNamed(alloc, name, terminal_light, options) catch |err| {
         debug_trace.logf("theme", "custom_theme_load_failed name={s} err={s}", .{ name, @errorName(err) });
         return null;
     };
     if (theme.light == terminal_light) return theme;
     if (siblingName(alloc, name, terminal_light) catch null) |sibling| {
-        if (loadNamed(alloc, sibling, options)) |swapped| {
+        if (loadNamed(alloc, sibling, terminal_light, options)) |swapped| {
             if (swapped.light == terminal_light) {
                 debug_trace.logf("theme", "theme_variant_swapped from={s} to={s}", .{ name, sibling });
                 return swapped;
@@ -1010,9 +1176,6 @@ pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: 
     return null;
 }
 
-/// Loads `~/.fx/themes/<name>.json` and resolves it for the terminal's color
-/// capability. The returned Theme is process-lifetime state allocated from
-/// `alloc`; the caller keeps the allocation alive.
 /// Whether `name` can name a theme file under ~/.fx/themes: 1 to 64 letters,
 /// digits, `-`, `_`, or `.`, and not `.` or `..`.
 pub fn validThemeName(name: []const u8) bool {
@@ -1024,9 +1187,27 @@ pub fn validThemeName(name: []const u8) bool {
     return !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..");
 }
 
-pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptions) LoadError!Theme {
+/// Loads `~/.fx/themes/<name>.json`, or the named theme fx ships when no such
+/// file exists, and resolves it for the terminal's color capability. `light`
+/// picks the variant of a named theme fx ships; a theme file declares its
+/// own. The returned Theme is process-lifetime state allocated from `alloc`;
+/// the caller keeps the allocation alive.
+pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, light: bool, options: ParseOptions) LoadError!Theme {
     if (!validThemeName(name)) return error.InvalidName;
+    var theme = loadFile(alloc, name, options) catch |err| switch (err) {
+        error.ThemeNotFound => blk: {
+            const named = namedTheme(name) orelse return error.ThemeNotFound;
+            break :blk try parse(alloc, named.bytes(light), options);
+        },
+        else => return err,
+    };
+    // A file without "name" would keep its builtin base's name and pass for
+    // that builtin, so a light/dark flip would not retint its colors.
+    if (std.mem.eql(u8, theme.name, builtin(theme.light).name)) theme.name = try alloc.dupe(u8, name);
+    return theme;
+}
 
+fn loadFile(alloc: std.mem.Allocator, name: []const u8, options: ParseOptions) LoadError!Theme {
     const home = io_mod.homeDir() orelse return error.ThemeNotFound;
     const dir_path = try profile_paths.rootPath(alloc, home, &.{"themes"});
     defer alloc.free(dir_path);
@@ -1052,16 +1233,38 @@ test "builtin selects the variant matching the light flag" {
     try std.testing.expect(builtin(true).light);
 }
 
+/// Slots the builtins leave empty on purpose: empty keeps fx's historical
+/// look, and a theme that sets one adds its color.
+const optional_slots = [_][]const u8{
+    "diff_added_word_style", "diff_removed_word_style", "heading_open",        "quote_open",
+    "list_marker_open",      "rule_open",               "agent_1_style",       "agent_2_style",
+    "agent_3_style",         "agent_4_style",           "agent_5_style",       "agent_6_style",
+    "type_style",            "punctuation_style",       "code_function_style",
+};
+
+fn isOptionalSlot(comptime name: []const u8) bool {
+    @setEvalBranchQuota(20_000);
+    inline for (optional_slots) |optional| {
+        if (comptime std.mem.eql(u8, optional, name)) return true;
+    }
+    return false;
+}
+
 test "every theme slot is populated" {
+    @setEvalBranchQuota(20_000);
     const info = @typeInfo(Theme).@"struct";
     inline for (info.field_names, info.field_types) |field_name, field_type| {
-        if (field_type == []const u8) {
+        if (comptime isOptionalSlot(field_name)) {
+            try std.testing.expectEqualStrings("", @field(fx_dark, field_name));
+            try std.testing.expectEqualStrings("", @field(fx_light, field_name));
+        } else if (field_type == []const u8) {
             try std.testing.expect(@field(fx_dark, field_name).len > 0);
             try std.testing.expect(@field(fx_light, field_name).len > 0);
         } else if (field_type == SyntaxPalette) {
             const syntax_info = @typeInfo(SyntaxPalette).@"struct";
             inline for (syntax_info.field_names, syntax_info.field_types) |syntax_name, syntax_type| {
                 if (syntax_type != []const u8) continue;
+                if (comptime isOptionalSlot(syntax_name)) continue;
                 try std.testing.expect(@field(fx_dark.syntax, syntax_name).len > 0);
                 try std.testing.expect(@field(fx_light.syntax, syntax_name).len > 0);
             }
@@ -1168,7 +1371,7 @@ test "parse resolves a native theme overlay on the matching builtin" {
         \\  "name": "test-native",
         \\  "colors": {
         \\    "divider": "#ff0000",
-        \\    "approval_button_active": { "fg": "#191c22", "bg": "#81a1c1", "bold": true },
+        \\    "approval_button_inactive": { "fg": "#191c22", "bg": "#81a1c1", "bold": true },
         \\    "diff_added_marker": "#30a46c"
         \\  },
         \\  "syntax": { "keyword": "#82d2ce", "comment": { "fg": "#6a9955", "italic": true } }
@@ -1178,7 +1381,7 @@ test "parse resolves a native theme overlay on the matching builtin" {
     try std.testing.expectEqualStrings("test-native", theme.name);
     try std.testing.expect(!theme.light);
     try std.testing.expectEqualStrings("\x1b[38;2;255;0;0m", theme.divider_style);
-    try std.testing.expectEqualStrings("\x1b[1;38;2;25;28;34;48;2;129;161;193m", theme.approval_button_active_style);
+    try std.testing.expectEqualStrings("\x1b[1;38;2;25;28;34;48;2;129;161;193m", theme.approval_button_inactive_style);
     try std.testing.expectEqualStrings("\x1b[38;2;48;164;108m", theme.diff_added_marker_truecolor);
     try std.testing.expectEqualStrings(fx_dark.diff_removed_marker_truecolor, theme.diff_removed_marker_truecolor);
     try std.testing.expectEqualStrings("\x1b[38;2;130;210;206m", theme.syntax.keyword_style);
@@ -1257,7 +1460,6 @@ test "parse resolves a VS Code theme through the adapter" {
     try std.testing.expectEqualStrings("\x1b[38;2;241;180;103m", theme.warning_style);
     try std.testing.expectEqualStrings("\x1b[38;2;63;162;102m", theme.green_style);
     try std.testing.expectEqualStrings("\x1b[38;2;252;107;131m", theme.red_style);
-    try std.testing.expectEqualStrings("\x1b[1;38;2;25;28;34;48;2;129;161;193m", theme.approval_button_active_style);
     // Exact scope beats prefix; later entries override at equal specificity;
     // compound selectors never fill a base slot.
     try std.testing.expectEqualStrings("\x1b[38;2;130;210;206m", theme.syntax.keyword_style);
@@ -1287,15 +1489,55 @@ test "parse rejects malformed themes" {
     try std.testing.expectError(error.InvalidTheme, parse(alloc, "{ \"colors\": { \"divider\": { \"bold\": true } } }", .{}));
 }
 
+test "every named theme fx ships has a dark and a light variant that parse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (named_themes) |named| {
+        try std.testing.expect(validThemeName(named.name));
+        try std.testing.expect(classifyValue(named.name).? == .custom);
+        for ([_]bool{ false, true }) |light| {
+            const theme = try parse(alloc, named.bytes(light), .{});
+            try std.testing.expectEqual(light, theme.light);
+            // Every slot is set, so no part of the theme falls back to fx's grays.
+            try std.testing.expect(!std.mem.eql(u8, theme.link_style, builtin(light).link_style));
+            try std.testing.expect(!std.mem.eql(u8, theme.syntax.keyword_style, builtin(light).syntax.keyword_style));
+        }
+    }
+}
+
+test "named themes are found by exact name and load without a theme file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("dotmatrix", namedTheme("dotmatrix").?.name);
+    try std.testing.expect(namedTheme("DOTMATRIX") == null);
+    try std.testing.expect(namedTheme("fx-dark") == null);
+    for ([_]bool{ false, true }) |light| {
+        const theme = try loadNamed(arena.allocator(), "dotmatrix", light, .{});
+        try std.testing.expectEqual(light, theme.light);
+        // Named, so a light/dark flip treats it as a theme of its own, not fx's.
+        try std.testing.expectEqualStrings("dotmatrix", theme.name);
+    }
+}
+
+test "a named theme fx ships follows the terminal's mode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |light| {
+        const theme = (try resolveNamed(arena.allocator(), "beige", light, .{})).?;
+        try std.testing.expectEqual(light, theme.light);
+    }
+}
+
 test "loadNamed validates the theme name before touching disk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "", .{}));
-    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "../escape", .{}));
-    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "a/b", .{}));
-    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "..", .{}));
-    try std.testing.expectError(error.ThemeNotFound, loadNamed(alloc, "fx-theme-that-does-not-exist-9z9z", .{}));
+    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "", false, .{}));
+    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "../escape", false, .{}));
+    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "a/b", false, .{}));
+    try std.testing.expectError(error.InvalidName, loadNamed(alloc, "..", false, .{}));
+    try std.testing.expectError(error.ThemeNotFound, loadNamed(alloc, "fx-theme-that-does-not-exist-9z9z", false, .{}));
 }
 
 test "siblingName maps variant suffixes for terminal-mode swaps" {
@@ -1337,13 +1579,80 @@ test "sgrHasParam parses the parameter list exactly" {
     try std.testing.expect(!sgrHasParam("\x1b[38;5;245", "38"));
 }
 
+test "native themes set the markdown, diff word, agent, accent, and new syntax slots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const theme = try parse(alloc,
+        \\{ "colors": {
+        \\    "accent": "#ff8800", "heading": { "fg": "#00ff00", "bold": true }, "quote": "#111111",
+        \\    "list_marker": "#222222", "rule": "#333333",
+        \\    "diff_added_word": { "bg": "#003300" }, "diff_removed_word": { "bg": "#330000" },
+        \\    "agent_1": "#0000ff", "agent_6": "#ff00ff" },
+        \\  "syntax": { "type": "#444444", "constant": "#555555", "punctuation": "#666666", "function": "#777777" } }
+    , .{ .truecolor = true });
+    try std.testing.expectEqualStrings("\x1b[38;2;255;136;0m", theme.accent_style);
+    try std.testing.expectEqualStrings("\x1b[1;38;2;0;255;0m", theme.heading_open);
+    try std.testing.expectEqualStrings("\x1b[38;2;17;17;17m", theme.quote_open);
+    try std.testing.expectEqualStrings("\x1b[38;2;34;34;34m", theme.list_marker_open);
+    try std.testing.expectEqualStrings("\x1b[38;2;51;51;51m", theme.rule_open);
+    try std.testing.expectEqualStrings("\x1b[48;2;0;51;0m", theme.diff_added_word_style);
+    try std.testing.expectEqualStrings("\x1b[48;2;51;0;0m", theme.diff_removed_word_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;0;0;255m", theme.agent_1_style);
+    try std.testing.expectEqualStrings("", theme.agent_2_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;68;68;68m", theme.syntax.type_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;85;85;85m", theme.syntax.constant_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;102;102;102m", theme.syntax.punctuation_style);
+    // Calls in code share the function color under its own escape form, so
+    // a light/dark flip can still tell the two slots apart.
+    try std.testing.expect(theme.syntax.code_function_style.len > 0);
+}
+
+test "older themes keep accent on permission_auto and literals on number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const theme = try parse(alloc,
+        \\{ "colors": { "permission_auto": "#ff0000" }, "syntax": { "number": "#00ff00" } }
+    , .{ .truecolor = true });
+    // Same color as its source slot, in its own distinct escape form.
+    try std.testing.expectEqualStrings(try withoutPadding(alloc, theme.permission_auto_style), try withoutPadding(alloc, theme.accent_style));
+    try std.testing.expectEqualStrings(try withoutPadding(alloc, theme.syntax.number_style), try withoutPadding(alloc, theme.syntax.constant_style));
+    // A theme that sets no function color leaves calls in code plain.
+    try std.testing.expectEqualStrings("", theme.syntax.code_function_style);
+}
+
+/// `escape` with the leading zeros `giveSlotsDistinctEscapes` adds removed.
+fn withoutPadding(alloc: std.mem.Allocator, escape: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var at_value_start = true;
+    for (escape, 0..) |byte, index| {
+        const more_digits = index + 1 < escape.len and std.ascii.isDigit(escape[index + 1]);
+        if (byte == '0' and at_value_start and more_digits) continue;
+        at_value_start = byte == ';' or byte == '[';
+        try out.append(alloc, byte);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "builtins leave the new slots at their historical look" {
+    for ([_]Theme{ fx_dark, fx_light }) |theme| {
+        try std.testing.expectEqualStrings(theme.permission_auto_style, theme.accent_style);
+        try std.testing.expectEqualStrings(theme.syntax.number_style, theme.syntax.constant_style);
+        try std.testing.expectEqualStrings("", theme.heading_open);
+        try std.testing.expectEqualStrings("", theme.diff_added_word_style);
+        try std.testing.expectEqualStrings("", theme.syntax.code_function_style);
+        try std.testing.expectEqualStrings("", agentStyle(theme, "scout"));
+    }
+}
+
 test "closingFor resets exactly what the open set" {
     try std.testing.expectEqualStrings("\x1b[39m", closingFor(fx_dark.hint_style));
     try std.testing.expectEqualStrings("\x1b[39m", closingFor(fx_dark.inline_code_open));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[22m", closingFor(fx_dark.tag_style));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[23m", closingFor("\x1b[3;38;2;1;2;3m"));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[22m\x1b[23m", closingFor("\x1b[1;3;38;2;1;2;3m"));
-    try std.testing.expectEqualStrings("\x1b[39m\x1b[49m\x1b[22m", closingFor(fx_dark.approval_button_active_style));
+    try std.testing.expectEqualStrings("\x1b[39m\x1b[49m\x1b[22m", closingFor("\x1b[48;5;255m\x1b[38;5;235m\x1b[1m"));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m", closingFor(fx_dark.approval_button_inactive_style));
 }
 
@@ -1536,4 +1845,19 @@ test "builtin themes pin the new slot bytes" {
     for ([_][]const u8{ fx_light.syntax.function_style, fx_light.syntax.variable_style, fx_light.syntax.operator_style }) |style| {
         try std.testing.expectEqualStrings(fx_light.syntax.keyword_style, style);
     }
+}
+
+test "VS Code themes follow the same accent, constant, and call rules as native ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const theme = try parse(alloc,
+        \\{ "type": "dark", "colors": { "editor.foreground": "#abcdef" },
+        \\  "tokenColors": [
+        \\    { "scope": "constant.numeric", "settings": { "foreground": "#112233" } },
+        \\    { "scope": "entity.name.function", "settings": { "foreground": "#445566" } } ] }
+    , .{ .truecolor = true });
+    try std.testing.expectEqualStrings(try withoutPadding(alloc, theme.permission_auto_style), try withoutPadding(alloc, theme.accent_style));
+    try std.testing.expectEqualStrings(try withoutPadding(alloc, theme.syntax.number_style), try withoutPadding(alloc, theme.syntax.constant_style));
+    try std.testing.expectEqualStrings(try withoutPadding(alloc, theme.syntax.function_style), try withoutPadding(alloc, theme.syntax.code_function_style));
 }

@@ -1049,6 +1049,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             .custom => |name| {
                 shared_theme.setSource(name, false);
                 const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
+                ui_render.noteTerminalMode(detected.light);
                 const custom_theme = shared_theme.resolveNamed(cfg.alloc, name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
                     debug_trace.logf("theme", "custom_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
                     break :blk null;
@@ -1063,6 +1064,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     } else {
         shared_theme.setSource(null, false);
         const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
+        ui_render.noteTerminalMode(detected.light);
         ui_render.initTheme(detected.light, detected.rgb);
     }
     // Custom themes keep live monitoring: terminal mode flips re-resolve the

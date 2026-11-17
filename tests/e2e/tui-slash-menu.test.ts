@@ -853,6 +853,65 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "/theme lists the named themes fx ships and applies and saves the chosen one",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-theme-command-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-theme-command-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          NO_COLOR: undefined,
+          COLORTERM: "truecolor",
+          COLORFGBG: "15;0",
+        },
+        width: 110,
+        height: 30,
+        stderrPath,
+      });
+      const s = session;
+      await s.waitForComposer(10_000);
+
+      await s.sendLiteralText("/theme ");
+      const menu = await s.waitForText("olive greens, like a handheld game screen", 5_000);
+      for (const name of ["phosphor", "breadbin", "dotmatrix", "beige", "geist"]) expect(menu).toContain(name);
+
+      await clearRenameComposer(s);
+      await s.sendText("/theme dotmatrix");
+      await s.waitForText("theme: dotmatrix", 5_000);
+      // The dotmatrix hint color, so the new theme painted the screen.
+      expect(await s.capturePaneEscapes()).toContain("\x1b[38;2;214;218;204m");
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).theme).toBe("dotmatrix");
+
+      // Every named theme has a dark variant, so beige applies here too.
+      await s.sendText("/theme beige");
+      await s.waitForText("theme: beige", 5_000);
+      expect(await s.capturePaneEscapes()).toContain("\x1b[38;2;221;215;201m");
+      expect(await s.capturePane()).not.toContain("not a dark theme");
+
+      await s.sendText("/theme nope");
+      await s.waitForText("no theme named nope; choose phosphor, breadbin, dotmatrix, beige, or geist", 5_000);
+
+      expect(gateway!.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "a /rename title that matches a skill stays a title",
     async () => {
       const { tracePath, stderrPath } = await startRenameMenuSession();
@@ -1957,7 +2016,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 40);
+      let grid = await waitForHelpMenu(session, 41);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1973,7 +2032,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 40);
+      grid = await waitForHelpMenu(session, 41);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1984,11 +2043,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 41);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 41"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1997,7 +2056,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 41);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -2014,7 +2073,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 41);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -2589,7 +2648,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 40);
+      grid = await waitForHelpMenu(session, 41);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);

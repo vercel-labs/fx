@@ -42,6 +42,7 @@ pub const ParsedCommand = union(enum) {
     ultrafast: []const u8,
     statusline: []const u8,
     notifications: []const u8,
+    theme: []const u8,
     workspace: []const u8,
     shell: []const u8,
     version,
@@ -89,6 +90,7 @@ pub const CommandHandlers = struct {
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_theme: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
@@ -138,6 +140,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .ultrafast => .{ .ultrafast = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
+        .theme => .{ .theme = payload },
         .workspace => .{ .workspace = payload },
         .shell => .{ .shell = payload },
         .version => .version,
@@ -208,6 +211,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .ultrafast => |rest| try handlers.handle_ultrafast(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
+        .theme => |rest| try handlers.handle_theme(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
@@ -500,6 +504,12 @@ fn recordNotifications(ctx: *anyopaque, value: []const u8) anyerror!void {
     test_context.payload = value;
 }
 
+fn recordTheme(ctx: *anyopaque, value: []const u8) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "theme";
+    test_context.payload = value;
+}
+
 fn recordUnknown(ctx: *anyopaque, value: []const u8) anyerror!void {
     const test_context = testContext(ctx);
     test_context.called = "unknown";
@@ -552,6 +562,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
+        .handle_theme = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
@@ -670,6 +681,17 @@ test "route forwards notifications payload" {
 
     try std.testing.expectEqualStrings("notifications", ctx.called);
     try std.testing.expectEqualStrings("off", ctx.payload);
+}
+
+test "route forwards theme payload" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_theme = recordTheme;
+
+    try route(testSlashRegistry(), &handlers, "/theme dotmatrix");
+
+    try std.testing.expectEqualStrings("theme", ctx.called);
+    try std.testing.expectEqualStrings("dotmatrix", ctx.payload);
 }
 
 test "route sends original command string to unknown handler" {
