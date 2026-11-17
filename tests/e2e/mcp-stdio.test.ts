@@ -4402,7 +4402,8 @@ describe("MCP stdio servers", () => {
   }, 60_000);
 
   test("a protocol error whose data is nested 2000 levels deep still reaches the model with its message", async () => {
-    // The depth limit reads a result only: an error's data is never written again as it is.
+    // The host drops an error's `data` and keeps its code and message, so no depth refusal is traced here:
+    // this test does not reach the check on `data`, which the Zig tests of `parseProtocolError` pin.
     const root = deepRoot("deep-error-data", "error_data", 2000);
     gateway = deepGateway("DEEP_ERROR_DATA_DONE", false);
     const result = await ask(root, "Use the stdio MCP echo tool.");
@@ -4410,6 +4411,7 @@ describe("MCP stdio servers", () => {
     const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
     expect(seen).toContain("MCP protocol error -32602: bad");
     expect(seen).not.toContain(DEEP_WORDS);
+    expect(refusedLines(root)).toEqual([]);
   }, 25_000);
 
   test("a reply cut inside deep nesting ends the call, and fx neither crashes nor waits", async () => {
@@ -4423,6 +4425,36 @@ describe("MCP stdio servers", () => {
     expect(result.stdout).toContain("DEEP_CUT_DONE");
     expect(toolResultText(gateway.requests.at(-1)!.body, "call_mcp")).not.toContain(LEGACY_RESULT);
   }, 25_000);
+
+  test("a result nested past the engine's own limit ends the call after the grace for an unreadable line, as malformed, and cancels it", async () => {
+    // The engine reads a message up to about 2,584 levels deep and drops a deeper one, so fx never sees
+    // the depth limit's check: the call waits out the grace for a line it cannot read (30 seconds), then
+    // ends as malformed and is cancelled on the server.
+    const root = deepRoot("deep-past-engine", "structured", 3000);
+    gateway = deepGateway("DEEP_PAST_ENGINE_DONE", false);
+    const started = Date.now();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool."], {
+      cwd: root.workspace,
+      env: v2Env(root, gateway),
+      timeoutMs: 60_000,
+    });
+    const seconds = (Date.now() - started) / 1000;
+    expect({ code: result.code, signal: result.signal }).toEqual({ code: 0, signal: null });
+    expect(result.stdout).toContain("DEEP_PAST_ENGINE_DONE");
+    const seen = toolResultText(gateway.requests.at(-1)!.body, "call_mcp");
+    expect(seen).toContain("the server's answer was malformed");
+    expect(seen).not.toContain(DEEP_WORDS);
+    expect(seen).not.toContain(LEGACY_RESULT);
+    // About 30 seconds after the line: not at once, and far from the 5 minutes an operation waits by default.
+    expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    const wire = readWire(root.wireLogPath);
+    const call = wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+    const cancelled = wire.find((entry) => entry.message.method === "notifications/cancelled");
+    expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
+    // The depth check never ran: the engine dropped the message first.
+    expect(refusedLines(root)).toEqual([]);
+    await expectFixtureProcessesExited(wire);
+  }, 90_000);
 });
 
 // `fx mcp call` lets a command fx's shell tool runs call the session's MCP
