@@ -503,8 +503,15 @@ fn detailOf(store: *Store, alloc: Allocator, id: []const u8, peeked: sm.Peeked) 
 /// it (D61). Caller owns the result.
 fn readV1Session(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     store.problem = .{};
-    var detail = (v1_conversion.readDetail(alloc, store.home, id) catch |err| switch (err) {
-        error.OutOfMemory, error.SessionNotFound => return err,
+    var detail = (v1_conversion.readDetail(alloc, store.home, id, &store.problem) catch |err| switch (err) {
+        // A folder others can write, a symlink or a FIFO is unsafe, not
+        // damaged: recover refuses it the same way (D61).
+        error.OutOfMemory,
+        error.SessionNotFound,
+        error.PrivateStatePermissionsUnsupported,
+        error.DurablePathUnsafe,
+        error.SessionPathUnsafe,
+        => return err,
         else => return v1Unreadable(store, alloc, id, err),
     }) orelse return error.SessionNotFound;
     defer detail.summary.deinit(alloc);
@@ -1296,7 +1303,8 @@ fn checkV1(store: *Store, alloc: Allocator, root_id: []const u8) !?Doctor.Stuck 
         error.OutOfMemory => return err,
         error.SessionBusy, error.SessionNotFound => return null,
         error.InvalidSessionFormat => return try stuckRoot(alloc, root_id, store.problem.text(), .nothing),
-        else => return try stuckRoot(alloc, root_id, @errorName(err), .nothing),
+        // A member folder others can write: `problem` names it and its fix (D61).
+        else => return try stuckRoot(alloc, root_id, if (store.problem.len > 0) store.problem.text() else @errorName(err), .nothing),
     };
     defer locks.release();
     for (locks.members.items) |*locked| {
@@ -3957,6 +3965,12 @@ const Conversion = struct {
             switch (err) {
                 error.SessionBusy => debug_trace.logf("convert", "action=Busy session={s}", .{root_id}),
                 error.InvalidSessionFormat => c.traceUnreadable(root_id, root_id),
+                // A member folder others can write, which `problem` names
+                // with its fix (D61): unreadable, as a damaged one is.
+                error.PrivateStatePermissionsUnsupported => {
+                    c.traceUnreadable(root_id, root_id);
+                    return error.InvalidSessionFormat;
+                },
                 // Another process converted it while this one waited, and
                 // removed its v1 folder once v2 held it (D61).
                 error.SessionNotFound => if (holdsV2(store, c.alloc, root_id)) return traceHeld(root_id),
@@ -4020,7 +4034,7 @@ const Conversion = struct {
         store.problem = .{};
         var v1 = try session_store.Store.initReadOnlyFromHome(c.alloc, store.home, "/");
         defer v1.deinit(c.alloc);
-        if (try v1_conversion.kindOf(&v1, c.alloc, root_id) != .root) return error.SessionNotFound;
+        if (try v1_conversion.kindOfRecorded(&v1, c.alloc, root_id, &store.problem) != .root) return error.SessionNotFound;
         var locks = try v1_conversion.lockFamily(c.alloc, &v1, root_id, 0, &store.problem);
         defer locks.release();
         const locked = &locks.members.items[0];
@@ -4683,10 +4697,8 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
     var reason: [v1_conversion.Problem.capacity]u8 = undefined;
     for (roots) |root| {
         const id = root.id;
-        if (root.unreadable) |why| {
-            try report.skip(alloc, id, "InvalidSessionFormat", why);
-            continue;
-        }
+        // A session v2 holds is converted, whatever its leftover v1 folder
+        // holds; `cleanLeftovers` keeps one it may not take (D61).
         if (store.manager.peek(alloc, id)) |peeked_value| {
             var peeked = peeked_value;
             defer peeked.deinit(alloc);
@@ -4698,6 +4710,10 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
                 try report.skip(alloc, id, "InvalidSessionFormat", std.mem.print(&reason, "the new store can't read its copy ({s})", .{@errorName(err)}) catch null);
                 continue;
             },
+        }
+        if (root.unreadable) |why| {
+            try report.skip(alloc, id, "InvalidSessionFormat", why);
+            continue;
         }
         var conversion: Conversion = .{ .store = store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
         defer conversion.deinit();
@@ -9497,6 +9513,16 @@ test "a prompt image the store does not save keeps its bytes inline and gets no 
     try testing.expectEqualStrings(images[1].snapshot_path.?, kept[1].snapshot_path.?);
 }
 
+/// Whether this process writes into `dir` whatever its mode, as root or a
+/// process with `CAP_DAC_OVERRIDE` does. A test of a refused write can't
+/// run then, so it skips.
+fn writesWhateverTheMode(dir: std.Io.Dir) bool {
+    const io = io_mod.getIo();
+    dir.writeFile(io, .{ .sub_path = ".mode-probe", .data = "" }) catch return false;
+    dir.deleteFile(io, ".mode-probe") catch {};
+    return true;
+}
+
 test "a turn the store cannot start keeps its prompt images inline and does not fail the prompt (D89)" {
     var t: TestHome = undefined;
     try t.init();
@@ -9515,10 +9541,11 @@ test "a turn the store cannot start keeps its prompt images inline and does not 
     // which a read-only store refuses.
     const io = io_mod.getIo();
     try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
-    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
+    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{ .iterate = true });
     defer root.close(io);
-    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
+    try root.setPermissions(io, .fromMode(0o500));
     defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(root)) return error.SkipZigTest;
     try s.savePromptImages(arena.allocator(), &images);
     try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
     try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
@@ -9693,7 +9720,7 @@ const V1Home = struct {
         for (ids) |id| {
             var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
             defer dir.close(io);
-            dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+            try dir.setPermissions(io, .fromMode(0o755));
             var walker = try dir.walk(a);
             defer walker.deinit();
             while (try walker.next(io)) |entry| switch (entry.kind) {
@@ -9977,9 +10004,9 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
     for ([_][]const u8{ "", "/state", "/proofs" }) |sub| {
         const path = try alloc.print("{s}/{s}{s}", .{ try v1.sessionPath(id, ""), terminal_dir_name, sub });
         defer alloc.free(path);
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
 
     const s = try openConverted(&t, id);
@@ -10287,6 +10314,28 @@ test "recover on a v1 session whose lock file others can write says its storage 
         return error.TestUnexpectedResult;
     } else |err| err;
     try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+}
+
+test "a v1 family whose subagent folder others can write: recover refuses it as unsafe, conversion as unreadable, and every member keeps its v1 folder (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    const err = if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| err;
+    try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    // Conversion reports it unreadable, as it does a damaged member.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    // Nothing was copied or removed: every member keeps its v1 folder.
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
 }
 
 test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
@@ -11194,6 +11243,215 @@ test "fx sessions convert converts every v1 family, and counts what it skipped (
     plain.deinit(alloc);
 }
 
+test "a v1 session whose folder others can write is refused as unsafe by show, recover and conversion, and stays (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("side", 1);
+    const id = ids[0];
+    for ([_]std.posix.mode_t{ 0o757, 0o775 }) |mode| {
+        try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(mode), .{});
+        if (readSession(&t.store, alloc, id)) |shown| {
+            var value = shown;
+            value.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+        if (recover(&t.store, alloc, id)) |recovered| {
+            var value = recovered;
+            value.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+        try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+        try expectUnsafeProblem(&t, "", id, "");
+        try testing.expect(V1Home.exists(&t, id));
+        try testing.expectError(error.NotFound, t.store.manager.peek(alloc, id));
+    }
+    // Readable by others only, it shows and converts (D61).
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o755), .{});
+    var shown = try readSession(&t.store, alloc, id);
+    shown.deinit(alloc);
+    const s = try openConverted(&t, id);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, id));
+}
+
+/// `t.store.problem` is exactly the reason fx gives when others can write
+/// `id`'s v1 folder, or `entry` in it, naming the subagent when `child` is
+/// set, with the command that makes the folder private (D61).
+fn expectUnsafeProblem(t: *TestHome, child: []const u8, id: []const u8, entry: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    const expected = try std.mem.print(&buffer, "{s}{s}{s}others can write {s}{s}, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{
+        if (child.len > 0) "its subagent " else "",
+        child,
+        if (child.len > 0) ": " else "",
+        entry,
+        if (entry.len > 0) " in its folder" else "its folder",
+        id,
+    });
+    try testing.expectEqualStrings(expected, t.store.problem.text());
+}
+
+test "a v1 family whose subagent folder others can write is refused with the subagent, its folder and the fix, and stays (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[1], ""), .fromMode(0o757), .{});
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, family[1], family[1], "");
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.converted);
+    const root_reason = for (report.skipped.items) |skipped| {
+        if (std.mem.eql(u8, skipped.id, family[0])) break skipped.reason.?;
+    } else return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, root_reason, "its subagent "));
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, family[0]));
+}
+
+test "a v1 family whose root's subagent folder others can write is refused, naming that folder and the fix (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    if (readSession(&t.store, alloc, family[0])) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    // Conversion reports it unreadable, with the reason.
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, "", family[0], "subagent");
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a v1 family whose children.json others can write is refused before it changes the family, naming the file (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent/children.json"), .fromMode(0o646), .{});
+    if (readSession(&t.store, alloc, family[0])) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    if (recover(&t.store, alloc, family[0])) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, family[0]));
+    try expectUnsafeProblem(&t, "", family[0], "subagent/children.json");
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a writable v1 entry's name reaches the reason terminal-safe, and a name too long to fit is left out, not cut (D61)" {
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    var folder = try t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
+    defer folder.close(io);
+    const hostile = "x\x1b]0;PWNED\x07\x1b[31mred";
+    folder.writeFile(io, .{ .sub_path = hostile, .data = "", .flags = .{ .permissions = .fromMode(0o666) } }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, hostile, .fromMode(0o666), .{});
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    const text = t.store.problem.text();
+    try testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try testing.expect(std.mem.findScalar(u8, text, 0x07) == null);
+    try testing.expect(std.mem.find(u8, text, "PWNED") != null);
+    var buffer: [256]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, text, try std.mem.print(&buffer, "in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id})));
+    try folder.deleteFile(io, hostile);
+
+    // Each control byte is written as a four-byte escape, so this name's
+    // reason would not fit whole.
+    const long: [255]u8 = @splat(0x01);
+    folder.writeFile(io, .{ .sub_path = &long, .data = "" }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, &long, .fromMode(0o666), .{});
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try testing.expectEqualStrings(try std.mem.print(&buffer, "others can write something in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id}), t.store.problem.text());
+}
+
+test "a v1 session whose events file others can write is refused like a writable folder, naming the file (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "events.jsonl"), .fromMode(0o646), .{});
+    if (readSession(&t.store, alloc, id)) |shown| {
+        var value = shown;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    if (recover(&t.store, alloc, id)) |recovered| {
+        var value = recovered;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DurablePathUnsafe, commandError(err));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try expectUnsafeProblem(&t, "", id, "events.jsonl");
+    try testing.expect(V1Home.exists(&t, id));
+}
+
+test "a converted session whose v1 folder comes back writable by others is kept, not reported unreadable (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("side", 1))[0];
+    const s = try openConverted(&t, id);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, id));
+    // The v1 copy is back, and others can write it.
+    _ = try v1.fixture("side", 1);
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o757), .{});
+    for (0..2) |_| {
+        var report = try convertAll(&t.store, alloc);
+        defer report.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), report.unreadable);
+        try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    }
+    try testing.expect(V1Home.exists(&t, id));
+    var shown = try readSession(&t.store, alloc, id);
+    shown.deinit(alloc);
+}
+
 test "a v1 profile an old release left readable by others converts (D61)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
@@ -11205,9 +11463,9 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     const roots = try v1.fixture("plain", 1);
     const v1_open_id = roots[0];
     for ([_][]const u8{ ".fx", ".fx/sessions", try v1.sessionPath(v1_open_id, "") }) |path| {
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        try dir.setPermissions(io, .fromMode(0o755));
     }
     const s = try openConverted(&t, v1_open_id);
     defer s.close();
@@ -11590,10 +11848,11 @@ test "a new session never takes an id v1's folder could not be checked for (D61)
     defer t.deinit();
     const io = io_mod.getIo();
     try t.tmp.dir.createDirPath(io, ".fx/sessions");
-    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
+    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{ .iterate = true });
     defer sessions.close(io);
-    sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
+    try sessions.setPermissions(io, .fromMode(0o000));
     defer sessions.setPermissions(io, .fromMode(0o700)) catch {};
+    if (writesWhateverTheMode(sessions)) return error.SkipZigTest;
     var model = "m".*;
     try testing.expectError(error.SessionStoreUnavailable, Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model)));
 }

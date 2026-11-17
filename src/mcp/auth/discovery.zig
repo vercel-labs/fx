@@ -463,6 +463,14 @@ test "an error written with escapes is read as the word it spells" {
     const quoted = (try parseChallenge(a, "Bearer error=\"inv\\\"alid\"")).?;
     try testing.expect(!quoted.insufficient_scope);
     try testing.expectEqualStrings("inv\"alid", quoted.error_code.?);
+    // An escaped backslash is a backslash in the value, and outside quotes a backslash is part of it:
+    // neither spells the name.
+    const escaped = (try parseChallenge(a, "Bearer error=\"insuffic\\\\ient_scope\"")).?;
+    try testing.expect(!escaped.insufficient_scope);
+    try testing.expectEqualStrings("insuffic\\ient_scope", escaped.error_code.?);
+    const unquoted = (try parseChallenge(a, "Bearer error=insuffic\\ient_scope")).?;
+    try testing.expect(!unquoted.insufficient_scope);
+    try testing.expectEqualStrings("insuffic\\ient_scope", unquoted.error_code.?);
 }
 
 test "canonical URIs and the resource check" {
