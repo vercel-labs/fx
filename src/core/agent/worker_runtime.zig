@@ -1890,11 +1890,14 @@ pub const WorkerRuntime = struct {
 
     /// The main loop's note that its flush of the pacer for the held mail
     /// failed. The gate's time limit still ends the hold; the loop does not
-    /// try again until the count has reached zero.
+    /// try again until the count has reached zero. A flush whose commit failed
+    /// has acknowledged it already (`appendFinishedPrompt` does in a `defer`),
+    /// so the count may be zero by now: that hold is over, and a mark set for
+    /// it would outlive it, since nothing clears a mark at a count of zero.
     pub fn noteCommitGateFlushFailed(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        self.commit_gate_flush_failed = true;
+        if (self.unacknowledged_finishes > 0) self.commit_gate_flush_failed = true;
     }
 
     /// Null when the gate lets the next work begin; otherwise how many
@@ -9503,6 +9506,26 @@ test "a failed flush stops the loop's asking until the hold is over, and the hol
     freeWorkItem(alloc, (try expired.tryTakeNextWork(alloc)).?);
     try std.testing.expectEqual(@as(u32, 0), expired.unacknowledged_finishes);
     try std.testing.expect(!expired.commit_gate_flush_failed);
+}
+
+test "a flush whose commit failed after its acknowledgement leaves no mark for the next hold" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+
+    // The loop's flush commits the turn and fails, as `appendFinishedPrompt`
+    // does: it acknowledges in a `defer` first, and the flush reports after.
+    runtime.acknowledgeFinishCommitted();
+    runtime.noteCommitGateFlushFailed();
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+    try std.testing.expect(!runtime.commit_gate_flush_failed);
+
+    // The next finish holds the mail again, and the loop is asked to flush.
+    try pushTestFinish(alloc, &runtime);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
 }
 
 test "the commit gate logs what it held, what released it, and the limit it gave up at" {

@@ -6076,6 +6076,9 @@ const FlushApp = struct {
     emitted: std.ArrayList(u8) = .empty,
     emit_attempts: usize = 0,
     fail_emit: bool = false,
+    /// The commit acknowledges, as `appendFinishedPrompt` does in a `defer`,
+    /// and then fails.
+    fail_commit: bool = false,
     commits: usize = 0,
 
     const finished_turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
@@ -6107,6 +6110,7 @@ const FlushApp = struct {
         const self: *FlushApp = @ptrCast(@alignCast(ctx));
         self.commits += 1;
         self.agent().worker.acknowledgeFinishCommitted();
+        if (self.fail_commit) return error.OutOfMemory;
         return .committed;
     }
 
@@ -6220,6 +6224,33 @@ test "the loop leaves a pacer alone unless it holds a finished turn the worker h
         try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
         try std.testing.expect(app.pacer.deferred_turn != null);
     }
+}
+
+test "a flush whose commit fails is not held against the next hold" {
+    var app: FlushApp = .{ .alloc = std.testing.allocator, .fail_commit = true };
+    defer app.deinit();
+    const agent = app.agent();
+    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+
+    // The commit acknowledges and fails inside the flush: the hold is over.
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(!agent.worker.commit_gate_flush_failed);
+
+    // The next finish holds the same mail again, and the loop flushes for it.
+    app.fail_commit = false;
+    app.pacer.clear(app.alloc);
+    try app.pacer.enqueue(app.alloc, "second");
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+    var events = agent.worker.takeEvents();
+    for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    events.deinit(std.heap.c_allocator);
+    try std.testing.expect(try Runtime(FlushApp).deferFinish(&app, agent, .{ .turn = FlushApp.finished_turn }));
+    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
+    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try std.testing.expectEqual(@as(usize, 2), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
 }
 
 test "a flush that fails is logged once, keeps the finished turn, and is not tried again until the hold is over" {
