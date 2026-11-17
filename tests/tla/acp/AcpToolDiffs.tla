@@ -19,8 +19,8 @@
 (* a file that doesn't exist, and each prepared edit picks a new one from *)
 (* Vs. A diff is the pair <<old, new>> of versions.                       *)
 (*                                                                         *)
-(* `Rules` set to FALSE gives fx acp before these rules (#2032 at         *)
-(* 5adfc548d): no update carries a diff. AcpToolDiffsToday.cfg shows      *)
+(* `Rules` set to FALSE gives fx acp before these rules:                  *)
+(* no update carries a diff. AcpToolDiffsToday.cfg shows                  *)
 (* Complete failing.                                                      *)
 (*                                                                         *)
 (* tests/tla/drivers/acp/tool_diffs/driver.ts runs the real fx acp        *)
@@ -30,7 +30,7 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
-    Rules,      \* TRUE: the S8f rules; FALSE: fx acp before them
+    Rules,      \* TRUE: the tool diffs rules; FALSE: fx acp before them
     Calls,      \* the edit calls of the run
     Files,
     FileOf,     \* [Calls -> Files]

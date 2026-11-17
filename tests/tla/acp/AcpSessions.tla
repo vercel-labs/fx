@@ -14,14 +14,14 @@
 (*    own session's workspace.                                            *)
 (*  - session/load or session/resume of a session that is already open   *)
 (*    reuses it: its turn keeps running, and load replays its history     *)
-(*    again (Q108). The open session keeps its workspace, so a request    *)
+(*    again. The open session keeps its workspace, so a request           *)
 (*    that names another one fails and changes nothing.                   *)
 (*  - fx saves a session as its first turn starts, so a later load can    *)
 (*    open it even when that turn never ended.                            *)
 (*  - session/close of a running session stops its turn and answers its  *)
 (*    prompt.                                                             *)
 (*                                                                         *)
-(* `Rules` set to FALSE gives fx before these rules (#1786 at 13bb8f7a4): *)
+(* `Rules` set to FALSE gives fx before these rules:                      *)
 (* one session is open, and session/new, load, or resume of any session   *)
 (* stops the running turn and replaces the open session. The              *)
 (* AcpSessionsToday-*.cfg configs show which rule fails then.             *)
@@ -38,7 +38,7 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS Rules,       \* TRUE: many sessions; FALSE: fx before S8c
+CONSTANTS Rules,       \* TRUE: many sessions; FALSE: one session at a time
           MaxPrompts,  \* prompts the client sends to each session
           MaxLoads     \* load and resume requests in a run
 
