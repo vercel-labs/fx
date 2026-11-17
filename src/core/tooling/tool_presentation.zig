@@ -64,14 +64,11 @@ pub fn subagentAction(
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
-    const args = if (outer.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return null,
-    } else outer;
+    const args = (try tool_args.unwrapRequest(scratch, outer)) orelse return null;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     // Every other action says what it does to whom, with nothing to preview.
     if (action_words.get(action)) |words| {
-        const named = tool_args.optionalStringArg(args, "agent");
+        const named = namedAgent(args, action);
         // A call that concerns every subagent, a wait or a status that names
         // none, names them when its host listed them in the call's
         // `resolved_display_target`; without the list it says "subagents".
@@ -152,18 +149,26 @@ pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?Subagen
     if (!std.mem.eql(u8, call.name, "subagent")) return null;
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
-    const outer = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch |err| return switch (err) {
+    const scratch = scratch_state.allocator();
+    const outer = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
-    const args = if (outer.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return null,
-    } else outer;
+    const args = (try tool_args.unwrapRequest(scratch, outer)) orelse return null;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     if (std.mem.eql(u8, action, "wait")) return .working;
-    if (std.mem.eql(u8, action, "status") and tool_args.optionalStringArg(args, "agent") == null) return .open;
+    if (std.mem.eql(u8, action, "status") and namedAgent(args, action) == null) return .open;
     return null;
+}
+
+/// The `agent` a `subagent` call of `action` names, or null. The decoder reads
+/// an empty `agent` on a `status` or a `wait` as none, so such a call's row
+/// reads as it does without the key. A `stop`, `close`, or `message` needs an
+/// agent, so for those an empty one stays as written.
+fn namedAgent(args: std.json.ObjectMap, action: []const u8) ?[]const u8 {
+    const agent = tool_args.optionalStringArg(args, "agent") orelse return null;
+    const optional = std.mem.eql(u8, action, "status") or std.mem.eql(u8, action, "wait");
+    return if (agent.len == 0 and optional) null else agent;
 }
 
 /// The `agent` a `subagent` call names, read from its arguments while they
@@ -173,11 +178,34 @@ pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?Subagen
 /// wrongly; the finished call's row names it once its arguments parse. The
 /// result is a slice of `json`.
 pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
+    return streamedStringField(json, "agent", 1, 2);
+}
+
+/// What a `toolbox` call does, read from its arguments while they still
+/// stream in: the first of its own `run`, `search`, and `open` keys whose
+/// value is a whole string, with no escape in it, as a JSON object with that
+/// one key, so its row can read as the finished call's will. A search with
+/// no words yet may list one server's tools, so it waits. Null until then.
+/// The caller owns the result.
+pub fn toolboxStreamedAction(alloc: std.mem.Allocator, json: []const u8) !?[]const u8 {
+    for ([_][]const u8{ "run", "search", "open" }) |key| {
+        const value = streamedStringField(json, key, 1, 1) orelse continue;
+        if (std.mem.eql(u8, key, "search") and std.mem.trim(u8, value, " \t\r\n").len == 0) continue;
+        return try std.mem.concat(alloc, u8, &.{ "{\"", key, "\":\"", value, "\"}" });
+    }
+    return null;
+}
+
+/// The value of `key` in `json` at a depth from `min_depth` to `max_depth`,
+/// read while the JSON still streams in and may stop anywhere. Null until
+/// that value is a complete string, and for one with an escape in it, which
+/// a row would show wrongly. The result is a slice of `json`.
+fn streamedStringField(json: []const u8, key: []const u8, min_depth: usize, max_depth: usize) ?[]const u8 {
     // Each open object or array, so a key is known from a value.
     var containers: [8]u8 = undefined;
     var depth: usize = 0;
     var expect_key = false;
-    var after_agent_key = false;
+    var after_key = false;
     var i: usize = 0;
     while (i < json.len) {
         const byte = json[i];
@@ -187,19 +215,19 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
                 containers[depth] = byte;
                 depth += 1;
                 expect_key = byte == '{';
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
             '}', ']' => {
                 if (depth == 0) return null;
                 depth -= 1;
                 expect_key = false;
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
             ',' => {
                 expect_key = depth > 0 and containers[depth - 1] == '{';
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
             '"' => {
@@ -219,21 +247,48 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
                 i = end + 1;
                 if (expect_key) {
                     expect_key = false;
-                    after_agent_key = !escaped and (depth == 1 or depth == 2) and std.mem.eql(u8, text, "agent");
+                    after_key = !escaped and depth >= min_depth and depth <= max_depth and std.mem.eql(u8, text, key);
                 } else {
-                    if (after_agent_key) return if (escaped or text.len == 0) null else text;
-                    after_agent_key = false;
+                    if (after_key) return if (escaped or text.len == 0) null else text;
+                    after_key = false;
                 }
             },
             ':', ' ', '\t', '\n', '\r' => i += 1,
             else => {
                 // A number or literal is no name.
-                after_agent_key = false;
+                after_key = false;
                 i += 1;
             },
         }
     }
     return null;
+}
+
+test "a streaming toolbox call names its action once its whole value arrives" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, action: ?[]const u8 }{
+        .{ .json = "", .action = null },
+        .{ .json = "{\"run\":\"glob", .action = null },
+        .{ .json = "{\"run\":\"glob_files\"", .action = "{\"run\":\"glob_files\"}" },
+        .{ .json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"te", .action = "{\"run\":\"mcp_fixture_echo\"}" },
+        .{ .json = "{\"search\":\"list fi", .action = null },
+        .{ .json = "{\"search\":\"list files\"", .action = "{\"search\":\"list files\"}" },
+        // An empty search may list one server's tools, so it waits.
+        .{ .json = "{\"search\":\"\",\"ser", .action = null },
+        .{ .json = "{\"open\":\"fixture\",\"res", .action = "{\"open\":\"fixture\"}" },
+        // Only the call's own keys count, not ones inside its arguments.
+        .{ .json = "{\"arguments\":{\"run\":\"x\"},\"run\":\"gl", .action = null },
+        .{ .json = "{\"run\":\"a\\u001b[2J\"", .action = null },
+    };
+    for (cases) |case| {
+        const got = try toolboxStreamedAction(alloc, case.json);
+        defer if (got) |bytes| alloc.free(bytes);
+        if (case.action) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
 }
 
 test "a streaming subagent call names its agent once the whole name arrives" {
@@ -321,6 +376,8 @@ test "only a wait and a status that names no agent concern every subagent" {
     const cases = [_]struct { name: []const u8 = "subagent", args: []const u8, roster: ?SubagentRoster }{
         .{ .args = "{\"action\":\"wait\"}", .roster = .working },
         .{ .args = "{\"request\":{\"action\":\"wait\",\"agent\":\"tester\"}}", .roster = .working },
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}", .roster = .working },
+        .{ .args = "{\"request\":\"[1]\"}", .roster = null },
         .{ .args = "{\"action\":\"status\"}", .roster = .open },
         .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .roster = null },
         .{ .args = "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"hi\"}", .roster = null },
@@ -331,6 +388,63 @@ test "only a wait and a status that names no agent concern every subagent" {
     for (cases) |case| {
         try std.testing.expectEqual(case.roster, try subagentRoster(alloc, .{ .id = "c", .name = case.name, .arguments_json = case.args }));
     }
+}
+
+test "an empty field the decoder reads as absent leaves every subagent row as it is without the field" {
+    const alloc = std.testing.allocator;
+    const all_five = "\"instructions\":\"\",\"report\":\"\",\"model\":\"\",\"effort\":\"\",\"profile\":\"\"";
+    // Each pair is one call with and without its empty field, flat and inside
+    // the `request` object.
+    const pairs = [_]struct { without: []const u8, empty: []const u8 }{
+        .{ .without = "{\"action\":\"status\"}", .empty = "{\"action\":\"status\",\"agent\":\"\"}" },
+        .{ .without = "{\"request\":{\"action\":\"status\"}}", .empty = "{\"request\":{\"action\":\"status\",\"agent\":\"\"}}" },
+        .{ .without = "{\"action\":\"wait\"}", .empty = "{\"action\":\"wait\",\"agent\":\"\"}" },
+        .{ .without = "{\"request\":{\"action\":\"wait\"}}", .empty = "{\"request\":{\"action\":\"wait\",\"agent\":\"\"}}" },
+        .{
+            .without = "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"}",
+            .empty = "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"," ++ all_five ++ "}",
+        },
+        .{
+            .without = "{\"request\":{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"}}",
+            .empty = "{\"request\":{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"go\"," ++ all_five ++ "}}",
+        },
+    };
+    const states = [_]SubagentActionState{ .active, .pending, .identity, .completed, .{ .stopped = "Failed" }, .{ .feedback = .queued } };
+    const saved_result = "{\"ok\":true,\"result\":\"r\",\"error_code\":null,\"subagents\":[\"reviewer\",\"builder\"]}";
+    for (pairs) |pair| {
+        const without: ToolCall = .{ .id = "c", .name = "subagent", .arguments_json = pair.without };
+        const empty: ToolCall = .{ .id = "c", .name = "subagent", .arguments_json = pair.empty };
+        // The row names no roster, or the one its host listed.
+        for ([_]?[]const u8{ null, "reviewer, builder" }) |target| {
+            var left = without;
+            var right = empty;
+            left.resolved_display_target = target;
+            right.resolved_display_target = target;
+            for (states) |state| {
+                const a = (try subagentAction(alloc, left, state)).?;
+                defer a.deinit(alloc);
+                const b = (try subagentAction(alloc, right, state)).?;
+                defer b.deinit(alloc);
+                try std.testing.expectEqualStrings(a.label, b.label);
+                try std.testing.expectEqualStrings(a.detail, b.detail);
+            }
+        }
+        try std.testing.expectEqual(try subagentRoster(alloc, without), try subagentRoster(alloc, empty));
+        // The line a saved result gives its row after a resume.
+        const line_without = try subagentStatusLine(alloc, without, saved_result);
+        defer if (line_without) |value| alloc.free(value);
+        const line_empty = try subagentStatusLine(alloc, empty, saved_result);
+        defer if (line_empty) |value| alloc.free(value);
+        if (line_without) |want| {
+            try std.testing.expectEqualStrings(want, line_empty orelse return error.TestExpectedLine);
+        } else {
+            try std.testing.expect(line_empty == null);
+        }
+    }
+    // The row of a status with no agent is the one the empty agent used to lose.
+    const status = (try subagentAction(alloc, .{ .id = "c", .name = "subagent", .arguments_json = "{\"action\":\"status\",\"agent\":\"\"}" }, .active)).?;
+    defer status.deinit(alloc);
+    try std.testing.expectEqualStrings("checking subagents", status.label);
 }
 
 /// The preview a subagent row shows for `raw`: runs of whitespace, line
@@ -441,6 +555,7 @@ test "subagent rows project request identity state and bounded safe previews" {
     const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8, detail: []const u8 }{
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "reviewer working", .detail = "· Check cancellation cleanup" },
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "sent to reviewer", .detail = "· Check replay" },
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"Check text\\\"}\"}", .state = .active, .label = "reviewer working", .detail = "· Check text" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied reviewer", .detail = "· Check again" },
@@ -463,7 +578,7 @@ test "subagent rows project request identity state and bounded safe previews" {
         try std.testing.expectEqualStrings(case.label, action.label);
         try std.testing.expectEqualStrings(case.detail, action.detail);
     }
-    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"request\":\"[1]\"}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
         try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
     }
     const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;
@@ -912,6 +1027,21 @@ pub const mcp_ran_label = "Ran MCP";
 /// A tool row's status line: a bold label, then the value in tool text.
 pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const u8) Allocator.Error![]u8 {
     return alloc.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+}
+
+/// The label of the row a call made through `fx mcp call` ends with.
+pub fn bridgeCallRowLabel(outcome: types.BridgeCallOutcome) []const u8 {
+    return switch (outcome) {
+        .completed => mcp_ran_label,
+        .cancelled => "Cancelled",
+        .failed => "Failed",
+    };
+}
+
+/// The status line of a call made through `fx mcp call` once it ended, the
+/// same live and when a resume shows the row again.
+pub fn bridgeCallRowSummary(alloc: Allocator, tool: []const u8, outcome: types.BridgeCallOutcome) Allocator.Error![]u8 {
+    return formatToolActionValue(alloc, bridgeCallRowLabel(outcome), tool);
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.

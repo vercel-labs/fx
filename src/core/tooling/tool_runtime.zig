@@ -20,6 +20,7 @@ const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
 const image_provider = @import("../agent/runtime/image_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -122,13 +123,21 @@ test {
     _ = tool_presentation;
 }
 
-/// Shows tool rows: a host's push of tool lifecycle events.
+/// Shows tool rows: a host's push of tool lifecycle events, and where it
+/// keeps the row of a call made through `fx mcp call`, so a resume shows it
+/// again. Null keeps none.
 pub const ToolLifecyclePublisher = struct {
     context: *anyopaque,
     push_fn: *const fn (*anyopaque, types.ToolLifecycleEvent) anyerror!void,
+    save_bridge_call_fn: ?*const fn (*anyopaque, types.BridgeCallRecord) anyerror!void = null,
 
     pub fn push(self: ToolLifecyclePublisher, event: types.ToolLifecycleEvent) anyerror!void {
         return self.push_fn(self.context, event);
+    }
+
+    pub fn saveBridgeCall(self: ToolLifecyclePublisher, record: types.BridgeCallRecord) anyerror!void {
+        const save = self.save_bridge_call_fn orelse return;
+        return save(self.context, record);
     }
 };
 
@@ -468,6 +477,10 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
     const started_at_ms = io_mod.milliTimestamp();
+    const call_dir = workspace_access.AccessScope.primaryDirectoryOf(
+        execution_ctx.access_scope,
+        execution_ctx.workspace_root,
+    );
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
         request.call.name,
@@ -511,21 +524,69 @@ pub fn executeToolCallAuthorized(
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
             .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+            .call_id = request.call.id,
+            .dir = call_dir,
+            // The tool returned no result, so nothing shows that a command
+            // ran: a run cancelled or out of time before it started ends here,
+            // as does a shell that could not start.
+            .reads_startup_files = false,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
+    const outcome = classifyReturnedToolCallOutcome(result);
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(result),
+        .outcome = outcome,
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+        .call_id = request.call.id,
+        .dir = call_dir,
+        // Only a command that ran leaves a command result, which makes the call
+        // `command_failed`; a call refused before its command started, and one
+        // that succeeded, are not resolved again.
+        .reads_startup_files = outcome == .command_failed and
+            callReadsStartupFiles(execution_ctx, request.call_allocator, request.call),
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+/// Whether `call` is a run whose command reads the startup files the shell
+/// snapshot holds: one that admission's `runCommandContext` resolves to the
+/// `user` environment, as its routine-command rule does, in the login shell
+/// the snapshot captures. `interact` and `stop` calls, a `clean` profile, a
+/// clean start, a tty run in another shell, and a call that does not resolve
+/// read none of them.
+fn callReadsStartupFiles(ctx: Context, alloc: Allocator, call: ToolCall) bool {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = tool_admission.runCommandContext(ctx.admissionInput(), arena, call) catch return false;
+    const shell = switch (command.environment) {
+        .user => |path| path,
+        else => return false,
+    };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const login = switch (shell_resolver.environment(arena, configured, null) catch return false) {
+        .user => |path| path,
+        else => return false,
+    };
+    return sameShellPath(arena, shell, login);
+}
+
+/// Whether two shell paths name one file, as `/bin/bash` and `/usr/bin/bash`
+/// do where `/bin` links to `/usr/bin`. A path that does not resolve matches
+/// only itself.
+fn sameShellPath(arena: Allocator, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const real_a = io_mod.realpathAlloc(arena, a) catch return false;
+    const real_b = io_mod.realpathAlloc(arena, b) catch return false;
+    return std.mem.eql(u8, real_a, real_b);
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
@@ -1162,11 +1223,14 @@ fn runBridgeCall(
 
 /// The row a bridge call shows in its shell call's group: the row a direct
 /// call of the same MCP tool shows, `Running MCP` and then `Ran MCP`. Only a
-/// host that set `nested_tool_lifecycle` shows it, and a row it could not
-/// show is logged, never a reason to fail the call.
+/// host that set `nested_tool_lifecycle` shows it, and keeps its tool name
+/// and outcome for a resume when the call ends. A row it could not show or
+/// keep is logged, never a reason to fail the call.
 const BridgeCallRow = struct {
     publisher: ToolLifecyclePublisher,
     id: types.ToolLifecycleId,
+    /// The shell call whose command made the call.
+    shell_call_id: []const u8,
     tool: []const u8,
 
     /// Arguments larger than this stay out of the row's details.
@@ -1175,7 +1239,12 @@ const BridgeCallRow = struct {
     fn start(ctx: Context, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) ?BridgeCallRow {
         const publisher = ctx.nested_tool_lifecycle orelse return null;
         const parent = ctx.output_chunk_lifecycle_id orelse return null;
-        const row: BridgeCallRow = .{ .publisher = publisher, .id = .{ .turn_id = parent.turn_id, .call_id = request_id }, .tool = tool };
+        const row: BridgeCallRow = .{
+            .publisher = publisher,
+            .id = .{ .turn_id = parent.turn_id, .call_id = request_id },
+            .shell_call_id = parent.call_id,
+            .tool = tool,
+        };
         row.begin(ctx, arena, arguments_json) catch |err| {
             debug_trace.logf("mcp-call", "request={s} row not shown err={s}", .{ request_id, @errorName(err) });
             return null;
@@ -1198,16 +1267,21 @@ const BridgeCallRow = struct {
         } });
     }
 
-    fn finish(self: BridgeCallRow, arena: Allocator, kind: types.ToolOutcomeKind) void {
-        const label = switch (kind) {
-            .completed => tool_presentation.mcp_ran_label,
-            .cancelled => "Cancelled",
-            .failed, .denied, .deferred => "Failed",
-        };
-        const summary = tool_presentation.formatToolActionValue(arena, label, self.tool) catch label;
+    fn finish(self: BridgeCallRow, arena: Allocator, outcome: types.BridgeCallOutcome) void {
+        const kind = outcome.toolOutcome();
+        const summary = tool_presentation.bridgeCallRowSummary(arena, self.tool, outcome) catch
+            tool_presentation.bridgeCallRowLabel(outcome);
         self.publisher.push(.{ .terminal = .{ .id = self.id, .outcome = .{ .kind = kind, .summary = summary } } }) catch |err| {
             // The worker's turn end closes a row whose end was lost.
             debug_trace.logf("mcp-call", "request={s} row end not shown err={s}", .{ self.id.call_id, @errorName(err) });
+        };
+        self.publisher.saveBridgeCall(.{
+            .call_id = self.shell_call_id,
+            .request_id = self.id.call_id,
+            .tool = self.tool,
+            .outcome = outcome,
+        }) catch |err| {
+            debug_trace.logf("mcp-call", "request={s} row not saved err={s} dropped=saved_bridge_row", .{ self.id.call_id, @errorName(err) });
         };
     }
 };
@@ -1429,6 +1503,75 @@ test "bridge messages name a requested tool as visible escapes, not raw bytes" {
     const failed = try callBridgeTool(failing.context(), arena, "call-1", name, "{}", .{}, &cancel);
     try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
     try expectBridgeNameQuoted(failed.bytes);
+}
+
+test "a bridge call's row ends, then keeps its shell call, tool, and outcome for a resume, and never its arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Rows = struct {
+        terminal: std.ArrayList(types.ToolOutcomeKind) = .empty,
+        saved: std.ArrayList(types.BridgeCallRecord) = .empty,
+        refuse_saves: bool = false,
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .terminal) try self.terminal.append(std.testing.allocator, event.terminal.outcome.kind);
+        }
+
+        fn save(raw: *anyopaque, record: types.BridgeCallRecord) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refuse_saves) return error.NoOpenTurn;
+            try self.saved.append(std.testing.allocator, record);
+        }
+    };
+    var rows: Rows = .{};
+    defer rows.terminal.deinit(std.testing.allocator);
+    defer rows.saved.deinit(std.testing.allocator);
+    var marker: u8 = 0;
+    var ok_runtime = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callOk };
+    defer ok_runtime.deinit(std.testing.allocator);
+    var failing_runtime = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callFailure };
+    defer failing_runtime.deinit(std.testing.allocator);
+    const publisher: ToolLifecyclePublisher = .{ .context = @ptrCast(&rows), .push_fn = Rows.push, .save_bridge_call_fn = Rows.save };
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const secret_arguments = "{\"text\":\"SECRET_ARGUMENT\"}";
+
+    var ok_ctx = ok_runtime.context();
+    ok_ctx.nested_tool_lifecycle = publisher;
+    ok_ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var ok_state = McpCallBridgeState{ .runtime = ok_ctx };
+    const ran = try runBridgeCall(@ptrCast(&ok_state), arena, "fx-mcp-call-7", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, ran.status);
+
+    var failing_ctx = failing_runtime.context();
+    failing_ctx.nested_tool_lifecycle = publisher;
+    failing_ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var failing_state = McpCallBridgeState{ .runtime = failing_ctx };
+    const failed = try runBridgeCall(@ptrCast(&failing_state), arena, "fx-mcp-call-8", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
+
+    try std.testing.expectEqualSlices(types.ToolOutcomeKind, &.{ .completed, .failed }, rows.terminal.items);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+    for (rows.saved.items, [_][]const u8{ "fx-mcp-call-7", "fx-mcp-call-8" }, [_]types.BridgeCallOutcome{ .completed, .failed }) |record, request_id, outcome| {
+        try std.testing.expectEqualStrings("shell-call-1", record.call_id);
+        try std.testing.expectEqualStrings(request_id, record.request_id);
+        try std.testing.expectEqualStrings("mcp_fs_read", record.tool);
+        try std.testing.expectEqual(outcome, record.outcome);
+    }
+
+    // A record the session can't take is logged; the call still returns.
+    rows.refuse_saves = true;
+    const unsaved = try runBridgeCall(@ptrCast(&ok_state), arena, "fx-mcp-call-9", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, unsaved.status);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+    try std.testing.expectEqual(@as(usize, 3), rows.terminal.items.len);
+
+    // A host that shows no rows keeps none.
+    rows.refuse_saves = false;
+    var rowless_state = McpCallBridgeState{ .runtime = ok_runtime.context() };
+    _ = try runBridgeCall(@ptrCast(&rowless_state), arena, "fx-mcp-call-10", "mcp_fs_read", secret_arguments, .{}, &cancel);
+    try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
 }
 
 const RunCommandBackendState = struct {
@@ -1737,6 +1880,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         },
         .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .tool_yield_flag = &ctx.worker.tool_yield_requested,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
@@ -1772,7 +1916,20 @@ fn terminal_lease_cleanup_dispatch_context(
 ) tool_dispatch.DispatchContext {
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.cancel_flag = null;
+    dispatch.tool_yield_flag = null;
     return dispatch;
+}
+
+/// Stops the shell commands that steering moved to the background during
+/// turn `turn_id`, after the user cancelled that turn. The stop ignores the
+/// turn's cancel flag, which is set by then.
+pub fn stop_steering_detached_commands(ctx: Context, turn_id: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return shell_impl.stopSteeringDetached(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        turn_id,
+    );
 }
 
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
@@ -1887,10 +2044,11 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
-        // A Token Pass session reads images with a Token Pass model.
-        // A custom connection reads images with its own vision_model.
+        // A Token Pass session of a team with Token Pass reads images with a
+        // Token Pass model. A custom connection reads images with its own
+        // vision_model.
         .model = if (state.runtime.provider == .gateway)
-            token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+            token_pass_team.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
         else
             state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };
@@ -4379,6 +4537,102 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "a call reads the startup files only when admission resolves it to a user-profile run" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry };
+    defer rt.deinit(std.testing.allocator);
+    const cases = [_]struct { arguments_json: []const u8, reads: bool }{
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", .reads = false },
+        // A clean start skips the startup files of any shell.
+        .{
+            .arguments_json = "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+            .reads = false,
+        },
+        // `interact` types into a session, here one that does not exist, and
+        // `stop` ends one; neither starts a command.
+        .{ .arguments_json = "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}", .reads = false },
+        .{ .arguments_json = "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}", .reads = false },
+        // The orchestrator adds the action a call leaves out before the call
+        // is stored, so a stored call without one never ran.
+        .{ .arguments_json = "{\"command\":\"ls\"}", .reads = false },
+        .{ .arguments_json = "not json", .reads = false },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "case", .name = "shell", .arguments_json = case.arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("arguments: {s}\n", .{case.arguments_json});
+            return err;
+        };
+    }
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
+    try std.testing.expect(!callReadsStartupFiles(rt.context(), std.testing.allocator, read));
+
+    // A tty run reads the snapshot's startup files only in the login shell
+    // the snapshot captured; another shell reads its own.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var login_buffer: [4096]u8 = undefined;
+    const login = switch (try shell_resolver.environment(arena, shell_resolver.configuredLoginShellInto(&login_buffer), null)) {
+        .user => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    const other: []const u8 = if (std.mem.endsWith(u8, login, "/zsh")) "/bin/bash" else "/bin/zsh";
+    const tty_cases = [_]struct { shell: ?[]const u8, reads: bool }{
+        .{ .shell = null, .reads = true },
+        .{ .shell = login, .reads = true },
+        .{ .shell = other, .reads = false },
+    };
+    for (tty_cases) |case| {
+        const shell_field = if (case.shell) |path|
+            try arena.print(",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\"}}", .{path})
+        else
+            "";
+        const arguments_json = try arena.print("{{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\"{s}}}", .{shell_field});
+        const call: ToolCall = .{ .id = "tty", .name = "shell", .arguments_json = arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("login {s}, arguments: {s}\n", .{ login, arguments_json });
+            return err;
+        };
+    }
+    // Two spellings of one file name one shell; a path that does not resolve
+    // matches only itself.
+    try std.testing.expect(sameShellPath(arena, "/bin/../bin/sh", "/bin/sh"));
+    try std.testing.expect(sameShellPath(arena, "/missing/zsh", "/missing/zsh"));
+    try std.testing.expect(!sameShellPath(arena, "/missing/zsh", "/missing/../missing/zsh"));
+}
+
+test "trace keeps a user-profile run cancelled before it starts as reading no startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    // Set before the call, so the runner stops before it starts a shell.
+    var cancel = std.atomic.Value(bool).init(true);
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry, .cancel_flag = &cancel };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // The shell tool reports the cancel as a failed result with no command
+    // result; a cancel the runner raises instead ends as an error.
+    if (executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "cancelled_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}",
+    })) |result| {
+        try std.testing.expect(result.cancelled);
+        try std.testing.expect(result.command_result_json == null);
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    var kept: [1]diagnostics.FailedToolCall = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotFailedToolCalls(&kept));
+    try std.testing.expectEqualStrings("cancelled_run", kept[0].callId());
+    try std.testing.expect(kept[0].outcome != .succeeded and kept[0].outcome != .command_failed);
+    // The trace writes `redefined` only for a call marked as reading them.
+    try std.testing.expect(!kept[0].reads_startup_files);
 }
 
 test "tool-call metrics retain caller identity across returned results" {
@@ -8592,4 +8846,169 @@ test "vision cancellation stops later batches and does not surface the outage ti
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), fixture.call_count);
+}
+
+/// The real shell tool, which registers its call with the bridge, in place of
+/// the double the other tests' registry uses.
+const bridge_test_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.shell} };
+
+/// A shell call run through `executeToolCallAuthorized` on its own thread. Its
+/// command publishes the bridge's socket and token and holds until the test
+/// is done, so the test can make the command's `fx mcp call` itself.
+const HeldShellCall = struct {
+    ctx: Context,
+    request: tool_contracts.ToolExecutionRequest,
+
+    fn run(self: *HeldShellCall) void {
+        // The result is in the call's arena, which the test frees.
+        _ = executeToolCallAuthorized(self.ctx, self.request) catch return;
+    }
+};
+
+/// What the bridge answers `tool`, called as a shell command's `fx mcp call` is,
+/// while a shell call runs under `rt` with `grants` in its request: the answer
+/// of the nested check that `executeToolCallAuthorized` set up from that
+/// request, and not what a `Context` holds.
+fn nestedBridgeStatus(rt: *TestRuntime, grants: []const PermissionGrant, tool: []const u8) !mcp_call_wire.Status {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "w");
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "w");
+    defer alloc.free(dir);
+    var test_arena = std.heap.ArenaAllocator.init(alloc);
+    defer test_arena.deinit();
+    const arena = test_arena.allocator();
+    // The shell call allocates on its own thread, so it gets its own arena.
+    var call_arena = std.heap.ArenaAllocator.init(alloc);
+    defer call_arena.deinit();
+    const env_file = try std.Io.Dir.path.join(arena, &.{ dir, "bridge.env" });
+    const done_file = try std.Io.Dir.path.join(arena, &.{ dir, "done" });
+    // The clean profile has no PATH of its own, and `sleep` is not a builtin.
+    const command = try arena.print(
+        "PATH=/usr/bin:/bin; printf '%s\\n%s\\n' \"$FX_MCP_CALL_SOCKET\" \"$FX_MCP_CALL_TOKEN\" > '{s}'; until [ -f '{s}' ]; do sleep 0.05; done",
+        .{ env_file, done_file },
+    );
+    var arguments: std.Io.Writer.Allocating = .init(arena);
+    // The command's own timeout ends the thread if the test cannot.
+    try arguments.writer.writeAll("{\"action\":\"run\",\"yield_time_ms\":30000,\"timeout_ms\":20000,\"command\":");
+    try std.json.Stringify.value(command, .{}, &arguments.writer);
+    try arguments.writer.writeAll("}");
+    const call: ToolCall = .{ .id = "hold", .name = "shell", .arguments_json = try arguments.toOwnedSlice() };
+    // The shell tool reaches the bridge only through the host's managed runtime.
+    var managed = managed_execution.Runtime.init(alloc);
+    defer managed.deinit();
+    var ctx = rt.context();
+    ctx.managed_executions = &managed;
+    const command_ctx = try tool_admission.runCommandContext(ctx.admissionInput(), arena, call);
+    var held = HeldShellCall{
+        .ctx = ctx,
+        .request = .{
+            .call_allocator = call_arena.allocator(),
+            .result_allocator = call_arena.allocator(),
+            .call = call,
+            .authority = .{ .run_command = .{ .shell_allowed = .{ .fingerprint = .init(command_ctx), .source = .configured_rule } } },
+            .session_grants = grants,
+            .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
+            .max_tool_result_bytes = ctx.max_tool_result_bytes,
+        },
+    };
+    const thread = try std.Thread.spawn(.{}, HeldShellCall.run, .{&held});
+    defer thread.join();
+    defer writeTestFile(tmp.dir, "w/done", "") catch {};
+
+    // No event says the command has written the file, so this is a bounded
+    // poll, until the file holds the socket and a whole token.
+    var socket_path: []const u8 = "";
+    var token: ?mcp_call.Token = null;
+    var waited: usize = 0;
+    while (token == null) : (waited += 1) {
+        if (waited >= 400) return error.TestBridgeNeverPublished;
+        io_mod.sleep(25 * std.time.ns_per_ms);
+        if (!absolutePathExists(env_file)) continue;
+        const published = try readTraceFileForTest(arena, env_file);
+        var lines = std.mem.splitScalar(u8, published, '\n');
+        socket_path = lines.next() orelse continue;
+        token = mcp_call_wire.parseToken(lines.next() orelse continue);
+    }
+    const reply = try mcp_call_client.call(arena, std.testing.io, socket_path, token.?, .{ .call = .{ .tool = tool, .arguments_json = "{}" } });
+    return reply.header.status;
+}
+
+/// A tool definition the bridge's review accepts: a description and an input schema.
+fn echoMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"description\":\"Echoes its text.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}") } };
+}
+
+const mcp_call = @import("../mcp_host/mcp_call.zig");
+const mcp_call_client = @import("../mcp_host/mcp_call_client.zig");
+const mcp_call_wire = @import("../mcp_host/mcp_call_wire.zig");
+
+test "a command's fx mcp call is checked against the approvals its tool call began with" {
+    if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other") }};
+    var counting = McpFixture.CountingContext{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .ask,
+        .interactive = false,
+        .mcp_ctx = &counting,
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_tool_schema = echoMcpSchema,
+        .mcp_call_tool = McpFixture.callCounting,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    // The approval the call began with lets the nested call run, with no prompt.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // Without it the nested call is not allowed, and the tool does not run.
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo"));
+    // An approval of another tool does not cover it.
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &other, "mcp_fixture_echo"));
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // A deny rule still wins over the approval.
+    var deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fixture_echo"), .pattern = @constCast("mcp_fixture_echo"), .action = .deny },
+    };
+    rt.permission_rules = .{ .rules = &deny_rules };
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo"));
+    rt.permission_rules = .{};
+
+    // A tool this agent is not offered stays unavailable, approval or not.
+    rt.mcp_tool_schema = goneMcpSchema;
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo"));
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "in auto mode a command's fx mcp call skips the safety check for the approved tool only" {
+    if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    var counting = McpFixture.CountingContext{};
+    var reviewer = TestAutoReview{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .auto,
+        .interactive = false,
+        .auto_classifier = reviewer.classifier(),
+        .mcp_ctx = &counting,
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_tool_schema = echoMcpSchema,
+        .mcp_call_tool = McpFixture.callCounting,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    // The approved tool runs without a review.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 0), reviewer.calls);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // Another tool, and the same tool without the approval, each get one.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_other") != .denied);
+    try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
+    try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
 }

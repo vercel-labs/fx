@@ -31,6 +31,16 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
   "FX_HOME",
+  // A pane inherits the tmux server's environment, which a developer's shell
+  // may have filled: their terminal recording would start on every test's fx,
+  // and the bridge of the fx session that started the server would point
+  // `fx mcp call` at that session.
+  "FX_DEBUG_RECORD",
+  "FX_DEBUG_RECORD_SILENT_BANNER",
+  "FX_RECORD",
+  "FX_RECORD_INPUT",
+  "FX_MCP_CALL_SOCKET",
+  "FX_MCP_CALL_TOKEN",
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
@@ -378,6 +388,9 @@ export type FakeGatewayTitleResponse =
 export type FakeGatewayModel = {
   id: string;
   type?: string;
+  // AI Gateway marks a model the team's Token Pass pays for, only for a team
+  // with an active pass.
+  token_pass?: boolean;
   owned_by?: string;
   released?: number;
   tags?: string[];
@@ -393,6 +406,7 @@ export type FakeGatewayModel = {
     type: string;
     [key: string]: unknown;
   }>;
+  fast_variant_of?: string;
 };
 
 export type FakeGatewayModelRequest = {
@@ -571,6 +585,29 @@ export function startFakeGateway(
   }, options);
 }
 
+// The Token Pass models of a coding-agent catalog as AI Gateway sends them: a
+// team with an active pass gets `token_pass: true` on each, and any other team
+// gets the same models without the mark.
+export function tokenPassCatalog(hasPass: boolean): FakeGatewayModel[] {
+  return [
+    { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+    ...["moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"].map((id) => ({
+      id,
+      type: "language",
+      tags: ["tool-use"],
+      ...(hasPass ? { token_pass: true } : {}),
+    })),
+  ];
+}
+
+// fx asks AI Gateway's credits endpoint whether the team has Token Pass. With
+// no fake gateway, that request would reach the real AI Gateway, so it goes to
+// a closed loopback port, where it fails at once.
+export function localCreditsEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (env.FX_GATEWAY_BASE_URL || env.FX_TEST_GATEWAY_CREDITS_URL) return env;
+  return { ...env, FX_TEST_GATEWAY_CREDITS_URL: "http://127.0.0.1:9/coding-agent/v1/credits" };
+}
+
 // Same server and classifier handling as startFakeGateway, but every
 // completion request is answered by the supplied callback instead of a
 // finite queue. For suites that replay one response indefinitely or switch
@@ -679,7 +716,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = providerVersionTestEnv(requestedEnv);
+    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
 
     if (
       minimumHistoryLines !== undefined &&

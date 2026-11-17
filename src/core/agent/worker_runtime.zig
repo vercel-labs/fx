@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -638,6 +639,13 @@ pub const WorkerRuntime = struct {
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
+    /// Set while steering waits for the active turn behind a running tool.
+    /// A shell call that sees it stops waiting for its command and returns
+    /// the command running, under the same `session_id`, so the turn reaches
+    /// its next steering boundary without stopping the command. Cleared when
+    /// the turn takes its steering and when a turn starts or ends. Written
+    /// under `worker_mutex`; tools read it without the lock.
+    tool_yield_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     direct_steering_closed: bool = false,
     /// Set by `nudgeWaiter` and cleared by `waitForPostOrNudge`, so a nudge
     /// sent before the wait starts still ends it. Guarded by `worker_mutex`.
@@ -650,6 +658,19 @@ pub const WorkerRuntime = struct {
     handed_off_turn_id: u64 = 0,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
+    /// Set once by a host that applies each `finish_prompt` this worker
+    /// pushes, and then calls `acknowledgeFinishCommitted` (the app's worker
+    /// threads). While a finished turn's commit is unacknowledged, mail that
+    /// missed the turn does not start the next one (`commitGateRemainingMsLocked`).
+    /// Off for every other host, which keeps the order it always had.
+    commit_gate: bool = false,
+    /// `finish_prompt` events pushed and not yet acknowledged. Guarded by
+    /// `worker_mutex`; counted only while `commit_gate` is on.
+    unacknowledged_finishes: u32 = 0,
+    /// When `unacknowledged_finishes` last left zero, in awake milliseconds.
+    commit_gate_since_ms: i64 = 0,
+    /// Whether this spell of holding mail has been logged.
+    commit_gate_logged: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
     /// work until a fresh-session scrollback handoff succeeds or is cancelled.
     session_transition_held: bool = false,
@@ -658,6 +679,15 @@ pub const WorkerRuntime = struct {
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_permission_waiting: bool = false,
+    /// How many tool calls of the running turn wait for the user right now: for
+    /// the answer to a permission request, and to a question the agent or an
+    /// MCP server asked, or the out-of-credits picker, which only the user can
+    /// answer. A failed request that waits for the user in another way (a
+    /// sign-in, or a refused one) is no question and is not counted. Changed
+    /// under `worker_mutex` and read with no lock (`userWait`), so a reader
+    /// that holds other locks cannot deadlock with a wait that is ending.
+    permission_waits: std.atomic.Value(u32) = .init(0),
+    question_waits: std.atomic.Value(u32) = .init(0),
     /// Set for a subagent's agent. Feedback main steered into a turn, which
     /// carries a receipt, is set aside when the turn ends without taking it,
     /// and the subagent's owner takes it back (`takeLeftoverMessages`) to run
@@ -841,22 +871,35 @@ pub const WorkerRuntime = struct {
 
     /// Cancels the turn in flight without stopping the worker, which goes on
     /// to run later turns, as a subagent's agent does: every wait wakes to
-    /// see the cancel, and a permission request the turn is waiting on is
-    /// declined.
+    /// see the cancel, a permission request the turn is waiting on is
+    /// declined, and a question it is waiting on is cancelled.
     pub fn requestTurnCancel(self: *WorkerRuntime) void {
         self.requestCancel();
         self.cancelApprovalTurn();
+        if (self.cancelPendingQuestionBatch()) {
+            debug_trace.logf("worker", "pending question cancelled reason=turn_cancel", .{});
+        }
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
-        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        self.markExplicitCancellation();
+        // The worker sets `worker_processing` under this lock as it takes and
+        // ends turns, so the trace reads it under the lock too.
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const processing = if (self.worker_processing) "true" else "false";
+        const queued = self.queuedWorkCountLocked();
+        debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ processing, queued });
+        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ processing, queued });
+        self.markExplicitCancellationLocked();
     }
 
     fn markExplicitCancellation(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        self.markExplicitCancellationLocked();
+    }
+
+    fn markExplicitCancellationLocked(self: *WorkerRuntime) void {
         self.steering_cancel_turn_id = null;
         self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
@@ -938,6 +981,19 @@ pub const WorkerRuntime = struct {
             self.steering_cancel_turn_id != self.active_turn_id;
     }
 
+    /// Whether the running turn `turn_id` ends because it was explicitly
+    /// cancelled, as by Escape, rather than because steering ended it to
+    /// hand off to an image or `$skill`.
+    pub fn turnEndsByExplicitCancel(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return turn_id != 0 and
+            turn_id == self.active_turn_id and
+            self.worker_cancel_requested.load(.seq_cst) and
+            self.steering_cancel_turn_id != turn_id and
+            self.handed_off_turn_id != turn_id;
+    }
+
     pub fn pushEvent(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !void {
         const owned = try dupeWorkerEvent(alloc, event);
         errdefer freeWorkerEvent(alloc, owned);
@@ -953,6 +1009,7 @@ pub const WorkerRuntime = struct {
         var tool_transition = try self.prepareActiveToolTransitionLocked(alloc, event);
         errdefer tool_transition.deinit(alloc);
         self.worker_events.appendAssumeCapacity(event);
+        if (self.commit_gate and event == .finish_prompt) self.noteFinishPushedLocked();
         // Logged under the lock the main loop drains with, so this line
         // always comes before the line that applies the event.
         if (self.trace_agent) |agent| {
@@ -1110,7 +1167,18 @@ pub const WorkerRuntime = struct {
         var queued = prompt;
         queued.delivery = .{ .active_turn = self.active_turn_id };
         try self.enqueuePromptLocked(alloc, queued);
+        self.requestToolYieldForLocked(queued);
         return true;
+    }
+
+    /// Asks a running shell command to return running, under its session,
+    /// when `queued` is steering that would otherwise wait behind it.
+    fn requestToolYieldForLocked(self: *WorkerRuntime, queued: QueuedPrompt) void {
+        if (queued.delivery.activeTurnId() != self.active_turn_id) return;
+        if (!yieldsRunningTools(queued)) return;
+        if (!self.hasActiveToolBoundaryLocked() or self.compactionInFlightLocked()) return;
+        self.tool_yield_requested.store(true, .seq_cst);
+        debug_trace.eventf("worker", "steering_tool_yield_requested", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} author={s} active_tools={d}", .{ queued.turn_id, @tagName(queued.author), self.active_tool_calls.count() });
     }
 
     /// Posts a message from another agent. It joins the running turn when
@@ -1244,6 +1312,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         debug_trace.eventf("worker", "queued_prompt_taken", .{ .turn_id = turn_id }, "worker={x} mail={s} remaining={d} marked=true", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
         return prompt;
     }
@@ -1410,6 +1479,7 @@ pub const WorkerRuntime = struct {
         {
             queued.delivery = .{ .active_turn = self.active_turn_id };
             interrupt_after_admission = !self.hasSteeringWaitBoundaryLocked();
+            if (!interrupt_after_admission) self.requestToolYieldForLocked(queued);
         } else if (steer_if_active and older_waits and sameTurnSteeringEligible(queued)) {
             queued.delivery = .continuation;
             debug_trace.eventf("worker", "steering_behind_waiting", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} queue_depth={d}", .{ queued.turn_id, self.queuedWorkCountLocked() });
@@ -1434,6 +1504,19 @@ pub const WorkerRuntime = struct {
     /// draws it as a message the user typed.
     fn previewsAsSteering(prompt: QueuedPrompt) bool {
         return prompt.delivery.isSteering() and prompt.author != .child;
+    }
+
+    /// Whether steering `prompt` moves a running shell command to the
+    /// background so the turn takes it at once. The user's and a parent
+    /// agent's steering do; a subagent's report waits for the tool, so a
+    /// stream of reports does not detach every command main runs.
+    fn yieldsRunningTools(prompt: QueuedPrompt) bool {
+        return prompt.author != .child;
+    }
+
+    /// Clears a pending tool yield; the caller holds `worker_mutex`.
+    fn clearToolYieldLocked(self: *WorkerRuntime) void {
+        self.tool_yield_requested.store(false, .seq_cst);
     }
 
     fn sameTurnSteeringEligible(prompt: QueuedPrompt) bool {
@@ -1551,10 +1634,12 @@ pub const WorkerRuntime = struct {
                 for (self.queued_prompts.items) |prompt| {
                     if (prompt.delivery.activeTurnId() == turn_id and !sameTurnSteeringEligible(prompt)) {
                         self.handed_off_turn_id = turn_id;
+                        self.clearToolYieldLocked();
                         return .handoff;
                     }
                 }
                 const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
+                if (messages.len != 0) self.clearToolYieldLocked();
                 if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
                 debug_trace.eventf("worker", "steering_taken", .{ .turn_id = turn_id }, "worker={x} kind={s} count={d} closed={}", .{ @intFromPtr(self), @tagName(kind), messages.len, self.direct_steering_closed });
                 return if (messages.len == 0)
@@ -1711,6 +1796,116 @@ pub const WorkerRuntime = struct {
         self.turn_start_held = false;
         debug_trace.logf("worker", "turn start hold released", .{});
         self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// The longest mail that missed a turn waits for that turn's commit.
+    pub const commit_gate_limit_ms: i64 = 5000;
+
+    /// Opts this worker into the commit gate. Only a host that applies the
+    /// finish events it takes from this worker, and then calls
+    /// `acknowledgeFinishCommitted` for each it commits and
+    /// `acknowledgeFinishDropped` for each it drops unsaved, may call it: the
+    /// gate waits for those calls, and a host that never makes them only loses
+    /// `commit_gate_limit_ms` per spell. A host that does not call this, as
+    /// libfx and ACP do not, never counts a finish and never holds mail.
+    pub fn enableCommitGate(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.commit_gate = true;
+    }
+
+    /// The main loop's note that it committed a finished turn to the session,
+    /// or failed to: either way nothing more of that turn is open, so the next
+    /// turn may begin. Wakes the worker held for it.
+    pub fn acknowledgeFinishCommitted(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.releaseFinishesLocked(1, "committed");
+    }
+
+    /// The main loop's note that it dropped a finished turn without
+    /// committing it, as a cancel or a session switch drops the one the pacer
+    /// held. Nothing of that turn is open and no commit is coming, so the
+    /// gate must not wait for it: it lowers the count as a commit does, and
+    /// logs the drop with `reason`.
+    pub fn acknowledgeFinishDropped(self: *WorkerRuntime, reason: []const u8) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.commit_gate) return;
+        debug_trace.eventf("worker", "commit_gate_finish_dropped", .{ .turn_id = self.active_turn_id }, "worker={x} count=1 unacknowledged={d} reason={s}", .{ @intFromPtr(self), self.unacknowledged_finishes, reason });
+        self.releaseFinishesLocked(1, reason);
+    }
+
+    fn releaseFinishesLocked(self: *WorkerRuntime, count: u32, reason: []const u8) void {
+        if (!self.commit_gate or self.unacknowledged_finishes == 0) return;
+        self.unacknowledged_finishes -|= count;
+        if (self.unacknowledged_finishes > 0) return;
+        if (self.commit_gate_logged) {
+            debug_trace.eventf("worker", "commit_gate_released", .{ .turn_id = self.active_turn_id }, "worker={x} waited_ms={d} reason={s}", .{ @intFromPtr(self), self.commitGateWaitedMsLocked(), reason });
+        }
+        self.commit_gate_logged = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    fn noteFinishPushedLocked(self: *WorkerRuntime) void {
+        if (self.unacknowledged_finishes == 0) self.commit_gate_since_ms = commitGateNowMs();
+        self.unacknowledged_finishes +|= 1;
+    }
+
+    fn commitGateNowMs() i64 {
+        const timestamp = std.Io.Clock.awake.now(io_mod.getIo());
+        return @intCast(@divFloor(timestamp.nanoseconds, 1_000_000));
+    }
+
+    fn commitGateWaitedMsLocked(self: *WorkerRuntime) i64 {
+        return @max(0, commitGateNowMs() - self.commit_gate_since_ms);
+    }
+
+    /// Null when the gate lets the next work begin; otherwise how many
+    /// milliseconds remain before it gives up. The gate holds only the mail
+    /// that missed the turn that just finished (a continuation) while that
+    /// turn's commit is unacknowledged: a turn that starts before the commit
+    /// writes its first piece into the log while the finished turn is still
+    /// open, which supersedes both
+    /// (`tests/tla/subagent/MainMail.tla` CommitBeforeNextTurn). Prompts a user
+    /// typed, and compaction, are not held.
+    ///
+    /// What ends the hold: the main loop's acknowledgement (a cancelled turn
+    /// still finishes, a failed commit still acknowledges, and a finish the
+    /// loop drops unsaved is acknowledged as dropped); a stop of this
+    /// worker, which the wait loops check on their own; and
+    /// `commit_gate_limit_ms` after the finish was pushed, when it logs
+    /// `commit_gate_expired`, forgets the unacknowledged count, and lets the
+    /// mail begin as it did before the gate.
+    fn commitGateRemainingMsLocked(self: *WorkerRuntime) ?i64 {
+        if (!self.commit_gate or self.unacknowledged_finishes == 0) return null;
+        if (self.queued_context_compaction != null or self.queued_prompts.items.len == 0) return null;
+        const head = self.queued_prompts.items[0];
+        if (!head.delivery.isContinuation()) return null;
+        const waited = self.commitGateWaitedMsLocked();
+        if (waited >= commit_gate_limit_ms) {
+            debug_trace.eventf("worker", "commit_gate_expired", .{ .turn_id = head.turn_id }, "worker={x} unacknowledged={d} waited_ms={d} mail={s} reason=timeout", .{ @intFromPtr(self), self.unacknowledged_finishes, waited, @tagName(head.mail) });
+            self.unacknowledged_finishes = 0;
+            self.commit_gate_logged = false;
+            return null;
+        }
+        if (!self.commit_gate_logged) {
+            self.commit_gate_logged = true;
+            debug_trace.eventf("worker", "commit_gate_held", .{ .turn_id = head.turn_id }, "worker={x} mail={s} unacknowledged={d}", .{ @intFromPtr(self), @tagName(head.mail), self.unacknowledged_finishes });
+        }
+        return commit_gate_limit_ms - waited;
+    }
+
+    /// Waits for a change, at most `remaining_ms`, with `worker_mutex` held.
+    /// False when the wait itself failed, as `std.Io.Condition.wait` does when
+    /// cancelled.
+    fn waitCommitGateLocked(self: *WorkerRuntime, remaining_ms: i64) bool {
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(remaining_ms), .clock = .awake } };
+        self.worker_cond.waitTimeout(io_mod.getIo(), &self.worker_mutex, timeout) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return false,
+        };
+        return true;
     }
 
     /// Whether the queued prompt for `turn_id` carries the stale shell
@@ -1897,6 +2092,11 @@ pub const WorkerRuntime = struct {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
             self.queued_history = &.{};
         }
+        // A tool yield stands only for steering that still waits for the turn.
+        const yield_still_wanted = for (self.queued_prompts.items) |queued| {
+            if (queued.delivery.activeTurnId() == self.active_turn_id and yieldsRunningTools(queued)) break true;
+        } else false;
+        if (!yield_still_wanted) self.clearToolYieldLocked();
         const turn_id = prompt.turn_id;
         const remaining = self.queuedWorkCountLocked();
         freeQueuedPrompt(alloc, prompt);
@@ -1918,12 +2118,17 @@ pub const WorkerRuntime = struct {
         while (true) {
             // Leftover steering is not work: with only that queued, wait on.
             if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
-            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held) and
+            const gate_ms = self.commitGateRemainingMsLocked();
+            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held or gate_ms != null) and
                 !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
             self.tool_phase_step_id = null;
-            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+            if (gate_ms) |ms| {
+                if (!self.waitCommitGateLocked(ms)) break;
+            } else {
+                self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+            }
         }
         return self.takeNextPromptLocked(alloc);
     }
@@ -1935,13 +2140,18 @@ pub const WorkerRuntime = struct {
         while (true) {
             // Leftover steering is not work: with only that queued, wait on.
             if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
+            const gate_ms = self.commitGateRemainingMsLocked();
             if (!(((self.queued_prompts.items.len == 0 and
                 self.queued_context_compaction == null) or self.turn_start_held or
-                self.session_transition_held) and !self.worker_stop_requested)) break;
+                self.session_transition_held or gate_ms != null) and !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
             self.tool_phase_step_id = null;
-            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+            if (gate_ms) |ms| {
+                if (!self.waitCommitGateLocked(ms)) break;
+            } else {
+                self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+            }
         }
         return self.takeNextWorkLocked(alloc);
     }
@@ -1987,7 +2197,7 @@ pub const WorkerRuntime = struct {
         if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
         if (self.queued_prompts.items.len == 0 or
             self.turn_start_held or self.session_transition_held or
-            self.worker_stop_requested)
+            self.worker_stop_requested or self.commitGateRemainingMsLocked() != null)
         {
             return null;
         }
@@ -2000,7 +2210,8 @@ pub const WorkerRuntime = struct {
         if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
-            self.session_transition_held or self.worker_stop_requested)
+            self.session_transition_held or self.worker_stop_requested or
+            self.commitGateRemainingMsLocked() != null)
         {
             return null;
         }
@@ -2015,6 +2226,7 @@ pub const WorkerRuntime = struct {
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
+            self.clearToolYieldLocked();
             self.active_context_compaction = true;
             if (task.operation_id) |id| self.compaction_presentation.running(id, .preparation);
             debug_trace.eventf(
@@ -2083,6 +2295,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         if (typedByUser(job)) self.noteTypedLocked(alloc, job.turn_id, job.prompt);
         // The last turn's final boundary closed it to messages; this one
         // starts open, as a direct turn does.
@@ -2133,6 +2346,7 @@ pub const WorkerRuntime = struct {
         self.steering_cancel_turn_id = null;
         self.clearActiveToolCallsLocked();
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         self.active_context_compaction = false;
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
@@ -2150,6 +2364,7 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
+        self.clearToolYieldLocked();
         debug_trace.eventf("worker", "processing_begun", .{ .turn_id = turn_id }, "worker={x} queued={d}", .{ @intFromPtr(self), self.queued_prompts.items.len });
         return true;
     }
@@ -2427,10 +2642,22 @@ pub const WorkerRuntime = struct {
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
+    /// Drops every queued event, as a live session switch does. A finish among
+    /// them will never be committed, so the commit gate stops waiting for it.
     pub fn discardEvents(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         var events = self.takeEvents();
         defer events.deinit(alloc);
-        for (events.items) |event| freeWorkerEvent(alloc, event);
+        var finishes: u32 = 0;
+        for (events.items) |event| {
+            if (event == .finish_prompt) finishes += 1;
+            freeWorkerEvent(alloc, event);
+        }
+        if (finishes == 0) return;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.commit_gate) return;
+        debug_trace.eventf("worker", "commit_gate_finish_dropped", .{ .turn_id = self.active_turn_id }, "worker={x} count={d} unacknowledged={d} reason=events_discarded", .{ @intFromPtr(self), finishes, self.unacknowledged_finishes });
+        self.releaseFinishesLocked(finishes, "events_discarded");
     }
 
     pub fn syncQueuedPromptModel(self: *WorkerRuntime, alloc: std.mem.Allocator, model: []const u8) !void {
@@ -2846,6 +3073,18 @@ pub const WorkerRuntime = struct {
         };
     }
 
+    /// What a turn waits for the user to answer.
+    pub const UserWait = enum { approval, question };
+
+    /// What the running turn waits for the user to answer, or null. It reads
+    /// atomics, so any thread may call it with any lock held. An approval
+    /// wins over a question when a turn has both.
+    pub fn userWait(self: *const WorkerRuntime) ?UserWait {
+        if (self.permission_waits.load(.acquire) > 0) return .approval;
+        if (self.question_waits.load(.acquire) > 0) return .question;
+        return null;
+    }
+
     pub const PermissionRequestObserver = struct {
         context: *anyopaque,
         observe_fn: *const fn (
@@ -2904,9 +3143,11 @@ pub const WorkerRuntime = struct {
             };
         }
 
+        _ = self.permission_waits.fetchAdd(1, .release);
         while (self.pending_permission_response == null and !self.worker_stop_requested) {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
+        _ = self.permission_waits.fetchSub(1, .release);
 
         const response = self.pending_permission_response orelse
             permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
@@ -3083,9 +3324,11 @@ pub const WorkerRuntime = struct {
         owns_pending_question = false;
         self.worker_cond.broadcast(io_mod.getIo());
 
+        _ = self.question_waits.fetchAdd(1, .release);
         while (self.pending_question_response == .pending and !self.worker_stop_requested) {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
+        _ = self.question_waits.fetchSub(1, .release);
 
         if (self.pending_question_shared) |pending| {
             freeOwnedQuestionBatch(alloc, pending);
@@ -5307,6 +5550,110 @@ test "tool lifecycle decides whether interactive steering interrupts immediately
     try std.testing.expect(runtime.isCancelRequested());
 }
 
+test "steering behind a running tool asks the tool to yield instead of cancelling" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_shell" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } } });
+
+    // A subagent's report waits for the tool and does not detach it.
+    var report = try makePrompt(alloc, "child report", "model");
+    report.author = .child;
+    try runtime.admitInteractivePrompt(alloc, report);
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "look at the config instead", "model"));
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    // The yield stands until the turn takes its steering.
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .terminal = .{
+        .id = .{ .turn_id = 41, .call_id = "call_shell" },
+        .outcome = .{ .kind = .completed, .summary = "completed" },
+    } } });
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .model));
+    defer freeSteeringMessages(alloc, guidance);
+    try std.testing.expectEqual(@as(usize, 2), guidance.len);
+    try std.testing.expectEqualStrings("look at the config instead", guidance[1].text);
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+
+    // With no tool running, steering interrupts the model and asks no yield.
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+}
+
+test "a parent's steering into a subagent asks its running tool to yield and a child's report does not" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_shell" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } } });
+
+    var report = try makePrompt(alloc, "child report", "model");
+    report.author = .child;
+    if (!try runtime.admitActiveSteering(alloc, report)) {
+        freeQueuedPrompt(alloc, report);
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    var from_parent = try makePrompt(alloc, "stop and check the logs", "model");
+    from_parent.author = .parent;
+    if (!try runtime.admitActiveSteering(alloc, from_parent)) {
+        freeQueuedPrompt(alloc, from_parent);
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+}
+
+test "steering during a tool-producing step asks the coming tool to yield" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+        .turn_id = 41,
+        .step_id = 7,
+        .phase = .running,
+    } });
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer before the tool starts", "model"));
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    // Taking the steer back for editing leaves nothing to yield for.
+    const retracted = (try runtime.popQueuedSteerForEdit(alloc)).?;
+    defer alloc.free(retracted);
+    try std.testing.expectEqualStrings("steer before the tool starts", retracted);
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer again", "model"));
+    try std.testing.expect(runtime.tool_yield_requested.load(.seq_cst));
+    runtime.finishProcessing();
+    try std.testing.expect(!runtime.tool_yield_requested.load(.seq_cst));
+}
+
 test "subagent wait phase preserves steering control and existing tool boundaries" {
     const alloc = std.testing.allocator;
     for ([_]?u64{ null, 7 }) |tool_step| {
@@ -6414,6 +6761,27 @@ test "request shutdown sets stop and cancel flags" {
     runtime.requestShutdown();
     try std.testing.expect(runtime.worker_stop_requested);
     try std.testing.expect(runtime.worker_cancel_requested.load(.seq_cst));
+}
+
+test "only an explicit cancel of the running turn counts as one" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    runtime.active_turn_id = 7;
+    // A turn that ends with no cancel, such as normally.
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(7));
+    runtime.requestCancel();
+    try std.testing.expect(runtime.turnEndsByExplicitCancel(7));
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(6));
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(0));
+    // Steering that joins the turn, or hands it off to an image or
+    // `$skill`, ends the wait the same way but is not a user cancel.
+    runtime.steering_cancel_turn_id = 7;
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(7));
+    runtime.steering_cancel_turn_id = null;
+    runtime.handed_off_turn_id = 7;
+    try std.testing.expect(!runtime.turnEndsByExplicitCancel(7));
 }
 
 test "takeEventBatch snapshots cancellation with detached events" {
@@ -7913,9 +8281,12 @@ test "semantic notice enqueue frees partial topic body and queue allocations" {
 const PermissionThreadState = struct {
     decision: ?types.ToolPermissionDecision = null,
     err: ?anyerror = null,
+    /// Set when the asking thread's blocking call has returned.
+    returned: std.Io.Event = .unset,
 };
 
 fn runPermissionRequest(state: *PermissionThreadState, runtime: *WorkerRuntime, label: []const u8) void {
+    defer state.returned.set(io_mod.getIo());
     var response = runtime.requestPermissionBlocking(
         std.testing.allocator,
         .{ .label = label },
@@ -8284,9 +8655,12 @@ test "text enqueue allocation failure preserves active interactive state" {
 const QuestionThreadState = struct {
     answers: ?[][]u8 = null,
     err: ?anyerror = null,
+    /// Set when the asking thread's blocking call has returned.
+    returned: std.Io.Event = .unset,
 };
 
 fn runQuestionRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    defer state.returned.set(io_mod.getIo());
     state.answers = runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, entries) catch |err| {
         state.err = err;
         return;
@@ -8294,6 +8668,7 @@ fn runQuestionRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entr
 }
 
 fn runRouteRecoveryRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    defer state.returned.set(io_mod.getIo());
     state.answers = runtime.requestRouteRecoveryAnswerBlocking(std.testing.allocator, entries) catch |err| {
         state.err = err;
         return;
@@ -8352,6 +8727,208 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+/// Joins the thread that asked the user once its call has returned, within
+/// the bound every test wait has, and expects `runtime` to wait for the user as
+/// `expected` says by then: a wait drops its count before its call returns. A
+/// thread that is still waiting is released with `requestStop` first, so a
+/// wait that does not end fails the test instead of hanging it.
+fn expectAskReturns(thread: std.Thread, returned: *std.Io.Event, runtime: *WorkerRuntime, expected: ?WorkerRuntime.UserWait) !void {
+    const ended = testing_event.setInTime(returned);
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(expected, runtime.userWait());
+}
+
+fn runPermissionRequestWithReview(
+    state: *PermissionThreadState,
+    runtime: *WorkerRuntime,
+    label: []const u8,
+    review: *const diff_mod.FileReview,
+) void {
+    defer state.returned.set(io_mod.getIo());
+    var response = runtime.requestPermissionBlockingWithReview(
+        std.testing.allocator,
+        .{ .label = label },
+        review,
+    ) catch |err| {
+        state.err = err;
+        return;
+    };
+    defer response.deinit();
+    state.decision = response.decision;
+}
+
+fn runMcpElicitationRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
+    defer state.returned.set(io_mod.getIo());
+    state.answers = runtime.requestMcpElicitationAnswerBlocking(std.testing.allocator, entries) catch |err| {
+        state.err = err;
+        return;
+    };
+}
+
+/// Who asks the user a question: the agent's own question tool, an MCP
+/// server's elicitation, or the picker a failed request opens.
+const QuestionAsker = enum { agent, mcp_server, failed_request };
+
+/// Starts the thread that puts `entries` to the user the way `asker` does.
+fn startQuestionAsker(asker: QuestionAsker, state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) !std.Thread {
+    return switch (asker) {
+        .agent => std.Thread.spawn(.{}, runQuestionRequest, .{ state, runtime, entries }),
+        .mcp_server => std.Thread.spawn(.{}, runMcpElicitationRequest, .{ state, runtime, entries }),
+        .failed_request => std.Thread.spawn(.{}, runRouteRecoveryRequest, .{ state, runtime, entries }),
+    };
+}
+
+test "a turn that waits for a permission answer says so until the wait ends, however it ends" {
+    const alloc = std.testing.allocator;
+    const Ends = enum { allowed, denied, approval_cancelled, turn_cancelled, stopped };
+    for (std.enums.values(Ends)) |how| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+
+        var state = PermissionThreadState{};
+        const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+        const request_id = try waitForPermissionLabel(&runtime, "Allow?");
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .approval), runtime.userWait());
+        switch (how) {
+            .allowed => try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitPermissionDecisionForTest(&runtime, request_id, .once)),
+            .denied => try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitPermissionDecisionForTest(&runtime, request_id, .deny)),
+            .approval_cancelled => runtime.cancelApprovalTurn(),
+            .turn_cancelled => runtime.requestTurnCancel(),
+            .stopped => runtime.requestStop(),
+        }
+        try expectAskReturns(thread, &state.returned, &runtime, null);
+    }
+}
+
+test "a turn that waits for a question's answer says so until the wait ends, however it ends" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    const Ends = enum { answered, escaped, stopped };
+    for (std.enums.values(Ends)) |how| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, null), runtime.userWait());
+
+        var state = QuestionThreadState{};
+        const thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &state, &runtime, &entries });
+        var snapshot = try waitForQuestionSnapshot(&runtime);
+        snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .question), runtime.userWait());
+        switch (how) {
+            .answered => try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null),
+            .escaped => try runtime.submitQuestionBatchAnswer(alloc, null, null),
+            .stopped => runtime.requestStop(),
+        }
+        defer freeAnswers(alloc, state.answers);
+        try expectAskReturns(thread, &state.returned, &runtime, null);
+    }
+}
+
+test "an MCP server's question and the out-of-credits picker are waits for the user" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    for ([_]QuestionAsker{ .mcp_server, .failed_request }) |asker| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        var state = QuestionThreadState{};
+        const thread = try startQuestionAsker(asker, &state, &runtime, &entries);
+        var snapshot = try waitForQuestionSnapshot(&runtime);
+        snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .question), runtime.userWait());
+        try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+        defer freeAnswers(alloc, state.answers);
+        try expectAskReturns(thread, &state.returned, &runtime, null);
+    }
+}
+
+test "a permission request and a question that wait together are both counted" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+
+    var question = QuestionThreadState{};
+    const question_thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &question, &runtime, &entries });
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+    var permission = PermissionThreadState{};
+    const permission_thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &permission, &runtime, "Allow?" });
+    const request_id = try waitForPermissionLabel(&runtime, "Allow?");
+    // An approval wins in what it reports, and answering it leaves the question.
+    try std.testing.expectEqual(@as(?WorkerRuntime.UserWait, .approval), runtime.userWait());
+    try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitPermissionDecisionForTest(&runtime, request_id, .once));
+    try expectAskReturns(permission_thread, &permission.returned, &runtime, .question);
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    defer freeAnswers(alloc, question.answers);
+    try expectAskReturns(question_thread, &question.returned, &runtime, null);
+}
+
+test "cancelling a turn ends the question it waits on, whoever asked it" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    for (std.enums.values(QuestionAsker)) |asker| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        var state = QuestionThreadState{};
+        const thread = try startQuestionAsker(asker, &state, &runtime, &entries);
+        var snapshot = try waitForQuestionSnapshot(&runtime);
+        snapshot.deinit(alloc);
+        runtime.requestTurnCancel();
+        const ended = testing_event.setInTime(&state.returned);
+        // A wait that did not end is released, so the test fails instead of hanging.
+        if (!ended) runtime.requestStop();
+        thread.join();
+        defer freeAnswers(alloc, state.answers);
+        try std.testing.expect(ended);
+        try std.testing.expect(state.answers == null);
+    }
+}
+
+test "cancelling a turn declines the permission request it waits on" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+    _ = try waitForPermissionLabel(&runtime, "Allow?");
+    runtime.requestTurnCancel();
+    const ended = testing_event.setInTime(&state.returned);
+    // A request that stayed open is released, so the test fails instead of hanging.
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
+}
+
+test "cancelling a turn declines a permission request that waits on a file review" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var review = try diff_mod.FileReview.init(alloc, "", "line 1\n");
+    defer review.deinit(alloc);
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequestWithReview, .{ &state, &runtime, "file_mutation", &review });
+    _ = try waitForPermissionLabel(&runtime, "file_mutation");
+    runtime.requestTurnCancel();
+    const ended = testing_event.setInTime(&state.returned);
+    if (!ended) runtime.requestStop();
+    thread.join();
+    try std.testing.expect(ended);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, state.decision.?);
+    try std.testing.expect(runtime.pending_permission_review == null);
 }
 
 test "question resume observer runs only for accepted answers before releasing the worker" {
@@ -8718,4 +9295,307 @@ test "main's worker still runs steering its turn left as the next turn" {
     const promoted = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, promoted);
     try std.testing.expectEqualStrings("feedback", promoted.prompt);
+}
+
+fn pushTestFinish(alloc: std.mem.Allocator, runtime: *WorkerRuntime) !void {
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("answer"),
+    } };
+    try runtime.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+}
+
+/// A worker whose turn 9 closed to mail and finished, with a report that
+/// missed it waiting for the next turn.
+fn finishedTurnWithMissedMail(alloc: std.mem.Allocator, runtime: *WorkerRuntime) !void {
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try pushTestFinish(alloc, runtime);
+    try runtime.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+    runtime.finishProcessing();
+}
+
+test "the commit gate holds mail that missed a finished turn until its commit is acknowledged" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expectEqual(@as(u32, 1), runtime.unacknowledged_finishes);
+
+    // The finish is in the queue and the loop has not committed it.
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+
+    // Taking the event is not the commit.
+    var events = runtime.takeEvents();
+    for (events.items) |event| freeWorkerEvent(alloc, event);
+    events.deinit(alloc);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+}
+
+test "the commit gate holds mail behind every unacknowledged finish" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try pushTestFinish(alloc, &runtime);
+    try std.testing.expectEqual(@as(u32, 2), runtime.unacknowledged_finishes);
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    runtime.acknowledgeFinishCommitted();
+    // An acknowledgement with nothing outstanding changes nothing.
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    freeWorkItem(alloc, work);
+}
+
+test "the commit gate holds neither a prompt a user typed, nor compaction, nor a host that did not opt in" {
+    const alloc = std.testing.allocator;
+
+    // A prompt the user typed goes at once, and so does mail behind it.
+    var typed = WorkerRuntime{};
+    defer typed.deinit(alloc);
+    typed.enableCommitGate();
+    try pushTestFinish(alloc, &typed);
+    try typed.enqueuePrompt(alloc, try makePrompt(alloc, "typed", "model"));
+    try typed.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    const first = (try typed.tryTakeNextWork(alloc)).?;
+    freeWorkItem(alloc, first);
+
+    // Compaction goes ahead of held mail.
+    var compacting = WorkerRuntime{};
+    defer compacting.deinit(alloc);
+    compacting.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &compacting);
+    var no_bytes: [0]u8 = .{};
+    var no_history: [0]types.HistoryTurn = .{};
+    compacting.queued_context_compaction = .{ .turn_id = 4, .model = &no_bytes, .api_key = &no_bytes, .history = &no_history };
+    try std.testing.expect(compacting.commitGateRemainingMsLocked() == null);
+    compacting.queued_context_compaction = null;
+
+    // Without the opt-in no finish is counted, so nothing is held.
+    var plain = WorkerRuntime{};
+    defer plain.deinit(alloc);
+    try finishedTurnWithMissedMail(alloc, &plain);
+    try std.testing.expectEqual(@as(u32, 0), plain.unacknowledged_finishes);
+    const mail = (try plain.tryTakeNextWork(alloc)).?;
+    freeWorkItem(alloc, mail);
+    plain.acknowledgeFinishCommitted();
+    try std.testing.expectEqual(@as(u32, 0), plain.unacknowledged_finishes);
+}
+
+test "the commit gate logs what it held, what released it, and the limit it gave up at" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "gate.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var held = WorkerRuntime{};
+    defer held.deinit(alloc);
+    held.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &held);
+    // However many times the worker asks, the hold is logged once.
+    for (0..3) |_| try std.testing.expect((try held.tryTakeNextWork(alloc)) == null);
+    held.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try held.tryTakeNextWork(alloc)).?);
+
+    var stuck = WorkerRuntime{};
+    defer stuck.deinit(alloc);
+    stuck.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &stuck);
+    try std.testing.expect((try stuck.tryTakeNextWork(alloc)) == null);
+    // The loop never commits: the finish was pushed longer ago than the limit.
+    stuck.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    freeWorkItem(alloc, (try stuck.tryTakeNextWork(alloc)).?);
+    try std.testing.expectEqual(@as(u32, 0), stuck.unacknowledged_finishes);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, trace, "event=commit_gate_held"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "event=commit_gate_released"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "event=commit_gate_expired"));
+    try std.testing.expect(std.mem.find(u8, trace, "reason=timeout") != null);
+}
+
+const GateWaiter = struct {
+    runtime: *WorkerRuntime,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    got_prompt: bool = false,
+
+    fn run(self: *@This()) void {
+        const work = self.runtime.waitAndTakeNextWork(std.testing.allocator) catch null;
+        if (work) |item| {
+            self.got_prompt = true;
+            freeWorkItem(std.testing.allocator, item);
+        }
+        self.done.store(true, .release);
+    }
+
+    fn settle() void {
+        io_mod.sleep(60 * std.time.ns_per_ms);
+    }
+};
+
+test "a worker held by the commit gate wakes on the acknowledgement" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    var waiter: GateWaiter = .{ .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, GateWaiter.run, .{&waiter});
+    GateWaiter.settle();
+    try std.testing.expect(!waiter.done.load(.acquire));
+    runtime.acknowledgeFinishCommitted();
+    thread.join();
+    try std.testing.expect(waiter.got_prompt);
+}
+
+test "a worker held by the commit gate ends when it is stopped, and the mail stays queued" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    var waiter: GateWaiter = .{ .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, GateWaiter.run, .{&waiter});
+    GateWaiter.settle();
+    try std.testing.expect(!waiter.done.load(.acquire));
+    runtime.requestShutdown();
+    thread.join();
+    try std.testing.expect(!waiter.got_prompt);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "a worker held by the commit gate goes on at its limit when the commit never comes" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    // 150 ms of the limit are left.
+    runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms - 150;
+    var waiter: GateWaiter = .{ .runtime = &runtime };
+    const started = io_mod.milliTimestamp();
+    const thread = try std.Thread.spawn(.{}, GateWaiter.run, .{&waiter});
+    thread.join();
+    try std.testing.expect(waiter.got_prompt);
+    try std.testing.expect(io_mod.milliTimestamp() - started >= 100);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+}
+
+test "a finish the app dropped without committing does not hold mail behind a later commit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+
+    // Turn A finished and the app dropped its finish: a cancel cleared what
+    // the pacer held, so nothing will commit it.
+    try pushTestFinish(alloc, &runtime);
+    var taken = runtime.takeEvents();
+    for (taken.items) |event| freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    runtime.acknowledgeFinishDropped("cancel");
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    // Turn B finishes and is committed, and a report missed it.
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    runtime.acknowledgeFinishCommitted();
+    try std.testing.expect(runtime.commitGateRemainingMsLocked() == null);
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+}
+
+test "an acknowledged drop lowers the count by one, and does nothing for a host that did not opt in" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try pushTestFinish(alloc, &runtime);
+    try pushTestFinish(alloc, &runtime);
+    runtime.acknowledgeFinishDropped("session_switch");
+    try std.testing.expectEqual(@as(u32, 1), runtime.unacknowledged_finishes);
+    runtime.acknowledgeFinishDropped("session_switch");
+    runtime.acknowledgeFinishDropped("session_switch");
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    var plain = WorkerRuntime{};
+    defer plain.deinit(alloc);
+    try pushTestFinish(alloc, &plain);
+    plain.acknowledgeFinishDropped("cancel");
+    try std.testing.expectEqual(@as(u32, 0), plain.unacknowledged_finishes);
+}
+
+test "discarded events release the finishes among them, so a later report is not held" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+
+    // A live session switch drops the events the loop had not applied.
+    try pushTestFinish(alloc, &runtime);
+    try pushTestFinish(alloc, &runtime);
+    try runtime.pushEvent(alloc, .{ .error_text = .{ .topic = "t", .tone = .@"error", .body = @constCast("b") } });
+    try std.testing.expectEqual(@as(u32, 2), runtime.unacknowledged_finishes);
+    runtime.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    // The next session's first turn finishes, is committed, and a report missed it.
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    runtime.acknowledgeFinishCommitted();
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    freeWorkItem(alloc, work);
+}
+
+test "the commit gate logs a finish the app dropped, with its reason" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "dropped.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try pushTestFinish(alloc, &runtime);
+    runtime.acknowledgeFinishDropped("cancel");
+    try pushTestFinish(alloc, &runtime);
+    runtime.discardEvents(alloc);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=commit_gate_finish_dropped") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=cancel") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=events_discarded") != null);
 }

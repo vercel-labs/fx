@@ -6,11 +6,13 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const token_pass = @import("../core/gateway/token_pass.zig");
+const token_pass_team = @import("../core/gateway/token_pass_team.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -42,6 +44,7 @@ const file_mutation_contract = @import("../core/tooling/file_mutation_contract.z
 const catalog_state = @import("../core/mcp/catalog_state.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
+const mcp_tools = @import("../core/mcp/features/tools.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
@@ -672,11 +675,81 @@ const ResumeRerun = struct {
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
-    if (comptime host_target.is_wasm) return js_host_tools.provider();
     return .{
         .context = @ptrCast(state),
-        .call_fn = callHostTool,
+        .call_fn = callHostToolWithSchemaTypes,
     };
+}
+
+/// Calls a host tool on this backend with `hostToolArguments`, so both
+/// backends send the same input.
+fn callHostToolWithSchemaTypes(
+    raw_state: *anyopaque,
+    alloc: Allocator,
+    name: []const u8,
+    call_id: []const u8,
+    arguments_json: []const u8,
+    max_result_bytes: usize,
+    cancel_flag: ?*std.atomic.Value(bool),
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const sent = try hostToolArguments(arena_state.allocator(), state.host_tools.dynamic_tools, name, arguments_json);
+    if (comptime host_target.is_wasm) {
+        return js_host_tools.provider().call(alloc, name, call_id, sent, max_result_bytes, cancel_flag);
+    }
+    return callHostTool(raw_state, alloc, name, call_id, sent, max_result_bytes, cancel_flag);
+}
+
+/// The arguments to send host tool `name`. A value the model wrote as JSON
+/// text where the tool's `inputSchema` names another type is sent as that
+/// type, as MCP calls are (`src/core/mcp_host/model.zig`); otherwise the
+/// model's own bytes. Allocated in `arena`.
+fn hostToolArguments(
+    arena: Allocator,
+    tools: []const agent_stream_provider.DynamicFunctionTool,
+    name: []const u8,
+    arguments_json: []const u8,
+) Allocator.Error![]const u8 {
+    const tool = for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) break tool;
+    } else return arguments_json;
+    const schema_json = try std.json.Stringify.valueAlloc(arena, tool.input_schema, .{});
+    const repaired = (try mcp_tools.repairArgumentTypes(arena, schema_json, arguments_json)) orelse return arguments_json;
+    for (repaired.fields) |field| {
+        debug_trace.logf("acp", "host tool argument sent as its schema's type tool={s} field={s} type={t}", .{ name, field.name, field.json_type });
+    }
+    return repaired.arguments_json;
+}
+
+test "host tool arguments are sent as the types the tool's schema names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const schema = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        "{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\"},\"exact\":{\"type\":\"boolean\"},\"tags\":{\"type\":\"array\"},\"label\":{\"type\":\"string\"},\"any\":{}}}",
+        .{},
+    );
+    const tools = [_]agent_stream_provider.DynamicFunctionTool{.{ .name = "count", .description = "", .input_schema = schema }};
+
+    try std.testing.expectEqualStrings(
+        "{\"limit\":40,\"exact\":true,\"tags\":[\"a\"],\"label\":\"40\"}",
+        try hostToolArguments(arena, &tools, "count", "{\"limit\":\"40\",\"exact\":\"true\",\"tags\":\"[\\\"a\\\"]\",\"label\":\"40\"}"),
+    );
+    // Text that is not exactly a value of the field's type, a field with no
+    // single type, a tool with no registered schema, and arguments that are
+    // not an object are sent as the model wrote them.
+    for ([_]struct { tool: []const u8, arguments: []const u8 }{
+        .{ .tool = "count", .arguments = "{\"limit\":\"forty\"}" },
+        .{ .tool = "count", .arguments = "{\"any\":\"40\",\"label\":\"x\"}" },
+        .{ .tool = "missing", .arguments = "{\"limit\":\"40\"}" },
+        .{ .tool = "count", .arguments = "[\"40\"]" },
+    }) |case| {
+        try std.testing.expectEqual(case.arguments.ptr, (try hostToolArguments(arena, &tools, case.tool, case.arguments)).ptr);
+    }
 }
 
 fn callHostTool(
@@ -870,14 +943,58 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
     try out.append(alloc, ')');
 }
 
+/// The sign-in one turn sends, copied when the turn starts: publishing a
+/// refreshed credential frees the server's copy (`server.adoptServerCredential`),
+/// so a turn, report turns included, never borrows it.
+const TurnSignIn = struct {
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+
+    /// The caller owns the result and frees it with `deinit`.
+    fn capture(alloc: Allocator, state: *const server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
+        const api_key = try alloc.dupe(u8, session.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team = if (state.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .api_key = api_key,
+            .credential_source = session.credential_source,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+        };
+    }
+
+    /// The job borrows these copies until `deinit`.
+    fn apply(self: TurnSignIn, job: *worker_runtime.QueuedPrompt) void {
+        job.api_key = self.api_key;
+        job.credential_source = self.credential_source;
+        job.account_id = self.account_id;
+        job.gateway_team = self.gateway_team;
+    }
+
+    fn deinit(self: *TurnSignIn, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.gateway_team) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
+/// `usage_total` gets the usage of every turn the prompt runs, its own and
+/// each report turn after it, as each ends: the response reports the whole
+/// prompt's usage (`publishPromptOutcome` in `server.zig`).
 pub fn handlePrompt(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
+    usage_total: *types.Usage,
 ) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
@@ -1121,17 +1238,16 @@ pub fn handlePrompt(
         try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
-    const job: worker_runtime.QueuedPrompt = .{
+    var sign_in = try TurnSignIn.capture(alloc, state, session);
+    defer sign_in.deinit(alloc);
+    var job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
         .model = session.model,
-        .api_key = @constCast(session.api_key),
-        .credential_source = session.credential_source,
-        .account_id = if (session.account_id) |account_id| @constCast(account_id) else null,
+        .api_key = &.{},
         .provider = session.provider,
-        .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
         .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
@@ -1148,6 +1264,7 @@ pub fn handlePrompt(
         // in a new process says it holds none of it.
         .recovery_source_already_presented = recovery_checkpoint != null and !prompt_input.fresh_output,
     };
+    sign_in.apply(&job);
 
     // A turn whose completions report no tokens sends no `usage_update`.
     session.context_used.store(0, .release);
@@ -1174,7 +1291,7 @@ pub fn handlePrompt(
     };
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
-    agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
+    const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
             .kind = .acp,
@@ -1182,7 +1299,12 @@ pub fn handlePrompt(
             .session_id = session.session_id,
         },
         .outcome_allocator = alloc,
-    }, agent_config, job) catch |err| {
+    }, agent_config, job);
+    // The next turn starts the agent's usage over, so this turn's is added to
+    // the prompt's now, however it ended. The agent's own count stays as it
+    // is: a checkpoint saves it.
+    usage_total.add(session.session_rt.agent.turn_usage);
+    first_turn catch |err| {
         if (err == error.TurnYielded) {
             // The journal keeps the turn open for a later resume; nothing
             // ends it here.
@@ -1208,7 +1330,7 @@ pub fn handlePrompt(
         }
     };
     try endJournalTurn(alloc, state.alloc, session);
-    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job)) |outcome| {
+    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
         prompt_input.retainImageSnapshots();
         return outcome;
     }
@@ -1247,9 +1369,10 @@ fn maybeStartAcpTitleTask(
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
     const provider_title_model = bundle.title_model orelse return;
-    // A Token Pass session titles itself with a Token Pass model.
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model.
     const title_model = if (session.provider == .gateway)
-        token_pass.modelForSideCall(.title, session.model, provider_title_model)
+        token_pass_team.modelForSideCall(.title, session.model, provider_title_model)
     else
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
@@ -2958,7 +3081,7 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// shows on the subagent call that sent the work. A turn
 /// started this way is the child's, never the user's, so its root context
 /// stays the user's own request. Returns the prompt's outcome when a turn
-/// ends it early.
+/// ends it early. Each turn's usage is added to `usage_total` when it ends.
 fn runReportTurns(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
@@ -2967,6 +3090,7 @@ fn runReportTurns(
     deps: *const agent_runtime.AgentRuntimeDeps,
     agent_config: agent_runtime.Config,
     base: worker_runtime.QueuedPrompt,
+    usage_total: *types.Usage,
 ) !?TerminalOutcome {
     const tree = state.subagent_host orelse return null;
     while (true) {
@@ -3008,7 +3132,12 @@ fn runReportTurns(
         }
         const history = try session.session_rt.snapshotHistory(alloc);
         defer types.freeHistoryTurnSlice(alloc, history);
+        // The first turn's sign-in may have been refreshed since; send the
+        // current one, as a turn the user starts does.
+        var sign_in = try TurnSignIn.capture(alloc, state, session);
+        defer sign_in.deinit(alloc);
         var job = base;
+        sign_in.apply(&job);
         job.turn_id = 0;
         job.prompt = next.prompt;
         job.author = next.author;
@@ -3022,7 +3151,7 @@ fn runReportTurns(
         job.recovery_checkpoint = null;
         job.recovery_source_already_presented = false;
         debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
-        agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
+        const report_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
             .view = state.lifecycle_view,
             .scope = .{
                 .kind = .acp,
@@ -3030,7 +3159,9 @@ fn runReportTurns(
                 .session_id = session.session_id,
             },
             .outcome_allocator = alloc,
-        }, agent_config, job) catch |err| {
+        }, agent_config, job);
+        usage_total.add(session.session_rt.agent.turn_usage);
+        report_turn catch |err| {
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
@@ -5216,12 +5347,13 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         error.WriteFailed,
     };
 
+    var usage: types.Usage = .{};
     for (errors) |expected_error| {
         AcpContextRegistryFixture.reset();
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, alloc, &msg, "code", .ask),
+            handlePrompt(&state, alloc, &msg, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(state.active_session.?.pending_prompt_id == null);
@@ -5793,6 +5925,52 @@ test "ACP full advertisement includes direct provider search with explicit permi
     defer projection.deinit(std.testing.allocator);
     try std.testing.expect(tool_projection_mod.containsName(projection.advertised_names, "web_search"));
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
+}
+
+test "ACP turn sign-in outlives a refreshed credential the server publishes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    state.gateway_team = try alloc.dupe(u8, "team_before");
+
+    var first = try TurnSignIn.capture(alloc, &state, &state.active_session.?);
+    defer first.deinit(alloc);
+    var job: worker_runtime.QueuedPrompt = .{
+        .prompt = &.{},
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    first.apply(&job);
+
+    // A step's refresh publishes a new credential and frees the old one.
+    var refreshed: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "refreshed-api-key"),
+        .source = .ai_gateway_api_key,
+        .team_id = try alloc.dupe(u8, "team_after"),
+    };
+    server.adoptServerCredential(&state, &refreshed);
+    refreshed.deinit(alloc);
+    try std.testing.expectEqualStrings("test-api-key", job.api_key);
+    try std.testing.expectEqualStrings("team_before", job.gateway_team.?);
+
+    // The report turn after it sends the published one.
+    var next = try TurnSignIn.capture(alloc, &state, &state.active_session.?);
+    defer next.deinit(alloc);
+    var report_job = job;
+    next.apply(&report_job);
+    try std.testing.expectEqualStrings("refreshed-api-key", report_job.api_key);
+    try std.testing.expectEqualStrings("team_after", report_job.gateway_team.?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, report_job.credential_source.?);
 }
 
 test "ACP prompt agent config carries request options from active session" {
