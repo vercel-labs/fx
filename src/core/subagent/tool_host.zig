@@ -375,6 +375,9 @@ pub const Runtime = struct {
         profile: []u8,
         /// What it is for (`Child.purpose`), or empty when it has none.
         purpose: []u8,
+        /// How its last finished work ended, or null before it has finished
+        /// one. Saved with the child, so a restart keeps it.
+        last_outcome: ?child_state.Outcome = null,
     };
 
     /// The root's subagents in the order they started, after a restart too.
@@ -411,6 +414,7 @@ pub const Runtime = struct {
                 .name = name,
                 .profile = profile,
                 .purpose = try alloc.dupe(u8, child.purpose orelse ""),
+                .last_outcome = child.last_outcome,
             };
             filled += 1;
         }
@@ -3330,6 +3334,11 @@ test "stop ends a subagent's turn without a report and drops what waits for it" 
     const child = registry.findPersistent("reviewer").?;
     try std.testing.expectEqual(child_state.Outcome.cancelled, child.last_outcome.?);
     try std.testing.expect(!child.last_report_owed);
+    // The app reads it from the list, to say the subagent was stopped.
+    const listing = try runtime.listChildren(alloc);
+    defer Runtime.freeChildListing(alloc, listing);
+    try std.testing.expectEqual(@as(usize, 1), listing.len);
+    try std.testing.expectEqual(@as(?child_state.Outcome, .cancelled), listing[0].last_outcome);
     const again = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-4", null);
     try std.testing.expect(std.mem.find(u8, again, "reviewer was not working.") != null);
     const missing = try callTool(runtime, arena, .{ .stop = .{ .agent = "nobody" } }, "call-5", null);

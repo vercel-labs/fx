@@ -510,6 +510,78 @@ test "the state column is as wide as the widest state shown, so the model follow
     });
 }
 
+test "a failed or stopped subagent's state fits the state column, wide and narrow" {
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active },
+        .{ .name = "builder", .subagent = true, .title = "Build the parser", .state = "failed", .model = "anthropic/claude-opus-4-7" },
+        .{ .name = "tester", .subagent = true, .title = "Run the auth tests", .state = "stopped", .model = "openai/gpt-5.4-mini" },
+        .{ .name = "docs", .subagent = true, .title = "", .state = "idle" },
+    };
+    const projection: AgentsMenuProjection = .{ .rows = &rows };
+    // The column is as wide as the widest state shown, "stopped".
+    try expectRows(projection, 80, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       Fix the login bug   working",
+        "  ├ builder  Build the parser    failed   opus 4-7",
+        "  ├ tester   Run the auth tests  stopped  gpt-5.4-mini",
+        "  └ docs     new session         idle",
+    });
+    // Narrower, the model goes first, and the state always fits.
+    try expectRows(projection, 48, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       Fix the login bug   working",
+        "  ├ builder  Build the parser    failed",
+        "  ├ tester   Run the auth tests  stopped",
+        "  └ docs     new session         idle",
+    });
+    try expectRows(projection, 40, max_inline_rows, &.{
+        "  Agents 4",
+        "",
+        "  main       Fix the login bug  working",
+        "  ├ builder  Build the parser   failed",
+        "  ├ tester   Run the auth tes…  stopped",
+        "  └ docs     new session        idle",
+    });
+}
+
+test "a stopped row that shows what its subagent is for keeps the state column, wide and narrow" {
+    // After a quit and a resume, a subagent whose turn the quit cut short has
+    // no title yet, so its row shows its purpose and says `stopped`.
+    const rows = [_]AgentsMenuRow{
+        .{ .name = "main", .title = "Fix the login bug", .state = "idle" },
+        .{ .name = "scout", .subagent = true, .title = "", .purpose = "日本語日本語日本語日本語", .state = "stopped" },
+        .{ .name = "docs", .subagent = true, .title = "", .purpose = "Write the docs.", .state = "idle" },
+    };
+    const projection: AgentsMenuProjection = .{ .rows = &rows };
+    for ([_]u16{ 80, 48 }) |width| {
+        try expectRows(projection, width, max_inline_rows, &.{
+            "  Agents 3",
+            "",
+            "  main     Fix the login bug         idle",
+            "  ├ scout  日本語日本語日本語日本語  stopped",
+            "  └ docs   Write the docs.           idle",
+        });
+    }
+    // Narrower, the title cell takes what is left: a cut keeps whole wide
+    // characters, and the state column stays under one column on every row.
+    try expectRows(projection, 40, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main     Fix the login bug    idle",
+        "  ├ scout  日本語日本語日本語…  stopped",
+        "  └ docs   Write the docs.      idle",
+    });
+    try expectRows(projection, 34, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main     Fix the logi…  idle",
+        "  ├ scout  日本語日本語…  stopped",
+        "  └ docs   Write the do…  idle",
+    });
+}
+
 test "a narrow agent list leaves out the profile, then the model, and cuts a long title" {
     const projection: AgentsMenuProjection = .{ .rows = &test_team };
     try expectRows(projection, 64, max_inline_rows, &.{

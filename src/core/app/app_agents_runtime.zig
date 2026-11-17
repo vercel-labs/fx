@@ -107,6 +107,9 @@ pub const ChildAgent = struct {
     /// Main loop only.
     approval_asked: u64 = 0,
     question_asked: u64 = 0,
+    /// How its last turn ended, which its row and its footer name once none
+    /// is going (`LastEnd`). Main loop only.
+    last_end: LastEnd = .done,
     /// Backs `footerLabel`.
     label_buf: [160]u8 = undefined,
 
@@ -115,12 +118,13 @@ pub const ChildAgent = struct {
         return if (self.name.len > 0) self.name else self.id;
     }
 
-    /// The footer's name for it on its own screen, marked done while none of
-    /// its turns is going. Valid until the next call; only the main
+    /// The footer's name for it on its own screen, marked with how its last
+    /// turn ended while none of its turns is going: done, failed, or
+    /// stopped, as its row says. Valid until the next call; only the main
     /// loop paints.
     fn footerLabel(self: *ChildAgent) []const u8 {
         if (self.workGoing()) return self.displayName();
-        return std.mem.print(&self.label_buf, "{s} · done", .{self.displayName()}) catch self.displayName();
+        return std.mem.print(&self.label_buf, "{s} · {s}", .{ self.displayName(), @tagName(self.last_end) }) catch self.displayName();
     }
 
     /// Whether a turn of its is running, waiting to run, or finished with
@@ -143,6 +147,57 @@ pub const ChildAgent = struct {
 /// An agent in the switch list, such as the row Delete closes or the row
 /// above a closed agent: a subagent, or an instance with null for the first.
 const ListedAgent = struct { agent: ?*ChildAgent };
+
+/// How a subagent's last turn ended, which its row and its footer name once
+/// no turn is going. The tag names are the footer's words. A turn the user
+/// typed on its screen counts, as it does in the report to its parent.
+const LastEnd = enum {
+    /// Its last turn completed, or it has not run.
+    done,
+    /// Its last turn failed, as the report to its parent says.
+    failed,
+    /// Its last turn was stopped or cancelled, by the user, by its parent,
+    /// or by fx quitting: the report says it was cancelled or interrupted.
+    stopped,
+
+    /// What the host's record of a finished work leaves here. The record
+    /// is what a restart keeps. A work that never reached the subagent,
+    /// which its parent's report says fx stopped, reads as stopped.
+    fn of(outcome: ?subagent_child_state.Outcome) LastEnd {
+        return switch (outcome orelse return .done) {
+            .completed => .done,
+            .failed => .failed,
+            .cancelled, .interrupted, .lost => .stopped,
+        };
+    }
+};
+
+/// How a turn that ended as `outcome` ends the work it ran for. This is the
+/// one mapping behind the row's mark (`LastEnd`), the host's record of a turn
+/// the user typed, and the outcome that ends a turn its parent started
+/// (`endRun`), which is also how the report to the parent words it.
+/// `handed_off` is whether the turn ended by handing off to the user's image
+/// or `$skill`: the work is then done, not cancelled.
+fn workOutcome(handed_off: bool, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
+    return switch (outcome) {
+        .completed => .completed,
+        .failed => .failed,
+        .interrupted => if (handed_off) .completed else .cancelled,
+        .paused => .cancelled,
+    };
+}
+
+/// What the slot thread of a run its parent started waits for, for a work
+/// that ended as `outcome`. The record has five outcomes and the slot thread
+/// three; `workOutcome` gives only the first three, so the last two arms stand
+/// for a work that did not finish.
+fn completionOf(outcome: subagent_child_state.Outcome) agents.ChildRunCompletion.Outcome {
+    return switch (outcome) {
+        .completed => .completed,
+        .failed => .failed,
+        .cancelled, .interrupted, .lost => .cancelled,
+    };
+}
 
 /// A key that arms, and then closes, the highlighted row of the agent list
 /// when the search is empty, and edits the search when it holds text:
@@ -225,6 +280,11 @@ const InstanceState = enum {
     working,
     finished,
     idle,
+    /// A subagent that is not busy, whose last turn failed or was stopped
+    /// (`LastEnd`). Listed after idle: it asks no more than idle does, so
+    /// it sorts where idle does and never outranks it.
+    failed,
+    stopped,
 
     pub fn label(self: InstanceState) []const u8 {
         return switch (self) {
@@ -234,6 +294,8 @@ const InstanceState = enum {
             .working => "working",
             .finished => "finished",
             .idle => "idle",
+            .failed => "failed",
+            .stopped => "stopped",
         };
     }
 
@@ -241,7 +303,7 @@ const InstanceState = enum {
         return switch (self) {
             .needs_approval, .has_question, .needs_you => .attention,
             .working => .working,
-            .finished, .idle => .idle,
+            .finished, .idle, .failed, .stopped => .idle,
         };
     }
 
@@ -250,7 +312,7 @@ const InstanceState = enum {
         return switch (self) {
             .needs_approval, .has_question, .needs_you => .needs_user,
             .working, .finished => .active,
-            .idle => .idle,
+            .idle, .failed, .stopped => .idle,
         };
     }
 };
@@ -306,7 +368,7 @@ fn busyAs(state: InstanceState) ?Busiest {
         .has_question => .has_question,
         .needs_you => .needs_you,
         .working => .working,
-        .finished, .idle => null,
+        .finished, .idle, .failed, .stopped => null,
     };
 }
 
@@ -317,14 +379,19 @@ fn moreUrgent(a: InstanceState, b: InstanceState) InstanceState {
 }
 
 /// `request_waits` is whether the agent's status row shows a request that
-/// waits for the user.
-fn instanceState(agent: *agents.Agent, request_waits: bool) InstanceState {
+/// waits for the user. `last_end` is how a subagent's last turn ended, and
+/// `.done` for an instance, whose states it never changes.
+fn instanceState(agent: *agents.Agent, request_waits: bool, last_end: LastEnd) InstanceState {
     if (agent.approval_prompt.isActive()) return .needs_approval;
     if (agent.question_prompt.isActive()) return .has_question;
     if (request_waits) return .needs_you;
     if (turnInFlight(agent)) return .working;
     if (agent.finished_unseen) return .finished;
-    return .idle;
+    return switch (last_end) {
+        .done => .idle,
+        .failed => .failed,
+        .stopped => .stopped,
+    };
 }
 
 /// Whether one of `agent`'s turns is going or queued.
@@ -348,6 +415,105 @@ test "a subagent's parent may send again only a refused or a day-old request" {
     for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
         try std.testing.expect(!parentMayResend(need));
     }
+}
+
+test "a subagent's last work reads as done, failed, or stopped, as its parent's report words it" {
+    const Outcome = subagent_child_state.Outcome;
+    try std.testing.expectEqual(LastEnd.done, LastEnd.of(null));
+    try std.testing.expectEqual(LastEnd.done, LastEnd.of(Outcome.completed));
+    try std.testing.expectEqual(LastEnd.failed, LastEnd.of(Outcome.failed));
+    // Stopped by the user, stopped by its parent, or cut short by fx quitting
+    // are cancelled; fx stopping mid-turn is interrupted; fx stopping before
+    // the message arrived is lost. Its parent's report says fx or the user
+    // stopped it each time.
+    for ([_]Outcome{ .cancelled, .interrupted, .lost }) |outcome| {
+        try std.testing.expectEqual(LastEnd.stopped, LastEnd.of(outcome));
+    }
+    // The footer's words are the tags.
+    try std.testing.expectEqualStrings("done", @tagName(LastEnd.done));
+    try std.testing.expectEqualStrings("failed", @tagName(LastEnd.failed));
+    try std.testing.expectEqualStrings("stopped", @tagName(LastEnd.stopped));
+}
+
+test "a turn's end becomes its work's outcome in one place, which the row and the parent's work both take" {
+    const Ended = types.TurnPresentationOutcome;
+    const Outcome = subagent_child_state.Outcome;
+    const Case = struct { ended: Ended, handed_off: bool, outcome: Outcome, mark: LastEnd };
+    // Every end, with and without a hand-off. A hand-off turns only an
+    // interrupted turn into a finished one.
+    const cases = [_]Case{
+        .{ .ended = .completed, .handed_off = false, .outcome = .completed, .mark = .done },
+        .{ .ended = .completed, .handed_off = true, .outcome = .completed, .mark = .done },
+        .{ .ended = .failed, .handed_off = false, .outcome = .failed, .mark = .failed },
+        .{ .ended = .failed, .handed_off = true, .outcome = .failed, .mark = .failed },
+        .{ .ended = .interrupted, .handed_off = false, .outcome = .cancelled, .mark = .stopped },
+        .{ .ended = .interrupted, .handed_off = true, .outcome = .completed, .mark = .done },
+        .{ .ended = .paused, .handed_off = false, .outcome = .cancelled, .mark = .stopped },
+        .{ .ended = .paused, .handed_off = true, .outcome = .cancelled, .mark = .stopped },
+    };
+    for (cases) |case| {
+        const outcome = workOutcome(case.handed_off, case.ended);
+        try std.testing.expectEqual(case.outcome, outcome);
+        // The row names the work's outcome.
+        try std.testing.expectEqual(case.mark, LastEnd.of(outcome));
+        // The parent's work ends as the record has it, by the same name.
+        try std.testing.expectEqualStrings(@tagName(outcome), @tagName(completionOf(outcome)));
+        // Only a failed turn fails its work, which is when `endRun` keeps the
+        // failure for the parent.
+        try std.testing.expectEqual(case.ended == .failed, outcome == .failed);
+    }
+    // Each end is in the table, so a new one must be added to it.
+    try std.testing.expectEqual(std.enums.values(Ended).len * 2, cases.len);
+    // Every outcome the record can hold converts, the two a turn never gives
+    // among them.
+    const Work = agents.ChildRunCompletion.Outcome;
+    try std.testing.expectEqual(Work.completed, completionOf(.completed));
+    try std.testing.expectEqual(Work.failed, completionOf(.failed));
+    for ([_]Outcome{ .cancelled, .interrupted, .lost }) |outcome| {
+        try std.testing.expectEqual(Work.cancelled, completionOf(outcome));
+    }
+}
+
+test "a failed or stopped row asks no more of the user than an idle one and sorts with it" {
+    try std.testing.expectEqualStrings("failed", InstanceState.failed.label());
+    try std.testing.expectEqualStrings("stopped", InstanceState.stopped.label());
+    for ([_]InstanceState{ .failed, .stopped }) |state| {
+        try std.testing.expectEqual(InstanceState.idle.urgency(), state.urgency());
+        try std.testing.expectEqual(InstanceState.idle.tone(), state.tone());
+        try std.testing.expect(busyAs(state) == null);
+        // Never more urgent than another state that is not busy, so it never
+        // stands for the busiest agent.
+        try std.testing.expectEqual(InstanceState.idle, moreUrgent(.idle, state));
+        try std.testing.expectEqual(InstanceState.working, moreUrgent(state, .working));
+    }
+}
+
+test "an agent's state says how its last turn ended only when nothing else claims the row" {
+    var agent: agents.Agent = .{};
+    try std.testing.expectEqual(InstanceState.idle, instanceState(&agent, false, .done));
+    try std.testing.expectEqual(InstanceState.failed, instanceState(&agent, false, .failed));
+    try std.testing.expectEqual(InstanceState.stopped, instanceState(&agent, false, .stopped));
+    // A request only the user can continue outranks it.
+    try std.testing.expectEqual(InstanceState.needs_you, instanceState(&agent, true, .failed));
+    // So does a turn going: the next turn starts over.
+    agent.worker.worker_processing = true;
+    try std.testing.expectEqual(InstanceState.working, instanceState(&agent, false, .failed));
+    try std.testing.expectEqual(InstanceState.working, instanceState(&agent, false, .stopped));
+    agent.worker.worker_processing = false;
+    try std.testing.expectEqual(InstanceState.failed, instanceState(&agent, false, .failed));
+}
+
+test "a subagent's footer name says how its last turn ended once no turn is going" {
+    var id = "writer-id".*;
+    var child: ChildAgent = .{ .id = &id };
+    try std.testing.expectEqualStrings("writer-id · done", child.footerLabel());
+    child.last_end = .failed;
+    try std.testing.expectEqualStrings("writer-id · failed", child.footerLabel());
+    child.last_end = .stopped;
+    try std.testing.expectEqualStrings("writer-id · stopped", child.footerLabel());
+    // While a turn goes, the name stands alone, whatever the last one did.
+    child.agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("writer-id", child.footerLabel());
 }
 
 /// Slot threads and the main loop both use the hand-off list.
@@ -1220,6 +1386,9 @@ pub fn Runtime(comptime App: type) type {
                 for (listing) |entry| {
                     const child = findChild(app, entry.id) orelse restored: {
                         const restored_child = try addChild(app, entry.id);
+                        // How its last work ended, as the host saved it: a
+                        // restart, `/resume`, and a fork's copy keep it.
+                        restored_child.last_end = LastEnd.of(entry.last_outcome);
                         try showSavedTitle(app, host, restored_child);
                         const history = host.childHistory(app.alloc, entry.id) catch |err| {
                             debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ entry.id, @errorName(err) });
@@ -2429,17 +2598,20 @@ pub fn Runtime(comptime App: type) type {
         /// but is not applied yet is still working: the list places it by the
         /// newest reply in its history, so its state and its place change
         /// together, as `tests/tla/agents_menu/spec/RowOrder.tla`
-        /// PlaceChangesWithLabel requires.
+        /// PlaceChangesWithLabel requires. A subagent that is not busy
+        /// says how its last turn ended: failed or stopped, else idle, and
+        /// an instance stays idle (`LastEnd`).
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
             }
-            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target));
+            const last_end: LastEnd = if (target) |child| (if (child.agent.role == .subagent) child.last_end else .done) else .done;
+            const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target), last_end);
             const child = target orelse return state;
             if (child.agent.role != .subagent) return state;
             return switch (state) {
-                .idle, .finished => if (resultPending(app, child)) .working else state,
+                .idle, .finished, .failed, .stopped => if (resultPending(app, child)) .working else state,
                 .working, .needs_approval, .has_question, .needs_you => state,
             };
         }
@@ -3069,7 +3241,7 @@ pub fn Runtime(comptime App: type) type {
                     .interrupted => |value| value.assistant orelse "",
                     .compacted_summary => "",
                 };
-                endAndFollowUserWork(app.alloc, host, run, &agent.worker, userWorkOutcome(run, finished.terminal_outcome orelse .completed), reply);
+                endAndFollowUserWork(app.alloc, host, run, &agent.worker, workOutcome(run.handed_off, finished.terminal_outcome orelse .completed), reply);
                 return;
             }
             if (!run.inFlight()) return;
@@ -3116,6 +3288,7 @@ pub fn Runtime(comptime App: type) type {
         /// on its way, held by the pacer or not yet drained, so the run ends
         /// when it is saved, or in `settleChildRuns` once nothing is left.
         pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
+            noteLastEnd(app, agent, finished);
             const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             run.ended_as = finished.outcome;
             if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
@@ -3135,7 +3308,7 @@ pub fn Runtime(comptime App: type) type {
                 if (hasPendingWork(child) or child.agent.worker.isProcessing()) continue;
                 if (run.turn_work_id.len > 0) {
                     const host = hostOf(app, child) orelse continue;
-                    endAndFollowUserWork(app.alloc, host, run, &child.agent.worker, userWorkOutcome(run, outcome), "");
+                    endAndFollowUserWork(app.alloc, host, run, &child.agent.worker, workOutcome(run.handed_off, outcome), "");
                     continue;
                 }
                 if (!run.inFlight()) continue;
@@ -3151,13 +3324,18 @@ pub fn Runtime(comptime App: type) type {
             return if (run.turn_work_id.len > 0) run else null;
         }
 
-        fn userWorkOutcome(run: *const agents.ChildRun, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
-            return switch (outcome) {
-                .completed => .completed,
-                .failed => .failed,
-                .interrupted => if (run.handed_off) .completed else .cancelled,
-                .paused => .cancelled,
-            };
+        /// Remembers how a subagent's turn ended, for its row and its
+        /// footer. Every turn of its counts, the parent's work, the user's
+        /// on its own screen, and a wake by its own child, and the newest
+        /// wins, so a later turn that completes clears a failure. The turn
+        /// is mapped by `workOutcome`, as `endRun` and a turn the user typed
+        /// map it, so the row and the report to the parent agree
+        /// (`tests/tla/agents_menu/spec/RowOrder.tla` EndIsOfAppliedTurn).
+        fn noteLastEnd(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const handed_off = finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id);
+            child.last_end = LastEnd.of(workOutcome(handed_off, finished.outcome));
         }
 
         /// Ends a user's turn's work. When the turn handed off to the user's
@@ -3256,20 +3434,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn endRun(run: *agents.ChildRun, outcome: types.TurnPresentationOutcome) void {
-            switch (outcome) {
-                .completed => finishRun(run, .completed),
-                .failed => {
-                    // Keeps the provider's own error when the worker set one.
-                    if (run.turn) |turn| if (turn.failureDiagnostic() == null) {
-                        turn.failure_diagnostic = run.failure orelse
-                            types.ModelFailureDiagnostic.init("agent_turn_failed");
-                    };
-                    finishRun(run, .failed);
-                },
-                // Handed off to the user's image or `$skill`: the work is done.
-                .interrupted => finishRun(run, if (run.handed_off) .completed else .cancelled),
-                .paused => finishRun(run, .cancelled),
+            const ended = workOutcome(run.handed_off, outcome);
+            if (ended == .failed) {
+                // Keeps the provider's own error when the worker set one.
+                if (run.turn) |turn| if (turn.failureDiagnostic() == null) {
+                    turn.failure_diagnostic = run.failure orelse
+                        types.ModelFailureDiagnostic.init("agent_turn_failed");
+                };
             }
+            finishRun(run, completionOf(ended));
         }
 
         /// Gives a child agent its next run, replacing the last one, and takes
