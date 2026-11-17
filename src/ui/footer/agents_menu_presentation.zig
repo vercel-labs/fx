@@ -16,6 +16,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
@@ -218,10 +219,12 @@ fn composeAgentRow(alloc: Allocator, projection: AgentsMenuProjection, index: us
     const indent = indentWidth(width);
     const columns: Columns = .of(projection, width, indent);
     // Selection is the whole row bold and bright, as in the session list.
-    // An unselected row is dim, with its name and what it is doing in plain
-    // text, and a state that waits for the user bright.
+    // An unselected row is dim, with its name in the agent's theme color, or
+    // plain when the theme sets none, what it is doing in plain text, and a
+    // state that waits for the user bright.
     const dim = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
     const plain = if (selected) ui_render.selected_completion_style else "";
+    const name_style = if (selected) plain else shared_theme.agentStyle(shared_theme.current(), row.name);
     const state_style = if (selected) ui_render.selected_completion_style else switch (row.state_tone) {
         .needs_user => ui_render.hint_style,
         .active => "",
@@ -244,7 +247,9 @@ fn composeAgentRow(alloc: Allocator, projection: AgentsMenuProjection, index: us
         name_start += branchWidth(row);
         name_width -|= branchWidth(row);
     }
-    try appendCell(alloc, &line, name_start, row.name, name_width, plain);
+    // appendCell ends every cell with a full reset, so the name's color ends
+    // there too and the title starts in its own style.
+    try appendCell(alloc, &line, name_start, row.name, name_width, name_style);
     try appendCell(alloc, &line, columns.titleStart(indent), titleOf(row), columns.title, dim);
     try appendCell(alloc, &line, columns.stateStart(indent), row.state, columns.state, state_style);
     var model_buf: [model_label_bytes]u8 = undefined;
@@ -705,4 +710,101 @@ test "the agent list scrolls to keep the selected agent in view, and a branch th
         "  ├ e   t  idle",
         "  └ f   t  idle",
     });
+}
+
+/// fx_dark with three agent colors set, for tests that color agent names.
+fn agentColorTheme() shared_theme.Theme {
+    var theme = shared_theme.fx_dark;
+    theme.agent_1_style = "\x1b[38;2;255;0;0m";
+    theme.agent_2_style = "\x1b[1;38;2;0;255;0m";
+    theme.agent_3_style = "\x1b[38;2;0;0;255;48;2;9;9;9m";
+    return theme;
+}
+
+test "an unselected agent's name takes its theme color, and the selected row keeps the selection style" {
+    const alloc = std.testing.allocator;
+    const projection: AgentsMenuProjection = .{ .rows = &test_team, .selected = 2 };
+    // Each row as a builtin theme draws it.
+    var builtin: [3][]u8 = undefined;
+    for (&builtin, 2..) |*bytes, row_index| {
+        var row = try composeAgentsMenuRow(alloc, projection, @intCast(row_index), 80, max_inline_rows);
+        bytes.* = try row.toOwnedSlice(alloc);
+    }
+    defer for (builtin) |bytes| alloc.free(bytes);
+
+    const theme = agentColorTheme();
+    shared_theme.activate(theme);
+    defer shared_theme.activate(shared_theme.fx_dark);
+
+    // An unselected subagent's name is in its color, and the reset that ends
+    // the cell gives the title its own style back.
+    var waiting = try composeAgentsMenuRow(alloc, projection, 3, 80, max_inline_rows);
+    defer waiting.deinit(alloc);
+    const tester = shared_theme.agentStyle(theme, "tester");
+    try std.testing.expect(tester.len > 0);
+    const dim = ui_render.dim_style;
+    const reset = ui_render.reset_style;
+    const expected_waiting = try alloc.print(
+        "  {[dim]s}├ {[reset]s}{[agent]s}tester{[reset]s}  {[dim]s}Run the auth tests{[reset]s}" ++
+            "  {[bright]s}needs approval{[reset]s}  {[dim]s}gpt-5.4-mini{[reset]s}   {[dim]s}tester{[reset]s}",
+        .{ .dim = dim, .reset = reset, .bright = ui_render.hint_style, .agent = tester },
+    );
+    defer alloc.free(expected_waiting);
+    try std.testing.expectEqualStrings(expected_waiting, waiting.items);
+
+    // An unselected fx's name takes its color too.
+    var main_row = try composeAgentsMenuRow(alloc, projection, 2, 80, max_inline_rows);
+    defer main_row.deinit(alloc);
+    const main_name = try std.mem.concat(alloc, u8, &.{ "  ", shared_theme.agentStyle(theme, "main"), "main", reset });
+    defer alloc.free(main_name);
+    try std.testing.expect(std.mem.startsWith(u8, main_row.items, main_name));
+
+    // The selected row is the selection style throughout, as without agent
+    // colors.
+    var chosen = try composeAgentsMenuRow(alloc, projection, 4, 80, max_inline_rows);
+    defer chosen.deinit(alloc);
+    try std.testing.expectEqualStrings(builtin[2], chosen.items);
+    try std.testing.expect(std.mem.find(u8, chosen.items, shared_theme.agentStyle(theme, "docs")) == null);
+
+    // Colored rows take the same columns as plain ones.
+    for (builtin[0..2], [_][]const u8{ main_row.items, waiting.items }) |plain_bytes, colored| {
+        try std.testing.expectEqual(display_width.visibleWidthIgnoringAnsi(plain_bytes), display_width.visibleWidthIgnoringAnsi(colored));
+    }
+}
+
+test "agent colors keep the agent list's columns at every width" {
+    shared_theme.activate(agentColorTheme());
+    defer shared_theme.activate(shared_theme.fx_dark);
+    const projection: AgentsMenuProjection = .{ .rows = &test_team, .selected = 1 };
+    try expectRows(projection, 80, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main      Fix the login bug   working         opus 4-7 high",
+        "  ├ tester  Run the auth tests  needs approval  gpt-5.4-mini   tester",
+        "  └ docs    new session         idle",
+    });
+    try expectRows(projection, 40, max_inline_rows, &.{
+        "  Agents 3",
+        "",
+        "  main      Fix the lo…  working",
+        "  ├ tester  Run the au…  needs approval",
+        "  └ docs    new session  idle",
+    });
+    // A row too narrow even for its name and state is cut at the edge, and
+    // its color ends there.
+    var row = try composeAgentsMenuRow(std.testing.allocator, projection, 2, 6, max_inline_rows);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 6);
+    try std.testing.expect(std.mem.endsWith(u8, row.items, ui_render.reset_style));
+}
+
+test "a builtin theme leaves agent names plain in the agent list" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings("", shared_theme.agentStyle(shared_theme.current(), "tester"));
+    const projection: AgentsMenuProjection = .{ .rows = &test_team, .selected = 0 };
+    var row = try composeAgentsMenuRow(alloc, projection, 3, 80, max_inline_rows);
+    defer row.deinit(alloc);
+    const plain_name = try std.mem.concat(alloc, u8, &.{ ui_render.reset_style, "tester", ui_render.reset_style });
+    defer alloc.free(plain_name);
+    try std.testing.expect(std.mem.find(u8, row.items, plain_name) != null);
 }

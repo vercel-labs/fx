@@ -164,7 +164,10 @@ pub fn highlight(
                     try appendStyled(alloc, &styled, palette.keyword_style, token, base);
                     styled_word = true;
                 } else if (inPackedList(token, token_hash, profile.literals, profile.keyword_case)) {
-                    try appendStyled(alloc, &styled, palette.number_style, token, base);
+                    try appendStyled(alloc, &styled, palette.constant_style, token, base);
+                    styled_word = true;
+                } else if (codeWordStyle(palette, source, token, end)) |style| {
+                    try appendStyled(alloc, &styled, style, token, base);
                     styled_word = true;
                 }
             }
@@ -178,12 +181,41 @@ pub fn highlight(
             index = end;
             continue;
         }
+        if (!profile.command_words and palette.punctuation_style.len != 0 and isPunctuation(byte)) {
+            try appendStyled(alloc, &styled, palette.punctuation_style, source[index .. index + 1], base);
+            index += 1;
+            continue;
+        }
         try styled.append(alloc, byte);
         if (!std.ascii.isWhitespace(byte)) command_position = false;
         index += 1;
     }
 
     return styled.toOwnedSlice(alloc);
+}
+
+/// The color for a code word that is neither keyword nor literal: a call
+/// (`name(`) takes the code function color, a PascalCase name the type
+/// color. Null when the theme leaves that color empty, as the builtins do.
+fn codeWordStyle(palette: Palette, source: []const u8, token: []const u8, end: usize) ?[]const u8 {
+    if (end < source.len and source[end] == '(' and palette.code_function_style.len != 0) return palette.code_function_style;
+    if (palette.type_style.len != 0 and isPascalCase(token)) return palette.type_style;
+    return null;
+}
+
+fn isPascalCase(token: []const u8) bool {
+    if (token.len < 2 or !std.ascii.isUpper(token[0])) return false;
+    for (token[1..]) |byte| {
+        if (std.ascii.isLower(byte)) return true;
+    }
+    return false;
+}
+
+fn isPunctuation(byte: u8) bool {
+    return switch (byte) {
+        '(', ')', '{', '}', '[', ']', ',', ';', '.', ':' => true,
+        else => false,
+    };
 }
 
 /// Control keywords after which the next word is again a command.
@@ -808,4 +840,30 @@ test "split slots let themes color commands variables and operators apart" {
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;201mecho\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;202m$HOME\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;203m|\x1b[39m") != null);
+}
+
+test "themes color calls, types, literals, and punctuation in code when they set those slots" {
+    const alloc = std.testing.allocator;
+    var theme = shared_theme.fx_dark;
+    theme.syntax.code_function_style = "<fn>";
+    theme.syntax.type_style = "<type>";
+    theme.syntax.constant_style = "<const>";
+    theme.syntax.punctuation_style = "<p>";
+    shared_theme.activate(theme);
+    defer shared_theme.activate(shared_theme.fx_dark);
+
+    const styled = try highlight(alloc, "let c: Config = load(true);", languages.resolve("ts").?, .dark, null);
+    defer alloc.free(styled);
+    try std.testing.expect(std.mem.find(u8, styled, "<type>Config") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "<fn>load") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "<const>true") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "<p>;") != null);
+}
+
+test "builtin themes leave calls, types, and punctuation in code plain" {
+    const alloc = std.testing.allocator;
+    shared_theme.activate(shared_theme.fx_dark);
+    const styled = try highlight(alloc, "let c: Config = load(1);", languages.resolve("ts").?, .dark, null);
+    defer alloc.free(styled);
+    try std.testing.expect(std.mem.find(u8, styled, "Config = load(") != null);
 }

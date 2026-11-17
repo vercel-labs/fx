@@ -268,7 +268,7 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
     }
     var w: std.Io.Writer = .fixed(out);
     if (marker_visible) {
-        w.print("{s}{s}{s}", .{ ui_render.permission_auto_style, marker, ui_render.reset_style }) catch return label;
+        w.print("{s}{s}{s}", .{ ui_render.accent_style, marker, ui_render.reset_style }) catch return label;
     } else {
         w.writeAll(" ") catch return label;
     }
@@ -360,7 +360,7 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     var marker_writer: std.Io.Writer = .fixed(&marker_buf);
     if (markerBlinkVisible(shimmer_pos)) {
         marker_writer.print("{s}{s}{s}", .{
-            ui_render.permission_auto_style,
+            ui_render.accent_style,
             label[marker_start..marker_end],
             ui_render.reset_style,
         }) catch return label;

@@ -1,0 +1,80 @@
+{
+  "type": "light",
+  "colors": {
+    "link": "#2B6A8A",
+    "inline_code": "#8A4B1F",
+    "dim": "#918875",
+    "hint": "#544F43",
+    "statusline": "#746B58",
+    "divider": "#CAC1AC",
+    "tag": {
+      "fg": "#2E2A22",
+      "bold": true
+    },
+    "subtitle": {
+      "fg": "#9C4A1A",
+      "bold": true
+    },
+    "selected_completion": {
+      "fg": "#9C4A1A",
+      "bold": true
+    },
+    "approval_button_inactive": {
+      "fg": "#2E2A22",
+      "bg": "#EFDCB9"
+    },
+    "system_notice_label": {
+      "fg": "#2E2A22",
+      "bold": true
+    },
+    "system_notice_text": "#544F43",
+    "warning": "#744C00",
+    "green": "#116329",
+    "red": "#CF222E",
+    "diff_added": "#116329",
+    "diff_removed": "#CF222E",
+    "diff_added_marker": "#116329",
+    "diff_removed_marker": "#CF222E",
+    "diff_added_word": {
+      "bg": "#C2E1C5"
+    },
+    "diff_removed_word": {
+      "bg": "#FFE6E4"
+    },
+    "permission_auto": "#9C4A1A",
+    "user_card_marker": "#9C4A1A",
+    "user_card_accent": "#544F43",
+    "task_completed": "#116329",
+    "tool_stdout": "#544F43",
+    "tool_stderr": "#744C00",
+    "accent": "#9C4A1A",
+    "heading": {
+      "fg": "#9C4A1A",
+      "bold": true
+    },
+    "quote": "#A39A86",
+    "list_marker": "#9C4A1A",
+    "rule": "#B9B09C",
+    "agent_1": "#2B6A8A",
+    "agent_2": "#9C4A1A",
+    "agent_3": "#0B7365",
+    "agent_4": "#1C560B",
+    "agent_5": "#3D3C86",
+    "agent_6": "#6F285C"
+  },
+  "syntax": {
+    "keyword": "#9C4A1A",
+    "string": "#4B772B",
+    "number": "#2B6A8A",
+    "comment": {
+      "fg": "#918874",
+      "italic": true
+    },
+    "function": "#6A4C93",
+    "variable": "#744C00",
+    "operator": "#746B58",
+    "type": "#2B6A8A",
+    "constant": "#6A4C93",
+    "punctuation": "#746B58"
+  }
+}

@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const shared_theme = @import("../shared/theme.zig");
 const ansi = @import("presentation/ansi.zig");
 const tu = @import("presentation/text_util.zig");
 const bp = @import("presentation/block_parse.zig");
@@ -497,7 +498,7 @@ pub const MarkdownProcessor = struct {
     ) !void {
         const fs = self.footnoteSink();
         if (self.in_code_block) {
-            try ansi.writeDim(alloc, out, ansi.vertical_rule_prefix);
+            try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, ansi.vertical_rule_prefix, .dim);
             try out.appendSlice(alloc, line);
             return;
         }

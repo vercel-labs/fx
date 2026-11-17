@@ -18,6 +18,7 @@ const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const shared_theme = @import("../shared/theme.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
@@ -318,6 +319,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
+                .handle_theme = commandHandleTheme,
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
@@ -1470,6 +1472,11 @@ pub fn Handlers(comptime App: type) type {
             try handleNotificationsCommand(app, rest);
         }
 
+        fn commandHandleTheme(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleThemeCommand(app, rest);
+        }
+
         fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleShellCommand(app, rest);
@@ -1917,6 +1924,86 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .tone = .neutral,
         .body = level.label(),
     }, true);
+}
+
+/// "phosphor, breadbin, dotmatrix, beige, or geist": the named themes `/theme` offers.
+const named_theme_choices = blk: {
+    var text: []const u8 = "";
+    for (shared_theme.named_themes, 0..) |theme, i| {
+        const separator = if (i == 0) "" else if (i + 1 == shared_theme.named_themes.len) ", or " else ", ";
+        text = text ++ separator ++ theme.name;
+    }
+    break :blk text;
+};
+
+/// Whether `name` loads: a theme file under ~/.fx/themes or a named theme fx
+/// ships. Either variant answers that, so this asks for the dark one.
+fn themeLoads(alloc: std.mem.Allocator, name: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    _ = shared_theme.loadNamed(arena.allocator(), name, false, .{}) catch return false;
+    return true;
+}
+
+/// `/theme <name>` applies a theme now and saves it as the `theme` setting,
+/// as `fx config set theme <name>` does. Bare `/theme` names the current
+/// theme and the ones fx ships.
+fn handleThemeCommand(app: anytype, rest: []const u8) !void {
+    const App = @TypeOf(app.*);
+    const value = std.mem.trim(u8, rest, " \t");
+    if (value.len == 0) {
+        const current = shared_theme.sourceName() orelse if (shared_theme.variantPinned())
+            (if (shared_theme.current().light) "light" else "dark")
+        else
+            "fx (follows the terminal)";
+        const body = try app.alloc.print("{s} · choose {s}", .{ current, named_theme_choices });
+        defer app.alloc.free(body);
+        try app.writeDomainNotice(.{ .topic = "theme", .tone = .neutral, .body = body }, true);
+        return;
+    }
+    const known = switch (shared_theme.classifyValue(value).?) {
+        .pin_light, .pin_dark => true,
+        .custom => |name| shared_theme.validThemeName(name) and themeLoads(app.alloc, name),
+    };
+    if (!known) {
+        const body = try app.alloc.print("no theme named {s}; choose {s}", .{ value, named_theme_choices });
+        defer app.alloc.free(body);
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = body }, true);
+        return;
+    }
+    if (comptime !@hasDecl(App, "applyThemeSetting")) return;
+
+    const named_applied = try app.applyThemeSetting(value);
+    // A host that owns configuration, such as a browser, has no settings
+    // file, so the theme lasts for this session there.
+    if (comptime !runtime_profile.allows(App, .js_host_config)) {
+        const patch: config_runtime.UserSettingsPatch = .{ .theme = value };
+        var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+        defer attempt.deinit(app.alloc);
+        switch (attempt) {
+            .failure => |failure| try session_commands.reportUserSettingsFailure(app, "theme", failure.err, failure.cleanup, true),
+            .outcome => |outcome| _ = try session_commands.reportUserSettingsCommit(app, "theme", patch, outcome, null, false),
+        }
+    }
+
+    // FX_THEME wins over the setting at startup; say so, or the next launch
+    // would contradict what this command just reported.
+    if (io_mod.getenv("FX_THEME")) |env_theme| if (env_theme.len > 0) {
+        const env_body = try app.alloc.print("FX_THEME={s} is set, so fx starts with it instead of this setting", .{env_theme});
+        defer app.alloc.free(env_body);
+        try app.writeDomainNotice(.{ .topic = "theme", .tone = .warning, .body = env_body }, true);
+    };
+
+    const is_named = shared_theme.classifyValue(value).? == .custom;
+    if (is_named and !named_applied) {
+        // fx applies a named theme only in a terminal of its own mode.
+        const mode = if (shared_theme.current().light) "light" else "dark";
+        const body = try app.alloc.print("{s} · not a {s} theme, so fx shows its own colors in this {s} terminal", .{ value, mode, mode });
+        defer app.alloc.free(body);
+        try app.writeDomainNotice(.{ .topic = "theme", .tone = .warning, .body = body }, true);
+        return;
+    }
+    try app.writeDomainNotice(.{ .topic = "theme", .tone = .neutral, .body = value }, true);
 }
 
 pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {

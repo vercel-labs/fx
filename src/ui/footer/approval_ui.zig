@@ -4,6 +4,7 @@ const approval_decision = @import("../../core/permissions/approval_decision.zig"
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const permission_request = @import("../../core/permissions/permission_request.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
@@ -793,7 +794,8 @@ pub fn composeFileApprovalRow(
         => .empty,
         .preview => |index| composeFileApprovalPreviewRow(
             alloc,
-            request.preview.lines[index],
+            request.preview.lines,
+            index,
             projection.preview_number_width,
             width,
         ),
@@ -932,10 +934,12 @@ fn composeFileApprovalQuestionRow(
 
 fn composeFileApprovalPreviewRow(
     alloc: Allocator,
-    line: diff_mod.PreviewLine,
+    lines: []const diff_mod.PreviewLine,
+    index: usize,
     number_width: usize,
     width: u16,
 ) !std.ArrayList(u8) {
+    const line = lines[index];
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     var remaining: usize = width;
@@ -1004,14 +1008,71 @@ fn composeFileApprovalPreviewRow(
     _ = try appendTerminalSafeClipped(alloc, &row, op, remaining);
     remaining -|= display_width.visibleWidth(op);
     try appendSpacesWithinWidth(alloc, &row, 1, &remaining);
-    _ = try appendTerminalSafeClipped(
-        alloc,
-        &row,
-        line.text,
-        remaining,
-    );
+    const word_style = switch (line.op) {
+        .addition => ui_render.diff_added_word_style,
+        .deletion => ui_render.diff_removed_word_style,
+        .context => "",
+        .elision, .notice => unreachable,
+    };
+    const word: ?WordHighlight = if (word_style.len == 0)
+        null
+    else if (diff_mod.changedSpan(lines, index)) |span|
+        .{ .span = span, .word_style = word_style, .line_style = style }
+    else
+        null;
+    // A background in the line style spans the whole row, as in a review
+    // tool, so the rest of the row is filled while the style is active.
+    const fill_row = shared_theme.sgrHasParam(style, "48");
+    if (word == null and !fill_row) {
+        _ = try appendTerminalSafeClipped(
+            alloc,
+            &row,
+            line.text,
+            remaining,
+        );
+    } else {
+        remaining -|= try appendDiffTextClipped(alloc, &row, line.text, remaining, word);
+        if (fill_row) try appendSpacesWithinWidth(alloc, &row, remaining, &remaining);
+    }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
+}
+
+/// The changed span of a paired diff line and the styles around it.
+const WordHighlight = struct {
+    span: diff_mod.ChangedSpan,
+    word_style: []const u8,
+    line_style: []const u8,
+};
+
+/// Clips `text` to `width` as `appendTerminalSafeClipped` does, but draws the
+/// visible part of `word.span` in the word style, then restores the line
+/// style. Returns the columns written.
+fn appendDiffTextClipped(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    width: usize,
+    word: ?WordHighlight,
+) !usize {
+    const clip = clipTerminalSafe(text, width);
+    const visible = clip.visible;
+    // A clipped row shows only the part of the span left of the cut.
+    const start = if (word) |highlight| @min(highlight.span.start, visible.len) else visible.len;
+    const end = if (word) |highlight| @min(@max(highlight.span.end, start), visible.len) else visible.len;
+    if (start == end) {
+        try out.appendSlice(alloc, visible);
+    } else {
+        const highlight = word.?;
+        try out.appendSlice(alloc, visible[0..start]);
+        try out.appendSlice(alloc, highlight.word_style);
+        try out.appendSlice(alloc, visible[start..end]);
+        try out.appendSlice(alloc, shared_theme.closingFor(highlight.word_style));
+        try out.appendSlice(alloc, highlight.line_style);
+        try out.appendSlice(alloc, visible[end..]);
+    }
+    if (clip.marked) try out.appendSlice(alloc, clip_marker);
+    return display_width.visibleWidth(visible) + if (clip.marked) display_width.visibleWidth(clip_marker) else 0;
 }
 
 fn composeFileApprovalHiddenPreviewRow(
@@ -1370,25 +1431,31 @@ fn appendTerminalSafeClipped(
     text: []const u8,
     width: usize,
 ) !bool {
-    const text_width = display_width.visibleWidth(text);
-    if (text_width <= width) {
-        try out.appendSlice(alloc, text);
-        return true;
-    }
-    if (width == 0) return false;
-    const marker = "…";
-    const marker_width = display_width.visibleWidth(marker);
-    if (width <= marker_width) {
-        try out.appendSlice(alloc, marker);
-        return false;
-    }
-    const prefix = text_utils.prefixTerminalSafeByWidth(
-        text,
-        width - marker_width,
-    );
-    try out.appendSlice(alloc, prefix);
-    try out.appendSlice(alloc, marker);
-    return false;
+    const clip = clipTerminalSafe(text, width);
+    try out.appendSlice(alloc, clip.visible);
+    if (clip.marked) try out.appendSlice(alloc, clip_marker);
+    return clip.fits;
+}
+
+const clip_marker = "…";
+
+const Clip = struct {
+    /// The part of the text that fits before the marker.
+    visible: []const u8,
+    /// Whether `clip_marker` follows the visible part.
+    marked: bool,
+    /// Whether the whole text fit.
+    fits: bool,
+};
+
+/// Fits terminal-safe `text` into `width` columns: whole when it fits,
+/// otherwise a prefix and `clip_marker`, or nothing in zero columns.
+fn clipTerminalSafe(text: []const u8, width: usize) Clip {
+    if (display_width.visibleWidth(text) <= width) return .{ .visible = text, .marked = false, .fits = true };
+    if (width == 0) return .{ .visible = "", .marked = false, .fits = false };
+    const marker_width = display_width.visibleWidth(clip_marker);
+    if (width <= marker_width) return .{ .visible = "", .marked = true, .fits = false };
+    return .{ .visible = text_utils.prefixTerminalSafeByWidth(text, width - marker_width), .marked = true, .fits = false };
 }
 
 fn appendSpacesWithinWidth(
@@ -3025,4 +3092,139 @@ test "permission hints use compact ask modal language" {
     ) != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "wheel scroll") != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "tab amend") != null);
+}
+
+/// Restores the diff styles a preview-row test changes.
+const SavedDiffStyles = struct {
+    added: []const u8,
+    removed: []const u8,
+    added_word: []const u8,
+    removed_word: []const u8,
+
+    fn capture() SavedDiffStyles {
+        return .{
+            .added = ui_render.diff_added_style,
+            .removed = ui_render.diff_removed_style,
+            .added_word = ui_render.diff_added_word_style,
+            .removed_word = ui_render.diff_removed_word_style,
+        };
+    }
+
+    fn restore(self: SavedDiffStyles) void {
+        ui_render.diff_added_style = self.added;
+        ui_render.diff_removed_style = self.removed;
+        ui_render.diff_added_word_style = self.added_word;
+        ui_render.diff_removed_word_style = self.removed_word;
+    }
+};
+
+const word_preview_lines = [_]diff_mod.PreviewLine{
+    .{ .op = .deletion, .old_line = 2, .text = "let x = 12345;" },
+    .{ .op = .addition, .new_line = 2, .text = "let x = 67890;" },
+    .{ .op = .context, .old_line = 3, .new_line = 3, .text = "keep" },
+};
+
+test "file approval preview rows are unchanged without word styles or backgrounds" {
+    const alloc = std.testing.allocator;
+    const saved = SavedDiffStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "";
+    ui_render.diff_removed_word_style = "";
+
+    var row = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 1, 1, 40);
+    defer row.deinit(alloc);
+    const expected = try std.mem.concat(alloc, u8, &.{
+        "  ",
+        ui_render.statusline_style,
+        "2",
+        ui_render.reset_style,
+        " ",
+        ui_render.diff_added_style,
+        "+ let x = 67890;",
+        ui_render.reset_style,
+    });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, row.items);
+}
+
+test "file approval preview rows draw changed words in the word style" {
+    const alloc = std.testing.allocator;
+    const saved = SavedDiffStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "\x1b[48;5;22m";
+    ui_render.diff_removed_word_style = "\x1b[48;5;52m";
+
+    var added = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 1, 1, 40);
+    defer added.deinit(alloc);
+    const expected = try std.mem.concat(alloc, u8, &.{
+        "  ",
+        ui_render.statusline_style,
+        "2",
+        ui_render.reset_style,
+        " ",
+        ui_render.diff_added_style,
+        "+ let x = \x1b[48;5;22m67890\x1b[39m\x1b[49m",
+        ui_render.diff_added_style,
+        ";",
+        ui_render.reset_style,
+    });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, added.items);
+
+    var removed = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 0, 1, 40);
+    defer removed.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, removed.items, "\x1b[48;5;52m12345\x1b[39m\x1b[49m") != null);
+
+    // A context row has no word style.
+    var context = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 2, 1, 40);
+    defer context.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, context.items, "\x1b[48;5;") == null);
+
+    // Clipping inside the span keeps the cut, closes the word style before the
+    // ellipsis, and never overflows the row.
+    const clipped_width = 6 + 11;
+    var clipped = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 1, 1, clipped_width);
+    defer clipped.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, clipped.items, "let x = \x1b[48;5;22m67\x1b[39m\x1b[49m") != null);
+    try std.testing.expect(std.mem.find(u8, clipped.items, "…") != null);
+    try std.testing.expectEqual(
+        @as(usize, clipped_width),
+        display_width.visibleWidthIgnoringAnsi(clipped.items),
+    );
+}
+
+test "file approval preview word spans keep encoded escapes whole" {
+    const alloc = std.testing.allocator;
+    const saved = SavedDiffStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "<W>";
+    const lines = [_]diff_mod.PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "a\\x1bz" },
+        .{ .op = .addition, .new_line = 1, .text = "a\\x1cz" },
+    };
+    var row = try composeFileApprovalPreviewRow(alloc, &lines, 1, 1, 40);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "+ a<W>\\x1c\x1b[39m") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, row.items, "\\x1c"));
+}
+
+test "file approval preview rows fill the row when the diff style has a background" {
+    const alloc = std.testing.allocator;
+    const saved = SavedDiffStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "";
+    ui_render.diff_removed_word_style = "";
+    ui_render.diff_added_style = "\x1b[38;5;252;48;2;31;77;44m";
+
+    for ([_]u16{ 8, 30, 80 }) |width| {
+        var row = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 1, 1, width);
+        defer row.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, width), display_width.visibleWidthIgnoringAnsi(row.items));
+        try std.testing.expect(std.mem.endsWith(u8, row.items, " " ++ ui_render.reset_style) or width <= 20);
+    }
+
+    // A foreground-only style keeps its row as wide as its text.
+    var plain = try composeFileApprovalPreviewRow(alloc, &word_preview_lines, 0, 1, 80);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 20), display_width.visibleWidthIgnoringAnsi(plain.items));
 }

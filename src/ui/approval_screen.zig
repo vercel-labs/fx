@@ -3,6 +3,7 @@ const diff_mod = @import("../core/output/diff.zig");
 const input_action = @import("../core/input/input_action.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
+const shared_theme = @import("../core/shared/theme.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const approval_readiness = @import("footer/approval_readiness.zig");
@@ -809,13 +810,23 @@ fn walkReviewRowsRange(
     var logical_start = @min(first_logical_row, review.rowCount());
     var visual_row: usize = 0;
     const logical_end = @min(review.rowCount(), logical_start +| logical_row_count);
+    // Word highlighting pairs a changed row with the rows around it, so each
+    // chunk is read with enough rows on both sides to see its runs whole.
+    const context_rows: usize = if (reviewWordStylesSet()) diff_mod.word_pair_context_rows else 0;
     while (logical_start < logical_end) {
         const logical_count = @min(@as(usize, 64), logical_end - logical_start);
-        const viewport = try review.viewport(alloc, logical_start, logical_count);
+        const context_start = logical_start -| context_rows;
+        const context_end = @min(review.rowCount(), logical_start + logical_count +| context_rows);
+        const viewport = try review.viewport(alloc, context_start, context_end - context_start);
         defer viewport.deinit(alloc);
-        logical_start += viewport.lines.len;
+        const first_index = @min(logical_start - context_start, viewport.lines.len);
+        const lines = viewport.lines[first_index..][0..@min(
+            logical_count,
+            viewport.lines.len - first_index,
+        )];
+        logical_start += lines.len;
 
-        for (viewport.lines) |line| {
+        for (lines, first_index..) |line, context_index| {
             var elision_text: [64]u8 = undefined;
             const text = try reviewLineText(line, &elision_text);
             var encoded = try text_utils.encodeTerminalSafe(
@@ -825,6 +836,10 @@ fn walkReviewRowsRange(
             );
             defer encoded.deinit(alloc);
             if (encoded.truncated) return error.TruncatedReviewLine;
+            const word_span = if (context_rows > 0)
+                try encodedWordSpan(viewport.lines, context_index)
+            else
+                null;
 
             var encoded_offset: usize = 0;
             var first_segment = true;
@@ -841,7 +856,13 @@ fn walkReviewRowsRange(
                 if (encoded_offset < encoded.bytes.len and segment.len == 0) {
                     return error.ReviewLineDoesNotFit;
                 }
-                try visitor.visitRow(line, segment, first_segment, visual_row);
+                try visitor.visitRow(
+                    line,
+                    segment,
+                    first_segment,
+                    visual_row,
+                    segmentWordSpan(word_span, encoded_offset, segment.len),
+                );
                 visual_row += 1;
                 encoded_offset += segment.len;
                 first_segment = false;
@@ -851,13 +872,61 @@ fn walkReviewRowsRange(
     return visual_row;
 }
 
+fn reviewWordStylesSet() bool {
+    return ui_render.diff_added_word_style.len != 0 or
+        ui_render.diff_removed_word_style.len != 0;
+}
+
+fn reviewWordStyle(op: diff_mod.PreviewOp) []const u8 {
+    return switch (op) {
+        .addition => ui_render.diff_added_word_style,
+        .deletion => ui_render.diff_removed_word_style,
+        .notice, .context, .elision => "",
+    };
+}
+
+/// The changed span of `lines[index]` as offsets into its terminal-safe
+/// encoding, or null when the row has no word style or no span.
+fn encodedWordSpan(lines: []const diff_mod.ReviewLine, index: usize) std.Io.Writer.Error!?diff_mod.ChangedSpan {
+    if (reviewWordStyle(lines[index].op).len == 0) return null;
+    const span = diff_mod.changedSpan(lines, index) orelse return null;
+    // Span ends fall on UTF-8 boundaries, where encoding a prefix of the
+    // line yields a prefix of the line's encoding.
+    const text = lines[index].text;
+    return .{
+        .start = try encodedLen(text[0..span.start]),
+        .end = try encodedLen(text[0..span.end]),
+    };
+}
+
+/// The length of what `text_utils.encodeTerminalSafe` writes for `raw`.
+fn encodedLen(raw: []const u8) std.Io.Writer.Error!usize {
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try counter.writer.print("{f}", .{text_utils.terminalSafe(raw)});
+    return @intCast(counter.fullCount());
+}
+
+/// The part of an encoded line's span inside one wrapped segment, relative
+/// to the segment's start.
+fn segmentWordSpan(
+    span: ?diff_mod.ChangedSpan,
+    segment_start: usize,
+    segment_len: usize,
+) ?diff_mod.ChangedSpan {
+    const line_span = span orelse return null;
+    const start = @max(line_span.start, segment_start);
+    const end = @min(line_span.end, segment_start + segment_len);
+    if (start >= end) return null;
+    return .{ .start = start - segment_start, .end = end - segment_start };
+}
+
 fn reviewVisualRowCount(
     alloc: Allocator,
     review: FileReviewSource,
     width: u16,
 ) !usize {
     const counter = struct {
-        fn visitRow(_: @This(), _: diff_mod.ReviewLine, _: []const u8, _: bool, _: usize) !void {}
+        fn visitRow(_: @This(), _: diff_mod.ReviewLine, _: []const u8, _: bool, _: usize, _: ?diff_mod.ChangedSpan) !void {}
     }{};
     return walkReviewRows(alloc, review, width, counter);
 }
@@ -870,7 +939,7 @@ fn reviewVisualRowCountRange(
     width: u16,
 ) !usize {
     const counter = struct {
-        fn visitRow(_: @This(), _: diff_mod.ReviewLine, _: []const u8, _: bool, _: usize) !void {}
+        fn visitRow(_: @This(), _: diff_mod.ReviewLine, _: []const u8, _: bool, _: usize, _: ?diff_mod.ChangedSpan) !void {}
     }{};
     return walkReviewRowsRange(
         alloc,
@@ -1228,6 +1297,7 @@ const ReviewRowPainter = struct {
     scroll_rows: usize,
     start_row: u16,
     max_rows: usize,
+    width: u16,
     painted_rows: u16 = 0,
     changed_or_notice_visible: bool = false,
 
@@ -1237,15 +1307,41 @@ const ReviewRowPainter = struct {
         segment: []const u8,
         first_segment: bool,
         visual_row: usize,
+        word_span: ?diff_mod.ChangedSpan,
     ) !void {
         if (visual_row < self.scroll_rows) return;
         if (@as(usize, self.painted_rows) >= self.max_rows) return;
 
         var line_out: std.Io.Writer.Allocating = .init(self.alloc);
         defer line_out.deinit();
-        try appendReviewPrefix(&line_out.writer, line, first_segment);
-        try line_out.writer.writeAll(reviewStyle(line.op));
-        try line_out.writer.writeAll(segment);
+        const writer = &line_out.writer;
+        const style = reviewStyle(line.op);
+        // A background in the line style spans the whole row, as in a review
+        // tool, so the rest of the row is filled while the style is active.
+        const fill_row = shared_theme.sgrHasParam(style, "48");
+        if (fill_row) {
+            try appendFilledReviewPrefix(writer, line, first_segment, style);
+        } else {
+            try appendReviewPrefix(writer, line, first_segment);
+            try writer.writeAll(style);
+        }
+        const word_style = reviewWordStyle(line.op);
+        if (word_span != null and word_style.len != 0) {
+            const span = word_span.?;
+            try writer.writeAll(segment[0..span.start]);
+            try writer.writeAll(word_style);
+            try writer.writeAll(segment[span.start..span.end]);
+            try writer.writeAll(shared_theme.closingFor(word_style));
+            try writer.writeAll(style);
+            try writer.writeAll(segment[span.end..]);
+        } else {
+            try writer.writeAll(segment);
+        }
+        if (fill_row) {
+            const used = reviewPrefixWidth(line, first_segment) +
+                display_width.visibleWidth(segment);
+            try writeSpaces(writer, @as(usize, self.width) -| used);
+        }
         try writeComposedRow(
             self.writer,
             self.start_row + self.painted_rows,
@@ -1304,6 +1400,7 @@ fn writeReviewRowsRange(
         .scroll_rows = scroll_rows,
         .start_row = start_row,
         .max_rows = max_rows,
+        .width = width,
     };
     _ = try walkReviewRowsRange(
         alloc,
@@ -1401,6 +1498,46 @@ fn appendReviewPrefix(
         return;
     }
 
+    try appendReviewNumber(writer, line);
+    const marker_style = reviewMarkerStyle(line.op);
+    try writer.writeAll(if (marker_style.len != 0) marker_style else reviewStyle(line.op));
+    try writer.writeAll(reviewSign(line.op));
+    try writer.writeAll(ui_render.reset_style);
+    try writer.writeAll(" ");
+}
+
+/// `appendReviewPrefix` for a line style with a background: the same
+/// columns, but the line style starts at the sign column so the background
+/// runs from there to the end of the row, on wrapped rows too.
+fn appendFilledReviewPrefix(
+    writer: *std.Io.Writer,
+    line: diff_mod.ReviewLine,
+    first_segment: bool,
+    style: []const u8,
+) !void {
+    if (!first_segment or line.op == .notice) {
+        const width = reviewPrefixWidth(line, first_segment);
+        try writeSpaces(writer, width - 2);
+        try writer.writeAll(style);
+        try writeSpaces(writer, 2);
+        return;
+    }
+
+    try writeSpaces(writer, 2);
+    try appendReviewNumber(writer, line);
+    const marker_style = reviewMarkerStyle(line.op);
+    try writer.writeAll(style);
+    try writer.writeAll(marker_style);
+    try writer.writeAll(reviewSign(line.op));
+    if (marker_style.len != 0) {
+        try writer.writeAll(shared_theme.closingFor(marker_style));
+        try writer.writeAll(style);
+    }
+    try writer.writeAll(" ");
+}
+
+/// The right-aligned line number and the space after it.
+fn appendReviewNumber(writer: *std.Io.Writer, line: diff_mod.ReviewLine) !void {
     var number_buf: [16]u8 = undefined;
     const number_text = if (line.new_line orelse line.old_line) |number|
         std.mem.print(&number_buf, "{d}", .{number}) catch ""
@@ -1418,18 +1555,16 @@ fn appendReviewPrefix(
     try writer.writeAll(number_text);
     try writer.writeAll(ui_render.reset_style);
     try writer.writeAll(" ");
+}
 
-    const op = switch (line.op) {
+fn reviewSign(op: diff_mod.PreviewOp) []const u8 {
+    return switch (op) {
         .addition => "+",
         .deletion => "-",
         .context => " ",
         .elision => "⋯",
         .notice => unreachable,
     };
-    try writer.writeAll(if (marker_style.len != 0) marker_style else reviewStyle(line.op));
-    try writer.writeAll(op);
-    try writer.writeAll(ui_render.reset_style);
-    try writer.writeAll(" ");
 }
 
 fn writeSpaces(writer: *std.Io.Writer, count: usize) !void {
@@ -2479,4 +2614,215 @@ test "command review hint keeps enter and esc guidance at narrow widths" {
     try std.testing.expect(std.mem.find(u8, minimal.written(), "esc cancel") != null);
     try std.testing.expect(std.mem.find(u8, minimal.written(), "wheel scroll") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(minimal.written()) <= 40);
+}
+
+/// Restores the diff styles a review-row test changes.
+const SavedReviewStyles = struct {
+    added: []const u8,
+    removed: []const u8,
+    added_word: []const u8,
+    removed_word: []const u8,
+    added_marker: []const u8,
+    removed_marker: []const u8,
+
+    fn capture() SavedReviewStyles {
+        return .{
+            .added = ui_render.diff_added_style,
+            .removed = ui_render.diff_removed_style,
+            .added_word = ui_render.diff_added_word_style,
+            .removed_word = ui_render.diff_removed_word_style,
+            .added_marker = ui_render.diff_added_marker_style,
+            .removed_marker = ui_render.diff_removed_marker_style,
+        };
+    }
+
+    fn restore(self: SavedReviewStyles) void {
+        ui_render.diff_added_style = self.added;
+        ui_render.diff_removed_style = self.removed;
+        ui_render.diff_added_word_style = self.added_word;
+        ui_render.diff_removed_word_style = self.removed_word;
+        ui_render.diff_added_marker_style = self.added_marker;
+        ui_render.diff_removed_marker_style = self.removed_marker;
+    }
+};
+
+fn paintReviewRows(
+    alloc: Allocator,
+    old_text: []const u8,
+    new_text: []const u8,
+    first_logical_row: usize,
+    logical_row_count: usize,
+    width: u16,
+) ![]u8 {
+    var review = try diff_mod.FileReview.init(alloc, old_text, new_text);
+    defer review.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    _ = try writeReviewRowsRange(
+        &out.writer,
+        alloc,
+        .{ .full = &review },
+        first_logical_row,
+        logical_row_count,
+        0,
+        1,
+        64,
+        width,
+    );
+    return out.toOwnedSlice();
+}
+
+fn paintOneReviewRow(
+    alloc: Allocator,
+    line: diff_mod.ReviewLine,
+    segment: []const u8,
+    first_segment: bool,
+    width: u16,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var painter = ReviewRowPainter{
+        .writer = &out.writer,
+        .alloc = alloc,
+        .scroll_rows = 0,
+        .start_row = 1,
+        .max_rows = 1,
+        .width = width,
+    };
+    try painter.visitRow(line, segment, first_segment, 0, null);
+    return out.toOwnedSlice();
+}
+
+test "review rows are unchanged without word styles or backgrounds" {
+    const alloc = std.testing.allocator;
+    const saved = SavedReviewStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "";
+    ui_render.diff_removed_word_style = "";
+    ui_render.diff_added_marker_style = "";
+
+    const row = try paintOneReviewRow(alloc, .{ .op = .addition, .new_line = 2, .text = "let x = 2;" }, "let x = 2;", true, 40);
+    defer alloc.free(row);
+    const expected = try std.mem.concat(alloc, u8, &.{
+        "\x1b[1;1H",
+        ui_render.reset_style,
+        "\x1b[K",
+        "      ",
+        ui_render.statusline_style,
+        "2",
+        ui_render.reset_style,
+        " ",
+        ui_render.diff_added_style,
+        "+",
+        ui_render.reset_style,
+        " ",
+        ui_render.diff_added_style,
+        "let x = 2;",
+        ui_render.reset_style,
+    });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, row);
+
+    const painted = try paintReviewRows(alloc, "a\nlet x = 1;\nc\n", "a\nlet x = 2;\nc\n", 0, 4, 80);
+    defer alloc.free(painted);
+    try std.testing.expect(std.mem.find(u8, painted, "let x = 2;") != null);
+}
+
+test "review rows draw changed words, across wrapped rows and chunk edges" {
+    const alloc = std.testing.allocator;
+    const saved = SavedReviewStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "<AW>";
+    ui_render.diff_removed_word_style = "<RW>";
+
+    const painted = try paintReviewRows(alloc, "a\nlet x = 1;\nc\n", "a\nlet x = 2;\nc\n", 0, 4, 80);
+    defer alloc.free(painted);
+    const removed = try std.mem.concat(alloc, u8, &.{ "let x = <RW>1\x1b[39m", ui_render.diff_removed_style, ";" });
+    defer alloc.free(removed);
+    const added = try std.mem.concat(alloc, u8, &.{ "let x = <AW>2\x1b[39m", ui_render.diff_added_style, ";" });
+    defer alloc.free(added);
+    try std.testing.expect(std.mem.find(u8, painted, removed) != null);
+    try std.testing.expect(std.mem.find(u8, painted, added) != null);
+
+    // Painting only the added row still finds the removed row it pairs with.
+    const alone = try paintReviewRows(alloc, "a\nlet x = 1;\nc\n", "a\nlet x = 2;\nc\n", 2, 1, 80);
+    defer alloc.free(alone);
+    try std.testing.expect(std.mem.find(u8, alone, added) != null);
+    try std.testing.expect(std.mem.find(u8, alone, "<RW>") == null);
+
+    // Ten text columns per row: the span 8..12 wraps, and each row opens and
+    // closes the word style for its own part.
+    const wrapped = try paintReviewRows(alloc, "aaaaaaaaXXXXbbbbbbbb\n", "aaaaaaaaYYYYbbbbbbbb\n", 0, 2, 20);
+    defer alloc.free(wrapped);
+    try std.testing.expect(std.mem.find(u8, wrapped, "aaaaaaaa<RW>XX\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, wrapped, "aaaaaaaa<AW>YY\x1b[39m") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wrapped, "<RW>XX\x1b[39m"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wrapped, "<AW>YY\x1b[39m"));
+
+    // Sixty-three unchanged lines put the removed row last in the first
+    // 64-row chunk and the added row first in the next one.
+    var old_text: std.ArrayList(u8) = .empty;
+    defer old_text.deinit(alloc);
+    for (0..63) |line_index| try old_text.print(alloc, "same {d}\n", .{line_index});
+    var new_text = try old_text.clone(alloc);
+    defer new_text.deinit(alloc);
+    try old_text.appendSlice(alloc, "let x = 1;\n");
+    try new_text.appendSlice(alloc, "let x = 2;\n");
+    const straddling = try paintReviewRows(alloc, old_text.items, new_text.items, 0, 65, 80);
+    defer alloc.free(straddling);
+    try std.testing.expect(std.mem.find(u8, straddling, removed) != null);
+    try std.testing.expect(std.mem.find(u8, straddling, added) != null);
+}
+
+test "review row word spans keep file escapes encoded" {
+    const alloc = std.testing.allocator;
+    const saved = SavedReviewStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "<AW>";
+    ui_render.diff_removed_word_style = "<RW>";
+
+    const painted = try paintReviewRows(alloc, "\x1b[31mred\n", "\x1b[32mred\n", 0, 2, 80);
+    defer alloc.free(painted);
+    try std.testing.expect(std.mem.find(u8, painted, "\\x1b[3<RW>1\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "\\x1b[3<AW>2\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "\x1b[32m") == null);
+}
+
+test "review rows fill the row when the diff style has a background" {
+    const alloc = std.testing.allocator;
+    const saved = SavedReviewStyles.capture();
+    defer saved.restore();
+    ui_render.diff_added_word_style = "";
+    ui_render.diff_removed_word_style = "";
+    ui_render.diff_added_style = "\x1b[38;5;252;48;2;31;77;44m";
+    ui_render.diff_added_marker_style = "\x1b[38;5;34m";
+    const line: diff_mod.ReviewLine = .{ .op = .addition, .new_line = 2, .text = "let x = 2;" };
+
+    const first = try paintOneReviewRow(alloc, line, "let x = 2;", true, 40);
+    defer alloc.free(first);
+    try std.testing.expectEqual(@as(usize, 40), display_width.visibleWidthIgnoringAnsi(first));
+    const sign = try std.mem.concat(alloc, u8, &.{
+        ui_render.diff_added_style,
+        ui_render.diff_added_marker_style,
+        "+\x1b[39m",
+        ui_render.diff_added_style,
+        " let x = 2;   ",
+    });
+    defer alloc.free(sign);
+    try std.testing.expect(std.mem.find(u8, first, sign) != null);
+    try std.testing.expect(std.mem.endsWith(u8, first, " " ++ ui_render.reset_style));
+
+    const wrapped = try paintOneReviewRow(alloc, line, "2;", false, 40);
+    defer alloc.free(wrapped);
+    try std.testing.expectEqual(@as(usize, 40), display_width.visibleWidthIgnoringAnsi(wrapped));
+    const continuation = try std.mem.concat(alloc, u8, &.{ "        ", ui_render.diff_added_style, "  2;" });
+    defer alloc.free(continuation);
+    try std.testing.expect(std.mem.find(u8, wrapped, continuation) != null);
+
+    // A foreground-only style keeps its row as wide as its text.
+    ui_render.diff_added_style = "\x1b[38;5;252m";
+    const plain = try paintOneReviewRow(alloc, line, "let x = 2;", true, 40);
+    defer alloc.free(plain);
+    try std.testing.expectEqual(@as(usize, 20), display_width.visibleWidthIgnoringAnsi(plain));
 }

@@ -42,11 +42,13 @@ pub var diff_added_style: []const u8 = shared_theme.fx_dark.diff_added_style;
 pub var diff_removed_style: []const u8 = shared_theme.fx_dark.diff_removed_style;
 pub var diff_added_marker_style: []const u8 = "";
 pub var diff_removed_marker_style: []const u8 = "";
-pub var approval_button_active_style: []const u8 = shared_theme.fx_dark.approval_button_active_style;
 pub var approval_button_inactive_style: []const u8 = shared_theme.fx_dark.approval_button_inactive_style;
 pub var selected_completion_style: []const u8 = shared_theme.fx_dark.selected_completion_style;
 // Statusbar permissions "auto": a step brighter than the statusline gray.
 pub var permission_auto_style: []const u8 = shared_theme.fx_dark.permission_auto_style;
+pub var accent_style: []const u8 = shared_theme.fx_dark.accent_style;
+pub var diff_added_word_style: []const u8 = shared_theme.fx_dark.diff_added_word_style;
+pub var diff_removed_word_style: []const u8 = shared_theme.fx_dark.diff_removed_word_style;
 var active_terminal_background: ?TerminalRgb = null;
 
 var truecolor_enabled: bool = true;
@@ -109,10 +111,12 @@ pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
     failure_style = failureStyle(theme, shared_theme.sourceName() != null);
     diff_added_style = theme.diff_added_style;
     diff_removed_style = theme.diff_removed_style;
-    approval_button_active_style = theme.approval_button_active_style;
     approval_button_inactive_style = theme.approval_button_inactive_style;
     selected_completion_style = theme.selected_completion_style;
     permission_auto_style = theme.permission_auto_style;
+    accent_style = theme.accent_style;
+    diff_added_word_style = theme.diff_added_word_style;
+    diff_removed_word_style = theme.diff_removed_word_style;
 
     // Terminal-following defaults keep diff markers monochrome. An explicit
     // light/dark pin or named theme enables its green/red marker colors.
@@ -129,6 +133,26 @@ pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
     }
 
     user_message_card.applyTheme(theme, terminal_bg);
+}
+
+/// The terminal background the active theme was applied against, when the
+/// terminal reported one.
+/// The terminal's own light or dark mode, last detected at startup or told
+/// by a terminal theme notification. Null when fx never detected it, as
+/// when it started with the theme pinned to light or dark. The applied
+/// theme's mode can differ from it, so `/theme` reads this, not `is_light`.
+var terminal_light: ?bool = null;
+
+pub fn noteTerminalMode(light: bool) void {
+    terminal_light = light;
+}
+
+pub fn terminalModeLight() ?bool {
+    return terminal_light;
+}
+
+pub fn activeTerminalBackground() ?TerminalRgb {
+    return active_terminal_background;
 }
 
 pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
