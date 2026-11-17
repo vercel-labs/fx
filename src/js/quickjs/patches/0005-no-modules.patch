@@ -1,0 +1,41 @@
+diff --git a/quickjs.c b/quickjs.c
+index b5786ef..c348c08 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31965,6 +31965,8 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+     JSValue attributes_obj = JS_UNDEFINED;
+     JSValue args[5];
+ 
++    /* fx loads no modules, so the module code stays out of its build. */
++    return JS_ThrowTypeError(ctx, "import() is not available in code mode");
+     basename = JS_GetScriptOrModuleName(ctx, 0);
+     if (basename == JS_ATOM_NULL)
+         basename_val = JS_NULL;
+@@ -38185,6 +38187,9 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
+         ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
+     } else if (tag == JS_TAG_MODULE) {
+         JSModuleDef *m;
++        /* fx loads no modules. */
++        JS_FreeValue(ctx, fun_obj);
++        return JS_ThrowTypeError(ctx, "modules are not available in code mode");
+         m = JS_VALUE_GET_PTR(fun_obj);
+         /* the module refcount should be >= 2 */
+         JS_FreeValue(ctx, fun_obj);
+@@ -38248,6 +38253,8 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+         var_refs = NULL;
+         is_strict_mode = (flags & JS_EVAL_FLAG_STRICT) != 0;
+         if (eval_type == JS_EVAL_TYPE_MODULE) {
++            /* fx loads no modules. */
++            return JS_ThrowSyntaxError(ctx, "modules are not available in code mode");
+             JSAtom module_name = JS_NewAtom(ctx, filename);
+             if (module_name == JS_ATOM_NULL)
+                 return JS_EXCEPTION;
+@@ -40485,6 +40492,8 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
+         no_allow_bytecode:
+             return JS_ThrowSyntaxError(ctx, "no bytecode allowed");
+         }
++        /* fx loads no modules. */
++        return JS_ThrowSyntaxError(ctx, "modules are not available in code mode");
+         obj = JS_ReadModule(s);
+         break;
+     case BC_TAG_OBJECT:
