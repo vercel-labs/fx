@@ -11611,16 +11611,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     // joins it (`postMail` in `src/core/agent/worker_runtime.zig`), and the
     // receipt would get no request of its own.
     let committedBefore = 0;
-    // A wait that fails answers the child's request with an error that only
-    // the gateway's log shows, so the test throws it after the run.
+    // A wait that fails is kept and answered with an error response, so fx
+    // sees a failed request and `runFx` ends it normally; the test throws the
+    // kept error after the run. Thrown out of the gateway's handler, it would
+    // fail the test at once and leave fx running.
     let holdError: unknown;
-    const holdChild = async () => {
-      try {
-        await waitForRootTurnCommitted(root.home, committedBefore);
-      } catch (error) {
-        holdError ??= error;
-        throw error;
+    const holdChild = async (): Promise<Response | undefined> => {
+      if (holdError === undefined) {
+        try {
+          await waitForRootTurnCommitted(root.home, committedBefore);
+          return undefined;
+        } catch (error) {
+          holdError = error;
+        }
       }
+      return new Response("the parent's turn was not saved", { status: 500 });
     };
     const gateway = startDynamicFakeGateway(async (body) => {
       // Each run's report starts the parent's next turn.
@@ -11643,7 +11648,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(body).toContain("PERSISTED_FIRST");
         expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
-        await holdChild();
+        const refused = await holdChild();
+        if (refused) return refused;
         return fakeGatewayFinalText("PERSISTED_SECOND");
       }
       if (promptText(body).includes("RESUME_PERSISTENT_SECOND")) {
@@ -11664,7 +11670,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (promptText(body).includes(firstMessage)) {
         expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
-        await holdChild();
+        const refused = await holdChild();
+        if (refused) return refused;
         return fakeGatewayFinalText("PERSISTED_FIRST");
       }
       return fakeGatewayToolCall("persistent_resume_one", "subagent", {
