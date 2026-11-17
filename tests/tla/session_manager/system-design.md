@@ -1854,13 +1854,13 @@ as it was sent):
   - **Turn:** a host begins each turn's captures (`beginCaptureTurn`)
     when the turn starts, saves each capture of that turn with the token it
     returns, and commits the turn with `commitTurnWithCaptures` and that
-    token. The token ends when that commit lands, or at the next
+    token. The token closes when that commit lands, or at the next
     `beginCaptureTurn`, which also drops what the old token still holds
     unless that turn ended and waits for its commit (**Ended turn**), so
     a turn that never committed with its token, such as one whose
     `prepareTurn` failed or whose failed commit was never retried, leaves
     nothing for the next: an ended one stays held only for its own token,
-    until another ended turn replaces it. A capture that arrives with an ended token is
+    until another ended turn replaces it. A capture that arrives with a closed token is
     refused and dropped with a trace line instead of joining a later turn.
     Tokens come from one counter for the whole process, so no other
     Session, nor the object a resume opens, takes them.
