@@ -2132,7 +2132,10 @@ pub fn Runtime(comptime App: type) type {
             {
                 if (comptime @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommittedTurn")) {
                     if (committed) |turn| {
-                        agent.worker.acknowledgeFinishCommittedTurn(app.alloc, turn, ownership, agent.session.max_history_turns);
+                        // The worker's queue is allocated with `c_allocator`, by
+                        // `postAgentMessage` and by the worker threads, so the
+                        // turn is added with the same allocator.
+                        agent.worker.acknowledgeFinishCommittedTurn(std.heap.c_allocator, turn, ownership, agent.session.max_history_turns);
                         return;
                     }
                 }

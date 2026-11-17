@@ -8496,9 +8496,11 @@ test "a hidden agent's turn that its own tick commits reaches the report queued 
         .assistant = @constCast("the finished answer"),
     } };
     const worker = &hidden.agent.worker;
-    // `deinitChildren` leaves a worker to its owner, and the turn the tick
-    // commits lands in the agent's session and names its title.
-    defer worker.deinit(alloc);
+    // `deinitChildren` leaves a worker to its owner. Its queue is allocated
+    // with `c_allocator`, as `postAgentMessage` allocates it, and the turn the
+    // tick commits lands in the agent's session and names its title.
+    const gpa = std.heap.c_allocator;
+    defer worker.deinit(gpa);
     defer hidden.agent.session_persistence.deinit(alloc);
     defer hidden.agent.session.deinit(alloc);
     defer hidden.agent.session_title.deinit(alloc);
@@ -8507,25 +8509,25 @@ test "a hidden agent's turn that its own tick commits reaches the report queued 
     worker.worker_processing = true;
     worker.active_turn_id = 9;
     worker.direct_steering_closed = true;
-    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
-    const earlier = try alloc.alloc(types.HistoryTurn, 1);
+    try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = turn } });
+    const earlier = try gpa.alloc(types.HistoryTurn, 1);
     earlier[0] = .{ .assistant = .{
-        .user = .{ .text = try alloc.dupe(u8, "earlier prompt") },
-        .assistant = try alloc.dupe(u8, "earlier answer"),
+        .user = .{ .text = try gpa.dupe(u8, "earlier prompt") },
+        .assistant = try gpa.dupe(u8, "earlier answer"),
     } };
-    try worker.postMail(alloc, .{
-        .prompt = try alloc.dupe(u8, "a report"),
+    try worker.postMail(gpa, .{
+        .prompt = try gpa.dupe(u8, "a report"),
         .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
+        .model = try gpa.dupe(u8, "test-model"),
+        .api_key = try gpa.dupe(u8, "test-key"),
         .permission_mode = .auto,
         .history = earlier,
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
+        .grants = try gpa.alloc(types.PermissionGrant, 0),
     });
     worker.finishProcessing();
     var taken = worker.takeEvents();
-    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-    taken.deinit(alloc);
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
+    taken.deinit(gpa);
     try hidden.screen.pacer.enqueue(alloc, "still showing");
     try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
     try std.testing.expectEqual(@as(u32, 1), worker.queued_history_owed);
@@ -8537,8 +8539,8 @@ test "a hidden agent's turn that its own tick commits reaches the report queued 
     try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
 
     // The report starts with the turn the tick committed, after the earlier one.
-    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
-    defer worker_runtime.freeWorkItem(alloc, work);
+    const work = (try worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(gpa, work);
     try std.testing.expectEqual(@as(usize, 2), work.prompt.history.len);
     try std.testing.expectEqualStrings("earlier answer", work.prompt.history[0].assistant.assistant);
     try std.testing.expectEqualStrings("the finished answer", work.prompt.history[1].assistant.assistant);
