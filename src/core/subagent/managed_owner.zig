@@ -161,9 +161,10 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
-    /// `/close` closed this owner's tree: works that end from now on owe no
-    /// report, since nobody is left to take one. A quit leaves it false, so
-    /// its reports stay owed.
+    /// `/close`, or a switch to another session, closed this owner's tree:
+    /// works that end from now on owe no report, since nobody is left to take
+    /// one, and a teardown ends them cancelled. A quit leaves it false, so its
+    /// reports stay owed.
     tree_closed: bool = false,
     /// Set when fx starts to quit, so a work its quit cancels says so in
     /// its report.
@@ -363,6 +364,28 @@ pub const Owner = struct {
         }
     }
 
+    /// A child whose running turn waits for the user, and what for.
+    pub const UserWaiting = struct {
+        child_id: []const u8,
+        wait: worker_runtime.WorkerRuntime.UserWait,
+    };
+
+    /// The children whose running turns wait for the user now, in `alloc`,
+    /// which should be an arena. It reads each worker's wait with no worker
+    /// lock but takes the owner's, so call it with no state-store lock held:
+    /// an approval commit takes the owner's lock first (`submitWorkerApproval`).
+    pub fn userWaits(self: *Owner, alloc: Allocator) Allocator.Error![]const UserWaiting {
+        var waits: std.ArrayList(UserWaiting) = .empty;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            const worker = slot.worker orelse continue;
+            const waiting_for = worker.userWait() orelse continue;
+            try waits.append(alloc, .{ .child_id = try alloc.dupe(u8, slot.child_id), .wait = waiting_for });
+        }
+        return waits.items;
+    }
+
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
         // A single-threaded build, such as the WebAssembly terminal, has no
         // slot threads, and its subagent tool is off, so no child is started.
@@ -453,8 +476,9 @@ pub const Owner = struct {
         }
     }
 
-    /// Marks this owner's tree closed by `/close`: every work that ends
-    /// after this owes no report. Call before the tree's turns are cancelled.
+    /// Marks this owner's tree closed by `/close` or by a switch to another
+    /// session: every work that ends after this owes no report. Call before
+    /// the tree's turns are cancelled or the owner is torn down.
     pub fn closeTree(self: *Owner) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1243,7 +1267,7 @@ fn runOne(slot: *Slot) OneOutcome {
         admission,
         &slot.cancel,
     ) catch |err| {
-        const outcome: child_state.Outcome = if (slot.shutdown.load(.seq_cst))
+        const outcome: child_state.Outcome = if (interruptedByTeardown(slot))
             .interrupted
         else if (slot.cancel.load(.seq_cst) or err == error.Cancelled)
             .cancelled
@@ -1258,7 +1282,7 @@ fn runOne(slot: *Slot) OneOutcome {
                 null,
         };
     };
-    if (slot.shutdown.load(.seq_cst)) return .{
+    if (interruptedByTeardown(slot)) return .{
         .work_id = work_id,
         .outcome = .interrupted,
     };
@@ -1273,6 +1297,20 @@ fn runOne(slot: *Slot) OneOutcome {
             .awaiting_approval, .paused => .interrupted,
         },
     };
+}
+
+/// Whether the owner's teardown ended `slot`'s work as a quit does:
+/// interrupted, with its report left owed. After `closeTree` the teardown
+/// ends the work cancelled instead, which owes nothing. A finish that owes
+/// nothing is saved without data, and a reopen reads an interrupted finish
+/// without data as crash repair, which owes a report
+/// (`reports.PendingFold.step`), so only a cancelled one stays quiet.
+fn interruptedByTeardown(slot: *Slot) bool {
+    if (!slot.shutdown.load(.seq_cst)) return false;
+    const owner = slot.owner;
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    defer owner.mutex.unlock(io_mod.getIo());
+    return !owner.tree_closed;
 }
 
 /// A child's saved preferences, read without opening its session. Caller

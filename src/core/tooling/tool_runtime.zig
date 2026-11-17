@@ -8899,3 +8899,168 @@ test "vision cancellation stops later batches and does not surface the outage ti
     );
     try std.testing.expectEqual(@as(usize, 1), fixture.call_count);
 }
+
+/// The real shell tool, which registers its call with the bridge, in place of
+/// the double the other tests' registry uses.
+const bridge_test_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.shell} };
+
+/// A shell call run through `executeToolCallAuthorized` on its own thread. Its
+/// command publishes the bridge's socket and token and holds until the test
+/// is done, so the test can make the command's `fx mcp call` itself.
+const HeldShellCall = struct {
+    ctx: Context,
+    request: tool_contracts.ToolExecutionRequest,
+
+    fn run(self: *HeldShellCall) void {
+        // The result is in the call's arena, which the test frees.
+        _ = executeToolCallAuthorized(self.ctx, self.request) catch return;
+    }
+};
+
+/// What the bridge answers `tool`, called as a shell command's `fx mcp call` is,
+/// while a shell call runs under `rt` with `grants` in its request: the answer
+/// of the nested check that `executeToolCallAuthorized` set up from that
+/// request, and not what a `Context` holds.
+fn nestedBridgeStatus(rt: *TestRuntime, grants: []const PermissionGrant, tool: []const u8) !mcp_call_wire.Status {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "w");
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "w");
+    defer alloc.free(dir);
+    var test_arena = std.heap.ArenaAllocator.init(alloc);
+    defer test_arena.deinit();
+    const arena = test_arena.allocator();
+    // The shell call allocates on its own thread, so it gets its own arena.
+    var call_arena = std.heap.ArenaAllocator.init(alloc);
+    defer call_arena.deinit();
+    const env_file = try std.Io.Dir.path.join(arena, &.{ dir, "bridge.env" });
+    const done_file = try std.Io.Dir.path.join(arena, &.{ dir, "done" });
+    // The clean profile has no PATH of its own, and `sleep` is not a builtin.
+    const command = try arena.print(
+        "PATH=/usr/bin:/bin; printf '%s\\n%s\\n' \"$FX_MCP_CALL_SOCKET\" \"$FX_MCP_CALL_TOKEN\" > '{s}'; until [ -f '{s}' ]; do sleep 0.05; done",
+        .{ env_file, done_file },
+    );
+    var arguments: std.Io.Writer.Allocating = .init(arena);
+    // The command's own timeout ends the thread if the test cannot.
+    try arguments.writer.writeAll("{\"action\":\"run\",\"yield_time_ms\":30000,\"timeout_ms\":20000,\"command\":");
+    try std.json.Stringify.value(command, .{}, &arguments.writer);
+    try arguments.writer.writeAll("}");
+    const call: ToolCall = .{ .id = "hold", .name = "shell", .arguments_json = try arguments.toOwnedSlice() };
+    // The shell tool reaches the bridge only through the host's managed runtime.
+    var managed = managed_execution.Runtime.init(alloc);
+    defer managed.deinit();
+    var ctx = rt.context();
+    ctx.managed_executions = &managed;
+    const command_ctx = try tool_admission.runCommandContext(ctx.admissionInput(), arena, call);
+    var held = HeldShellCall{
+        .ctx = ctx,
+        .request = .{
+            .call_allocator = call_arena.allocator(),
+            .result_allocator = call_arena.allocator(),
+            .call = call,
+            .authority = .{ .run_command = .{ .shell_allowed = .{ .fingerprint = .init(command_ctx), .source = .configured_rule } } },
+            .session_grants = grants,
+            .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
+            .max_tool_result_bytes = ctx.max_tool_result_bytes,
+        },
+    };
+    const thread = try std.Thread.spawn(.{}, HeldShellCall.run, .{&held});
+    defer thread.join();
+    defer writeTestFile(tmp.dir, "w/done", "") catch {};
+
+    // No event says the command has written the file, so this is a bounded
+    // poll, until the file holds the socket and a whole token.
+    var socket_path: []const u8 = "";
+    var token: ?mcp_call.Token = null;
+    var waited: usize = 0;
+    while (token == null) : (waited += 1) {
+        if (waited >= 400) return error.TestBridgeNeverPublished;
+        io_mod.sleep(25 * std.time.ns_per_ms);
+        if (!absolutePathExists(env_file)) continue;
+        const published = try readTraceFileForTest(arena, env_file);
+        var lines = std.mem.splitScalar(u8, published, '\n');
+        socket_path = lines.next() orelse continue;
+        token = mcp_call_wire.parseToken(lines.next() orelse continue);
+    }
+    const reply = try mcp_call_client.call(arena, std.testing.io, socket_path, token.?, .{ .call = .{ .tool = tool, .arguments_json = "{}" } });
+    return reply.header.status;
+}
+
+/// A tool definition the bridge's review accepts: a description and an input schema.
+fn echoMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"description\":\"Echoes its text.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}") } };
+}
+
+const mcp_call = @import("../mcp_host/mcp_call.zig");
+const mcp_call_client = @import("../mcp_host/mcp_call_client.zig");
+const mcp_call_wire = @import("../mcp_host/mcp_call_wire.zig");
+
+test "a command's fx mcp call is checked against the approvals its tool call began with" {
+    if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other") }};
+    var counting = McpFixture.CountingContext{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .ask,
+        .interactive = false,
+        .mcp_ctx = &counting,
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_tool_schema = echoMcpSchema,
+        .mcp_call_tool = McpFixture.callCounting,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    // The approval the call began with lets the nested call run, with no prompt.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // Without it the nested call is not allowed, and the tool does not run.
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo"));
+    // An approval of another tool does not cover it.
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &other, "mcp_fixture_echo"));
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // A deny rule still wins over the approval.
+    var deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fixture_echo"), .pattern = @constCast("mcp_fixture_echo"), .action = .deny },
+    };
+    rt.permission_rules = .{ .rules = &deny_rules };
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo"));
+    rt.permission_rules = .{};
+
+    // A tool this agent is not offered stays unavailable, approval or not.
+    rt.mcp_tool_schema = goneMcpSchema;
+    try std.testing.expectEqual(mcp_call_wire.Status.denied, try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo"));
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "in auto mode a command's fx mcp call skips the safety check for the approved tool only" {
+    if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    var counting = McpFixture.CountingContext{};
+    var reviewer = TestAutoReview{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .auto,
+        .interactive = false,
+        .auto_classifier = reviewer.classifier(),
+        .mcp_ctx = &counting,
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_tool_schema = echoMcpSchema,
+        .mcp_call_tool = McpFixture.callCounting,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    // The approved tool runs without a review.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 0), reviewer.calls);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // Another tool, and the same tool without the approval, each get one.
+    try std.testing.expect(try nestedBridgeStatus(&rt, &echo, "mcp_fixture_other") != .denied);
+    try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
+    try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
+    try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
+}
