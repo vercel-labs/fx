@@ -859,24 +859,40 @@ pub fn repositoryFacts(arena: Allocator, ready: Ready, cwd: []const u8, limits: 
     return repositoryFactsWith(arena, ready, cwd, limits, &base);
 }
 
-/// Which of `paths` the tree of commit `head` holds, read with one
-/// `ls-tree` through the read-only route; null when git could not
-/// answer. Paths match literally, never as patterns. Memory belongs to
-/// `arena`.
+/// The most path bytes one `pathsInTree` run puts on git's command line, well
+/// under every system's argument limit (macOS allows 1 MiB for arguments and
+/// environment together).
+const max_tree_query_bytes: usize = 64 * 1024;
+
+/// Which of `paths` the tree of commit `head` holds, read with `ls-tree`
+/// through the read-only route, in batches that keep each command line under
+/// `max_tree_query_bytes`; null when git could not answer. Paths match
+/// literally, never as patterns. Memory belongs to `arena`.
 pub fn pathsInTree(arena: Allocator, ready: Ready, cwd: []const u8, head: []const u8, paths: []const []const u8, limits: Limits) Allocator.Error!?[]const []const u8 {
     if (paths.len == 0) return &.{};
-    var argv: std.ArrayList([]const u8) = .empty;
-    try appendPrelude(arena, &argv, ready);
-    try argv.appendSlice(arena, &.{ "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", "--full-tree", head, "--" });
-    try argv.appendSlice(arena, paths);
     var base = try environment(arena);
-    const listing = switch (try runBounded(arena, argv.items, cwd, &base, null, null, limits)) {
-        .ok => |stdout| stdout,
-        .failed => return null,
-    };
     var found: std.ArrayList([]const u8) = .empty;
-    var names = std.mem.splitScalar(u8, listing, 0);
-    while (names.next()) |name| if (name.len > 0) try found.append(arena, name);
+    var start: usize = 0;
+    while (start < paths.len) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try appendPrelude(arena, &argv, ready);
+        try argv.appendSlice(arena, &.{ "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", "--full-tree", head, "--" });
+        var bytes: usize = 0;
+        while (start < paths.len) {
+            const path = paths[start];
+            const next = bytes + path.len + 1;
+            if (bytes > 0 and next > max_tree_query_bytes) break;
+            try argv.append(arena, path);
+            bytes = next;
+            start += 1;
+        }
+        const listing = switch (try runBounded(arena, argv.items, cwd, &base, null, null, limits)) {
+            .ok => |stdout| stdout,
+            .failed => return null,
+        };
+        var names = std.mem.splitScalar(u8, listing, 0);
+        while (names.next()) |name| if (name.len > 0) try found.append(arena, name);
+    }
     return found.items;
 }
 
@@ -2402,6 +2418,36 @@ test "safe git lists which paths a commit's tree holds, matching them literally"
     for (found) |name| try std.testing.expect(!std.mem.eql(u8, name, "ab"));
     const none = (try pathsInTree(repo.arena, ready, repo.repo, head, &.{}, .{})).?;
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "safe git lists a commit's paths across batches when the names exceed one command line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    try repo.write("repo/a*", "star\n");
+    try repo.write("repo/d/.env", "SECRET=1\n");
+    try repo.plain(repo.repo, &.{ "add", "-A" });
+    try repo.commit(repo.repo);
+    const head = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD" });
+    const ready = try repo.ready(repo.repo);
+    // 3000 missing paths, each 40 'x' characters after `missing/<i>/`,
+    // together exceed one 64 KiB command line, so the listing batches.
+    var paths: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        try paths.append(repo.arena, try repo.arena.print("missing/{d}/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.pem", .{i}));
+    }
+    try paths.append(repo.arena, "a*");
+    try paths.append(repo.arena, "d/.env");
+    const found = (try pathsInTree(repo.arena, ready, repo.repo, head, paths.items, .{})).?;
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    for ([_][]const u8{ "a*", "d/.env" }) |path| {
+        var listed = false;
+        for (found) |name| listed = listed or std.mem.eql(u8, name, path);
+        try std.testing.expect(listed);
+    }
 }
 
 test "safe git repository facts never start a lazy fetch from a repository's promisor remote" {
