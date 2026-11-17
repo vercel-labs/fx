@@ -1,6 +1,6 @@
 ---- MODULE ErrorData ----
-\* What a failed tools/call's error `data` becomes on its way to the model
-\* (findings.md D2). A server explains a refusal in the error's `data`, such as
+\* What a failed tools/call's error `data` becomes on its way to the model.
+\* A server explains a refusal in the error's `data`, such as
 \* which arguments broke its schema. The engine reads it (`wire.Failure.data`),
 \* the host copies the failure (`copyCall`, src/core/mcp_host/runtime.zig), and
 \* the model's text is written from the copy (`render`,
@@ -15,9 +15,13 @@
 \* then the first `prefix` bytes of the data written with `extra` bytes of
 \* escapes (a quote or a backslash costs 1 more, a control byte 5 more), then a
 \* marker. So the bytes of the data in the text are `Shown`: `size` for the
-\* whole text, and 2 + prefix + extra for a cut. `held` is the most bytes the
-\* host kept of the data before the cut, and `logged` says that a trace or log
-\* line carried the data. `split` says the cut fell inside a character.
+\* whole text, and 2 + prefix + extra for a cut. `held` is the most bytes of the
+\* data's compact text the host holds at one moment, the moment of the cut included:
+\* the whole text when it fits the cap, and otherwise its first bytes, as many as
+\* the cut may read, 2 * Cap (the rest of the text is counted, not kept). It counts
+\* the text and not the parse of it, which is bounded by the 16 KiB the host parses.
+\* `logged` says that a trace or log line carried the data. `split` says the cut
+\* fell inside a character.
 \*   Carry "data": the host keeps the data, bounded, as the code does after the change.
 \*   Carry "drop": it keeps only the code and the message, as the code did before.
 \* A -32042 answer is the user's to answer (UrlRetry.tla): its data is left out,
@@ -47,6 +51,8 @@ VARIABLES seen, code, kind, size, form, prefix, extra, marked, held, split, logg
 vars == <<seen, code, kind, size, form, prefix, extra, marked, held, split, logged>>
 
 Carried(c, k) == Carry = "data" /\ c = "invalid_params" /\ k = "text"
+
+Min(a, b) == IF a < b THEN a ELSE b
 
 \* What the code may keep of a cut: a prefix of the data, whose escapes cost `e` more bytes,
 \* so that its quotes and escaped form fit the cap, and one more character would not.
@@ -86,7 +92,7 @@ Answer(c, k, n, p, e) ==
             /\ extra' = e
     /\ form' = IF ~Carried(c, k) THEN "none" ELSE IF n <= Cap THEN "whole" ELSE "cut"
     /\ marked' = (Carried(c, k) /\ n > Cap)
-    /\ held' = IF ~Carried(c, k) THEN 0 ELSE IF n <= Cap THEN n ELSE 2 + p + e
+    /\ held' = IF ~Carried(c, k) THEN 0 ELSE IF n <= Cap THEN n ELSE Min(n, 2 * Cap)
     /\ split' = FALSE
     /\ logged' = FALSE
 
@@ -121,8 +127,10 @@ Bounded ==
 \* A cut keeps as much as fits: one more character would not.
 KeepsMost == (seen /\ form = "cut") => 2 + prefix + extra + MaxChar > Cap
 
-\* The host never keeps more than the cap of it, even for the moment of the cut.
-HeldBounded == seen => held <= Cap
+\* The host holds at most 2 * Cap bytes of the data's compact text, even for the moment of the
+\* cut: the text is written into a buffer of that size, and the rest is only counted. Not the
+\* whole text, which can be 47 times the length of the data it was written from.
+HeldBounded == seen => held <= 2 * Cap
 
 \* The cut falls where a character ends.
 CutOnBoundary == seen => ~split

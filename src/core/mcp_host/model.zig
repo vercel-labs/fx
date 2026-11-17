@@ -1236,7 +1236,7 @@ fn renderedFailure(a: Allocator, code: i64, message: []const u8, data: ?[]const 
     return out.model_output;
 }
 
-test "a protocol error's data reaches the model after its message, in the form a server wrote it" {
+test "a protocol error's data reaches the model after its message, as the compact JSON the host kept" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

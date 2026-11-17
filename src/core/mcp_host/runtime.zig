@@ -26,6 +26,7 @@ const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_depth = @import("../shared/json_depth.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
@@ -2791,6 +2792,9 @@ const data_cap = 8 * 1024;
 const data_marker_max = 64;
 /// Data longer than this is cut without being read; its marker names its length.
 const data_parse_max = 2 * data_cap;
+/// The most bytes of the compact text the host holds at once: the cut needs the first
+/// `data_cap` bytes of it, and this leaves the same again for a character that ends past them.
+const data_hold_max = 2 * data_cap;
 /// Data nested deeper than this is left out: `std.json` keeps the nesting of what it
 /// writes in a stack of 256 levels and core writes the data again, so the 2,000
 /// levels the engine reads would crash fx.
@@ -2799,58 +2803,43 @@ const data_depth_max = 128;
 /// The host's copy of a server's error data, bounded as `data_cap` says and
 /// allocated in `alloc`; null when there is none to keep, or the data is left out:
 /// it is null, nested past `data_depth_max`, or not text. `scratch` holds the parse
-/// of data short enough to read, and is empty again on return.
+/// of data short enough to read, and is empty again on return. Of the compact text
+/// it never holds more than `data_hold_max` bytes: the rest is counted, not kept.
 fn boundErrorData(scratch: Allocator, alloc: Allocator, raw: []const u8) Allocator.Error!?[]const u8 {
     if (std.mem.eql(u8, raw, "null")) return null;
-    if (raw.len > data_parse_max) return try cutErrorData(alloc, raw);
+    if (raw.len > data_parse_max) return try cutErrorData(alloc, raw, raw.len);
     var arena: std.heap.ArenaAllocator = .init(scratch);
     defer arena.deinit();
-    const compact = (try compactText(arena.allocator(), raw)) orelse {
+    var held: [data_hold_max]u8 = undefined;
+    const compact = (try compactText(arena.allocator(), raw, &held)) orelse {
         debug_trace.logf("mcp", "MCP error data left out reason=unreadable bytes={d}", .{raw.len});
         return null;
     };
-    if (compact.len <= data_cap) return try alloc.dupe(u8, compact);
-    return try cutErrorData(alloc, compact);
+    if (compact.len <= data_cap) return try alloc.dupe(u8, compact.head);
+    return try cutErrorData(alloc, compact.head, compact.len);
 }
 
-/// The data written as `std.json` writes it with no spaces, or null when it is nested past
-/// `data_depth_max` or is not JSON. The text is in `a`.
-fn compactText(a: Allocator, raw: []const u8) Allocator.Error!?[]const u8 {
-    if (!nestingWithin(raw, data_depth_max)) return null;
+/// The data written as `std.json` writes it with no spaces: its first bytes, as many as fit
+/// `buffer`, and the length of the whole text.
+const CompactText = struct { head: []const u8, len: usize };
+
+/// The compact text of `raw`, or null when it is nested past `data_depth_max` or is not JSON.
+/// The parse is in `a`. The text is written twice into writers that keep nothing of it
+/// beyond `buffer`: once to count its length, once to fill `buffer` until it is full. A compact
+/// text can be 47 times as long as the data (`5e-324` is 6 bytes and writes 47), so it is never held whole.
+fn compactText(a: Allocator, raw: []const u8, buffer: []u8) Allocator.Error!?CompactText {
+    if (json_depth.exceedsDepth(raw, data_depth_max)) return null;
     const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    return std.json.Stringify.valueAlloc(a, value, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+    var counted: std.Io.Writer.Discarding = .init(&.{});
+    std.json.Stringify.value(value, .{}, &counted.writer) catch return error.OutOfMemory;
+    var held: std.Io.Writer = .fixed(buffer);
+    std.json.Stringify.value(value, .{}, &held) catch |err| switch (err) {
+        error.WriteFailed => {}, // `buffer` is full: the rest is only counted
     };
-}
-
-/// Whether JSON text nests arrays and objects at most `max` deep.
-fn nestingWithin(raw: []const u8, max: usize) bool {
-    var depth: usize = 0;
-    var in_string = false;
-    var escaped = false;
-    for (raw) |byte| {
-        if (in_string) {
-            if (escaped) {
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') in_string = false;
-            continue;
-        }
-        switch (byte) {
-            '"' => in_string = true,
-            '[', '{' => {
-                depth += 1;
-                if (depth > max) return false;
-            },
-            ']', '}' => depth -|= 1,
-            else => {},
-        }
-    }
-    return true;
+    return .{ .head = held.buffered(), .len = @intCast(counted.fullCount()) };
 }
 
 /// The bytes `std.json` writes for one character of a string.
@@ -2865,8 +2854,9 @@ fn escapedCost(char: []const u8) usize {
 
 /// A JSON string literal: the longest prefix of `text` that fits `data_cap`
 /// with its quotes and escapes and ends where a character ends, then the marker,
-/// which names how long `text` is. `text` is longer than `data_cap`.
-fn cutErrorData(alloc: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
+/// which names `total` bytes, how long the whole text is. `text` is the whole text,
+/// or its first bytes, at least `data_cap` of them, and the whole text is longer than `data_cap`.
+fn cutErrorData(alloc: Allocator, text: []const u8, total: usize) Allocator.Error!?[]const u8 {
     const budget = data_cap - 2;
     var end: usize = 0;
     var used: usize = 0;
@@ -2886,7 +2876,7 @@ fn cutErrorData(alloc: Allocator, text: []const u8) Allocator.Error!?[]const u8 
     errdefer out.deinit();
     out.writer.writeByte('"') catch return error.OutOfMemory;
     std.json.Stringify.encodeJsonStringChars(prefix, .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.print(" ... [data truncated: {d} bytes, cap is {d}]\"", .{ text.len, data_cap }) catch return error.OutOfMemory;
+    out.writer.print(" ... [data truncated: {d} bytes, cap is {d}]\"", .{ total, data_cap }) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -3481,7 +3471,7 @@ fn keptFailure(a: Allocator, code: i64, data: ?[]const u8) !CallResult {
 /// What the host reads of `raw`, as the spec says: the data as `std.json` writes it with no spaces,
 /// or null when the data is nested past the limit or is not JSON. The text is in `a`.
 fn compactOf(a: Allocator, raw: []const u8) ?[]const u8 {
-    if (!nestingWithin(raw, data_depth_max)) return null;
+    if (json_depth.exceedsDepth(raw, data_depth_max)) return null;
     const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return null;
     return std.json.Stringify.valueAlloc(a, value, .{}) catch null;
 }
@@ -3496,9 +3486,14 @@ const cut_marker = " ... [data truncated";
 /// otherwise the data as the host reads it, `std.json`'s compact writing of it.
 fn expectBoundedCut(a: Allocator, raw: []const u8, held: []const u8) !void {
     const source: []const u8 = if (raw.len > data_parse_max) raw else compactOf(a, raw) orelse return error.TestUnexpectedResult;
+    try expectCutOf(a, source, held);
+}
+
+/// `expectBoundedCut` for a `source` the caller worked out.
+fn expectCutOf(a: Allocator, source: []const u8, held: []const u8) !void {
     try testing.expect(source.len > data_cap);
     try testing.expect(std.unicode.utf8ValidateSlice(held));
-    const decoded = try std.json.parseFromSliceLeaky([]const u8, a, held, .{});
+    const decoded = try json_decode.parseFromSliceLeaky([]const u8, a, held, .{});
     try testing.expect(std.unicode.utf8ValidateSlice(decoded));
     const at = std.mem.find(u8, decoded, cut_marker) orelse return error.TestUnexpectedResult;
     const marker = try a.print("{s}", .{decoded[at..]});
@@ -3572,7 +3567,7 @@ test "copyCall counts escapes against the cap: quotes and backslashes cost two b
     const cut = (try keptFailure(a, -32602, quotes)).failure.data orelse return error.TestUnexpectedResult;
     try expectBoundedCut(a, quotes, cut);
     // Every byte of that prefix costs two: it ends exactly at the cap after escaping.
-    const decoded = try std.json.parseFromSliceLeaky([]const u8, a, cut, .{});
+    const decoded = try json_decode.parseFromSliceLeaky([]const u8, a, cut, .{});
     const at = std.mem.find(u8, decoded, cut_marker).?;
     try testing.expectEqual(@as(usize, data_cap - 2), 2 * at);
     // A JSON string of control characters is written with `\u0007`: a backslash costs two, the rest one.
@@ -3608,6 +3603,98 @@ test "copyCall cuts data that compacts to more than the cap even when its own te
     const raw = try a.print("[{s}", .{floats});
     try testing.expect(raw.len < data_cap);
     try expectBoundedCut(a, raw, (try keptFailure(a, -32602, raw)).failure.data orelse return error.TestUnexpectedResult);
+}
+
+/// Counts the bytes an allocator holds at once, to see what a call keeps in its scratch.
+const PeakAllocator = struct {
+    backing: Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *PeakAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const out = self.backing.rawAlloc(len, alignment, return_address) orelse return null;
+        self.live += len;
+        self.peak = @max(self.peak, self.live);
+        return out;
+    }
+
+    // Never grows or shrinks in place, so the peak does not depend on what the backing allocator can do.
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.live -= memory.len;
+        self.backing.rawFree(memory, alignment, return_address);
+    }
+};
+
+/// `[5e-324,` and so on to 16,383 bytes: each number is 6 bytes that `std.json` writes as 327.
+fn tinyNumbers(a: Allocator) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '[');
+    for (0..2340) |_| try out.appendSlice(a, "5e-324,");
+    try out.appendSlice(a, "0]");
+    return out.items;
+}
+
+fn nestedArrays(a: Allocator, depth: usize) ![]const u8 {
+    const text = try a.alloc(u8, depth * 2);
+    @memset(text[0..depth], '[');
+    @memset(text[depth..], ']');
+    return text;
+}
+
+test "copyCall gives the model what it gave for the hostile data a review sent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 16 KiB of `5e-324` writes as 765,183 bytes: the model gets the cap and a marker that names that length.
+    const tiny = try tinyNumbers(a);
+    try testing.expectEqual(@as(usize, 16383), tiny.len);
+    const tiny_kept = (try keptFailure(a, -32602, tiny)).failure.data orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 8240), tiny_kept.len);
+    try testing.expect(std.mem.find(u8, tiny_kept, " ... [data truncated: 765183 bytes, cap is 8192]\"") != null);
+    try expectBoundedCut(a, tiny, tiny_kept);
+    // 10,000 levels in 20 KB: too long to read, so it is cut as a string of its own text.
+    const deep = try nestedArrays(a, 10_000);
+    const deep_kept = (try keptFailure(a, -32602, deep)).failure.data orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 8239), deep_kept.len);
+    try expectBoundedCut(a, deep, deep_kept);
+    // 128 levels are kept as they are, and 129 are left out.
+    const at_limit = try nestedArrays(a, 128);
+    try testing.expectEqualStrings(at_limit, (try keptFailure(a, -32602, at_limit)).failure.data orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(@as(?[]const u8, null), (try keptFailure(a, -32602, try nestedArrays(a, 129))).failure.data);
+}
+
+test "copyCall never holds more than the cap of the compact text, even for the moment of the cut" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const tiny = try tinyNumbers(out.allocator());
+    // What the parse alone takes of scratch.
+    var tree: PeakAllocator = .{ .backing = testing.allocator };
+    {
+        var arena: std.heap.ArenaAllocator = .init(tree.allocator());
+        defer arena.deinit();
+        _ = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), tiny, .{});
+    }
+    var scratch: PeakAllocator = .{ .backing = testing.allocator };
+    const kept = (try boundErrorData(scratch.allocator(), out.allocator(), tiny)).?;
+    try expectBoundedCut(out.allocator(), tiny, kept);
+    // Empty again on return, and at its fullest the parse tree and at most two caps of text: the compact
+    // text is 765,183 bytes, which nothing holds.
+    try testing.expectEqual(@as(usize, 0), scratch.live);
+    try testing.expect(scratch.peak <= tree.peak + 2 * data_cap);
 }
 
 test "copyCall never holds a huge error data whole, and cuts it where a character ends" {
@@ -3670,6 +3757,16 @@ test "copyCall leaves out data it cannot read safely: not UTF-8, not JSON, or ne
     brackets[0] = '"';
     brackets[brackets.len - 1] = '"';
     try testing.expectEqualStrings(brackets, (try keptFailure(a, -32602, brackets)).failure.data orelse "(dropped)");
+}
+
+test "copyCall writes numbers as std.json does, as core's own round trip would, and leaves out a repeated key" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("0.1", (try keptFailure(a, -32602, "0.1000000000000000055511151231257827")).failure.data orelse return error.TestUnexpectedResult);
+    try testing.expectEqualStrings("12345678901234567000", (try keptFailure(a, -32602, "12345678901234567890.5")).failure.data orelse return error.TestUnexpectedResult);
+    // Valid JSON, but `std.json` refuses a key it already has, so the data cannot be read.
+    try testing.expectEqual(@as(?[]const u8, null), (try keptFailure(a, -32602, "{\"a\":1,\"a\":2}")).failure.data);
 }
 
 test "copyCall leaves out the data of a -32042 answer: the URLs it lists are the host's to ask about" {
@@ -3799,13 +3896,21 @@ fn fuzzErrorData(_: void, smith: *testing.Smith) !void {
         return;
     }
     const raw = data.?;
+    // What the host should read, worked out without `compactText`: the data must be JSON, and the model
+    // sees it with no spaces. Nothing here is a number, whose writing `std.json` changes.
+    var source: []const u8 = raw;
     if (raw.len <= data_parse_max) {
-        const compact = compactOf(a, raw) orelse {
+        if (!try std.json.validate(a, raw)) {
             try testing.expectEqual(@as(?[]const u8, null), kept);
             return;
-        };
-        if (compact.len <= data_cap) {
-            try testing.expectEqualStrings(compact, kept orelse return error.TestUnexpectedResult);
+        }
+        source = try withoutSpaces(a, raw);
+        if (source.len <= data_cap) {
+            const held = kept orelse return error.TestUnexpectedResult;
+            try expectNoSpaceOutsideStrings(held);
+            const want = try json_decode.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+            const got = try json_decode.parseFromSliceLeaky(std.json.Value, a, held, .{});
+            try testing.expect(jsonEqual(want, got));
             return;
         }
     }
@@ -3814,7 +3919,69 @@ fn fuzzErrorData(_: void, smith: *testing.Smith) !void {
         try testing.expect(!std.unicode.utf8ValidateSlice(raw));
         return;
     };
-    try expectBoundedCut(a, raw, held);
+    try expectCutOf(a, source, held);
+}
+
+/// `raw` without the whitespace outside its strings.
+fn withoutSpaces(a: Allocator, raw: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var in_string = false;
+    var escaped = false;
+    for (raw) |byte| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') in_string = false;
+        } else if (byte == '"') {
+            in_string = true;
+        } else if (std.ascii.isWhitespace(byte)) continue;
+        try out.append(a, byte);
+    }
+    return out.items;
+}
+
+fn expectNoSpaceOutsideStrings(text: []const u8) !void {
+    var in_string = false;
+    var escaped = false;
+    for (text) |byte| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') in_string = false;
+        } else if (byte == '"') {
+            in_string = true;
+        } else try testing.expect(!std.ascii.isWhitespace(byte));
+    }
+}
+
+fn jsonEqual(x: std.json.Value, y: std.json.Value) bool {
+    if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+    return switch (x) {
+        .null => true,
+        .bool => |v| v == y.bool,
+        .integer => |v| v == y.integer,
+        .float => |v| v == y.float,
+        .number_string => |v| std.mem.eql(u8, v, y.number_string),
+        .string => |v| std.mem.eql(u8, v, y.string),
+        .array => |v| {
+            if (v.items.len != y.array.items.len) return false;
+            for (v.items, y.array.items) |item, other| if (!jsonEqual(item, other)) return false;
+            return true;
+        },
+        .object => |v| {
+            if (v.count() != y.object.count()) return false;
+            var it = v.iterator();
+            while (it.next()) |entry| {
+                const other = y.object.get(entry.key_ptr.*) orelse return false;
+                if (!jsonEqual(entry.value_ptr.*, other)) return false;
+            }
+            return true;
+        },
+    };
 }
 
 test "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes" {
