@@ -1208,7 +1208,7 @@ test "a reload beside a call that is out and a reader of the access view ends on
     const a = arena.allocator();
 
     // A subagent's admission: the view it was given.
-    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
     const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
 
@@ -1241,9 +1241,9 @@ test "a reload beside a call that is out and a reader of the access view ends on
 
         fn run(self: *@This()) void {
             while (!self.stop.load(.acquire)) {
-                var seen = self.catalog.snapshotAccessView(testing.allocator, "child", "parent", .{}) catch return;
+                var seen = self.catalog.snapshotAccessView(testing.allocator, "child", "parent") catch return;
                 seen.deinit(testing.allocator);
-                const names = self.catalog.snapshotToolNames(testing.allocator, .{}) catch return;
+                const names = self.catalog.snapshotToolNames(testing.allocator) catch return;
                 for (names) |name| testing.allocator.free(name);
                 testing.allocator.free(names);
                 _ = self.reads.fetchAdd(1, .monotonic);
