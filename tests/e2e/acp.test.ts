@@ -888,6 +888,11 @@ class AcpClient {
     return resp as object;
   }
 
+  /** False once the agent process has exited or been killed. */
+  isRunning(): boolean {
+    return this.proc.exitCode === null && this.proc.signalCode === null;
+  }
+
   async close(): Promise<void> {
     if (!this._closed) {
       this.proc.stdin!.end();
@@ -6031,6 +6036,7 @@ describe("acp: model-independent", () => {
       });
       let ended = true;
       let endError = "";
+      let alive = true;
       let messages: any[] = [];
       try {
         messages = (await runPrompt(client, "Call the supplied MCP tool.", opts.wait ?? 20_000)).messages;
@@ -6038,6 +6044,7 @@ describe("acp: model-independent", () => {
         ended = false;
         endError = error instanceof Error ? error.message : String(error);
       }
+      alive = client.isRunning();
       const trace = (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").split("\n").filter(Boolean);
       const wire = (existsSync(wirePath) ? readFileSync(wirePath, "utf8") : "")
         .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line).message as Record<string, any>);
@@ -6048,7 +6055,7 @@ describe("acp: model-independent", () => {
       } catch {
         toolText = "";
       }
-      return { shown, ended, endError, statuses, trace, wire, toolText };
+      return { shown, ended, endError, alive, statuses, trace, wire, toolText };
     } finally {
       await client?.close();
       if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
@@ -6094,6 +6101,8 @@ describe("acp: model-independent", () => {
             // refusal of the question or of its answer.
             expect(run.ended).toBe(false);
             expect(run.endError).toMatch(/^ACP (readLine timeout|prompt timed out)/);
+            // A crash of fx can end the wait the same way, so the process must still be there.
+            expect(run.alive).toBe(true);
             expect(run.wire.filter((message) => message.method === "tools/call")).toHaveLength(1);
             expect(run.wire.find((message) => message.method === "notifications/cancelled")).toBeUndefined();
             expect(run.trace.join("\n")).not.toMatch(/MCP question not answered|MCP answer not sent|MCP elicitation answer (not sent|dropped)|answered cancel|answered decline/);
