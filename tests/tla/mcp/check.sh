@@ -11,6 +11,9 @@
 # and the rule it names must be the one that fails. They run after the models
 # whatever the selection, and are listed at the end of this script:
 #
+#   Elicitation.findings   matching a form's names by their bytes refuses an
+#                          answer that fits the form (the engine before it
+#                          matched decoded strings)                  FitAccepted
 #   FieldRead.findings          comparing a member's name as written reads a
 #                               name with an escape as absent, while std.json
 #                               reads it once                   AgreeOrRefused
@@ -51,4 +54,5 @@ Request Request.findings SoonAfterRefusal
 WireDepth WireDepth.findings NoWriterOverflow
 FieldRead FieldRead.findings AgreeOrRefused
 FieldRead FieldRead.findings.isError ReportedAsSaid
+Elicitation Elicitation.findings FitAccepted
 EOF_FINDINGS

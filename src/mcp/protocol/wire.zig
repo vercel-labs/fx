@@ -274,6 +274,18 @@ pub fn sameString(a: []const u8, b: []const u8) bool {
     return sameDecoded(&x, &y);
 }
 
+/// How many code points the string token `token`, quotes included, holds once
+/// decoded: an escape is one, and a surrogate pair written as two escapes is
+/// one. Null for a token that is not a string, or that holds an escape or
+/// UTF-8 that is not valid. It uses the decoder of `sameString`.
+pub fn codePointCount(token: []const u8) ?usize {
+    if (!isStringToken(token)) return null;
+    var d: Decoder = .{ .raw = token[1 .. token.len - 1] };
+    var count: usize = 0;
+    while (d.next() catch return null) |_| count += 1;
+    return count;
+}
+
 /// Whether the string token `token`, quotes included, spells `name`, which is
 /// already decoded.
 fn spells(token: []const u8, name: []const u8) bool {
@@ -896,6 +908,34 @@ test "sameString is JSON's equality of two string tokens" {
     try testing.expect(sameString("1", "1"));
     try testing.expect(sameString("\"\\ud83d\"", "\"\\ud83d\""));
     try testing.expect(sameString("\"\xed\xa0\x80\"", "\"\xed\xa0\x80\""));
+}
+
+test "codePointCount counts a string token's code points as it decodes them" {
+    const counts = [_]struct { token: []const u8, count: usize }{
+        .{ .token = "\"\"", .count = 0 },
+        .{ .token = "\"abc\"", .count = 3 },
+        .{ .token = "\"\\u0041bc\"", .count = 3 },
+        .{ .token = "\"caf\\u00e9\"", .count = 4 },
+        .{ .token = "\"café\"", .count = 4 },
+        .{ .token = "\"\\ud83d\\ude00\"", .count = 1 }, // a surrogate pair is one
+        .{ .token = "\"\\uD83D\\uDE00\"", .count = 1 },
+        .{ .token = "\"😀\"", .count = 1 },
+        .{ .token = "\"a\\/b\\n\\\\\\\"\"", .count = 6 }, // a / b newline backslash quote
+        .{ .token = "\"\\u0000\"", .count = 1 },
+    };
+    for (counts) |c| {
+        testing.expectEqual(@as(?usize, c.count), codePointCount(c.token)) catch |err| {
+            std.debug.print("expected {d} code points in {s}\n", .{ c.count, c.token });
+            return err;
+        };
+    }
+    // A token that is not a string, or holds a bad escape or a lone surrogate, has no count.
+    for ([_][]const u8{ "12", "\"", "", "true", "\"\\q\"", "\"\\u12\"", "\"\\ud83d\"", "\"\\ude00\"", "\"\\ud83dx\"", "\"\xff\"" }) |token| {
+        testing.expectEqual(@as(?usize, null), codePointCount(token)) catch |err| {
+            std.debug.print("expected no count for {s}\n", .{token});
+            return err;
+        };
+    }
 }
 
 test "walks an object's fields with their keys exactly as written" {
