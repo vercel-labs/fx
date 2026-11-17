@@ -5553,6 +5553,8 @@ describe("acp: model-independent", () => {
     mode: string;
     keys: string[];
     capabilities: Record<string, unknown>;
+    /** How long to wait for the prompt to end, 20 seconds by default. */
+    wait?: number;
   }) {
     const root = createIsolatedRoot("fx-acp-mcp-escaped-keys-");
     const pidPath = join(root.root, "mcp-escaped-keys.pid");
@@ -5585,6 +5587,7 @@ describe("acp: model-independent", () => {
             FX_MCP_LEGACY_VERSION: "2025-11-25",
             FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND: "1",
             FX_MCP_WIRE_LOG: wirePath,
+            ...(declared === "form" ? { FX_MCP_ALLOW_FORM_ONLY: "1" } : {}),
             ...escape,
           }).map(([name, value]) => ({ name, value })),
         };
@@ -5599,11 +5602,13 @@ describe("acp: model-independent", () => {
         return { action: "accept", content: "choice" in properties ? { choice: properties.choice.enum[0] } : { confirmed: true } };
       });
       let ended = true;
+      let endError = "";
       let messages: any[] = [];
       try {
-        messages = (await runPrompt(client, "Call the supplied MCP tool.", 20_000)).messages;
-      } catch {
+        messages = (await runPrompt(client, "Call the supplied MCP tool.", opts.wait ?? 20_000)).messages;
+      } catch (error) {
         ended = false;
+        endError = error instanceof Error ? error.message : String(error);
       }
       const trace = (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").split("\n").filter(Boolean);
       const wire = (existsSync(wirePath) ? readFileSync(wirePath, "utf8") : "")
@@ -5615,7 +5620,7 @@ describe("acp: model-independent", () => {
       } catch {
         toolText = "";
       }
-      return { shown, ended, statuses, trace, wire, toolText };
+      return { shown, ended, endError, statuses, trace, wire, toolText };
     } finally {
       await client?.close();
       if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
@@ -5642,17 +5647,29 @@ describe("acp: model-independent", () => {
     ["a 2025 URL question with elicitationId escaped", { fixture: "legacy", mode: "url_required_error", keys: ["elicitationId"], capabilities: { form: {}, url: {} } }, [["url", "https://example.test/authorize"]], "held"],
     ["a 2025 form, plain", { fixture: "legacy", mode: "direct_form", keys: [], capabilities: { form: {}, url: {} } }, [["form", null]], "completed"],
     ["a 2025 form with mode escaped", { fixture: "legacy", mode: "direct_form", keys: ["mode"], capabilities: { form: {}, url: {} } }, [["form", null]], "completed"],
+    ["a 2025 URL question to a client that takes forms only, plain", { fixture: "legacy", mode: "url_required_error", keys: [], capabilities: { form: {} } }, [], "MCP protocol error -32042: URL elicitation required"],
+    ["a 2025 URL question to a client that takes forms only, mode escaped", { fixture: "legacy", mode: "url_required_error", keys: ["mode"], capabilities: { form: {} } }, [], "MCP protocol error -32042: URL elicitation required"],
     ["a 2025 form with requestedSchema escaped", { fixture: "legacy", mode: "direct_form", keys: ["requestedSchema"], capabilities: { form: {}, url: {} } }, [["form", null]], "completed"],
   ];
   test(
     "ACP asks about a URL or a form the same way whether the server writes a key plain or with an escape",
     async () => {
       for (const [label, probe, asked, ended] of ESCAPED_KEY_CASES) {
-        const run = await driveEscapedKeys(probe);
+        // A held call never ends, so the wait is short: the question reaches the client within a second or two.
+        const run = await driveEscapedKeys({ ...probe, wait: ended === "held" ? 6_000 : undefined });
         try {
           expect(run.shown.map((request) => [request.mode, request.url ?? null])).toEqual(asked);
           if (ended === "completed") expect(run.statuses.at(-1)).toBe("completed");
-          else if (ended === "held") expect(run.ended).toBe(false);
+          else if (ended === "held") {
+            // Held for the whole wait, not ended by a crash or an error: the wait ran out (the client's read
+            // or the prompt timed out), the server was called once and never cancelled, and the trace holds no
+            // refusal of the question or of its answer.
+            expect(run.ended).toBe(false);
+            expect(run.endError).toMatch(/^ACP (readLine timeout|prompt timed out)/);
+            expect(run.wire.filter((message) => message.method === "tools/call")).toHaveLength(1);
+            expect(run.wire.find((message) => message.method === "notifications/cancelled")).toBeUndefined();
+            expect(run.trace.join("\n")).not.toMatch(/MCP question not answered|MCP answer not sent|MCP elicitation answer (not sent|dropped)|answered cancel|answered decline/);
+          }
           else if (ended === "failed") expect(run.statuses.at(-1)).toBe("failed");
           else {
             expect(run.statuses.at(-1)).toBe("failed");

@@ -676,7 +676,7 @@ test "a refused line shaped like a response still names its request" {
         try testing.expectEqual(@as(?RequestId, null), responseId(line));
 }
 
-test "a key written with escapes never matches a field" {
+test "a key whose last escaped piece is a field name does not match it" {
     // The scanner splits this key into pieces, and the last one is "id".
     const message = try decode("{\"jsonrpc\":\"2.0\",\"x\\u0000id\":5,\"id\":1,\"result\":{}}");
     try testing.expectEqual(@as(?RequestId, 1), message.response.id);

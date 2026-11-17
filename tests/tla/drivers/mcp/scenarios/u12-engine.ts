@@ -698,7 +698,7 @@ export const scenarios: Scenario[] = [
     machines: { a: ["engine"] },
     control: { server: "a", maxAttempts: 3 },
   }),
-  // ---- a protocol field name written with escapes (finding N5, GN5) ----
+  // ---- a protocol field name written with escapes ----
   // The reply lines are raw, so a field name carries a JSON escape: `is\u0045rror` is `isError` once decoded.
   engineScenario({
     name: "u12-escaped-iserror",

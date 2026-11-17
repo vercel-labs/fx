@@ -284,8 +284,12 @@ function handle(message) {
       // own version and never asks for one.
       const asksForUrl = (mode === "url_required_error" || mode === "url_required_multiple") &&
         legacyVersion === "2025-11-25";
+      // FX_MCP_ALLOW_FORM_ONLY=1 lets a client that declares forms and no URLs connect, to see what fx
+      // does with a URL question it cannot take.
+      const formOnly = process.env.FX_MCP_ALLOW_FORM_ONLY === "1" && capability?.form != null;
       if (
         (mode === "direct_form" || asksForUrl) &&
+        !formOnly &&
         (capability?.form == null || capability?.url == null)
       ) process.exit(7);
     }
