@@ -81,7 +81,7 @@ const max_unreadable_replies = 3;
 /// Whether the store now holds a login the waiting request can send, other
 /// than the one the provider refused, as another fx process that signs in
 /// saves.
-pub const SignInRenewed = struct {
+const SignInRenewed = struct {
     ctx: *anyopaque,
     check: *const fn (ctx: *anyopaque) bool,
 };
