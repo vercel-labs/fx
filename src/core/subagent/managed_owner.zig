@@ -13,6 +13,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const end_test_controls = @import("end_test_controls.zig");
 const start_test_controls = @import("start_test_controls.zig");
+const publish_test_controls = @import("publish_test_controls.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -49,6 +50,11 @@ const Slot = struct {
     /// Set when the user closes the child from the agent list, so its
     /// report says the user closed it.
     closed_by_user: bool = false,
+    /// Set once the work's end is recorded, until the host chooses a next
+    /// work for the slot (`markNext`). A stop or close that finds it set has
+    /// no work to end, stopped or not: the slot has only not gone on yet
+    /// (`tests/tla/subagent/StopMessage.tla` GapStopHonest).
+    ended: bool = false,
     /// Set by the host once it has no next work for the slot, which then
     /// finishes. A start for the child waits for that.
     ending: bool = false,
@@ -135,7 +141,9 @@ pub const WorkEnd = struct {
 
 /// The host's hook for a work's end, called on the child's slot thread with
 /// no lock held. It returns true when it has installed the child's next
-/// work in the registry, which the same slot then runs.
+/// work in the registry, which the same slot then runs. Before it returns
+/// true it must call `markNext`, so the slot's stop flags are the next
+/// work's from then on.
 pub const EndHook = struct {
     context: *anyopaque,
     end_fn: *const fn (*anyopaque, WorkEnd) bool,
@@ -466,6 +474,27 @@ pub const Owner = struct {
         return observation;
     }
 
+    /// The host chose a next work for the child's slot, which goes on to run
+    /// it: the ended work's stop is spent and its settled messages go, so a
+    /// stop or close from here on is for the next work, which the slot then
+    /// starts already stopped. The host calls it while it holds its
+    /// admission lock, as it calls `markEnding`, so the choice and what a
+    /// stop or close sees of it are in one order.
+    pub fn markNext(self: *Owner, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id) or slot.completion != .running) continue;
+            self.dropSettledFeedbackLocked(slot.child_id);
+            slot.cancel.store(false, .seq_cst);
+            slot.stopped_by_parent = false;
+            slot.stopped_by_user = false;
+            slot.closed_by_user = false;
+            slot.metrics.reset();
+            slot.ended = false;
+        }
+    }
+
     /// The host has no next work for the child's slot, which is about to
     /// finish its last one.
     pub fn markEnding(self: *Owner, child_id: []const u8) void {
@@ -547,6 +576,8 @@ pub const Owner = struct {
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
             if (slot.completion != .running) return false;
+            // The work ended and the slot has not gone on: no work to end.
+            if (slot.ended) return false;
             slot.stopped_by_user = true;
             slot.closed_by_user = true;
             slot.cancel.store(true, .seq_cst);
@@ -567,6 +598,9 @@ pub const Owner = struct {
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
             if (slot.completion != .running) return null;
+            // The work ended and the slot has not gone on: no work to stop.
+            // Whatever waited for it is the host's to drop.
+            if (slot.ended) return null;
             // A second stop of a turn still ending: the first counted its
             // unread messages, which stay queued until the end drops them.
             const counted = slot.stopped_by_parent;
@@ -1094,6 +1128,7 @@ fn slotMain(slot: *Slot) void {
         else
             owner.cancelCause(outcome.outcome, slot.stopped_by_user) };
         const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
+        slot.ended = true;
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
         if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
@@ -1109,17 +1144,14 @@ fn slotMain(slot: *Slot) void {
             .end = end,
             .leftovers = slot.leftovers.items,
         }) else false;
+        publish_test_controls.holdPublish(slot.child_id);
         owner.mutex.lockUncancelable(io_mod.getIo());
         freeLeftovers(owner.alloc, slot);
         if (next and !closing and !owner.closed and !slot.shutdown.load(.seq_cst)) {
-            // The next work starts afresh: this one's stop is spent, and its
-            // messages' entries go, as Owner.start drops them.
-            owner.dropSettledFeedbackLocked(slot.child_id);
-            slot.cancel.store(false, .seq_cst);
-            slot.stopped_by_parent = false;
-            slot.stopped_by_user = false;
-            slot.closed_by_user = false;
-            slot.metrics.reset();
+            // The host's choice of this work already spent the ended work's
+            // stop (`markNext`), so a stop since then is this work's and
+            // stays: it starts stopped.
+            std.debug.assert(!slot.ended);
             owner.mutex.unlock(io_mod.getIo());
             continue;
         }

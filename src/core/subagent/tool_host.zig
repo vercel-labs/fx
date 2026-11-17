@@ -17,6 +17,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
 const close_test_controls = @import("close_test_controls.zig");
+const publish_test_controls = @import("publish_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -1058,7 +1059,10 @@ pub const Runtime = struct {
     /// Makes the parent's next message waiting for `child_id` the slot's
     /// next work, or else marks the child idle.
     fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) bool {
-        if (self.startNextPendingLocked(child_id)) return true;
+        if (self.startNextPendingLocked(child_id)) {
+            self.managed.markNext(child_id);
+            return true;
+        }
         self.clearBusyLocked(child_id);
         self.managed.markEnding(child_id);
         return false;
@@ -2752,6 +2756,9 @@ const MailboxFixture = struct {
     hosted: ?*worker_runtime.WorkerRuntime = null,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
+    /// How many runs began with their cancel flag already set: a work that
+    /// was stopped before it started.
+    cancelled_at_start: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
     /// "agent work_id outcome output" per report, in arrival order. Owned.
     reports: std.ArrayList([]u8) = .empty,
@@ -2799,6 +2806,7 @@ const MailboxFixture = struct {
 
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (cancel.load(.seq_cst)) _ = self.cancelled_at_start.fetchAdd(1, .seq_cst);
         const worker = turn.workerRuntime();
         // Counted once its turn has begun, so a test that waits for the run
         // can message it. A run that takes no steering is a turn past its
@@ -4021,6 +4029,251 @@ test "after the user closes a subagent, main's status and the message that start
         for (taken) |id| alloc.free(id);
         alloc.free(taken);
     }
+}
+
+/// Holds a subagent's slot after its work ended and the host's end hook
+/// returned, until a test lets it go, so the test can send a stop or a close
+/// into the gap before the slot goes on (`publish_test_controls`).
+const PublishHold = struct {
+    var holds = std.atomic.Value(u32).init(0);
+    var reached: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn arm() void {
+        holds.store(0, .seq_cst);
+        reached = .unset;
+        go = .unset;
+        publish_test_controls.test_hold = hold;
+    }
+
+    /// Lets a held slot go.
+    fn release() void {
+        go.set(io_mod.getIo());
+    }
+
+    /// Stops holding. Call it once no slot thread runs any more, since a
+    /// slot reads the hook when each of its works ends.
+    fn clear() void {
+        publish_test_controls.test_hold = null;
+    }
+
+    /// Holds the first end; a later one goes straight on.
+    fn hold(_: []const u8) void {
+        if (holds.fetchAdd(1, .seq_cst) != 0) return;
+        reached.set(io_mod.getIo());
+        while (!go.isSet()) io_mod.sleep(std.time.ns_per_ms);
+    }
+};
+
+/// A subagent `reviewer` whose first work has ended, with its slot held
+/// before it goes on. With `next_waits`, a second message waited for it, so
+/// the host chose that message's turn as the slot's next work; otherwise the
+/// child is idle. With `hosted`, the turns run on a child agent's own worker,
+/// as the app's do. Initialized in place, since the host points into it.
+const EndedSubagent = struct {
+    alloc: Allocator,
+    arena_state: std.heap.ArenaAllocator,
+    parent: child_state.TestParent,
+    hosted_worker: worker_runtime.WorkerRuntime,
+    fixture: MailboxFixture,
+    runtime: *Runtime,
+    child_id: []const u8,
+
+    fn init(self: *EndedSubagent, alloc: Allocator, next_waits: bool, hosted: bool) !void {
+        self.* = .{
+            .alloc = alloc,
+            .arena_state = .init(alloc),
+            .parent = undefined,
+            .hosted_worker = .{},
+            .fixture = .{ .hold = next_waits, .hosted = if (hosted) &self.hosted_worker else null },
+            .runtime = undefined,
+            .child_id = undefined,
+        };
+        errdefer self.arena_state.deinit();
+        errdefer self.hosted_worker.deinit(alloc);
+        try self.parent.init(alloc);
+        errdefer self.parent.deinit();
+        PublishHold.arm();
+        // Undone in reverse: the slot is let go, its threads end with the
+        // runtime, and only then is the hook cleared.
+        errdefer PublishHold.clear();
+        self.runtime = if (hosted)
+            try hostedMailboxRuntime(alloc, &self.fixture, &self.parent)
+        else
+            try mailboxRuntime(alloc, &self.fixture, &self.parent);
+        errdefer self.runtime.deinit();
+        errdefer PublishHold.release();
+        const arena = self.arena_state.allocator();
+        _ = try callTool(self.runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+        if (next_waits) {
+            try waitForRuns(&self.fixture, 1);
+            _ = try callTool(self.runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+            self.fixture.release.set(io_mod.getIo());
+        }
+        if (!testing_event.setInTime(&PublishHold.reached)) return error.Timeout;
+        self.child_id = try reviewerId(self.runtime, arena);
+        if (!next_waits) try waitUntilQuiet(self.runtime);
+    }
+
+    fn deinit(self: *EndedSubagent) void {
+        PublishHold.release();
+        self.runtime.deinit();
+        PublishHold.clear();
+        self.fixture.deinit();
+        self.hosted_worker.deinit(self.alloc);
+        self.parent.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn registryHolds(self: *EndedSubagent) !bool {
+        var registry = try self.runtime.managed.state_store.load(self.alloc);
+        defer registry.deinit(self.alloc);
+        return registry.findById(self.child_id) != null;
+    }
+};
+
+test "a stop right after a subagent's work ended finds it not working" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "reviewer was not working.") != null);
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped") == null);
+    // Nothing else changed: its report was posted once, and it is still open.
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    try std.testing.expect(try ended.registryHolds());
+}
+
+test "a close right after a subagent's work ended closes it as an idle one" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "Closed reviewer. A later message to reviewer starts a new one.") != null);
+    try std.testing.expect(std.mem.find(u8, answer, "ending its turn") == null);
+    try std.testing.expect(!try ended.registryHolds());
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    const taken = try ended.runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "the user's close right after a subagent's work ended ends no turn" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    const closed = (try ended.runtime.closeChild(ended.child_id, .user)).?;
+    try std.testing.expect(!closed.stopped);
+    try std.testing.expectEqual(@as(usize, 0), closed.dropped);
+    try std.testing.expect(!try ended.registryHolds());
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+}
+
+test "a stop right after a subagent's work ended stops the turn the user began on its screen" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, false, false);
+    defer ended.deinit();
+
+    // The user's turn runs on the child's own worker.
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try std.testing.expect(worker.beginDirectProcessing(5));
+    const work_id = ended.runtime.beginUserWork(alloc, ended.child_id, &worker).?;
+    defer alloc.free(work_id);
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped reviewer: its turn ended") != null);
+    try std.testing.expect(worker.isCancelRequested());
+    ended.runtime.endUserWork(ended.child_id, work_id, .cancelled, "");
+    // The parent's own stop answers that turn, so it owes no report.
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+}
+
+fn expectStopStopsNextWork(hosted: bool) !void {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, true, hosted);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, answer, "Stopped reviewer: its turn ended.") != null);
+    PublishHold.release();
+    try waitUntilQuiet(ended.runtime);
+    // The second turn began stopped: its run saw the cancel at its start. It
+    // owes no report, and the log says it was cancelled.
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.cancelled_at_start.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    var registry = try ended.runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(child_state.Outcome.cancelled, registry.findById(ended.child_id).?.last_outcome.?);
+}
+
+fn expectCloseEndsNextWork(hosted: bool) !void {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, true, hosted);
+    defer ended.deinit();
+
+    const answer = try callTool(ended.runtime, ended.arena_state.allocator(), .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    // Its next turn was already chosen, so the close ends that turn.
+    try std.testing.expect(std.mem.find(u8, answer, "Closed reviewer, ending its turn.") != null);
+    PublishHold.release();
+    try waitUntilQuiet(ended.runtime);
+    try waitUntilClosed(ended.runtime, ended.child_id);
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.cancelled_at_start.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.reportCount());
+    const taken = try ended.runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "a stop right after a subagent's work ended stops the turn its waiting message starts" {
+    try expectStopStopsNextWork(false);
+}
+
+test "a stop right after a subagent's work ended stops the turn its waiting message starts, on a hosted subagent" {
+    try expectStopStopsNextWork(true);
+}
+
+test "a close right after a subagent's work ended runs no turn for its waiting message and owes no report" {
+    try expectCloseEndsNextWork(false);
+}
+
+test "a close right after a subagent's work ended runs no turn for its waiting message, on a hosted subagent" {
+    try expectCloseEndsNextWork(true);
+}
+
+test "the user's close right after a subagent's work ended ends the turn its waiting message starts, and says so" {
+    const alloc = std.testing.allocator;
+    var ended: EndedSubagent = undefined;
+    try ended.init(alloc, true, false);
+    defer ended.deinit();
+
+    const closed = (try ended.runtime.closeChild(ended.child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    PublishHold.release();
+    try waitUntilQuiet(ended.runtime);
+    try waitUntilClosed(ended.runtime, ended.child_id);
+    try std.testing.expectEqual(@as(usize, 1), ended.fixture.cancelled_at_start.load(.seq_cst));
+    // What a user's close of a working subagent reports, and nothing of the
+    // turn's own work.
+    try std.testing.expectEqual(@as(usize, 2), ended.fixture.reportCount());
+    try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, ended.fixture.ends.items[1]);
+    try std.testing.expect(std.mem.find(u8, ended.fixture.reports.items[1], "The user closed it before it finished.") != null);
+    try std.testing.expect(std.mem.find(u8, ended.fixture.reports.items[1], "DONE second") == null);
 }
 
 test "an idle subagent closes at once, and its name then starts a new one" {
