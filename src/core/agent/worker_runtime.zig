@@ -9653,6 +9653,61 @@ test "a hold that began long after the finish still ends at its limit, and says 
     try std.testing.expect(waited < WorkerRuntime.commit_gate_limit_ms + 1000);
 }
 
+/// What a held spell has left of its limit.
+fn commitGateLeftMs(runtime: *WorkerRuntime) ?i64 {
+    runtime.worker_mutex.lockUncancelable(io_mod.getIo());
+    defer runtime.worker_mutex.unlock(io_mod.getIo());
+    return runtime.commitGateRemainingMsLocked();
+}
+
+test "a hold that its commit released leaves the next hold a whole limit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    runtime.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+
+    // A second finish and report come long after the first hold began. Its
+    // clock is two limits old, and the new hold must not inherit it.
+    try finishedTurnWithLateMail(alloc, &runtime, 2 * WorkerRuntime.commit_gate_limit_ms);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    const left = commitGateLeftMs(&runtime).?;
+    try std.testing.expect(left > WorkerRuntime.commit_gate_limit_ms - 1000);
+    try std.testing.expect(left <= WorkerRuntime.commit_gate_limit_ms);
+
+    runtime.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+}
+
+test "a hold that ended at its limit leaves the next hold a whole limit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try finishedTurnWithMissedMail(alloc, &runtime);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    // The loop never commits: the hold ends at its limit and the mail starts.
+    runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+
+    // A second finish and report come long after that hold began, and the
+    // new hold must not inherit its clock.
+    try finishedTurnWithLateMail(alloc, &runtime, 2 * WorkerRuntime.commit_gate_limit_ms);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expect(runtime.commitGateWaitsForCommit());
+    const left = commitGateLeftMs(&runtime).?;
+    try std.testing.expect(left > WorkerRuntime.commit_gate_limit_ms - 1000);
+    try std.testing.expect(left <= WorkerRuntime.commit_gate_limit_ms);
+
+    runtime.acknowledgeFinishCommitted();
+    freeWorkItem(alloc, (try runtime.tryTakeNextWork(alloc)).?);
+}
+
 test "text a user typed while a turn ran, which missed the turn, waits for its commit like mail" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
