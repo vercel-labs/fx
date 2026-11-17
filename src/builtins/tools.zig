@@ -101,7 +101,7 @@ const shell_properties = [_]model_tool_schema.Property{
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "For run: clean skips the user's startup files." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "For run with tty=true: use this shell instead of the default." },
     .{ .name = "tty", .json_type = .boolean, .description = "For run: give the command a terminal, for interactive programs." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 30000 (the default), interact up to 300000 (default 5000)." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 300000 (default 30000), interact up to 300000 (default 5000)." },
     .{ .name = "timeout_ms", .json_type = .integer, .description = "For run: kill the command after this long. Only when asked for a deadline." },
     .{ .name = "reload", .json_type = .boolean, .description = "For run: reload the user's startup files first, such as after installing a tool." },
     .{ .name = "session_id", .json_type = .string, .description = "For interact and stop." },
@@ -971,7 +971,7 @@ test "shell advertises only run interact and stop" {
         "Only when asked for a deadline",
         "Never rerun it",
         "check it is ready in that call",
-        "run waits up to 30000 (the default), interact up to 300000 (default 5000)",
+        "run waits up to 300000 (default 30000), interact up to 300000 (default 5000)",
         "run it with tty=true",
     }) |guidance| {
         try std.testing.expect(std.mem.find(u8, schema_json, guidance) != null);

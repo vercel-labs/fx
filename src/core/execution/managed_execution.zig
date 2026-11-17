@@ -629,7 +629,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         input: StartCapturedInput,
     ) !PreparedSnapshot {
-        if (input.yield_time_ms > contract.max_yield_time_ms) {
+        if (input.yield_time_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidYieldTime;
         }
         const admission = try self.admitCaptured(input);
