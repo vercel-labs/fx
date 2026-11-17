@@ -233,6 +233,89 @@ test "the transcript window keeps a dropped entry while a row of it is still on 
     try expectWindowMatchesEntries(&runtime);
 }
 
+test "a turn summary on screen still counts every file its turn read after the window drops the rest of the turn" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+
+    // Turn 1 reads three files. Each read's status row carries the tool
+    // detail the recap counts, attached the way the app attaches it.
+    const prompt = try alloc.dupe(u8, "READS_PROMPT");
+    defer alloc.free(prompt);
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+    const reads = [_]struct { call_id: []const u8, label: []const u8, arguments_json: []const u8 }{
+        .{ .call_id = "read-a", .label = "Read a.txt", .arguments_json = "{\"path\":\"a.txt\"}" },
+        .{ .call_id = "read-b", .label = "Read b.txt", .arguments_json = "{\"path\":\"b.txt\"}" },
+        .{ .call_id = "read-c", .label = "Read c.txt", .arguments_json = "{\"path\":\"c.txt\"}" },
+    };
+    for (reads) |read| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, read.label, true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, .{
+            .id = read.call_id,
+            .name = "read_file",
+            .arguments_json = read.arguments_json,
+        }, .read, .{
+            .tool_call_id = @constCast(read.call_id),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("file contents\n"),
+            .output_bytes = 14,
+            .stored_output_bytes = 14,
+            .created_at_ms = 123,
+        });
+    }
+    _ = try runtime.appendAssistantTurnEntry(alloc);
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "READS_ANSWER\n");
+    const summary_id = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+    {
+        var before = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+        defer before.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, before.bytes, "Explored 3 files") != null);
+    }
+
+    // The summary's first row is the history edge of the committed frame.
+    // Rows above it go to terminal history; the summary's row stays on screen.
+    try commitStableFrame(alloc, &runtime);
+    var flow = try source_preparation.prepareRetentionSource(&runtime, alloc);
+    defer flow.deinit(alloc);
+    var summary_first_row: ?u32 = null;
+    var owner: ?u32 = null;
+    for (flow.line_provenance, 0..) |line, index| {
+        owner = source_preparation.publication_owner(owner, line);
+        if (owner == summary_id and summary_first_row == null) summary_first_row = flow.transcript_visual_row_offsets[index];
+    }
+    try std.testing.expect(summary_first_row != null);
+    const anchor = &runtime.transcript_commit_state.stable;
+    anchor.history_visual_offset = summary_first_row.?;
+
+    // A compaction, then a turn that ends. The window would drop turn 1's rows
+    // in history, but the summary is on screen, so it holds the whole turn.
+    try runtime.transcriptWindowCompacted(alloc);
+    try runTurn(alloc, &runtime, &metrics, "NEXT_PROMPT", "NEXT_ANSWER\n");
+    try std.testing.expect(holds(&runtime, "READS_PROMPT") and holds(&runtime, "Read a.txt"));
+    var summary_held = false;
+    for (runtime.notebook.entries.items) |entry| {
+        if (entry.id() == summary_id) summary_held = true;
+    }
+    try std.testing.expect(summary_held);
+
+    // The held summary still recaps all three reads of its turn.
+    var after = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    defer after.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 3 files") != null);
+
+    // Once the summary's row is in terminal history too, the next sync drops
+    // the whole turn.
+    const later = &runtime.transcript_commit_state.stable;
+    later.history_visual_offset = later.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "READS_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript_window.?.pending_drops.items.len);
+    try expectWindowMatchesEntries(&runtime);
+}
+
 test "a cleared transcript starts the transcript window over" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);

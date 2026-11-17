@@ -7287,7 +7287,27 @@ pub const TranscriptRuntime = struct {
             if (committed.transcript_visual_row_offsets[index + 1] <= history) continue;
             if (owner) |id| try set.put(alloc, id, {});
         }
+        // A turn summary recaps its turn from the turn's entries
+        // (`tool_group_projection.recapTurnSummary`), so the whole turn, from
+        // its prompt, stays while the summary's row is on screen.
+        try self.holdTurnsOfHeldSummaries(alloc, &set);
         return .{ .entries = set };
+    }
+
+    /// Adds to `set` every entry of each turn whose summary `set` holds,
+    /// back to the turn's prompt.
+    fn holdTurnsOfHeldSummaries(self: *TranscriptRuntime, alloc: Allocator, set: *std.AutoHashMapUnmanaged(u32, void)) !void {
+        const entries = self.notebook.entries.items;
+        for (entries, 0..) |entry, index| {
+            const raw = switch (entry) {
+                .raw_bytes => |value| value,
+                else => continue,
+            };
+            if (raw.class != .turn_summary or !set.contains(raw.id)) continue;
+            var start = tool_group_projection.turnSummaryTurnStart(entries, index);
+            if (start > 0 and std.meta.activeTag(entries[start - 1]) == .user_turn) start -= 1;
+            for (entries[start..index]) |held| try set.put(alloc, held.id(), {});
+        }
     }
 
     /// Swap the bytes of the `raw_bytes` entry with `entry_id` to a dup of
