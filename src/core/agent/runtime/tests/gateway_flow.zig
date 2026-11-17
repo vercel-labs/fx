@@ -7024,10 +7024,13 @@ test "processQueuedPrompt suppresses a repeated confirmed provider tool identity
 test "processQueuedPrompt rejects content filter before tool execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
-    const completions = [_]FakeCompletion{.{
+    // The host cannot ask, so the request is sent four times; each block
+    // carries the call, and none of them runs.
+    const blocked: FakeCompletion = .{
         .tool_calls = &calls,
         .finish_reason = .content_filter,
-    }};
+    };
+    const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -7039,12 +7042,13 @@ test "processQueuedPrompt rejects content filter before tool execution" {
         runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
     );
 
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .content_filter, "⚠ blocked · content_filter · content filter");
+    const statuses = hooks.route_recovery_statuses.items;
+    try expectRouteStatus(&hooks, statuses.len - 1, .content_filter, "⚠ blocked · content_filter · content filter");
 }
 
 test "processQueuedPrompt retries replay-safe provider errors before success" {
@@ -9142,12 +9146,13 @@ test "processQueuedPrompt recovers provider error after streamed tool start" {
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
 }
 
-test "processQueuedPrompt ends a content-filtered turn without a resend when the host cannot ask" {
+test "processQueuedPrompt resends a content-filtered request three times when the host cannot ask, then ends the turn" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
+    const blocked: FakeCompletion = .{
         .finish_reason = .content_filter,
         .provider_failure_detail = "content_filter: filtered",
-    }};
+    };
+    const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -9161,10 +9166,38 @@ test "processQueuedPrompt ends a content-filtered turn without a resend when the
         runFakePrompt(&gateway, &hooks, config, fixture.job()),
     );
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .content_filter, "⚠ blocked · content_filter: filtered · content filter");
+    // Three resends at once, no question nobody could answer, and the same
+    // terminal status as a turn that was never resent.
+    try std.testing.expectEqual(@as(usize, 4), hooks.route_recovery_statuses.items.len);
+    try expectModuleStatus(&hooks, 0, .retrying, "Blocked by the content filter · retrying (1/3)");
+    try expectModuleStatus(&hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
+    try expectModuleStatus(&hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
+    try expectRouteStatus(&hooks, 3, .content_filter, "⚠ blocked · content_filter: filtered · content filter");
+    try std.testing.expect(needUserText(&hooks) == null);
+}
+
+test "processQueuedPrompt answers after two content-filter blocks when the host cannot ask" {
+    const alloc = std.testing.allocator;
+    const blocked: FakeCompletion = .{
+        .finish_reason = .content_filter,
+        .provider_failure_detail = "content_filter: filtered",
+    };
+    const completions = [_]FakeCompletion{ blocked, blocked, .{ .content = "allowed answer" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    try std.testing.expect(needUserText(&hooks) == null);
+    try expectRecovered(&hooks, 3);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 /// How many HTTP error notices the turn showed.
@@ -9192,12 +9225,13 @@ fn needUserText(hooks: *const FakeAgentRuntimeDeps) ?[]const u8 {
     return null;
 }
 
-test "processQueuedPrompt waits for the user after a content filter and resends on Enter" {
+test "processQueuedPrompt resends a content-filtered request three times, then waits for the user and resends on Enter" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .finish_reason = .content_filter, .provider_failure_detail = "content_filter: filtered" },
-        .{ .content = "allowed answer" },
+    const blocked: FakeCompletion = .{
+        .finish_reason = .content_filter,
+        .provider_failure_detail = "content_filter: filtered",
     };
+    const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked, .{ .content = "allowed answer" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -9210,8 +9244,14 @@ test "processQueuedPrompt waits for the user after a content filter and resends 
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Blocked by the content filter · press Esc and rephrase", needUserText(&hooks).?);
+    // Three resends at once, the question after the fourth block, and the
+    // user's Enter sends the fifth request, which is answered.
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_models.items.len);
+    try expectModuleStatus(&hooks, 0, .retrying, "Blocked by the content filter · retrying (1/3)");
+    try expectModuleStatus(&hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
+    try expectModuleStatus(&hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
+    try expectModuleStatus(&hooks, 3, .need_user, "Blocked by the content filter · press Esc and rephrase");
+    try expectRecovered(&hooks, 5);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 

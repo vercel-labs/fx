@@ -594,6 +594,14 @@ pub const RequestRecovery = struct {
     }
 
     fn showLocked(self: *RequestRecovery, status: recovery.Status) !void {
+        // After a content filter's last resend, a host that cannot ask has
+        // nobody to answer the question, and the turn loop ends the request
+        // on fx's own content-filter status next, so the question never
+        // reaches it.
+        if (status.need == .content_filter and !self.canAskUser()) {
+            debug_trace.eventf("recovery", "status_not_shown", self.trace_ctx, "need=content_filter reason=host_cannot_ask", .{});
+            return;
+        }
         if (types.RouteRecoveryStatus.fromRecovery(status, self.attempts)) |shown| {
             self.recovery_shown = true;
             self.host_showing = true;
@@ -754,6 +762,52 @@ test "responding from two threads at once delivers one responding" {
         // The retrying status clears exactly once per send.
         try std.testing.expectEqual(clears + 1, fake.route_recovery_clear_count);
     }
+}
+
+test "a host that cannot ask resends a blocked reply at once and never shows the question" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    for (0..3) |_| {
+        try std.testing.expectEqual(Send{}, (try request.failed(.{ .kind = .content_filter })).?);
+    }
+    try std.testing.expectEqual(@as(u16, 4), request.attempt());
+    // The fourth block needs the user, whom this host cannot ask.
+    try std.testing.expectEqual(@as(?Send, null), try request.failed(.{ .kind = .content_filter }));
+    const statuses = fake.route_recovery_statuses.items;
+    try std.testing.expectEqual(@as(usize, 3), statuses.len);
+    for (statuses) |status| try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.retrying, status.kind);
+    try std.testing.expectEqualStrings("Blocked by the content filter · retrying (3/3)", statuses[2].text.slice());
+}
+
+test "a host that can ask resends a blocked reply at once, then shows the question" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    for (0..3) |_| {
+        try std.testing.expectEqual(Send{}, (try request.failed(.{ .kind = .content_filter })).?);
+    }
+    try std.testing.expectEqual(@as(?Send, null), try request.failed(.{ .kind = .content_filter }));
+    const statuses = fake.route_recovery_statuses.items;
+    try std.testing.expectEqual(@as(usize, 4), statuses.len);
+    try std.testing.expectEqualStrings("Blocked by the content filter · retrying (3/3)", statuses[2].text.slice());
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.need_user, statuses[3].kind);
+    // Enter sends it again.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 5), request.attempt());
 }
 
 test "a healthy request shows nothing and reports no recovery" {
