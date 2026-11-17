@@ -109,6 +109,7 @@ pub const UserSettingsPatch = struct {
     ultrafast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    show_reasoning: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -145,6 +146,7 @@ pub const UserSettingsPatch = struct {
             self.ultrafast_mode == null and
             self.slash_menu_categories == null and
             self.collapse_tool_calls == null and
+            self.show_reasoning == null and
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
@@ -1280,6 +1282,7 @@ fn applyUserPatchToRoot(
     }
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
+    if (patch.show_reasoning) |value| application.changed = try putBool(arena, &root.object, "show_reasoning", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;

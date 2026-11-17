@@ -16644,7 +16644,7 @@ test "rewrite publication keeps the frozen prefix when a finished turn holds a h
 
 test "reasoning deltas grow one trailing block and finalize into a summary plus hidden text" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16) };
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
     defer runtime.deinit(alloc);
 
     try runtime.appendReasoningDelta(alloc, 7, "first ");
@@ -16692,9 +16692,36 @@ test "reasoning deltas grow one trailing block and finalize into a summary plus 
     try std.testing.expectEqual(@as(usize, 2), runtime.notebook.entries.items.len);
 }
 
-test "reasoning display text neutralizes provider escape bytes" {
+test "reasoning stays hidden until show_reasoning is on" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16) };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningDelta(alloc, 5, "hidden thought");
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+
+    try runtime.finalizeActiveReasoning(alloc, io_mod.milliTimestamp());
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+    try std.testing.expect((try runtime.peekTurnReasoning(alloc)) == null);
+
+    // A saved turn's reasoning replays only when the setting is on, so an
+    // earlier session's thinking cannot leak past it.
+    try runtime.appendReasoningRecord(alloc, .{
+        .text = @constCast("saved thought"),
+        .duration_ms = 3_000,
+        .tokens = 9,
+    }, 1_000);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
+
+    runtime.show_reasoning = true;
+    try runtime.appendReasoningDelta(alloc, 5, "now visible");
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(RawEntryClass.assistant_reasoning, runtime.notebook.entries.items[0].raw_bytes.class);
+}
+
+test "reasoning display text neutralizes provider escape bytes" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
     defer runtime.deinit(alloc);
 
     try runtime.appendReasoningDelta(alloc, 3, "safe \x1b[31mred\x1b[0m\x07 text");
@@ -16707,7 +16734,7 @@ test "reasoning display text neutralizes provider escape bytes" {
 
 test "a saved reasoning record replays as its summary row and hidden full text" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16) };
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
     defer runtime.deinit(alloc);
 
     try runtime.appendReasoningRecord(alloc, .{
@@ -16726,7 +16753,7 @@ test "a saved reasoning record replays as its summary row and hidden full text" 
 
 test "clearing the transcript forgets the turn's reasoning" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16) };
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
     defer runtime.deinit(alloc);
 
     try runtime.appendReasoningDelta(alloc, 9, "thinking");
@@ -16738,7 +16765,7 @@ test "clearing the transcript forgets the turn's reasoning" {
 
 test "reasoning shows as its summary inline and its full text only in the full transcript" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16) };
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 24, 16), .show_reasoning = true };
     defer runtime.deinit(alloc);
 
     try runtime.appendReasoningRecord(alloc, .{

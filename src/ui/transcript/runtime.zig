@@ -4814,6 +4814,7 @@ const transcript_screen_fields = [_][:0]const u8{
     "transcript_archive_boundary",
     "transcript_archive_land_index",
     "collapse_tool_calls",
+    "show_reasoning",
     "painting",
     "footer_viewport",
     "extra_input_rows",
@@ -4995,6 +4996,11 @@ pub const TranscriptRuntime = struct {
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
     collapse_tool_calls: bool = false,
+    /// When enabled, the transcript streams the model's reasoning as dim text,
+    /// collapses it to a one-line summary when the answer or a tool starts,
+    /// and keeps its full text for Ctrl+O. Off by default: thinking then shows
+    /// only the Thinking indicator, and nothing is saved to the session.
+    show_reasoning: bool = false,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
@@ -5233,6 +5239,7 @@ pub const TranscriptRuntime = struct {
         self.replaceable_row = source.replaceable_row;
         self.command_output_render = source.command_output_render;
         self.collapse_tool_calls = source.collapse_tool_calls;
+        self.show_reasoning = source.show_reasoning;
         self.full_transcript = source.full_transcript;
         self.transcript_band_dirty = source.transcript_band_dirty;
     }
@@ -7176,6 +7183,7 @@ pub const TranscriptRuntime = struct {
     /// displayed as visible text, so provider bytes cannot drive the
     /// terminal.
     pub fn appendReasoningDelta(self: *TranscriptRuntime, alloc: Allocator, turn_id: u64, delta: []const u8) !void {
+        if (!self.show_reasoning) return;
         if (delta.len == 0) return;
         if (self.notebook.reasoning_turn_id != turn_id) {
             self.clearTurnReasoning(alloc);
@@ -7201,6 +7209,7 @@ pub const TranscriptRuntime = struct {
     /// Every end of a thinking phase calls this before the next transcript
     /// row lands, because only the trailing line can be replaced in place.
     pub fn finalizeActiveReasoning(self: *TranscriptRuntime, alloc: Allocator, now_ms: i64) !void {
+        if (!self.show_reasoning) return;
         const active_text = self.notebook.reasoning_active_text.items;
         if (active_text.len == 0) {
             self.notebook.reasoning_active_entry_id = null;
@@ -7275,6 +7284,7 @@ pub const TranscriptRuntime = struct {
     /// The committed turn's aggregate reasoning, or null when it never
     /// thought. The caller owns the record.
     pub fn peekTurnReasoning(self: *TranscriptRuntime, alloc: Allocator) !?types.ReasoningRecord {
+        if (!self.show_reasoning) return null;
         const text = self.notebook.reasoning_turn_text.items;
         if (text.len == 0) return null;
         const clipped = if (text.len > types.ReasoningRecord.max_text_bytes)
@@ -7308,6 +7318,7 @@ pub const TranscriptRuntime = struct {
         created_at_ms: i64,
     ) !void {
         if (record.text.len == 0) return;
+        if (!self.show_reasoning) return;
         // Saved text is provider output as well, so it is cleaned here too
         // before it reaches the terminal.
         var safe: std.ArrayList(u8) = .empty;

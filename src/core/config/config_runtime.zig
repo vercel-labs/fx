@@ -66,6 +66,9 @@ pub const Settings = struct {
     provider_strict: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    /// Show the model's reasoning in the transcript instead of only the
+    /// Thinking indicator. Profile-only, so a repository cannot turn it on.
+    show_reasoning: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
@@ -153,6 +156,7 @@ pub const ConfigSources = struct {
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
+    show_reasoning: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
@@ -1007,6 +1011,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
+    if (settings.show_reasoning != null) sources.show_reasoning = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
@@ -1920,6 +1925,11 @@ fn parseProfileOnlyFields(
         settings.collapse_tool_calls = value.bool;
     }
 
+    if (root.object.get("show_reasoning")) |show_reasoning_value| {
+        if (show_reasoning_value != .bool) return error.InvalidShowReasoningType;
+        settings.show_reasoning = show_reasoning_value.bool;
+    }
+
     if (root.object.get("session_titles")) |session_titles_value| {
         const value = session_titles_value;
         if (value != .bool) return error.InvalidSessionTitlesType;
@@ -2165,6 +2175,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.provider_strict) |value| target.provider_strict = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
+    if (incoming.show_reasoning) |value| target.show_reasoning = value;
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
@@ -3042,6 +3053,26 @@ test "collapse tool calls parses merges and rejects invalid types" {
     try std.testing.expectError(
         error.InvalidCollapseToolCallsType,
         parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":\"off\"}"),
+    );
+}
+
+test "show reasoning parses merges and rejects invalid types" {
+    var absent = try parseSettingsJson(std.testing.allocator, "{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.show_reasoning == null);
+
+    var first = try parseSettingsJson(std.testing.allocator, "{\"show_reasoning\":true}");
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.show_reasoning.?);
+
+    var second = try parseSettingsJson(std.testing.allocator, "{\"show_reasoning\":false}");
+    defer second.deinit(std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
+    try std.testing.expect(!first.show_reasoning.?);
+
+    try std.testing.expectError(
+        error.InvalidShowReasoningType,
+        parseSettingsJson(std.testing.allocator, "{\"show_reasoning\":\"off\"}"),
     );
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { onlySessionId } from "./saved-sessions";
@@ -136,6 +136,12 @@ function setup(responses: (Response | ((body: string) => Response | Promise<Resp
   return { home, workspace, gateway, env, cleanup };
 }
 
+/// Turns the opt-in reasoning display on for this profile before fx starts.
+function enableShowReasoning(home: string) {
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), `${JSON.stringify({ show_reasoning: true })}\n`);
+}
+
 async function start(cmd: string, workspace: string, env: Record<string, string | undefined>, width = 120, height = 70): Promise<Session> {
   const session = await TmuxSession.create({ cmd, cwd: workspace, env, width, height, isolated: true });
   await session.waitForComposer(TIMEOUT);
@@ -261,6 +267,7 @@ describe("Ctrl+O full detail", () => {
   test.skipIf(!tmuxAvailable())("a reply's thought stays inline as its one-line summary and shows whole in the full transcript, live and after a resume", async () => {
     const thought = "THOUGHT_BEFORE_ANSWER: two candidate files, the second matches.";
     const env = setup([thinkingReply(thought, "Answer after thought.", genId(9))]);
+    enableShowReasoning(env.home);
     let session: Session | undefined;
     try {
       session = await start(binary, env.workspace, env.env);
@@ -281,6 +288,62 @@ describe("Ctrl+O full detail", () => {
       expect(oneLine(resumed)).toContain(thought);
       expect(resumed.join("\n")).not.toMatch(/Thought for \d+s/);
       expectInOrder(resumed, [["Think before answering"], ["THOUGHT_BEFORE_ANSWER"], ["Answer after thought."]]);
+    } finally {
+      await session?.kill();
+      env.cleanup();
+    }
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("reasoning stays hidden until show_reasoning is on", async () => {
+    const thought = "HIDDEN_THOUGHT: two candidate files, the second matches.";
+    const env = setup([thinkingReply(thought, "Answer without thought.", genId(10))]);
+    let session: Session | undefined;
+    try {
+      session = await start(binary, env.workspace, env.env);
+      await ask(session, "Think quietly", "Answer without thought.");
+      // The default is off, so the transcript never shows the summary row or
+      // the reasoning text anywhere, including the full transcript.
+      const inlinePane = await session.capturePane();
+      expect(inlinePane).not.toMatch(/Thought for \d+s/);
+      expect(inlinePane).not.toContain("HIDDEN_THOUGHT");
+      const live = await fullDetail(session);
+      expect(oneLine(live)).not.toContain(thought);
+    } finally {
+      await session?.kill();
+      env.cleanup();
+    }
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("/show-reasoning turns the reasoning display on and off", async () => {
+    const first = "HIDDEN_BEFORE_TOGGLE: check the tests.";
+    const second = "SHOWN_AFTER_TOGGLE: answer now.";
+    const env = setup([
+      thinkingReply(first, "First answer.", genId(14)),
+      thinkingReply(second, "Second answer.", genId(15)),
+    ]);
+    let session: Session | undefined;
+    try {
+      session = await start(binary, env.workspace, env.env);
+      await ask(session, "Think quietly", "First answer.");
+      expect(await session.capturePane()).not.toMatch(/Thought for \d+s/);
+
+      // A value the command cannot take gets its usage line, and changes nothing.
+      await session.sendText("/show-reasoning sometimes");
+      await session.waitForText("usage: /show-reasoning [on|off]", TIMEOUT);
+      expect(await session.capturePane()).not.toMatch(/Thought for \d+s/);
+
+      await session.sendText("/show-reasoning on");
+      await session.waitForText("saved to global settings", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+
+      await ask(session, "Think loudly", "Second answer.");
+      expect(await session.capturePane()).toMatch(/Thought for \d+s/);
+      const full = await fullDetail(session);
+      expect(oneLine(full)).toContain(second);
+
+      await session.sendText("/show-reasoning off");
+      await session.waitForText("saved to global settings", TIMEOUT);
+      expect(readFileSync(join(env.home, ".fx", "settings.json"), "utf8")).toContain('"show_reasoning":false');
     } finally {
       await session?.kill();
       env.cleanup();

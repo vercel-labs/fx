@@ -140,6 +140,7 @@ pub const keys = [_]Key{
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
+    .{ .name = "show_reasoning", .where = .profile, .kind = .boolean, .description = "Show the model's reasoning in the transcript" },
     // Retired, but still read so that fx can explain the migration.
     .{ .name = "skill_match_fuzzy", .where = .profile, .kind = .refused, .description = "No longer supported; fx refuses a file that sets it, so remove it" },
     .{ .name = "skill_symlink_authorities", .where = .profile, .kind = .strings, .description = "Absolute directories that symlinked skills may resolve into" },

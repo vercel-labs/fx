@@ -311,6 +311,7 @@ pub fn Handlers(comptime App: type) type {
                 .create_trace = commandCreateTrace,
                 .compact_history = commandCompactHistory,
                 .handle_settings = commandHandleSettings,
+                .handle_show_reasoning = commandHandleShowReasoning,
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .handle_fast = commandHandleFast,
@@ -1283,6 +1284,32 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
 
+        fn commandHandleShowReasoning(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const value = std.mem.trim(u8, rest, " \t");
+            // Like `/settings startup-scrollback`, a bare command toggles, so
+            // the surface offers one action instead of a required argument.
+            const wanted: bool = if (value.len == 0)
+                !app.shell.show_reasoning
+            else if (std.ascii.eqlIgnoreCase(value, "on"))
+                true
+            else if (std.ascii.eqlIgnoreCase(value, "off"))
+                false
+            else {
+                try app.writeDomainNotice(.{
+                    .topic = "",
+                    .tone = .@"error",
+                    .body = "usage: /show-reasoning [on|off]",
+                }, true);
+                return;
+            };
+            const change = settings_catalog.Change{
+                .setting = .show_reasoning,
+                .value = if (wanted) "on" else "off",
+            };
+            try applySettingsCatalogChange(app, change);
+        }
+
         fn commandHandleSettings(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
@@ -1946,6 +1973,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
         snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
     }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "show_reasoning")) {
+        snapshot.show_reasoning = app.shell.show_reasoning;
+    }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "session_title_generation")) snapshot.session_titles = app.session_title_generation;
@@ -2020,6 +2050,17 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 app,
                 "collapse tool calls",
                 .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
+        },
+        .show_reasoning => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = enabled != app.shell.show_reasoning;
+            if (runtime_changed) app.shell.show_reasoning = enabled;
+            try persistUserPreferences(
+                app,
+                "show reasoning",
+                .{ .show_reasoning = enabled },
                 runtime_changed,
             );
         },
