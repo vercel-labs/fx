@@ -6,8 +6,8 @@ This folder is fx's copy of [quickjs-ng](https://github.com/quickjs-ng/quickjs),
 
 | Field | Value |
 | --- | --- |
-| Release | `v0.18.0` |
-| Commit | `d7215b0ad3fc2c562e8317fd9bca058fd4863804` |
+| Release | `a71d444be5f72cb6b3418aff4f05cffb8af3690f` |
+| Commit | `a71d444be5f72cb6b3418aff4f05cffb8af3690f` |
 | License | MIT, in `LICENSE` and `THIRD_PARTY_NOTICES.md` |
 
 ## Release files
@@ -33,7 +33,7 @@ The release's copy of each engine file and its SHA-256. `check` compares this fo
 | `quickjs-atom.h` | `8045b870825a43ecdb50692aac7ad21b43139b288df466ca5f7b780bde4ac13f` |
 | `quickjs-c-atomics.h` | `29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c` |
 | `quickjs-opcode.h` | `0054b0c45fd091afa308c3fb93b5862e0b071235918d3d73e413d23fce388bbc` |
-| `quickjs.c` | `51b1d3919ffe812d0e01793f85d347bcea48c924c11262c5c5f00df1e4759d74` |
+| `quickjs.c` | `82e418450b68342e0178b4b9f4d982f83c13746b0f6886c53a5c6033947f6d48` |
 | `quickjs.h` | `6d3879c856551653a1c64fabe52d6d07dc84e97bac3df45848df626702fc30de` |
 
 ## What fx took
@@ -45,7 +45,6 @@ fx took the engine and nothing around it: `quickjs.c`, `libregexp.c`, `libunicod
 Each engine file here is the release's copy with the patches in `patches/` applied in name order, and each patch is one change. `scripts/quickjs-fork.sh check` takes the patches off a copy of this folder, newest first, and compares each file with its SHA-256 under Release files. It downloads nothing, and CI runs it on every change. Describe each patch here: the file, what changed, and why.
 
 - `patches/0001-poll-interrupts-in-long-loops.patch`, `quickjs.c`: the loops in `js_array_join`, `js_array_reverse`, `js_array_slice`, `js_array_concat`, `js_array_sort`, `JS_CopySubArray`, `JS_FlattenIntoArray`, `js_string_raw`, the array case of `js_json_to_str`, and the replacer-array loop of `JS_JSONStringify` call `js_poll_interrupts` on each pass, as `js_array_includes` already does. Each walks an object up to its `length`, which a program can set as high as 2^53 - 1, without allocating or calling back into JavaScript, so nothing else stops it. Without the check, `join`, `reverse`, `shift`, `unshift`, `splice`, `copyWithin`, `slice`, `concat`, `flat`, `sort`, `String.raw`, and `JSON.stringify` ran past fx's deadline for as long as the length allowed.
-- `patches/0002-normalize-realloc-callbacks.patch`, `quickjs.c`: `String.prototype.localeCompare` and `String.prototype.normalize` passed `js_realloc` and `js_realloc_rt` to `unicode_normalize` cast to `DynBufReallocFunc`. Calling a function through a pointer of another type fails the function-type check that `build.zig` turns on, so a program that called either method trapped. The fork adds `fx_dbuf_realloc_ctx` and `fx_dbuf_realloc_rt`, which have the exact `DynBufReallocFunc` type, and passes those instead.
 - `patches/0003-cutils-include-stddef.patch`, `cutils.h`: includes `<stddef.h>`. A static musl build's headers don't define `offsetof` along the way, as glibc's and macOS's do, so the header's own fallback, `((size_t) &((type *)0)->field)`, stood in for it. The undefined-behavior checks read that as a member access through a null pointer, so every `container_of` and `list_entry` trapped, and the engine stopped at its first allocation.
 - `patches/0004-no-debug-dumps.patch`, `quickjs.c`: builds without `ENABLE_DUMPS`. Upstream turns the dump code on whenever `NDEBUG` is undefined, and fx builds the C without `NDEBUG`, which also keeps the engine's `assert` checks. fx never sets dump flags, so that code was linked but never ran: about 36 KB of the engine.
 - `patches/0005-no-modules.patch`, `quickjs.c`: dynamic `import()` rejects its promise before loading anything, and evaluating a module, compiling source as a module, reading module bytecode, and building a module namespace each return an error first. The namespace is built through the engine's table of lazy property initializers, so its entry needs the error too, or the namespace and export-resolution code stays linked. fx runs every program as a script, and `engine.zig`'s module loader already refused every `import()`, but the module code stayed linked: about 20 KB. `import()` still returns a promise that rejects with "import() is not available in code mode", so a program's `.catch` sees it.
