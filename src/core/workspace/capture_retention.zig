@@ -69,9 +69,10 @@
 //! 5. Each eviction is journaled in `captures/evictions.jsonl`, two synced
 //!    lines per session, so a removal is never silent: `"phase":"intent"`
 //!    with the refs found, before any ref is deleted, then `"phase":"done"`
-//!    with the refs deleted and those `kept` because a capture moved them
-//!    meanwhile. An intent without its done line is an eviction a crash
-//!    stopped. A session that kept every ref is not reported as evicted.
+//!    with the refs deleted, those `kept` because a capture moved them
+//!    meanwhile, and those `failed` because their delete could not finish.
+//!    An intent without its done line is an eviction a crash stopped. A
+//!    session that kept every ref is not reported as evicted.
 //! 6. Eviction stops when a marker or journal line cannot be written, a
 //!    store it deleted refs from cannot be pruned, or the space cannot be
 //!    measured: the space would not be seen to drop, and evicting on would
@@ -529,6 +530,7 @@ const Pass = struct {
             return .{ .stopped = .journal_failed };
         };
         var deleted: usize = 0;
+        var kept: usize = 0;
         var left: std.ArrayList(usize) = .empty;
         for (candidate.refs.items) |ref| {
             switch (try capture_store.storeOutput(arena, pass.ready, try capture_store.refStore(arena, pass.stores[ref.store]), .{ .delete_ref = .{ .ref = ref.name, .old = ref.oid } }, limits)) {
@@ -536,14 +538,19 @@ const Pass = struct {
                     deleted += 1;
                     if (std.mem.findScalar(usize, left.items, ref.store) == null) try left.append(arena, ref.store);
                 },
-                .failed => |failure| debug_trace.logf("workspace", "event=workspace_capture_ref_kept ref={s} failure={s}", .{ ref.name, @tagName(failure) }),
+                .failed => |failure| {
+                    // update-ref exits non-zero when the ref no longer names the listed commit: a capture moved it. Any other failure, such as a deadline, is counted apart.
+                    if (failure == .exited_nonzero) kept += 1;
+                    debug_trace.logf("workspace", "event=workspace_capture_ref_kept ref={s} failure={s}", .{ ref.name, @tagName(failure) });
+                },
             }
         }
         // What the deletes did: a ref a capture moved meanwhile stays.
         var done = line;
         done.phase = .done;
         done.refs = deleted;
-        done.kept = candidate.refs.items.len - deleted;
+        done.kept = kept;
+        done.failed = candidate.refs.items.len - deleted - kept;
         const recorded = if (appendJournal(arena, pass.io, pass.journal, done)) true else |err| unrecorded: {
             capture_store.keepCancel(pass.io, err);
             break :unrecorded false;
@@ -638,7 +645,7 @@ fn inventory(arena: Allocator, ready: safe_git.StoreReady, stores: []const []con
         };
         var lines = std.mem.splitScalar(u8, listing, '\n');
         while (lines.next()) |line| {
-            const parsed = parseRefLine(line) orelse continue;
+            const parsed = capture_store.parseRefLine(line) orelse continue;
             if (std.mem.eql(u8, parsed.key, current_key)) continue;
             const entry = try by_key.getOrPut(arena, parsed.key);
             if (!entry.found_existing) entry.value_ptr.* = .{ .key = parsed.key, .last = parsed.seconds };
@@ -647,26 +654,6 @@ fn inventory(arena: Allocator, ready: safe_git.StoreReady, stores: []const []con
         }
     }
     return by_key.values();
-}
-
-const RefLine = struct { name: []const u8, key: []const u8, oid: []const u8, seconds: i64 };
-
-/// `refs/fx/sessions/<key>/<worktree> <object> <seconds>`; null for anything
-/// else.
-fn parseRefLine(line: []const u8) ?RefLine {
-    var fields = std.mem.splitScalar(u8, line, ' ');
-    const name = fields.next() orelse return null;
-    const oid = fields.next() orelse return null;
-    const seconds = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
-    if (fields.next() != null) return null;
-    const prefix = "refs/fx/sessions/";
-    if (!std.mem.startsWith(u8, name, prefix)) return null;
-    var segments = std.mem.splitScalar(u8, name[prefix.len..], '/');
-    const key = segments.next() orelse return null;
-    const worktree = segments.next() orelse return null;
-    if (segments.next() != null or !isKey(key) or !isKey(worktree)) return null;
-    if (!safe_git.isOid(oid, .sha1) and !safe_git.isOid(oid, .sha256)) return null;
-    return .{ .name = name, .key = key, .oid = oid, .seconds = seconds };
 }
 
 fn isKey(text: []const u8) bool {
@@ -744,7 +731,7 @@ fn pack(arena: Allocator, io: std.Io, ready: safe_git.StoreReady, store_dir: []c
 /// Takes every capture lock of the store, waiting until `deadline`: its
 /// `init.lock`, then each worktree's lock in name order. The files join
 /// `locks`, which the caller closes. The worktree names, or null when a lock
-/// stayed held.
+/// stayed held or the worktrees folder could not be listed in full.
 fn lockStore(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), store_dir: []const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) Allocator.Error!?[]const []const u8 {
     // `init.lock` first: a capture that has not passed it has written
     // nothing, and the worktrees listed after it are all there are.
@@ -755,13 +742,22 @@ fn lockStore(arena: Allocator, io: std.Io, locks: *std.ArrayList(std.Io.File), s
         var dir = dir_value;
         defer dir.close(io);
         var entries = dir.iterate();
-        while (entries.next(io) catch |err| listed: {
+        while (entries.next(io) catch |err| {
             capture_store.keepCancel(io, err);
-            break :listed null;
+            debug_trace.logf("workspace", "event=workspace_capture_worktrees_unlisted store={s} err={s}", .{ store_dir, @errorName(err) });
+            return null;
         }) |entry| {
             if (entry.kind == .directory) try names.append(arena, try arena.dupe(u8, entry.name));
         }
-    } else |err| capture_store.keepCancel(io, err);
+    } else |err| switch (err) {
+        // No capture has made a worktree folder yet.
+        error.FileNotFound => {},
+        else => {
+            capture_store.keepCancel(io, err);
+            debug_trace.logf("workspace", "event=workspace_capture_worktrees_unlisted store={s} err={s}", .{ store_dir, @errorName(err) });
+            return null;
+        },
+    }
     // One order for every maintenance, so two never wait on each other.
     sort_utils.sort([]const u8, names.items, {}, lessThan);
     for (names.items) |name| {
@@ -1115,7 +1111,8 @@ fn removeStaleUsageTemps(io: std.Io, captures: []const u8, now_ms: i64) void {
 }
 
 /// One line of `evictions.jsonl`. The intent's `refs` are the refs found;
-/// the done line's are the refs deleted, and `kept` those a capture moved.
+/// the done line's are the refs deleted, `kept` those a capture moved, and
+/// `failed` those whose delete could not finish, such as at a deadline.
 const JournalLine = struct {
     phase: enum { intent, done },
     at_ms: i64,
@@ -1123,6 +1120,7 @@ const JournalLine = struct {
     reason: EvictionReason,
     refs: usize,
     kept: usize = 0,
+    failed: usize = 0,
 };
 
 /// Appends one line to the journal and syncs it. A symlink at `path` is
@@ -1132,7 +1130,7 @@ fn appendJournal(arena: Allocator, io: std.Io, path: []const u8, entry: JournalL
     const head = try arena.print("{{\"v\":1,\"phase\":\"{s}\",\"at_ms\":{d},\"session_key\":\"{s}\",\"reason\":\"{s}\",\"refs\":{d}", .{ @tagName(entry.phase), entry.at_ms, entry.key, @tagName(entry.reason), entry.refs });
     const line = switch (entry.phase) {
         .intent => try arena.print("{s}}}\n", .{head}),
-        .done => try arena.print("{s},\"kept\":{d}}}\n", .{ head, entry.kept }),
+        .done => try arena.print("{s},\"kept\":{d},\"failed\":{d}}}\n", .{ head, entry.kept, entry.failed }),
     };
     // An exclusive create never follows a symlink, so only a regular file
     // with one link is opened for the append.
@@ -1140,6 +1138,7 @@ fn appendJournal(arena: Allocator, io: std.Io, path: []const u8, entry: JournalL
         error.PathAlreadyExists => try io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_write),
         else => |other| return other,
     };
+    defer file.close(io);
     var end = (try file.stat(io)).size;
     if (end > max_journal_bytes) {
         const rotated = try arena.print("{s}.1", .{path});
@@ -1153,41 +1152,19 @@ fn appendJournal(arena: Allocator, io: std.Io, path: []const u8, entry: JournalL
         };
         if (renamed) {
             debug_trace.logf("workspace", "event=workspace_capture_journal_rotated bytes={d}", .{end});
-            file.close(io);
-            file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
+            const next = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
                 error.PathAlreadyExists => try io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_write),
                 else => |other| return other,
             };
+            file.close(io);
+            file = next;
             // Zero for the file just created; another process that recreated
             // the path meanwhile keeps its lines.
             end = (try file.stat(io)).size;
         }
     }
-    defer file.close(io);
     try file.writePositionalAll(io, line, end);
     try file.sync(io);
-}
-
-test "capture retention reads only well-formed capture refs" {
-    const oid = "0123456789abcdef0123456789abcdef01234567";
-    const key = "00112233445566778899aabbccddeeff";
-    const wt = "ffeeddccbbaa99887766554433221100";
-    const good = try std.testing.allocator.print("refs/fx/sessions/{s}/{s} {s} 1700000000", .{ key, wt, oid });
-    defer std.testing.allocator.free(good);
-    const parsed = parseRefLine(good).?;
-    try std.testing.expectEqualStrings(key, parsed.key);
-    try std.testing.expectEqualStrings(oid, parsed.oid);
-    try std.testing.expectEqual(@as(i64, 1_700_000_000), parsed.seconds);
-    for ([_][]const u8{
-        "",
-        "refs/heads/main " ++ oid ++ " 1",
-        "refs/fx/sessions/" ++ key ++ " " ++ oid ++ " 1",
-        "refs/fx/sessions/" ++ key ++ "/" ++ wt ++ "/x " ++ oid ++ " 1",
-        "refs/fx/sessions/" ++ key ++ "/" ++ wt ++ " nothex 1",
-        "refs/fx/sessions/" ++ key ++ "/" ++ wt ++ " " ++ oid ++ " soon",
-        "refs/fx/sessions/" ++ key ++ "/" ++ wt ++ " " ++ oid ++ " 1 extra",
-        "refs/fx/sessions/ABCDEF33445566778899aabbccddeeff/" ++ wt ++ " " ++ oid ++ " 1",
-    }) |line| try std.testing.expect(parseRefLine(line) == null);
 }
 
 test "capture retention evicts orphans first, then the longest unused, ties by key" {
@@ -1486,12 +1463,12 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
     var buffer: [1024]u8 = undefined;
     const bytes = buffer[0..@intCast(smith.slice(&buffer))];
     // An accepted ref line written back the way git lists it reads the same.
-    if (parseRefLine(bytes)) |parsed| {
+    if (capture_store.parseRefLine(bytes)) |parsed| {
         try std.testing.expect(std.mem.startsWith(u8, parsed.name, "refs/fx/sessions/"));
         try std.testing.expectEqualStrings(parsed.key, parsed.name["refs/fx/sessions/".len..][0..key_len]);
         const again = try alloc.print("{s} {s} {d}", .{ parsed.name, parsed.oid, parsed.seconds });
         defer alloc.free(again);
-        const reparsed = parseRefLine(again) orelse return error.TestUnexpectedResult;
+        const reparsed = capture_store.parseRefLine(again) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(parsed.name, reparsed.name);
         try std.testing.expectEqualStrings(parsed.key, reparsed.key);
         try std.testing.expectEqualStrings(parsed.oid, reparsed.oid);
@@ -1545,4 +1522,21 @@ test "capture retention rotates a journal over its limit" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
     try std.testing.expect(std.mem.startsWith(u8, text, "{\"v\":1,"));
     try std.testing.expect(capture_store.exists(io, try arena.print("{s}.1", .{path})));
+}
+
+test "capture retention: a store whose worktrees folder cannot be listed is not locked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const store_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    try tmp.dir.writeFile(io, .{ .sub_path = "init.lock", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "worktrees", .data = "" });
+    var locks: std.ArrayList(std.Io.File) = .empty;
+    defer for (locks.items) |file| file.close(io);
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(1000) });
+    const names = try lockStore(arena, io, &locks, store_dir, deadline, null);
+    try std.testing.expect(names == null);
 }

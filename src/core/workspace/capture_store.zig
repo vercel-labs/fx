@@ -346,7 +346,16 @@ const Run = struct {
         }
         // `lockUntil` logs why a lock could not be taken.
         const lock_path = try std.Io.Dir.path.join(arena, &.{ worktree_dir, "lock" });
-        self.lock = .{ .file = lockUntil(self.io, lock_path, self.deadline, self.request.cancel) catch |err| return switch (err) {
+        // Maintenance holds an existing store's `init.lock` and every
+        // worktree lock for a whole pack or prune; the turn waits for that
+        // only briefly. A missing store has no maintenance yet.
+        const store_head = try std.Io.Dir.path.join(arena, &.{ try storeGitDir(arena, store_dir), "HEAD" });
+        const store_exists = isPresent(self.io, store_head) catch |err| blk: {
+            keepCancel(self.io, err);
+            break :blk false;
+        };
+        const store_lock: ?[]const u8 = if (store_exists) try initLockPath(arena, store_dir) else null;
+        self.lock = .{ .file = lockWorktreeUntil(self.io, lock_path, store_lock, self.deadline, self.request.cancel) catch |err| return switch (err) {
             error.Busy => self.fail(.unavailable, .capture_locked),
             error.Unavailable => self.fail(.failed, .io_error),
             error.Canceled => self.fail(.unavailable, .cancelled),
@@ -1483,6 +1492,39 @@ fn lockFailed(io: std.Io, path: []const u8, err: anyerror) error{ Unavailable, C
     }
     logIoError("lock", path, err);
     return error.Unavailable;
+}
+
+/// `lockUntil` for a worktree's lock. While `store_lock`, the existing
+/// store's `init.lock`, is held too, maintenance is packing or pruning the
+/// store with every worktree lock held, so the wait ends as `Busy` after
+/// `existing_store_wait_ms` instead of at `deadline`. Another capture of the
+/// worktree, such as a parallel subagent's, holds only the worktree lock and
+/// is waited for until `deadline`.
+fn lockWorktreeUntil(io: std.Io, path: []const u8, store_lock: ?[]const u8, deadline: std.Io.Clock.Timestamp, cancel: ?*const std.atomic.Value(bool)) error{ Busy, Unavailable, Canceled }!std.Io.File {
+    const file = std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .read = true }) catch |err| return lockFailed(io, path, err);
+    errdefer file.close(io);
+    var maintenance_until: ?std.Io.Clock.Timestamp = null;
+    while (!(file.tryLock(io, .exclusive) catch |err| return lockFailed(io, path, err))) {
+        if (pastDeadline(io, deadline)) return error.Busy;
+        if (cancel) |flag| if (flag.load(.acquire)) return error.Canceled;
+        if (store_lock) |store_path| {
+            if (try lockHeld(io, store_path)) {
+                const until = maintenance_until orelse std.Io.Clock.Timestamp.fromNow(io, .{ .clock = deadline.clock, .raw = .fromMilliseconds(existing_store_wait_ms) });
+                maintenance_until = until;
+                if (pastDeadline(io, until)) return error.Busy;
+            } else maintenance_until = null;
+        }
+        io.sleep(.fromNanoseconds(lock_poll_ns), .awake) catch |err| return lockFailed(io, path, err);
+    }
+    return file;
+}
+
+/// Whether another holder has the flock on `path`. The lock this takes to
+/// look is released by the close.
+fn lockHeld(io: std.Io, path: []const u8) error{ Unavailable, Canceled }!bool {
+    const file = std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .read = true }) catch |err| return lockFailed(io, path, err);
+    defer file.close(io);
+    return !(file.tryLock(io, .exclusive) catch |err| return lockFailed(io, path, err));
 }
 
 /// Whether `path` exists. Only a path the system reports missing is false;
@@ -5353,11 +5395,11 @@ test "capture retention: a session a capture reopens keeps its refs, and the jou
     try testing.expectEqual(@as(usize, 1), admission.evicted[0].refs);
     try testing.expectEqualStrings(newer, (try repos.storeRef(repo, try repos.sessionRef(repo, "reopened"))).?);
 
-    const expected = [_]struct { []const u8, []const u8, i64, ?i64 }{
-        .{ "reopened", "intent", 1, null },
-        .{ "reopened", "done", 0, 1 },
-        .{ "newer", "intent", 1, null },
-        .{ "newer", "done", 1, 0 },
+    const expected = [_]struct { []const u8, []const u8, i64, ?i64, ?i64 }{
+        .{ "reopened", "intent", 1, null, null },
+        .{ "reopened", "done", 0, 1, 0 },
+        .{ "newer", "intent", 1, null, null },
+        .{ "newer", "done", 1, 0, 0 },
     };
     const lines = try journalLines(repos);
     try testing.expectEqual(expected.len, lines.len);
@@ -5367,6 +5409,7 @@ test "capture retention: a session a capture reopens keeps its refs, and the jou
         try testing.expectEqualStrings(want[1], parsed.get("phase").?.string);
         try testing.expectEqual(want[2], parsed.get("refs").?.integer);
         try testing.expectEqual(want[3], if (parsed.get("kept")) |kept| kept.integer else null);
+        try testing.expectEqual(want[4], if (parsed.get("failed")) |failed| failed.integer else null);
     }
 }
 
@@ -5993,6 +6036,88 @@ test "capture store: a capture of an existing store skips at once when maintenan
     try testing.expectEqual(Status.unavailable, outcome.status);
     try testing.expectEqual(policy.Reason.capture_locked, outcome.reason.?);
     try testing.expect(took_ms < 1000);
+}
+
+test "capture store: a capture skips soon when maintenance holds the store lock and every worktree lock" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeShapes("repo");
+    const repo = try repos.repository("repo");
+    // One capture leaves a store that later captures only check.
+    _ = try expectStored(try repos.captureRepo(repo, "first"));
+    const store_dir = try storeDir(repos.arena, repos.profile, repo.common_dir);
+    const held = try std.Io.Dir.createFileAbsolute(testing.io, try std.Io.Dir.path.join(repos.arena, &.{ store_dir, "init.lock" }), .{ .truncate = false, .read = true });
+    defer held.close(testing.io);
+    try testing.expect(try held.tryLock(testing.io, .exclusive));
+
+    // Maintenance holds every worktree lock along with the store lock.
+    var worktree_locks: std.ArrayList(std.Io.File) = .empty;
+    defer for (worktree_locks.items) |file| file.close(testing.io);
+    const worktrees = try worktreesDir(repos.arena, store_dir);
+    var dir = try std.Io.Dir.openDirAbsolute(testing.io, worktrees, .{ .iterate = true });
+    defer dir.close(testing.io);
+    var entries = dir.iterate();
+    while (try entries.next(testing.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const lock_path = try std.Io.Dir.path.join(repos.arena, &.{ worktrees, entry.name, worktree_lock_name });
+        const file = try std.Io.Dir.createFileAbsolute(testing.io, lock_path, .{ .truncate = false, .read = true });
+        errdefer file.close(testing.io);
+        try testing.expect(try file.tryLock(testing.io, .exclusive));
+        try worktree_locks.append(repos.arena, file);
+    }
+    try testing.expect(worktree_locks.items.len > 0);
+
+    var request = repos.request(repo, "second", .{});
+    request.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(1500) });
+    const started = io_mod.milliTimestamp();
+    const outcome = try capture(repos.arena, request);
+    const took_ms = io_mod.milliTimestamp() - started;
+    try testing.expectEqual(Status.unavailable, outcome.status);
+    try testing.expectEqual(policy.Reason.capture_locked, outcome.reason.?);
+    try testing.expect(took_ms < 1000);
+}
+
+test "capture store: a capture waits its whole deadline for another capture of its worktree" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    try repos.makeShapes("repo");
+    const repo = try repos.repository("repo");
+    _ = try expectStored(try repos.captureRepo(repo, "first"));
+    const store_dir = try storeDir(repos.arena, repos.profile, repo.common_dir);
+
+    // Only the worktree lock is held, as another capture of the same worktree holds it.
+    var worktree_locks: std.ArrayList(std.Io.File) = .empty;
+    defer for (worktree_locks.items) |file| file.close(testing.io);
+    const worktrees = try worktreesDir(repos.arena, store_dir);
+    var dir = try std.Io.Dir.openDirAbsolute(testing.io, worktrees, .{ .iterate = true });
+    defer dir.close(testing.io);
+    var entries = dir.iterate();
+    while (try entries.next(testing.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const lock_path = try std.Io.Dir.path.join(repos.arena, &.{ worktrees, entry.name, worktree_lock_name });
+        const file = try std.Io.Dir.createFileAbsolute(testing.io, lock_path, .{ .truncate = false, .read = true });
+        errdefer file.close(testing.io);
+        try testing.expect(try file.tryLock(testing.io, .exclusive));
+        try worktree_locks.append(repos.arena, file);
+    }
+    try testing.expect(worktree_locks.items.len > 0);
+
+    var request = repos.request(repo, "second", .{});
+    request.deadline = .fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(600) });
+    const started = io_mod.milliTimestamp();
+    const outcome = try capture(repos.arena, request);
+    const took_ms = io_mod.milliTimestamp() - started;
+    try testing.expectEqual(Status.unavailable, outcome.status);
+    try testing.expectEqual(policy.Reason.capture_locked, outcome.reason.?);
+    try testing.expect(took_ms >= 550);
 }
 
 test "capture retention: a marker left before the intent costs only a prune, and stale usage temps are removed" {
