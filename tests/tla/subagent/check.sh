@@ -30,6 +30,8 @@
 #                        arms the work, so they run after the stop      StopHoldsForQueued
 #   leftover-uncounted   a stop or close of such a turn drops the kept
 #                        messages and does not count them                NoSilentLoss
+#   close-leaves-kept    a close of a turn that ended, whose slot kept its unread
+#                        messages, leaves them with the closing subagent  ClosingHoldsNoKept
 #   user-ended-uncounted the user's stop of a turn that ended, while its slot
 #                        kept its unread messages, drops them and counts none  NoSilentLoss
 #   user-before-lock     the user's stop lands between the end hook's install
@@ -169,6 +171,7 @@ StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 StopMessage stop-message-mutation-late-rearm StopHoldsForQueued
 StopMessage stop-message-mutation-leftover-gap StopHoldsForQueued
 StopMessage stop-message-mutation-leftover-uncounted NoSilentLoss
+StopMessage stop-message-mutation-close-leaves-kept ClosingHoldsNoKept
 StopMessage stop-message-mutation-user-ended-uncounted NoSilentLoss
 StopMessage stop-message-mutation-user-before-lock StopHoldsForQueued
 StopMessage stop-message-mutation-user-next-runs StopHoldsForQueued

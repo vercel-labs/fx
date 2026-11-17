@@ -70,6 +70,7 @@
 (* before this: the stop reached nothing, answered "stopped", counted     *)
 (* nothing, and the hook installed the kept messages and armed the work.   *)
 (* "leftover_uncounted" is the slot that drops them without counting.     *)
+(* "close_leaves_kept" is a close that leaves them with the closing slot. *)
 (*                                                                         *)
 (* The user's stop reaches the same slot. Esc on a turn main did not start *)
 (* lands while main's slot is between two works (`userWorkRun` in          *)
@@ -98,7 +99,7 @@ Bugs == {"none", "today", "refuse_ending", "no_order", "uncounted",
          "join_user_ending", "read_after_stop", "drop_waiting_at_end",
          "queue_closing", "unmark_early", "start_next_turn", "late_rearm",
          "before_idle", "note_after_take", "names_busy",
-         "leftover_gap", "leftover_uncounted",
+         "leftover_gap", "leftover_uncounted", "close_leaves_kept",
          "user_ended_uncounted", "user_before_lock", "user_next_runs"}
 ASSUME Bug \in Bugs
 
@@ -395,7 +396,7 @@ DoClose(c) ==
           /\ phase' = [phase EXCEPT ![s] = IF @ = "idle" THEN "absent" ELSE "closing"]
           /\ waitq' = [waitq EXCEPT ![s] = <<>>]
           /\ startq' = [startq EXCEPT ![s] = {}]
-          /\ kept' = [kept EXCEPT ![s] = {}]
+          /\ kept' = [kept EXCEPT ![s] = IF Bug = "close_leaves_kept" THEN @ ELSE {}]
           /\ unread' = [unread EXCEPT ![s] = {}]
           /\ dropped' = dropped \cup lost
           /\ toldDropped' = toldDropped \cup counted
@@ -653,6 +654,11 @@ StopRunsFirst == ~coverBroken
 ClosingHoldsNothing ==
     \A s \in Subs : Marked(s) => waitq[s] = <<>> /\ unread[s] = {}
 
+\* Nor does it hold a message its slot kept from a turn that ended without
+\* reading it, or installed as its next work: the close drops and counts them
+\* (`Owner.stop`, `Owner.closeByUser`).
+ClosingHoldsNoKept ==
+    \A s \in Subs : Marked(s) => startq[s] = {} /\ kept[s] = {}
 
 \* A message main sends to a turn that is still starting joins that turn:
 \* fx never holds it for a later one (Owner.steer's .starting).
