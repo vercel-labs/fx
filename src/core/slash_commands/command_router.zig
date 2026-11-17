@@ -43,6 +43,7 @@ pub const ParsedCommand = union(enum) {
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
+    loop: []const u8,
     shell: []const u8,
     version,
     unknown,
@@ -90,6 +91,7 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_loop: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
@@ -139,6 +141,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
+        .loop => .{ .loop = payload },
         .shell => .{ .shell = payload },
         .version => .version,
     };
@@ -209,6 +212,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
+        .loop => |rest| try handlers.handle_loop(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
@@ -553,6 +557,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
+        .handle_loop = unexpectedPayload,
         .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
@@ -589,6 +594,27 @@ test "/setup warns through its own handler and /provider does not" {
         handlers.setup_alias = Record.setupAlias;
         try route(testSlashRegistry(), &handlers, case.cmd);
         try std.testing.expectEqualStrings(case.called, ctx.called);
+    }
+}
+
+test "loop routes its payload" {
+    const Record = struct {
+        fn loop(ctx: *anyopaque, value: []const u8) anyerror!void {
+            const test_context = testContext(ctx);
+            test_context.called = "loop";
+            test_context.payload = value;
+        }
+    };
+    for ([_]struct { cmd: []const u8, payload: []const u8 }{
+        .{ .cmd = "/loop 5m check", .payload = "5m check" },
+        .{ .cmd = "/loop", .payload = "" },
+    }) |case| {
+        var ctx: TestContext = .{};
+        var handlers = testHandlers(&ctx);
+        handlers.handle_loop = Record.loop;
+        try route(testSlashRegistry(), &handlers, case.cmd);
+        try std.testing.expectEqualStrings("loop", ctx.called);
+        try std.testing.expectEqualStrings(case.payload, ctx.payload);
     }
 }
 
