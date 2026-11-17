@@ -49,6 +49,7 @@ const mcp_tools = @import("../core/mcp/features/tools.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
+const permissions = @import("../core/permissions/permissions.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
@@ -1679,7 +1680,7 @@ fn initialDynamicTools(
     const session = if (ctx.state.active_session) |*active| active else return host_tools;
     const loaded = if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
         arena,
-        session.permission_rules,
+        permissions.mcpRules(ctx.captured_permission_mode orelse session.permission_mode, session.permission_rules),
         ctx.state.context_limits,
         .unrestricted,
         &session.cancel_flag,

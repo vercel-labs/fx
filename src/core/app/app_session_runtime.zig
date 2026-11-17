@@ -3389,6 +3389,9 @@ pub fn Runtime(comptime App: type) type {
                         command_artifact_handle,
                         replayed_output,
                     );
+                    // The live row's command metadata, so the compact view
+                    // shows the command's short form, as it did live.
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn appendQuestionResolution(
@@ -4971,7 +4974,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const rules: types.PermissionRuleSet = if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{};
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(alloc, root_id, root_id, rules)
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -5086,12 +5089,7 @@ pub fn Runtime(comptime App: type) type {
                 alloc.free(integrations);
             }
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(
-                    alloc,
-                    root_id,
-                    root_id,
-                    app.permission_engine.rules,
-                )
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -9699,6 +9697,105 @@ test "zero-output cancelled command restores detail without an output block" {
     try std.testing.expectEqual(@as(usize, 1), app.cancelled_command_detail_count);
     try std.testing.expect(!app.cancelled_command_replayed_output);
     try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
+}
+
+test "a command cancelled before it printed anything keeps its row across a persisted session restart (D100)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var session_id: ?[]u8 = null;
+    defer if (session_id) |id| alloc.free(id);
+
+    {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try app.agent().session_persistence.v2.?.beginTurn();
+        // The command printed nothing, so core keeps no replay, and its
+        // terminal names no artifact.
+        Runtime(TestApp).recordToolTerminal(
+            &app,
+            (&app).agent(),
+            .{ .terminal = .{
+                .id = .{ .turn_id = 7, .call_id = "silent-command" },
+                .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
+            } },
+            true,
+        );
+        try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), .{ .interrupted = .{
+            .user = .{ .text = @constCast("run the slow command") },
+            .tool_call = .{
+                .id = "silent-command",
+                .name = "shell",
+                .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}",
+            },
+        } });
+        session_id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
+        Runtime(TestApp).finalizePersistence(&app, (&app).agent());
+    }
+
+    var resumed = try TestApp.init(alloc, paths.workspace);
+    defer resumed.deinit();
+    try configureTestPreferences(&resumed);
+    try Runtime(TestApp).initializePersistence(&resumed, (&resumed).agent(), true);
+    resumed.requested_resume = .{ .id = try alloc.dupe(u8, session_id.?) };
+    try Runtime(TestApp).resumeRequestedSession(&resumed, (&resumed).agent());
+
+    // The command's row comes back, with no output under it.
+    try std.testing.expectEqual(@as(usize, 1), resumed.cancelled_command_detail_count);
+    try std.testing.expect(!resumed.cancelled_command_replayed_output);
+    try std.testing.expect(resumed.cancelled_command_artifact_handle == null);
+    try std.testing.expectEqual(@as(usize, 0), resumed.command_output_flush_count);
+    try std.testing.expectEqualSlices(ReplayEvent, &.{.completed_tool_status}, resumed.replay_events.items);
+}
+
+test "a resumed cancelled command row has the live row's command metadata, for its short form" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    const history = [_]types.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("cancel it") },
+        .tool_call = .{
+            .id = "cancelled-run",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch .ready && sleep 30\"}",
+        },
+        .cancelled_command = .{},
+    } }};
+
+    try Runtime(TestApp).replayHistoryToSink(&app, (&app).agent(), &sink, &history, &labels);
+
+    // The same display and label the live row stores when the call starts,
+    // which the compact view needs to show `Cancelled touch, sleep`.
+    var cancelled_rows: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        const outcome = detail.outcome orelse continue;
+        if (outcome != .cancelled) continue;
+        cancelled_rows += 1;
+        try std.testing.expectEqualStrings("touch .ready && sleep 30", detail.command_display.?);
+        try std.testing.expectEqualStrings("Ran", detail.command_action_label.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cancelled_rows);
 }
 
 test "cancelled command replay rejects unsafe handles without partial output" {
