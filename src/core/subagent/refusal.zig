@@ -321,6 +321,7 @@ test "the host, the decoder and the provider name no code outside Refusal unless
     const own_text = [_][]const u8{
         "feedback_capacity",
         "close_not_saved",
+        "start_failed",
         "profile_unavailable",
         "ambiguous_model",
         "unknown_model",
